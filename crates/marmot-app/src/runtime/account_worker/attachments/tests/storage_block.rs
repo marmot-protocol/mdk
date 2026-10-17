@@ -66,6 +66,7 @@ async fn fixture(
     seed(&storage, reference, false);
     client.state.groups.push(projection(reference));
     storage
+        .app_storage()
         .remember_encrypted_media_epoch_secret(
             GROUP,
             crate::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
@@ -74,19 +75,26 @@ async fn fixture(
         )
         .unwrap();
     let now = crate::unix_now_seconds();
-    admit_demands(&storage, now, true).unwrap();
+    admit_demands(&storage.app_storage(), now, true).unwrap();
     let asset = storage
+        .app_storage()
         .due_attachment_acquisitions(now, 1)
         .unwrap()
         .remove(0);
     if explicit {
-        assert!(storage.explicitly_retry_attachment(&asset, now).unwrap());
+        assert!(
+            storage
+                .app_storage()
+                .explicitly_retry_attachment(&asset, now)
+                .unwrap()
+        );
     }
     let mut policy = crate::runtime::attachment_controls::default_policy(&client.app.config);
     policy.automatic = !explicit;
     policy.transfer_limit = transfer_limit;
     policy.disk_reserve = 0;
     storage
+        .app_storage()
         .set_attachment_download_policy(&policy, now)
         .unwrap();
     let (http, completions) = context();
@@ -130,6 +138,7 @@ impl Fixture {
     }
     fn status(&self) -> storage_sqlite::AttachmentTransferStatus {
         self.storage
+            .app_storage()
             .attachment_transfer_status(
                 GROUP,
                 &"11".repeat(32),
@@ -160,6 +169,7 @@ impl Fixture {
     /// The parked row's readmission due time, in the scheduler's clock.
     fn due(&self) -> Option<u64> {
         self.storage
+            .app_storage()
             .attachment_acquisition_status(&self.status().reference.unwrap())
             .unwrap()
             .unwrap()
@@ -240,6 +250,7 @@ impl Fixture {
         // retained-byte usage.
         assert_eq!(
             self.storage
+                .app_storage()
                 .attachment_acquisition_status(&reference)
                 .unwrap()
                 .unwrap()
@@ -538,11 +549,16 @@ async fn interrupted_download_retries_with_its_checkpoint_credited() {
         }
     ));
     complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
-    let saved = fixture.storage.attachment_partial_bytes_for_test().unwrap();
+    let saved = fixture
+        .storage
+        .app_storage()
+        .attachment_partial_bytes_for_test()
+        .unwrap();
     assert_eq!(saved, interrupted as u64, "the interrupted prefix is kept");
     assert!(
         fixture
             .storage
+            .app_storage()
             .retry_attachment_acquisition(
                 &fixture.status().reference.unwrap(),
                 crate::unix_now_seconds()
@@ -782,7 +798,13 @@ async fn park_mid_transfer() -> MidTransferPark {
     // Wait on the saved checkpoints, which track processed bytes exactly,
     // rather than on throttled progress reports.
     let started = tokio::time::Instant::now();
-    while fixture.storage.attachment_partial_bytes_for_test().unwrap() < first as u64 {
+    while fixture
+        .storage
+        .app_storage()
+        .attachment_partial_bytes_for_test()
+        .unwrap()
+        < first as u64
+    {
         assert!(
             started.elapsed() < Duration::from_secs(30),
             "{:?}",
@@ -796,7 +818,11 @@ async fn park_mid_transfer() -> MidTransferPark {
     proceed.send(true).unwrap();
     let done = fixture.completion().await;
     let headroom = parked_headroom(&done);
-    let saved = fixture.storage.attachment_partial_bytes_for_test().unwrap();
+    let saved = fixture
+        .storage
+        .app_storage()
+        .attachment_partial_bytes_for_test()
+        .unwrap();
     assert!(saved >= 6 * MIB && saved < total, "saved {saved}");
     complete_media_http(&mut fixture.client, done, &fixture.shared, &fixture.http).await;
     assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
@@ -878,7 +904,13 @@ async fn a_refused_checkpoint_write_parks_instead_of_retrying() {
     let mut fixture = explicit_fixture(&reference, 64 * MIB).await;
     fixture.tick().await;
     let started = tokio::time::Instant::now();
-    while fixture.storage.attachment_partial_bytes_for_test().unwrap() < MIB {
+    while fixture
+        .storage
+        .app_storage()
+        .attachment_partial_bytes_for_test()
+        .unwrap()
+        < MIB
+    {
         assert!(started.elapsed() < Duration::from_secs(10));
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -1022,7 +1054,14 @@ async fn memory_publication_onto_a_full_disk_parks_until_room_returns() {
     )
     .await;
     assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
-    assert_eq!(fixture.storage.retained_attachment_byte_count().unwrap(), 0);
+    assert_eq!(
+        fixture
+            .storage
+            .app_storage()
+            .retained_attachment_byte_count()
+            .unwrap(),
+        0
+    );
     assert_eq!(fixture.status().retry_at, None, "no retry timer runs");
     let target = free + plain.len() as u64;
     fixture.set_free(target + STORAGE_READMIT_MARGIN_BYTES - 1);
@@ -1077,7 +1116,11 @@ async fn memory_publication_onto_a_full_disk_with_a_checkpoint_parks_for_the_sto
             ..
         }
     ));
-    let saved = fixture.storage.attachment_partial_bytes_for_test().unwrap();
+    let saved = fixture
+        .storage
+        .app_storage()
+        .attachment_partial_bytes_for_test()
+        .unwrap();
     assert_eq!(saved, 3 * MIB, "every whole checkpoint unit is on disk");
     fixture.media().simulate_full_disk_for_test(true);
     complete_and_settle(
@@ -1157,7 +1200,14 @@ async fn file_publication_onto_a_full_disk_parks_until_room_returns() {
     )
     .await;
     assert_eq!(fixture.state(), AttachmentTransferState::StorageBlocked);
-    assert_eq!(fixture.storage.retained_attachment_byte_count().unwrap(), 0);
+    assert_eq!(
+        fixture
+            .storage
+            .app_storage()
+            .retained_attachment_byte_count()
+            .unwrap(),
+        0
+    );
     // The refusal saw the pinned space less the staged ciphertext it held
     // (no validator, so no wire checkpoint); the worker's frame gets that file
     // back, so the target is the refusal's own free space plus one more body.

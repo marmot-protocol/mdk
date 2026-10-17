@@ -6,11 +6,11 @@ fn sent(store: &SqliteAccountStorage, message: &str) {
     seed(store, message);
     let mut event = source(message);
     event.direction = "sent".into();
-    store.record_app_event(&event).unwrap();
+    store.app_storage().record_app_event(&event).unwrap();
 }
 
 /// Stage the same private bytes and bind their exact source descriptor.
-fn bound(store: &SqliteAccountStorage, message: &str) -> Vec<u8> {
+fn bound(store: &SqliteAppStorage, message: &str) -> Vec<u8> {
     let tokens = store
         .stage_attachment_uploads(GROUP, 3, &[BODY], 11, 10000)
         .unwrap();
@@ -21,7 +21,7 @@ fn bound(store: &SqliteAccountStorage, message: &str) -> Vec<u8> {
 }
 
 /// Attach an accepted source owner to the staged fixture.
-fn staged(store: &SqliteAccountStorage, message: &str) -> Vec<u8> {
+fn staged(store: &SqliteAppStorage, message: &str) -> Vec<u8> {
     let token = bound(store, message);
     store
         .protect_attachment_uploads(GROUP, message, &source(message).tags)
@@ -46,22 +46,22 @@ fn usage(store: &SqliteAccountStorage) -> u64 {
 #[test]
 fn outgoing_owner_batch_rolls_back_late_insert_failure() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     sent(&store, "owner-batch");
     let first = source("owner-batch").tags[0].clone();
     let mut second = first.clone();
     second.push("filename distinct".into());
-    let tokens = store
+    let tokens = app
         .stage_attachment_uploads(GROUP, 3, &[BODY, BODY], 11, 10000)
         .unwrap();
-    store
-        .bind_attachment_uploads(
-            &tokens,
-            &[
-                (serde_json::to_value(&first).unwrap(), digest()),
-                (serde_json::to_value(&second).unwrap(), digest()),
-            ],
-        )
-        .unwrap();
+    app.bind_attachment_uploads(
+        &tokens,
+        &[
+            (serde_json::to_value(&first).unwrap(), digest()),
+            (serde_json::to_value(&second).unwrap(), digest()),
+        ],
+    )
+    .unwrap();
     sql(
         &store,
         &format!(
@@ -71,8 +71,7 @@ fn outgoing_owner_batch_rolls_back_late_insert_failure() {
     );
     let tags = [first, vec!["other".into()], second];
     assert!(
-        store
-            .protect_attachment_uploads(GROUP, "owner-batch", &tags)
+        app.protect_attachment_uploads(GROUP, "owner-batch", &tags)
             .is_err()
     );
     let owner_count = || {
@@ -90,8 +89,7 @@ fn outgoing_owner_batch_rolls_back_late_insert_failure() {
     assert_eq!(usage(&store), 2 * BODY.len() as u64);
     sql(&store, "DROP TRIGGER fail_second_upload_owner");
     for _ in 0..2 {
-        store
-            .protect_attachment_uploads(GROUP, "owner-batch", &tags)
+        app.protect_attachment_uploads(GROUP, "owner-batch", &tags)
             .unwrap();
         assert_eq!(owner_count(), 2);
         assert_eq!(usage(&store), 2 * BODY.len() as u64);
@@ -117,13 +115,15 @@ fn outgoing_staging_survives_restart_and_pending_send_outlives_orphan_ttl() {
     pending.direction = "sent".into();
     pending.source_message_id_hex = None;
     pending.source_epoch = None;
-    store.record_app_event(&pending).unwrap();
-    staged(&store, "pending");
+    store.app_storage().record_app_event(&pending).unwrap();
+    staged(&store.app_storage(), "pending");
     store
+        .app_storage()
         .protect_attachment_uploads(GROUP, "pending", &source("pending").tags)
         .unwrap();
     assert_eq!(
         store
+            .app_storage()
             .prune_attachment_uploads(11 + 8 * 24 * 3600, 64)
             .unwrap(),
         0
@@ -131,21 +131,22 @@ fn outgoing_staging_survives_restart_and_pending_send_outlives_orphan_ttl() {
     assert_eq!(usage(&store), BODY.len() as u64);
     assert_eq!(
         store
+            .app_storage()
             .promote_attachment_uploads(GROUP, "pending", 20, 10000)
             .unwrap(),
         0
     );
     store.close().unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let app = store.app_storage();
     sent(&store, "pending");
     assert_eq!(
-        store
-            .promote_attachment_uploads(GROUP, "pending", 20, 10000)
+        app.promote_attachment_uploads(GROUP, "pending", 20, 10000)
             .unwrap(),
         1
     );
-    let asset = request(&store, "pending");
-    assert_eq!(read(&store, &asset), BODY);
+    let asset = request(&app, "pending");
+    assert_eq!(read(&app, &asset), BODY);
     assert_eq!(usage(&store), BODY.len() as u64);
 }
 
@@ -153,34 +154,33 @@ fn outgoing_staging_survives_restart_and_pending_send_outlives_orphan_ttl() {
 #[test]
 fn outgoing_batch_promotion_respects_exact_capacity_and_repeated_slots() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     sent(&store, "two");
     let mut event = source("two");
     event.direction = "sent".into();
     event.tags.push(event.tags[0].clone());
-    store.record_app_event(&event).unwrap();
-    let token = staged(&store, "two");
-    store
-        .set_attachment_download_policy(
-            &AttachmentDownloadPolicy {
-                retained_bytes: 2 * BODY.len() as u64,
-                ..policy(false, 1)
-            },
-            11,
-        )
-        .unwrap();
+    app.record_app_event(&event).unwrap();
+    let token = staged(&app, "two");
+    app.set_attachment_download_policy(
+        &AttachmentDownloadPolicy {
+            retained_bytes: 2 * BODY.len() as u64,
+            ..policy(false, 1)
+        },
+        11,
+    )
+    .unwrap();
     assert_eq!(
-        store
-            .promote_attachment_uploads(GROUP, "two", 12, 10000)
+        app.promote_attachment_uploads(GROUP, "two", 12, 10000)
             .unwrap(),
         2
     );
     assert_eq!(usage(&store), 2 * BODY.len() as u64);
     for index in [0, 1] {
-        let asset = store
+        let asset = app
             .retained_attachment_asset(GROUP, "two", "source-two", index, 12)
             .unwrap()
             .unwrap();
-        assert_eq!(read(&store, &asset.reference), BODY);
+        assert_eq!(read(&app, &asset.reference), BODY);
     }
     let count: i64 = store
         .lock()
@@ -198,16 +198,16 @@ fn outgoing_batch_promotion_respects_exact_capacity_and_repeated_slots() {
 #[test]
 fn outgoing_stage_capacity_failure_rolls_back_the_batch_without_eviction() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     sent(&store, "existing");
-    let asset = request(&store, "existing");
-    publish(&store, &asset);
+    let asset = request(&app, "existing");
+    publish(&app, &asset);
     assert!(
-        store
-            .stage_attachment_uploads(GROUP, 3, &[BODY, BODY], 20, 2 * BODY.len() as u64)
+        app.stage_attachment_uploads(GROUP, 3, &[BODY, BODY], 20, 2 * BODY.len() as u64)
             .is_err()
     );
     assert_eq!(usage(&store), BODY.len() as u64);
-    assert_eq!(read(&store, &asset), BODY);
+    assert_eq!(read(&app, &asset), BODY);
     assert_eq!(
         store
             .lock()
@@ -226,131 +226,121 @@ fn outgoing_stage_capacity_failure_rolls_back_the_batch_without_eviction() {
 #[test]
 fn outgoing_promotion_fault_rolls_back_and_recovers_without_new_demand() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     sent(&store, "recover");
-    staged(&store, "recover");
+    staged(&app, "recover");
     sql(
         &store,
         "CREATE TRIGGER fail_outgoing_publication BEFORE INSERT ON retained_attachment_bytes BEGIN SELECT RAISE(ABORT,'injected publication failure');END;",
     );
     assert!(
-        store
-            .promote_attachment_uploads(GROUP, "recover", 12, 10000)
+        app.promote_attachment_uploads(GROUP, "recover", 12, 10000)
             .is_err()
     );
     assert_eq!(usage(&store), BODY.len() as u64);
     assert!(
-        store
-            .retained_attachment_asset(GROUP, "recover", "source-recover", 0, 12)
+        app.retained_attachment_asset(GROUP, "recover", "source-recover", 0, 12)
             .unwrap()
             .is_none()
     );
     sql(&store, "DROP TRIGGER fail_outgoing_publication;");
     assert_eq!(
-        store
-            .promote_attachment_uploads(GROUP, "recover", 12, 10000)
+        app.promote_attachment_uploads(GROUP, "recover", 12, 10000)
             .unwrap(),
         1
     );
-    assert_eq!(read(&store, &request(&store, "recover")), BODY);
+    assert_eq!(read(&app, &request(&app, "recover")), BODY);
     sent(&store, "corrupt");
-    staged(&store, "corrupt");
+    staged(&app, "corrupt");
     sql(
         &store,
         "UPDATE outgoing_attachment_uploads SET bytes=x'00';",
     );
     assert_eq!(
-        store
-            .promote_attachment_uploads(GROUP, "corrupt", 12, 10000)
+        app.promote_attachment_uploads(GROUP, "corrupt", 12, 10000)
             .unwrap(),
         0
     );
     assert_eq!(usage(&store), BODY.len() as u64);
     assert_eq!(
-        transfer(&store, "corrupt", true).state,
+        transfer(&app, "corrupt", true).state,
         AttachmentTransferState::CompletedUnretained
     );
     assert!(
-        store
-            .attachment_transfer_candidates(100, 64, true)
+        app.attachment_transfer_candidates(100, 64, true)
             .unwrap()
             .is_empty()
     );
-    assert_eq!(store.prune_attachment_uploads(13, 64).unwrap(), 1);
+    assert_eq!(app.prune_attachment_uploads(13, 64).unwrap(), 1);
 }
 
 /// Moving exclusively owned bytes under a lowered quota consumes no extra capacity.
 #[test]
 fn outgoing_exclusive_move_survives_lowered_quota() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     sent(&store, "blocked");
-    staged(&store, "blocked");
-    store
-        .set_attachment_download_policy(
-            &AttachmentDownloadPolicy {
-                retained_bytes: 1,
-                ..policy(true, 1)
-            },
-            11,
-        )
-        .unwrap();
+    staged(&app, "blocked");
+    app.set_attachment_download_policy(
+        &AttachmentDownloadPolicy {
+            retained_bytes: 1,
+            ..policy(true, 1)
+        },
+        11,
+    )
+    .unwrap();
     assert_eq!(
-        store
-            .promote_attachment_uploads(GROUP, "blocked", 12, 10000)
+        app.promote_attachment_uploads(GROUP, "blocked", 12, 10000)
             .unwrap(),
         1
     );
     assert_eq!(
-        transfer(&store, "blocked", true).state,
+        transfer(&app, "blocked", true).state,
         AttachmentTransferState::Ready
     );
     assert!(
-        store
-            .attachment_transfer_candidates(100, 64, true)
+        app.attachment_transfer_candidates(100, 64, true)
             .unwrap()
             .is_empty()
     );
-    store
-        .set_attachment_download_policy(&policy(false, 10000), 13)
+    app.set_attachment_download_policy(&policy(false, 10000), 13)
         .unwrap();
-    assert_eq!(store.recover_attachment_uploads(14, 64, 10000).unwrap(), 0);
-    assert_eq!(read(&store, &request(&store, "blocked")), BODY);
+    assert_eq!(app.recover_attachment_uploads(14, 64, 10000).unwrap(), 0);
+    assert_eq!(read(&app, &request(&app, "blocked")), BODY);
 }
 
 /// Promotion fences a racing acquisition rather than permitting late overwrite.
 #[test]
 fn outgoing_confirmation_fences_active_acquisition_and_preserves_removal() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     sent(&store, "race");
-    let asset = request(&store, "race");
-    let job = store
+    let asset = request(&app, "race");
+    let job = app
         .claim_attachment_acquisition(&asset, 11, 100)
         .unwrap()
         .unwrap();
-    staged(&store, "race");
+    staged(&app, "race");
     assert_eq!(
-        store
-            .promote_attachment_uploads(GROUP, "race", 12, 10000)
+        app.promote_attachment_uploads(GROUP, "race", 12, 10000)
             .unwrap(),
         1
     );
-    assert!(!store.attachment_transfer_is_active(&job, 12).unwrap());
+    assert!(!app.attachment_transfer_is_active(&job, 12).unwrap());
     assert_eq!(
-        store
-            .complete_attachment_acquisition(&job, BODY, 12, 10000)
+        app.complete_attachment_acquisition(&job, BODY, 12, 10000)
             .unwrap(),
         AttachmentPublishResult::Superseded
     );
-    store.remove_attachment_reference(&asset).unwrap();
-    staged(&store, "race");
+    app.remove_attachment_reference(&asset).unwrap();
+    staged(&app, "race");
     assert_eq!(
-        store
-            .promote_attachment_uploads(GROUP, "race", 13, 10000)
+        app.promote_attachment_uploads(GROUP, "race", 13, 10000)
             .unwrap(),
         0
     );
     assert!(
-        store
-            .retained_attachment_asset(GROUP, "race", "source-race", 0, 13)
+        app.retained_attachment_asset(GROUP, "race", "source-race", 0, 13)
             .unwrap()
             .is_none()
     );
@@ -366,10 +356,11 @@ fn outgoing_promotion_respects_expiry_invalidation_epoch_and_account_isolation()
     ] {
         let store = SqliteAccountStorage::in_memory().unwrap();
         sent(&store, "stale");
-        staged(&store, "stale");
+        staged(&store.app_storage(), "stale");
         sql(&store, mutation);
         assert_eq!(
             store
+                .app_storage()
                 .promote_attachment_uploads(GROUP, "stale", 12, 10000)
                 .unwrap(),
             0
@@ -377,10 +368,11 @@ fn outgoing_promotion_respects_expiry_invalidation_epoch_and_account_isolation()
     }
     let store = SqliteAccountStorage::in_memory().unwrap();
     sent(&store, "foreign");
-    let tokens = vec![staged(&store, "foreign")];
+    let tokens = vec![staged(&store.app_storage(), "foreign")];
     assert!(
         SqliteAccountStorage::in_memory()
             .unwrap()
+            .app_storage()
             .bind_attachment_uploads(&tokens, &[(selected("foreign").slot, digest())])
             .is_err()
     );
@@ -392,10 +384,12 @@ fn outgoing_orphan_cleanup_and_group_deletion_release_quota() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     sent(&store, "orphan");
     store
+        .app_storage()
         .stage_attachment_uploads(GROUP, 3, &[BODY, BODY], 11, 10000)
         .unwrap();
     assert_eq!(
         store
+            .app_storage()
             .prune_attachment_uploads(11 + 8 * 24 * 3600, 1)
             .unwrap(),
         1
@@ -412,21 +406,19 @@ fn outgoing_orphan_cleanup_and_group_deletion_release_quota() {
 #[test]
 fn shared_upload_survives_first_confirmation_and_configured_quota_is_enforced() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     sent(&store, "shared-a");
     sent(&store, "shared-b");
-    let token = staged(&store, "shared-a");
-    store
-        .protect_attachment_uploads(GROUP, "shared-b", &source("shared-b").tags)
+    let token = staged(&app, "shared-a");
+    app.protect_attachment_uploads(GROUP, "shared-b", &source("shared-b").tags)
         .unwrap();
     assert_eq!(
-        store
-            .promote_attachment_uploads(GROUP, "shared-a", 12, BODY.len() as u64)
+        app.promote_attachment_uploads(GROUP, "shared-a", 12, BODY.len() as u64)
             .unwrap(),
         0
     );
     assert_eq!(
-        store
-            .promote_attachment_uploads(GROUP, "shared-a", 12, 2 * BODY.len() as u64)
+        app.promote_attachment_uploads(GROUP, "shared-a", 12, 2 * BODY.len() as u64)
             .unwrap(),
         1
     );
@@ -443,28 +435,28 @@ fn shared_upload_survives_first_confirmation_and_configured_quota_is_enforced() 
         1
     );
     assert_eq!(
-        store
-            .promote_attachment_uploads(GROUP, "shared-b", 12, 2 * BODY.len() as u64)
+        app.promote_attachment_uploads(GROUP, "shared-b", 12, 2 * BODY.len() as u64)
             .unwrap(),
         1
     );
     assert_eq!(usage(&store), 2 * BODY.len() as u64);
-    assert_eq!(read(&store, &request(&store, "shared-a")), BODY);
-    assert_eq!(read(&store, &request(&store, "shared-b")), BODY);
+    assert_eq!(read(&app, &request(&app, "shared-a")), BODY);
+    assert_eq!(read(&app, &request(&app, "shared-b")), BODY);
 }
 
 /// Observed failed uploads release reservations immediately; admitted ownership wins.
 #[test]
 fn failed_upload_cleanup_is_immediate_but_never_discards_pending_owner() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     sent(&store, "owner");
-    let unowned = store
+    let unowned = app
         .stage_attachment_uploads(GROUP, 3, &[BODY, BODY], 11, 10000)
         .unwrap();
-    store.abandon_attachment_uploads(&unowned).unwrap();
+    app.abandon_attachment_uploads(&unowned).unwrap();
     assert_eq!(usage(&store), 0);
-    let owned = vec![staged(&store, "owner")];
-    store.abandon_attachment_uploads(&owned).unwrap();
+    let owned = vec![staged(&app, "owner")];
+    app.abandon_attachment_uploads(&owned).unwrap();
     assert_eq!(usage(&store), BODY.len() as u64);
 }
 
@@ -474,16 +466,15 @@ fn shared_upload_releases_retired_owner_reservations() {
     for retire in ["invalidated", "expired", "removed", "cancelled"] {
         for after_first in [false, true] {
             let store = SqliteAccountStorage::in_memory().unwrap();
+            let app = store.app_storage();
             sent(&store, "live");
             sent(&store, "retired");
-            staged(&store, "live");
-            store
-                .protect_attachment_uploads(GROUP, "retired", &source("retired").tags)
+            staged(&app, "live");
+            app.protect_attachment_uploads(GROUP, "retired", &source("retired").tags)
                 .unwrap();
             if after_first {
                 assert_eq!(
-                    store
-                        .promote_attachment_uploads(GROUP, "live", 12, 2 * BODY.len() as u64)
+                    app.promote_attachment_uploads(GROUP, "live", 12, 2 * BODY.len() as u64)
                         .unwrap(),
                     1
                 );
@@ -498,29 +489,26 @@ fn shared_upload_releases_retired_owner_reservations() {
                     "UPDATE app_events SET retention_expires_at=12 WHERE message_id_hex='retired'",
                 ),
                 "removed" => {
-                    store
-                        .remove_attachment_reference(&request(&store, "retired"))
+                    app.remove_attachment_reference(&request(&app, "retired"))
                         .unwrap();
                 }
                 "cancelled" => {
-                    store
-                        .cancel_attachment_acquisition(&request(&store, "retired"))
+                    app.cancel_attachment_acquisition(&request(&app, "retired"))
                         .unwrap();
                 }
                 _ => unreachable!(),
             }
             if after_first {
-                assert_eq!(store.prune_attachment_uploads(13, 64).unwrap(), 1);
+                assert_eq!(app.prune_attachment_uploads(13, 64).unwrap(), 1);
             } else {
                 assert_eq!(
-                    store
-                        .promote_attachment_uploads(GROUP, "live", 13, BODY.len() as u64)
+                    app.promote_attachment_uploads(GROUP, "live", 13, BODY.len() as u64)
                         .unwrap(),
                     1
                 );
             }
             assert_eq!(usage(&store), BODY.len() as u64);
-            assert_eq!(read(&store, &request(&store, "live")), BODY);
+            assert_eq!(read(&app, &request(&app, "live")), BODY);
         }
     }
 }
@@ -529,22 +517,21 @@ fn shared_upload_releases_retired_owner_reservations() {
 #[test]
 fn duplicate_outgoing_slots_recover_after_quota_increase() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     sent(&store, "duplicate");
     let mut event = source("duplicate");
     event.direction = "sent".into();
     event.tags.push(event.tags[0].clone());
-    store.record_app_event(&event).unwrap();
-    staged(&store, "duplicate");
+    app.record_app_event(&event).unwrap();
+    staged(&app, "duplicate");
     assert_eq!(
-        store
-            .promote_attachment_uploads(GROUP, "duplicate", 12, BODY.len() as u64)
+        app.promote_attachment_uploads(GROUP, "duplicate", 12, BODY.len() as u64)
             .unwrap(),
         0
     );
     assert_eq!(usage(&store), BODY.len() as u64);
     assert_eq!(
-        store
-            .recover_attachment_uploads(13, 64, 2 * BODY.len() as u64)
+        app.recover_attachment_uploads(13, 64, 2 * BODY.len() as u64)
             .unwrap(),
         2
     );
@@ -555,18 +542,18 @@ fn duplicate_outgoing_slots_recover_after_quota_increase() {
 #[test]
 fn blocked_recovery_does_not_scan_staged_content() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     sent(&store, "blocked-scan");
-    staged(&store, "blocked-scan");
+    staged(&app, "blocked-scan");
     sent(&store, "shared-scan");
-    store
-        .protect_attachment_uploads(GROUP, "shared-scan", &source("shared-scan").tags)
+    app.protect_attachment_uploads(GROUP, "shared-scan", &source("shared-scan").tags)
         .unwrap();
     // A corrupt BLOB would fail verification. Stable full-quota passes must not read it.
     sql(&store, "UPDATE outgoing_attachment_uploads SET bytes=x'00'");
     for now in 12..22 {
-        assert_eq!(store.recover_attachment_uploads(now, 64, 1).unwrap(), 0);
+        assert_eq!(app.recover_attachment_uploads(now, 64, 1).unwrap(), 0);
     }
-    assert_eq!(store.recover_attachment_uploads(22, 64, 10000).unwrap(), 0);
+    assert_eq!(app.recover_attachment_uploads(22, 64, 10000).unwrap(), 0);
     assert_eq!(usage(&store), 0);
 }
 
@@ -574,32 +561,30 @@ fn blocked_recovery_does_not_scan_staged_content() {
 #[test]
 fn outgoing_recovery_page_rotates_past_blocked_owner() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     sent(&store, "a-blocked");
     sent(&store, "b-shared");
     sent(&store, "z-affordable");
-    staged(&store, "a-blocked");
-    store
-        .protect_attachment_uploads(GROUP, "b-shared", &source("b-shared").tags)
+    staged(&app, "a-blocked");
+    app.protect_attachment_uploads(GROUP, "b-shared", &source("b-shared").tags)
         .unwrap();
     let mut event = source("z-affordable");
     event.direction = "sent".into();
     event.tags[0].push("filename distinct".into());
-    store.record_app_event(&event).unwrap();
-    let token = store
+    app.record_app_event(&event).unwrap();
+    let token = app
         .stage_attachment_uploads(GROUP, 3, &[BODY], 11, 10000)
         .unwrap();
-    store
-        .bind_attachment_uploads(
-            &token,
-            &[(serde_json::to_value(&event.tags[0]).unwrap(), digest())],
-        )
-        .unwrap();
-    store
-        .protect_attachment_uploads(GROUP, "z-affordable", &event.tags)
+    app.bind_attachment_uploads(
+        &token,
+        &[(serde_json::to_value(&event.tags[0]).unwrap(), digest())],
+    )
+    .unwrap();
+    app.protect_attachment_uploads(GROUP, "z-affordable", &event.tags)
         .unwrap();
     let mut recovered = 0;
     for now in 12..18 {
-        recovered += store
+        recovered += app
             .recover_attachment_uploads(now, 1, 2 * BODY.len() as u64)
             .unwrap();
     }
@@ -608,8 +593,7 @@ fn outgoing_recovery_page_rotates_past_blocked_owner() {
         "bounded token/history cursors must rotate past blocked owners regardless of random token order"
     );
     assert!(
-        store
-            .retained_attachment_asset(GROUP, "z-affordable", "source-z-affordable", 0, 14)
+        app.retained_attachment_asset(GROUP, "z-affordable", "source-z-affordable", 0, 14)
             .unwrap()
             .is_some()
     );
@@ -628,9 +612,10 @@ fn rejected_pending_submission_releases_outgoing_staging() {
     event.direction = "sent".into();
     event.source_message_id_hex = None;
     event.source_epoch = None;
-    store.record_app_event(&event).unwrap();
-    staged(&store, "rejected");
+    store.app_storage().record_app_event(&event).unwrap();
+    staged(&store.app_storage(), "rejected");
     store
+        .app_storage()
         .insert_local_submission(&crate::app::local_submissions::LocalSubmission {
             group_id_hex: GROUP.into(),
             client_token: "rejected-token".into(),
@@ -643,11 +628,24 @@ fn rejected_pending_submission_releases_outgoing_staging() {
             outcome_json: None,
         })
         .unwrap();
-    assert_eq!(store.prune_attachment_uploads(12, 64).unwrap(), 0);
+    assert_eq!(
+        store
+            .app_storage()
+            .prune_attachment_uploads(12, 64)
+            .unwrap(),
+        0
+    );
     store
+        .app_storage()
         .finish_local_submission(GROUP, "rejected-token", None)
         .unwrap();
-    assert_eq!(store.prune_attachment_uploads(13, 64).unwrap(), 1);
+    assert_eq!(
+        store
+            .app_storage()
+            .prune_attachment_uploads(13, 64)
+            .unwrap(),
+        1
+    );
     assert_eq!(usage(&store), 0);
 }
 
@@ -655,36 +653,37 @@ fn rejected_pending_submission_releases_outgoing_staging() {
 #[test]
 fn outgoing_promotion_credits_its_own_partial_at_exact_capacity() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     sent(&store, "partial-race");
-    let asset = request(&store, "partial-race");
-    let job = store
+    let asset = request(&app, "partial-race");
+    let job = app
         .claim_attachment_acquisition(&asset, 11, 100)
         .unwrap()
         .unwrap();
-    assert!(checkpoint(&store, &job, &partial_identity(100), 0, b"prefix", 11).unwrap());
-    staged(&store, "partial-race");
+    assert!(checkpoint(&app, &job, &partial_identity(100), 0, b"prefix", 11).unwrap());
+    staged(&app, "partial-race");
     assert_eq!(
-        store
-            .promote_attachment_uploads(GROUP, "partial-race", 12, BODY.len() as u64)
+        app.promote_attachment_uploads(GROUP, "partial-race", 12, BODY.len() as u64)
             .unwrap(),
         1
     );
     assert_eq!(partial_usage(&store), 0);
     assert_eq!(usage(&store), BODY.len() as u64);
-    assert_eq!(read(&store, &asset), BODY);
+    assert_eq!(read(&app, &asset), BODY);
 }
 
 /// Outer rollback discards callbacks; optional promotion faults cannot undo a commit.
 #[test]
 fn outgoing_retention_waits_for_outer_commit_and_preserves_source_on_fault() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "seed");
-    bound(&store, "projection");
+    bound(&app, "projection");
     let mut event = source("projection");
     event.direction = "sent".into();
     let rolled_back: StorageResult<()> = store.connection.with_transaction(|| {
-        store.record_app_event(&event)?;
-        store.retain_attachment_uploads_after_commit(GROUP, "projection", 12, 10000);
+        app.record_app_event(&event)?;
+        app.retain_attachment_uploads_after_commit(GROUP, "projection", 12, 10000);
         assert_eq!(
             store
                 .lock()?
@@ -706,8 +705,8 @@ fn outgoing_retention_waits_for_outer_commit_and_preserves_source_on_fault() {
     store
         .connection
         .with_transaction(|| {
-            store.record_app_event(&event)?;
-            store.retain_attachment_uploads_after_commit(GROUP, "projection", 12, 10000);
+            app.record_app_event(&event)?;
+            app.retain_attachment_uploads_after_commit(GROUP, "projection", 12, 10000);
             assert_eq!(
                 store
                     .lock()?
@@ -735,14 +734,13 @@ fn outgoing_retention_waits_for_outer_commit_and_preserves_source_on_fault() {
         1
     );
     assert!(
-        store
-            .retained_attachment_asset(GROUP, "projection", "source-projection", 0, 12)
+        app.retained_attachment_asset(GROUP, "projection", "source-projection", 0, 12)
             .unwrap()
             .is_none()
     );
     sql(&store, "DROP TRIGGER fail_optional_copy");
-    assert_eq!(store.recover_attachment_uploads(13, 64, 10000).unwrap(), 1);
-    assert_eq!(read(&store, &request(&store, "projection")), BODY);
+    assert_eq!(app.recover_attachment_uploads(13, 64, 10000).unwrap(), 1);
+    assert_eq!(read(&app, &request(&app, "projection")), BODY);
 }
 
 /// Source identity repairs the post-commit/pre-owner gap even after TTL and encrypted reopen.
@@ -760,18 +758,19 @@ fn ownerless_pending_and_confirmed_uploads_survive_ttl_and_recover() {
             event.source_message_id_hex = None;
             event.source_epoch = None;
         }
-        store.record_app_event(&event).unwrap();
-        bound(&store, "crash-gap");
+        store.app_storage().record_app_event(&event).unwrap();
+        bound(&store.app_storage(), "crash-gap");
         store.close().unwrap();
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let app = store.app_storage();
         let now = 11 + 8 * 24 * 3600;
-        assert_eq!(store.prune_attachment_uploads(now, 64).unwrap(), 0);
+        assert_eq!(app.prune_attachment_uploads(now, 64).unwrap(), 0);
         if pending {
-            assert_eq!(store.recover_attachment_uploads(now, 64, 10000).unwrap(), 0);
+            assert_eq!(app.recover_attachment_uploads(now, 64, 10000).unwrap(), 0);
             sent(&store, "crash-gap");
         }
-        assert_eq!(store.recover_attachment_uploads(now, 64, 10000).unwrap(), 1);
-        assert_eq!(read(&store, &request(&store, "crash-gap")), BODY);
+        assert_eq!(app.recover_attachment_uploads(now, 64, 10000).unwrap(), 1);
+        assert_eq!(read(&app, &request(&app, "crash-gap")), BODY);
     }
 }
 
@@ -779,39 +778,37 @@ fn ownerless_pending_and_confirmed_uploads_survive_ttl_and_recover() {
 #[test]
 fn corrupt_shared_upload_is_quarantined_without_reacquisition() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     for message in ["a-poison", "b-poison", "z-valid"] {
         sent(&store, message);
     }
-    staged(&store, "a-poison");
-    store
-        .protect_attachment_uploads(GROUP, "b-poison", &source("b-poison").tags)
+    staged(&app, "a-poison");
+    app.protect_attachment_uploads(GROUP, "b-poison", &source("b-poison").tags)
         .unwrap();
     sql(&store, "UPDATE outgoing_attachment_uploads SET bytes=x'00'");
     let mut valid = source("z-valid");
     valid.direction = "sent".into();
     valid.tags[0].push("filename distinct".into());
-    store.record_app_event(&valid).unwrap();
-    let tokens = store
+    app.record_app_event(&valid).unwrap();
+    let tokens = app
         .stage_attachment_uploads(GROUP, 3, &[BODY], 11, 10000)
         .unwrap();
-    store
-        .bind_attachment_uploads(
-            &tokens,
-            &[(serde_json::to_value(&valid.tags[0]).unwrap(), digest())],
-        )
-        .unwrap();
-    assert_eq!(store.recover_attachment_uploads(12, 64, 10000).unwrap(), 1);
+    app.bind_attachment_uploads(
+        &tokens,
+        &[(serde_json::to_value(&valid.tags[0]).unwrap(), digest())],
+    )
+    .unwrap();
+    assert_eq!(app.recover_attachment_uploads(12, 64, 10000).unwrap(), 1);
     for message in ["a-poison", "b-poison"] {
         assert_eq!(
-            transfer(&store, message, true).state,
+            transfer(&app, message, true).state,
             AttachmentTransferState::CompletedUnretained
         );
     }
     assert_eq!(usage(&store), BODY.len() as u64);
-    assert_eq!(store.prune_attachment_uploads(13, 64).unwrap(), 1);
+    assert_eq!(app.prune_attachment_uploads(13, 64).unwrap(), 1);
     assert!(
-        store
-            .attachment_transfer_candidates(100, 64, true)
+        app.attachment_transfer_candidates(100, 64, true)
             .unwrap()
             .is_empty()
     );
@@ -832,45 +829,51 @@ fn ownerless_committed_sources_survive_both_abandonment_paths() {
             event.source_message_id_hex = None;
             event.source_epoch = None;
         }
-        store.record_app_event(&event).unwrap();
-        let token = bound(&store, id);
+        store.app_storage().record_app_event(&event).unwrap();
+        let token = bound(&store.app_storage(), id);
         sql(
             &store,
             "CREATE TRIGGER fail_owner BEFORE INSERT ON outgoing_attachment_upload_owners BEGIN SELECT RAISE(ABORT,'generated owner fault'); END;",
         );
         assert!(
             store
+                .app_storage()
                 .protect_attachment_uploads(GROUP, id, &event.tags)
                 .is_err()
         );
         sql(&store, "DROP TRIGGER fail_owner");
-        store.abandon_attachment_uploads(&[token]).unwrap();
         store
+            .app_storage()
+            .abandon_attachment_uploads(&[token])
+            .unwrap();
+        store
+            .app_storage()
             .abandon_bound_attachment_uploads(GROUP, &[selected(id).slot])
             .unwrap();
     }
     assert_eq!(usage(&store), 2 * BODY.len() as u64);
     store.close().unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let app = store.app_storage();
     sent(&store, "pending-ownerless");
-    assert_eq!(store.recover_attachment_uploads(20, 64, 10000).unwrap(), 2);
-    assert_eq!(read(&store, &request(&store, "pending-ownerless")), BODY);
-    assert_eq!(read(&store, &request(&store, "confirmed-ownerless")), BODY);
+    assert_eq!(app.recover_attachment_uploads(20, 64, 10000).unwrap(), 2);
+    assert_eq!(read(&app, &request(&app, "pending-ownerless")), BODY);
+    assert_eq!(read(&app, &request(&app, "confirmed-ownerless")), BODY);
 }
 
 /// Recovery advances through a raw indexed page even when every inspected source is ineligible.
 #[test]
 fn outgoing_recovery_advances_past_received_history_without_scanning_it_all() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "seed");
     for index in 0..100 {
-        store
-            .record_app_event(&source(&format!("received-{index:03}")))
+        app.record_app_event(&source(&format!("received-{index:03}")))
             .unwrap();
     }
     sent(&store, "zz-outgoing");
-    let token = bound(&store, "zz-outgoing");
-    assert_eq!(store.recover_attachment_uploads(20, 4, 10000).unwrap(), 0);
+    let token = bound(&app, "zz-outgoing");
+    assert_eq!(app.recover_attachment_uploads(20, 4, 10000).unwrap(), 0);
     let first_cursor: String = store
         .lock()
         .unwrap()
@@ -890,10 +893,10 @@ fn outgoing_recovery_advances_past_received_history_without_scanning_it_all() {
     );
     let mut recovered = 0;
     for _ in 0..30 {
-        recovered += store.recover_attachment_uploads(20, 4, 10000).unwrap();
+        recovered += app.recover_attachment_uploads(20, 4, 10000).unwrap();
     }
     assert_eq!(recovered, 1);
-    assert_eq!(read(&store, &request(&store, "zz-outgoing")), BODY);
+    assert_eq!(read(&app, &request(&app, "zz-outgoing")), BODY);
     let plan:String=store.lock().unwrap().query_row("EXPLAIN QUERY PLAN SELECT message_id_hex,attachment_index FROM attachment_history WHERE group_id_hex=?1 AND source_epoch=3 AND slot_json=?2 AND (message_id_hex,attachment_index)>(?3,0) ORDER BY message_id_hex,attachment_index LIMIT 4",params![GROUP,serde_json::to_string(&selected("zz-outgoing").slot).unwrap(),"received-000"],|row|row.get(3)).unwrap();
     assert!(
         plan.contains("idx_attachment_history_outgoing_slot"),
@@ -905,6 +908,7 @@ fn outgoing_recovery_advances_past_received_history_without_scanning_it_all() {
 #[test]
 fn outgoing_recovery_preserves_interleaved_descriptor_fairness() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "seed");
     let mut slots = Vec::new();
     for (name, ids) in [
@@ -915,20 +919,19 @@ fn outgoing_recovery_preserves_interleaved_descriptor_fairness() {
             let mut event = source(id);
             event.direction = "sent".into();
             event.tags[0].push(format!("filename {name}"));
-            store.record_app_event(&event).unwrap();
+            app.record_app_event(&event).unwrap();
             if id == ids[0] {
                 slots.push((serde_json::to_value(&event.tags[0]).unwrap(), digest()));
             }
         }
     }
-    let tokens = store
+    let tokens = app
         .stage_attachment_uploads(GROUP, 3, &[BODY, BODY], 11, 10000)
         .unwrap();
-    store.bind_attachment_uploads(&tokens, &slots).unwrap();
+    app.bind_attachment_uploads(&tokens, &slots).unwrap();
     for now in 12..28 {
         assert_eq!(
-            store
-                .recover_attachment_uploads(now, 2, 2 * BODY.len() as u64)
+            app.recover_attachment_uploads(now, 2, 2 * BODY.len() as u64)
                 .unwrap(),
             0
         );
@@ -947,14 +950,14 @@ fn outgoing_recovery_preserves_interleaved_descriptor_fairness() {
         "every blocked owner must be visited; cursor advancement must not discard unselected candidates"
     );
     for now in 28..44 {
-        store.recover_attachment_uploads(now, 2, 10000).unwrap();
+        app.recover_attachment_uploads(now, 2, 10000).unwrap();
     }
     for id in ["a", "b", "c", "d", "e", "f", "y", "z"] {
-        let asset = store
+        let asset = app
             .retained_attachment_asset(GROUP, id, &format!("source-{id}"), 0, 44)
             .unwrap()
             .unwrap();
-        assert_eq!(read(&store, &asset.reference), BODY);
+        assert_eq!(read(&app, &asset.reference), BODY);
     }
 }
 
@@ -962,15 +965,15 @@ fn outgoing_recovery_preserves_interleaved_descriptor_fairness() {
 #[test]
 fn outgoing_staging_blocks_all_network_routes_after_promotion_fault() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     sent(&store, "managed");
-    staged(&store, "managed");
+    staged(&app, "managed");
     sql(
         &store,
         "CREATE TRIGGER fail_bytes BEFORE INSERT ON retained_attachment_bytes BEGIN SELECT RAISE(ABORT,'generated promotion fault'); END;",
     );
     assert!(
-        store
-            .promote_attachment_uploads(GROUP, "managed", 12, 10000)
+        app.promote_attachment_uploads(GROUP, "managed", 12, 10000)
             .is_err()
     );
     let policy = AttachmentDownloadPolicy {
@@ -979,36 +982,34 @@ fn outgoing_staging_blocks_all_network_routes_after_promotion_fault() {
         disk_reserve: 0,
         transfer_limit: 1024,
     };
-    let (_, admitted) = store
+    let (_, admitted) = app
         .request_automatic_attachment(GROUP, &selected("managed"), digest(), 12, (&policy, true))
         .unwrap();
     assert!(
         !admitted,
         "screen rendering must not reacquire staged outgoing bytes"
     );
-    let asset = request(&store, "managed");
-    store.promote_attachment_demand(&asset, 12).unwrap();
+    let asset = request(&app, "managed");
+    app.promote_attachment_demand(&asset, 12).unwrap();
     assert!(
-        store
-            .attachment_transfer_candidates(12, 32, true)
+        app.attachment_transfer_candidates(12, 32, true)
             .unwrap()
             .is_empty()
     );
     assert!(
-        store
-            .attachment_transfer_candidates(12, 32, false)
+        app.attachment_transfer_candidates(12, 32, false)
             .unwrap()
             .is_empty()
     );
-    let job = store
+    let job = app
         .claim_attachment_acquisition(&asset, 12, 100)
         .unwrap()
         .unwrap();
     assert!(
-        !store.begin_attachment_network_attempt(&job, 12).unwrap(),
+        !app.begin_attachment_network_attempt(&job, 12).unwrap(),
         "final race fence must reject HTTP even for an already claimed explicit job"
     );
     sql(&store, "DROP TRIGGER fail_bytes");
-    assert_eq!(store.recover_attachment_uploads(13, 64, 10000).unwrap(), 1);
-    assert_eq!(read(&store, &asset), BODY);
+    assert_eq!(app.recover_attachment_uploads(13, 64, 10000).unwrap(), 1);
+    assert_eq!(read(&app, &asset), BODY);
 }

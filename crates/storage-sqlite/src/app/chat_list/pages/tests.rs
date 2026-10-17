@@ -16,7 +16,7 @@ fn seed(
     conn.execute("INSERT INTO account_groups(group_id_hex, endpoint, updated_at, archived, self_membership, pending_confirmation) VALUES (?1, '', 0, ?2, ?3, ?4)", params![id, archived, membership, pending]).unwrap();
     conn.execute("INSERT INTO chat_list_rows(group_id_hex, updated_at, archived, self_membership, unread_count, pending_confirmation) VALUES (?1, 0, ?2, ?3, ?4, ?5)", params![id, archived, membership, unread, pending]).unwrap();
 }
-fn page(store: &SqliteAccountStorage, view: ChatListView) -> ChatListPage {
+fn page(store: &SqliteAppStorage, view: ChatListView) -> ChatListPage {
     store
         .chat_list_page(ChatListPageQuery {
             view,
@@ -33,16 +33,17 @@ fn ids(page: &ChatListPage) -> Vec<&str> {
 #[test]
 fn four_lists_partition_terminal_and_archive_state_and_suppress_invites_from_unread() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "01", false, "member", 0, false);
     seed(&store, "02", false, "member", 1, false);
     seed(&store, "03", true, "member", 1, false);
     seed(&store, "04", false, "left", 1, false);
     seed(&store, "05", true, "removed", 1, false);
     seed(&store, "06", false, "member", 9, true);
-    assert_eq!(ids(&page(&store, ChatListView::Chats)), ["01", "02", "06"]);
-    assert_eq!(ids(&page(&store, ChatListView::Unread)), ["02"]);
-    assert_eq!(ids(&page(&store, ChatListView::Archived)), ["03"]);
-    assert_eq!(ids(&page(&store, ChatListView::Left)), ["04", "05"]);
+    assert_eq!(ids(&page(&app, ChatListView::Chats)), ["01", "02", "06"]);
+    assert_eq!(ids(&page(&app, ChatListView::Unread)), ["02"]);
+    assert_eq!(ids(&page(&app, ChatListView::Archived)), ["03"]);
+    assert_eq!(ids(&page(&app, ChatListView::Left)), ["04", "05"]);
 }
 
 fn engine_group(store: &SqliteAccountStorage, id: &str) -> GroupId {
@@ -75,6 +76,7 @@ fn query(
 fn mixed_case_ids_follow_engine_lifecycle_writes_and_read_operation_overlays() {
     for id in ["ABCD", "aBcD"] {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
         seed(&store, id, false, "member", 4, false);
         let group = engine_group(&store, id);
         store
@@ -84,13 +86,13 @@ fn mixed_case_ids_follow_engine_lifecycle_writes_and_read_operation_overlays() {
                 last_proposed_epoch: None,
             })
             .unwrap();
-        assert!(page(&store, ChatListView::Chats).rows.is_empty(), "{id}");
+        assert!(page(&app, ChatListView::Chats).rows.is_empty(), "{id}");
         assert_eq!(
-            page(&store, ChatListView::Left).rows[0].leave_requested_at_ms,
+            page(&app, ChatListView::Left).rows[0].leave_requested_at_ms,
             Some(123)
         );
         store.clear_leave_request(&group).unwrap();
-        assert_eq!(ids(&page(&store, ChatListView::Chats)), [id]);
+        assert_eq!(ids(&page(&app, ChatListView::Chats)), [id]);
         let mut request = DisbandRequest {
             group_id: group.clone(),
             requested_at_ms: 124,
@@ -98,11 +100,11 @@ fn mixed_case_ids_follow_engine_lifecycle_writes_and_read_operation_overlays() {
             last_prepared_epoch: None,
         };
         store.put_disband_request(&request).unwrap();
-        assert!(page(&store, ChatListView::Left).rows[0].disbanding);
+        assert!(page(&app, ChatListView::Left).rows[0].disbanding);
         request.status = DisbandRequestStatus::Failed(DisbandFailureReason::NoLongerAdmin);
         store.put_disband_request(&request).unwrap();
         assert_eq!(
-            page(&store, ChatListView::Chats).rows[0].disband_request,
+            page(&app, ChatListView::Chats).rows[0].disband_request,
             Some(request)
         );
         store
@@ -113,7 +115,7 @@ fn mixed_case_ids_follow_engine_lifecycle_writes_and_read_operation_overlays() {
                 [group.as_slice()],
             )
             .unwrap();
-        assert!(page(&store, ChatListView::Left).rows[0].disbanding);
+        assert!(page(&app, ChatListView::Left).rows[0].disbanding);
         store
             .lock()
             .unwrap()
@@ -122,7 +124,7 @@ fn mixed_case_ids_follow_engine_lifecycle_writes_and_read_operation_overlays() {
                 [group.as_slice()],
             )
             .unwrap();
-        assert_eq!(ids(&page(&store, ChatListView::Chats)), [id]);
+        assert_eq!(ids(&page(&app, ChatListView::Chats)), [id]);
         store
             .lock()
             .unwrap()
@@ -131,9 +133,9 @@ fn mixed_case_ids_follow_engine_lifecycle_writes_and_read_operation_overlays() {
                 [group.as_slice()],
             )
             .unwrap();
-        assert!(page(&store, ChatListView::Chats).rows.is_empty());
+        assert!(page(&app, ChatListView::Chats).rows.is_empty());
         assert_eq!(
-            page(&store, ChatListView::Left).rows[0].lifecycle_state,
+            page(&app, ChatListView::Left).rows[0].lifecycle_state,
             cgka_traits::GroupLifecycleState::Disbanded
         );
         store
@@ -144,16 +146,17 @@ fn mixed_case_ids_follow_engine_lifecycle_writes_and_read_operation_overlays() {
                 [group.as_slice()],
             )
             .unwrap();
-        assert_eq!(ids(&page(&store, ChatListView::Chats)), [id]);
+        assert_eq!(ids(&page(&app, ChatListView::Chats)), [id]);
     }
 }
 
 #[test]
 fn queued_leave_and_disband_states_follow_engine_writes_without_subscribers() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "01", false, "member", 4, false);
     let group = engine_group(&store, "01");
-    let cursor = page(&store, ChatListView::Chats).last;
+    let cursor = page(&app, ChatListView::Chats).last;
     store
         .put_leave_request(&LeaveRequest {
             group_id: group.clone(),
@@ -161,12 +164,12 @@ fn queued_leave_and_disband_states_follow_engine_writes_without_subscribers() {
             last_proposed_epoch: None,
         })
         .unwrap();
-    assert!(page(&store, ChatListView::Chats).rows.is_empty());
-    let left = page(&store, ChatListView::Left);
+    assert!(page(&app, ChatListView::Chats).rows.is_empty());
+    let left = page(&app, ChatListView::Left);
     assert_eq!(left.rows[0].leave_requested_at_ms, Some(123));
     assert_eq!(left.rows[0].self_membership, crate::SelfMembership::Member);
     assert!(matches!(
-        store.chat_list_page(query(
+        app.chat_list_page(query(
             ChatListView::Chats,
             1,
             ChatListPageDirection::Forward,
@@ -175,7 +178,7 @@ fn queued_leave_and_disband_states_follow_engine_writes_without_subscribers() {
         Err(ChatListPageError::StaleCursor)
     ));
     store.clear_leave_request(&group).unwrap();
-    assert_eq!(ids(&page(&store, ChatListView::Chats)), ["01"]);
+    assert_eq!(ids(&page(&app, ChatListView::Chats)), ["01"]);
     let mut request = DisbandRequest {
         group_id: group.clone(),
         requested_at_ms: 124,
@@ -183,15 +186,15 @@ fn queued_leave_and_disband_states_follow_engine_writes_without_subscribers() {
         last_prepared_epoch: None,
     };
     store.put_disband_request(&request).unwrap();
-    assert!(page(&store, ChatListView::Left).rows[0].disbanding);
+    assert!(page(&app, ChatListView::Left).rows[0].disbanding);
     request.status = DisbandRequestStatus::Failed(DisbandFailureReason::NoLongerAdmin);
     store.put_disband_request(&request).unwrap();
-    let active = page(&store, ChatListView::Chats);
+    let active = page(&app, ChatListView::Chats);
     assert!(!active.rows[0].disbanding);
     assert_eq!(active.rows[0].disband_request, Some(request));
     // An authenticated candidate gates work even when our own request failed.
     store.lock().unwrap().execute("INSERT INTO cgka_disband_candidates(group_id, commit_id, record) VALUES (?1, x'01', x'00')", [group.as_slice()]).unwrap();
-    assert!(page(&store, ChatListView::Left).rows[0].disbanding);
+    assert!(page(&app, ChatListView::Left).rows[0].disbanding);
     store
         .lock()
         .unwrap()
@@ -200,7 +203,7 @@ fn queued_leave_and_disband_states_follow_engine_writes_without_subscribers() {
             [group.as_slice()],
         )
         .unwrap();
-    assert_eq!(ids(&page(&store, ChatListView::Chats)), ["01"]);
+    assert_eq!(ids(&page(&app, ChatListView::Chats)), ["01"]);
     store
         .lock()
         .unwrap()
@@ -210,7 +213,7 @@ fn queued_leave_and_disband_states_follow_engine_writes_without_subscribers() {
         )
         .unwrap();
     assert_eq!(
-        page(&store, ChatListView::Left).rows[0].lifecycle_state,
+        page(&app, ChatListView::Left).rows[0].lifecycle_state,
         cgka_traits::GroupLifecycleState::Disbanded
     );
 }
@@ -218,6 +221,7 @@ fn queued_leave_and_disband_states_follow_engine_writes_without_subscribers() {
 #[test]
 fn pins_filter_before_paging_and_keep_normalized_positions_with_gaps() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     for id in ["01", "02", "03", "04", "05"] {
         seed(
             &store,
@@ -236,7 +240,7 @@ fn pins_filter_before_paging_and_keep_normalized_positions_with_gaps() {
         )
         .unwrap();
     }
-    let all = page(&store, ChatListView::Chats);
+    let all = page(&app, ChatListView::Chats);
     assert_eq!(ids(&all), ["03", "02", "01", "05", "04"]);
     assert_eq!(
         all.rows
@@ -246,7 +250,7 @@ fn pins_filter_before_paging_and_keep_normalized_positions_with_gaps() {
         [Some(0), Some(1), Some(2), None, None]
     );
     assert_eq!(
-        ids(&page(&store, ChatListView::Unread)),
+        ids(&page(&app, ChatListView::Unread)),
         ["03", "01", "05", "04"]
     );
     store
@@ -257,7 +261,7 @@ fn pins_filter_before_paging_and_keep_normalized_positions_with_gaps() {
             [],
         )
         .unwrap();
-    let all = page(&store, ChatListView::Chats);
+    let all = page(&app, ChatListView::Chats);
     assert_eq!(all.rows[1].pinned_position, Some(1));
     // Changing ordinal and inserting ahead maintain ranks without a read-time pin scan.
     store
@@ -273,10 +277,10 @@ fn pins_filter_before_paging_and_keep_normalized_positions_with_gaps() {
         .unwrap()
         .execute("INSERT INTO chat_pin_positions VALUES ('04', 1)", [])
         .unwrap();
-    let all = page(&store, ChatListView::Chats);
+    let all = page(&app, ChatListView::Chats);
     assert_eq!(ids(&all), ["04", "01", "03", "05"]);
     assert_eq!(all.rows[2].pinned_position, Some(2));
-    let first = store
+    let first = app
         .chat_list_page(query(
             ChatListView::Chats,
             2,
@@ -286,7 +290,7 @@ fn pins_filter_before_paging_and_keep_normalized_positions_with_gaps() {
         .unwrap();
     assert_eq!(ids(&first), ["04", "01"]);
     assert!(!first.has_more_before && first.has_more_after);
-    let second = store
+    let second = app
         .chat_list_page(query(
             ChatListView::Chats,
             2,
@@ -296,7 +300,7 @@ fn pins_filter_before_paging_and_keep_normalized_positions_with_gaps() {
         .unwrap();
     assert_eq!(ids(&second), ["03", "05"]);
     assert!(second.has_more_before && !second.has_more_after);
-    let back = store
+    let back = app
         .chat_list_page(query(
             ChatListView::Chats,
             2,
@@ -305,7 +309,7 @@ fn pins_filter_before_paging_and_keep_normalized_positions_with_gaps() {
         ))
         .unwrap();
     assert_eq!(ids(&back), ids(&first));
-    let tail = store
+    let tail = app
         .chat_list_page(query(
             ChatListView::Chats,
             2,
@@ -314,7 +318,7 @@ fn pins_filter_before_paging_and_keep_normalized_positions_with_gaps() {
         ))
         .unwrap();
     assert_eq!(ids(&tail), ["03", "05"]);
-    let empty = store
+    let empty = app
         .chat_list_page(query(
             ChatListView::Chats,
             2,
@@ -328,6 +332,7 @@ fn pins_filter_before_paging_and_keep_normalized_positions_with_gaps() {
 #[test]
 fn manual_unread_invite_acceptance_and_source_membership_change_are_immediate() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "01", false, "member", 0, false);
     seed(&store, "02", false, "member", 8, true);
     let conn = store.lock().unwrap();
@@ -337,7 +342,7 @@ fn manual_unread_invite_acceptance_and_source_membership_change_are_immediate() 
     )
     .unwrap();
     drop(conn);
-    assert_eq!(ids(&page(&store, ChatListView::Unread)), ["01"]);
+    assert_eq!(ids(&page(&app, ChatListView::Unread)), ["01"]);
     store
         .lock()
         .unwrap()
@@ -346,23 +351,21 @@ fn manual_unread_invite_acceptance_and_source_membership_change_are_immediate() 
             [],
         )
         .unwrap();
-    let unread = page(&store, ChatListView::Unread);
+    let unread = page(&app, ChatListView::Unread);
     assert_eq!(ids(&unread), ["01", "02"]);
     assert!(!unread.rows[1].pending_confirmation);
     assert_eq!(unread.rows[1].unread_count, 8);
     // A source membership update is visible before the legacy chat row is refreshed.
-    store
-        .set_group_self_membership("01", crate::SelfMembership::Removed)
+    app.set_group_self_membership("01", crate::SelfMembership::Removed)
         .unwrap();
-    assert_eq!(ids(&page(&store, ChatListView::Unread)), ["02"]);
+    assert_eq!(ids(&page(&app, ChatListView::Unread)), ["02"]);
     assert_eq!(
-        page(&store, ChatListView::Left).rows[0].self_membership,
+        page(&app, ChatListView::Left).rows[0].self_membership,
         crate::SelfMembership::Removed
     );
-    store
-        .set_group_self_membership("01", crate::SelfMembership::Member)
+    app.set_group_self_membership("01", crate::SelfMembership::Member)
         .unwrap();
-    assert_eq!(ids(&page(&store, ChatListView::Unread)), ["01", "02"]);
+    assert_eq!(ids(&page(&app, ChatListView::Unread)), ["01", "02"]);
 }
 
 #[test]
@@ -373,7 +376,7 @@ fn pages_share_outer_transaction_without_committing_or_rolling_it_back() {
         for id in ["01", "02", "03"] {
             seed(&store, id, false, "member", 0, false);
         }
-        let before = page(&store, ChatListView::Chats).first;
+        let before = page(&store.app_storage(), ChatListView::Chats).first;
         let result =
             StorageProvider::with_transaction(&store, |store| -> Result<(), ChatListPageError> {
                 store
@@ -383,21 +386,21 @@ fn pages_share_outer_transaction_without_committing_or_rolling_it_back() {
                         [],
                     )
                     .storage()?;
-                let first = store.chat_list_page(query(
+                let first = store.app_storage().chat_list_page(query(
                     ChatListView::Chats,
                     1,
                     ChatListPageDirection::Forward,
                     None,
                 ))?;
                 assert_eq!(ids(&first), ["03"]);
-                let next = store.chat_list_page(query(
+                let next = store.app_storage().chat_list_page(query(
                     ChatListView::Chats,
                     1,
                     ChatListPageDirection::Forward,
                     first.last,
                 ))?;
                 assert_eq!(ids(&next), ["01"]);
-                let anchored = store.chat_list_page_from_anchor(
+                let anchored = store.app_storage().chat_list_page_from_anchor(
                     ChatListView::Chats,
                     "02",
                     2,
@@ -405,7 +408,7 @@ fn pages_share_outer_transaction_without_committing_or_rolling_it_back() {
                 )?;
                 assert_eq!(ids(&anchored), ["01", "02"]);
                 assert!(matches!(
-                    store.chat_list_page_from_anchor(
+                    store.app_storage().chat_list_page_from_anchor(
                         ChatListView::Chats,
                         "missing",
                         2,
@@ -426,14 +429,14 @@ fn pages_share_outer_transaction_without_committing_or_rolling_it_back() {
         }
         assert!(store.lock().unwrap().is_autocommit());
         assert_eq!(
-            ids(&page(&store, ChatListView::Chats)),
+            ids(&page(&store.app_storage(), ChatListView::Chats)),
             if commit {
                 vec!["03", "01", "02"]
             } else {
                 vec!["01", "02", "03"]
             }
         );
-        let resumed = store.chat_list_page(query(
+        let resumed = store.app_storage().chat_list_page(query(
             ChatListView::Chats,
             1,
             ChatListPageDirection::Forward,
@@ -450,12 +453,13 @@ fn pages_share_outer_transaction_without_committing_or_rolling_it_back() {
 #[test]
 fn cursor_rejects_cross_store_view_and_mutation_but_not_presentation_only_change() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "01", false, "member", 1, false);
     seed(&store, "02", false, "member", 1, false);
-    let cursor = page(&store, ChatListView::Chats).first;
+    let cursor = page(&app, ChatListView::Chats).first;
     for limit in [0, 101, usize::MAX] {
         assert!(matches!(
-            store.chat_list_page(query(
+            app.chat_list_page(query(
                 ChatListView::Chats,
                 limit,
                 ChatListPageDirection::Forward,
@@ -466,7 +470,7 @@ fn cursor_rejects_cross_store_view_and_mutation_but_not_presentation_only_change
     }
     let other = SqliteAccountStorage::in_memory().unwrap();
     assert!(matches!(
-        other.chat_list_page(query(
+        other.app_storage().chat_list_page(query(
             ChatListView::Chats,
             1,
             ChatListPageDirection::Forward,
@@ -475,7 +479,7 @@ fn cursor_rejects_cross_store_view_and_mutation_but_not_presentation_only_change
         Err(ChatListPageError::CursorMismatch)
     ));
     assert!(matches!(
-        store.chat_list_page(query(
+        app.chat_list_page(query(
             ChatListView::Unread,
             1,
             ChatListPageDirection::Forward,
@@ -492,15 +496,14 @@ fn cursor_rejects_cross_store_view_and_mutation_but_not_presentation_only_change
         )
         .unwrap();
     assert_eq!(
-        store
-            .chat_list_page(query(
-                ChatListView::Chats,
-                1,
-                ChatListPageDirection::Forward,
-                cursor.clone()
-            ))
-            .unwrap()
-            .rows[0]
+        app.chat_list_page(query(
+            ChatListView::Chats,
+            1,
+            ChatListPageDirection::Forward,
+            cursor.clone()
+        ))
+        .unwrap()
+        .rows[0]
             .title,
         "changed"
     );
@@ -513,7 +516,7 @@ fn cursor_rejects_cross_store_view_and_mutation_but_not_presentation_only_change
         )
         .unwrap();
     assert!(matches!(
-        store.chat_list_page(query(
+        app.chat_list_page(query(
             ChatListView::Chats,
             1,
             ChatListPageDirection::Forward,
@@ -526,8 +529,9 @@ fn cursor_rejects_cross_store_view_and_mutation_but_not_presentation_only_change
 #[test]
 fn navigation_and_cursor_revision_roll_back_with_failed_source_write() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "01", false, "member", 1, false);
-    let cursor = page(&store, ChatListView::Chats).last;
+    let cursor = page(&app, ChatListView::Chats).last;
     {
         let conn = store.lock().unwrap();
         let tx = conn.unchecked_transaction().unwrap();
@@ -541,16 +545,15 @@ fn navigation_and_cursor_revision_roll_back_with_failed_source_write() {
         );
         // Dropping without commit simulates an aborted source mutation.
     }
-    assert_eq!(ids(&page(&store, ChatListView::Chats)), ["01"]);
+    assert_eq!(ids(&page(&app, ChatListView::Chats)), ["01"]);
     assert!(
-        store
-            .chat_list_page(query(
-                ChatListView::Chats,
-                1,
-                ChatListPageDirection::Forward,
-                cursor
-            ))
-            .is_ok()
+        app.chat_list_page(query(
+            ChatListView::Chats,
+            1,
+            ChatListPageDirection::Forward,
+            cursor
+        ))
+        .is_ok()
     );
 }
 
@@ -575,7 +578,10 @@ fn page_does_not_decode_unrelated_operation_records() {
             [group.as_slice()],
         )
         .unwrap();
-    assert_eq!(ids(&page(&store, ChatListView::Chats)), ["01"]);
+    assert_eq!(
+        ids(&page(&store.app_storage(), ChatListView::Chats)),
+        ["01"]
+    );
 }
 
 #[test]
@@ -594,7 +600,9 @@ fn reopening_preserves_queued_leave_and_bounded_navigation() {
         })
         .unwrap();
     store.close().unwrap();
-    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key)
+        .unwrap()
+        .app_storage();
     assert!(page(&store, ChatListView::Archived).rows.is_empty());
     assert_eq!(
         page(&store, ChatListView::Left).rows[0].leave_requested_at_ms,
@@ -607,6 +615,7 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
     use crate::base::query_work_test_support::measure;
     for (count, pin_cap) in [(256, 8), (4096, 8), (256, 256), (4096, 4096)] {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
         {
             let conn = store.lock().unwrap();
             conn.execute_batch(&format!("CREATE TEMP TABLE numbers(x INTEGER PRIMARY KEY);
@@ -630,18 +639,17 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
             ChatListView::Archived,
             ChatListView::Left,
         ] {
-            let tail = store
+            let tail = app
                 .chat_list_page(query(view, 10, ChatListPageDirection::Backward, None))
                 .unwrap();
             let (_, anchor_steps) = measure(&store, || {
-                store
-                    .chat_list_page_from_anchor(
-                        view,
-                        &tail.rows.last().unwrap().group_id_hex,
-                        10,
-                        ChatListPageDirection::Backward,
-                    )
-                    .unwrap()
+                app.chat_list_page_from_anchor(
+                    view,
+                    &tail.rows.last().unwrap().group_id_hex,
+                    10,
+                    ChatListPageDirection::Backward,
+                )
+                .unwrap()
             });
             assert!(
                 anchor_steps < 2400,
@@ -653,8 +661,7 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
                     (ChatListPageDirection::Backward, tail.first.clone()),
                 ] {
                     let (result, steps) = measure(&store, || {
-                        store
-                            .chat_list_page(query(view, limit, direction, cursor.clone()))
+                        app.chat_list_page(query(view, limit, direction, cursor.clone()))
                             .unwrap()
                     });
                     assert!(
@@ -695,12 +702,11 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
         // bounded page and ordinary-write work; the budget rejects per-pin rank rebuilds.
         let new_pin = format!("{:032x}", count - 1);
         let (pin_state, pin_steps) =
-            measure(&store, || store.set_chat_pinned(&new_pin, true).unwrap());
+            measure(&store, || app.set_chat_pinned(&new_pin, true).unwrap());
         let mut reordered = pin_state.ordered_group_ids.clone();
         reordered.reverse();
-        let (_, reorder_steps) =
-            measure(&store, || store.set_pinned_chat_order(&reordered).unwrap());
-        let (_, unpin_steps) = measure(&store, || store.set_chat_pinned(&new_pin, false).unwrap());
+        let (_, reorder_steps) = measure(&store, || app.set_pinned_chat_order(&reordered).unwrap());
+        let (_, unpin_steps) = measure(&store, || app.set_chat_pinned(&new_pin, false).unwrap());
         eprintln!(
             "rows={count} pins={} pin_vm_steps={pin_steps} reorder_vm_steps={reorder_steps} unpin_vm_steps={unpin_steps}",
             pin_state.ordered_group_ids.len()
@@ -740,6 +746,7 @@ fn filtered_page_query_work_stays_bounded_with_unrelated_rows_and_history() {
 #[test]
 fn missing_projected_pin_and_row_recreation_keep_authoritative_global_pin_ranks() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     for id in ["01", "02", "03"] {
         seed(&store, id, false, "member", 1, false);
     }
@@ -752,7 +759,7 @@ fn missing_projected_pin_and_row_recreation_keep_authoritative_global_pin_ranks(
         )
         .unwrap();
     assert_eq!(
-        page(&store, ChatListView::Chats).rows[1].pinned_position,
+        page(&app, ChatListView::Chats).rows[1].pinned_position,
         Some(2)
     );
     store
@@ -764,7 +771,7 @@ fn missing_projected_pin_and_row_recreation_keep_authoritative_global_pin_ranks(
         )
         .unwrap();
     assert_eq!(
-        page(&store, ChatListView::Chats).rows[1].pinned_position,
+        page(&app, ChatListView::Chats).rows[1].pinned_position,
         Some(1)
     );
     store
@@ -775,7 +782,7 @@ fn missing_projected_pin_and_row_recreation_keep_authoritative_global_pin_ranks(
         INSERT INTO chat_list_rows(group_id_hex, updated_at) VALUES('02',0);",
         )
         .unwrap();
-    let result = page(&store, ChatListView::Chats);
+    let result = page(&app, ChatListView::Chats);
     assert_eq!(ids(&result), ["01", "02", "03"]);
     assert_eq!(
         result
@@ -797,11 +804,17 @@ fn stable_anchor_accepts_normalized_ids_for_mixed_case_rows() {
             ChatListPageDirection::Backward,
         ] {
             let anchored = store
+                .app_storage()
                 .chat_list_page_from_anchor(ChatListView::Chats, "abcd", 10, direction)
                 .unwrap();
             assert_eq!(ids(&anchored), [id]);
             assert!(matches!(
-                store.chat_list_page_from_anchor(ChatListView::Archived, "abcd", 10, direction),
+                store.app_storage().chat_list_page_from_anchor(
+                    ChatListView::Archived,
+                    "abcd",
+                    10,
+                    direction
+                ),
                 Err(ChatListPageError::AnchorUnavailable)
             ));
         }
@@ -827,13 +840,18 @@ fn legacy_disband_record_without_status_retains_pending_semantics() {
         })
         .unwrap();
     store.lock().unwrap().execute_batch("UPDATE cgka_disband_requests SET record = CAST(json_remove(CAST(record AS TEXT),'$.status') AS BLOB)").unwrap();
-    assert!(page(&store, ChatListView::Left).rows[0].disbanding);
-    assert!(page(&store, ChatListView::Chats).rows.is_empty());
+    assert!(page(&store.app_storage(), ChatListView::Left).rows[0].disbanding);
+    assert!(
+        page(&store.app_storage(), ChatListView::Chats)
+            .rows
+            .is_empty()
+    );
 }
 
 #[test]
 fn stable_anchor_recovers_deep_page_after_unrelated_traffic_without_restarting_at_top() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     for n in 1..=260 {
         seed(&store, &format!("{n:04x}"), false, "member", 1, false);
     }
@@ -846,7 +864,7 @@ fn stable_anchor_recovers_deep_page_after_unrelated_traffic_without_restarting_a
                 [tick],
             )
             .unwrap();
-        let anchored = store
+        let anchored = app
             .chat_list_page_from_anchor(
                 ChatListView::Chats,
                 "00c8",
@@ -857,7 +875,7 @@ fn stable_anchor_recovers_deep_page_after_unrelated_traffic_without_restarting_a
         assert_eq!(anchored.rows.first().unwrap().group_id_hex, "00c8");
         assert_eq!(anchored.rows.len(), 50);
         assert!(anchored.has_more_before && anchored.has_more_after);
-        let preceding = store
+        let preceding = app
             .chat_list_page_from_anchor(
                 ChatListView::Chats,
                 "00c8",
@@ -868,7 +886,7 @@ fn stable_anchor_recovers_deep_page_after_unrelated_traffic_without_restarting_a
         assert_eq!(preceding.rows.last().unwrap().group_id_hex, "00c8");
     }
     assert!(matches!(
-        store.chat_list_page_from_anchor(
+        app.chat_list_page_from_anchor(
             ChatListView::Archived,
             "00c8",
             50,
@@ -882,7 +900,7 @@ fn stable_anchor_recovers_deep_page_after_unrelated_traffic_without_restarting_a
         .execute("DELETE FROM chat_list_rows WHERE group_id_hex = '00c8'", [])
         .unwrap();
     assert!(matches!(
-        store.chat_list_page_from_anchor(
+        app.chat_list_page_from_anchor(
             ChatListView::Chats,
             "00c8",
             50,
@@ -895,6 +913,7 @@ fn stable_anchor_recovers_deep_page_after_unrelated_traffic_without_restarting_a
 #[test]
 fn accepting_an_archived_invite_preserves_archive_and_source_fields() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "01", true, "member", 7, true);
     store
         .lock()
@@ -904,13 +923,13 @@ fn accepting_an_archived_invite_preserves_archive_and_source_fields() {
             [],
         )
         .unwrap();
-    let archived = page(&store, ChatListView::Archived);
+    let archived = page(&app, ChatListView::Archived);
     assert_eq!(ids(&archived), ["01"]);
     assert!(archived.rows[0].archived);
     assert!(!archived.rows[0].pending_confirmation);
     assert_eq!(archived.rows[0].unread_count, 7);
-    assert!(page(&store, ChatListView::Chats).rows.is_empty());
-    assert!(page(&store, ChatListView::Unread).rows.is_empty());
+    assert!(page(&app, ChatListView::Chats).rows.is_empty());
+    assert!(page(&app, ChatListView::Unread).rows.is_empty());
     store
         .lock()
         .unwrap()
@@ -919,10 +938,10 @@ fn accepting_an_archived_invite_preserves_archive_and_source_fields() {
             [],
         )
         .unwrap();
-    let active = page(&store, ChatListView::Unread);
+    let active = page(&app, ChatListView::Unread);
     assert!(!active.rows[0].archived);
     // The source overlay is observable even before the legacy row is refreshed.
-    assert!(store.chat_list_row("01").unwrap().unwrap().archived);
+    assert!(app.chat_list_row("01").unwrap().unwrap().archived);
 }
 
 #[test]
@@ -933,7 +952,7 @@ fn batched_pin_rewrite_preserves_missing_rows_and_rolls_back_inside_outer_transa
         seed(&store, id, false, "member", 1, false);
     }
     for id in ["01", "02", "03"] {
-        store.set_chat_pinned(id, true).unwrap();
+        store.app_storage().set_chat_pinned(id, true).unwrap();
     }
     store
         .lock()
@@ -941,8 +960,8 @@ fn batched_pin_rewrite_preserves_missing_rows_and_rolls_back_inside_outer_transa
         .execute("DELETE FROM chat_list_rows WHERE group_id_hex = '02'", [])
         .unwrap();
     let order = ["01", "02", "03"].map(String::from);
-    store.set_pinned_chat_order(&order).unwrap();
-    let current = page(&store, ChatListView::Chats);
+    store.app_storage().set_pinned_chat_order(&order).unwrap();
+    let current = page(&store.app_storage(), ChatListView::Chats);
     assert_eq!(ids(&current), ["01", "03", "04"]);
     assert_eq!(
         current
@@ -963,7 +982,7 @@ fn batched_pin_rewrite_preserves_missing_rows_and_rolls_back_inside_outer_transa
         )
         .unwrap();
     StorageProvider::with_transaction(&store, |store| -> Result<(), StorageError> {
-        assert!(store.set_chat_pinned("04", true).is_err());
+        assert!(store.app_storage().set_chat_pinned("04", true).is_err());
         // Catching the command error must not commit a disabled trigger or half-rebuilt pins.
         assert_eq!(
             store
@@ -977,7 +996,11 @@ fn batched_pin_rewrite_preserves_missing_rows_and_rolls_back_inside_outer_transa
             0
         );
         assert_eq!(
-            store.set_chat_pinned("01", true).unwrap().ordered_group_ids,
+            store
+                .app_storage()
+                .set_chat_pinned("01", true)
+                .unwrap()
+                .ordered_group_ids,
             order
         );
         Ok(())
@@ -985,6 +1008,7 @@ fn batched_pin_rewrite_preserves_missing_rows_and_rolls_back_inside_outer_transa
     .unwrap();
     assert!(
         store
+            .app_storage()
             .chat_list_page(query(
                 ChatListView::Chats,
                 1,
@@ -1001,8 +1025,8 @@ fn batched_pin_rewrite_preserves_missing_rows_and_rolls_back_inside_outer_transa
         INSERT INTO chat_list_rows(group_id_hex, updated_at) VALUES ('02',0);",
         )
         .unwrap();
-    store.set_chat_pinned("03", false).unwrap();
-    let current = page(&store, ChatListView::Chats);
+    store.app_storage().set_chat_pinned("03", false).unwrap();
+    let current = page(&store.app_storage(), ChatListView::Chats);
     assert_eq!(ids(&current), ["01", "02", "03", "04"]);
     assert_eq!(
         current
@@ -1021,7 +1045,7 @@ fn batched_pin_rewrite_preserves_missing_rows_and_rolls_back_inside_outer_transa
             [],
         )
         .unwrap();
-    let current = page(&store, ChatListView::Chats);
+    let current = page(&store.app_storage(), ChatListView::Chats);
     assert_eq!(current.rows[0].group_id_hex, "02");
     assert_eq!(current.rows[0].pinned_position, Some(0));
 }
@@ -1038,7 +1062,7 @@ fn window_query(
         before_anchor,
     }
 }
-fn prepare_window_fixture(store: &SqliteAccountStorage, id: &str) {
+fn prepare_window_fixture(store: &SqliteAppStorage, id: &str) {
     use crate::{
         ConversationPresentation, PresentationResolution, PresentationSource, PresentationText,
         SelectedAvatar, StoredChatPresentation,
@@ -1068,24 +1092,21 @@ fn prepare_window_fixture(store: &SqliteAccountStorage, id: &str) {
 #[test]
 fn window_read_shares_one_snapshot_and_limits_only_required_selected_preparation() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     for i in 0..250 {
         seed(&store, &format!("{i:04x}"), false, "member", 1, false);
     }
-    prepare_window_fixture(&store, "0000");
-    let read = store
-        .read_chat_list_window(window_query(2, &[], 0))
-        .unwrap();
+    prepare_window_fixture(&app, "0000");
+    let read = app.read_chat_list_window(window_query(2, &[], 0)).unwrap();
     assert!(read.snapshot.is_none());
     assert_eq!(read.pending_presentations, ["0001"]);
-    prepare_window_fixture(&store, "0001");
-    let read = store
-        .read_chat_list_window(window_query(2, &[], 0))
-        .unwrap();
+    prepare_window_fixture(&app, "0001");
+    let read = app.read_chat_list_window(window_query(2, &[], 0)).unwrap();
     assert_eq!(read.snapshot.unwrap().rows.len(), 2);
     assert!(read.pending_presentations.is_empty());
     assert_eq!(ids(&read.page), ["0000", "0001"]);
     // Fallback anchors are resolved in the same snapshot as both sides of the window.
-    let read = store
+    let read = app
         .read_chat_list_window(window_query(200, &["ffff", "007d"], 50))
         .unwrap();
     assert_eq!(read.anchor.as_deref(), Some("007d"));
@@ -1096,7 +1117,7 @@ fn window_read_shares_one_snapshot_and_limits_only_required_selected_preparation
     );
     assert!(!read.page.has_more_after);
     assert!(read.page.has_more_before);
-    let reset = store
+    let reset = app
         .read_chat_list_window(window_query(20, &["ffff"], 4))
         .unwrap();
     assert!(reset.anchor.is_none());
@@ -1110,7 +1131,7 @@ fn bounded_window_composes_with_caller_transaction_and_rolls_back_as_one_unit() 
     for i in 0..20 {
         let id = format!("{i:04x}");
         seed(&store, &id, false, "member", 1, false);
-        prepare_window_fixture(&store, &id);
+        prepare_window_fixture(&store.app_storage(), &id);
     }
     let result: Result<(), StorageError> = store.with_transaction(|s| {
         s.lock()?
@@ -1120,6 +1141,7 @@ fn bounded_window_composes_with_caller_transaction_and_rolls_back_as_one_unit() 
             )
             .storage()?;
         let read = s
+            .app_storage()
             .read_chat_list_window(window_query(10, &["0004", "0005"], 4))
             .unwrap();
         assert_eq!(read.anchor.as_deref(), Some("0005"));
@@ -1128,6 +1150,7 @@ fn bounded_window_composes_with_caller_transaction_and_rolls_back_as_one_unit() 
     });
     assert!(result.is_err());
     let read = store
+        .app_storage()
         .read_chat_list_window(window_query(10, &["0004"], 4))
         .unwrap();
     assert_eq!(read.anchor.as_deref(), Some("0004"));
@@ -1142,12 +1165,13 @@ fn ready_window_sql_work_is_bounded_across_account_and_history_sizes() {
         for i in 0..count {
             let id = format!("{i:04x}");
             seed(&store, &id, false, "member", 1, false);
-            prepare_window_fixture(&store, &id);
+            prepare_window_fixture(&store.app_storage(), &id);
         }
         // Real retained app-event history in a visible conversation must not be hydrated by this read.
         store.lock().unwrap().execute_batch("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<5000) INSERT INTO app_events(group_id_hex, message_id_hex, direction, sender, plaintext, kind, tags_json, recorded_at, received_at) SELECT '0000', printf('%064x',x), 'received', 'sender', 'retained history', 9, '[]', x, x FROM n;").unwrap();
         let (read, steps) = measure(&store, || {
             store
+                .app_storage()
                 .read_chat_list_window(window_query(20, &[], 0))
                 .unwrap()
         });
@@ -1160,6 +1184,7 @@ fn ready_window_sql_work_is_bounded_across_account_and_history_sizes() {
         if count >= 200 {
             let (read, steps) = measure(&store, || {
                 store
+                    .app_storage()
                     .read_chat_list_window(window_query(200, &["0096"], 150))
                     .unwrap()
             });
@@ -1179,19 +1204,20 @@ fn ready_window_sql_work_is_bounded_across_account_and_history_sizes() {
 #[test]
 fn authoritative_self_arrival_restores_departed_archive_once_and_preserves_ordinary_archive() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "01", true, "left", 4, false);
     seed(&store, "02", true, "removed", 3, false);
     seed(&store, "03", true, "member", 2, true);
     for id in ["01", "02"] {
-        assert!(store.restore_group_self_membership(id).unwrap());
+        assert!(app.restore_group_self_membership(id).unwrap());
         assert_eq!(
-            store.group_self_membership(id).unwrap(),
+            app.group_self_membership(id).unwrap(),
             Some(crate::SelfMembership::Member)
         );
     }
-    assert!(!store.restore_group_self_membership("03").unwrap());
-    assert_eq!(ids(&page(&store, ChatListView::Chats)), ["01", "02"]);
-    assert_eq!(ids(&page(&store, ChatListView::Archived)), ["03"]);
+    assert!(!app.restore_group_self_membership("03").unwrap());
+    assert_eq!(ids(&page(&app, ChatListView::Chats)), ["01", "02"]);
+    assert_eq!(ids(&page(&app, ChatListView::Archived)), ["03"]);
     store
         .lock()
         .unwrap()
@@ -1200,8 +1226,8 @@ fn authoritative_self_arrival_restores_departed_archive_once_and_preserves_ordin
             [],
         )
         .unwrap();
-    assert!(!store.restore_group_self_membership("01").unwrap());
-    assert_eq!(ids(&page(&store, ChatListView::Archived)), ["01", "03"]);
+    assert!(!app.restore_group_self_membership("01").unwrap());
+    assert_eq!(ids(&page(&app, ChatListView::Archived)), ["01", "03"]);
 }
 
 #[test]
@@ -1212,15 +1238,15 @@ fn account_attention_adds_invites_without_changing_unread_list_or_mute_policy() 
                 for unread in [0, 3] {
                     for manual in [false, true] {
                         let store = SqliteAccountStorage::in_memory().unwrap();
+                        let app = store.app_storage();
                         seed(&store, "01", archived, membership, unread, pending);
                         store.lock().unwrap().execute("UPDATE chat_list_rows SET manually_marked_unread=?1 WHERE group_id_hex='01'", [manual]).unwrap();
                         store.lock().unwrap().execute("UPDATE account_groups SET pending_confirmation=?1 WHERE group_id_hex='01'",[pending]).unwrap();
                         store.lock().unwrap().execute("UPDATE chat_list_rows SET unread_mention_count=?1 WHERE group_id_hex='01'",[if unread>0 {2} else {0}]).unwrap();
-                        store
-                            .set_chat_muted("01", Some(crate::unix_now_ms() + 100000))
+                        app.set_chat_muted("01", Some(crate::unix_now_ms() + 100000))
                             .unwrap();
-                        let total = store.account_attention_total().unwrap();
-                        let rows = page(&store, ChatListView::Unread).rows;
+                        let total = app.account_attention_total().unwrap();
+                        let rows = page(&app, ChatListView::Unread).rows;
                         let invite = !archived && pending && membership == "member";
                         assert_eq!(
                             total.unread_conversations,
@@ -1251,20 +1277,21 @@ fn account_attention_adds_invites_without_changing_unread_list_or_mute_policy() 
 fn account_attention_tracks_queued_departure_cancellation_and_caller_rollback() {
     use cgka_traits::storage::{StorageError, StorageProvider};
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "01", false, "member", 3, false);
     let group = engine_group(&store, "01");
-    let baseline = store.account_attention_total().unwrap();
+    let baseline = app.account_attention_total().unwrap();
     let result = store.with_transaction(|s| -> Result<(), StorageError> {
         s.put_leave_request(&LeaveRequest {
             group_id: group.clone(),
             requested_at_ms: 123,
             last_proposed_epoch: None,
         })?;
-        assert!(!s.account_attention_total()?.has_unread());
+        assert!(!s.app_storage().account_attention_total()?.has_unread());
         Err(StorageError::NotFound)
     });
     assert!(result.is_err());
-    assert_eq!(store.account_attention_total().unwrap(), baseline);
+    assert_eq!(app.account_attention_total().unwrap(), baseline);
     let mut request = DisbandRequest {
         group_id: group.clone(),
         requested_at_ms: 123,
@@ -1272,10 +1299,10 @@ fn account_attention_tracks_queued_departure_cancellation_and_caller_rollback() 
         last_prepared_epoch: None,
     };
     store.put_disband_request(&request).unwrap();
-    assert!(!store.account_attention_total().unwrap().has_unread());
+    assert!(!app.account_attention_total().unwrap().has_unread());
     request.status = DisbandRequestStatus::Failed(DisbandFailureReason::NoLongerAdmin);
     store.put_disband_request(&request).unwrap();
-    assert_eq!(store.account_attention_total().unwrap(), baseline);
+    assert_eq!(app.account_attention_total().unwrap(), baseline);
 }
 
 #[test]
@@ -1293,7 +1320,9 @@ fn account_attention_query_work_is_independent_of_retained_history_and_skips_qui
                 SELECT printf('%032x',1),printf('%064x',x),'received','sender','large retained history',9,'[]',x,x FROM n;")).unwrap();
         seed(&store, "invite", false, "member", 30, true);
         store.lock().unwrap().execute_batch("UPDATE account_groups SET pending_confirmation=1, archived=1 WHERE group_id_hex IN (SELECT printf('%032x',x) FROM numbers WHERE x>10);").unwrap();
-        let (total, steps) = measure(&store, || store.account_attention_total().unwrap());
+        let (total, steps) = measure(&store, || {
+            store.app_storage().account_attention_total().unwrap()
+        });
         assert_eq!(total.unread_count, 6);
         assert_eq!(total.unread_conversations, 3);
         assert_eq!(total.attention_only_conversations, 1);
@@ -1310,9 +1339,10 @@ fn account_attention_query_work_is_independent_of_retained_history_and_skips_qui
 fn invite_attention_follows_source_acceptance_archive_and_departure_before_row_refresh() {
     use cgka_traits::storage::{StorageError, StorageProvider};
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "01", false, "member", 3, true);
     let group = engine_group(&store, "01");
-    let invite = store.account_attention_total().unwrap();
+    let invite = app.account_attention_total().unwrap();
     assert_eq!(invite.unread_count, 0);
     assert_eq!(invite.attention_only_conversations, 1);
     // Keep a deliberately stale invitation display row through each source update.
@@ -1323,7 +1353,7 @@ fn invite_attention_follows_source_acceptance_archive_and_departure_before_row_r
         (true, false, 0, 1),
     ] {
         store.lock().unwrap().execute("UPDATE account_groups SET pending_confirmation=?1, archived=?2 WHERE group_id_hex='01'", params![pending, archived]).unwrap();
-        let total = store.account_attention_total().unwrap();
+        let total = app.account_attention_total().unwrap();
         assert_eq!(total.unread_count, messages);
         assert_eq!(total.attention_only_conversations, attention);
     }
@@ -1333,11 +1363,11 @@ fn invite_attention_follows_source_acceptance_archive_and_departure_before_row_r
             requested_at_ms: 123,
             last_proposed_epoch: None,
         })?;
-        assert!(!s.account_attention_total()?.has_unread());
+        assert!(!s.app_storage().account_attention_total()?.has_unread());
         Err(StorageError::NotFound)
     });
     assert!(result.is_err());
-    assert_eq!(store.account_attention_total().unwrap(), invite);
+    assert_eq!(app.account_attention_total().unwrap(), invite);
     store
         .put_disband_request(&DisbandRequest {
             group_id: group,
@@ -1346,5 +1376,5 @@ fn invite_attention_follows_source_acceptance_archive_and_departure_before_row_r
             last_prepared_epoch: None,
         })
         .unwrap();
-    assert!(!store.account_attention_total().unwrap().has_unread());
+    assert!(!app.account_attention_total().unwrap().has_unread());
 }

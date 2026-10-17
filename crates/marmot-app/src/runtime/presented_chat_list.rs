@@ -4,7 +4,8 @@ use super::{
 };
 use crate::chat_presentation::signals::PresentationInvalidation;
 use crate::{AppError, MarmotApp, PresentedChatListSnapshot, PresentedChatRow};
-use storage_sqlite::{ChatListQuery, SqliteAccountStorage};
+use storage_sqlite::ChatListQuery;
+use storage_sqlite::SqliteAppStorage;
 use tokio::sync::{broadcast, watch};
 
 /// A complete replacement. Sequence orders all row changes, even at equal presentation revisions.
@@ -201,7 +202,7 @@ async fn prepared_snapshot(
             app.ensure_chat_list_projection(&account)?;
             let storage = app.account_storage(&label)?;
             let snapshot = read_or_prepare(
-                &storage,
+                &storage.app_storage(),
                 ChatListQuery { include_archived },
                 group.as_deref(),
                 || {
@@ -247,7 +248,7 @@ async fn prepared_snapshot(
 /// concurrent preparers. Re-read before interpreting its progress flag: a lost CAS can mean
 /// another caller completed the result, or advanced a multi-batch preparation.
 fn read_or_prepare(
-    storage: &SqliteAccountStorage,
+    storage: &SqliteAppStorage,
     query: ChatListQuery,
     group: Option<&str>,
     prepare: impl FnOnce() -> Result<bool, AppError>,
@@ -374,6 +375,7 @@ mod tests {
         // the materialized row. Read-time derivation must still unmute it correctly.
         let storage = app.account_storage("alice").unwrap();
         storage
+            .app_storage()
             .set_chat_muted(&id, Some(crate::notifications::unix_now_ms() - 1))
             .unwrap();
         let row = runtime
@@ -398,24 +400,24 @@ mod tests {
         client.create_group("Pending", &[]).await.unwrap();
         app.ensure_chat_list_projection(&account).unwrap();
         let storage = app.account_storage("alice").unwrap();
+        let app = storage.app_storage();
         let query = ChatListQuery {
             include_archived: true,
         };
         assert!(
-            storage
-                .read_presented_chat_list(query.clone(), None)
+            app.read_presented_chat_list(query.clone(), None)
                 .unwrap()
                 .is_none()
         );
         assert!(matches!(
-            read_or_prepare(&storage, query.clone(), None, || Ok(false)),
+            read_or_prepare(&app, query.clone(), None, || Ok(false)),
             Err(AppError::ChatPresentationNotReady)
         ));
         // Deterministic interleaving: the owner advances the checkpoint after the reader's
         // miss, but the reader's own stale CAS reports no progress. The result is not ready
         // yet, so retry only because the durable checkpoint really advanced.
         let mut worker = super::super::presentation::PresentationMaintenance::default();
-        let partial = read_or_prepare(&storage, query.clone(), None, || {
+        let partial = read_or_prepare(&app, query.clone(), None, || {
             assert!(worker.run(&client, &account.account_id_hex)?);
             Ok(false)
         })
@@ -423,18 +425,16 @@ mod tests {
         assert!(partial.is_none());
         // The owner completes before the losing preparer returns false. Re-read wins
         // over that stale progress flag and returns the complete row without an error.
-        let ready = read_or_prepare(&storage, query.clone(), None, || {
+        let ready = read_or_prepare(&app, query.clone(), None, || {
             while worker.run(&client, &account.account_id_hex)? {}
             Ok(false)
         })
         .unwrap()
         .unwrap();
         assert_eq!(ready.rows.len(), 1);
-        let repeat = read_or_prepare(&storage, query, None, || {
-            panic!("ready reads must not prepare")
-        })
-        .unwrap()
-        .unwrap();
+        let repeat = read_or_prepare(&app, query, None, || panic!("ready reads must not prepare"))
+            .unwrap()
+            .unwrap();
         assert_eq!(ready, repeat);
     }
 
@@ -576,7 +576,7 @@ mod tests {
             .open_presented_chat_list("alice", false)
             .await
             .unwrap();
-        let storage = app.account_storage("alice").unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
         let mut state = storage.load_account_projection_state("alice", 100).unwrap();
         state.groups[0].profile_name = "After".into();
         storage

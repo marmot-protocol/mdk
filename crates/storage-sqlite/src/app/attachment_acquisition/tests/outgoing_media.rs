@@ -7,7 +7,7 @@ use super::*;
 
 fn media(
     dir: &tempfile::TempDir,
-    store: &SqliteAccountStorage,
+    store: &SqliteAppStorage,
 ) -> MediaStore<crate::SqliteMediaCatalog> {
     MediaStore::new(
         dir.path().join(media_store::MEDIA_DIRECTORY),
@@ -22,17 +22,18 @@ fn staged_send(
     media: &MediaStore<crate::SqliteMediaCatalog>,
     message: &str,
 ) -> (Vec<u8>, media_store::FileId) {
+    let app = store.app_storage();
     seed(store, message);
     let mut event = source(message);
     event.direction = "sent".into();
-    store.record_app_event(&event).unwrap();
-    let token = store
+    app.record_app_event(&event).unwrap();
+    let token = app
         .reserve_attachment_upload(GROUP, 3, 11)
         .unwrap()
         .unwrap();
     let StageOutcome::Staged { id, digest: sealed } = media
         .stage(
-            &store.attachment_upload_stage(&token),
+            &app.attachment_upload_stage(&token),
             Category::Retained,
             &mut std::io::Cursor::new(BODY),
             BODY.len() as u64,
@@ -44,12 +45,11 @@ fn staged_send(
         panic!("staged");
     };
     assert_eq!(sealed, digest());
-    store
-        .bind_attachment_uploads(
-            std::slice::from_ref(&token),
-            &[(selected(message).slot, digest())],
-        )
-        .unwrap();
+    app.bind_attachment_uploads(
+        std::slice::from_ref(&token),
+        &[(selected(message).slot, digest())],
+    )
+    .unwrap();
     (token, id)
 }
 
@@ -67,13 +67,14 @@ fn count(store: &SqliteAccountStorage, query: &str, id: &media_store::FileId) ->
 fn a_promoted_upload_is_consumed_and_its_file_retained() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let media = media(&dir, &store);
+    let app = store.app_storage();
+    let media = media(&dir, &app);
     let (token, id) = staged_send(&store, &media, "sent");
-    assert_eq!(store.attachment_upload_file(&token).unwrap(), Some(id));
+    assert_eq!(app.attachment_upload_file(&token).unwrap(), Some(id));
     assert_eq!(
         media
             .promote(
-                &store.attachment_upload_promotion(GROUP, "sent", &token, || 12),
+                &app.attachment_upload_promotion(GROUP, "sent", &token, || 12),
                 id
             )
             .unwrap(),
@@ -89,7 +90,7 @@ fn a_promoted_upload_is_consumed_and_its_file_retained() {
         1
     );
     assert_eq!(
-        store.attachment_upload_file(&token).unwrap(),
+        app.attachment_upload_file(&token).unwrap(),
         None,
         "consumed"
     );
@@ -105,13 +106,14 @@ fn a_promoted_upload_is_consumed_and_its_file_retained() {
 fn a_removed_slot_refuses_promotion() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let media = media(&dir, &store);
+    let app = store.app_storage();
+    let media = media(&dir, &app);
     let (token, id) = staged_send(&store, &media, "removed");
-    store.remove_local_attachment(GROUP, "removed", 0).unwrap();
+    app.remove_local_attachment(GROUP, "removed", 0).unwrap();
     assert_eq!(
         media
             .promote(
-                &store.attachment_upload_promotion(GROUP, "removed", &token, || 12),
+                &app.attachment_upload_promotion(GROUP, "removed", &token, || 12),
                 id
             )
             .unwrap(),
@@ -126,15 +128,16 @@ fn a_removed_slot_refuses_promotion() {
 fn an_expired_upload_releases_its_staged_file() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let media = media(&dir, &store);
+    let app = store.app_storage();
+    let media = media(&dir, &app);
     seed(&store, "orphan");
-    let token = store
+    let token = app
         .reserve_attachment_upload(GROUP, 3, 11)
         .unwrap()
         .unwrap();
     let StageOutcome::Staged { id, .. } = media
         .stage(
-            &store.attachment_upload_stage(&token),
+            &app.attachment_upload_stage(&token),
             Category::Retained,
             &mut std::io::Cursor::new(BODY),
             BODY.len() as u64,
@@ -146,8 +149,7 @@ fn an_expired_upload_releases_its_staged_file() {
         panic!("staged");
     };
     assert_eq!(
-        store
-            .prune_attachment_uploads(11 + 8 * 24 * 3600, 64)
+        app.prune_attachment_uploads(11 + 8 * 24 * 3600, 64)
             .unwrap(),
         1
     );
@@ -161,10 +163,11 @@ fn an_expired_upload_releases_its_staged_file() {
 fn legacy_promotion_skips_file_backed_uploads() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let media = media(&dir, &store);
+    let media = media(&dir, &store.app_storage());
     let (_, id) = staged_send(&store, &media, "legacy");
     assert_eq!(
         store
+            .app_storage()
             .promote_attachment_uploads(GROUP, "legacy", 12, u64::MAX)
             .unwrap(),
         0
@@ -178,14 +181,17 @@ fn legacy_promotion_skips_file_backed_uploads() {
 fn a_store_reset_clears_staged_files_and_their_upload_references() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let media = media(&dir, &store);
+    let media = media(&dir, &store.app_storage());
     let (token, id) = staged_send(&store, &media, "reset");
     sql(
         &store,
         "UPDATE chat_presentation_meta SET store_epoch=randomblob(16) WHERE id=1",
     );
     assert_eq!(media.file_state(&id).unwrap(), None);
-    assert_eq!(store.attachment_upload_file(&token).unwrap(), None);
+    assert_eq!(
+        store.app_storage().attachment_upload_file(&token).unwrap(),
+        None
+    );
 }
 
 /// Releasing a staged upload clears its reference and deletes the staged
@@ -194,21 +200,22 @@ fn a_store_reset_clears_staged_files_and_their_upload_references() {
 fn releasing_a_staged_upload_keeps_the_upload_row() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let media = media(&dir, &store);
+    let app = store.app_storage();
+    let media = media(&dir, &app);
     let (token, id) = staged_send(&store, &media, "release");
     assert!(
         media
-            .release_staged(&store.attachment_upload_stage(&token), id)
+            .release_staged(&app.attachment_upload_stage(&token), id)
             .unwrap()
     );
     assert_eq!(media.file_state(&id).unwrap(), None);
-    assert_eq!(store.attachment_upload_file(&token).unwrap(), None);
+    assert_eq!(app.attachment_upload_file(&token).unwrap(), None);
     assert!(!media.path(&id).exists());
 }
 
 /// Stage `BODY` into a fresh upload bound to `message`'s slot.
 fn stage_upload(
-    store: &SqliteAccountStorage,
+    store: &SqliteAppStorage,
     media: &MediaStore<crate::SqliteMediaCatalog>,
     message: &str,
 ) -> (Vec<u8>, media_store::FileId) {
@@ -246,45 +253,46 @@ fn stage_upload(
 fn a_shared_upload_keeps_its_file_for_the_message_still_waiting() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let media = media(&dir, &store);
+    let app = store.app_storage();
+    let media = media(&dir, &app);
     let (token, id) = staged_send(&store, &media, "first");
     let mut second = source("second");
     second.direction = "sent".into();
-    store.record_app_event(&second).unwrap();
+    app.record_app_event(&second).unwrap();
 
     assert_eq!(
         media
             .promote(
-                &store.attachment_upload_promotion(GROUP, "first", &token, || 12),
+                &app.attachment_upload_promotion(GROUP, "first", &token, || 12),
                 id
             )
             .unwrap(),
         PromoteOutcome::Ready
     );
     assert_eq!(
-        store.attachment_upload_file(&token).unwrap(),
+        app.attachment_upload_file(&token).unwrap(),
         Some(id),
         "the second message still owns the upload"
     );
-    store.remove_local_attachment(GROUP, "first", 0).unwrap();
+    app.remove_local_attachment(GROUP, "first", 0).unwrap();
     assert_eq!(media.file_state(&id).unwrap(), Some(FileState::Ready));
 
     assert_eq!(
         media
             .promote(
-                &store.attachment_upload_promotion(GROUP, "second", &token, || 12),
+                &app.attachment_upload_promotion(GROUP, "second", &token, || 12),
                 id
             )
             .unwrap(),
         PromoteOutcome::Ready
     );
     assert_eq!(
-        store.attachment_upload_file(&token).unwrap(),
+        app.attachment_upload_file(&token).unwrap(),
         None,
         "consumed"
     );
     assert_eq!(media.file_state(&id).unwrap(), Some(FileState::Ready));
-    store.remove_local_attachment(GROUP, "second", 0).unwrap();
+    app.remove_local_attachment(GROUP, "second", 0).unwrap();
     assert_eq!(
         media.file_state(&id).unwrap(),
         None,
@@ -298,35 +306,36 @@ fn a_shared_upload_keeps_its_file_for_the_message_still_waiting() {
 fn an_upload_whose_slots_are_already_filled_is_released() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let media = media(&dir, &store);
+    let app = store.app_storage();
+    let media = media(&dir, &app);
     let (first, first_id) = staged_send(&store, &media, "filled");
     assert_eq!(
         media
             .promote(
-                &store.attachment_upload_promotion(GROUP, "filled", &first, || 12),
+                &app.attachment_upload_promotion(GROUP, "filled", &first, || 12),
                 first_id
             )
             .unwrap(),
         PromoteOutcome::Ready
     );
-    let (token, id) = stage_upload(&store, &media, "filled");
+    let (token, id) = stage_upload(&app, &media, "filled");
     assert_eq!(
         media
             .promote(
-                &store.attachment_upload_promotion(GROUP, "filled", &token, || 12),
+                &app.attachment_upload_promotion(GROUP, "filled", &token, || 12),
                 id
             )
             .unwrap(),
         PromoteOutcome::Released
     );
-    assert_eq!(store.attachment_upload_file(&token).unwrap(), None);
+    assert_eq!(app.attachment_upload_file(&token).unwrap(), None);
     assert_eq!(media.file_state(&id).unwrap(), None);
     assert!(!media.path(&id).exists());
     assert_eq!(media.file_state(&first_id).unwrap(), Some(FileState::Ready));
 }
 
 /// The message owning `message`'s upload, as admission records it.
-fn protect(store: &SqliteAccountStorage, message: &str) {
+fn protect(store: &SqliteAppStorage, message: &str) {
     let tag: Vec<String> = serde_json::from_value(selected(message).slot).unwrap();
     store
         .protect_attachment_uploads(GROUP, message, &[tag])
@@ -340,15 +349,16 @@ fn protect(store: &SqliteAccountStorage, message: &str) {
 fn owned_file_backed_uploads_are_paged_for_promotion() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let media = media(&dir, &store);
+    let app = store.app_storage();
+    let media = media(&dir, &app);
     seed(&store, "unbound");
-    let unbound = store
+    let unbound = app
         .reserve_attachment_upload(GROUP, 3, 11)
         .unwrap()
         .unwrap();
     media
         .stage(
-            &store.attachment_upload_stage(&unbound),
+            &app.attachment_upload_stage(&unbound),
             Category::Retained,
             &mut std::io::Cursor::new(BODY),
             BODY.len() as u64,
@@ -357,7 +367,7 @@ fn owned_file_backed_uploads_are_paged_for_promotion() {
         )
         .unwrap();
     assert!(
-        store.attachment_upload_owners(None, 8).unwrap().is_empty(),
+        app.attachment_upload_owners(None, 8).unwrap().is_empty(),
         "an upload not yet bound to a descriptor is never promoted"
     );
     // Bound uploads are found through the sent message's descriptor, with or
@@ -366,7 +376,7 @@ fn owned_file_backed_uploads_are_paged_for_promotion() {
     let (second, _) = staged_send(&store, &media, "second");
     // The fixture's sends share one descriptor, so each message carries both
     // uploads: four (upload, message) pairs.
-    let all = store.attachment_upload_owners(None, 8).unwrap();
+    let all = app.attachment_upload_owners(None, 8).unwrap();
     let key =
         |owner: &crate::AttachmentUploadOwner| (owner.token.clone(), owner.message_id_hex.clone());
     let mut sorted = all.iter().map(key).collect::<Vec<_>>();
@@ -382,7 +392,7 @@ fn owned_file_backed_uploads_are_paged_for_promotion() {
     let mut paged = Vec::new();
     let mut after = None;
     loop {
-        let page = store.attachment_upload_owners(after.as_ref(), 1).unwrap();
+        let page = app.attachment_upload_owners(after.as_ref(), 1).unwrap();
         let Some(last) = page.last().cloned() else {
             break;
         };
@@ -398,17 +408,18 @@ fn owned_file_backed_uploads_are_paged_for_promotion() {
 fn an_upload_with_a_lost_file_is_dropped() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let media = media(&dir, &store);
+    let app = store.app_storage();
+    let media = media(&dir, &app);
     let (token, id) = staged_send(&store, &media, "lost");
-    protect(&store, "lost");
-    assert!(!store.drop_lost_attachment_upload(&token, id).unwrap());
+    protect(&app, "lost");
+    assert!(!app.drop_lost_attachment_upload(&token, id).unwrap());
     // Promotion runs before any read or sweep notices the missing file: it
     // must mark it lost, not record the slot as retained.
     std::fs::remove_file(media.path(&id)).unwrap();
     assert_eq!(
         media
             .promote(
-                &store.attachment_upload_promotion(GROUP, "lost", &token, || 12),
+                &app.attachment_upload_promotion(GROUP, "lost", &token, || 12),
                 id
             )
             .unwrap(),
@@ -425,13 +436,11 @@ fn an_upload_with_a_lost_file_is_dropped() {
         )
         .unwrap();
     assert_eq!(retained, 0, "the slot is not recorded as retained");
-    assert!(store.drop_lost_attachment_upload(&token, id).unwrap());
-    assert_eq!(store.attachment_upload_file(&token).unwrap(), None);
+    assert!(app.drop_lost_attachment_upload(&token, id).unwrap());
+    assert_eq!(app.attachment_upload_file(&token).unwrap(), None);
     assert_eq!(media.file_state(&id).unwrap(), None);
     assert!(
-        !store
-            .attachment_source_has_upload(GROUP, "lost", 0)
-            .unwrap(),
+        !app.attachment_source_has_upload(GROUP, "lost", 0).unwrap(),
         "the slot no longer waits for an upload"
     );
 }
@@ -445,7 +454,7 @@ fn ownerless_file_backed_uploads_survive_abandonment_and_promote() {
     let path = dir.path().join("ownerless.sqlite");
     let key = SqlCipherKey::new("generated-ownerless-key").unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    let files = media(&dir, &store);
+    let files = media(&dir, &store.app_storage());
     seed(&store, "seed");
     for (id, pending) in [("pending-ownerless", true), ("confirmed-ownerless", false)] {
         let mut event = source(id);
@@ -454,15 +463,16 @@ fn ownerless_file_backed_uploads_survive_abandonment_and_promote() {
             event.source_message_id_hex = None;
             event.source_epoch = None;
         }
-        store.record_app_event(&event).unwrap();
+        store.app_storage().record_app_event(&event).unwrap();
         let token = store
+            .app_storage()
             .reserve_attachment_upload(GROUP, 3, 11)
             .unwrap()
             .unwrap();
         assert!(matches!(
             files
                 .stage(
-                    &store.attachment_upload_stage(&token),
+                    &store.app_storage().attachment_upload_stage(&token),
                     Category::Retained,
                     &mut std::io::Cursor::new(BODY),
                     BODY.len() as u64,
@@ -473,6 +483,7 @@ fn ownerless_file_backed_uploads_survive_abandonment_and_promote() {
             StageOutcome::Staged { .. }
         ));
         store
+            .app_storage()
             .bind_attachment_uploads(
                 std::slice::from_ref(&token),
                 &[(selected(id).slot, digest())],
@@ -484,12 +495,17 @@ fn ownerless_file_backed_uploads_survive_abandonment_and_promote() {
         );
         assert!(
             store
+                .app_storage()
                 .protect_attachment_uploads(GROUP, id, &event.tags)
                 .is_err()
         );
         sql(&store, "DROP TRIGGER fail_owner");
-        store.abandon_attachment_uploads(&[token]).unwrap();
         store
+            .app_storage()
+            .abandon_attachment_uploads(&[token])
+            .unwrap();
+        store
+            .app_storage()
             .abandon_bound_attachment_uploads(GROUP, &[selected(id).slot])
             .unwrap();
     }
@@ -506,13 +522,14 @@ fn ownerless_file_backed_uploads_survive_abandonment_and_promote() {
     drop(files);
     store.close().unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    let files = media(&dir, &store);
+    let app = store.app_storage();
+    let files = media(&dir, &app);
     let mut event = source("pending-ownerless");
     event.direction = "sent".into();
-    store.record_app_event(&event).unwrap();
+    app.record_app_event(&event).unwrap();
     let mut promoted = 0;
-    for owner in store.attachment_upload_owners(None, 8).unwrap() {
-        let target = store.attachment_upload_promotion(
+    for owner in app.attachment_upload_owners(None, 8).unwrap() {
+        let target = app.attachment_upload_promotion(
             &owner.group_id_hex,
             &owner.message_id_hex,
             &owner.token,
@@ -527,7 +544,7 @@ fn ownerless_file_backed_uploads_survive_abandonment_and_promote() {
     }
     assert!(promoted > 0);
     for id in ["pending-ownerless", "confirmed-ownerless"] {
-        let asset = request(&store, id);
+        let asset = request(&app, id);
         let file: Vec<u8> = store
             .lock()
             .unwrap()

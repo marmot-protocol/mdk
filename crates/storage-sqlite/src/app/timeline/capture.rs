@@ -1,6 +1,7 @@
 //! One immutable account read for a conversation window. Engine lifecycle and
 //! directory identities have separate owners; neither is guessed by storage.
 use super::*;
+use crate::SqliteAppStorage;
 use crate::{ChatPresentationInput, SelectedMessageDraft};
 
 /// Persisted inputs captured together. The timeline has a single owner in
@@ -31,7 +32,7 @@ impl std::fmt::Debug for ConversationAccountSnapshot {
     }
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Read history, provenance, presentation inputs, composer descriptors and
     /// local controls under one deferred read snapshot. No attachment bytes,
     /// full group record, roster, network, preparation or read acknowledgement.

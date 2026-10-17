@@ -2,8 +2,10 @@
 //! draft a confirmed message came from, consumed in the engine's transaction,
 //! and the draft observer the app registers.
 
-use crate::SqliteAccountStorage;
-use crate::app::message_drafts::revisioned::{DraftAcceptance, accept_submission_tx};
+use crate::app::message_drafts::revisioned::{
+    DraftAcceptance, MessageDraftCommitObserver, accept_submission_tx,
+};
+use crate::{SqliteAccountStorage, SqliteAppStorage};
 use cgka_traits::storage::StorageResult;
 
 /// Accepts the submission and draft of a queued app message, identified by its
@@ -14,7 +16,7 @@ pub(crate) fn accept_confirmed_payload(
     payload: &[u8],
 ) -> StorageResult<bool> {
     use sha2::{Digest, Sha256};
-    SqliteAccountStorage::accept_local_submission_tx(
+    SqliteAppStorage::accept_local_submission_tx(
         conn,
         group_hex,
         "payload_hash",
@@ -30,7 +32,7 @@ pub(crate) fn accept_confirmed_event(
     group_hex: &str,
     app_event_id: &str,
 ) -> StorageResult<bool> {
-    SqliteAccountStorage::accept_local_submission_tx(
+    SqliteAppStorage::accept_local_submission_tx(
         conn,
         group_hex,
         "app_event_id",
@@ -42,4 +44,27 @@ pub(crate) fn accept_confirmed_event(
 /// Wakes the app's draft observer after a confirm that changed a draft.
 pub(crate) fn notify_draft_committed(storage: &SqliteAccountStorage, group_hex: &str) {
     storage.notify_message_draft_committed(group_hex);
+}
+
+impl SqliteAccountStorage {
+    /// Install the app owner's coalesced wakeup. The callback must not panic.
+    /// Nested writes defer notification until the outer transaction commits.
+    #[doc(hidden)]
+    pub fn set_message_draft_commit_observer(&self, observer: MessageDraftCommitObserver) {
+        *self
+            .draft_commit_observer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(observer);
+    }
+    pub(crate) fn notify_message_draft_committed(&self, group: &str) {
+        let observer = self
+            .draft_commit_observer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(observer) = observer {
+            let group = group.to_owned();
+            self.connection.after_commit(move || observer(&group));
+        }
+    }
 }

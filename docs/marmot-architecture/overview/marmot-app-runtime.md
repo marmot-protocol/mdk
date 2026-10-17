@@ -139,7 +139,7 @@ add the incremental, bounded, non-blocking, single-source properties around it s
 
 1. **Storage ordering surfaces** (`storage-sqlite`). Two DISTINCT, separately-named orders that MUST NOT be conflated:
    - **Raw-event replay cursor** — `AppEventReplayCursor` = `(recorded_at, message_id_hex, insert_order)` over the
-     `app_events` table (queried via `SqliteAccountStorage::app_messages`), with a matching
+     `app_events` table (queried via `SqliteAppStorage::app_messages`), with a matching
      `APP_EVENT_REPLAY_ORDER_ASC/_DESC` SQL fragment. `insert_order` is a LOCAL rowid,
      correct here because this cursor is only a per-client lag-recovery cut-point (never cross-client display). The
      third field is load-bearing for unscoped (all-groups) recovery, where the same `message_id_hex` can appear in two

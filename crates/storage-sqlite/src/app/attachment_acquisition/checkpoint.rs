@@ -4,6 +4,7 @@
 //! `attachment_partial` row, each call one transaction under the attempt's
 //! fences, so a stale or cancelled attempt can never change a newer one's
 //! checkpoint.
+use crate::SqliteAppStorage;
 use media_store::{CatalogResult, CheckpointStart, CheckpointTarget, FileId};
 
 use super::*;
@@ -20,13 +21,13 @@ enum Scope {
 
 /// One claimed acquisition's download checkpoint.
 pub struct AttachmentCheckpoint {
-    storage: SqliteAccountStorage,
+    storage: SqliteAppStorage,
     job: AttachmentAcquisition,
     scope: Scope,
     clock: fn() -> u64,
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// The checkpoint `job` is saving for `identity`. `clock` gives Unix
     /// seconds for the attempt fences at each call; it must not block.
     pub fn attachment_checkpoint(

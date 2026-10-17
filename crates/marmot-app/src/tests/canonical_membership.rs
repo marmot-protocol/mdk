@@ -1012,7 +1012,7 @@ async fn termination_then_restoration_preserves_failed_sends_and_archive() {
         let peer = nostr::prelude::Keys::generate().public_key().to_hex();
         let peer_token = drained_seam_push_token(&group_hex, &peer, 7);
         app.upsert_group_push_token("alice", &peer_token).unwrap();
-        let storage = app.account_storage("alice").unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
         let mut withdrawn = peer_token.clone();
         withdrawn.leaf_index = 8;
         storage

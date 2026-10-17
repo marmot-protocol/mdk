@@ -35,7 +35,7 @@ The crate is split by which side owns each table (see the
   transport-specific app storage: delivery spill, NIP-77 reconciliation, user blocks, the moderation outbox, agent
   stream sequences and prepared group-image uploads.
 - `SqliteAppStorage` (`app/handle.rs`) — the app side's handle, over the same connection; get it with
-  `storage.app_storage()`. App storage methods are moving onto it a folder at a time.
+  `storage.app_storage()`. Every app and transport method is on it.
 - `cross/` — the code that must touch both sides in one transaction, one named function per crossing.
 - `shared.rs` + `shared/` — `SqliteSharedStorage`, a separate, non-account-scoped database for cross-identity state
   (public-directory cache and presentation, relay-telemetry, usage-diagnostics and audit-log settings, the telemetry

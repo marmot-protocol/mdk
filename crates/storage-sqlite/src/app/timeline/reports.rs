@@ -1,5 +1,8 @@
 //! Individual in-group reports and admin dismissal labels. No shared review workflow.
 use super::*;
+#[cfg(test)]
+use crate::SqliteAccountStorage;
+use crate::SqliteAppStorage;
 use cgka_traits::app_event::AppMessageAuthority;
 use cgka_traits::reporting::{ReportReason, parse_dismissal, parse_removal, parse_report};
 
@@ -180,7 +183,7 @@ fn dismissal_page(
         next_cursor: None,
     })
 }
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Source authority is stored atomically with its dependent projections.
     pub fn record_app_event_with_source(
         &self,
@@ -463,7 +466,7 @@ pub(super) fn retain_pruned_controls(
     Ok(count)
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Repair only indexed deletion, edit and moderation events in the captured
     /// pre-migration prefix. Ordinary history is neither scanned nor reprojected.
     pub fn backfill_content_reports(
@@ -676,12 +679,12 @@ mod tests {
             moderation_grant: grant,
         }
     }
-    fn record(s: &SqliteAccountStorage, e: &StoredAppEvent) {
+    fn record(s: &SqliteAppStorage, e: &StoredAppEvent) {
         let proof =
             cgka_traits::reporting::requires_source_authority(e.kind).then(|| authority(true));
         s.record_app_event_with_source(e, None, proof).unwrap();
     }
-    fn page(s: &SqliteAccountStorage) -> ContentReportPage {
+    fn page(s: &SqliteAppStorage) -> ContentReportPage {
         s.content_reports(&id(99), None, None, 100).unwrap()
     }
     #[test]
@@ -694,29 +697,34 @@ mod tests {
                 let key = SqlCipherKey::new("07".repeat(32)).unwrap();
                 let s = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
                 let author = if admin_is_author { 20 } else { 10 };
-                record(&s, &event(1, author, 9, vec![], "original"));
+                record(&s.app_storage(), &event(1, author, 9, vec![], "original"));
                 let mut complaint = report(5);
                 complaint.tags[1][1] = id(author);
-                record(&s, &complaint);
-                record(&s, &event(2, 11, 9, vec![vec!["e".into(), id(1)]], "reply"));
+                record(&s.app_storage(), &complaint);
+                record(
+                    &s.app_storage(),
+                    &event(2, 11, 9, vec![vec!["e".into(), id(1)]], "reply"),
+                );
                 let mut author_delete = event(3, author, 5, vec![vec!["e".into(), id(1)]], "");
                 let mut admin_delete = removal(4, 1);
                 // Same authenticated timestamp: event id resolves the tie, not arrival order.
                 author_delete.recorded_at = 10;
                 admin_delete.recorded_at = 10;
                 if reverse {
-                    record(&s, &admin_delete);
-                    record(&s, &author_delete);
+                    record(&s.app_storage(), &admin_delete);
+                    record(&s.app_storage(), &author_delete);
                 } else {
-                    record(&s, &author_delete);
+                    record(&s.app_storage(), &author_delete);
                     assert_eq!(
-                        s.timeline_message(&id(99), &id(1))
+                        s.app_storage()
+                            .timeline_message(&id(99), &id(1))
                             .unwrap()
                             .unwrap()
                             .deletion_source,
                         DeletionSource::Author
                     );
                     let update = s
+                        .app_storage()
                         .record_app_event_with_source(&admin_delete, None, Some(authority(true)))
                         .unwrap();
                     assert!(
@@ -731,7 +739,9 @@ mod tests {
                     }));
                 }
                 drop(s);
-                let s = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+                let s = SqliteAccountStorage::open_encrypted(&path, &key)
+                    .unwrap()
+                    .app_storage();
                 for rebuild in [false, true] {
                     if rebuild {
                         s.rebuild_message_timeline_for_group(&id(99)).unwrap();
@@ -790,7 +800,7 @@ mod tests {
             [2, 0, 1],
             [2, 1, 0],
         ] {
-            let s = SqliteAccountStorage::in_memory().unwrap();
+            let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
             for n in order {
                 record(&s, &events[n]);
             }
@@ -808,7 +818,7 @@ mod tests {
     }
     #[test]
     fn reports_and_admin_labels_remain_independent_events() {
-        let s = SqliteAccountStorage::in_memory().unwrap();
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
         for e in [
             target(),
             report(2),
@@ -853,7 +863,7 @@ mod tests {
     }
     #[test]
     fn only_same_group_reports_and_source_authorized_labels_take_effect() {
-        let s = SqliteAccountStorage::in_memory().unwrap();
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
         record(&s, &report(2));
         let mut wrong = report(3);
         wrong.tags[1][1] = id(12);
@@ -886,7 +896,7 @@ mod tests {
     fn removal_requires_resolved_source_authority_in_both_projections() {
         // Exercise controls both before and after their target arrives.
         for control_first in [false, true] {
-            let s = SqliteAccountStorage::in_memory().unwrap();
+            let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
             if !control_first {
                 record(&s, &target());
             }
@@ -947,7 +957,7 @@ mod tests {
             dismiss(5, &[2]),
         ];
         for order in [[0, 1, 2, 3, 4], [2, 3, 4, 1, 0], [4, 3, 2, 1, 0]] {
-            let s = SqliteAccountStorage::in_memory().unwrap();
+            let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
             for n in order {
                 record(&s, &events[n]);
             }
@@ -971,7 +981,7 @@ mod tests {
     }
     #[test]
     fn expiry_of_target_does_not_expire_report_explanations() {
-        let s = SqliteAccountStorage::in_memory().unwrap();
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
         s.record_app_event_with_source(
             &target(),
             Some(AppMessageRetentionDecision {
@@ -1003,10 +1013,11 @@ mod tests {
             }
         }
         let s = SqliteAccountStorage::in_memory().unwrap();
-        record(&s, &target());
-        record(&s, &report(2));
-        record(&s, &report(3));
-        let template = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+        let s_app = s.app_storage();
+        record(&s_app, &target());
+        record(&s_app, &report(2));
+        record(&s_app, &report(3));
+        let template = s_app.timeline_message(&id(99), &id(1)).unwrap().unwrap();
         let count = 2 * (SQLITE_BIND_PARAMETER_CHUNK / 4) + 1;
         let mut messages = (0..count)
             .map(|n| {
@@ -1034,7 +1045,7 @@ mod tests {
     }
     #[test]
     fn indexed_report_and_label_pages_are_bounded() {
-        let s = SqliteAccountStorage::in_memory().unwrap();
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
         record(&s, &target());
         for n in 20..130 {
             record(&s, &report(n));
@@ -1062,12 +1073,14 @@ mod tests {
     #[test]
     fn projection_failure_rolls_back_raw_event_and_retry_is_safe() {
         let s = SqliteAccountStorage::in_memory().unwrap();
-        record(&s, &target());
+        let s_app = s.app_storage();
+        record(&s_app, &target());
         s.lock().unwrap().execute_batch("CREATE TRIGGER fail_report BEFORE INSERT ON content_reports BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
-        assert!(s.record_app_event(&report(2)).is_err());
+        assert!(s_app.record_app_event(&report(2)).is_err());
         assert!(raw(&s.lock().unwrap(), &id(99), &id(2)).unwrap().is_none());
         assert!(
-            !s.timeline_message(&id(99), &id(1))
+            !s_app
+                .timeline_message(&id(99), &id(1))
                 .unwrap()
                 .unwrap()
                 .has_reports
@@ -1076,12 +1089,13 @@ mod tests {
             .unwrap()
             .execute_batch("DROP TRIGGER fail_report")
             .unwrap();
-        record(&s, &report(2));
-        assert_eq!(page(&s).reports.len(), 1);
+        record(&s_app, &report(2));
+        assert_eq!(page(&s_app).reports.len(), 1);
     }
     #[test]
     fn bounded_backfill_restores_individual_reports_and_progress() {
         let s = SqliteAccountStorage::in_memory().unwrap();
+        let s_app = s.app_storage();
         for e in [
             target(),
             report(2),
@@ -1089,11 +1103,11 @@ mod tests {
             event(4, 10, 1009, vec![vec!["e".into(), id(1)]], "edit"),
             event(5, 10, 5, vec![vec!["e".into(), id(1)]], ""),
         ] {
-            record(&s, &e);
+            record(&s_app, &e);
         }
         s.lock().unwrap().execute_batch("DELETE FROM content_reports; DELETE FROM message_modifier_edges WHERE kind IN (1009,1984,1985,4891); UPDATE message_timeline SET deleted=0,plaintext='stale'; UPDATE content_report_backfill SET after_order=0,through_order=(SELECT MAX(insert_order) FROM app_events)").unwrap();
         for expected in 2..=5 {
-            s.backfill_content_reports(1).unwrap();
+            s_app.backfill_content_reports(1).unwrap();
             let progress: i64 = s
                 .lock()
                 .unwrap()
@@ -1103,38 +1117,40 @@ mod tests {
                 .unwrap();
             assert_eq!(progress, expected);
         }
-        assert!(page(&s).reports[0].dismissed);
-        let message = s.timeline_message(&id(99), &id(1)).unwrap().unwrap();
+        assert!(page(&s_app).reports[0].dismissed);
+        let message = s_app.timeline_message(&id(99), &id(1)).unwrap().unwrap();
         assert!(message.deleted && message.plaintext.is_empty());
-        assert!(s.timeline_message(&id(99), &id(4)).unwrap().is_none());
-        assert!(s.backfill_content_reports(1).unwrap().is_empty());
+        assert!(s_app.timeline_message(&id(99), &id(4)).unwrap().is_none());
+        assert!(s_app.backfill_content_reports(1).unwrap().is_empty());
     }
     #[test]
     fn blocking_does_not_filter_report_records_or_labels() {
         let s = SqliteAccountStorage::in_memory().unwrap();
+        let s_app = s.app_storage();
         for e in [target(), report(2), dismiss(3, &[2])] {
-            record(&s, &e);
+            record(&s_app, &e);
         }
         s.lock()
             .unwrap()
             .execute("INSERT INTO user_blocks VALUES(?1,0,0)", params![id(11)])
             .unwrap();
-        assert!(page(&s).reports[0].dismissed);
-        assert_eq!(page(&s).reports[0].reporter, id(11));
+        assert!(page(&s_app).reports[0].dismissed);
+        assert_eq!(page(&s_app).reports[0].reporter, id(11));
         s.lock()
             .unwrap()
             .execute("INSERT INTO user_blocks VALUES(?1,0,0)", params![id(10)])
             .unwrap();
-        assert!(s.timeline_message(&id(99), &id(1)).unwrap().is_none());
+        assert!(s_app.timeline_message(&id(99), &id(1)).unwrap().is_none());
         assert_eq!(
-            s.reported_message(&id(99), &id(1))
+            s_app
+                .reported_message(&id(99), &id(1))
                 .unwrap()
                 .unwrap()
                 .plaintext,
             "original"
         );
-        record(&s, &removal(4, 1));
-        let current = s.reported_message(&id(99), &id(1)).unwrap().unwrap();
+        record(&s_app, &removal(4, 1));
+        let current = s_app.reported_message(&id(99), &id(1)).unwrap().unwrap();
         assert!(current.deleted && current.plaintext.is_empty());
     }
     #[test]
@@ -1145,7 +1161,7 @@ mod tests {
         });
         let mut deletion = event(2, 20, 5, vec![vec!["e".into(), id(1)]], "");
         deletion.moderation_grant = true;
-        let s = SqliteAccountStorage::in_memory().unwrap();
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
         s.record_app_event(&target()).unwrap();
         s.record_app_event_with_source(&deletion, None, authority)
             .unwrap();
@@ -1174,7 +1190,7 @@ mod tests {
                 .unwrap()
                 .deleted
         );
-        let legacy = SqliteAccountStorage::in_memory().unwrap();
+        let legacy = SqliteAccountStorage::in_memory().unwrap().app_storage();
         legacy.record_app_event(&target()).unwrap();
         legacy.record_app_event(&deletion).unwrap();
         legacy
@@ -1196,7 +1212,7 @@ mod tests {
     }
     #[test]
     fn deleted_custom_tags_are_masked_on_reads_and_restored_on_withdrawal() {
-        let s = SqliteAccountStorage::in_memory().unwrap();
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let tags = vec![vec!["title".into(), "classified title".into()]];
         record(&s, &event(1, 10, 30402, tags.clone(), "listing"));
         record(&s, &event(2, 10, 5, vec![vec!["e".into(), id(1)]], ""));
@@ -1225,7 +1241,7 @@ mod tests {
 
     #[test]
     fn admin_deletion_masks_media_reply_search_and_edit_history() {
-        let s = SqliteAccountStorage::in_memory().unwrap();
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let mut message = target();
         message.tags.push(vec![
             "imeta".into(),
@@ -1283,7 +1299,7 @@ mod tests {
     }
     #[test]
     fn expired_deletion_evidence_prevents_late_content_resurrection() {
-        let s = SqliteAccountStorage::in_memory().unwrap();
+        let s = SqliteAccountStorage::in_memory().unwrap().app_storage();
         for e in [target(), removal(2, 1)] {
             record(&s, &e);
         }

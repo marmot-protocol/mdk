@@ -2,7 +2,7 @@ use super::*;
 use crate::{MarmotApp, MediaAttachmentOutcome};
 use marmot_account::AccountHome;
 use storage_sqlite::StoredAppEvent;
-fn add(s: &storage_sqlite::SqliteAccountStorage, group: &str, id: u64) {
+fn add(s: &storage_sqlite::SqliteAppStorage, group: &str, id: u64) {
     s.record_app_event(&StoredAppEvent {
         group_id_hex: group.into(),
         message_id_hex: format!("{id:064x}"),
@@ -27,7 +27,7 @@ async fn account_pages_are_local_account_isolated_and_keep_typed_rejections() {
     home.create_account("alice").unwrap();
     home.create_account("bob").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let s = app.account_storage("alice").unwrap();
+    let s = app.account_storage("alice").unwrap().app_storage();
     let runtime = app.runtime();
     for id in 1..=3 {
         add(&s, if id == 2 { "bb" } else { "aa" }, id);
@@ -97,7 +97,7 @@ async fn native_block_policy_fences_global_pages_and_never_returns_hidden_sender
         .create_account("alice")
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let s = app.account_storage("alice").unwrap();
+    let s = app.account_storage("alice").unwrap().app_storage();
     let runtime = app.runtime();
     add(&s, "aa", 1);
     add(&s, "bb", 2);
@@ -113,15 +113,14 @@ async fn native_block_policy_fences_global_pages_and_never_returns_hidden_sender
         event_created_at: 1,
         ..Default::default()
     };
-    s.app_storage()
-        .adopt_block_list(
-            &list,
-            &[("11".repeat(32), false)],
-            100,
-            &account.account_id_hex,
-            &|_, _| false,
-        )
-        .unwrap();
+    s.adopt_block_list(
+        &list,
+        &[("11".repeat(32), false)],
+        100,
+        &account.account_id_hex,
+        &|_, _| false,
+    )
+    .unwrap();
     assert!(matches!(
         runtime
             .account_attachment_history_page(

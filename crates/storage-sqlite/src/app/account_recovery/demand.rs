@@ -1,6 +1,9 @@
 //! Typed joins for non-legacy recovery callers. Duplicate requests do not rearm
 //! capability-blocked work, alter frozen scopes, or forgive account retry cost.
 use super::*;
+#[cfg(test)]
+use crate::SqliteAccountStorage;
+use crate::SqliteAppStorage;
 
 /// Identities are private to this account database. Job/operation identities
 /// come from their existing owner; recovery does not allocate another scheduler.
@@ -77,7 +80,7 @@ pub(super) fn recovery_cause(value: i64) -> StorageResult<RecoveryCause> {
     })
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     pub fn request_recovery(
         &self,
         request: RecoveryRequest<'_>,
@@ -401,6 +404,7 @@ mod tests {
     fn a_stale_explicit_close_keeps_a_newer_request() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let first = store
+            .app_storage()
             .request_recovery(
                 RecoveryRequest::ExplicitHistory {
                     operation_id: &[1; 16],
@@ -411,6 +415,7 @@ mod tests {
         // The second request lands between the first repair's pass and its
         // close.
         let second = store
+            .app_storage()
             .request_recovery(
                 RecoveryRequest::ExplicitHistory {
                     operation_id: &[2; 16],
@@ -422,22 +427,34 @@ mod tests {
         assert!(second.revision > first.revision);
         let explicit_pending = |store: &SqliteAccountStorage| {
             store
+                .app_storage()
                 .pending_recovery_demands()
                 .unwrap()
                 .iter()
                 .any(|demand| demand.cause == RecoveryCause::ExplicitHistory)
         };
-        assert!(!store.close_explicit_history_request(first).unwrap());
+        assert!(
+            !store
+                .app_storage()
+                .close_explicit_history_request(first)
+                .unwrap()
+        );
         assert!(explicit_pending(&store), "the newer request survives");
-        assert!(store.close_explicit_history_request(second).unwrap());
+        assert!(
+            store
+                .app_storage()
+                .close_explicit_history_request(second)
+                .unwrap()
+        );
         assert!(!explicit_pending(&store));
     }
 
     #[test]
     fn cancelling_one_caller_preserves_independent_demand_and_quiescence() {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
         let operation = [7; 16];
-        let caller = store
+        let caller = app
             .request_recovery(
                 RecoveryRequest::ExplicitHistory {
                     operation_id: &operation,
@@ -445,12 +462,10 @@ mod tests {
                 1000,
             )
             .unwrap();
-        store
-            .request_recovery(RecoveryRequest::IncrementalHistory, 1000)
+        app.request_recovery(RecoveryRequest::IncrementalHistory, 1000)
             .unwrap();
-        let fence = store.recovery_revision_fence().unwrap();
-        store
-            .reserve_recovery_attempt(&fence, 1000, 15000, true)
+        let fence = app.recovery_revision_fence().unwrap();
+        app.reserve_recovery_attempt(&fence, 1000, 15000, true)
             .unwrap()
             .unwrap();
         store
@@ -458,8 +473,8 @@ mod tests {
             .unwrap()
             .execute_batch("UPDATE account_recovery_obligations SET eligibility=3")
             .unwrap();
-        store.detach_recovery_waiter(caller).unwrap();
-        let joined = store
+        app.detach_recovery_waiter(caller).unwrap();
+        let joined = app
             .request_recovery(
                 RecoveryRequest::ExplicitHistory {
                     operation_id: &operation,
@@ -468,23 +483,22 @@ mod tests {
             )
             .unwrap();
         assert!(joined == caller);
-        store
-            .request_recovery(RecoveryRequest::IncrementalHistory, 999999)
+        app.request_recovery(RecoveryRequest::IncrementalHistory, 999999)
             .unwrap();
-        assert_eq!(store.recovery_revision_fence().unwrap(), fence);
-        assert_eq!(store.pending_recovery_demands().unwrap().len(), 2);
+        assert_eq!(app.recovery_revision_fence().unwrap(), fence);
+        assert_eq!(app.pending_recovery_demands().unwrap().len(), 2);
         assert!(
-            store
-                .recovery_eligible_revision_fence(false)
+            app.recovery_eligible_revision_fence(false)
                 .unwrap()
                 .obligations
                 .is_empty()
         );
-        assert_eq!(store.recovery_retry_state().unwrap().not_before_ms, 16000);
+        assert_eq!(app.recovery_retry_state().unwrap().not_before_ms, 16000);
     }
     #[test]
     fn maintenance_session_restore_and_reclamation_preserve_other_debt_and_retry() {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
         store
             .lock()
             .unwrap()
@@ -493,7 +507,7 @@ mod tests {
                 [b"group".as_slice()],
             )
             .unwrap();
-        let ticket = store
+        let ticket = app
             .request_recovery(
                 RecoveryRequest::MaintenanceBoundary {
                     job_id: b"job",
@@ -502,15 +516,14 @@ mod tests {
                 1,
             )
             .unwrap();
-        let other = store
+        let other = app
             .request_recovery(RecoveryRequest::IncrementalHistory, 1)
             .unwrap();
-        let fence = store.recovery_revision_fence().unwrap();
-        store
-            .reserve_recovery_attempt(&fence, 1, 15000, false)
+        let fence = app.recovery_revision_fence().unwrap();
+        app.reserve_recovery_attempt(&fence, 1, 15000, false)
             .unwrap()
             .unwrap();
-        let retry = store.recovery_retry_state().unwrap();
+        let retry = app.recovery_retry_state().unwrap();
         store
             .lock()
             .unwrap()
@@ -519,8 +532,8 @@ mod tests {
                 [ticket.id.as_slice()],
             )
             .unwrap();
-        store.restore_recovery_maintenance_session(ticket).unwrap();
-        let restored = store.pending_recovery_demands().unwrap();
+        app.restore_recovery_maintenance_session(ticket).unwrap();
+        let restored = app.pending_recovery_demands().unwrap();
         assert_eq!(
             restored
                 .iter()
@@ -530,17 +543,16 @@ mod tests {
                 .revision,
             ticket.revision + 1
         );
-        store.restore_recovery_maintenance_session(ticket).unwrap();
-        assert_eq!(store.recovery_retry_state().unwrap(), retry);
-        store
-            .retain_recovery_maintenance_jobs(&[(b"job".to_vec(), b"group".to_vec())])
+        app.restore_recovery_maintenance_session(ticket).unwrap();
+        assert_eq!(app.recovery_retry_state().unwrap(), retry);
+        app.retain_recovery_maintenance_jobs(&[(b"job".to_vec(), b"group".to_vec())])
             .unwrap();
-        assert_eq!(store.pending_recovery_demands().unwrap().len(), 2);
-        store.retain_recovery_maintenance_jobs(&[]).unwrap();
-        let retained = store.pending_recovery_demands().unwrap();
+        assert_eq!(app.pending_recovery_demands().unwrap().len(), 2);
+        app.retain_recovery_maintenance_jobs(&[]).unwrap();
+        let retained = app.pending_recovery_demands().unwrap();
         assert_eq!(retained.len(), 1);
         assert!(retained[0].ticket == other);
-        assert_eq!(store.recovery_retry_state().unwrap(), retry);
+        assert_eq!(app.recovery_retry_state().unwrap(), retry);
         let count: i64 = store
             .lock()
             .unwrap()
@@ -556,7 +568,8 @@ mod tests {
     #[test]
     fn successive_explicit_callers_reuse_debt_without_free_retry_or_stale_detach() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        let first = store
+        let app = store.app_storage();
+        let first = app
             .request_recovery(
                 RecoveryRequest::ExplicitHistory {
                     operation_id: &[0; 16],
@@ -564,14 +577,13 @@ mod tests {
                 1,
             )
             .unwrap();
-        let fence = store.recovery_revision_fence().unwrap();
-        store
-            .reserve_recovery_attempt(&fence, 1, 15000, true)
+        let fence = app.recovery_revision_fence().unwrap();
+        app.reserve_recovery_attempt(&fence, 1, 15000, true)
             .unwrap()
             .unwrap();
-        let retry = store.recovery_retry_state().unwrap();
+        let retry = app.recovery_retry_state().unwrap();
         for index in 1..100 {
-            let ticket = store
+            let ticket = app
                 .request_recovery(
                     RecoveryRequest::ExplicitHistory {
                         operation_id: &[index; 16],
@@ -581,9 +593,9 @@ mod tests {
                 .unwrap();
             assert_eq!(ticket.id, first.id);
             assert_eq!(ticket.revision, first.revision + u64::from(index));
-            store.detach_recovery_waiter(first).unwrap();
-            assert_eq!(store.pending_recovery_demands().unwrap().len(), 1);
-            assert_eq!(store.recovery_retry_state().unwrap(), retry);
+            app.detach_recovery_waiter(first).unwrap();
+            assert_eq!(app.pending_recovery_demands().unwrap().len(), 1);
+            assert_eq!(app.recovery_retry_state().unwrap(), retry);
         }
         let urgency: i64 = store
             .lock()
@@ -604,7 +616,8 @@ mod waiter_tests {
     #[test]
     fn abandoned_waiter_keeps_debt_and_satisfied_waiter_is_reclaimed() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        let ticket = store
+        let app = store.app_storage();
+        let ticket = app
             .request_recovery(
                 RecoveryRequest::ExplicitHistory {
                     operation_id: &[7; 16],
@@ -612,17 +625,17 @@ mod waiter_tests {
                 1,
             )
             .unwrap();
-        let fence = store.recovery_revision_fence().unwrap();
-        let retry = store
+        let fence = app.recovery_revision_fence().unwrap();
+        let retry = app
             .reserve_recovery_attempt(&fence, 1, 15_000, true)
             .unwrap()
             .unwrap();
-        store.restore_recovery_waiters().unwrap();
+        app.restore_recovery_waiters().unwrap();
         assert_eq!(
-            store.pending_recovery_demands().unwrap()[0].ticket.id,
+            app.pending_recovery_demands().unwrap()[0].ticket.id,
             ticket.id
         );
-        assert_eq!(store.recovery_retry_state().unwrap(), retry);
+        assert_eq!(app.recovery_retry_state().unwrap(), retry);
         assert_eq!(
             store
                 .lock()
@@ -640,7 +653,7 @@ mod waiter_tests {
             .unwrap()
             .execute("UPDATE account_recovery_obligations SET state=1", [])
             .unwrap();
-        store.detach_recovery_waiter(ticket).unwrap();
+        app.detach_recovery_waiter(ticket).unwrap();
         assert_eq!(
             store
                 .lock()
@@ -653,11 +666,11 @@ mod waiter_tests {
                 .unwrap(),
             0
         );
-        assert_eq!(store.recovery_retry_state().unwrap(), retry);
+        assert_eq!(app.recovery_retry_state().unwrap(), retry);
     }
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Admission pressure is demand, not permission for immediate replay into
     /// the same queue. Duplicate pressure joins one row and one waiting period.
     pub fn record_recovery_capacity_pressure(
@@ -713,63 +726,56 @@ mod capacity_tests {
     #[test]
     fn admission_pressure_waits_before_a_probe_without_resetting_retry_cost() {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
         store.put_group(&sample_group(gid(1), 1, 2)).unwrap();
-        store
-            .record_recovery_capacity_pressure(gid(1).as_slice(), 1, 1_000)
+        app.record_recovery_capacity_pressure(gid(1).as_slice(), 1, 1_000)
             .unwrap();
-        let original = store.recovery_revision_fence().unwrap();
-        store
-            .record_recovery_capacity_pressure(gid(1).as_slice(), 1, 5_000)
+        let original = app.recovery_revision_fence().unwrap();
+        app.record_recovery_capacity_pressure(gid(1).as_slice(), 1, 5_000)
             .unwrap();
-        assert_eq!(store.recovery_revision_fence().unwrap(), original);
-        store
-            .release_due_recovery_capacity_probes(15_999, 15_000)
+        assert_eq!(app.recovery_revision_fence().unwrap(), original);
+        app.release_due_recovery_capacity_probes(15_999, 15_000)
             .unwrap();
         assert!(
-            store
-                .recovery_eligible_revision_fence(false)
+            app.recovery_eligible_revision_fence(false)
                 .unwrap()
                 .obligations
                 .is_empty()
         );
-        assert_eq!(store.recovery_retry_state().unwrap().attempt_serial, 0);
-        store
-            .release_due_recovery_capacity_probes(16_000, 15_000)
+        assert_eq!(app.recovery_retry_state().unwrap().attempt_serial, 0);
+        app.release_due_recovery_capacity_probes(16_000, 15_000)
             .unwrap();
-        let fence = store.recovery_eligible_revision_fence(false).unwrap();
-        let first = store
+        let fence = app.recovery_eligible_revision_fence(false).unwrap();
+        let first = app
             .reserve_recovery_attempt(&fence, 16_000, 15_000, false)
             .unwrap()
             .unwrap();
-        store
-            .record_recovery_capacity_pressure(gid(1).as_slice(), 1, 16_001)
+        app.record_recovery_capacity_pressure(gid(1).as_slice(), 1, 16_001)
             .unwrap();
-        store
-            .release_due_recovery_capacity_probes(31_000, 15_000)
+        app.release_due_recovery_capacity_probes(31_000, 15_000)
             .unwrap();
         assert!(
-            store
-                .recovery_eligible_revision_fence(false)
+            app.recovery_eligible_revision_fence(false)
                 .unwrap()
                 .obligations
                 .is_empty()
         );
-        assert_eq!(store.recovery_retry_state().unwrap(), first);
-        store
-            .release_due_recovery_capacity_probes(31_001, 15_000)
+        assert_eq!(app.recovery_retry_state().unwrap(), first);
+        app.release_due_recovery_capacity_probes(31_001, 15_000)
             .unwrap();
-        let second = store
+        let second = app
             .reserve_recovery_attempt(&fence, 31_001, 30_000, false)
             .unwrap()
             .unwrap();
         assert_eq!(second.ordinal, 2);
-        assert_eq!(store.pending_recovery_demands().unwrap().len(), 1);
+        assert_eq!(app.pending_recovery_demands().unwrap().len(), 1);
     }
 
     #[test]
     fn abandoned_waiter_keeps_debt_and_satisfied_waiter_is_reclaimed() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        let ticket = store
+        let app = store.app_storage();
+        let ticket = app
             .request_recovery(
                 RecoveryRequest::ExplicitHistory {
                     operation_id: &[7; 16],
@@ -777,17 +783,17 @@ mod capacity_tests {
                 1,
             )
             .unwrap();
-        let fence = store.recovery_revision_fence().unwrap();
-        let retry = store
+        let fence = app.recovery_revision_fence().unwrap();
+        let retry = app
             .reserve_recovery_attempt(&fence, 1, 15_000, true)
             .unwrap()
             .unwrap();
-        store.restore_recovery_waiters().unwrap();
+        app.restore_recovery_waiters().unwrap();
         assert_eq!(
-            store.pending_recovery_demands().unwrap()[0].ticket.id,
+            app.pending_recovery_demands().unwrap()[0].ticket.id,
             ticket.id
         );
-        assert_eq!(store.recovery_retry_state().unwrap(), retry);
+        assert_eq!(app.recovery_retry_state().unwrap(), retry);
         assert_eq!(
             store
                 .lock()
@@ -805,7 +811,7 @@ mod capacity_tests {
             .unwrap()
             .execute("UPDATE account_recovery_obligations SET state=1", [])
             .unwrap();
-        store.detach_recovery_waiter(ticket).unwrap();
+        app.detach_recovery_waiter(ticket).unwrap();
         assert_eq!(
             store
                 .lock()
@@ -818,6 +824,6 @@ mod capacity_tests {
                 .unwrap(),
             0
         );
-        assert_eq!(store.recovery_retry_state().unwrap(), retry);
+        assert_eq!(app.recovery_retry_state().unwrap(), retry);
     }
 }

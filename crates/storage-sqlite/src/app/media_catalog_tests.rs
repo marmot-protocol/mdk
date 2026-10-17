@@ -66,6 +66,7 @@ impl SqliteHarness {
             format!("x {}", hex::encode(digest)),
         ];
         self.storage
+            .app_storage()
             .record_app_event(&StoredAppEvent {
                 group_id_hex: GROUP.into(),
                 message_id_hex: message.clone(),
@@ -95,6 +96,7 @@ impl SqliteHarness {
         };
         let AttachmentDemand::Requested(asset) = self
             .storage
+            .app_storage()
             .request_attachment_acquisition(GROUP, &entry, digest, NOW)
             .unwrap()
         else {
@@ -123,6 +125,7 @@ impl SqliteHarness {
         let asset = self.slots.borrow()[&slot].1.clone();
         let job = self
             .storage
+            .app_storage()
             .claim_attachment_acquisition(&asset, NOW, NOW + 1_000)
             .unwrap()
             .expect("the slot's download is claimed");
@@ -143,6 +146,7 @@ impl SqliteHarness {
             format!("x {}", hex::encode([8; 32])),
         ];
         self.storage
+            .app_storage()
             .record_app_event(&StoredAppEvent {
                 group_id_hex: GROUP.into(),
                 message_id_hex: message.clone(),
@@ -161,6 +165,7 @@ impl SqliteHarness {
             .unwrap();
         let token = self
             .storage
+            .app_storage()
             .reserve_attachment_upload(GROUP, 1, NOW)
             .unwrap()
             .expect("an upload slot is free");
@@ -191,11 +196,14 @@ impl Harness for SqliteHarness {
     }
 
     fn catalog(&self) -> SqliteMediaCatalog {
-        SqliteMediaCatalog::new(self.storage.clone())
+        SqliteMediaCatalog::new(self.storage.app_storage())
     }
 
     fn target(&self, slot: u32) -> Box<dyn PublishTarget + '_> {
-        Box::new(SlotPublication::new(self.storage.clone(), self.token(slot)))
+        Box::new(SlotPublication::new(
+            self.storage.app_storage(),
+            self.token(slot),
+        ))
     }
 
     /// Deleting the acquisition, as removal and source invalidation do.
@@ -208,6 +216,7 @@ impl Harness for SqliteHarness {
 
     fn release(&self, slot: u32) -> Vec<FileId> {
         self.storage
+            .app_storage()
             .release_media_reference(&self.token(slot))
             .unwrap()
     }
@@ -241,10 +250,11 @@ impl Harness for SqliteHarness {
             etag: "\"tag\"".into(),
             total: 100,
         };
-        Box::new(
-            self.storage
-                .attachment_checkpoint(&self.job(slot), identity, || NOW),
-        )
+        Box::new(self.storage.app_storage().attachment_checkpoint(
+            &self.job(slot),
+            identity,
+            || NOW,
+        ))
     }
 
     /// A worker restart requeues the claimed job; claiming it again starts
@@ -253,6 +263,7 @@ impl Harness for SqliteHarness {
         self.job(slot);
         self.jobs.borrow_mut().remove(&slot);
         self.storage
+            .app_storage()
             .resume_attachment_acquisitions(NOW, 64)
             .unwrap();
         self.job(slot);
@@ -266,15 +277,21 @@ impl Harness for SqliteHarness {
     }
 
     fn stage_target(&self, slot: u32) -> Box<dyn StageTarget + '_> {
-        Box::new(self.storage.attachment_upload_stage(&self.upload(slot).1))
+        Box::new(
+            self.storage
+                .app_storage()
+                .attachment_upload_stage(&self.upload(slot).1),
+        )
     }
 
     fn promote_target(&self, slot: u32) -> Box<dyn PromoteTarget + '_> {
         let (message, token) = self.upload(slot);
-        Box::new(
-            self.storage
-                .attachment_upload_promotion(GROUP, &message, &token, || NOW),
-        )
+        Box::new(self.storage.app_storage().attachment_upload_promotion(
+            GROUP,
+            &message,
+            &token,
+            || NOW,
+        ))
     }
 
     /// Expiry, an abandoned send or group deletion: the upload row goes.

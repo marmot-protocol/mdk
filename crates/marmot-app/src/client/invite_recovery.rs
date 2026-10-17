@@ -103,7 +103,7 @@ impl AppClient {
             failed_reinvites,
             group_id_hex: hex::encode(group_id.as_slice()),
             automatic_recovery_failed: !group.is_terminal()
-                && storage.automatic_recovery_failed(group_id)?,
+                && storage.app_storage().automatic_recovery_failed(group_id)?,
             rejoin_invitations,
             history_may_be_incomplete: !history_notice_ids.is_empty(),
             history_notice_ids,
@@ -126,6 +126,7 @@ impl AppClient {
         self.pending_applied_sync_summary.merge(summary);
         self.app
             .account_storage(&self.state.label)?
+            .app_storage()
             .clear_recovery_failure(&group_id)?;
         self.mark_group_projection_dirty_hex(hex::encode(group_id.as_slice()));
         self.group_recovery_status(&group_id)
@@ -177,6 +178,7 @@ impl AppClient {
                 let changed = self
                     .app
                     .account_storage(&self.state.label)?
+                    .app_storage()
                     .clear_recovery_failure(group_id)?;
                 self.epoch_stall.clear_recovered_group(group_id);
                 if changed {

@@ -161,7 +161,7 @@ async fn run_held_comparison(
     .await
     .expect("Bob joined before the target message");
 
-    let storage = app.account_storage(&alice.label).unwrap();
+    let storage = app.account_storage(&alice.label).unwrap().app_storage();
     let route: [u8; 32] = hex::decode(
         app.group(&alice.label, &hex::encode(&group))
             .unwrap()
@@ -187,7 +187,6 @@ async fn run_held_comparison(
     *gate.target.lock().unwrap() = Some(event.id.to_hex());
     assert!(
         !storage
-            .app_storage()
             .retained_recovery_event(&recovery_route, &event_id, None, crate::unix_now_seconds())
             .unwrap()
     );
@@ -224,7 +223,6 @@ async fn run_held_comparison(
             gate.all_queries.load(Ordering::SeqCst),
             gate.id_queries.load(Ordering::SeqCst),
             storage
-                .app_storage()
                 .retained_recovery_event(
                     &recovery_route,
                     &event_id,
@@ -282,7 +280,6 @@ async fn run_held_comparison(
     assert!(storage.recovery_comparison().unwrap().pending());
     assert_eq!(
         storage
-            .app_storage()
             .transport_reconciliation_replay_cursor(&recovery_route)
             .unwrap(),
         None
@@ -484,7 +481,6 @@ async fn run_held_comparison(
                 .unwrap();
             assert!(
                 storage
-                    .app_storage()
                     .transport_reconciliation_replay_cursor(&recovery_route)
                     .unwrap()
                     .is_some(),
@@ -532,7 +528,7 @@ async fn comparison_credit_exhaustion_does_not_spend_reservation() {
         .use_private_recovery_credit_pool_for_test();
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();
-    let storage = app.account_storage(&account.label).unwrap();
+    let storage = app.account_storage(&account.label).unwrap().app_storage();
     let credits = recovery_credits::hold_all_credits_for_test(&pool);
     let commands = runtime
         .accounts()

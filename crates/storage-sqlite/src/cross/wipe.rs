@@ -19,6 +19,32 @@ use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 impl SqliteAccountStorage {
+    /// Transactionally removes all app-local data for one group without touching
+    /// the stored MLS/OpenMLS group state. This is the storage primitive for the
+    /// local delete/wipe UX: it drops the chat-list/account projection, plaintext
+    /// app events, timeline rows, agent-stream start projection rows, cached
+    /// encrypted-media epoch secrets, and group push-token rows keyed by
+    /// `group_id_hex`. A metadata-only media-secret retirement barrier remains
+    /// because protocol/MLS state is intentionally retained; without it that
+    /// state could immediately rederive wiped key bytes. `seen_events` and
+    /// protocol/MLS tables are left intact for active groups. A durable local
+    /// deletion frontier distinguishes the intentionally absent projection from
+    /// a torn write, suppressing historical relay replay while allowing a
+    /// causally newer chat message to re-create it. A terminal group is
+    /// different: its live MLS state is already erased, so this transaction also
+    /// removes the full `cgka_groups` row and retains only
+    /// `cgka_disband_tombstones` as the permanent anti-resurrection guard. The
+    /// logical wipe and a durable WAL checkpoint intent commit together under
+    /// `secure_delete = ON`. If `wal_checkpoint(TRUNCATE)` is blocked by a reader,
+    /// the committed result is returned with `erasure_pending`; a retry recovers
+    /// the accumulated result from the intent and attempts truncation again.
+    pub fn delete_local_group_data(
+        &self,
+        group_id_hex: &str,
+    ) -> StorageResult<DeleteLocalGroupDataResult> {
+        self.delete_local_group_data_inner(group_id_hex, None)
+    }
+
     pub(crate) fn forget_group_local_data(
         &self,
         group_id_hex: &str,
@@ -202,7 +228,7 @@ impl SqliteAccountStorage {
         })?;
 
         let finish = match finish_secure_delete_checkpoint_intent::<DeleteLocalGroupDataResult>(
-            self,
+            &self.app_storage(),
             SECURE_DELETE_LOCAL_GROUP_OPERATION,
             group_id_hex,
         ) {

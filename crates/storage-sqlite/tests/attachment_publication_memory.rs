@@ -6,6 +6,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use storage_sqlite::SqliteAppStorage;
 
 use sha2::{Digest, Sha256};
 use storage_sqlite::{
@@ -74,7 +75,7 @@ fn sqlite_highwater(reset: bool) -> u64 {
 /// Record a received message (`message` and `source` are repeated hex bytes)
 /// carrying one attachment slot for `plaintext`, and claim its acquisition.
 fn claimed_job(
-    store: &SqliteAccountStorage,
+    store: &SqliteAppStorage,
     (message, source): (&str, &str),
     plaintext: &[u8],
 ) -> (AttachmentAssetRef, AttachmentAcquisition) {
@@ -154,27 +155,26 @@ fn publishing_a_large_body_adds_a_bounded_amount_of_memory() {
     let key = SqlCipherKey::new("attachment-memory-test-key").unwrap();
     let store =
         SqliteAccountStorage::open_encrypted(dir.path().join("account.sqlite"), &key).unwrap();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".into(),
-                groups: vec![group()],
-                ..Default::default()
-            },
-            100,
-            300,
-        )
-        .unwrap();
+    let app = store.app_storage();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".into(),
+            groups: vec![group()],
+            ..Default::default()
+        },
+        100,
+        300,
+    )
+    .unwrap();
     // A cheap non-repeating pattern; SQLCipher encrypts pages either way.
     let plaintext: Vec<u8> = (0..48 * MIB)
         .map(|i| (i as u32).wrapping_mul(2654435761).to_le_bytes()[1])
         .collect();
-    let (asset, job) = claimed_job(&store, ("11", "22"), &plaintext);
+    let (asset, job) = claimed_job(&app, ("11", "22"), &plaintext);
 
     let window = start_window();
     assert_eq!(
-        store
-            .complete_attachment_acquisition(&job, &plaintext, 12, 1 << 40)
+        app.complete_attachment_acquisition(&job, &plaintext, 12, 1 << 40)
             .unwrap(),
         AttachmentPublishResult::Published
     );
@@ -197,33 +197,32 @@ fn publishing_a_large_body_adds_a_bounded_amount_of_memory() {
         "publication allocated {rust_peak} bytes of Rust heap"
     );
     for offset in [0usize, 17 * MIB + 3, plaintext.len() - MIB] {
-        let window = store
+        let window = app
             .read_retained_attachment(&asset, 12, offset as u64, MIB)
             .unwrap()
             .unwrap();
         assert_eq!(&*window, &plaintext[offset..offset + MIB]);
     }
     assert_eq!(
-        store.retained_attachment_byte_count().unwrap(),
+        app.retained_attachment_byte_count().unwrap(),
         plaintext.len() as u64
     );
 
     // The file sink publishes a decrypted file through bounded chunk imports.
     let mut file_body = plaintext;
     file_body[0] ^= 0xff;
-    let (file_asset, file_job) = claimed_job(&store, ("44", "55"), &file_body);
+    let (file_asset, file_job) = claimed_job(&app, ("44", "55"), &file_body);
     let window = start_window();
     assert_eq!(
-        store
-            .complete_attachment_acquisition_from_reader(
-                &file_job,
-                &mut std::io::Cursor::new(&file_body),
-                file_body.len() as u64,
-                12,
-                1 << 40,
-                &|| false,
-            )
-            .unwrap(),
+        app.complete_attachment_acquisition_from_reader(
+            &file_job,
+            &mut std::io::Cursor::new(&file_body),
+            file_body.len() as u64,
+            12,
+            1 << 40,
+            &|| false,
+        )
+        .unwrap(),
         AttachmentPublishResult::Published
     );
     let (sqlite_peak, rust_peak) = end_window(window);
@@ -240,7 +239,7 @@ fn publishing_a_large_body_adds_a_bounded_amount_of_memory() {
         rust_peak < (4 * MIB),
         "the chunked import allocated {rust_peak} bytes of Rust heap"
     );
-    let window = store
+    let window = app
         .read_retained_attachment(&file_asset, 12, (40 * MIB) as u64, MIB)
         .unwrap()
         .unwrap();

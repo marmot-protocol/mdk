@@ -187,7 +187,7 @@ async fn managed_account_worker_keeps_its_session_through_notification_lag() {
     let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let relay_plane = app.relay_plane.clone();
-    let storage = app.account_storage("alice").unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
     let runtime = crate::MarmotAppRuntime::new(app);
 
     runtime.reconcile_accounts().await.unwrap();
@@ -267,7 +267,7 @@ async fn notification_loss_is_durable_and_survives_receiver_replacement() {
     )
     .with_test_relay_client(relay);
     let mut client = client_on_app_relay_plane(&app, "alice").await;
-    let storage = app.account_storage("alice").unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
     let account = client.adapter.account_id().clone();
     app.relay_plane
         .set_account_delivery_recovery_marker_for_test(
@@ -457,7 +457,7 @@ async fn sdk_account_worker_keeps_serving_through_notification_lag() {
         url.clone(),
         crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
     );
-    let storage = app.account_storage(&alice.label).unwrap();
+    let storage = app.account_storage(&alice.label).unwrap().app_storage();
     let runtime = crate::MarmotAppRuntime::new(app);
     runtime.reconcile_accounts().await.unwrap();
     timeout(Duration::from_secs(30), runtime.catch_up_accounts())
@@ -660,7 +660,7 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
             .await
             .unwrap();
         drop(client);
-        let storage = app.account_storage(&alice.label).unwrap();
+        let storage = app.account_storage(&alice.label).unwrap().app_storage();
         let mut stored = storage
             .load_account_projection_state(&alice.label, crate::MAX_SEEN_EVENT_IDS)
             .unwrap();

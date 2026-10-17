@@ -1,5 +1,6 @@
 //! Bounded account-local attachment discovery over the existing canonical slot index.
 use super::*;
+use crate::SqliteAppStorage;
 
 /// Empty selections mean every group/sender. Selections compose with inclusive date bounds.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -180,7 +181,7 @@ fn sql(seek: bool) -> String {
         WHERE visible=1 AND timeline_at>=?1 AND timeline_at<=?2{seek}
         ORDER BY timeline_at DESC,group_id_hex DESC,message_id_hex DESC,attachment_order DESC LIMIT ?3")
 }
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Constant-work local refresh token. Source/visibility/role changes invalidate account cursors; additions advertise refresh.
     pub fn account_attachment_history_version(
         &self,

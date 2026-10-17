@@ -4,7 +4,7 @@ use super::*;
 const UPLOAD_TTL: u64 = 7 * 24 * 3600;
 
 struct Batch<'a> {
-    store: &'a SqliteAccountStorage,
+    store: &'a SqliteAppStorage,
     reservations: Vec<(Vec<u8>, Vec<u8>)>,
     finished: bool,
 }
@@ -29,7 +29,7 @@ impl Drop for Batch<'_> {
 }
 
 pub(super) fn stage(
-    store: &SqliteAccountStorage,
+    store: &SqliteAppStorage,
     group: &str,
     epoch: u64,
     sources: &mut [AttachmentUploadSource<'_>],
@@ -146,7 +146,7 @@ pub(super) type Verification = std::collections::HashMap<Vec<u8>, (Vec<u8>, bool
 /// Every read releases the connection; a stale body identity cannot satisfy the
 /// later promotion. Legacy staged blobs keep their original verification path.
 pub(super) fn verify(
-    store: &SqliteAccountStorage,
+    store: &SqliteAppStorage,
     group: &str,
     message: &str,
 ) -> StorageResult<Verification> {

@@ -53,6 +53,7 @@ impl Fixture {
             })
             .collect();
         storage
+            .app_storage()
             .save_account_projection_state(
                 &StoredAccountState {
                     label: account.label.clone(),
@@ -65,6 +66,7 @@ impl Fixture {
             .unwrap();
         if prepare {
             storage
+                .app_storage()
                 .refresh_chat_list_rows(&account.account_id_hex, &|_, _| false)
                 .unwrap();
         }
@@ -124,7 +126,7 @@ async fn independent_initial_snapshot_manual_updates_and_cancelled_recv() {
             .is_empty()
     );
     assert!(matches!(
-        store.chat_presentation("0000").unwrap(),
+        store.app_storage().chat_presentation("0000").unwrap(),
         storage_sqlite::ChatPresentationRead::Pending
     ));
     assert!(
@@ -163,7 +165,7 @@ async fn independent_initial_snapshot_manual_updates_and_cancelled_recv() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incomplete_base_rows_are_unavailable_then_retry_without_worker_or_new_event() {
     let f = Fixture::new();
-    let storage = f.seed(&f.alice, 120, false);
+    let storage = f.seed(&f.alice, 120, false).app_storage();
     let mut sub = f.runtime.subscribe_account_attention().await.unwrap();
     assert!(matches!(
         state(&sub.snapshot, &f.alice.account_id_hex),
@@ -236,7 +238,7 @@ async fn account_read_failure_is_not_zero_or_removal_and_recovers_without_notifi
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn event_lag_recovers_effective_invite_archive_and_departure_state() {
     let f = Fixture::new();
-    let storage = f.seed(&f.alice, 1, true);
+    let storage = f.seed(&f.alice, 1, true).app_storage();
     let mut sub = f.runtime.subscribe_account_attention().await.unwrap();
     assert_eq!(
         ready(&sub.snapshot, &f.alice.account_id_hex),
@@ -410,7 +412,8 @@ async fn first_snapshot_attaches_before_a_concurrent_commit() {
             .with_transaction(|s| -> Result<(), StorageError> {
                 held_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
-                s.set_chat_manually_unread(&id, "0000", true, &|_, _| false)?;
+                s.app_storage()
+                    .set_chat_manually_unread(&id, "0000", true, &|_, _| false)?;
                 Ok(())
             })
             .unwrap()
@@ -489,7 +492,7 @@ async fn empty_subscription_closes_on_terminal_storage_close() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn message_and_mention_totals_change_while_unread_membership_stays_true() {
     let f = Fixture::new();
-    let storage = f.seed(&f.alice, 1, true);
+    let storage = f.seed(&f.alice, 1, true).app_storage();
     f.runtime
         .set_chat_manually_unread("alice", "0000", true)
         .unwrap();
@@ -582,7 +585,7 @@ async fn unknown_presentation_label_discovers_account_without_catalog_notificati
     let mut sub = f.runtime.subscribe_account_attention().await.unwrap();
     let catalog_signal = f.app().presentation_signals.subscribe_catalog();
     let carol = f.app().account_home().create_account("carol").unwrap();
-    let store = f.seed(&carol, 1, true);
+    let store = f.seed(&carol, 1, true).app_storage();
     store
         .set_chat_manually_unread(&carol.account_id_hex, "0000", true, &|_, _| false)
         .unwrap();
@@ -666,7 +669,7 @@ async fn stalled_retry_backoff_is_capped_and_progress_resets_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_invitation_attention_updates_without_an_account_worker() {
     let f = Fixture::new();
-    let storage = f.seed(&f.alice, 1, true);
+    let storage = f.seed(&f.alice, 1, true).app_storage();
     let mut sub = f.runtime.subscribe_account_attention().await.unwrap();
     assert!(!ready(&sub.snapshot, &f.alice.account_id_hex).has_unread());
     // Arrival, archive, restore, acceptance. No message or manual unread is required.

@@ -1,4 +1,5 @@
 use super::*;
+use storage_sqlite::SqliteAppStorage;
 
 #[test]
 fn attachment_capacity_reserves_disk_overhead_and_never_evicts() {
@@ -135,12 +136,12 @@ fn seed(
     reference: &crate::MediaAttachmentReference,
     pending: bool,
 ) {
-    seed_direction(storage, reference, pending, "received");
+    seed_direction(&storage.app_storage(), reference, pending, "received");
 }
 
 /// Seed an accepted source row with an explicit direction under the same attachment identity.
 fn seed_direction(
-    storage: &SqliteAccountStorage,
+    storage: &SqliteAppStorage,
     reference: &crate::MediaAttachmentReference,
     pending: bool,
     direction: &str,
@@ -324,10 +325,11 @@ async fn download_without_engine_and_retain(
     .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
     let storage = app.account_storage("alice").unwrap();
-    seed_direction(&storage, &reference, true, direction);
+    seed_direction(&storage.app_storage(), &reference, true, direction);
     let projection = projection(&reference);
     client.state.groups.push(projection);
     storage
+        .app_storage()
         .remember_encrypted_media_epoch_secret(
             GROUP,
             crate::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
@@ -341,12 +343,13 @@ async fn download_without_engine_and_retain(
     schedule(&client, &shared, &http, &mut admission).unwrap();
     assert!(
         storage
+            .app_storage()
             .due_attachment_acquisitions(crate::unix_now_seconds(), 32)
             .unwrap()
             .is_empty()
     );
     // Accept the invitation, without creating or hydrating an MLS group.
-    seed_direction(&storage, &reference, false, direction);
+    seed_direction(&storage.app_storage(), &reference, false, direction);
     assert!(
         client
             .prepare_background_attachment_download(
@@ -359,13 +362,18 @@ async fn download_without_engine_and_retain(
         "retained source secret"
     );
     assert!(
-        !storage.attachment_worker_demands(32).unwrap().is_empty(),
+        !storage
+            .app_storage()
+            .attachment_worker_demands(32)
+            .unwrap()
+            .is_empty(),
         "accepted source demand"
     );
     if explicit && direction == "sent" {
         let connection = retention_fault_connection(&app);
         // A pending sibling keeps the shared quarantine marker alive through Retry.
         storage
+            .app_storage()
             .record_app_event(&StoredAppEvent {
                 group_id_hex: GROUP.into(),
                 message_id_hex: "55".repeat(32),
@@ -383,9 +391,11 @@ async fn download_without_engine_and_retain(
             })
             .unwrap();
         let tokens = storage
+            .app_storage()
             .stage_attachment_uploads(GROUP, 3, &[b"retained worker bytes"], 10, 1_000_000)
             .unwrap();
         storage
+            .app_storage()
             .bind_attachment_uploads(
                 &tokens,
                 &[(
@@ -402,6 +412,7 @@ async fn download_without_engine_and_retain(
             .unwrap();
         assert_eq!(
             storage
+                .app_storage()
                 .promote_attachment_uploads(
                     GROUP,
                     &"11".repeat(32),
@@ -415,17 +426,17 @@ async fn download_without_engine_and_retain(
     let _fault_connection = outgoing_faults.then(|| {
         let connection = retention_fault_connection(&app);
         let tag = reference.imeta_tag();
-        storage.record_app_event(&StoredAppEvent {
+        storage.app_storage().record_app_event(&StoredAppEvent {
             group_id_hex: GROUP.into(), message_id_hex: "55".repeat(32),
             source_message_id_hex: Some("66".repeat(32)), source_epoch: Some(3),
             direction: "sent".into(), sender: "33".repeat(32), plaintext: String::new(),
             kind: 9, tags: vec![tag.clone()], recorded_at: 10, received_at: 10,
             origin_commit_id: None, moderation_grant: false,
         }).unwrap();
-        let tokens = storage.stage_attachment_uploads(GROUP,3,&[b"retained worker bytes"],10,1_000_000).unwrap();
-        storage.bind_attachment_uploads(&tokens,&[(serde_json::to_value(tag).unwrap(),crate::media::media_hash_from_reference(&reference).unwrap())]).unwrap();
-        storage.protect_attachment_uploads(GROUP,&"55".repeat(32),&[reference.imeta_tag()]).unwrap();
-        storage.stage_attachment_uploads(GROUP,3,&[b"orphan"],0,1_000_000).unwrap();
+        let tokens = storage.app_storage().stage_attachment_uploads(GROUP,3,&[b"retained worker bytes"],10,1_000_000).unwrap();
+        storage.app_storage().bind_attachment_uploads(&tokens,&[(serde_json::to_value(tag).unwrap(),crate::media::media_hash_from_reference(&reference).unwrap())]).unwrap();
+        storage.app_storage().protect_attachment_uploads(GROUP,&"55".repeat(32),&[reference.imeta_tag()]).unwrap();
+        storage.app_storage().stage_attachment_uploads(GROUP,3,&[b"orphan"],0,1_000_000).unwrap();
         connection.execute_batch(&format!("CREATE TRIGGER fail_outgoing_prune BEFORE DELETE ON outgoing_attachment_uploads WHEN OLD.slot_json IS NULL BEGIN SELECT RAISE(ABORT,'generated prune fault'); END;
         CREATE TRIGGER fail_outgoing_promotion BEFORE INSERT ON retained_attachment_bytes WHEN EXISTS(SELECT 1 FROM attachment_acquisition q WHERE q.token=NEW.token AND q.message_id_hex='{}') BEGIN SELECT RAISE(ABORT,'generated promotion fault'); END;", "55".repeat(32))).unwrap();
         connection
@@ -455,6 +466,7 @@ async fn download_without_engine_and_retain(
         let now = crate::unix_now_seconds();
         let asset = if direction == "sent" {
             storage
+                .app_storage()
                 .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
                 .unwrap()
                 .unwrap()
@@ -462,11 +474,15 @@ async fn download_without_engine_and_retain(
                 .unwrap()
         } else {
             storage
+                .app_storage()
                 .attachment_transfer_candidates(now, 1, true)
                 .unwrap()
                 .remove(0)
         };
-        storage.explicitly_retry_attachment(&asset, now).unwrap();
+        storage
+            .app_storage()
+            .explicitly_retry_attachment(&asset, now)
+            .unwrap();
         let mut policy =
             super::super::super::attachment_controls::default_policy(&client.app.config);
         policy.automatic = false;
@@ -474,6 +490,7 @@ async fn download_without_engine_and_retain(
         // explicit 512 MiB ceiling. A tiny explicit file must still finish.
         policy.retained_bytes = policy.transfer_limit;
         storage
+            .app_storage()
             .set_attachment_download_policy(&policy, now)
             .unwrap();
     }
@@ -509,6 +526,7 @@ async fn download_without_engine_and_retain(
         // This pure explicit job must not have acquired that contract.
         assert_eq!(
             storage
+                .app_storage()
                 .begin_attachment_network_attempt(job, crate::unix_now_seconds())
                 .unwrap(),
             direction != "sent",
@@ -537,7 +555,11 @@ async fn download_without_engine_and_retain(
         "ready source must not download twice"
     );
     assert!(
-        storage.attachment_worker_demands(32).unwrap().is_empty(),
+        storage
+            .app_storage()
+            .attachment_worker_demands(32)
+            .unwrap()
+            .is_empty(),
         "invalid sibling was acknowledged"
     );
     drop(client);
@@ -607,12 +629,14 @@ async fn attachment_worker_exit_cancels_transfer_and_releases_global_capacity() 
 async fn attachment_missing_secret_does_not_claim_or_back_off_a_page_of_siblings() {
     let (_dir, client, storage, reference) = offline_fixture().await;
     let entry = storage
+        .app_storage()
         .attachment_history_page(GROUP, 100, None)
         .unwrap()
         .entries
         .remove(0);
     for n in 1..20 {
         storage
+            .app_storage()
             .record_app_event(&StoredAppEvent {
                 group_id_hex: GROUP.into(),
                 message_id_hex: format!("{n:064x}"),
@@ -637,8 +661,11 @@ async fn attachment_missing_secret_does_not_claim_or_back_off_a_page_of_siblings
             .is_none()
     );
     let now = crate::unix_now_seconds();
-    while admit_demands(&storage, now, false).unwrap() {}
-    let jobs = storage.due_attachment_acquisitions(now, 32).unwrap();
+    while admit_demands(&storage.app_storage(), now, false).unwrap() {}
+    let jobs = storage
+        .app_storage()
+        .due_attachment_acquisitions(now, 32)
+        .unwrap();
     assert_eq!(jobs.len(), 20);
     let shared = RuntimeSharedServices::default();
     let (http, mut completions) = context();
@@ -647,12 +674,17 @@ async fn attachment_missing_secret_does_not_claim_or_back_off_a_page_of_siblings
     admission.ready().await;
     schedule(&client, &shared, &http, &mut admission).unwrap();
     assert_eq!(
-        storage.due_attachment_acquisitions(now, 32).unwrap().len(),
+        storage
+            .app_storage()
+            .due_attachment_acquisitions(now, 32)
+            .unwrap()
+            .len(),
         19
     );
     for job in jobs {
         assert_eq!(
             storage
+                .app_storage()
                 .attachment_acquisition_status(&job)
                 .unwrap()
                 .unwrap()
@@ -676,14 +708,21 @@ async fn attachment_missing_secret_deferral_is_bounded_and_explicit_retry_readmi
     let now = crate::unix_now_seconds();
     // Earlier worker ticks already found the source-epoch material missing.
     let mut at = now - 10_000;
-    admit_demands(&storage, at, false).unwrap();
+    admit_demands(&storage.app_storage(), at, false).unwrap();
     let asset = storage
+        .app_storage()
         .due_attachment_acquisitions(at, 1)
         .unwrap()
         .remove(0);
     for _ in 0..5 {
-        assert!(!storage.defer_attachment_preparation(&asset, at).unwrap());
+        assert!(
+            !storage
+                .app_storage()
+                .defer_attachment_preparation(&asset, at)
+                .unwrap()
+        );
         at = storage
+            .app_storage()
             .attachment_acquisition_status(&asset)
             .unwrap()
             .unwrap()
@@ -698,6 +737,7 @@ async fn attachment_missing_secret_deferral_is_bounded_and_explicit_retry_readmi
     admission.ready().await;
     schedule(&client, &shared, &http, &mut admission).unwrap();
     let status = storage
+        .app_storage()
         .attachment_acquisition_status(&asset)
         .unwrap()
         .unwrap();
@@ -709,6 +749,7 @@ async fn attachment_missing_secret_deferral_is_bounded_and_explicit_retry_readmi
     assert!(status.due.is_none());
     let transfer = || {
         storage
+            .app_storage()
             .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
             .unwrap()
             .unwrap()
@@ -716,7 +757,12 @@ async fn attachment_missing_secret_deferral_is_bounded_and_explicit_retry_readmi
     };
     assert_eq!(transfer(), storage_sqlite::AttachmentTransferState::Failed);
     assert!(completions.try_recv().is_err());
-    assert!(storage.explicitly_retry_attachment(&asset, now).unwrap());
+    assert!(
+        storage
+            .app_storage()
+            .explicitly_retry_attachment(&asset, now)
+            .unwrap()
+    );
     assert_eq!(transfer(), storage_sqlite::AttachmentTransferState::Queued);
 }
 
@@ -801,6 +847,7 @@ fn attachment_explicit_retry_derives_an_uncached_source_epoch_key() {
             base_url,
         }];
         storage
+            .app_storage()
             .record_app_event(&StoredAppEvent {
                 group_id_hex: group_hex.clone(),
                 message_id_hex: "11".repeat(32),
@@ -831,14 +878,21 @@ fn attachment_explicit_retry_derives_an_uncached_source_epoch_key() {
         // sixth in this pass fails the job.
         let now = crate::unix_now_seconds();
         let mut at = now - 10_000;
-        admit_demands(&storage, at, true).unwrap();
+        admit_demands(&storage.app_storage(), at, true).unwrap();
         let asset = storage
+            .app_storage()
             .due_attachment_acquisitions(at, 1)
             .unwrap()
             .remove(0);
         for _ in 0..5 {
-            assert!(!storage.defer_attachment_preparation(&asset, at).unwrap());
+            assert!(
+                !storage
+                    .app_storage()
+                    .defer_attachment_preparation(&asset, at)
+                    .unwrap()
+            );
             at = storage
+                .app_storage()
                 .attachment_acquisition_status(&asset)
                 .unwrap()
                 .unwrap()
@@ -853,6 +907,7 @@ fn attachment_explicit_retry_derives_an_uncached_source_epoch_key() {
         schedule(&client, &shared, &http, &mut admission).unwrap();
         let transfer = || {
             storage
+                .app_storage()
                 .attachment_transfer_status(
                     &group_hex,
                     &"11".repeat(32),
@@ -868,7 +923,12 @@ fn attachment_explicit_retry_derives_an_uncached_source_epoch_key() {
         assert_eq!(transfer(), storage_sqlite::AttachmentTransferState::Failed);
         assert!(completions.try_recv().is_err());
 
-        assert!(storage.explicitly_retry_attachment(&asset, now).unwrap());
+        assert!(
+            storage
+                .app_storage()
+                .explicitly_retry_attachment(&asset, now)
+                .unwrap()
+        );
         schedule(&client, &shared, &http, &mut admission).unwrap();
         admission.ready().await;
         schedule(&client, &shared, &http, &mut admission).unwrap();
@@ -900,17 +960,20 @@ fn attachment_explicit_retry_derives_an_uncached_source_epoch_key() {
 async fn attachment_restart_reclaims_inflight_and_late_publication_cannot_win() {
     let (_dir, client, storage, _) = offline_fixture().await;
     let now = crate::unix_now_seconds();
-    admit_demands(&storage, now, false).unwrap();
+    admit_demands(&storage.app_storage(), now, false).unwrap();
     let asset = storage
+        .app_storage()
         .due_attachment_acquisitions(now, 1)
         .unwrap()
         .remove(0);
     let old = storage
+        .app_storage()
         .claim_attachment_acquisition(&asset, now, now + LEASE_SECONDS)
         .unwrap()
         .unwrap();
     assert!(
         storage
+            .app_storage()
             .due_attachment_acquisitions(now, 1)
             .unwrap()
             .is_empty()
@@ -921,7 +984,10 @@ async fn attachment_restart_reclaims_inflight_and_late_publication_cannot_win() 
     schedule(&client, &shared, &http, &mut restarted).unwrap();
     let now = crate::unix_now_seconds();
     assert_eq!(
-        storage.due_attachment_acquisitions(now, 1).unwrap(),
+        storage
+            .app_storage()
+            .due_attachment_acquisitions(now, 1)
+            .unwrap(),
         vec![asset.clone()]
     );
     complete(
@@ -949,10 +1015,12 @@ async fn attachment_restart_reclaims_inflight_and_late_publication_cannot_win() 
         .is_none()
     );
     let next = storage
+        .app_storage()
         .claim_attachment_acquisition(&asset, now, now + LEASE_SECONDS)
         .unwrap()
         .unwrap();
     storage
+        .app_storage()
         .remove_local_attachment(GROUP, &"11".repeat(32), 0)
         .unwrap();
     complete(
@@ -987,17 +1055,20 @@ async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_on(
     let (_dir, client, storage, _) = offline_fixture().await;
     let now = crate::unix_now_seconds();
     let entry = storage
+        .app_storage()
         .attachment_history_page(GROUP, 100, None)
         .unwrap()
         .entries
         .remove(0);
     let storage_sqlite::AttachmentDemand::Requested(asset) = storage
+        .app_storage()
         .request_attachment_acquisition(GROUP, &entry, [0; 32], now)
         .unwrap()
     else {
         panic!("demand");
     };
     let job = storage
+        .app_storage()
         .claim_attachment_acquisition(&asset, now, now + LEASE_SECONDS)
         .unwrap()
         .unwrap();
@@ -1013,6 +1084,7 @@ async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_on(
     )
     .unwrap();
     let status = storage
+        .app_storage()
         .attachment_acquisition_status(&asset)
         .unwrap()
         .unwrap();
@@ -1030,8 +1102,12 @@ mod storage_block;
 async fn attachment_worker_disk_pause_does_not_consume_attempts() {
     let (_dir, mut client, store, _reference) = offline_fixture().await;
     let now = crate::unix_now_seconds();
-    admit_demands(&store, now, false).unwrap();
-    let asset = store.due_attachment_acquisitions(now, 1).unwrap().remove(0);
+    admit_demands(&store.app_storage(), now, false).unwrap();
+    let asset = store
+        .app_storage()
+        .due_attachment_acquisitions(now, 1)
+        .unwrap()
+        .remove(0);
     client
         .app
         .config
@@ -1047,12 +1123,14 @@ async fn attachment_worker_disk_pause_does_not_consume_attempts() {
     admission.ready().await;
     schedule(&client, &shared, &http, &mut admission).unwrap();
     let status = store
+        .app_storage()
         .attachment_acquisition_status(&asset)
         .unwrap()
         .unwrap();
     assert_eq!(status.attempts, 0);
     assert!(status.due.unwrap() > now);
     let progress = store
+        .app_storage()
         .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
         .unwrap()
         .unwrap();
@@ -1068,9 +1146,14 @@ async fn attachment_worker_disk_pause_does_not_consume_attempts() {
 async fn attachment_cancellation_observation_error_is_not_cancellation() {
     let (_dir, _client, store, _reference) = offline_fixture().await;
     let now = crate::unix_now_seconds();
-    admit_demands(&store, now, false).unwrap();
-    let asset = store.due_attachment_acquisitions(now, 1).unwrap().remove(0);
+    admit_demands(&store.app_storage(), now, false).unwrap();
+    let asset = store
+        .app_storage()
+        .due_attachment_acquisitions(now, 1)
+        .unwrap()
+        .remove(0);
     let job = store
+        .app_storage()
         .claim_attachment_acquisition(&asset, now, now + LEASE_SECONDS)
         .unwrap()
         .unwrap();
@@ -1123,6 +1206,7 @@ async fn attachment_host_managed_requires_demand_and_fences_permission_generatio
     schedule(&client, &runtime.shared, &http, &mut admission).unwrap();
     assert!(
         storage
+            .app_storage()
             .due_attachment_acquisitions(crate::unix_now_seconds(), 64)
             .unwrap()
             .is_empty()
@@ -1169,6 +1253,7 @@ async fn attachment_host_managed_requires_demand_and_fences_permission_generatio
     schedule(&client, &runtime.shared, &http, &mut admission).unwrap();
     assert!(
         storage
+            .app_storage()
             .due_attachment_acquisitions(crate::unix_now_seconds(), 64)
             .unwrap()
             .is_empty(),
@@ -1192,6 +1277,7 @@ async fn attachment_host_managed_requires_demand_and_fences_permission_generatio
     let asset = result.status.unwrap().reference.unwrap();
     let now = crate::unix_now_seconds();
     let job = storage
+        .app_storage()
         .claim_attachment_acquisition(&asset, now, now + 100)
         .unwrap()
         .unwrap();
@@ -1199,7 +1285,7 @@ async fn attachment_host_managed_requires_demand_and_fences_permission_generatio
         .shared
         .attachment_permissions
         .lease(
-            &storage.attachment_store_identity().unwrap(),
+            &storage.app_storage().attachment_store_identity().unwrap(),
             &reference.media_type,
         )
         .unwrap();
@@ -1209,8 +1295,18 @@ async fn attachment_host_managed_requires_demand_and_fences_permission_generatio
         .await
         .unwrap();
     assert!(!lease.allowed());
-    assert!(!storage.begin_attachment_network_attempt(&job, now).unwrap());
-    assert!(!storage.attachment_transfer_is_active(&job, now).unwrap());
+    assert!(
+        !storage
+            .app_storage()
+            .begin_attachment_network_attempt(&job, now)
+            .unwrap()
+    );
+    assert!(
+        !storage
+            .app_storage()
+            .attachment_transfer_is_active(&job, now)
+            .unwrap()
+    );
     assert!(
         runtime
             .set_attachment_automatic_permission("alice", next.clone(), all_attachment_permission())
@@ -1333,6 +1429,7 @@ async fn promoted_attempt_survives_automatic_revocation_without_extending_lease(
             .unwrap()
     );
     let storage = app.account_storage("alice").unwrap();
+    let app = storage.app_storage();
     let (mut reference, _) = crate::media::tests::attachment_worker_fixture(b"promotion bytes");
     reference.locators = vec![crate::MediaLocator {
         kind: "blossom-v1".into(),
@@ -1340,12 +1437,12 @@ async fn promoted_attempt_survives_automatic_revocation_without_extending_lease(
     }];
     seed(&storage, &reference, false);
     let now = crate::unix_now_seconds();
-    let selected = storage
+    let selected = app
         .attachment_history_page(GROUP, 1, None)
         .unwrap()
         .entries
         .remove(0);
-    let storage_sqlite::AttachmentDemand::Requested(asset) = storage
+    let storage_sqlite::AttachmentDemand::Requested(asset) = app
         .request_attachment_acquisition(
             GROUP,
             &selected,
@@ -1356,22 +1453,22 @@ async fn promoted_attempt_survives_automatic_revocation_without_extending_lease(
     else {
         panic!("request")
     };
-    let job = storage
+    let job = app
         .claim_attachment_acquisition(&asset, now, now + 180)
         .unwrap()
         .unwrap();
-    let deadline = storage
+    let deadline = app
         .attachment_acquisition_status(&asset)
         .unwrap()
         .unwrap()
         .due;
-    let identity = storage.attachment_store_identity().unwrap();
+    let identity = app.attachment_store_identity().unwrap();
     let permission = runtime
         .shared
         .attachment_permissions
         .lease(&identity, "image/png")
         .unwrap();
-    assert!(storage.promote_attachment_demand(&asset, now).unwrap());
+    assert!(app.promote_attachment_demand(&asset, now).unwrap());
     runtime
         .begin_attachment_permission_update("alice")
         .await
@@ -1387,14 +1484,13 @@ async fn promoted_attempt_survives_automatic_revocation_without_extending_lease(
         .is_err()
     );
     assert_eq!(
-        storage
-            .attachment_acquisition_status(&asset)
+        app.attachment_acquisition_status(&asset)
             .unwrap()
             .unwrap()
             .due,
         deadline
     );
-    storage.cancel_attachment_acquisition(&asset).unwrap();
+    app.cancel_attachment_acquisition(&asset).unwrap();
     let (_, updates) = watch::channel(());
     tokio::time::timeout(
         Duration::from_secs(1),
@@ -1433,9 +1529,11 @@ async fn outgoing_retention_failure_preserves_all_source_projection_paths() {
     let (_dir, client, storage, reference) = offline_fixture().await;
     let connection = retention_fault_connection(&client.app);
     let token = storage
+        .app_storage()
         .stage_attachment_uploads(GROUP, 3, &[b"retained worker bytes"], 10, 1_000_000)
         .unwrap();
     storage
+        .app_storage()
         .bind_attachment_uploads(
             &token,
             &[(
@@ -1514,6 +1612,7 @@ async fn outgoing_retention_failure_preserves_all_source_projection_paths() {
         .unwrap();
     assert!(
         storage
+            .app_storage()
             .recover_attachment_uploads(11, 64, 1_000_000)
             .unwrap()
             > 0
@@ -1537,7 +1636,10 @@ pub(super) fn read_retained(
     offset: u64,
     limit: usize,
 ) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, AppError> {
-    match storage.retained_attachment_read(reference, now, offset, limit)? {
+    match storage
+        .app_storage()
+        .retained_attachment_read(reference, now, offset, limit)?
+    {
         None => Ok(None),
         Some(storage_sqlite::RetainedAttachmentRead::Bytes(bytes)) => Ok(Some(bytes)),
         Some(storage_sqlite::RetainedAttachmentRead::MediaFile(id)) => {
@@ -1601,6 +1703,7 @@ fn retain_twin(
     ];
     let (message, source) = ("44".repeat(32), "55".repeat(32));
     storage
+        .app_storage()
         .record_app_event(&StoredAppEvent {
             group_id_hex: GROUP.into(),
             message_id_hex: message.clone(),
@@ -1618,14 +1721,16 @@ fn retain_twin(
         })
         .unwrap();
     let now = crate::unix_now_seconds();
-    admit_demands(storage, now, false).unwrap();
+    admit_demands(&storage.app_storage(), now, false).unwrap();
     let twin = storage
+        .app_storage()
         .attachment_transfer_status(GROUP, &message, &source, 0, now, true)
         .unwrap()
         .unwrap()
         .reference
         .unwrap();
     let job = storage
+        .app_storage()
         .claim_attachment_acquisition(&twin, now, now + 600)
         .unwrap()
         .unwrap();
@@ -1638,7 +1743,7 @@ fn retain_twin(
     assert!(matches!(
         media
             .publish(
-                &storage.attachment_publication(&job, &clock),
+                &storage.app_storage().attachment_publication(&job, &clock),
                 media_store::Category::Retained,
                 &mut std::io::Cursor::new(&body[..]),
                 body.len() as u64,
@@ -1672,7 +1777,7 @@ async fn reuse_skips_download_gates(low_disk: bool) {
         crate::media::attachment_resume::test_free_space::set(dir.path(), 0);
     }
     let now = crate::unix_now_seconds();
-    admit_demands(&storage, now, false).unwrap();
+    admit_demands(&storage.app_storage(), now, false).unwrap();
     let shared = RuntimeSharedServices::default();
     let (http, mut completions) = context();
     let mut admission = Admission::default();
@@ -1693,6 +1798,7 @@ async fn reuse_skips_download_gates(low_disk: bool) {
     complete_and_settle(&mut client, done, &shared, &http, &mut completions).await;
     let (message, source) = ("11".repeat(32), "22".repeat(32));
     let status = storage
+        .app_storage()
         .attachment_transfer_status(GROUP, &message, &source, 0, now, true)
         .unwrap()
         .unwrap();

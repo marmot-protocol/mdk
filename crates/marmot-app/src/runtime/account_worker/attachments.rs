@@ -6,6 +6,7 @@ use super::*;
 use crate::AccountMediaStore;
 use crate::media::AttachmentDownloadFailure;
 use media_store::{Category, MediaError};
+use storage_sqlite::SqliteAppStorage;
 use storage_sqlite::{
     ATTACHMENT_ACQUISITION_BATCH_LIMIT, AttachmentAcquisition, SqliteAccountStorage,
 };
@@ -87,7 +88,7 @@ fn spawn_upload_promotion(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         match crate::media::outgoing::promote_uploads(
-            &storage,
+            &storage.app_storage(),
             &media,
             after.as_ref(),
             crate::media::outgoing::UPLOAD_PROMOTION_BATCH,
@@ -129,11 +130,7 @@ fn reference(
     crate::parse_media_attachment(&tag, Some(epoch), loopback).ok()
 }
 
-fn admit_demands(
-    storage: &SqliteAccountStorage,
-    now: u64,
-    loopback: bool,
-) -> Result<bool, AppError> {
+fn admit_demands(storage: &SqliteAppStorage, now: u64, loopback: bool) -> Result<bool, AppError> {
     let demands = storage.attachment_worker_demands(DEMAND_BATCH)?;
     let more = demands.len() == DEMAND_BATCH;
     for demand in demands {
@@ -224,7 +221,7 @@ async fn cancelled(
     permission: Option<super::super::attachment_permission::PermissionLease>,
 ) {
     loop {
-        let store = storage.clone();
+        let store = storage.app_storage();
         let current = job.clone();
         let active = tokio::task::spawn_blocking(move || {
             Ok::<_, cgka_traits::StorageError>((
@@ -248,7 +245,7 @@ async fn cancelled(
     }
 }
 
-fn retry_at(storage: &SqliteAccountStorage, job: &AttachmentAcquisition, now: u64) -> u64 {
+fn retry_at(storage: &SqliteAppStorage, job: &AttachmentAcquisition, now: u64) -> u64 {
     let attempts = storage
         .attachment_acquisition_status(&job.reference)
         .ok()
@@ -287,19 +284,24 @@ pub(super) fn schedule(
     let storage = client.app.account_storage(&client.state.label)?;
     let now = scheduler_now(client);
     // Abandoned ciphertext expires even after automatic acquisition is disabled.
-    let partials = storage.prune_attachment_partials(now, 64)?;
+    let partials = storage.app_storage().prune_attachment_partials(now, 64)?;
     let orphan_uploads = storage
+        .app_storage()
         .prune_attachment_uploads(now, 64)
         .unwrap_or_else(|_| {
             tracing::warn!(target: "marmot_app::runtime", method = "outgoing_retention_prune",
             "optional outgoing retention cleanup deferred");
             0
         });
-    let policy = storage.attachment_download_policy(
+    let policy = storage.app_storage().attachment_download_policy(
         &super::super::attachment_controls::default_policy(&client.app.config),
     )?;
     if !admission.resumed {
-        if storage.resume_attachment_acquisitions(now, 64)? == 64 {
+        if storage
+            .app_storage()
+            .resume_attachment_acquisitions(now, 64)?
+            == 64
+        {
             return Ok(true);
         }
         admission.resumed = true;
@@ -325,13 +327,16 @@ pub(super) fn schedule(
             false,
         );
     }
-    let expired = storage.prune_expired_attachment_acquisitions(now, 64)?;
+    let expired = storage
+        .app_storage()
+        .prune_expired_attachment_acquisitions(now, 64)?;
     let host_managed = client.app.config.attachment_acquisition_mode
         == crate::AttachmentAcquisitionMode::HostManaged;
-    let identity = storage.attachment_store_identity()?;
+    let identity = storage.app_storage().attachment_store_identity()?;
     // Legacy uploads (bodies in SQLCipher) keep their own recovery until
     // they expire; file-backed ones promote through the media store.
     if storage
+        .app_storage()
         .recover_attachment_uploads(now, 32, policy.retained_bytes)
         .is_err()
     {
@@ -347,7 +352,7 @@ pub(super) fn schedule(
         shared.attachment_updates.clone(),
     );
     let resumed = if policy.automatic {
-        storage.resume_permitted_attachments(
+        storage.app_storage().resume_permitted_attachments(
             now,
             if host_managed {
                 shared.attachment_permissions.categories(&identity)
@@ -362,7 +367,7 @@ pub(super) fn schedule(
         || (policy.automatic
             && !host_managed
             && admit_demands(
-                &storage,
+                &storage.app_storage(),
                 now,
                 client.app.config.allow_loopback_blob_endpoints,
             )?)
@@ -383,7 +388,7 @@ pub(super) fn schedule(
     // publish them; their checkpoints make the readmitted attempt local work.
     // Unknown free space readmits nothing, as it admits nothing below.
     let readmitted = match free {
-        Some(free) => storage.readmit_storage_blocked_attachments(
+        Some(free) => storage.app_storage().readmit_storage_blocked_attachments(
             now,
             policy.disk_reserve,
             free,
@@ -397,7 +402,10 @@ pub(super) fn schedule(
     }
     let more = more || readmitted == ATTACHMENT_ACQUISITION_BATCH_LIMIT;
     let free = free.unwrap_or(0);
-    let candidates = storage.attachment_transfer_candidates(now, 32, policy.automatic)?;
+    let candidates =
+        storage
+            .app_storage()
+            .attachment_transfer_candidates(now, 32, policy.automatic)?;
     if candidates.is_empty() {
         admission.waiting = None;
         return Ok(more);
@@ -412,13 +420,18 @@ pub(super) fn schedule(
         return Ok(more);
     };
     for candidate in candidates {
-        let explicit = storage.attachment_request_is_explicit(&candidate)?;
+        let explicit = storage
+            .app_storage()
+            .attachment_request_is_explicit(&candidate)?;
         let max = if explicit {
             crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES
         } else {
             policy.transfer_limit
         };
-        let Some(source) = storage.prepare_attachment_acquisition(&candidate, now)? else {
+        let Some(source) = storage
+            .app_storage()
+            .prepare_attachment_acquisition(&candidate, now)?
+        else {
             continue;
         };
         let Some(reference) = reference(
@@ -426,7 +439,9 @@ pub(super) fn schedule(
             source.source_epoch,
             client.app.config.allow_loopback_blob_endpoints,
         ) else {
-            storage.finish_attachment_preparation(&candidate, now, None)?;
+            storage
+                .app_storage()
+                .finish_attachment_preparation(&candidate, now, None)?;
             continue;
         };
         let permission = if host_managed && !explicit {
@@ -434,7 +449,9 @@ pub(super) fn schedule(
                 .attachment_permissions
                 .lease(&identity, &reference.media_type)
             else {
-                storage.park_attachment_permission(&candidate)?;
+                storage
+                    .app_storage()
+                    .park_attachment_permission(&candidate)?;
                 continue;
             };
             Some(lease)
@@ -450,14 +467,22 @@ pub(super) fn schedule(
         // before the download-only gates (disk headroom for a new body,
         // source-key preparation) can defer or fail this job. The database
         // records the twin; the blocking task confirms its file is on disk.
-        if storage.attachment_media_twin_recorded(&candidate)? {
+        if storage
+            .app_storage()
+            .attachment_media_twin_recorded(&candidate)?
+        {
             if permission.as_ref().is_some_and(|p| !p.allowed()) {
                 continue;
             }
             if host_managed && !explicit {
-                storage.enable_attachment_automatic_history(&candidate)?;
+                storage
+                    .app_storage()
+                    .enable_attachment_automatic_history(&candidate)?;
             }
-            let Some(job) = storage.claim_attachment_acquisition(&candidate, now, lease_until)?
+            let Some(job) =
+                storage
+                    .app_storage()
+                    .claim_attachment_acquisition(&candidate, now, lease_until)?
             else {
                 continue;
             };
@@ -474,7 +499,7 @@ pub(super) fn schedule(
                     let attached = {
                         let job = job.clone();
                         tokio::task::spawn_blocking(move || {
-                            attach_existing_body(&media, &storage, &job)
+                            attach_existing_body(&media, &storage.app_storage(), &job)
                         })
                     };
                     let result = if attached.await.unwrap_or(false) {
@@ -501,9 +526,15 @@ pub(super) fn schedule(
         // automatic-sized object even for explicit work, then enforce actual
         // checkpoint/publication capacity as the transfer grows.
         let reservation = policy.transfer_limit;
-        let recorded = storage.attachment_checkpoint_recorded(&candidate)?;
+        let recorded = storage
+            .app_storage()
+            .attachment_checkpoint_recorded(&candidate)?;
         if !capacity(&policy, reservation, recorded, free) {
-            storage.finish_attachment_preparation(&candidate, now, Some(now.saturating_add(15)))?;
+            storage.app_storage().finish_attachment_preparation(
+                &candidate,
+                now,
+                Some(now.saturating_add(15)),
+            )?;
             continue;
         }
         // Free disk is the only gate (mdk#2314): retained media has no byte
@@ -511,7 +542,9 @@ pub(super) fn schedule(
         let group = match hex::decode(&source.group_id_hex) {
             Ok(bytes) => GroupId::new(bytes),
             Err(_) => {
-                storage.finish_attachment_preparation(&candidate, now, None)?;
+                storage
+                    .app_storage()
+                    .finish_attachment_preparation(&candidate, now, None)?;
                 continue;
             }
         };
@@ -519,7 +552,9 @@ pub(super) fn schedule(
             .ok()
             .and_then(|v| v.try_into().ok())
         else {
-            storage.finish_attachment_preparation(&candidate, now, None)?;
+            storage
+                .app_storage()
+                .finish_attachment_preparation(&candidate, now, None)?;
             continue;
         };
         // Queued explicit work (Retry, download again) derives a missing
@@ -540,7 +575,10 @@ pub(super) fn schedule(
             // preserving siblings and their attempts. The deferral streak is
             // bounded: material that never arrives fails the job, not the loop.
             Ok(None) | Err(_) => {
-                if storage.defer_attachment_preparation(&candidate, now)? {
+                if storage
+                    .app_storage()
+                    .defer_attachment_preparation(&candidate, now)?
+                {
                     tracing::warn!(
                         target: "marmot_app::runtime",
                         method = "attachment_acquisition",
@@ -556,9 +594,15 @@ pub(super) fn schedule(
             continue;
         }
         if host_managed && !explicit {
-            storage.enable_attachment_automatic_history(&candidate)?;
+            storage
+                .app_storage()
+                .enable_attachment_automatic_history(&candidate)?;
         }
-        let Some(job) = storage.claim_attachment_acquisition(&candidate, now, lease_until)? else {
+        let Some(job) =
+            storage
+                .app_storage()
+                .claim_attachment_acquisition(&candidate, now, lease_until)?
+        else {
             continue;
         };
         let media = client
@@ -595,7 +639,7 @@ pub(super) fn schedule(
                 let reuse = {
                     let (media, storage, job) = (media, storage.clone(), job.clone());
                     tokio::task::spawn_blocking(move || {
-                        attach_existing_body(&media, &storage, &job)
+                        attach_existing_body(&media, &storage.app_storage(), &job)
                     })
                 };
                 let result = if reuse.await.unwrap_or(false) {
@@ -646,7 +690,7 @@ where
 /// (or no longer needs a body). Blocking.
 fn attach_existing_body(
     media: &AccountMediaStore,
-    storage: &SqliteAccountStorage,
+    storage: &SqliteAppStorage,
     job: &AttachmentAcquisition,
 ) -> bool {
     let Ok(digest) = job.plaintext_digest() else {
@@ -724,38 +768,39 @@ pub(super) fn complete_acquired_stored(
     result: Result<crate::client::AcquiredMediaBody, AttachmentDownloadFailure>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<(), AppError> {
+    let app = storage.app_storage();
     let now = crate::unix_now_seconds();
     let body = match result {
         Ok(crate::client::AcquiredMediaBody::Retained) => return Ok(()),
         Ok(body) => body,
         Err(AttachmentDownloadFailure::Retry(_)) => {
-            storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
+            app.fail_attachment_acquisition(job, Some(retry_at(&app, job, now)))?;
             return Ok(());
         }
         Err(AttachmentDownloadFailure::SizeLimit(_, limit)) => {
-            storage.block_attachment_size_policy(job, limit, now)?;
+            app.block_attachment_size_policy(job, limit, now)?;
             return Ok(());
         }
         // Disk, not the network, is the blocker: park with the checkpoint until
         // free space covers the reserve or the user retries, never on a timer.
         Err(AttachmentDownloadFailure::StorageBlocked { headroom }) => {
-            storage.block_attachment_storage(job, headroom, now)?;
+            app.block_attachment_storage(job, headroom, now)?;
             return Ok(());
         }
         Err(AttachmentDownloadFailure::Stop(_) | AttachmentDownloadFailure::FileRequired) => {
-            storage.fail_attachment_acquisition(job, None)?;
+            app.fail_attachment_acquisition(job, None)?;
             return Ok(());
         }
     };
-    let policy = storage.attachment_download_policy(fallback)?;
+    let policy = app.attachment_download_policy(fallback)?;
     let digest = job.plaintext_digest()?;
     let clock = crate::unix_now_seconds;
-    let target = storage.attachment_publication(job, &clock);
+    let target = app.attachment_publication(job, &clock);
     // A retried attempt of either sink needs its store file and whatever of
     // its ciphertext is not checkpointed: the checkpoint stays on disk, a
     // file body's staging does not. That staging is held until the headroom
     // is measured below.
-    let saved = storage
+    let saved = app
         .attachment_checkpoint_recorded(&job.reference)
         .ok()
         .flatten()
@@ -798,18 +843,18 @@ pub(super) fn complete_acquired_stored(
         // Published, reused or superseded: the store and the job agree.
         Ok(_) => {}
         Err(MediaError::InvalidBody(_)) => {
-            storage.fail_attachment_acquisition(job, None)?;
+            app.fail_attachment_acquisition(job, None)?;
         }
         // The disk (or database) is full: park, never retry on a timer.
         Err(MediaError::Capacity) => {
             let required = media_store::DiskPolicy::download_need(len, saved);
             let headroom = full_disk_headroom(directory, &policy, len, required, held);
-            storage.block_attachment_storage(job, headroom, now)?;
+            app.block_attachment_storage(job, headroom, now)?;
         }
         // Shutting down: the durable lease lets the next worker resume it.
         Err(MediaError::Closed) => {}
         Err(_) => {
-            storage.fail_attachment_acquisition(job, Some(retry_at(storage, job, now)))?;
+            app.fail_attachment_acquisition(job, Some(retry_at(&app, job, now)))?;
         }
     }
     // Only now, with the job's outcome recorded: a published job's wire file

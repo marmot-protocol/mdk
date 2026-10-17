@@ -4,6 +4,7 @@
 //! media store drives the file and the ordering through
 //! [`AttachmentCheckpoint`](super::AttachmentCheckpoint); these are its row
 //! operations, each under the job's attempt fences.
+use crate::SqliteAppStorage;
 use media_store::{CheckpointStart, FileId};
 
 use super::*;
@@ -121,7 +122,7 @@ pub(super) fn valid_publication_attempt(
     .storage()
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Inspect a current checkpoint without reading or allocating its body.
     /// This is sink selection only; the selected loader still authenticates chunks.
     pub fn attachment_partial_total(

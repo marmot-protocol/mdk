@@ -3990,7 +3990,7 @@ async fn accepted_edit_emits_content_row_and_recovered_snapshot_without_activity
     let mut client = app.client("alice").await.unwrap();
     let group = client.create_group("edits", &[]).await.unwrap();
     let group_hex = hex::encode(group.as_slice());
-    let storage = app.account_storage("alice").unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
     let original = storage_sqlite::StoredAppEvent {
         group_id_hex: group_hex.clone(),
         message_id_hex: "01".repeat(32),
@@ -4222,15 +4222,18 @@ fn recovery_preserves_persisted_authority_after_reopen() {
         };
         if index == 3 {
             // Legacy grants alone are not reconstructed as source evidence.
-            storage.record_app_event(&event).unwrap();
+            storage.app_storage().record_app_event(&event).unwrap();
         } else {
             storage
+                .app_storage()
                 .record_app_event_with_source(&event, None, authority)
                 .unwrap();
         }
     }
     storage.close().unwrap();
-    let storage = storage_sqlite::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let storage = storage_sqlite::SqliteAccountStorage::open_encrypted(&path, &key)
+        .unwrap()
+        .app_storage();
     let rows = storage
         .app_messages(storage_sqlite::StoredAppMessageQuery {
             group_id_hex: Some("aa".into()),

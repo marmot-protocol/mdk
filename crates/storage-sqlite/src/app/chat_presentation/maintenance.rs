@@ -1,5 +1,6 @@
 //! Bounded account-side application and durable restart positions. No shared-store locks here.
 use super::*;
+use crate::SqliteAppStorage;
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatPresentationActivePeer {
@@ -31,7 +32,7 @@ pub struct ChatPresentationCheckpoint {
     pub generation: u64,
     pub state: ChatPresentationCatchUp,
 }
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     pub fn chat_presentation_checkpoint(&self) -> StorageResult<ChatPresentationCheckpoint> {
         let conn = self.lock()?;
         let (generation, bytes): (i64, Option<Vec<u8>>) = conn

@@ -3,6 +3,9 @@
 //! or reads an obligation's current standing after an owner decision.
 use super::demand::{invalid_demand, recovery_cause};
 use super::*;
+#[cfg(test)]
+use crate::SqliteAccountStorage;
+use crate::SqliteAppStorage;
 
 /// Where an obligation stands in storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,7 +118,7 @@ pub(super) fn ticket(row: &DemandRow) -> StorageResult<RecoveryDemandTicket> {
     })
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// One obligation's current standing, or `None` once it was reclaimed.
     pub fn recovery_obligation_status(
         &self,
@@ -163,13 +166,16 @@ mod tests {
 
     fn store() -> SqliteAccountStorage {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.ensure_account_projection("alice").unwrap();
+        store
+            .app_storage()
+            .ensure_account_projection("alice")
+            .unwrap();
         store
     }
 
     #[test]
     fn requests_report_recorded_then_unchanged_duplicates() {
-        let store = store();
+        let store = store().app_storage();
         let (ticket, first) = store
             .request_recovery_observed(RecoveryRequest::IncrementalHistory, 1)
             .unwrap();
@@ -190,7 +196,7 @@ mod tests {
 
     #[test]
     fn explicit_requests_share_one_obligation_and_join_it() {
-        let store = store();
+        let store = store().app_storage();
         let (first, recorded) = store
             .request_recovery_observed(
                 RecoveryRequest::ExplicitHistory {
@@ -215,7 +221,7 @@ mod tests {
 
     #[test]
     fn loss_imports_sum_generations_per_cause() {
-        let store = store();
+        let store = store().app_storage();
         assert!(
             store
                 .synchronize_account_delivery_loss("alice")

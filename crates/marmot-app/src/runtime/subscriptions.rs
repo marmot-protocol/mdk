@@ -89,10 +89,10 @@ pub enum RuntimeTimelineMessageUpdate {
 /// Rehydrate a queued delta by id, retaining incremental window updates even
 /// when another conversation has a blocked participant.
 fn filter_projection_for_block_policy(
-    storage: &storage_sqlite::SqliteAccountStorage,
+    storage: &storage_sqlite::SqliteAppStorage,
     mut update: RuntimeProjectionUpdate,
 ) -> Result<RuntimeProjectionUpdate, AppError> {
-    if !storage.app_storage().has_blocked_users()? {
+    if !storage.has_blocked_users()? {
         return Ok(update);
     }
     let mut records = HashMap::new();
@@ -484,7 +484,7 @@ impl RuntimeTimelineMessagesSubscription {
             let signal = if let TimelineSubscriptionSignal::Projection(update) = signal {
                 let storage = self.policy_storage.clone();
                 match blocking_app_task(move || {
-                    filter_projection_for_block_policy(&storage, *update)
+                    filter_projection_for_block_policy(&storage.app_storage(), *update)
                 })
                 .await
                 {

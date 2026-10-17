@@ -46,6 +46,7 @@ async fn outgoing_cleanup_failure_preserves_primary_error() {
             .app
             .account_storage("alice")
             .unwrap()
+            .app_storage()
             .abandon_attachment_uploads(&[vec![1; 16]])
             .map_err(AppError::from);
         assert!(matches!(
@@ -500,7 +501,7 @@ async fn outgoing_sends_ignore_the_budget_and_refuse_what_they_cannot_stage() {
                 .await
                 .unwrap();
             let group_hex = hex::encode(group.as_slice());
-            let storage = app.account_storage("alice").unwrap();
+            let storage = app.account_storage("alice").unwrap().app_storage();
             let connection = fault_connection(&app);
             let (url, puts, server) = upload_endpoint().await;
             let request = || crate::MediaUploadRequest {
@@ -736,7 +737,7 @@ async fn staging_does_not_hold_an_account_transaction() {
     let (finished, done) = std::sync::mpsc::channel();
     let probe = std::thread::spawn(move || {
         cgka_traits::StorageProvider::with_transaction(&probe_storage, |storage| {
-            storage.attachment_download_policy(
+            storage.app_storage().attachment_download_policy(
                 &crate::runtime::attachment_controls::default_policy(
                     &crate::MarmotAppConfig::default(),
                 ),

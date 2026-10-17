@@ -18,8 +18,9 @@ fn budget(store: &SqliteAccountStorage, asset: &AttachmentAssetRef) -> Budget {
 fn explicit_join_preserves_queued_retry_and_fetching_budgets() {
     for state in [0, 1, 2] {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
         seed(&store, "join");
-        let asset = request(&store, "join");
+        let asset = request(&app, "join");
         store.lock().unwrap().execute(
             "UPDATE attachment_acquisition SET state=?2,due=100,attempt=CASE WHEN ?2=1 THEN randomblob(16) ELSE NULL END,attempts=2,automatic_history=1,acquisition_attempts=2,network_attempts=7,retry_not_before=100,progress_epoch=9 WHERE token=?1",
             params![asset.token,state],
@@ -27,30 +28,25 @@ fn explicit_join_preserves_queued_retry_and_fetching_budgets() {
         let before = budget(&store, &asset);
         for now in 20..30 {
             assert_eq!(
-                store
-                    .request_explicit_attachment(GROUP, &selected("join"), digest(), now)
+                app.request_explicit_attachment(GROUP, &selected("join"), digest(), now)
                     .unwrap(),
                 AttachmentDemand::Requested(asset.clone())
             );
             assert_eq!(budget(&store, &asset), before);
             assert!(
-                store
-                    .attachment_transfer_candidates(now, 64, true)
+                app.attachment_transfer_candidates(now, 64, true)
                     .unwrap()
                     .is_empty()
             );
             assert!(
-                store
-                    .claim_attachment_acquisition(&asset, now, 200)
+                app.claim_attachment_acquisition(&asset, now, 200)
                     .unwrap()
                     .is_none()
             );
         }
-        assert!(store.attachment_request_is_explicit(&asset).unwrap());
+        assert!(app.attachment_request_is_explicit(&asset).unwrap());
         assert_eq!(
-            store
-                .attachment_transfer_candidates(100, 64, false)
-                .unwrap(),
+            app.attachment_transfer_candidates(100, 64, false).unwrap(),
             vec![asset]
         );
     }
@@ -60,27 +56,25 @@ fn explicit_join_preserves_queued_retry_and_fetching_budgets() {
 #[test]
 fn permission_paused_promotion_preserves_backoff_and_counters() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "paused");
-    let asset = request(&store, "paused");
+    let asset = request(&app, "paused");
     store.lock().unwrap().execute("UPDATE attachment_acquisition SET state=2,due=100,automatic_history=1,acquisition_attempts=2,network_attempts=7 WHERE token=?1",[&asset.token]).unwrap();
-    store.park_attachment_permission(&asset).unwrap();
-    assert!(store.promote_attachment_demand(&asset, 20).unwrap());
+    app.park_attachment_permission(&asset).unwrap();
+    assert!(app.promote_attachment_demand(&asset, 20).unwrap());
     let after = budget(&store, &asset);
     assert_eq!(after.1, 2);
     assert_eq!(after.2, 7);
     assert_eq!(after.4, 100);
     assert_eq!(after.5, Some(100));
-    assert!(!store.promote_attachment_demand(&asset, 21).unwrap());
+    assert!(!app.promote_attachment_demand(&asset, 21).unwrap());
     assert!(
-        store
-            .attachment_transfer_candidates(99, 64, false)
+        app.attachment_transfer_candidates(99, 64, false)
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        store
-            .attachment_transfer_candidates(100, 64, false)
-            .unwrap(),
+        app.attachment_transfer_candidates(100, 64, false).unwrap(),
         vec![asset]
     );
 }
@@ -98,8 +92,9 @@ fn promotion_rejects_terminal_and_suppressed_sources() {
         "size_blocked_max=1",
     ] {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
         seed(&store, "terminal");
-        let asset = request(&store, "terminal");
+        let asset = request(&app, "terminal");
         store
             .lock()
             .unwrap()
@@ -109,28 +104,28 @@ fn promotion_rejects_terminal_and_suppressed_sources() {
             )
             .unwrap();
         let before = budget(&store, &asset);
-        assert!(!store.promote_attachment_demand(&asset, 20).unwrap());
+        assert!(!app.promote_attachment_demand(&asset, 20).unwrap());
         assert_eq!(budget(&store, &asset), before);
-        assert!(!store.attachment_request_is_explicit(&asset).unwrap());
+        assert!(!app.attachment_request_is_explicit(&asset).unwrap());
     }
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "removed");
-    let asset = request(&store, "removed");
-    store.remove_attachment_reference(&asset).unwrap();
-    assert!(!store.promote_attachment_demand(&asset, 20).unwrap());
+    let asset = request(&app, "removed");
+    app.remove_attachment_reference(&asset).unwrap();
+    assert!(!app.promote_attachment_demand(&asset, 20).unwrap());
     assert_eq!(
-        store
-            .request_explicit_attachment(GROUP, &selected("removed"), digest(), 20)
+        app.request_explicit_attachment(GROUP, &selected("removed"), digest(), 20)
             .unwrap(),
         AttachmentDemand::Suppressed
     );
-    let AttachmentDemand::Requested(recovered) = store
+    let AttachmentDemand::Requested(recovered) = app
         .request_attachment_download_again(GROUP, &selected("removed"), digest(), 21)
         .unwrap()
     else {
         panic!("deliberate recovery")
     };
-    assert!(store.attachment_request_is_explicit(&recovered).unwrap());
+    assert!(app.attachment_request_is_explicit(&recovered).unwrap());
 }
 
 /// Source validity and account-store incarnation are checked inside promotion.
@@ -144,16 +139,22 @@ fn promotion_rejects_expired_hidden_pending_and_foreign_sources() {
     ] {
         let store = SqliteAccountStorage::in_memory().unwrap();
         seed(&store, "stale");
-        let asset = request(&store, "stale");
+        let asset = request(&store.app_storage(), "stale");
         sql(&store, mutation);
-        assert!(!store.promote_attachment_demand(&asset, 20).unwrap());
+        assert!(
+            !store
+                .app_storage()
+                .promote_attachment_demand(&asset, 20)
+                .unwrap()
+        );
     }
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "foreign");
-    let asset = request(&store, "foreign");
+    let asset = request(&store.app_storage(), "foreign");
     assert!(
         !SqliteAccountStorage::in_memory()
             .unwrap()
+            .app_storage()
             .promote_attachment_demand(&asset, 20)
             .unwrap()
     );
@@ -163,40 +164,40 @@ fn promotion_rejects_expired_hidden_pending_and_foreign_sources() {
 #[test]
 fn seventh_backlog_promotion_preserves_single_owner_and_retry_positive_control() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     let mut assets = Vec::new();
     for n in 0..7 {
         let name = format!("file-{n}");
         seed(&store, &name);
-        assets.push(request(&store, &name));
+        assets.push(request(&app, &name));
     }
-    let running = store
+    let running = app
         .claim_attachment_acquisition(&assets[0], 12, 100)
         .unwrap()
         .unwrap();
     let before = budget(&store, &assets[0]);
-    assert!(store.promote_attachment_demand(&assets[6], 20).unwrap());
+    assert!(app.promote_attachment_demand(&assets[6], 20).unwrap());
     assert_eq!(
-        store.attachment_transfer_candidates(20, 64, true).unwrap()[0],
+        app.attachment_transfer_candidates(20, 64, true).unwrap()[0],
         assets[6]
     );
     assert_eq!(budget(&store, &assets[0]), before);
-    let tapped = store
+    let tapped = app
         .claim_attachment_acquisition(&assets[6], 20, 100)
         .unwrap()
         .unwrap();
     assert!(
-        store
-            .claim_attachment_acquisition(&assets[6], 21, 100)
+        app.claim_attachment_acquisition(&assets[6], 21, 100)
             .unwrap()
             .is_none()
     );
-    assert!(store.attachment_transfer_is_active(&running, 21).unwrap());
-    assert!(store.promote_attachment_demand(&assets[0], 21).unwrap());
-    assert!(store.attachment_transfer_is_active(&running, 21).unwrap());
-    store.cancel_attachment_acquisition(&assets[6]).unwrap();
-    assert!(!store.promote_attachment_demand(&assets[6], 22).unwrap());
-    assert!(!store.attachment_transfer_is_active(&tapped, 22).unwrap());
-    assert!(store.explicitly_retry_attachment(&assets[6], 23).unwrap());
+    assert!(app.attachment_transfer_is_active(&running, 21).unwrap());
+    assert!(app.promote_attachment_demand(&assets[0], 21).unwrap());
+    assert!(app.attachment_transfer_is_active(&running, 21).unwrap());
+    app.cancel_attachment_acquisition(&assets[6]).unwrap();
+    assert!(!app.promote_attachment_demand(&assets[6], 22).unwrap());
+    assert!(!app.attachment_transfer_is_active(&tapped, 22).unwrap());
+    assert!(app.explicitly_retry_attachment(&assets[6], 23).unwrap());
     assert_eq!(budget(&store, &assets[6]).1, 0);
 }
 
@@ -208,16 +209,27 @@ fn promotion_survives_encrypted_restart() {
     let key = SqlCipherKey::new("promotion-key").unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     seed(&store, "restart");
-    let asset = request(&store, "restart");
+    let asset = request(&store.app_storage(), "restart");
     store.lock().unwrap().execute("UPDATE attachment_acquisition SET state=2,due=100,retry_not_before=100,automatic_history=1,acquisition_attempts=2,network_attempts=7 WHERE token=?1",[&asset.token]).unwrap();
     let before = budget(&store, &asset);
-    assert!(store.promote_attachment_demand(&asset, 20).unwrap());
+    assert!(
+        store
+            .app_storage()
+            .promote_attachment_demand(&asset, 20)
+            .unwrap()
+    );
     store.close().unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     assert_eq!(budget(&store, &asset), before);
-    assert!(store.attachment_request_is_explicit(&asset).unwrap());
     assert!(
         store
+            .app_storage()
+            .attachment_request_is_explicit(&asset)
+            .unwrap()
+    );
+    assert!(
+        store
+            .app_storage()
             .attachment_transfer_candidates(99, 64, false)
             .unwrap()
             .is_empty()
@@ -228,20 +240,21 @@ fn promotion_survives_encrypted_restart() {
 #[test]
 fn active_budget_ceiling_promotion_preserves_partials_and_progress() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "last");
-    let asset = request(&store, "last");
-    let job = store
+    let asset = request(&app, "last");
+    let job = app
         .claim_attachment_acquisition(&asset, 12, 100)
         .unwrap()
         .unwrap();
-    checkpoint(&store, &job, &partial_identity(10), 0, b"abc", 12).unwrap();
+    checkpoint(&app, &job, &partial_identity(10), 0, b"abc", 12).unwrap();
     store.lock().unwrap().execute("UPDATE attachment_acquisition SET automatic_history=1,acquisition_attempts=4,network_attempts=64,progress_received=3,progress_total=10,progress_phase=1 WHERE token=?1",[&asset.token]).unwrap();
     let before = budget(&store, &asset);
-    assert!(store.promote_attachment_demand(&asset, 20).unwrap());
+    assert!(app.promote_attachment_demand(&asset, 20).unwrap());
     assert_eq!(budget(&store, &asset), before);
     assert_eq!(partial_usage(&store), 3);
-    assert!(store.attachment_transfer_is_active(&job, 20).unwrap());
-    assert!(!store.begin_attachment_network_attempt(&job, 20).unwrap());
+    assert!(app.attachment_transfer_is_active(&job, 20).unwrap());
+    assert!(!app.begin_attachment_network_attempt(&job, 20).unwrap());
 }
 
 /// Failure in the promotion write rolls back initial demand creation as well.
@@ -255,6 +268,7 @@ fn initial_explicit_demand_rolls_back_on_promotion_failure() {
     );
     assert!(
         store
+            .app_storage()
             .request_explicit_attachment(GROUP, &selected("fresh"), digest(), 20)
             .is_err()
     );
@@ -272,18 +286,19 @@ fn initial_explicit_demand_rolls_back_on_promotion_failure() {
 #[test]
 fn explicit_priority_survives_same_source_reprojection() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "first");
     seed(&store, "second");
-    let a = request(&store, "first");
-    let b = request(&store, "second");
-    assert!(store.promote_attachment_demand(&a, 20).unwrap());
-    assert!(store.promote_attachment_demand(&b, 21).unwrap());
+    let a = request(&app, "first");
+    let b = request(&app, "second");
+    assert!(app.promote_attachment_demand(&a, 20).unwrap());
+    assert!(app.promote_attachment_demand(&b, 21).unwrap());
     sql(
         &store,
         "UPDATE attachment_history SET received_at=99 WHERE message_id_hex='first';",
     );
     assert_eq!(
-        store.attachment_transfer_candidates(22, 64, true).unwrap(),
+        app.attachment_transfer_candidates(22, 64, true).unwrap(),
         vec![b, a]
     );
 }
@@ -293,10 +308,11 @@ fn explicit_priority_survives_same_source_reprojection() {
 fn pause_promotion_race_keeps_live_claim_charged_in_both_orders() {
     for pause_first in [false, true] {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
         seed(&store, "race");
-        let asset = request(&store, "race");
-        store.enable_attachment_automatic_history(&asset).unwrap();
-        let job = store
+        let asset = request(&app, "race");
+        app.enable_attachment_automatic_history(&asset).unwrap();
+        let job = app
             .claim_attachment_acquisition(&asset, 11, 100)
             .unwrap()
             .unwrap();
@@ -305,13 +321,13 @@ fn pause_promotion_race_keeps_live_claim_charged_in_both_orders() {
             "UPDATE attachment_acquisition SET acquisition_attempts=4,network_attempts=12",
         );
         if pause_first {
-            store.pause_automatic_attachments(12).unwrap();
+            app.pause_automatic_attachments(12).unwrap();
         }
-        assert!(store.promote_attachment_demand(&asset, 13).unwrap());
+        assert!(app.promote_attachment_demand(&asset, 13).unwrap());
         if !pause_first {
-            store.pause_automatic_attachments(14).unwrap();
+            app.pause_automatic_attachments(14).unwrap();
         }
-        assert!(store.fail_attachment_acquisition(&job, Some(30)).unwrap());
+        assert!(app.fail_attachment_acquisition(&job, Some(30)).unwrap());
         let (acquisitions, network): (u64, u64) = store
             .lock()
             .unwrap()
@@ -323,13 +339,12 @@ fn pause_promotion_race_keeps_live_claim_charged_in_both_orders() {
             .unwrap();
         assert_eq!((acquisitions, network), (4, 12));
         assert!(
-            store
-                .claim_attachment_acquisition(&asset, 100, 200)
+            app.claim_attachment_acquisition(&asset, 100, 200)
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
-            transfer(&store, "race", true).state,
+            transfer(&app, "race", true).state,
             AttachmentTransferState::RetryExhausted
         );
     }

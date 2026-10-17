@@ -324,7 +324,7 @@ impl AgentConnector {
             // anything that could have been dropped, while keeping replay O(window)
             // instead of O(history) on the same task that must keep draining the
             // broadcast channel. The `limit` path returns the newest N rows (see
-            // `SqliteAccountStorage::app_messages`), which is exactly the recent
+            // `SqliteAppStorage::app_messages`), which is exactly the recent
             // window a lagged subscription missed.
             let query = AppMessageQuery {
                 group_id_hex: group_filter.map(str::to_owned),

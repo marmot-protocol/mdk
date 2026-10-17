@@ -38,7 +38,7 @@ fn setup() -> (tempfile::TempDir, MarmotApp, ChatPresentationInput) {
     let store = app.account_storage("alice").unwrap();
     let input = ChatPresentationInput {
         group_id_hex: "11".repeat(16),
-        source_version: store.chat_presentation_version().unwrap(),
+        source_version: store.app_storage().chat_presentation_version().unwrap(),
         row_epoch: vec![1; 16],
         group_name: String::new(),
         member_count: Some(2),
@@ -99,6 +99,7 @@ fn project(
 fn prepare(app: &MarmotApp, page: TimelinePage) -> ConversationPresentationPage {
     app.account_storage("alice")
         .unwrap()
+        .app_storage()
         .conversation_presentation_page(page)
         .unwrap()
 }
@@ -335,6 +336,7 @@ fn conversation_system_references_require_matching_stored_commit_provenance() {
     row.direction = "system".into();
     row.source_message_id_hex = None;
     store
+        .app_storage()
         .record_app_event(&StoredAppEvent {
             group_id_hex: row.group_id_hex.clone(),
             message_id_hex: row.message_id_hex.clone(),
@@ -356,6 +358,7 @@ fn conversation_system_references_require_matching_stored_commit_provenance() {
     fake.subject_account_id_hex = Some("ee".repeat(32));
     row.group_system = Some(fake);
     let captured = store
+        .app_storage()
         .conversation_presentation_page(page(vec![row.clone()]))
         .unwrap();
     assert_eq!(
@@ -395,7 +398,9 @@ fn conversation_system_references_require_matching_stored_commit_provenance() {
     use cgka_traits::StorageProvider;
     let captured = store
         .with_transaction::<_, cgka_traits::storage::StorageError, _>(|store| {
-            store.conversation_presentation_page(page(vec![row.clone(); MAX_TIMELINE_LIMIT]))
+            store
+                .app_storage()
+                .conversation_presentation_page(page(vec![row.clone(); MAX_TIMELINE_LIMIT]))
         })
         .unwrap();
     assert_eq!(captured.page().messages.len(), MAX_TIMELINE_LIMIT);
@@ -444,6 +449,7 @@ fn conversation_scope_and_row_limit_fail_before_directory_hydration() {
     assert!(
         app.account_storage("alice")
             .unwrap()
+            .app_storage()
             .conversation_presentation_page(page(vec![row; 201]))
             .is_err()
     );

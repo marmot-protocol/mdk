@@ -5,11 +5,13 @@ pub use revisioned::{
     SelectedMessageDraftContent,
 };
 
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 use crate::base::connection::CachedSql;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::{SqliteAccountStorage, SqliteResultExt, unix_now_ms};
+use crate::{SqliteAppStorage, SqliteResultExt, unix_now_ms};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -112,7 +114,7 @@ impl fmt::Debug for StoredMessageDraftSummary {
     }
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// List draft preview metadata newest-first without loading attachment BLOBs.
     pub fn message_drafts(&self) -> StorageResult<Vec<StoredMessageDraftSummary>> {
         let mut conn = self.lock()?;
@@ -596,19 +598,19 @@ mod tests {
     #[test]
     fn message_draft_round_trips_and_survives_projection_pruning() {
         let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
         let group_id_hex = "11".repeat(16);
-        storage
-            .save_account_projection_state(
-                &StoredAccountState {
-                    label: "alice".to_owned(),
-                    seen_events: vec![],
-                    last_transport_timestamp: None,
-                    groups: vec![group(&group_id_hex)],
-                },
-                100,
-                MAX_FUTURE_SKEW_SECS,
-            )
-            .unwrap();
+        app.save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: vec![],
+                last_transport_timestamp: None,
+                groups: vec![group(&group_id_hex)],
+            },
+            100,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
 
         let attachment = StoredMessageDraftAttachment {
             id: "attachment-1".to_owned(),
@@ -620,7 +622,7 @@ mod tests {
             duration_seconds: Some(1.5),
             waveform_samples: vec![0.25, 0.75],
         };
-        let saved = storage
+        let saved = app
             .save_message_draft(
                 &group_id_hex,
                 "hello",
@@ -631,7 +633,7 @@ mod tests {
         assert_eq!(saved.content, "hello");
         assert_eq!(saved.media_attachments, vec![attachment.clone()]);
         assert_eq!(
-            storage.message_drafts().unwrap(),
+            app.message_drafts().unwrap(),
             vec![StoredMessageDraftSummary {
                 group_id_hex: group_id_hex.clone(),
                 content: "hello".to_owned(),
@@ -648,7 +650,7 @@ mod tests {
         );
 
         let initial_attachment_rowid = attachment_rowid(&storage, &group_id_hex, &attachment.id);
-        let text_only_update = storage
+        let text_only_update = app
             .save_message_draft(
                 &group_id_hex,
                 "updated text",
@@ -664,42 +666,39 @@ mod tests {
             "text-only saves must not rewrite attachment blobs"
         );
 
-        let updated = storage
+        let updated = app
             .save_message_draft(&group_id_hex, "updated", None, &[])
             .unwrap();
         assert_eq!(updated.created_at_ms, saved.created_at_ms);
         assert_eq!(updated.content, "updated");
         assert!(updated.media_attachments.is_empty());
 
-        storage.delete_message_draft(&group_id_hex).unwrap();
-        assert!(storage.message_draft(&group_id_hex).unwrap().is_none());
+        app.delete_message_draft(&group_id_hex).unwrap();
+        assert!(app.message_draft(&group_id_hex).unwrap().is_none());
 
-        storage
-            .save_message_draft(
-                &group_id_hex,
-                "protected",
-                None,
-                std::slice::from_ref(&attachment),
-            )
-            .unwrap();
-        storage
-            .save_account_projection_state(
-                &StoredAccountState {
-                    label: "alice".to_owned(),
-                    seen_events: vec![],
-                    last_transport_timestamp: None,
-                    groups: vec![],
-                },
-                100,
-                MAX_FUTURE_SKEW_SECS,
-            )
-            .unwrap();
-        let protected = storage.message_draft(&group_id_hex).unwrap().unwrap();
+        app.save_message_draft(
+            &group_id_hex,
+            "protected",
+            None,
+            std::slice::from_ref(&attachment),
+        )
+        .unwrap();
+        app.save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: vec![],
+                last_transport_timestamp: None,
+                groups: vec![],
+            },
+            100,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+        let protected = app.message_draft(&group_id_hex).unwrap().unwrap();
         assert_eq!(protected.content, "protected");
         assert_eq!(protected.media_attachments, vec![attachment]);
         assert_eq!(
-            storage
-                .load_account_projection_state("alice", 100)
+            app.load_account_projection_state("alice", 100)
                 .unwrap()
                 .groups
                 .len(),
@@ -707,22 +706,20 @@ mod tests {
             "the draft-owning projection row must remain for the foreign key"
         );
 
-        storage.delete_message_draft(&group_id_hex).unwrap();
-        storage
-            .save_account_projection_state(
-                &StoredAccountState {
-                    label: "alice".to_owned(),
-                    seen_events: vec![],
-                    last_transport_timestamp: None,
-                    groups: vec![],
-                },
-                100,
-                MAX_FUTURE_SKEW_SECS,
-            )
-            .unwrap();
+        app.delete_message_draft(&group_id_hex).unwrap();
+        app.save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: vec![],
+                last_transport_timestamp: None,
+                groups: vec![],
+            },
+            100,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
         assert!(
-            storage
-                .load_account_projection_state("alice", 100)
+            app.load_account_projection_state("alice", 100)
                 .unwrap()
                 .groups
                 .is_empty(),
@@ -757,19 +754,19 @@ mod tests {
     #[test]
     fn message_draft_attachment_reorder_preserves_existing_rows() {
         let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
         let group_id_hex = "22".repeat(16);
-        storage
-            .save_account_projection_state(
-                &StoredAccountState {
-                    label: "alice".to_owned(),
-                    seen_events: vec![],
-                    last_transport_timestamp: None,
-                    groups: vec![group(&group_id_hex)],
-                },
-                100,
-                MAX_FUTURE_SKEW_SECS,
-            )
-            .unwrap();
+        app.save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: vec![],
+                last_transport_timestamp: None,
+                groups: vec![group(&group_id_hex)],
+            },
+            100,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
         let first = StoredMessageDraftAttachment {
             id: "first".to_owned(),
             file_name: "first.txt".to_owned(),
@@ -790,25 +787,23 @@ mod tests {
             duration_seconds: None,
             waveform_samples: vec![],
         };
-        storage
-            .save_message_draft(
-                &group_id_hex,
-                "draft",
-                None,
-                &[first.clone(), second.clone()],
-            )
-            .unwrap();
+        app.save_message_draft(
+            &group_id_hex,
+            "draft",
+            None,
+            &[first.clone(), second.clone()],
+        )
+        .unwrap();
         let first_rowid = attachment_rowid(&storage, &group_id_hex, &first.id);
         let second_rowid = attachment_rowid(&storage, &group_id_hex, &second.id);
 
-        storage
-            .save_message_draft(
-                &group_id_hex,
-                "draft",
-                None,
-                &[second.clone(), first.clone()],
-            )
-            .unwrap();
+        app.save_message_draft(
+            &group_id_hex,
+            "draft",
+            None,
+            &[second.clone(), first.clone()],
+        )
+        .unwrap();
 
         assert_eq!(
             attachment_rowid(&storage, &group_id_hex, &first.id),
@@ -819,8 +814,7 @@ mod tests {
             second_rowid
         );
         assert_eq!(
-            storage
-                .message_draft(&group_id_hex)
+            app.message_draft(&group_id_hex)
                 .unwrap()
                 .unwrap()
                 .media_attachments,
@@ -832,7 +826,9 @@ mod tests {
     fn saving_draft_for_unknown_group_is_typed_not_found() {
         let storage = SqliteAccountStorage::in_memory().unwrap();
         assert!(matches!(
-            storage.save_message_draft(&"33".repeat(16), "draft", None, &[]),
+            storage
+                .app_storage()
+                .save_message_draft(&"33".repeat(16), "draft", None, &[]),
             Err(StorageError::NotFound)
         ));
     }
@@ -850,7 +846,8 @@ mod tests {
         };
         let storage =
             SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
-                .unwrap();
+                .unwrap()
+                .app_storage();
         let group_id_hex = "55".repeat(16);
         storage
             .save_account_projection_state(
@@ -894,7 +891,7 @@ mod tests {
 
     #[test]
     fn saving_draft_rejects_non_finite_waveform_samples_before_writing() {
-        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let storage = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let group_id_hex = "44".repeat(16);
         storage
             .save_account_projection_state(

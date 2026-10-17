@@ -1,7 +1,7 @@
 //! Derived attachment discovery. Protocol validation and acquisition policy live
 //! above storage; a slot is not a promise that an attachment can be downloaded.
 use crate::base::connection::CachedSql;
-use crate::{SqliteAccountStorage, SqliteResultExt};
+use crate::{SqliteAppStorage, SqliteResultExt};
 use cgka_traits::storage::StorageError;
 use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value};
 
@@ -168,7 +168,7 @@ fn version_tx(
     })
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Cheap authoritative change signal, including after the final page.
     /// Compare for equality to discover changes, then use
     /// [`AttachmentHistoryVersion::requires_restart_since`] to distinguish an

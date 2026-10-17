@@ -153,8 +153,9 @@ impl MarmotApp {
         let storage = self.account_storage(label)?;
         let outcome = result.as_ref().ok().map(encode_local_outcome).transpose()?;
         StorageProvider::with_transaction(&storage, |storage| {
-            let Some(current) =
-                storage.local_submission(&submission.group_id_hex, &submission.client_token)?
+            let Some(current) = storage
+                .app_storage()
+                .local_submission(&submission.group_id_hex, &submission.client_token)?
             else {
                 return Ok(None);
             };
@@ -168,7 +169,7 @@ impl MarmotApp {
             } else {
                 None
             };
-            storage.finish_local_submission(
+            storage.app_storage().finish_local_submission(
                 &submission.group_id_hex,
                 &submission.client_token,
                 outcome.as_deref(),
@@ -294,7 +295,7 @@ impl MarmotApp {
         );
         let request_hash = request_hash.finalize().to_vec();
         let result = StorageProvider::with_transaction(&storage, |storage| {
-            if let Some(existing) = storage.local_submission(&group_hex, &token)? {
+            if let Some(existing) = storage.app_storage().local_submission(&group_hex, &token)? {
                 if existing.request_hash != request_hash {
                     return Err(AppError::InvalidAppMessagePayload(
                         "client token is already bound to another submission".into(),
@@ -330,7 +331,7 @@ impl MarmotApp {
             }
             let consuming_revision = match &draft {
                 Some(LocalDraftAdmission::Source(revision)) => {
-                    let selected = storage.selected_message_draft(&group_hex)?;
+                    let selected = storage.app_storage().selected_message_draft(&group_hex)?;
                     if selected.revision != *revision {
                         return Err(AppError::MessageDraftRevisionConflict);
                     }
@@ -347,13 +348,15 @@ impl MarmotApp {
                     Some(revision)
                 }
                 Some(LocalDraftAdmission::ConsumeIfCurrent(revision)) => {
-                    let selected = storage.selected_message_draft(&group_hex)?;
+                    let selected = storage.app_storage().selected_message_draft(&group_hex)?;
                     match selected.draft.filter(|_| selected.revision == *revision) {
                         Some(selected) => {
-                            let plaintext_hashes =
-                                storage.message_draft_plaintext_hashes(revision).map_err(
-                                    |error| crate::drafts::revision_error(error, &group_hex),
-                                )?;
+                            let plaintext_hashes = storage
+                                .app_storage()
+                                .message_draft_plaintext_hashes(revision)
+                                .map_err(|error| {
+                                    crate::drafts::revision_error(error, &group_hex)
+                                })?;
                             if selected.content.trim() != request.content.trim()
                                 || selected.reply_to_message_id_hex != request.reply_to
                                 || !draft_media_describes_refs(&selected, &request.attachments)
@@ -379,6 +382,7 @@ impl MarmotApp {
             let mut event_created_at = created_at;
             let intent = if let Some(original_token) = &edit_of_client_token {
                 let original = storage
+                    .app_storage()
                     .local_submission(&group_hex, original_token)?
                     .ok_or_else(|| {
                         AppError::InvalidAppMessagePayload(
@@ -391,6 +395,7 @@ impl MarmotApp {
                     ));
                 }
                 let original_row = storage
+                    .app_storage()
                     .timeline_message(&group_hex, &original.message_id_hex)?
                     .ok_or_else(|| {
                         AppError::InvalidAppMessagePayload(
@@ -445,7 +450,10 @@ impl MarmotApp {
             // Keep the existing wire identity. A new token must not overwrite
             // another admission's correlation or adopt an existing legacy row.
             // Same-token retries returned above, before rebuilding an event.
-            if storage.local_message_identity_exists(&group_hex, &event.id)? {
+            if storage
+                .app_storage()
+                .local_message_identity_exists(&group_hex, &event.id)?
+            {
                 return Err(AppError::InvalidAppMessagePayload(
                     "message identity collision: an identical event already exists; submission was not accepted".into(),
                 ));
@@ -471,7 +479,7 @@ impl MarmotApp {
                 state: 0,
                 outcome_json: None,
             };
-            storage.insert_local_submission(&submission)?;
+            storage.app_storage().insert_local_submission(&submission)?;
             let projection = AppMessageProjection {
                 authority: None,
                 message_id_hex: event.id.clone(),
@@ -491,6 +499,7 @@ impl MarmotApp {
             let update = self.record_account_app_event(&account.label, &projection)?;
             if let Some(revision) = consuming_revision {
                 storage
+                    .app_storage()
                     .clear_message_draft_if_revision(revision)
                     .map_err(|error| crate::drafts::revision_error(error, &group_hex))?;
             }

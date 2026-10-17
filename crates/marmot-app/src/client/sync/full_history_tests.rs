@@ -45,6 +45,7 @@ fn answered(routes: usize) -> ScriptedComparisons {
 fn explicit_pending(app: &MarmotApp) -> bool {
     app.account_storage("alice")
         .unwrap()
+        .app_storage()
         .pending_recovery_demands()
         .unwrap()
         .iter()
@@ -112,6 +113,7 @@ async fn certified_window_closes_the_request_and_names_the_history_below_it() {
     assert!(
         app.account_storage("alice")
             .unwrap()
+            .app_storage()
             .parked_recovery_obligations()
             .unwrap()
             .is_empty(),
@@ -224,7 +226,7 @@ async fn cancelled_before_start_requests_nothing_and_keeps_overflow() {
     let (_dir, app, relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     let before = relay.subscription_count();
-    let storage = app.account_storage("alice").unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
     storage
         .mark_account_delivery_recovery("alice", 7, 1)
         .unwrap();
@@ -297,7 +299,11 @@ async fn cancellation_stops_the_comparison_and_keeps_debt_and_cost() {
             .contains("full_history_repair_cancelled")
     );
     assert_eq!(
-        storage.recovery_retry_state().unwrap().attempt_serial,
+        storage
+            .app_storage()
+            .recovery_retry_state()
+            .unwrap()
+            .attempt_serial,
         1,
         "the cancelled attempt keeps its retry cost"
     );
@@ -311,6 +317,7 @@ async fn unfinished_overflow_repair_survives_reopen() {
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     app.account_storage("alice")
         .unwrap()
+        .app_storage()
         .mark_account_delivery_recovery("alice", 7, 1)
         .unwrap();
     client.delivery_overflow_recovery_pending = true;
@@ -324,6 +331,7 @@ async fn unfinished_overflow_repair_survives_reopen() {
         reopened
             .account_storage("alice")
             .unwrap()
+            .app_storage()
             .account_delivery_recovery("alice")
             .unwrap()
             .is_some()
@@ -359,7 +367,7 @@ async fn one_failed_required_relay_cannot_complete_full_history_repair() {
 async fn dropped_explicit_future_detaches_urgency_without_losing_other_debt_or_retry() {
     let (_dir, app, relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
-    let storage = app.account_storage("alice").unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
     storage
         .mark_account_delivery_recovery("alice", 42, 3)
         .unwrap();
@@ -425,7 +433,7 @@ async fn dropped_explicit_future_detaches_urgency_without_losing_other_debt_or_r
 async fn loss_handoff_active_attempt_does_not_advance_the_durable_cursor() {
     let (_dir, app, _relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
-    let storage = app.account_storage("alice").unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
     storage
         .mark_account_delivery_recovery("alice", 42, 3)
         .unwrap();
@@ -459,7 +467,7 @@ async fn loss_handoff_active_attempt_does_not_advance_the_durable_cursor() {
 async fn qualified_loss_acknowledgment_persists_admitted_cursor_only_after_handoff() {
     let (_dir, app, relay) = fixture();
     let mut client = client_on_app_relay_plane(&app, "alice").await;
-    let storage = app.account_storage("alice").unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
     storage
         .mark_account_delivery_recovery("alice", 91, 1)
         .unwrap();
@@ -569,6 +577,7 @@ async fn a_sync_with_nothing_to_select_takes_no_recovery_credit() {
     assert_eq!(
         app.account_storage("alice")
             .unwrap()
+            .app_storage()
             .recovery_retry_state()
             .unwrap()
             .attempt_serial,
@@ -903,6 +912,7 @@ async fn owner_passes_close_a_certified_explicit_request_without_a_notice() {
     }
     let storage = app.account_storage("alice").unwrap();
     storage
+        .app_storage()
         .request_recovery(
             storage_sqlite::RecoveryRequest::ExplicitHistory {
                 operation_id: &[9; 16],
@@ -934,12 +944,22 @@ async fn owner_passes_close_a_certified_explicit_request_without_a_notice() {
         client.run_recovery_grant_for_test(grant).await.unwrap();
         passes += 1;
         assert!(
-            storage.parked_recovery_obligations().unwrap().is_empty(),
+            storage
+                .app_storage()
+                .parked_recovery_obligations()
+                .unwrap()
+                .is_empty(),
             "a certified slice never parks the rest"
         );
     }
     assert!(passes > 1, "the request needed more than one slice");
-    assert!(storage.parked_recovery_obligations().unwrap().is_empty());
+    assert!(
+        storage
+            .app_storage()
+            .parked_recovery_obligations()
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         client.take_history_notice_changes().is_none(),
         "no notice was raised"

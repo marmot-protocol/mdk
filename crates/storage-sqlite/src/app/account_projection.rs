@@ -1,6 +1,6 @@
 use crate::base::connection::CachedSql;
 use crate::{
-    SQLITE_BIND_PARAMETER_CHUNK, SqliteAccountStorage, SqliteResultExt,
+    SQLITE_BIND_PARAMETER_CHUNK, SqliteAppStorage, SqliteResultExt,
     base::connection::retry_on_busy, bool_i64, i64_to_u64, i64_to_usize, tags_from_json,
     u64_to_i64, unix_now_ms, unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
 };
@@ -194,7 +194,7 @@ pub struct StoredAccountGroup {
     pub prior_nostr_routes: Vec<StoredNostrRoute>,
     /// The local account's membership in this group. Read-only on this struct:
     /// it is loaded from `account_groups` but owned exclusively by
-    /// [`SqliteAccountStorage::set_group_self_membership`], so the projection
+    /// [`SqliteAppStorage::set_group_self_membership`], so the projection
     /// save deliberately ignores it (a routine resave must not clobber a
     /// membership change). New rows take the schema default `Member`.
     pub self_membership: SelfMembership,
@@ -239,7 +239,7 @@ pub struct StoredNostrRoute {
     /// Unix seconds when the device saw this route replaced as the group's
     /// current route, which anchors its retained history floor. `None` on a
     /// route still current when recorded, and on routes stored before this
-    /// field existed until [`SqliteAccountStorage::stamp_unrecorded_prior_route_switches`]
+    /// field existed until [`SqliteAppStorage::stamp_unrecorded_prior_route_switches`]
     /// stamps them. Stored inside the route JSON, so no schema change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaced_at: Option<u64>,
@@ -329,7 +329,7 @@ impl StoredAppMessageRecord {
     }
 }
 
-/// Column list for [`SqliteAccountStorage::app_messages`], decoded by
+/// Column list for [`SqliteAppStorage::app_messages`], decoded by
 /// `app_message_from_row` (including resolved source authority at indexes 15–16).
 const APP_EVENT_REPLAY_COLUMNS: &str = "message_id_hex, direction, group_id_hex, sender, plaintext, \
      kind, tags_json, source_epoch, retention_seconds, retention_expires_at, recorded_at, \
@@ -337,7 +337,7 @@ const APP_EVENT_REPLAY_COLUMNS: &str = "message_id_hex, direction, group_id_hex,
      authority_context";
 
 /// The ONE ascending order for the raw-event replay surface (recovery / lag
-/// replay), shared by [`SqliteAccountStorage::app_messages`] and — via
+/// replay), shared by [`SqliteAppStorage::app_messages`] and — via
 /// [`AppEventReplayCursor`]'s `Ord` — the runtime recovery watermark and
 /// suppression, so the query order and the watermark cut-point can never drift
 /// (#630, #736 boundary contract 1). This is the RAW-EVENT surface only: it is
@@ -463,7 +463,7 @@ struct RawStoredAccountGroup {
     self_membership: SelfMembership,
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     pub fn ensure_account_projection(&self, label: &str) -> StorageResult<()> {
         self.lock()?
             .execute_cached(
@@ -1387,32 +1387,6 @@ impl SqliteAccountStorage {
             .storage()?;
             Ok(())
         })
-    }
-
-    /// Transactionally removes all app-local data for one group without touching
-    /// the stored MLS/OpenMLS group state. This is the storage primitive for the
-    /// local delete/wipe UX: it drops the chat-list/account projection, plaintext
-    /// app events, timeline rows, agent-stream start projection rows, cached
-    /// encrypted-media epoch secrets, and group push-token rows keyed by
-    /// `group_id_hex`. A metadata-only media-secret retirement barrier remains
-    /// because protocol/MLS state is intentionally retained; without it that
-    /// state could immediately rederive wiped key bytes. `seen_events` and
-    /// protocol/MLS tables are left intact for active groups. A durable local
-    /// deletion frontier distinguishes the intentionally absent projection from
-    /// a torn write, suppressing historical relay replay while allowing a
-    /// causally newer chat message to re-create it. A terminal group is
-    /// different: its live MLS state is already erased, so this transaction also
-    /// removes the full `cgka_groups` row and retains only
-    /// `cgka_disband_tombstones` as the permanent anti-resurrection guard. The
-    /// logical wipe and a durable WAL checkpoint intent commit together under
-    /// `secure_delete = ON`. If `wal_checkpoint(TRUNCATE)` is blocked by a reader,
-    /// the committed result is returned with `erasure_pending`; a retry recovers
-    /// the accumulated result from the intent and attempts truncation again.
-    pub fn delete_local_group_data(
-        &self,
-        group_id_hex: &str,
-    ) -> StorageResult<DeleteLocalGroupDataResult> {
-        self.delete_local_group_data_inner(group_id_hex, None)
     }
 
     /// Return the durable message-ingress frontier recorded by a deliberate
@@ -3416,7 +3390,7 @@ pub(crate) fn merge_local_group_delete_intent_tx(
 }
 
 pub(crate) fn finish_secure_delete_checkpoint_intent<T>(
-    storage: &SqliteAccountStorage,
+    storage: &SqliteAppStorage,
     operation_kind: &str,
     scope: &str,
 ) -> StorageResult<SecureDeleteCheckpointFinish<T>>

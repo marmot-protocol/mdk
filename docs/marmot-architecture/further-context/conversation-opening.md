@@ -8,7 +8,7 @@ status: implementation
 # Bounded conversation opening
 
 C5 M1 ([#1838](https://github.com/marmot-protocol/mdk/issues/1838)) adds
-`SqliteAccountStorage::conversation_open`: one read-only snapshot containing a bounded timeline page,
+`SqliteAppStorage::conversation_open`: one read-only snapshot containing a bounded timeline page,
 retained read state, invitation status, the selected opening position and an opaque anchor for each row.
 It reuses the existing timeline and unread projections without a schema migration. This is the storage foundation;
 the composed live screen and native bindings follow in later C5 slices.

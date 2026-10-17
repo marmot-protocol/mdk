@@ -4,8 +4,10 @@
 //! table instead of dropping them. The account worker later admits each row
 //! through the ordinary ingest path and removes it afterwards, so a spilled
 //! delivery stays durable until ingest has seen it.
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 use crate::base::connection::{CachedSql, retry_on_busy};
-use crate::{SqliteAccountStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
+use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::TransportDelivery;
 use cgka_traits::storage::StorageResult;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -103,7 +105,7 @@ fn already_spilled(conn: &Connection, event_id: &[u8]) -> StorageResult<bool> {
     .storage()
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Spill deliveries in order and report one disposition per input.
     pub fn spill_account_deliveries(
         &self,
@@ -361,13 +363,13 @@ mod tests {
             .unwrap();
     }
 
-    fn due(store: &SqliteAccountStorage, now: u64) -> SpilledDeliveryBatch {
+    fn due(store: &SqliteAppStorage, now: u64) -> SpilledDeliveryBatch {
         store.spilled_account_deliveries(10, now).unwrap()
     }
 
     #[test]
     fn spill_round_trips_in_order_and_removes_rows() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let outcome = store
             .spill_account_deliveries(&[delivery(2), delivery(1)], LIMITS, 9)
             .unwrap();
@@ -402,6 +404,7 @@ mod tests {
             .unwrap();
 
         let outcome = store
+            .app_storage()
             .spill_account_deliveries(&[delivery(1), delivery(2), delivery(3)], LIMITS, 9)
             .unwrap();
         assert_eq!(
@@ -417,7 +420,7 @@ mod tests {
     #[test]
     fn spill_reports_full_at_limits_but_keeps_rows_it_already_holds() {
         use DeliverySpillDisposition::{Full, Stored};
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let outcome = store
             .spill_account_deliveries(
                 &[delivery(1), delivery(1), delivery(2), delivery(3)],
@@ -440,6 +443,7 @@ mod tests {
         let empty = SqliteAccountStorage::in_memory().unwrap();
         assert_eq!(
             empty
+                .app_storage()
                 .spill_account_deliveries(&[delivery(5)], tight, 9)
                 .unwrap(),
             vec![Full]
@@ -461,9 +465,9 @@ mod tests {
     #[test]
     fn undecodable_rows_are_reported_and_discarded_as_loss() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.ensure_account_projection("alice").unwrap();
-        store
-            .spill_account_deliveries(&[delivery(1), delivery(2), delivery(3)], LIMITS, 9)
+        let app = store.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        app.spill_account_deliveries(&[delivery(1), delivery(2), delivery(3)], LIMITS, 9)
             .unwrap();
         store
             .lock()
@@ -473,27 +477,25 @@ mod tests {
                 [vec![1_u8; 32]],
             )
             .unwrap();
-        let first = store.spilled_account_deliveries(2, 9).unwrap();
+        let first = app.spilled_account_deliveries(2, 9).unwrap();
         assert_eq!(first.undecodable.len(), 1);
         assert!(first.more, "a full read continues past the bad row");
         assert_eq!(first.deliveries.len(), 1);
         assert_eq!(first.deliveries[0].delivery, delivery(2));
 
-        store
-            .discard_spilled_account_deliveries(&first.undecodable, "alice", 77, 9)
+        app.discard_spilled_account_deliveries(&first.undecodable, "alice", 77, 9)
             .unwrap();
         assert_eq!(
             loss_evidence(&store),
             vec![(RecoveryLossCause::Queue as i64, 1)]
         );
         assert_eq!(
-            store
-                .recovery_loss_goal_floor("alice", RecoveryLossCause::Queue)
+            app.recovery_loss_goal_floor("alice", RecoveryLossCause::Queue)
                 .unwrap(),
             None,
             "an undecodable row's time is unknown, so the loss is unbounded"
         );
-        let rest: Vec<_> = due(&store, 9)
+        let rest: Vec<_> = due(&app, 9)
             .deliveries
             .iter()
             .map(|row| row.delivery.clone())
@@ -503,7 +505,7 @@ mod tests {
 
     #[test]
     fn discarded_rows_bound_the_loss_goal_by_their_created_at() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         store.ensure_account_projection("alice").unwrap();
         store
             .spill_account_deliveries(&[delivery(5), delivery(3), delivery(9)], LIMITS, 9)
@@ -529,37 +531,37 @@ mod tests {
     #[test]
     fn deferred_rows_wait_with_doubling_delay_and_are_never_deleted_by_deferral() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.ensure_account_projection("alice").unwrap();
-        store
-            .spill_account_deliveries(&[delivery(1)], LIMITS, 100)
+        let app = store.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        app.spill_account_deliveries(&[delivery(1)], LIMITS, 100)
             .unwrap();
-        let seq = due(&store, 100).deliveries[0].seq;
+        let seq = due(&app, 100).deliveries[0].seq;
 
         assert_eq!(
-            store.defer_spilled_account_delivery(seq, 100).unwrap(),
+            app.defer_spilled_account_delivery(seq, 100).unwrap(),
             Some(SpilledDeliveryDeferral {
                 attempts: 1,
                 not_before: 160
             })
         );
-        let waiting = due(&store, 159);
+        let waiting = due(&app, 159);
         assert!(waiting.deliveries.is_empty());
         assert_eq!(waiting.next_retry_at, Some(160));
-        assert_eq!(due(&store, 160).deliveries.len(), 1);
+        assert_eq!(due(&app, 160).deliveries.len(), 1);
         assert_eq!(
-            store.defer_spilled_account_delivery(seq, 160).unwrap(),
+            app.defer_spilled_account_delivery(seq, 160).unwrap(),
             Some(SpilledDeliveryDeferral {
                 attempts: 2,
                 not_before: 280
             })
         );
         for _ in 0..10 {
-            store.defer_spilled_account_delivery(seq, 1_000).unwrap();
+            app.defer_spilled_account_delivery(seq, 1_000).unwrap();
         }
-        let capped = due(&store, u64::MAX >> 2);
+        let capped = due(&app, u64::MAX >> 2);
         assert_eq!(capped.deliveries.len(), 1, "deferral never deletes a row");
         assert_eq!(
-            store.defer_spilled_account_delivery(seq, 5_000).unwrap(),
+            app.defer_spilled_account_delivery(seq, 5_000).unwrap(),
             Some(SpilledDeliveryDeferral {
                 attempts: 13,
                 not_before: 5_000 + 3_600
@@ -567,23 +569,20 @@ mod tests {
         );
 
         assert!(
-            store
-                .discard_spilled_account_deliveries(&[seq], "unknown-account", 5, 5_000)
+            app.discard_spilled_account_deliveries(&[seq], "unknown-account", 5, 5_000)
                 .is_err(),
             "the loss record references a missing account"
         );
         assert_eq!(
-            due(&store, u64::MAX >> 2).deliveries.len(),
+            due(&app, u64::MAX >> 2).deliveries.len(),
             1,
             "a failed discard keeps the row"
         );
-        store
-            .discard_spilled_account_deliveries(&[seq], "alice", 5, 5_000)
+        app.discard_spilled_account_deliveries(&[seq], "alice", 5, 5_000)
             .unwrap();
-        assert!(due(&store, u64::MAX >> 2).deliveries.is_empty());
+        assert!(due(&app, u64::MAX >> 2).deliveries.is_empty());
         assert!(
-            store
-                .pending_recovery_demands()
+            app.pending_recovery_demands()
                 .unwrap()
                 .iter()
                 .any(|demand| demand.cause == crate::RecoveryCause::QueueLoss),
@@ -594,11 +593,10 @@ mod tests {
             vec![(RecoveryLossCause::Queue as i64, 1)]
         );
         assert_eq!(
-            store.defer_spilled_account_delivery(seq, 6_000).unwrap(),
+            app.defer_spilled_account_delivery(seq, 6_000).unwrap(),
             None
         );
-        store
-            .discard_spilled_account_deliveries(&[seq], "alice", 6, 6_000)
+        app.discard_spilled_account_deliveries(&[seq], "alice", 6, 6_000)
             .unwrap();
         assert_eq!(
             loss_evidence(&store).len(),

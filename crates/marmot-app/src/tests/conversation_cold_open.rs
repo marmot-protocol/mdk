@@ -39,26 +39,29 @@ impl History {
                     payload: vec![0; 4096],
                     deferred_peel: None,
                 })?;
-                store.record_app_event(&storage_sqlite::StoredAppEvent {
-                    group_id_hex: group_hex.clone(),
-                    message_id_hex: format!("{i:064x}"),
-                    source_message_id_hex: Some(source),
-                    source_epoch: Some(epoch.0),
-                    direction: "received".into(),
-                    sender: "bb".repeat(32),
-                    plaintext: format!("retained message {i}"),
-                    kind: 9,
-                    tags: vec![],
-                    recorded_at: 100 + i as u64,
-                    received_at: 100 + i as u64,
-                    origin_commit_id: None,
-                    moderation_grant: false,
-                })?;
+                store
+                    .app_storage()
+                    .record_app_event(&storage_sqlite::StoredAppEvent {
+                        group_id_hex: group_hex.clone(),
+                        message_id_hex: format!("{i:064x}"),
+                        source_message_id_hex: Some(source),
+                        source_epoch: Some(epoch.0),
+                        direction: "received".into(),
+                        sender: "bb".repeat(32),
+                        plaintext: format!("retained message {i}"),
+                        kind: 9,
+                        tags: vec![],
+                        recorded_at: 100 + i as u64,
+                        received_at: 100 + i as u64,
+                        origin_commit_id: None,
+                        moderation_grant: false,
+                    })?;
             }
             Ok::<_, cgka_traits::StorageError>(())
         })
         .unwrap();
         store
+            .app_storage()
             .refresh_chat_list_row(&account.account_id_hex, &group_hex, &|_, _| false)
             .unwrap();
         drop(client);
@@ -296,6 +299,7 @@ async fn cold_open_renders_large_history_during_stalled_initial_sync() {
         .expect("production worker must be blocked in initial relay sync");
         let store = h.app.account_storage("alice").unwrap();
         let before_read = store
+            .app_storage()
             .conversation_open(&hex::encode(h.group.as_slice()), Default::default())
             .unwrap()
             .read_state;
@@ -437,6 +441,7 @@ async fn cold_open_storage_and_hydration_timings() {
         let store = h.app.account_storage("alice").unwrap();
         let start = std::time::Instant::now();
         let page = store
+            .app_storage()
             .conversation_account_snapshot(&hex::encode(h.group.as_slice()), Default::default())
             .unwrap();
         let local_us = start.elapsed().as_micros();

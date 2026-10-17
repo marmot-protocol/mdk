@@ -5019,7 +5019,7 @@ impl MarmotAppRuntime {
     }
 
     /// One page of each voter's effective selection for one visible poll; see
-    /// `SqliteAccountStorage::poll_votes` for the tally, block and cursor rules.
+    /// `SqliteAppStorage::poll_votes` for the tally, block and cursor rules.
     pub fn poll_votes(
         &self,
         account_ref: &str,

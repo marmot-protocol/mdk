@@ -13,14 +13,14 @@ the list only shrinks. The plan is the
 | `routes.rs` | Deleting a route's recovery inventory and NIP-77 reconciliation state when the engine deletes the route or the group | `protocol/storage/transport_routes.rs`, `protocol/storage/groups.rs` |
 | `groups.rs` | Lifting the media-secret retirement barrier when a forgotten group rejoins | `protocol/storage/groups.rs` |
 | `release.rs` | Message release for replay: whether an app owns the messages, retiring seen-ring and inventory entries, arming or invalidating the recovery ledger | `protocol/storage/messages.rs` |
-| `outbound.rs` | The confirm path consuming the local submission and the draft a message came from, and waking the app's draft observer | `protocol/storage/outbound.rs` |
+| `outbound.rs` | The confirm path consuming the local submission and the draft a message came from, and waking the app's draft observer; the observer's setter, which `cgka-session` calls on the engine's storage | `protocol/storage/outbound.rs` |
 | `projection.rs` | The projection checkpoint acknowledging the engine outbox and probing forgotten groups, in its own transaction | `app/account_projection.rs` |
 | `authority.rs` | The app queueing backfilled authority requests in the engine's outbox | `app/timeline/reports.rs` |
-| `wipe.rs` | The local-forget wipe: a group's app data, and on an engine forget its engine rows and forget marker, in one transaction | `protocol/storage/groups.rs` (`forget_group_local`), `app/account_projection.rs` (`delete_local_group_data`) |
+| `wipe.rs` | The local-forget wipe: a group's app data, and on an engine forget its engine rows and forget marker, in one transaction. `delete_local_group_data`, the app's entry point, lives here on the account handle | `protocol/storage/groups.rs` (`forget_group_local`), `marmot-app` (`delete_local_group_data`) |
 | `views.rs` | App reads of engine tables: the chat list's leave and disband state, branch-withdrawal origins, a conversation's group state, a group's routes, the local-deletion frontier's message order, and the spill's released-receipt check | `app/chat_list.rs`, `app/chat_list/pages.rs`, `app/timeline.rs`, `app/timeline/capture.rs`, `app/account_projection.rs`, `app/transport/delivery_spill.rs` |
 
 Outside the schema links below, the only lines left on the list are the account handle's three in
-`base/connection.rs`, which step 4 PR 4 removes when `SqliteAccountStorage` moves to `protocol/`.
+`base/connection.rs`, which step 4 PR 4's last slice removes when `SqliteAccountStorage` moves to `protocol/`.
 
 ## Schema links that stay
 

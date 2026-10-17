@@ -42,7 +42,7 @@ impl MarmotAppRuntime {
             {
                 return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
             }
-            let storage = app.account_storage(&account.label)?;
+            let storage = app.account_storage(&account.label)?.app_storage();
             let mut changed = false;
             let mut requested = false;
             let result = targets
@@ -133,7 +133,7 @@ impl MarmotAppRuntime {
             let mut repaired = false;
             let outcome = (|| {
                 for reference in references {
-                    let result = storage.read_avatar_bounded(
+                    let result = storage.app_storage().read_avatar_bounded(
                         &reference,
                         crate::unix_now_seconds(),
                         remaining,
@@ -176,7 +176,9 @@ impl MarmotAppRuntime {
             {
                 return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
             }
-            app.account_storage(&account.label)?.clear_avatar_cache()?;
+            app.account_storage(&account.label)?
+                .app_storage()
+                .clear_avatar_cache()?;
             let _ = app.presentation_signals.avatars.send(account.label);
             Ok(())
         });

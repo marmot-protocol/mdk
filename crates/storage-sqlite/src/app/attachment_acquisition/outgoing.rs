@@ -1,5 +1,6 @@
 //! Optional outgoing retention after upload; publication and acquisition remain independent.
 use super::*;
+use crate::SqliteAppStorage;
 
 /// Valid staged bytes always win over HTTP; deliberate Retry may reacquire a quarantined body.
 pub(super) const STAGED_UPLOAD_MATCH: &str = "NOT EXISTS(SELECT 1 FROM outgoing_attachment_uploads u JOIN attachment_history h ON h.group_id_hex=u.group_id_hex AND h.source_epoch=u.source_epoch AND h.slot_json=u.slot_json JOIN app_events a ON a.group_id_hex=h.group_id_hex AND a.message_id_hex=h.message_id_hex WHERE h.group_id_hex=q.group_id_hex AND h.message_id_hex=q.message_id_hex AND h.attachment_index=q.attachment_index AND a.direction='sent' AND (u.quarantined=0 OR q.explicit_request=0))";
@@ -26,7 +27,7 @@ impl std::fmt::Debug for AttachmentUploadSource<'_> {
     }
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Reserve the complete outgoing batch, then import private snapshots in
     /// short, bounded transactions. Tokens become bindable only after every
     /// body verifies. Errors release the whole batch; an enclosing caller

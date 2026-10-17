@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 use rusqlite::params;
 
 fn seed(store: &SqliteAccountStorage, id: usize, slots: usize) {
@@ -10,7 +12,7 @@ fn seed(store: &SqliteAccountStorage, id: usize, slots: usize) {
             serde_json::json!({"imeta": (0..slots).map(|n| serde_json::json!(["imeta",format!("slot {n}")])).collect::<Vec<_>>()}).to_string()],
     ).unwrap();
 }
-fn page(store: &SqliteAccountStorage) -> AttachmentHistoryPage {
+fn page(store: &SqliteAppStorage) -> AttachmentHistoryPage {
     store.attachment_history_page("aa", 1, None).unwrap()
 }
 fn sql(store: &SqliteAccountStorage, text: &str) {
@@ -33,6 +35,7 @@ fn sparse_history_albums_and_equal_times_traverse_once_in_canonical_order() {
         let mut actual = Vec::new();
         loop {
             let p = store
+                .app_storage()
                 .attachment_history_page("aa", limit, cursor.as_ref())
                 .unwrap();
             assert!(p.entries.len() <= limit);
@@ -51,6 +54,7 @@ fn sparse_history_albums_and_equal_times_traverse_once_in_canonical_order() {
     }
     assert!(
         store
+            .app_storage()
             .attachment_history_page("bb", 1, None)
             .unwrap()
             .entries
@@ -58,7 +62,9 @@ fn sparse_history_albums_and_equal_times_traverse_once_in_canonical_order() {
     );
     for limit in [0, MAX_ATTACHMENT_HISTORY_PAGE + 1, usize::MAX] {
         assert!(matches!(
-            store.attachment_history_page("aa", limit, None),
+            store
+                .app_storage()
+                .attachment_history_page("aa", limit, None),
             Err(AttachmentHistoryError::InvalidLimit)
         ));
     }
@@ -67,14 +73,13 @@ fn sparse_history_albums_and_equal_times_traverse_once_in_canonical_order() {
 #[test]
 fn source_changes_invalidate_pages_but_unrelated_rows_and_reactions_do_not() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     for n in 0..4 {
         seed(&store, n, 2);
     }
-    let initial = page(&store);
+    let initial = page(&app);
     let cursor = initial.next_cursor.unwrap();
-    let second = store
-        .attachment_history_page("aa", 1, Some(&cursor))
-        .unwrap();
+    let second = app.attachment_history_page("aa", 1, Some(&cursor)).unwrap();
     assert_eq!(second.entries[0].attachment_index, 1);
     sql(
         &store,
@@ -82,7 +87,7 @@ fn source_changes_invalidate_pages_but_unrelated_rows_and_reactions_do_not() {
     );
     seed(&store, 10, 0);
     assert_eq!(
-        store.attachment_history_version("aa").unwrap(),
+        app.attachment_history_version("aa").unwrap(),
         initial.version
     );
     for change in [
@@ -92,11 +97,11 @@ fn source_changes_invalidate_pages_but_unrelated_rows_and_reactions_do_not() {
     ] {
         sql(&store, change);
         assert!(matches!(
-            store.attachment_history_page("aa", 1, Some(&cursor)),
+            app.attachment_history_page("aa", 1, Some(&cursor)),
             Err(AttachmentHistoryError::StaleCursor)
         ));
     }
-    let remaining = store.attachment_history_page("aa", 100, None).unwrap();
+    let remaining = app.attachment_history_page("aa", 100, None).unwrap();
     assert_eq!(remaining.entries.len(), 2);
     assert!(
         remaining
@@ -109,10 +114,9 @@ fn source_changes_invalidate_pages_but_unrelated_rows_and_reactions_do_not() {
         &store,
         "UPDATE message_timeline SET invalidation_status=NULL WHERE message_id_hex='000002'",
     );
-    assert_ne!(store.attachment_history_version("aa").unwrap(), before);
+    assert_ne!(app.attachment_history_version("aa").unwrap(), before);
     assert_eq!(
-        store
-            .attachment_history_page("aa", 100, None)
+        app.attachment_history_page("aa", 100, None)
             .unwrap()
             .entries
             .len(),
@@ -123,12 +127,13 @@ fn source_changes_invalidate_pages_but_unrelated_rows_and_reactions_do_not() {
 #[test]
 fn malformed_slots_legacy_epochs_and_pending_sends() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, 1, 1);
     sql(
         &store,
         "UPDATE message_timeline SET source_epoch=NULL,media_json='{\"imeta\":[[\"imeta\"],null,17,\"bad\",{},true,false]}'",
     );
-    let p = store.attachment_history_page("aa", 100, None).unwrap();
+    let p = app.attachment_history_page("aa", 100, None).unwrap();
     assert_eq!(p.entries.len(), 7);
     assert!(p.entries.iter().all(|e| e.source_epoch.is_none()));
     assert_eq!(p.entries[2].slot, serde_json::json!(17));
@@ -140,32 +145,32 @@ fn malformed_slots_legacy_epochs_and_pending_sends() {
             &store,
             &format!("UPDATE message_timeline SET media_json={bad}"),
         );
-        assert_eq!(page(&store).entries[0].slot, serde_json::Value::Null);
+        assert_eq!(page(&app).entries[0].slot, serde_json::Value::Null);
     }
     sql(
         &store,
         "UPDATE message_timeline SET source_message_id_hex=NULL",
     );
-    assert!(page(&store).entries.is_empty());
+    assert!(page(&app).entries.is_empty());
 }
 
 #[test]
 fn blocking_and_invite_visibility_are_revisioned_without_read_time_scans() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, 1, 3);
-    let before = page(&store);
+    let before = page(&app);
     sql(&store, "INSERT INTO user_blocks VALUES('alice',0,0)");
-    assert!(page(&store).entries.is_empty());
-    assert_ne!(page(&store).version, before.version);
+    assert!(page(&app).entries.is_empty());
+    assert_ne!(page(&app).version, before.version);
     sql(
         &store,
         "INSERT INTO blocked_pending_invites VALUES('aa'); DELETE FROM user_blocks",
     );
-    assert!(page(&store).entries.is_empty());
+    assert!(page(&app).entries.is_empty());
     sql(&store, "DELETE FROM blocked_pending_invites");
     assert_eq!(
-        store
-            .attachment_history_page("aa", 100, None)
+        app.attachment_history_page("aa", 100, None)
             .unwrap()
             .entries
             .len(),
@@ -175,23 +180,26 @@ fn blocking_and_invite_visibility_are_revisioned_without_read_time_scans() {
         &store,
         "INSERT INTO user_blocks VALUES('bob',0,0); UPDATE user_blocks SET public_key='alice'",
     );
-    assert!(page(&store).entries.is_empty());
+    assert!(page(&app).entries.is_empty());
 }
 
 #[test]
 fn account_group_fences_and_atomic_rollback() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, 1, 3);
-    let before = page(&store);
+    let before = page(&app);
     let cursor = before.next_cursor.unwrap();
     let other = SqliteAccountStorage::in_memory().unwrap();
     seed(&other, 1, 3);
     assert!(matches!(
-        other.attachment_history_page("aa", 1, Some(&cursor)),
+        other
+            .app_storage()
+            .attachment_history_page("aa", 1, Some(&cursor)),
         Err(AttachmentHistoryError::CursorMismatch)
     ));
     assert!(matches!(
-        store.attachment_history_page("bb", 1, Some(&cursor)),
+        app.attachment_history_page("bb", 1, Some(&cursor)),
         Err(AttachmentHistoryError::CursorMismatch)
     ));
     sql(
@@ -205,7 +213,7 @@ fn account_group_fences_and_atomic_rollback() {
             .execute("UPDATE message_timeline SET deleted=1", [])
             .is_err()
     );
-    assert_eq!(page(&store).version, before.version);
+    assert_eq!(page(&app).version, before.version);
     assert_eq!(
         store
             .lock()
@@ -221,7 +229,7 @@ fn account_group_fences_and_atomic_rollback() {
     );
     seed(&store, 1, 3);
     assert!(matches!(
-        store.attachment_history_page("aa", 1, Some(&cursor)),
+        app.attachment_history_page("aa", 1, Some(&cursor)),
         Err(AttachmentHistoryError::StaleCursor)
     ));
 }
@@ -232,8 +240,9 @@ fn page_work_is_bounded_even_with_large_hidden_history() {
         .lock()
         .unwrap();
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, 0, 3);
-    let cursor = page(&store).next_cursor.unwrap();
+    let cursor = page(&app).next_cursor.unwrap();
     sql(&store, "INSERT INTO user_blocks VALUES('bob',0,0)");
     sql(&store, "BEGIN");
     for n in 1..3000 {
@@ -246,16 +255,15 @@ fn page_work_is_bounded_even_with_large_hidden_history() {
     // The original cursor must restart after the mutations; both first page and
     // subsequent seek are bounded despite thousands of hidden, newer slots.
     assert!(matches!(
-        store.attachment_history_page("aa", 1, Some(&cursor)),
+        app.attachment_history_page("aa", 1, Some(&cursor)),
         Err(AttachmentHistoryError::StaleCursor)
     ));
     let first =
         crate::base::query_work_test_support::measured(&store, "attachment first", 1000, || {
-            page(&store)
+            page(&app)
         });
     crate::base::query_work_test_support::measured(&store, "attachment seek", 1000, || {
-        store
-            .attachment_history_page("aa", 1, first.next_cursor.as_ref())
+        app.attachment_history_page("aa", 1, first.next_cursor.as_ref())
             .unwrap()
     });
     crate::base::query_work_test_support::measured(
@@ -299,6 +307,7 @@ fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
         moderation_grant: false,
     };
     store
+        .app_storage()
         .record_app_event_with_source(
             &event,
             Some(AppMessageRetentionDecision {
@@ -308,13 +317,14 @@ fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
             None,
         )
         .unwrap();
-    let initial = page(&store);
+    let initial = page(&store.app_storage());
     let cursor = initial.next_cursor.unwrap();
     store.close().unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    assert_eq!(page(&store).version, initial.version);
+    assert_eq!(page(&store.app_storage()).version, initial.version);
     assert_eq!(
         store
+            .app_storage()
             .attachment_history_page("aa", 1, Some(&cursor))
             .unwrap()
             .entries[0]
@@ -323,7 +333,7 @@ fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
     );
     // Change the retained event without touching the materialized timeline. Rebuild
     // uses DELETE + INSERT, so the emoji UPDATE trigger cannot supply this fence.
-    assert_eq!(page(&store).entries[0].emoji_tags.len(), 1);
+    assert_eq!(page(&store.app_storage()).entries[0].emoji_tags.len(), 1);
     store
         .lock()
         .unwrap()
@@ -332,14 +342,18 @@ fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
             [serde_json::to_string(&event.tags[..2]).unwrap()],
         )
         .unwrap();
-    assert_eq!(page(&store).version, initial.version);
-    assert_eq!(page(&store).entries[0].emoji_tags.len(), 1);
-    store.rebuild_message_timeline_for_group("aa").unwrap();
-    let rebuilt = page(&store);
+    assert_eq!(page(&store.app_storage()).version, initial.version);
+    assert_eq!(page(&store.app_storage()).entries[0].emoji_tags.len(), 1);
+    store
+        .app_storage()
+        .rebuild_message_timeline_for_group("aa")
+        .unwrap();
+    let rebuilt = page(&store.app_storage());
     assert!(rebuilt.entries[0].emoji_tags.is_empty());
     assert!(rebuilt.version.requires_restart_since(&initial.version));
     assert_eq!(
         store
+            .app_storage()
             .attachment_history_page("aa", 100, None)
             .unwrap()
             .entries
@@ -347,17 +361,21 @@ fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
         2
     );
     assert!(matches!(
-        store.attachment_history_page("aa", 1, Some(&cursor)),
+        store
+            .app_storage()
+            .attachment_history_page("aa", 1, Some(&cursor)),
         Err(AttachmentHistoryError::StaleCursor)
     ));
     store
+        .app_storage()
         .invalidate_app_event_by_source("source", "branch_selection_withdrawn")
         .unwrap();
-    assert!(page(&store).entries.is_empty());
+    assert!(page(&store.app_storage()).entries.is_empty());
     let mut second = event.clone();
     second.message_id_hex = "second".into();
     second.source_message_id_hex = Some("source-second".into());
     store
+        .app_storage()
         .record_app_event_with_source(
             &second,
             Some(AppMessageRetentionDecision {
@@ -369,6 +387,7 @@ fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
         .unwrap();
     assert_eq!(
         store
+            .app_storage()
             .attachment_history_page("aa", 100, None)
             .unwrap()
             .entries
@@ -376,19 +395,21 @@ fn production_projection_rebuild_invalidation_expiry_and_encrypted_reopen() {
         2
     );
     store
+        .app_storage()
         .secure_prune_expired_app_events("aa", 20, "self", &|_, _| false)
         .unwrap();
-    assert!(page(&store).entries.is_empty());
+    assert!(page(&store.app_storage()).entries.is_empty());
     store.close().unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    assert!(page(&store).entries.is_empty());
+    assert!(page(&store.app_storage()).entries.is_empty());
 }
 
 #[test]
 fn changes_in_another_group_do_not_restart_this_group() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, 1, 2);
-    let before = page(&store);
+    let before = page(&app);
     sql(
         &store,
         "INSERT INTO message_timeline(group_id_hex,message_id_hex,source_message_id_hex,direction,sender,plaintext,kind,tags_json,timeline_at,received_at,reactions_json,media_json) VALUES('bb','other','source-other','received','bob','',9,'[]',1,1,'[]','{\"imeta\":[[\"imeta\"]]}')",
@@ -397,13 +418,12 @@ fn changes_in_another_group_do_not_restart_this_group() {
         &store,
         "UPDATE message_timeline SET deleted=1 WHERE group_id_hex='bb'",
     );
-    assert_eq!(page(&store).version, before.version);
+    assert_eq!(page(&app).version, before.version);
     assert!(
-        store
-            .attachment_history_page("aa", 1, before.next_cursor.as_ref())
+        app.attachment_history_page("aa", 1, before.next_cursor.as_ref())
             .is_ok()
     );
-    let debug = format!("{:?}", page(&store));
+    let debug = format!("{:?}", page(&app));
     assert!(!debug.contains("alice"));
     assert!(!debug.contains("000001"));
 }
@@ -418,7 +438,10 @@ fn authenticated_epoch_order_wins_over_wall_clock_and_legacy_rows() {
         &store,
         "UPDATE message_timeline SET source_epoch=9,timeline_at=1 WHERE message_id_hex='000001'; UPDATE message_timeline SET source_epoch=2,timeline_at=9999 WHERE message_id_hex='000002'; UPDATE message_timeline SET source_epoch=NULL,timeline_at=99999 WHERE message_id_hex='000003'",
     );
-    let rows = store.attachment_history_page("aa", 100, None).unwrap();
+    let rows = store
+        .app_storage()
+        .attachment_history_page("aa", 100, None)
+        .unwrap();
     assert_eq!(
         rows.entries
             .iter()
@@ -431,29 +454,28 @@ fn authenticated_epoch_order_wins_over_wall_clock_and_legacy_rows() {
 #[test]
 fn hidden_attachment_changes_preserve_visible_cursors_and_unblock_still_invalidates() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, 1, 2);
     sql(&store, "INSERT INTO user_blocks VALUES('bob',0,0)");
-    let before = page(&store);
+    let before = page(&app);
     sql(
         &store,
         "INSERT INTO message_timeline(group_id_hex,message_id_hex,source_message_id_hex,direction,sender,plaintext,kind,tags_json,timeline_at,received_at,reactions_json,media_json) VALUES('aa','hidden','source-hidden','received','bob','',9,'[]',1,1,'[]','{\"imeta\":[[\"imeta\"]]}')",
     );
-    assert_eq!(page(&store).version, before.version);
+    assert_eq!(page(&app).version, before.version);
     sql(
         &store,
         "UPDATE message_timeline SET media_json='{\"imeta\":[[\"imeta\",\"changed\"]]}' WHERE message_id_hex='hidden'",
     );
-    assert_eq!(page(&store).version, before.version);
+    assert_eq!(page(&app).version, before.version);
     assert!(
-        store
-            .attachment_history_page("aa", 1, before.next_cursor.as_ref())
+        app.attachment_history_page("aa", 1, before.next_cursor.as_ref())
             .is_ok()
     );
     sql(&store, "DELETE FROM user_blocks");
-    assert_ne!(page(&store).version, before.version);
+    assert_ne!(page(&app).version, before.version);
     assert_eq!(
-        store
-            .attachment_history_page("aa", 100, None)
+        app.attachment_history_page("aa", 100, None)
             .unwrap()
             .entries
             .len(),
@@ -465,12 +487,11 @@ fn hidden_attachment_changes_preserve_visible_cursors_and_unblock_still_invalida
         &store,
         "INSERT INTO user_blocks VALUES('bob',0,0); UPDATE message_timeline SET group_id_hex='bb' WHERE message_id_hex='hidden'",
     );
-    let hidden = store.attachment_history_version("bb").unwrap();
+    let hidden = app.attachment_history_version("bb").unwrap();
     sql(&store, "DELETE FROM user_blocks");
-    assert_ne!(store.attachment_history_version("bb").unwrap(), hidden);
+    assert_ne!(app.attachment_history_version("bb").unwrap(), hidden);
     assert_eq!(
-        store
-            .attachment_history_page("bb", 100, None)
+        app.attachment_history_page("bb", 100, None)
             .unwrap()
             .entries
             .len(),
@@ -481,57 +502,58 @@ fn hidden_attachment_changes_preserve_visible_cursors_and_unblock_still_invalida
 #[test]
 fn removing_account_group_projection_preserves_retained_attachment_sources() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     sql(
         &store,
         "INSERT INTO account_groups(group_id_hex,endpoint,updated_at) VALUES('aa','',0)",
     );
     seed(&store, 1, 3);
-    let before = page(&store);
+    let before = page(&app);
     // Full account-snapshot reconciliation can remove this row without deleting
     // app_events or message_timeline. Retained discovery must follow its source.
     sql(&store, "DELETE FROM account_groups WHERE group_id_hex='aa'");
-    let after = store.attachment_history_page("aa", 100, None).unwrap();
+    let after = app.attachment_history_page("aa", 100, None).unwrap();
     assert_eq!(after.entries.len(), 3);
     assert_ne!(after.version, before.version);
     assert!(matches!(
-        store.attachment_history_page("aa", 1, before.next_cursor.as_ref()),
+        app.attachment_history_page("aa", 1, before.next_cursor.as_ref()),
         Err(AttachmentHistoryError::StaleCursor)
     ));
     sql(&store, "INSERT INTO user_blocks VALUES('alice',0,0)");
-    assert!(page(&store).entries.is_empty());
-    assert_ne!(page(&store).version, after.version);
+    assert!(page(&app).entries.is_empty());
+    assert_ne!(page(&app).version, after.version);
     sql(
         &store,
         "DELETE FROM user_blocks; DELETE FROM message_timeline",
     );
-    assert!(page(&store).entries.is_empty());
+    assert!(page(&app).entries.is_empty());
 }
 
 #[test]
 fn new_attachments_signal_refresh_without_restarting_inflight_pagination() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     for id in [100, 300, 500] {
         seed(&store, id, 2);
     }
-    let initial = page(&store);
+    let initial = page(&app);
     let mut cursor = initial.next_cursor;
     seed(&store, 600, 1); // New head, outside the saved older-page boundary.
     seed(&store, 400, 1); // Backfill below the boundary, discovered while paging.
     seed(&store, 0, 1);
     assert_ne!(
-        store.attachment_history_version("aa").unwrap(),
+        app.attachment_history_version("aa").unwrap(),
         initial.version
     );
     assert!(
-        !store
-            .attachment_history_version("aa")
+        !app.attachment_history_version("aa")
             .unwrap()
             .requires_restart_since(&initial.version)
     );
     let mut actual = Vec::new();
     while let Some(boundary) = cursor {
         seed(&store, 700 + actual.len(), 1); // Ongoing traffic must not starve paging.
-        let p = store
+        let p = app
             .attachment_history_page("aa", 1, Some(&boundary))
             .unwrap();
         actual.extend(
@@ -555,7 +577,7 @@ fn new_attachments_signal_refresh_without_restarting_inflight_pagination() {
         ]
         .map(|(id, index)| (format!("{id:06}"), index))
     );
-    assert_eq!(page(&store).entries[0].message_id_hex, "000706");
+    assert_eq!(page(&app).entries[0].message_id_hex, "000706");
 }
 
 #[test]
@@ -566,7 +588,7 @@ fn damaged_index_json_is_a_storage_error_not_a_rejected_attachment_slot() {
         &store,
         "UPDATE attachment_history SET slot_json='private-corrupt-index-payload'",
     );
-    let result = store.attachment_history_page("aa", 1, None);
+    let result = store.app_storage().attachment_history_page("aa", 1, None);
     assert!(matches!(result, Err(AttachmentHistoryError::Storage(_))));
     assert!(
         !result
@@ -645,21 +667,21 @@ fn destructive_changes_still_require_restart_after_safe_additions() {
         "INSERT INTO user_blocks VALUES('alice',0,0)",
     ] {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
         seed(&store, 100, 2);
         seed(&store, 200, 2);
-        let initial = page(&store);
+        let initial = page(&app);
         seed(&store, 300, 1);
-        let added = store.attachment_history_version("aa").unwrap();
+        let added = app.attachment_history_version("aa").unwrap();
         assert!(!added.requires_restart_since(&initial.version));
         sql(&store, mutation);
         assert!(
-            store
-                .attachment_history_version("aa")
+            app.attachment_history_version("aa")
                 .unwrap()
                 .requires_restart_since(&added)
         );
         assert!(matches!(
-            store.attachment_history_page("aa", 1, initial.next_cursor.as_ref()),
+            app.attachment_history_page("aa", 1, initial.next_cursor.as_ref()),
             Err(AttachmentHistoryError::StaleCursor)
         ));
     }
@@ -669,20 +691,20 @@ fn destructive_changes_still_require_restart_after_safe_additions() {
 #[test]
 fn emoji_tag_changes_invalidate_attachment_history() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, 1, 2);
-    let first = page(&store);
+    let first = page(&app);
     sql(
         &store,
         "UPDATE message_timeline SET tags_json='[[\"emoji\",\"wave\",\"https://media.example/emoji\"]]' WHERE message_id_hex='000001'",
     );
     assert!(
-        store
-            .attachment_history_version("aa")
+        app.attachment_history_version("aa")
             .unwrap()
             .requires_restart_since(&first.version)
     );
     assert!(matches!(
-        store.attachment_history_page("aa", 1, first.next_cursor.as_ref()),
+        app.attachment_history_page("aa", 1, first.next_cursor.as_ref()),
         Err(AttachmentHistoryError::StaleCursor)
     ));
 }
@@ -708,7 +730,7 @@ fn attachment_history_metadata_is_source_scoped_and_not_an_album_copy() {
                 [tags],
             )
             .unwrap();
-        let result = page(&store);
+        let result = page(&store.app_storage());
         assert_eq!(result.entries[0].emoji_tags.len(), expected);
         assert_eq!(result.entries[0].attachment_index, 0);
         assert!(result.next_cursor.is_some());

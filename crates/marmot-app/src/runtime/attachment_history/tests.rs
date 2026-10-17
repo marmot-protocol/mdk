@@ -1,7 +1,8 @@
 use super::*;
 use crate::MarmotApp;
 use marmot_account::AccountHome;
-use storage_sqlite::{SqliteAccountStorage, StoredAppEvent};
+use storage_sqlite::SqliteAppStorage;
+use storage_sqlite::StoredAppEvent;
 
 /// Warm a real account, then retain a synthetic first-open migration observation.
 fn cached_diagnostic_runtime() -> (tempfile::TempDir, std::sync::Arc<MarmotAppRuntime>, String) {
@@ -179,7 +180,7 @@ fn tag(mime: &str) -> Vec<String> {
         "filename test.bin".into(),
     ]
 }
-fn add(store: &SqliteAccountStorage, i: usize) {
+fn add(store: &SqliteAppStorage, i: usize) {
     store
         .record_app_event(&StoredAppEvent {
             group_id_hex: "ab".repeat(16),
@@ -215,7 +216,7 @@ async fn attachment_discovery_traverses_sparse_albums_without_engine_or_network(
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let store = app.account_storage("alice").unwrap();
     for i in 0..350 {
-        add(&store, i);
+        add(&store.app_storage(), i);
     }
     let runtime = app.runtime();
     let group = GroupId::new(vec![0xab; 16]);
@@ -279,8 +280,8 @@ async fn attachment_discovery_fences_changes_isolates_accounts_and_closes() {
     let bob = home.create_account("bob").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let store = app.account_storage("alice").unwrap();
-    add(&store, 0);
-    add(&store, 7);
+    add(&store.app_storage(), 0);
+    add(&store.app_storage(), 7);
     let runtime = app.runtime();
     let group = GroupId::new(vec![0xab; 16]);
     let first = runtime
@@ -320,7 +321,7 @@ async fn attachment_discovery_fences_changes_isolates_accounts_and_closes() {
             .await
             .is_err()
     );
-    add(&store, 14);
+    add(&store.app_storage(), 14);
     let added = runtime
         .attachment_history_version("alice", &group)
         .await
@@ -335,6 +336,7 @@ async fn attachment_discovery_fences_changes_isolates_accounts_and_closes() {
         AttachmentPageRead::Page(_)
     ));
     store
+        .app_storage()
         .record_app_event(&StoredAppEvent {
             group_id_hex: "ab".repeat(16),
             message_id_hex: "ee".repeat(32),
@@ -377,6 +379,7 @@ async fn attachment_discovery_fences_changes_isolates_accounts_and_closes() {
             .all(|e| e.message_id_hex != format!("{:064x}", 7))
     );
     store
+        .app_storage()
         .invalidate_app_event_by_message_id(
             &"ab".repeat(16),
             &format!("{:064x}", 14),
@@ -498,10 +501,10 @@ async fn attachment_discovery_roles_preserve_slots_and_refresh() {
         origin_commit_id: None,
         moderation_grant: false,
     };
-    store.record_app_event(&event).unwrap();
+    store.app_storage().record_app_event(&event).unwrap();
     // Newer ordinary chat pushes the album far outside a recent conversation window.
     for i in 1..350 {
-        add(&store, i);
+        add(&store.app_storage(), i);
     }
     event.message_id_hex = "ff".repeat(32);
     event.source_message_id_hex = Some("fe".repeat(32));
@@ -510,7 +513,7 @@ async fn attachment_discovery_roles_preserve_slots_and_refresh() {
         vec!["emoji".into(), "wave".into(), emoji_url],
     ];
     event.recorded_at = 10000;
-    store.record_app_event(&event).unwrap();
+    store.app_storage().record_app_event(&event).unwrap();
     let runtime = app.runtime();
     let group = GroupId::new(vec![0xab; 16]);
     let AttachmentPageRead::Page(first) = runtime
@@ -572,7 +575,7 @@ async fn attachment_discovery_roles_preserve_slots_and_refresh() {
     ));
     // Removing the tag preserves the image's acquisition reference but changes its role.
     event.tags.pop();
-    store.record_app_event(&event).unwrap();
+    store.app_storage().record_app_event(&event).unwrap();
     let changed = runtime
         .attachment_history_version("alice", &group)
         .await

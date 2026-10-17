@@ -18,7 +18,7 @@ use media_store::{
 use rusqlite::{Connection, OptionalExtension, params};
 use zeroize::Zeroizing;
 
-use crate::{SqliteAccountStorage, SqliteResultExt, u64_to_i64};
+use crate::{SqliteAppStorage, SqliteResultExt, u64_to_i64};
 
 const STATE_PENDING: i64 = 0;
 const STATE_READY: i64 = 1;
@@ -70,16 +70,16 @@ fn id_from_sql(bytes: Vec<u8>) -> StorageResult<FileId> {
 /// `media_files` on one account database.
 #[derive(Clone)]
 pub struct SqliteMediaCatalog {
-    storage: SqliteAccountStorage,
+    storage: SqliteAppStorage,
 }
 
 impl SqliteMediaCatalog {
-    pub fn new(storage: SqliteAccountStorage) -> Self {
+    pub fn new(storage: SqliteAppStorage) -> Self {
         Self { storage }
     }
 
     /// The account database handle this catalog uses.
-    pub fn storage(&self) -> &SqliteAccountStorage {
+    pub fn storage(&self) -> &SqliteAppStorage {
         &self.storage
     }
 
@@ -351,12 +351,12 @@ pub(crate) fn commit_ready_in(
 /// Publication into one attachment slot (its acquisition token), fenced only
 /// by the slot still existing. Domain targets add their own fences.
 pub struct SlotPublication {
-    storage: SqliteAccountStorage,
+    storage: SqliteAppStorage,
     token: Vec<u8>,
 }
 
 impl SlotPublication {
-    pub fn new(storage: SqliteAccountStorage, token: Vec<u8>) -> Self {
+    pub fn new(storage: SqliteAppStorage, token: Vec<u8>) -> Self {
         Self { storage, token }
     }
 
@@ -423,7 +423,7 @@ impl PublishTarget for SlotPublication {
     }
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Removes slot `token`'s media reference. Returns the ids whose rows
     /// (keys) the removal deleted, for the store to unlink once this commits.
     pub fn release_media_reference(&self, token: &[u8]) -> StorageResult<Vec<FileId>> {

@@ -2,6 +2,9 @@
 //! relay EOSE never create a certificate. The account worker supplies the epoch
 //! actually observed after evaluating eligible local convergence work.
 use super::*;
+#[cfg(test)]
+use crate::SqliteAccountStorage;
+use crate::SqliteAppStorage;
 use rusqlite::OptionalExtension;
 
 pub struct QualifiedRecoveryStallSample {
@@ -10,7 +13,7 @@ pub struct QualifiedRecoveryStallSample {
     pub warning_changed: bool,
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Retire group-scoped recovery only after the account owner observes a
     /// terminal group. Account-wide history/loss debt and retry cost survive.
     pub fn retire_terminal_group_recovery(
@@ -144,51 +147,47 @@ mod tests {
     #[test]
     fn terminal_retirement_failure_preserves_all_group_debt_and_independent_loss() {
         let store = fixture();
+        let app = store.app_storage();
         let group = gid(1);
-        store
-            .request_recovery(
-                RecoveryRequest::KnownEvent {
-                    group_id: group.as_slice(),
-                    event_id: &[8; 32],
-                },
-                1,
-            )
-            .unwrap();
-        store
-            .request_recovery(
-                RecoveryRequest::MaintenanceBoundary {
-                    group_id: group.as_slice(),
-                    job_id: &[9],
-                },
-                1,
-            )
-            .unwrap();
-        store
-            .mark_account_delivery_recovery("alice", 55, 1)
-            .unwrap();
-        let before = store.recovery_revision_fence().unwrap();
-        let retry = store.recovery_retry_state().unwrap();
+        app.request_recovery(
+            RecoveryRequest::KnownEvent {
+                group_id: group.as_slice(),
+                event_id: &[8; 32],
+            },
+            1,
+        )
+        .unwrap();
+        app.request_recovery(
+            RecoveryRequest::MaintenanceBoundary {
+                group_id: group.as_slice(),
+                job_id: &[9],
+            },
+            1,
+        )
+        .unwrap();
+        app.mark_account_delivery_recovery("alice", 55, 1).unwrap();
+        let before = app.recovery_revision_fence().unwrap();
+        let retry = app.recovery_retry_state().unwrap();
         store.lock().unwrap().execute_batch("CREATE TRIGGER fail_terminal_retire BEFORE DELETE ON app_epoch_stall_evidence BEGIN SELECT RAISE(ABORT, 'injected terminal retire failure'); END;").unwrap();
-        assert!(store.retire_terminal_group_recovery(&group).is_err());
-        assert_eq!(store.recovery_revision_fence().unwrap(), before);
-        assert_eq!(store.epoch_stall_evidence().unwrap().len(), 1);
+        assert!(app.retire_terminal_group_recovery(&group).is_err());
+        assert_eq!(app.recovery_revision_fence().unwrap(), before);
+        assert_eq!(app.epoch_stall_evidence().unwrap().len(), 1);
         store
             .lock()
             .unwrap()
             .execute_batch("DROP TRIGGER fail_terminal_retire")
             .unwrap();
-        store.retire_terminal_group_recovery(&group).unwrap();
-        assert!(store.epoch_stall_evidence().unwrap().is_empty());
+        app.retire_terminal_group_recovery(&group).unwrap();
+        assert!(app.epoch_stall_evidence().unwrap().is_empty());
         assert!(
-            store
-                .pending_recovery_demands()
+            app.pending_recovery_demands()
                 .unwrap()
                 .iter()
                 .all(|d| d.group_id.is_none())
         );
-        assert!(store.account_delivery_recovery("alice").unwrap().is_some());
-        assert_eq!(store.recovery_retry_state().unwrap(), retry);
-        assert!(!store.retire_terminal_group_recovery(&group).unwrap());
+        assert!(app.account_delivery_recovery("alice").unwrap().is_some());
+        assert_eq!(app.recovery_retry_state().unwrap(), retry);
+        assert!(!app.retire_terminal_group_recovery(&group).unwrap());
     }
 
     fn fixture() -> SqliteAccountStorage {
@@ -198,26 +197,25 @@ mod tests {
     }
 
     fn seed(store: &SqliteAccountStorage) {
-        store.ensure_account_projection("alice").unwrap();
+        let app = store.app_storage();
+        app.ensure_account_projection("alice").unwrap();
         store.put_group(&sample_group(gid(1), 1, 2)).unwrap();
-        store
-            .arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
-                group_id_hex: hex::encode(gid(1).as_slice()),
-                stalled_epoch: 1,
-            }])
-            .unwrap();
-        store
-            .record_epoch_stall_evidence(&[crate::StoredEpochStallEvidence {
-                group_id_hex: hex::encode(gid(1).as_slice()),
-                stalled_epoch: 1,
-                fruitless_completions: 2,
-                fruitless_reported: false,
-                last_arm_at_ms: 1,
-            }])
-            .unwrap();
+        app.arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+            group_id_hex: hex::encode(gid(1).as_slice()),
+            stalled_epoch: 1,
+        }])
+        .unwrap();
+        app.record_epoch_stall_evidence(&[crate::StoredEpochStallEvidence {
+            group_id_hex: hex::encode(gid(1).as_slice()),
+            stalled_epoch: 1,
+            fruitless_completions: 2,
+            fruitless_reported: false,
+            last_arm_at_ms: 1,
+        }])
+        .unwrap();
     }
 
-    fn qualify(store: &SqliteAccountStorage) {
+    fn qualify(store: &SqliteAppStorage) {
         let fence = store.recovery_revision_fence().unwrap();
         let attempt = store
             .reserve_recovery_attempt(&fence, 1, 15_000, true)
@@ -265,7 +263,7 @@ mod tests {
         );
     }
 
-    fn observe(store: &SqliteAccountStorage, time: u64) -> Option<QualifiedRecoveryStallSample> {
+    fn observe(store: &SqliteAppStorage, time: u64) -> Option<QualifiedRecoveryStallSample> {
         let revision = store.next_recovery_engine_observation().unwrap();
         store
             .sample_qualified_recovery_stall(gid(1).as_slice(), 1, revision, time, 3_600_000, 3)
@@ -274,7 +272,7 @@ mod tests {
 
     #[test]
     fn qualified_stall_needs_three_distinct_paced_evaluations_without_replay() {
-        let store = fixture();
+        let store = fixture().app_storage();
         assert!(
             observe(&store, 1).is_none(),
             "legacy EOSE evidence and an evaluation do not prove coverage"
@@ -334,8 +332,8 @@ mod tests {
     fn qualified_stall_survives_unrelated_inventory_retirement() {
         for (route, at) in [([4_u8; 32], 50_i64), ([3_u8; 32], 101_i64)] {
             let store = fixture();
-            qualify(&store);
-            assert!(observe(&store, 1).is_some());
+            qualify(&store.app_storage());
+            assert!(observe(&store.app_storage(), 1).is_some());
             store
                 .lock()
                 .unwrap()
@@ -356,10 +354,17 @@ mod tests {
                     Ok::<_, StorageError>(())
                 })
                 .unwrap();
-            let sample = observe(&store, 3_600_001)
+            let sample = observe(&store.app_storage(), 3_600_001)
                 .expect("unrelated eviction must not suppress valid blocked-engine evidence");
             assert_eq!(sample.evidence.fruitless_completions, 2);
-            assert_eq!(store.recovery_retry_state().unwrap().attempt_serial, 1);
+            assert_eq!(
+                store
+                    .app_storage()
+                    .recovery_retry_state()
+                    .unwrap()
+                    .attempt_serial,
+                1
+            );
         }
     }
 
@@ -367,14 +372,18 @@ mod tests {
     fn qualified_stall_rejects_new_loss_route_and_inventory_changes() {
         for invalidation in 0..3 {
             let store = fixture();
-            qualify(&store);
-            assert!(observe(&store, 1).is_some());
+            qualify(&store.app_storage());
+            assert!(observe(&store.app_storage(), 1).is_some());
             match invalidation {
                 0 => store
+                    .app_storage()
                     .record_account_delivery_loss("alice", 77, 1, 1)
                     .unwrap(),
                 1 => {
-                    store.observe_recovery_route_snapshot([7; 32]).unwrap();
+                    store
+                        .app_storage()
+                        .observe_recovery_route_snapshot([7; 32])
+                        .unwrap();
                 }
                 _ => {
                     store.lock().unwrap().execute("INSERT INTO transport_reconciliation_items VALUES(1,?1,zeroblob(32),50)", [[3_u8; 32].as_slice()]).unwrap();
@@ -392,41 +401,46 @@ mod tests {
                         .unwrap();
                 }
             }
-            assert!(observe(&store, 3_600_001).is_none());
-            assert!(!store.automatic_recovery_failed(&gid(1)).unwrap());
+            assert!(observe(&store.app_storage(), 3_600_001).is_none());
+            assert!(
+                !store
+                    .app_storage()
+                    .automatic_recovery_failed(&gid(1))
+                    .unwrap()
+            );
         }
     }
 
     #[test]
     fn qualified_stall_transaction_failure_and_clock_rebase_never_forge_samples() {
         let store = fixture();
-        qualify(&store);
-        assert!(observe(&store, 5_000_000).is_some());
-        assert!(observe(&store, 1_000).is_none());
-        assert!(observe(&store, 3_600_999).is_none());
+        let app = store.app_storage();
+        qualify(&app);
+        assert!(observe(&app, 5_000_000).is_some());
+        assert!(observe(&app, 1_000).is_none());
+        assert!(observe(&app, 3_600_999).is_none());
         assert_eq!(
-            observe(&store, 3_601_000)
+            observe(&app, 3_601_000)
                 .unwrap()
                 .evidence
                 .fruitless_completions,
             2
         );
         store.lock().unwrap().execute_batch("CREATE TRIGGER fail_sample BEFORE INSERT ON app_group_recovery_failures BEGIN SELECT RAISE(FAIL, 'sample failure'); END;").unwrap();
-        let revision = store.next_recovery_engine_observation().unwrap();
+        let revision = app.next_recovery_engine_observation().unwrap();
         assert!(
-            store
-                .sample_qualified_recovery_stall(
-                    gid(1).as_slice(),
-                    1,
-                    revision,
-                    7_201_000,
-                    3_600_000,
-                    3
-                )
-                .is_err()
+            app.sample_qualified_recovery_stall(
+                gid(1).as_slice(),
+                1,
+                revision,
+                7_201_000,
+                3_600_000,
+                3
+            )
+            .is_err()
         );
         assert_eq!(
-            store.epoch_stall_evidence().unwrap()[0].fruitless_completions,
+            app.epoch_stall_evidence().unwrap()[0].fruitless_completions,
             2
         );
         store
@@ -435,31 +449,29 @@ mod tests {
             .execute_batch("DROP TRIGGER fail_sample")
             .unwrap();
         assert!(
-            store
-                .sample_qualified_recovery_stall(
-                    gid(1).as_slice(),
-                    1,
-                    revision,
-                    7_201_000,
-                    3_600_000,
-                    3
-                )
-                .unwrap()
-                .unwrap()
-                .escalated
+            app.sample_qualified_recovery_stall(
+                gid(1).as_slice(),
+                1,
+                revision,
+                7_201_000,
+                3_600_000,
+                3
+            )
+            .unwrap()
+            .unwrap()
+            .escalated
         );
         assert!(
-            store
-                .sample_qualified_recovery_stall(
-                    gid(1).as_slice(),
-                    1,
-                    revision,
-                    10_801_000,
-                    3_600_000,
-                    3
-                )
-                .unwrap()
-                .is_none()
+            app.sample_qualified_recovery_stall(
+                gid(1).as_slice(),
+                1,
+                revision,
+                10_801_000,
+                3_600_000,
+                3
+            )
+            .unwrap()
+            .is_none()
         );
     }
     #[test]
@@ -469,26 +481,28 @@ mod tests {
         let key = crate::SqlCipherKey::new("qualified stall reopen test").unwrap();
         let observation = {
             let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+            let app = store.app_storage();
             seed(&store);
-            qualify(&store);
-            let observation = store.next_recovery_engine_observation().unwrap();
+            qualify(&app);
+            let observation = app.next_recovery_engine_observation().unwrap();
             assert!(
-                store
-                    .sample_qualified_recovery_stall(
-                        gid(1).as_slice(),
-                        1,
-                        observation,
-                        1,
-                        3_600_000,
-                        3
-                    )
-                    .unwrap()
-                    .is_some()
+                app.sample_qualified_recovery_stall(
+                    gid(1).as_slice(),
+                    1,
+                    observation,
+                    1,
+                    3_600_000,
+                    3
+                )
+                .unwrap()
+                .is_some()
             );
             store.close().unwrap();
             observation
         };
-        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let reopened = SqliteAccountStorage::open_encrypted(&path, &key)
+            .unwrap()
+            .app_storage();
         assert!(
             reopened
                 .sample_qualified_recovery_stall(

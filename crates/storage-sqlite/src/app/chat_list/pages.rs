@@ -12,7 +12,7 @@
 //! Account attention reuses these keys and additionally counts active pending invitations;
 //! the Unread list continues to exclude invitations.
 use crate::base::connection::CachedSql;
-use crate::{ChatListRow, SqliteAccountStorage, SqliteResultExt, deserialize};
+use crate::{ChatListRow, SqliteAppStorage, SqliteResultExt, deserialize};
 use cgka_traits::storage::StorageError;
 use cgka_traits::storage::{DisbandRequest, DisbandRequestStatus, LeaveRequest};
 use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value};
@@ -180,7 +180,7 @@ pub enum ChatListPageError {
     Storage(#[from] StorageError),
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Recover around a stable row after cursor invalidation, without replaying earlier pages.
     /// Includes the anchor at the beginning (Forward) or end (Backward) of the returned page.
     /// Anchor lookup, fresh boundaries and page read are one transaction, so unrelated traffic

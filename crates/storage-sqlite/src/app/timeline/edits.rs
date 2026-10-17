@@ -1,5 +1,6 @@
 //! One accepted-edit resolver for incremental projection, repair and history.
 use super::*;
+use crate::SqliteAppStorage;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimelineEditSummary {
@@ -116,7 +117,7 @@ pub(super) fn apply(row: &mut TimelineRow, versions: &[TimelineEditVersion]) {
     }
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Read accepted edit history separately from the bounded screen payload.
     /// A cursor is an exclusive (timestamp, id) key, so it survives removal of its event.
     /// Output is capped at 100; resolution work is scoped to this target's retained edits.

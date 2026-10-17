@@ -23,8 +23,10 @@ pub use plan::{
 };
 pub use stall::QualifiedRecoveryStallSample;
 
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 use crate::base::connection::CachedSql;
-use crate::{SqliteAccountStorage, SqliteResultExt, i64_to_u64};
+use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -509,7 +511,7 @@ fn selected_completion_fence_matches(
         })
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     pub fn recovery_retry_state(&self) -> StorageResult<RecoveryRetryState> {
         let conn = self.lock()?;
         retry_state(&conn)
@@ -915,7 +917,10 @@ mod tests {
 
     fn fixture() -> SqliteAccountStorage {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.ensure_account_projection("alice").unwrap();
+        store
+            .app_storage()
+            .ensure_account_projection("alice")
+            .unwrap();
         store
     }
 
@@ -926,7 +931,9 @@ mod tests {
             let path = dir.path().join("loss.sqlite");
             let key = SqlCipherKey::new("generation retirement test").unwrap();
             {
-                let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+                let store = SqliteAccountStorage::open_encrypted(&path, &key)
+                    .unwrap()
+                    .app_storage();
                 store.ensure_account_projection("alice").unwrap();
                 store
                     .mark_account_delivery_recovery("alice", old, 2)
@@ -937,7 +944,9 @@ mod tests {
                 store.synchronize_account_delivery_loss("alice").unwrap();
                 assert!(!store.clear_account_delivery_recovery("alice", old).unwrap());
             }
-            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+            let store = SqliteAccountStorage::open_encrypted(&path, &key)
+                .unwrap()
+                .app_storage();
             store.synchronize_account_delivery_loss("alice").unwrap();
             let pending = store.account_delivery_recovery("alice").unwrap().unwrap();
             assert_eq!((pending.marker_token, pending.dropped_count), (newer, 15));
@@ -980,20 +989,17 @@ mod tests {
     #[test]
     fn review_legacy_clear_rollback_preserves_retirement_and_pending_loss() {
         let store = fixture();
-        store
-            .mark_account_delivery_recovery("alice", 10, 2)
+        let app = store.app_storage();
+        app.mark_account_delivery_recovery("alice", 10, 2).unwrap();
+        app.record_account_delivery_loss("alice", 90, 15, 10)
             .unwrap();
-        store
-            .record_account_delivery_loss("alice", 90, 15, 10)
-            .unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        let before = store.recovery_revision_fence().unwrap();
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        let before = app.recovery_revision_fence().unwrap();
         store.lock().unwrap().execute_batch("CREATE TRIGGER reject_rejoin BEFORE INSERT ON account_recovery_obligations BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
-        assert!(store.clear_account_delivery_recovery("alice", 90).is_err());
-        assert_eq!(store.recovery_revision_fence().unwrap(), before);
+        assert!(app.clear_account_delivery_recovery("alice", 90).is_err());
+        assert_eq!(app.recovery_revision_fence().unwrap(), before);
         assert_eq!(
-            store
-                .account_delivery_recovery("alice")
+            app.account_delivery_recovery("alice")
                 .unwrap()
                 .unwrap()
                 .marker_token,
@@ -1005,36 +1011,29 @@ mod tests {
             .unwrap()
             .execute_batch("DROP TRIGGER reject_rejoin")
             .unwrap();
-        assert!(!store.clear_account_delivery_recovery("alice", 90).unwrap());
-        assert!(store.clear_account_delivery_recovery("alice", 10).unwrap());
+        assert!(!app.clear_account_delivery_recovery("alice", 90).unwrap());
+        assert!(app.clear_account_delivery_recovery("alice", 10).unwrap());
     }
 
     #[test]
     fn review_adoption_fences_prior_generation_without_resetting_quiescence() {
         let store = fixture();
-        store
-            .mark_account_delivery_recovery("alice", 20, 4)
-            .unwrap();
-        store
-            .mark_account_delivery_recovery("alice", 10, 6)
-            .unwrap();
-        store
-            .mark_account_delivery_recovery("alice", 20, 4)
-            .unwrap();
+        let app = store.app_storage();
+        app.mark_account_delivery_recovery("alice", 20, 4).unwrap();
+        app.mark_account_delivery_recovery("alice", 10, 6).unwrap();
+        app.mark_account_delivery_recovery("alice", 20, 4).unwrap();
         store
             .lock()
             .unwrap()
             .execute_batch("UPDATE account_recovery_obligations SET eligibility=3")
             .unwrap();
-        let before = store.recovery_revision_fence().unwrap();
-        let retry = store.recovery_retry_state().unwrap();
-        store
-            .mark_account_delivery_recovery("alice", 10, 6)
-            .unwrap();
-        let after = store.recovery_revision_fence().unwrap();
+        let before = app.recovery_revision_fence().unwrap();
+        let retry = app.recovery_retry_state().unwrap();
+        app.mark_account_delivery_recovery("alice", 10, 6).unwrap();
+        let after = app.recovery_revision_fence().unwrap();
         assert!(after.loss_revision > before.loss_revision);
         assert!(after.obligations[0].1 > before.obligations[0].1);
-        assert_eq!(store.recovery_retry_state().unwrap(), retry);
+        assert_eq!(app.recovery_retry_state().unwrap(), retry);
         assert_eq!(
             store
                 .lock()
@@ -1048,8 +1047,7 @@ mod tests {
             3
         );
         assert!(
-            store
-                .reserve_recovery_attempt(&before, 1000, 15000, true)
+            app.reserve_recovery_attempt(&before, 1000, 15000, true)
                 .unwrap()
                 .is_none()
         );
@@ -1058,7 +1056,8 @@ mod tests {
     #[test]
     fn review_mixed_selection_cannot_reserve_for_quiescent_demand() {
         let store = fixture();
-        store.mark_account_delivery_recovery("alice", 1, 4).unwrap();
+        let app = store.app_storage();
+        app.mark_account_delivery_recovery("alice", 1, 4).unwrap();
         store
             .lock()
             .unwrap()
@@ -1067,25 +1066,22 @@ mod tests {
             INSERT INTO cgka_groups(id,epoch,record) VALUES(x'01',7,x'00')",
             )
             .unwrap();
-        store
-            .arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
-                group_id_hex: "01".into(),
-                stalled_epoch: 7,
-            }])
-            .unwrap();
-        let fence = store.recovery_revision_fence().unwrap();
-        let retry = store.recovery_retry_state().unwrap();
+        app.arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+            group_id_hex: "01".into(),
+            stalled_epoch: 7,
+        }])
+        .unwrap();
+        let fence = app.recovery_revision_fence().unwrap();
+        let retry = app.recovery_retry_state().unwrap();
         assert_eq!(fence.obligations.len(), 2);
         assert!(
-            store
-                .reserve_recovery_attempt(&fence, 1000, 15000, false)
+            app.reserve_recovery_attempt(&fence, 1000, 15000, false)
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(store.recovery_retry_state().unwrap(), retry);
+        assert_eq!(app.recovery_retry_state().unwrap(), retry);
         assert!(
-            store
-                .reserve_recovery_attempt(&fence, 1000, 15000, true)
+            app.reserve_recovery_attempt(&fence, 1000, 15000, true)
                 .unwrap()
                 .is_some()
         );
@@ -1094,18 +1090,18 @@ mod tests {
     #[test]
     fn duplicate_and_stale_epoch_observations_preserve_quiescence() {
         let store = fixture();
+        let app = store.app_storage();
         store
             .lock()
             .unwrap()
             .execute_batch("INSERT INTO cgka_groups(id, epoch, record) VALUES (x'01', 7, x'00')")
             .unwrap();
         let arm = |epoch| {
-            store
-                .arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
-                    group_id_hex: "01".into(),
-                    stalled_epoch: epoch,
-                }])
-                .unwrap()
+            app.arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+                group_id_hex: "01".into(),
+                stalled_epoch: epoch,
+            }])
+            .unwrap()
         };
         arm(7);
         store
@@ -1113,27 +1109,25 @@ mod tests {
             .unwrap()
             .execute_batch("UPDATE account_recovery_obligations SET eligibility = 3")
             .unwrap();
-        let before = store.recovery_revision_fence().unwrap();
+        let before = app.recovery_revision_fence().unwrap();
         arm(7);
         arm(6);
-        assert_eq!(store.recovery_revision_fence().unwrap(), before);
+        assert_eq!(app.recovery_revision_fence().unwrap(), before);
         assert!(
-            store
-                .reserve_recovery_attempt(&before, 1000, 15000, false)
+            app.reserve_recovery_attempt(&before, 1000, 15000, false)
                 .unwrap()
                 .is_none()
         );
         arm(8);
         assert!(
-            store
-                .reserve_recovery_attempt(
-                    &store.recovery_revision_fence().unwrap(),
-                    1000,
-                    15000,
-                    false
-                )
-                .unwrap()
-                .is_some()
+            app.reserve_recovery_attempt(
+                &app.recovery_revision_fence().unwrap(),
+                1000,
+                15000,
+                false
+            )
+            .unwrap()
+            .is_some()
         );
         store
             .lock()
@@ -1142,8 +1136,7 @@ mod tests {
             .unwrap();
         arm(8);
         assert!(
-            store
-                .recovery_revision_fence()
+            app.recovery_revision_fence()
                 .unwrap()
                 .obligations
                 .is_empty()
@@ -1153,27 +1146,27 @@ mod tests {
     #[test]
     fn notification_loss_imports_independent_demand_without_blocking_forever() {
         let store = fixture();
+        let app = store.app_storage();
         store.lock().unwrap().execute_batch(
             "INSERT INTO account_delivery_loss_evidence(account_label,cause,marker_token,pending_since,dropped_count)
              VALUES ('alice',1,7,10,0)"
         ).unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        let fence = store.recovery_revision_fence().unwrap();
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        let fence = app.recovery_revision_fence().unwrap();
         assert_eq!(fence.obligations.len(), 1);
-        assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+        assert!(app.account_delivery_recovery("alice").unwrap().is_none());
         assert!(
-            store
-                .reserve_recovery_attempt(&fence, 1000, 15000, false)
+            app.reserve_recovery_attempt(&fence, 1000, 15000, false)
                 .unwrap()
                 .is_some()
         );
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert_eq!(store.recovery_revision_fence().unwrap(), fence);
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(app.recovery_revision_fence().unwrap(), fence);
     }
 
     #[test]
     fn late_old_marker_does_not_replace_current_token_or_duplicate_loss_revision() {
-        let store = fixture();
+        let store = fixture().app_storage();
         store
             .mark_account_delivery_recovery("alice", 90, 4)
             .unwrap();
@@ -1221,34 +1214,28 @@ mod tests {
     #[test]
     fn worker_adopts_already_imported_generation_without_rearming_it() {
         let store = fixture();
-        store
-            .mark_account_delivery_recovery("alice", 20, 4)
+        let app = store.app_storage();
+        app.mark_account_delivery_recovery("alice", 20, 4).unwrap();
+        app.record_account_delivery_loss("alice", 10, 6, 10)
             .unwrap();
-        store
-            .record_account_delivery_loss("alice", 10, 6, 10)
-            .unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
+        app.synchronize_account_delivery_loss("alice").unwrap();
         store
             .lock()
             .unwrap()
             .execute_batch("UPDATE account_recovery_obligations SET eligibility = 3")
             .unwrap();
-        let before = store.recovery_revision_fence().unwrap();
-        store
-            .mark_account_delivery_recovery("alice", 10, 6)
-            .unwrap();
-        assert_eq!(store.recovery_revision_fence().unwrap(), before);
+        let before = app.recovery_revision_fence().unwrap();
+        app.mark_account_delivery_recovery("alice", 10, 6).unwrap();
+        assert_eq!(app.recovery_revision_fence().unwrap(), before);
         assert_eq!(
-            store
-                .account_delivery_recovery("alice")
+            app.account_delivery_recovery("alice")
                 .unwrap()
                 .unwrap()
                 .marker_token,
             10
         );
         assert!(
-            store
-                .reserve_recovery_attempt(&before, 1000, 15000, false)
+            app.reserve_recovery_attempt(&before, 1000, 15000, false)
                 .unwrap()
                 .is_none()
         );
@@ -1256,7 +1243,7 @@ mod tests {
 
     #[test]
     fn legacy_retirement_keeps_evidence_watermark_for_a_late_writer() {
-        let store = fixture();
+        let store = fixture().app_storage();
         store
             .record_account_delivery_loss("alice", 3, 9, 10)
             .unwrap();
@@ -1281,19 +1268,19 @@ mod tests {
     #[test]
     fn reservation_fences_selected_demand_without_blocking_on_unrelated_joins() {
         let store = fixture();
-        store.mark_account_delivery_recovery("alice", 1, 1).unwrap();
-        let selected = store.recovery_revision_fence().unwrap();
+        let app = store.app_storage();
+        app.mark_account_delivery_recovery("alice", 1, 1).unwrap();
+        let selected = app.recovery_revision_fence().unwrap();
         store
             .lock()
             .unwrap()
             .execute_batch("INSERT INTO cgka_groups(id, epoch, record) VALUES (x'01', 7, x'00')")
             .unwrap();
-        store
-            .arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
-                group_id_hex: "01".into(),
-                stalled_epoch: 7,
-            }])
-            .unwrap();
+        app.arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+            group_id_hex: "01".into(),
+            stalled_epoch: 7,
+        }])
+        .unwrap();
         store
             .lock()
             .unwrap()
@@ -1302,39 +1289,34 @@ mod tests {
             )
             .unwrap();
         assert!(
-            store
-                .reserve_recovery_attempt(&selected, 1000, 15000, false)
+            app.reserve_recovery_attempt(&selected, 1000, 15000, false)
                 .unwrap()
                 .is_none(),
             "unselected eligible demand cannot authorize the selected quiescent scope"
         );
         assert!(
-            store
-                .reserve_recovery_attempt(&selected, 1000, 15000, true)
+            app.reserve_recovery_attempt(&selected, 1000, 15000, true)
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(
-            store.recovery_revision_fence().unwrap().obligations.len(),
-            2
-        );
+        assert_eq!(app.recovery_revision_fence().unwrap().obligations.len(), 2);
     }
 
     #[test]
     fn same_epoch_release_fences_old_plans_and_rolls_back_as_one_unit() {
         let store = fixture();
+        let app = store.app_storage();
         store
             .lock()
             .unwrap()
             .execute_batch("INSERT INTO cgka_groups(id, epoch, record) VALUES (x'01', 7, x'00')")
             .unwrap();
-        store
-            .arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
-                group_id_hex: "01".into(),
-                stalled_epoch: 7,
-            }])
-            .unwrap();
-        let before = store.recovery_revision_fence().unwrap();
+        app.arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+            group_id_hex: "01".into(),
+            stalled_epoch: 7,
+        }])
+        .unwrap();
+        let before = app.recovery_revision_fence().unwrap();
         store
             .lock()
             .unwrap()
@@ -1345,7 +1327,7 @@ mod tests {
             )
             .unwrap();
         assert!(store.consume_released_transport_receipts().is_err());
-        assert_eq!(store.recovery_revision_fence().unwrap(), before);
+        assert_eq!(app.recovery_revision_fence().unwrap(), before);
         store
             .lock()
             .unwrap()
@@ -1355,12 +1337,11 @@ mod tests {
             store.consume_released_transport_receipts().unwrap().len(),
             1
         );
-        let after = store.recovery_revision_fence().unwrap();
+        let after = app.recovery_revision_fence().unwrap();
         assert_eq!(after.inventory_revision, before.inventory_revision + 1);
         assert_eq!(after.obligations[0].1, before.obligations[0].1 + 1);
         assert!(
-            store
-                .reserve_recovery_attempt(&before, 1000, 15000, true)
+            app.reserve_recovery_attempt(&before, 1000, 15000, true)
                 .unwrap()
                 .is_none()
         );
@@ -1370,12 +1351,12 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(store.recovery_revision_fence().unwrap(), after);
+        assert_eq!(app.recovery_revision_fence().unwrap(), after);
     }
 
     #[test]
     fn legacy_read_does_not_take_mutation_ownership_from_the_worker() {
-        let store = fixture();
+        let store = fixture().app_storage();
         store
             .record_account_delivery_loss("alice", 9, 1, 10)
             .unwrap();
@@ -1393,7 +1374,7 @@ mod tests {
 
     #[test]
     fn zero_count_loss_is_still_imported_as_pending_evidence() {
-        let store = fixture();
+        let store = fixture().app_storage();
         store
             .record_account_delivery_loss("alice", 9, 0, 10)
             .unwrap();
@@ -1408,43 +1389,37 @@ mod tests {
     #[test]
     fn unknown_scope_format_cannot_authorize_an_attempt() {
         let store = fixture();
-        store.mark_account_delivery_recovery("alice", 1, 1).unwrap();
+        let app = store.app_storage();
+        app.mark_account_delivery_recovery("alice", 1, 1).unwrap();
         store
             .lock()
             .unwrap()
             .execute_batch("UPDATE account_recovery_scopes SET scope_format = 2")
             .unwrap();
-        let fence = store.recovery_revision_fence().unwrap();
+        let fence = app.recovery_revision_fence().unwrap();
         assert!(
-            store
-                .reserve_recovery_attempt(&fence, 1000, 15000, true)
+            app.reserve_recovery_attempt(&fence, 1000, 15000, true)
                 .is_err()
         );
-        assert_eq!(store.recovery_retry_state().unwrap().attempt_serial, 0);
+        assert_eq!(app.recovery_retry_state().unwrap().attempt_serial, 0);
     }
 
     #[test]
     fn loss_writer_is_evidence_only_and_cannot_overwrite_another_generation() {
         let store = fixture();
-        store
-            .record_account_delivery_loss("alice", 1, 4, 10)
-            .unwrap();
-        store
-            .record_account_delivery_loss("alice", 2, 7, 11)
-            .unwrap();
-        store
-            .record_account_delivery_loss("alice", 1, 2, 12)
-            .unwrap();
-        let before = store.recovery_revision_fence().unwrap();
+        let app = store.app_storage();
+        app.record_account_delivery_loss("alice", 1, 4, 10).unwrap();
+        app.record_account_delivery_loss("alice", 2, 7, 11).unwrap();
+        app.record_account_delivery_loss("alice", 1, 2, 12).unwrap();
+        let before = app.recovery_revision_fence().unwrap();
         assert!(before.obligations.is_empty());
         assert!(
-            store
-                .reserve_recovery_attempt(&before, 1000, 15000, true)
+            app.reserve_recovery_attempt(&before, 1000, 15000, true)
                 .unwrap()
                 .is_none()
         );
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        let joined = store.recovery_revision_fence().unwrap();
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        let joined = app.recovery_revision_fence().unwrap();
         assert_eq!(joined.obligations.len(), 1);
         assert_eq!(joined.loss_revision, 2);
         let counts: Vec<i64> = store
@@ -1459,22 +1434,18 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(counts, vec![4, 7]);
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert_eq!(store.recovery_revision_fence().unwrap(), joined);
-        store
-            .record_account_delivery_loss("alice", 2, 8, 13)
-            .unwrap();
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(app.recovery_revision_fence().unwrap(), joined);
+        app.record_account_delivery_loss("alice", 2, 8, 13).unwrap();
         assert!(
-            store
-                .reserve_recovery_attempt(&joined, 1000, 15000, true)
+            app.reserve_recovery_attempt(&joined, 1000, 15000, true)
                 .unwrap()
                 .is_none()
         );
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert_eq!(store.recovery_revision_fence().unwrap().loss_revision, 3);
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(app.recovery_revision_fence().unwrap().loss_revision, 3);
         assert!(
-            store
-                .reserve_recovery_attempt(&joined, 1000, 15000, true)
+            app.reserve_recovery_attempt(&joined, 1000, 15000, true)
                 .unwrap()
                 .is_none()
         );
@@ -1483,9 +1454,8 @@ mod tests {
     #[test]
     fn evidence_import_failure_rolls_back_demand_and_acknowledgment() {
         let store = fixture();
-        store
-            .record_account_delivery_loss("alice", 3, 9, 10)
-            .unwrap();
+        let app = store.app_storage();
+        app.record_account_delivery_loss("alice", 3, 9, 10).unwrap();
         store
             .lock()
             .unwrap()
@@ -1494,10 +1464,9 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'injected'); END;",
             )
             .unwrap();
-        assert!(store.synchronize_account_delivery_loss("alice").is_err());
+        assert!(app.synchronize_account_delivery_loss("alice").is_err());
         assert!(
-            store
-                .recovery_revision_fence()
+            app.recovery_revision_fence()
                 .unwrap()
                 .obligations
                 .is_empty()
@@ -1519,11 +1488,8 @@ mod tests {
             .unwrap()
             .execute_batch("DROP TRIGGER fail_loss_import")
             .unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert_eq!(
-            store.recovery_revision_fence().unwrap().obligations.len(),
-            1
-        );
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(app.recovery_revision_fence().unwrap().obligations.len(), 1);
     }
 
     #[test]
@@ -1532,7 +1498,9 @@ mod tests {
         let path = dir.path().join("owner.sqlite");
         let key = SqlCipherKey::new("owner retry test").unwrap();
         {
-            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+            let store = SqliteAccountStorage::open_encrypted(&path, &key)
+                .unwrap()
+                .app_storage();
             store.ensure_account_projection("alice").unwrap();
             store.mark_account_delivery_recovery("alice", 1, 1).unwrap();
             let fence = store.recovery_revision_fence().unwrap();
@@ -1543,7 +1511,9 @@ mod tests {
             assert_eq!(reservation.attempt_serial, 1);
             assert_eq!(reservation.not_before_ms, 115000);
         }
-        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key)
+            .unwrap()
+            .app_storage();
         let fence = store.recovery_revision_fence().unwrap();
         assert_eq!(
             store
@@ -1596,7 +1566,7 @@ mod tests {
 
     #[test]
     fn duplicate_joins_do_not_move_retry_but_new_count_fences_old_plans() {
-        let store = fixture();
+        let store = fixture().app_storage();
         store.mark_account_delivery_recovery("alice", 1, 4).unwrap();
         let fence = store.recovery_revision_fence().unwrap();
         let reserved = store
@@ -1620,27 +1590,26 @@ mod tests {
     #[test]
     fn incapable_pending_scope_does_not_wake_on_retry_deadline() {
         let store = fixture();
-        store.mark_account_delivery_recovery("alice", 1, 4).unwrap();
+        let app = store.app_storage();
+        app.mark_account_delivery_recovery("alice", 1, 4).unwrap();
         store
             .lock()
             .unwrap()
             .execute_batch("UPDATE account_recovery_obligations SET eligibility = 3;")
             .unwrap();
-        let fence = store.recovery_revision_fence().unwrap();
+        let fence = app.recovery_revision_fence().unwrap();
         for now in [0, 300000, 600000, 1000000] {
             assert!(
-                store
-                    .reserve_recovery_attempt(&fence, now, 300000, false)
+                app.reserve_recovery_attempt(&fence, now, 300000, false)
                     .unwrap()
                     .is_none()
             );
         }
         assert!(
-            store
-                .reserve_recovery_attempt(&fence, 1000000, 300000, true)
+            app.reserve_recovery_attempt(&fence, 1000000, 300000, true)
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(store.recovery_revision_fence().unwrap(), fence);
+        assert_eq!(app.recovery_revision_fence().unwrap(), fence);
     }
 }

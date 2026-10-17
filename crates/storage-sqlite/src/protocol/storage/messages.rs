@@ -1473,13 +1473,22 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(store.pending_epoch_backfill_intents().unwrap().is_empty());
+        assert!(
+            store
+                .app_storage()
+                .pending_epoch_backfill_intents()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn released_transport_receipt_journal_tracks_app_without_persisted_receipts() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.ensure_account_projection("app-owner").unwrap();
+        store
+            .app_storage()
+            .ensure_account_projection("app-owner")
+            .unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         let mut record = sample_message(mid(1), gid(1), 0);
         record.state = MessageState::PeelDeferred;
@@ -1499,7 +1508,10 @@ mod tests {
         let path = dir.path().join("release.db");
         let key = crate::SqlCipherKey::new("synthetic release regression").unwrap();
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        store.ensure_account_projection("app-owner").unwrap();
+        store
+            .app_storage()
+            .ensure_account_projection("app-owner")
+            .unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         let mut record = sample_message(MessageId::new(vec![42; 32]), gid(1), 3);
         record.state = MessageState::PeelDeferred;
@@ -1545,7 +1557,14 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(store.pending_epoch_backfill_intents().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .app_storage()
+                .pending_epoch_backfill_intents()
+                .unwrap()
+                .len(),
+            1
+        );
         for table in ["seen_events", "transport_reconciliation_items"] {
             assert_eq!(
                 store
@@ -1560,7 +1579,11 @@ mod tests {
         store.close().unwrap();
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(
-            store.pending_epoch_backfill_intents().unwrap().len(),
+            store
+                .app_storage()
+                .pending_epoch_backfill_intents()
+                .unwrap()
+                .len(),
             1,
             "death after journal acknowledgement must not lose recovery intent"
         );
@@ -1570,7 +1593,10 @@ mod tests {
     #[test]
     fn released_transport_receipt_transaction_rolls_back_with_raw_bytes() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.ensure_account_projection("app-owner").unwrap();
+        store
+            .app_storage()
+            .ensure_account_projection("app-owner")
+            .unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         let mut record = sample_message(mid(1), gid(1), 0);
         record.state = MessageState::PeelDeferred;
@@ -1597,7 +1623,13 @@ mod tests {
             )
             .unwrap();
         assert!(store.consume_released_transport_receipts().is_err());
-        assert!(store.pending_epoch_backfill_intents().unwrap().is_empty());
+        assert!(
+            store
+                .app_storage()
+                .pending_epoch_backfill_intents()
+                .unwrap()
+                .is_empty()
+        );
         store
             .lock()
             .unwrap()
@@ -1612,7 +1644,10 @@ mod tests {
     #[test]
     fn released_transport_receipt_capacity_never_drops_replay_evidence_or_raw_bytes() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.ensure_account_projection("app-owner").unwrap();
+        store
+            .app_storage()
+            .ensure_account_projection("app-owner")
+            .unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         store
             .with_transaction(|storage| -> StorageResult<()> {

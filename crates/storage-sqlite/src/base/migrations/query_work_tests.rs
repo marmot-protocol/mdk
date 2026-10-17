@@ -136,6 +136,7 @@ fn maintenance_query_work() {
     let _measurement = QUERY_MEASUREMENT.lock().unwrap();
     for count in [256, 4_096] {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
         seed_query_history(&store.lock().unwrap(), count);
         // Rows a current writer stored carry their derived OpenMLS content
         // (`x'00'` classifies as unclassified); nothing is left to promote.
@@ -152,19 +153,18 @@ fn maintenance_query_work() {
         assert!(!promotion.has_more);
 
         let pending = measured(&store, "terminal pending sends", 64, || {
-            store
-                .invalidate_pending_sent_app_events_for_group("aa", "terminal")
+            app.invalidate_pending_sent_app_events_for_group("aa", "terminal")
                 .unwrap()
         });
         assert!(pending.is_none());
 
         let unread = measured(&store, "unread disband checks", 1_600, || {
-            store.account_unread_total().unwrap()
+            app.account_unread_total().unwrap()
         });
         assert_eq!(unread.unread_count, 32);
 
         let branches = measured(&store, "branch reconciliation", 256, || {
-            store.diverged_branch_selection_withdrawals().unwrap()
+            app.diverged_branch_selection_withdrawals().unwrap()
         });
         assert_eq!(branches.to_revive, [hex::encode(format!("{:032x}", 1))]);
         assert_eq!(branches.to_withdraw, [hex::encode(format!("{:032x}", 3))]);
@@ -195,7 +195,7 @@ fn maintenance_query_work() {
              VALUES ('ABCD', 0, 5);",
             )
             .unwrap();
-        assert_eq!(store.account_unread_total().unwrap().unread_count, 32);
+        assert_eq!(app.account_unread_total().unwrap().unread_count, 32);
     }
 }
 
@@ -279,6 +279,7 @@ fn replay_query_work() {
         // and independently pin that growing history adds no VM work.
         let (messages, steps) = measure(&store, || {
             store
+                .app_storage()
                 .app_messages(crate::StoredAppMessageQuery {
                     group_id_hex: None,
                     kinds: None,
@@ -493,7 +494,10 @@ fn branch_origin_hex_matching() {
          UPDATE app_events SET origin_commit_id = 'abc' WHERE insert_order = 8;",
         )
         .unwrap();
-    let branches = store.diverged_branch_selection_withdrawals().unwrap();
+    let branches = store
+        .app_storage()
+        .diverged_branch_selection_withdrawals()
+        .unwrap();
     assert_eq!(branches.to_withdraw, [hex::encode(format!("{:032x}", 3))]);
     store
         .lock()
@@ -503,7 +507,10 @@ fn branch_origin_hex_matching() {
             [],
         )
         .unwrap();
-    let branches = store.diverged_branch_selection_withdrawals().unwrap();
+    let branches = store
+        .app_storage()
+        .diverged_branch_selection_withdrawals()
+        .unwrap();
     assert_eq!(
         branches.to_withdraw,
         [hex::encode(format!("{:032x}", 3)), "abcd".to_owned()]
@@ -638,6 +645,7 @@ fn chat_readiness_query_work() {
     let _measurement = QUERY_MEASUREMENT.lock().unwrap();
     for count in [256, 16_384] {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
         {
             let conn = store.lock().unwrap();
             conn.execute_batch(
@@ -662,14 +670,11 @@ fn chat_readiness_query_work() {
                      '{\"by_emoji\":{},\"user_reactions\":[]}' FROM app_events;",
             ).unwrap();
         }
-        store
-            .refresh_chat_list_rows("local", &|_, _| false)
-            .unwrap();
+        app.refresh_chat_list_rows("local", &|_, _| false).unwrap();
         let changes = store.lock().unwrap().total_changes();
         {
             measured(&store, &format!("chat readiness rows={count}"), 700, || {
-                store
-                    .ensure_chat_list_rows("local", &|_, _| panic!("unexpected rebuild"))
+                app.ensure_chat_list_rows("local", &|_, _| panic!("unexpected rebuild"))
                     .unwrap();
             });
         }
@@ -684,7 +689,7 @@ fn chat_readiness_query_work() {
              DELETE FROM chat_list_unread_dirty_messages;",
             )
             .unwrap();
-        store.ensure_chat_list_rows("local", &|_, _| false).unwrap();
+        app.ensure_chat_list_rows("local", &|_, _| false).unwrap();
         let updated: i64 = store
             .lock()
             .unwrap()
@@ -695,8 +700,7 @@ fn chat_readiness_query_work() {
             )
             .unwrap();
         assert!(updated > 100000);
-        store
-            .ensure_chat_list_rows("local", &|_, _| panic!("unexpected rebuild"))
+        app.ensure_chat_list_rows("local", &|_, _| panic!("unexpected rebuild"))
             .unwrap();
     }
 }
@@ -706,6 +710,7 @@ fn pinned_chat_query_work() {
     let _measurement = QUERY_MEASUREMENT.lock().unwrap();
     for count in [64, 4_096] {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
         {
             let conn = store.lock().unwrap();
             conn.execute(
@@ -731,11 +736,7 @@ fn pinned_chat_query_work() {
                 // pinned preview retention. System provenance still skips its
                 // separate authenticated-event probe for ordinary/empty rows.
                 count * 192,
-                || {
-                    store
-                        .chat_list_rows(crate::ChatListQuery::default())
-                        .unwrap()
-                },
+                || app.chat_list_rows(crate::ChatListQuery::default()).unwrap(),
             );
             assert_eq!(rows.len(), count as usize);
             for (position, row) in rows.iter().enumerate() {
@@ -754,12 +755,10 @@ fn pinned_chat_query_work() {
                 [&first],
             )
             .unwrap();
-        let rows = store
-            .chat_list_rows(crate::ChatListQuery::default())
-            .unwrap();
+        let rows = app.chat_list_rows(crate::ChatListQuery::default()).unwrap();
         assert_eq!(rows[0].pinned_position, Some(1));
         assert_eq!(
-            store.chat_list_row(&last).unwrap().unwrap(),
+            app.chat_list_row(&last).unwrap().unwrap(),
             *rows.last().unwrap()
         );
         {
@@ -776,13 +775,12 @@ fn pinned_chat_query_work() {
             .unwrap();
         }
         assert_eq!(
-            store
-                .chat_list_rows(crate::ChatListQuery::default())
+            app.chat_list_rows(crate::ChatListQuery::default())
                 .unwrap()
                 .len(),
             count as usize - 2
         );
-        let rows = store
+        let rows = app
             .chat_list_rows(crate::ChatListQuery {
                 include_archived: true,
             })
@@ -809,7 +807,9 @@ fn report_backfill_skips_ordinary_history_with_bounded_query_work() {
              through_order=(SELECT MAX(insert_order) FROM app_events)",
             )
             .unwrap();
-        let (updates, steps) = measure(&store, || store.backfill_content_reports(100).unwrap());
+        let (updates, steps) = measure(&store, || {
+            store.app_storage().backfill_content_reports(100).unwrap()
+        });
         assert!(
             updates.is_empty(),
             "ordinary history must not be rebroadcast"

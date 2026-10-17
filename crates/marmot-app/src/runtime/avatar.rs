@@ -14,7 +14,7 @@ impl MarmotApp {
         let member = crate::chat_presentation::canonical_identity(member)
             .ok_or_else(|| AppError::InvalidEncryptedMedia("invalid avatar identity".into()))?;
         let account = self.account_home().account(label)?;
-        let storage = self.account_storage(label)?;
+        let storage = self.account_storage(label)?.app_storage();
         let input = storage.chat_presentation_input(group)?.ok_or_else(|| {
             AppError::InvalidEncryptedMedia("avatar conversation unavailable".into())
         })?;
@@ -84,7 +84,7 @@ impl IdentityAvatarMaintenance {
             if self.directory_version.as_ref() == Some(&head) {
                 return Ok(false);
             }
-            let checkpoint = storage.chat_presentation_checkpoint()?;
+            let checkpoint = storage.app_storage().chat_presentation_checkpoint()?;
             if !checkpoint.state.shared_epoch.is_empty()
                 && checkpoint.state.shared_epoch != head.store_epoch
             {
@@ -96,7 +96,9 @@ impl IdentityAvatarMaintenance {
             }
             self.directory_version = Some(head);
         }
-        let identities = storage.requested_avatar_identities_after(&self.after)?;
+        let identities = storage
+            .app_storage()
+            .requested_avatar_identities_after(&self.after)?;
         self.after = if identities.len() == storage_sqlite::AVATAR_IDENTITY_BATCH_LIMIT {
             identities.last().unwrap().owner.clone()
         } else {
@@ -106,12 +108,17 @@ impl IdentityAvatarMaintenance {
         let mut changed = false;
         for identity in &identities {
             let result = (|| -> Result<(), AppError> {
-                if let Some(input) = storage.chat_presentation_input(&identity.group)? {
+                if let Some(input) = storage
+                    .app_storage()
+                    .chat_presentation_input(&identity.group)?
+                {
                     let (selected, version) =
                         selected_identity(&client.app, &input, account, &identity.member)?;
-                    let before = storage.avatar_reference(&identity.owner)?;
-                    storage.maintain_identity_avatar_acquisition(identity, &selected, &version)?;
-                    changed |= before != storage.avatar_reference(&identity.owner)?;
+                    let before = storage.app_storage().avatar_reference(&identity.owner)?;
+                    storage
+                        .app_storage()
+                        .maintain_identity_avatar_acquisition(identity, &selected, &version)?;
+                    changed |= before != storage.app_storage().avatar_reference(&identity.owner)?;
                 }
                 Ok(())
             })();
@@ -164,7 +171,10 @@ mod tests {
                 .is_none()
         );
         let storage = app.account_storage("alice").unwrap();
-        let owner = storage.requested_avatar_identities_after("").unwrap()[0]
+        let owner = storage
+            .app_storage()
+            .requested_avatar_identities_after("")
+            .unwrap()[0]
             .owner
             .clone();
         app.shared_storage()
@@ -187,16 +197,29 @@ mod tests {
                 follows: vec![],
             })
             .unwrap();
-        let checkpoint = storage.chat_presentation_checkpoint().unwrap();
+        let checkpoint = storage
+            .app_storage()
+            .chat_presentation_checkpoint()
+            .unwrap();
         let mut transition = checkpoint.state.clone();
         transition.shared_epoch = vec![1; 16];
         storage
+            .app_storage()
             .commit_chat_presentation_batch(&checkpoint, &transition, &[])
             .unwrap();
         let mut maintenance = IdentityAvatarMaintenance::default();
         assert!(!maintenance.run(&client, &account.account_id_hex).unwrap());
-        assert!(storage.avatar_reference(&owner).unwrap().is_none());
-        let checkpoint = storage.chat_presentation_checkpoint().unwrap();
+        assert!(
+            storage
+                .app_storage()
+                .avatar_reference(&owner)
+                .unwrap()
+                .is_none()
+        );
+        let checkpoint = storage
+            .app_storage()
+            .chat_presentation_checkpoint()
+            .unwrap();
         transition.shared_epoch = app
             .shared_storage()
             .unwrap()
@@ -204,6 +227,7 @@ mod tests {
             .unwrap()
             .store_epoch;
         storage
+            .app_storage()
             .commit_chat_presentation_batch(&checkpoint, &transition, &[])
             .unwrap();
         maintenance.run(&client, &account.account_id_hex).unwrap();
@@ -213,9 +237,14 @@ mod tests {
                 .with_read_snapshot(|_| maintenance.run(&client, &account.account_id_hex))
                 .unwrap()
         );
-        let reference = storage.avatar_reference(&owner).unwrap().unwrap();
+        let reference = storage
+            .app_storage()
+            .avatar_reference(&owner)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             storage
+                .app_storage()
                 .claim_avatar_acquisition(0)
                 .unwrap()
                 .unwrap()
@@ -235,10 +264,19 @@ mod tests {
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
         // Removal during the shared-profile preparation gap must not recreate demand.
-        storage.remove_avatar_source(&reference).unwrap();
+        storage
+            .app_storage()
+            .remove_avatar_source(&reference)
+            .unwrap();
         IdentityAvatarMaintenance::default()
             .run(&client, &account.account_id_hex)
             .unwrap();
-        assert!(storage.avatar_reference(&owner).unwrap().is_none());
+        assert!(
+            storage
+                .app_storage()
+                .avatar_reference(&owner)
+                .unwrap()
+                .is_none()
+        );
     }
 }

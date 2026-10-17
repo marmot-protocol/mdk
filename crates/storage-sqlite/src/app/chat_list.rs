@@ -9,8 +9,8 @@ use crate::cross::views::{
     disbanding_group_ids_hex_with_requests_tx, pending_leave_requests_by_group_hex_tx,
 };
 use crate::{
-    SelfMembership, SqliteAccountStorage, SqliteResultExt, StoredAccountState, bool_i64,
-    i64_to_u64, optional_u64_to_i64, u64_to_i64, unix_now_ms, unix_now_seconds,
+    SelfMembership, SqliteAppStorage, SqliteResultExt, StoredAccountState, bool_i64, i64_to_u64,
+    optional_u64_to_i64, u64_to_i64, unix_now_ms, unix_now_seconds,
 };
 pub use attention::AccountAttentionTotal;
 use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
@@ -159,7 +159,7 @@ pub struct ExistingDirectConversation {
 /// When several reusable matches exist, selection follows durable chat-list
 /// activity order: highest `activity_sort_at`, then lowest `group_id_hex`.
 /// That is the same durable clock as the chat-list projection, not the
-/// local pin order used by [`SqliteAccountStorage::chat_list_rows`]. A pin
+/// local pin order used by [`SqliteAppStorage::chat_list_rows`]. A pin
 /// must not change which historical duplicate is reused.
 pub fn select_reusable_direct_conversation(
     candidates: &[ChatListRow],
@@ -446,7 +446,7 @@ impl TimelineReadMarker {
     }
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     pub fn chat_list_rows(&self, query: ChatListQuery) -> StorageResult<Vec<ChatListRow>> {
         let conn = self.lock()?;
         chat_list_rows_tx(&conn, query)

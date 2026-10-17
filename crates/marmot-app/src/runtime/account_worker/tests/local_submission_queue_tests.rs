@@ -204,6 +204,7 @@ async fn failed_permanent_removal_preserves_live_row_timing_then_committed_remov
     assert_eq!(
         app.account_storage(&account.label)
             .unwrap()
+            .app_storage()
             .local_submission(&hex::encode(&group), "remove-token")
             .unwrap()
             .unwrap()

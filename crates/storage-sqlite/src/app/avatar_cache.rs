@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::app::chat_presentation::nonnegative;
-use crate::{SqliteAccountStorage, SqliteResultExt, u64_to_i64};
+use crate::{SqliteAppStorage, SqliteResultExt, u64_to_i64};
 
 pub const MAX_AVATAR_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_AVATAR_CACHE_BYTES: u64 = 128 * 1024 * 1024;
@@ -172,7 +172,7 @@ const LIMITS: Limits = Limits {
     bytes: MAX_AVATAR_CACHE_BYTES,
 };
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Bind one logical subject (e.g. a chat or identity) to its selected source.
     /// Rebinding erases its previous bytes; repeating the same binding preserves
     /// the reference and bytes. Keys are opaque, bounded, app-derived identifiers,

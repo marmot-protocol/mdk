@@ -1,5 +1,6 @@
 //! Native-facing opaque locators and local metadata. No network work.
 use super::*;
+use crate::SqliteAppStorage;
 pub(super) const AVATAR_TARGET_LOOKUP_SQL: &str = "SELECT group_id_hex FROM chat_list_rows CROSS JOIN chat_presentation_meta m WHERE presentation_row_epoch = ?1 AND m.id = 1 AND m.store_epoch = ?2";
 use crate::{ChatPresentationVersion, SelectedAvatar};
 
@@ -118,7 +119,7 @@ impl AvatarAssetPresentation {
         }
     }
 }
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     pub fn avatar_target_presentation(
         &self,
         group: &str,

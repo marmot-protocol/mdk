@@ -41,7 +41,7 @@ impl MarmotAppRuntime {
         let fallback = default_policy(&self.accounts.app.config);
         validate_policy(&fallback)?;
         self.attachment_read(account_ref, move |s, _| {
-            Ok(s.attachment_download_policy(&fallback)?)
+            Ok(s.app_storage().attachment_download_policy(&fallback)?)
         })
         .await
     }
@@ -54,7 +54,8 @@ impl MarmotAppRuntime {
     ) -> Result<(), AppError> {
         validate_policy(&policy)?;
         self.attachment_read(account_ref, move |s, _| {
-            Ok(s.set_attachment_download_policy(&policy, crate::unix_now_seconds())?)
+            Ok(s.app_storage()
+                .set_attachment_download_policy(&policy, crate::unix_now_seconds())?)
         })
         .await?;
         self.wake_attachment_work();
@@ -76,11 +77,15 @@ impl MarmotAppRuntime {
         let changed = self
             .attachment_read(account_ref, move |s, _| {
                 Ok(match control {
-                    AttachmentControl::Cancel => s.cancel_attachment_acquisition(&reference)?,
-                    AttachmentControl::Retry => {
-                        s.explicitly_retry_attachment(&reference, crate::unix_now_seconds())?
+                    AttachmentControl::Cancel => {
+                        s.app_storage().cancel_attachment_acquisition(&reference)?
                     }
-                    AttachmentControl::Remove => s.remove_attachment_reference(&reference)?,
+                    AttachmentControl::Retry => s
+                        .app_storage()
+                        .explicitly_retry_attachment(&reference, crate::unix_now_seconds())?,
+                    AttachmentControl::Remove => {
+                        s.app_storage().remove_attachment_reference(&reference)?
+                    }
                 })
             })
             .await?;
@@ -101,7 +106,7 @@ impl MarmotAppRuntime {
         let result = self
             .attachment_read(account_ref, move |s, loopback| {
                 let now = crate::unix_now_seconds();
-                let Some(entry) = s.attachment_control_entry(
+                let Some(entry) = s.app_storage().attachment_control_entry(
                     &group,
                     &target.message_id_hex,
                     &target.source_message_id_hex,
@@ -120,7 +125,10 @@ impl MarmotAppRuntime {
                     })?;
                 let parsed = crate::parse_media_attachment(&tag, Some(epoch), loopback)?;
                 let digest = crate::media::media_hash_from_reference(&parsed)?;
-                match s.request_explicit_attachment(&group, &entry, digest, now)? {
+                match s
+                    .app_storage()
+                    .request_explicit_attachment(&group, &entry, digest, now)?
+                {
                     storage_sqlite::AttachmentDemand::Requested(reference) => Ok(Some(reference)),
                     _ => Ok(None),
                 }
@@ -142,7 +150,7 @@ impl MarmotAppRuntime {
         let result = self
             .attachment_read(account_ref, move |s, loopback| {
                 let now = crate::unix_now_seconds();
-                let Some(entry) = s.attachment_control_entry(
+                let Some(entry) = s.app_storage().attachment_control_entry(
                     &group,
                     &target.message_id_hex,
                     &target.source_message_id_hex,
@@ -161,7 +169,10 @@ impl MarmotAppRuntime {
                     })?;
                 let reference = crate::parse_media_attachment(&tag, Some(epoch), loopback)?;
                 let digest = crate::media::media_hash_from_reference(&reference)?;
-                match s.request_attachment_download_again(&group, &entry, digest, now)? {
+                match s
+                    .app_storage()
+                    .request_attachment_download_again(&group, &entry, digest, now)?
+                {
                     storage_sqlite::AttachmentDemand::Requested(reference) => Ok(Some(reference)),
                     _ => Ok(None),
                 }
@@ -184,7 +195,7 @@ impl MarmotAppRuntime {
             == crate::AttachmentAcquisitionMode::HostManaged;
         let permissions = self.shared.attachment_permissions.clone();
         self.attachment_read(account_ref, move |s, _| {
-            let policy = s.attachment_download_policy(&fallback)?;
+            let policy = s.app_storage().attachment_download_policy(&fallback)?;
             let targets = targets
                 .iter()
                 .map(|t| {
@@ -195,7 +206,7 @@ impl MarmotAppRuntime {
                     )
                 })
                 .collect::<Vec<_>>();
-            let mut frame = s.attachment_transfer_snapshot(
+            let mut frame = s.app_storage().attachment_transfer_snapshot(
                 &group,
                 &targets,
                 crate::unix_now_seconds(),

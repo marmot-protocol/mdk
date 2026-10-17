@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 use crate::base::test_support::sample_group;
 use crate::{
     SelfMembership, SqlCipherKey, StoredAccountGroup, StoredAccountGroupComponent,
@@ -142,6 +144,7 @@ fn reaction(id: &str, sender: &str, target: &str, at: u64) -> StoredAppEvent {
 fn setup_store_with_group(group: StoredAccountGroup) -> SqliteAccountStorage {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store
+        .app_storage()
         .save_account_projection_state(
             &StoredAccountState {
                 label: "alice".to_owned(),
@@ -164,20 +167,20 @@ fn assert_preview_retention(
     message_id: &str,
     expected: (Option<u64>, Option<u64>),
 ) {
-    let mut rows = store.chat_list_rows(ChatListQuery::default()).unwrap();
-    rows.push(store.chat_list_row(GROUP).unwrap().unwrap());
+    let app = store.app_storage();
+    let mut rows = app.chat_list_rows(ChatListQuery::default()).unwrap();
+    rows.push(app.chat_list_row(GROUP).unwrap().unwrap());
     rows.extend(
-        store
-            .chat_list_page(crate::ChatListPageQuery {
-                view: crate::ChatListView::Chats,
-                limit: 10,
-                direction: crate::ChatListPageDirection::Forward,
-                cursor: None,
-            })
-            .unwrap()
-            .rows,
+        app.chat_list_page(crate::ChatListPageQuery {
+            view: crate::ChatListView::Chats,
+            limit: 10,
+            direction: crate::ChatListPageDirection::Forward,
+            cursor: None,
+        })
+        .unwrap()
+        .rows,
     );
-    let direct = store.direct_conversation_candidate_rows(REMOTE).unwrap();
+    let direct = app.direct_conversation_candidate_rows(REMOTE).unwrap();
     assert_eq!(direct.len(), 1);
     rows.extend(direct);
     assert_eq!(rows.len(), 4);
@@ -218,17 +221,17 @@ fn chat_preview_retention_reads_preserve_every_pinned_state() {
         Some(AppMessageRetentionDecision::new(u64::MAX, 1)),
     ] {
         let store = retention_store();
-        store
-            .record_app_event_with_retention(&chat("message", REMOTE, 10, "hello"), decision)
+        let app = store.app_storage();
+        app.record_app_event_with_retention(&chat("message", REMOTE, 10, "hello"), decision)
             .unwrap();
-        store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+        app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
         let expected = (
             decision.map(|d| d.retention_seconds),
             decision.and_then(|d| d.expires_at),
         );
         assert_preview_retention(&store, "message", expected);
-        store.rebuild_message_timeline_for_group(GROUP).unwrap();
-        store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+        app.rebuild_message_timeline_for_group(GROUP).unwrap();
+        app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
         assert_preview_retention(&store, "message", expected);
     }
 }
@@ -236,22 +239,21 @@ fn chat_preview_retention_reads_preserve_every_pinned_state() {
 #[test]
 fn chat_preview_retention_uses_each_message_decision_before_and_after_prune() {
     let store = retention_store();
+    let app = store.app_storage();
     // A was sent under five minutes; B under thirty seconds. Both remain in
     // storage at read time, even though B's deadline has passed.
     for (id, at, seconds) in [("a", 10, 300), ("b", 20, 30)] {
-        store
-            .record_app_event_with_retention(
-                &chat(id, REMOTE, at, id),
-                Some(AppMessageRetentionDecision::new(at, seconds)),
-            )
-            .unwrap();
+        app.record_app_event_with_retention(
+            &chat(id, REMOTE, at, id),
+            Some(AppMessageRetentionDecision::new(at, seconds)),
+        )
+        .unwrap();
     }
-    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
     assert_preview_retention(&store, "b", (Some(30), Some(50)));
     // Reading exposes the exact expired deadline rather than hiding the row.
     // Once B is pruned, A still carries its own five-minute decision.
-    store
-        .secure_prune_expired_app_events(GROUP, 50, LOCAL, &no_mentions)
+    app.secure_prune_expired_app_events(GROUP, 50, LOCAL, &no_mentions)
         .unwrap();
     assert_preview_retention(&store, "a", (Some(300), Some(310)));
 }
@@ -259,20 +261,20 @@ fn chat_preview_retention_uses_each_message_decision_before_and_after_prune() {
 #[test]
 fn chat_preview_retention_finalization_is_visible_without_rebuilding_chat_rows() {
     let store = retention_store();
+    let app = store.app_storage();
     let mut pending = chat("pending", LOCAL, 50, "hello");
     pending.source_message_id_hex = None;
-    store.record_app_event(&pending).unwrap();
-    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    app.record_app_event(&pending).unwrap();
+    app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
     assert_preview_retention(&store, "pending", (None, None));
-    store
-        .finalize_app_event_source_retention(
-            GROUP,
-            "pending",
-            Some("source-pending"),
-            9,
-            AppMessageRetentionDecision::new(50, 300),
-        )
-        .unwrap();
+    app.finalize_app_event_source_retention(
+        GROUP,
+        "pending",
+        Some("source-pending"),
+        9,
+        AppMessageRetentionDecision::new(50, 300),
+    )
+    .unwrap();
     assert_preview_retention(&store, "pending", (Some(300), Some(350)));
 }
 
@@ -287,6 +289,7 @@ fn chat_startup_benchmark() {
     let store =
         SqliteAccountStorage::open_encrypted(dir.path().join("account.sqlite3"), &key).unwrap();
     store
+        .app_storage()
         .save_account_projection_state(
             &StoredAccountState {
                 label: "benchmark".to_owned(),
@@ -309,7 +312,7 @@ fn chat_startup_benchmark() {
             for index in seeded..count {
                 let mut event = chat(&format!("{index:064x}"), REMOTE, index, &body);
                 event.source_epoch = Some(1);
-                store.record_app_event(&event)?;
+                store.app_storage().record_app_event(&event)?;
             }
             Ok::<_, cgka_traits::StorageError>(())
         })
@@ -317,10 +320,17 @@ fn chat_startup_benchmark() {
         seeded = count;
         let id = format!("{:064x}", count - 1);
         store
+            .app_storage()
             .mark_timeline_message_read(LOCAL, GROUP, &id, &no_mentions)
             .unwrap();
-        store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
-        let expected = store.chat_list_rows(ChatListQuery::default()).unwrap();
+        store
+            .app_storage()
+            .ensure_chat_list_rows(LOCAL, &no_mentions)
+            .unwrap();
+        let expected = store
+            .app_storage()
+            .chat_list_rows(ChatListQuery::default())
+            .unwrap();
         assert_eq!(expected.len(), 1);
         assert_eq!(
             expected[0].last_message.as_ref().unwrap().message_id_hex,
@@ -332,12 +342,21 @@ fn chat_startup_benchmark() {
             if mode == "indexed" {
                 store.lock().unwrap().execute_batch("CREATE INDEX idx_message_timeline_group_received ON message_timeline(group_id_hex, received_at)").unwrap();
             }
-            store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+            store
+                .app_storage()
+                .ensure_chat_list_rows(LOCAL, &no_mentions)
+                .unwrap();
             let mut samples = Vec::new();
             for _ in 0..7 {
                 let start = std::time::Instant::now();
-                store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
-                let rows = store.chat_list_rows(ChatListQuery::default()).unwrap();
+                store
+                    .app_storage()
+                    .ensure_chat_list_rows(LOCAL, &no_mentions)
+                    .unwrap();
+                let rows = store
+                    .app_storage()
+                    .chat_list_rows(ChatListQuery::default())
+                    .unwrap();
                 samples.push(start.elapsed().as_micros());
                 assert_eq!(rows, expected);
             }
@@ -368,6 +387,7 @@ fn preview_query_work() {
         let store = setup_store();
         if direction == "pending-after" {
             store
+                .app_storage()
                 .record_app_event(&chat("accepted-first", REMOTE, 0, "first"))
                 .unwrap();
         }
@@ -386,10 +406,10 @@ fn preview_query_work() {
                     if direction != "received" {
                         event.source_message_id_hex = None;
                     }
-                    store.record_app_event(&event)?;
+                    store.app_storage().record_app_event(&event)?;
                 }
                 if direction != "pending-after" {
-                    store.record_app_event(&chat(
+                    store.app_storage().record_app_event(&chat(
                         &format!("accepted-{count}"),
                         REMOTE,
                         count,
@@ -401,6 +421,7 @@ fn preview_query_work() {
             .unwrap();
             seeded = count;
             store
+                .app_storage()
                 .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
                 .unwrap();
             {
@@ -428,6 +449,7 @@ fn preview_query_work() {
                 );
             }
             let row = store
+                .app_storage()
                 .refresh_chat_list_row(LOCAL, GROUP, &mentions_local)
                 .unwrap()
                 .unwrap();
@@ -493,6 +515,7 @@ fn created_group_projection_and_chat_list_row_commit_atomically() {
     };
 
     store
+        .app_storage()
         .save_account_projection_delta_and_refresh_chat_list_row(
             &state,
             256,
@@ -506,6 +529,7 @@ fn created_group_projection_and_chat_list_row_commit_atomically() {
         .expect_err("the injected chat-list failure must roll back the projection delta");
     assert!(
         store
+            .app_storage()
             .load_account_projection_state("alice", 256)
             .unwrap()
             .groups
@@ -519,6 +543,7 @@ fn created_group_projection_and_chat_list_row_commit_atomically() {
         .execute_batch("DROP TRIGGER fail_created_chat_list_row")
         .unwrap();
     let committed = store
+        .app_storage()
         .save_account_projection_delta_and_refresh_chat_list_row(
             &state,
             256,
@@ -531,7 +556,10 @@ fn created_group_projection_and_chat_list_row_commit_atomically() {
         )
         .unwrap()
         .expect("created chat-list row");
-    assert_eq!(store.chat_list_row(GROUP).unwrap(), Some(committed));
+    assert_eq!(
+        store.app_storage().chat_list_row(GROUP).unwrap(),
+        Some(committed)
+    );
 }
 
 /// Operational mdk#1487 benchmark for the post-canonical app-local tail.
@@ -581,8 +609,9 @@ fn measure_create_tail(
         "create-tail-benchmark-{invitees}-{baseline}-{include_row_read}"
     ))
     .unwrap();
-    let store =
-        SqliteAccountStorage::open_encrypted(dir.path().join("account.sqlite3"), &key).unwrap();
+    let store = SqliteAccountStorage::open_encrypted(dir.path().join("account.sqlite3"), &key)
+        .unwrap()
+        .app_storage();
     let mut durations = Vec::with_capacity(samples);
     for sample in 0..samples {
         let group_id_hex = format!("{invitees:02x}{sample:062x}");
@@ -607,8 +636,7 @@ fn measure_create_tail(
         let started = std::time::Instant::now();
         if baseline {
             store.record_pending_welcome_deliveries(&pending).unwrap();
-            store
-                .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+            store.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
                     &state,
                     256,
                     MAX_FUTURE_SKEW_SECS,
@@ -655,7 +683,7 @@ fn percentile_micros(samples: &[u128], percentile: usize) -> u128 {
 
 #[test]
 fn manual_unread_is_independent_durable_and_cleared_by_mark_read() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .record_app_event(&chat("history", REMOTE, 10, "old history"))
         .unwrap();
@@ -707,7 +735,7 @@ fn manual_unread_is_independent_durable_and_cleared_by_mark_read() {
 
 #[test]
 fn manual_unread_without_history_keeps_the_first_later_delivery_unread() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     let row = store
         .set_chat_manually_unread(LOCAL, GROUP, true, &no_mentions)
         .unwrap()
@@ -732,7 +760,7 @@ fn manual_unread_without_history_keeps_the_first_later_delivery_unread() {
 
 #[test]
 fn clearing_manual_unread_does_not_move_the_message_marker() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
@@ -755,7 +783,7 @@ fn clearing_manual_unread_does_not_move_the_message_marker() {
 
 #[test]
 fn chat_list_rows_join_effective_mute_without_per_row_queries() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
 
     let until = unix_now_ms() + 60_000;
@@ -787,7 +815,7 @@ fn conversation_kind_uses_durable_current_roster_projection() {
     let mut direct = group();
     direct.profile_name.clear();
     direct.member_count = Some(2);
-    let store = setup_store_with_group(direct);
+    let store = setup_store_with_group(direct).app_storage();
     store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
     assert_eq!(
         store
@@ -1074,17 +1102,17 @@ fn direct_conversation_candidate_rows_are_keyed_by_peer() {
     }
 
     let store = SqliteAccountStorage::in_memory().unwrap();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                groups,
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
+    let app = store.app_storage();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            groups,
+            ..StoredAccountState::default()
+        },
+        256,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
     {
         let conn = store.lock().unwrap();
         conn.execute(
@@ -1098,9 +1126,9 @@ fn direct_conversation_candidate_rows_are_keyed_by_peer() {
         )
         .unwrap();
     }
-    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    app.refresh_chat_list_rows(&local, &no_mentions).unwrap();
 
-    let candidates = store.direct_conversation_candidate_rows(&peer).unwrap();
+    let candidates = app.direct_conversation_candidate_rows(&peer).unwrap();
     assert_eq!(
         candidates
             .iter()
@@ -1115,16 +1143,15 @@ fn direct_conversation_candidate_rows_are_keyed_by_peer() {
             .all(|row| row.conversation_kind == ChatConversationKind::Direct)
     );
     assert!(
-        store
-            .direct_conversation_candidate_rows(&other)
+        app.direct_conversation_candidate_rows(&other)
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        store.unindexed_direct_conversation_group_ids().unwrap(),
+        app.unindexed_direct_conversation_group_ids().unwrap(),
         Vec::<String>::new()
     );
-    let loaded = store
+    let loaded = app
         .load_account_projection_state("alice", 16)
         .unwrap()
         .groups
@@ -1137,7 +1164,7 @@ fn direct_conversation_candidate_rows_are_keyed_by_peer() {
     expected_members.sort();
     assert_eq!(loaded_members, expected_members);
 
-    let plan = store
+    let plan = app
         .direct_conversation_candidate_query_plan(&hex_id(0xbb, 32))
         .unwrap()
         .join("\n")
@@ -1158,7 +1185,7 @@ fn fill_unindexed_direct_conversation_members_does_not_clobber_newer_rows() {
     let old_peer = hex_id(0xbb, 32);
     let new_peer = hex_id(0xcc, 32);
     let group_id = hex_id(0x11, 16);
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -1207,7 +1234,7 @@ fn fill_unindexed_direct_conversation_members_writes_when_empty() {
     let group_id = hex_id(0x11, 16);
     let mut unindexed = direct_group(&group_id, &local, &peer);
     unindexed.direct_member_ids_hex = None;
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -1245,7 +1272,7 @@ fn reset_direct_conversation_members_backfill_clears_index_and_marker() {
     let local = hex_id(0xaa, 32);
     let peer = hex_id(0xbb, 32);
     let group_id = hex_id(0x11, 16);
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -1300,7 +1327,7 @@ fn persist_direct_index_follows_two_member_ids_not_stale_count() {
     let peer = hex_id(0xbb, 32);
     let extra = hex_id(0xcc, 32);
     let group_id = hex_id(0x11, 16);
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
 
     let mut stale_count = direct_group(&group_id, &local, &peer);
     stale_count.member_count = Some(3);
@@ -1361,7 +1388,7 @@ fn replace_direct_conversation_members_rejects_non_two_member_slices() {
     let peer = hex_id(0xbb, 32);
     let extra = hex_id(0xcc, 32);
     let group_id = hex_id(0x11, 16);
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -1418,7 +1445,7 @@ fn unindexed_direct_conversation_group_ids_skip_malformed_hex() {
     malformed.direct_member_ids_hex = None;
     let mut valid = direct_group(&valid_id, &local, &peer);
     valid.direct_member_ids_hex = None;
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -1444,20 +1471,20 @@ fn direct_conversation_candidate_rows_follow_activity_not_pin_order() {
     let older_id = hex_id(0x11, 16);
     let newer_id = hex_id(0x22, 16);
     let store = SqliteAccountStorage::in_memory().unwrap();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                groups: vec![
-                    direct_group(&older_id, &local, &peer),
-                    direct_group(&newer_id, &local, &peer),
-                ],
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
+    let app = store.app_storage();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            groups: vec![
+                direct_group(&older_id, &local, &peer),
+                direct_group(&newer_id, &local, &peer),
+            ],
+            ..StoredAccountState::default()
+        },
+        256,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
     {
         let conn = store.lock().unwrap();
         conn.execute(
@@ -1470,10 +1497,10 @@ fn direct_conversation_candidate_rows_follow_activity_not_pin_order() {
         )
         .unwrap();
     }
-    store.refresh_chat_list_rows(&local, &no_mentions).unwrap();
-    store.set_chat_pinned(&older_id, true).unwrap();
+    app.refresh_chat_list_rows(&local, &no_mentions).unwrap();
+    app.set_chat_pinned(&older_id, true).unwrap();
 
-    let chat_list = store
+    let chat_list = app
         .chat_list_rows(ChatListQuery::default())
         .unwrap()
         .into_iter()
@@ -1485,7 +1512,7 @@ fn direct_conversation_candidate_rows_follow_activity_not_pin_order() {
         "visible chat list is pin-first"
     );
 
-    let candidates = store
+    let candidates = app
         .direct_conversation_candidate_rows(&peer)
         .unwrap()
         .into_iter()
@@ -1500,7 +1527,7 @@ fn direct_conversation_candidate_rows_follow_activity_not_pin_order() {
 
 #[test]
 fn latest_preview_carries_exact_media_and_delivery_projection() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     let mut pending = chat_with_tags(
         "pending",
         LOCAL,
@@ -1606,17 +1633,17 @@ fn never_messaged_rows_sort_by_creation_then_group_id_across_rebuilds() {
         ..group()
     };
     let store = SqliteAccountStorage::in_memory().unwrap();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                groups: vec![group(), second_group, tied_group],
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
+    let app = store.app_storage();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            groups: vec![group(), second_group, tied_group],
+            ..StoredAccountState::default()
+        },
+        256,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
     {
         let conn = store.lock().unwrap();
         conn.execute(
@@ -1631,10 +1658,8 @@ fn never_messaged_rows_sort_by_creation_then_group_id_across_rebuilds() {
         .unwrap();
     }
 
-    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    let before = store
-        .chat_list_rows(crate::ChatListQuery::default())
-        .unwrap();
+    app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let before = app.chat_list_rows(crate::ChatListQuery::default()).unwrap();
     assert_eq!(
         before
             .iter()
@@ -1662,10 +1687,8 @@ fn never_messaged_rows_sort_by_creation_then_group_id_across_rebuilds() {
         conn.execute("UPDATE chat_list_rows SET updated_at = 4000000000", [])
             .unwrap();
     }
-    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    let after = store
-        .chat_list_rows(crate::ChatListQuery::default())
-        .unwrap();
+    app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let after = app.chat_list_rows(crate::ChatListQuery::default()).unwrap();
     let semantic_after = after
         .iter()
         .map(|row| {
@@ -1684,6 +1707,7 @@ fn initialize_chat_read_state_returns_none_for_unknown_group() {
     let store = setup_store();
 
     let row = store
+        .app_storage()
         .initialize_chat_read_state(LOCAL, "missing-group", &no_mentions)
         .unwrap();
 
@@ -1694,6 +1718,7 @@ fn initialize_chat_read_state_returns_none_for_unknown_group() {
 fn visible_activity_survives_read_metadata_membership_and_secure_prune_updates() {
     for mark_read in [false, true] {
         let store = setup_store();
+        let app = store.app_storage();
         {
             let conn = store.lock().unwrap();
             conn.execute(
@@ -1702,13 +1727,11 @@ fn visible_activity_survives_read_metadata_membership_and_secure_prune_updates()
             )
             .unwrap();
         }
-        store
-            .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+        app.initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
             .unwrap();
-        store
-            .record_app_event(&chat("visible", REMOTE, 100, "semantic activity"))
+        app.record_app_event(&chat("visible", REMOTE, 100, "semantic activity"))
             .unwrap();
-        let mut row = store
+        let mut row = app
             .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
             .unwrap()
             .expect("chat row");
@@ -1717,7 +1740,7 @@ fn visible_activity_survives_read_metadata_membership_and_secure_prune_updates()
         assert_eq!(row.unread_count, 1);
 
         if mark_read {
-            row = store
+            row = app
                 .mark_timeline_message_read(LOCAL, GROUP, "visible", &no_mentions)
                 .unwrap()
                 .expect("chat row");
@@ -1730,31 +1753,28 @@ fn visible_activity_survives_read_metadata_membership_and_secure_prune_updates()
         renamed
             .components
             .push(avatar_url_component("https://cdn.example.com/new.png"));
-        store
-            .save_account_projection_state(
-                &StoredAccountState {
-                    label: "alice".to_owned(),
-                    groups: vec![renamed],
-                    ..StoredAccountState::default()
-                },
-                256,
-                MAX_FUTURE_SKEW_SECS,
-            )
+        app.save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                groups: vec![renamed],
+                ..StoredAccountState::default()
+            },
+            256,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+        app.set_group_self_membership(GROUP, SelfMembership::Removed)
             .unwrap();
-        store
-            .set_group_self_membership(GROUP, SelfMembership::Removed)
-            .unwrap();
-        row = store
+        row = app
             .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
             .unwrap()
             .expect("chat row");
         assert_eq!(row.conversation_created_at, 5);
         assert_eq!(row.activity_sort_at, 100);
 
-        store
-            .secure_prune_app_events_before(GROUP, 101, LOCAL, &no_mentions)
+        app.secure_prune_app_events_before(GROUP, 101, LOCAL, &no_mentions)
             .unwrap();
-        row = store.chat_list_row(GROUP).unwrap().expect("chat row");
+        row = app.chat_list_row(GROUP).unwrap().expect("chat row");
         assert_eq!(row.last_message, None);
         assert_eq!(row.unread_count, 0);
         assert_eq!(row.unread_mention_count, 0);
@@ -1772,25 +1792,23 @@ fn visible_activity_survives_read_metadata_membership_and_secure_prune_updates()
             )
             .unwrap();
         }
-        store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
-        row = store.chat_list_row(GROUP).unwrap().expect("chat row");
+        app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+        row = app.chat_list_row(GROUP).unwrap().expect("chat row");
         assert_eq!(row.last_message, None);
         assert_eq!(row.conversation_created_at, 5);
         assert_eq!(row.activity_sort_at, 100);
 
-        store
-            .record_app_event(&chat("new-visible", REMOTE, 200, "new activity"))
+        app.record_app_event(&chat("new-visible", REMOTE, 200, "new activity"))
             .unwrap();
-        row = store
+        row = app
             .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
             .unwrap()
             .expect("chat row");
         assert_eq!(row.activity_sort_at, 200);
 
-        store
-            .invalidate_app_event_by_message_id(GROUP, "new-visible", "LosingBranch")
+        app.invalidate_app_event_by_message_id(GROUP, "new-visible", "LosingBranch")
             .unwrap();
-        row = store
+        row = app
             .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
             .unwrap()
             .expect("chat row");
@@ -1839,24 +1857,40 @@ fn retained_pruned_anchor_survives_a_real_rebuild_cycle() {
     // A full rebuild (app warm-up path) must retain the migrated anchor: the
     // preview is gone but its durable position stays, and the recompute floor
     // (max(read cursor 300, creation 5) = 300) does not lower it.
-    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    let row = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    store
+        .app_storage()
+        .refresh_chat_list_rows(LOCAL, &no_mentions)
+        .unwrap();
+    let row = store
+        .app_storage()
+        .chat_list_row(GROUP)
+        .unwrap()
+        .expect("chat row");
     assert_eq!(row.last_message, None);
     assert_eq!(row.conversation_created_at, 5);
     assert_eq!(row.activity_sort_at, 350);
 
     // The completeness check must treat the retained-then-rebuilt row as current,
     // so ensure is a no-op rather than perpetually rebuilding.
-    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    let after_ensure = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    store
+        .app_storage()
+        .ensure_chat_list_rows(LOCAL, &no_mentions)
+        .unwrap();
+    let after_ensure = store
+        .app_storage()
+        .chat_list_row(GROUP)
+        .unwrap()
+        .expect("chat row");
     assert_eq!(after_ensure.activity_sort_at, 350);
 
     // Now introduce a visible message strictly above the retained anchor; the
     // rebuild must advance to it, proving preservation is a floor, not a freeze.
     store
+        .app_storage()
         .record_app_event(&chat("newer", REMOTE, 400, "newer activity"))
         .unwrap();
     let advanced = store
+        .app_storage()
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
@@ -1865,7 +1899,7 @@ fn retained_pruned_anchor_survives_a_real_rebuild_cycle() {
 
 #[test]
 fn refresh_chat_list_row_returns_refreshed_single_group_projection() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
 
     store
         .record_app_event(&chat("latest", REMOTE, 10, "single row"))
@@ -1900,6 +1934,7 @@ fn refresh_chat_list_row_projects_group_avatar_url() {
     let store = setup_store_with_group(group);
 
     let row = store
+        .app_storage()
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
@@ -1912,7 +1947,7 @@ fn refresh_chat_list_row_projects_group_avatar_url() {
 
 #[test]
 fn chat_list_reads_cached_projection_without_rebuilding() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .record_app_event(&chat("old", REMOTE, 10, "cached"))
         .unwrap();
@@ -1957,7 +1992,7 @@ fn chat_list_reads_cached_projection_without_rebuilding() {
 
 #[test]
 fn ensure_chat_list_rows_backfills_missing_projection_rows() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .record_app_event(&chat("latest", REMOTE, 10, "backfilled"))
         .unwrap();
@@ -1976,8 +2011,8 @@ fn ensure_chat_list_rows_backfills_missing_projection_rows() {
 #[test]
 fn ensure_chat_list_rows_rebuilds_stale_account_group_rows() {
     let store = setup_store();
-    store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+    let app = store.app_storage();
+    app.refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap();
     {
         let conn = store.lock().unwrap();
@@ -1990,8 +2025,8 @@ fn ensure_chat_list_rows_rebuilds_stale_account_group_rows() {
         .unwrap();
     }
 
-    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    let row = store
+    app.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let row = app
         .chat_list_rows(crate::ChatListQuery::default())
         .unwrap()
         .pop()
@@ -2008,7 +2043,7 @@ fn ensure_chat_list_rows_repairs_drifted_self_membership() {
     // rows at the default 'member'). The open-path completeness check must
     // treat a row whose denormalized membership disagrees with
     // `account_groups` as stale and rebuild it.
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap();
@@ -2037,7 +2072,8 @@ fn ensure_chat_list_rows_treats_unknown_self_membership_as_normalized() {
     // CASE) — otherwise it sees 'member' != '<unknown>' forever and rebuilds the
     // whole projection on every open.
     let store = setup_store();
-    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let app = store.app_storage();
+    app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
 
     {
         let conn = store.lock().unwrap();
@@ -2055,9 +2091,9 @@ fn ensure_chat_list_rows_treats_unknown_self_membership_as_normalized() {
         .unwrap();
     }
 
-    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    app.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
 
-    let row = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    let row = app.chat_list_row(GROUP).unwrap().expect("chat row");
     assert_eq!(row.self_membership, SelfMembership::Member);
     assert_eq!(
         row.updated_at, 4_000_000_000,
@@ -2068,7 +2104,7 @@ fn ensure_chat_list_rows_treats_unknown_self_membership_as_normalized() {
 
 #[test]
 fn ensure_chat_list_rows_rebuilds_stale_message_rows() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .record_app_event(&chat("old", REMOTE, 10, "old preview"))
         .unwrap();
@@ -2094,11 +2130,10 @@ fn ensure_chat_list_rows_rebuilds_stale_message_rows() {
 #[test]
 fn ensure_chat_list_rows_rebuilds_stale_read_state_rows() {
     let store = setup_store();
-    store
-        .record_app_event(&chat("unread", REMOTE, 10, "needs read state"))
+    let app = store.app_storage();
+    app.record_app_event(&chat("unread", REMOTE, 10, "needs read state"))
         .unwrap();
-    store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+    app.refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap();
     {
         let conn = store.lock().unwrap();
@@ -2118,8 +2153,8 @@ fn ensure_chat_list_rows_rebuilds_stale_read_state_rows() {
         .unwrap();
     }
 
-    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    let row = store
+    app.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let row = app
         .chat_list_rows(crate::ChatListQuery::default())
         .unwrap()
         .pop()
@@ -2131,7 +2166,7 @@ fn ensure_chat_list_rows_rebuilds_stale_read_state_rows() {
 
 #[test]
 fn chat_list_read_state_and_preview_follow_canonical_epoch_order() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
@@ -2175,7 +2210,7 @@ fn chat_list_read_state_and_preview_follow_canonical_epoch_order() {
 
 #[test]
 fn newer_authenticated_message_replaces_older_pending_preview() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     let mut pending = chat("pending", LOCAL, 100, "older pending send");
     pending.source_message_id_hex = None;
     pending.source_epoch = None;
@@ -2199,7 +2234,7 @@ fn newer_authenticated_message_replaces_older_pending_preview() {
 
 #[test]
 fn newer_pending_message_replaces_older_authenticated_preview() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     let mut delivered = chat("delivered", LOCAL, 100, "older delivered send");
     delivered.source_epoch = Some(7);
     store.record_app_event(&delivered).unwrap();
@@ -2223,7 +2258,7 @@ fn newer_pending_message_replaces_older_authenticated_preview() {
 
 #[test]
 fn pending_preview_clock_rollback() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     let mut stale = chat("stale", LOCAL, 1_000, "stale pending");
     stale.source_message_id_hex = None;
     store.record_app_event(&stale).unwrap();
@@ -2245,7 +2280,7 @@ fn pending_preview_clock_rollback() {
 
 #[test]
 fn pending_send_with_source_epoch_uses_pending_preview_ordering() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     let mut delivered = chat("delivered", LOCAL, 100, "older delivered send");
     delivered.source_epoch = Some(8);
     store.record_app_event(&delivered).unwrap();
@@ -2272,7 +2307,7 @@ fn pending_send_with_source_epoch_uses_pending_preview_ordering() {
 
 #[test]
 fn replayed_older_authenticated_message_does_not_replace_newer_pending_preview() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     let mut delivered = chat("delivered", LOCAL, 100, "older delivered send");
     delivered.source_epoch = Some(7);
     store.record_app_event(&delivered).unwrap();
@@ -2300,6 +2335,7 @@ fn replayed_older_authenticated_message_does_not_replace_newer_pending_preview()
 #[test]
 fn legacy_read_state_uses_canonical_first_unread_order_across_refresh_paths() {
     let store = setup_store();
+    let app = store.app_storage();
     {
         let conn = store.lock().unwrap();
         conn.execute(
@@ -2314,12 +2350,12 @@ fn legacy_read_state_uses_canonical_first_unread_order_across_refresh_paths() {
 
     let mut higher_epoch = chat("higher-epoch", REMOTE, 10, "earlier wall clock");
     higher_epoch.source_epoch = Some(8);
-    store.record_app_event(&higher_epoch).unwrap();
+    app.record_app_event(&higher_epoch).unwrap();
     let mut lower_epoch = chat("lower-epoch", REMOTE, 20, "later wall clock");
     lower_epoch.source_epoch = Some(7);
-    store.record_app_event(&lower_epoch).unwrap();
+    app.record_app_event(&lower_epoch).unwrap();
 
-    let rebuilt = store
+    let rebuilt = app
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
@@ -2328,7 +2364,7 @@ fn legacy_read_state_uses_canonical_first_unread_order_across_refresh_paths() {
         Some("lower-epoch")
     );
 
-    let targeted = store
+    let targeted = app
         .refresh_chat_list_row_for_messages(
             LOCAL,
             GROUP,
@@ -2345,7 +2381,7 @@ fn legacy_read_state_uses_canonical_first_unread_order_across_refresh_paths() {
 
 #[test]
 fn ensure_repairs_a_stale_pending_preview_after_newer_authenticated_activity() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     let mut pending = chat("pending", LOCAL, 100, "older pending send");
     pending.source_message_id_hex = None;
     pending.source_epoch = None;
@@ -2381,7 +2417,7 @@ fn ensure_repairs_a_stale_pending_preview_after_newer_authenticated_activity() {
 
 #[test]
 fn group_system_read_marker_preserves_same_epoch_canonical_phase() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
@@ -2420,7 +2456,7 @@ fn group_system_read_marker_preserves_same_epoch_canonical_phase() {
 
 #[test]
 fn read_marker_follows_pending_send_into_authenticated_history() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     let mut pending = chat("pending", LOCAL, 500, "optimistic send");
     pending.source_message_id_hex = None;
     pending.source_epoch = None;
@@ -2448,7 +2484,7 @@ fn read_marker_follows_pending_send_into_authenticated_history() {
 
 #[test]
 fn failed_pending_read_marker_does_not_hide_authenticated_history() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     for epoch in 1..=8 {
         let mut accepted = chat(
             &format!("accepted-{epoch}"),
@@ -2494,15 +2530,14 @@ fn failed_pending_read_marker_does_not_hide_authenticated_history() {
 #[test]
 fn pruned_read_marker_keeps_canonical_epoch_anchor() {
     let store = setup_store();
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+    let app = store.app_storage();
+    app.initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
 
     let mut marker = chat("marker", REMOTE, 150, "newer epoch");
     marker.source_epoch = Some(8);
-    store.record_app_event(&marker).unwrap();
-    store
-        .mark_timeline_message_read(LOCAL, GROUP, "marker", &no_mentions)
+    app.record_app_event(&marker).unwrap();
+    app.mark_timeline_message_read(LOCAL, GROUP, "marker", &no_mentions)
         .unwrap();
 
     {
@@ -2517,16 +2552,16 @@ fn pruned_read_marker_keeps_canonical_epoch_anchor() {
 
     let mut late_older = chat("late-older", REMOTE, 900, "older epoch");
     late_older.source_epoch = Some(7);
-    store.record_app_event(&late_older).unwrap();
+    app.record_app_event(&late_older).unwrap();
 
-    let row = store
+    let row = app
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
     assert_eq!(row.unread_count, 0);
     assert_eq!(row.last_read_message_id_hex.as_deref(), Some("marker"));
 
-    let row = store
+    let row = app
         .mark_timeline_message_read(LOCAL, GROUP, "late-older", &no_mentions)
         .unwrap()
         .expect("chat row");
@@ -2537,22 +2572,22 @@ fn pruned_read_marker_keeps_canonical_epoch_anchor() {
 #[test]
 fn failed_local_send_does_not_replace_delivered_preview_after_prune_or_ensure() {
     let store = setup_store();
+    let app = store.app_storage();
     let mut pruned = chat("pruned", REMOTE, 10, "expired history");
     pruned.source_epoch = Some(6);
-    store.record_app_event(&pruned).unwrap();
+    app.record_app_event(&pruned).unwrap();
     let mut failed = chat("failed", LOCAL, 300, "did not reach the group");
     failed.source_message_id_hex = None;
-    store.record_app_event(&failed).unwrap();
-    store
-        .invalidate_app_event_by_message_id(GROUP, "failed", "local_publish_failed")
+    app.record_app_event(&failed).unwrap();
+    app.invalidate_app_event_by_message_id(GROUP, "failed", "local_publish_failed")
         .unwrap();
 
     let mut delivered = chat("delivered", REMOTE, 150, "accepted history");
     delivered.source_epoch = Some(8);
-    store.record_app_event(&delivered).unwrap();
+    app.record_app_event(&delivered).unwrap();
 
-    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    let row = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let row = app.chat_list_row(GROUP).unwrap().expect("chat row");
     assert_eq!(
         row.last_message
             .as_ref()
@@ -2560,10 +2595,9 @@ fn failed_local_send_does_not_replace_delivered_preview_after_prune_or_ensure() 
         Some("delivered")
     );
 
-    store
-        .secure_prune_app_events_before(GROUP, 20, LOCAL, &no_mentions)
+    app.secure_prune_app_events_before(GROUP, 20, LOCAL, &no_mentions)
         .unwrap();
-    let after_prune = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    let after_prune = app.chat_list_row(GROUP).unwrap().expect("chat row");
     assert_eq!(
         after_prune
             .last_message
@@ -2579,8 +2613,8 @@ fn failed_local_send_does_not_replace_delivered_preview_after_prune_or_ensure() 
             "failed-send preview priority must match the completeness query"
         );
     }
-    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    let after_ensure = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    app.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let after_ensure = app.chat_list_row(GROUP).unwrap().expect("chat row");
     assert_eq!(
         after_ensure
             .last_message
@@ -2593,16 +2627,17 @@ fn failed_local_send_does_not_replace_delivered_preview_after_prune_or_ensure() 
 #[test]
 fn secure_prune_does_not_resurrect_a_pending_preview_displaced_by_accepted_activity() {
     let store = setup_store();
+    let app = store.app_storage();
     let mut pending = chat("pending", LOCAL, 300, "older unresolved send");
     pending.source_message_id_hex = None;
     pending.source_epoch = None;
-    store.record_app_event(&pending).unwrap();
+    app.record_app_event(&pending).unwrap();
 
     let mut accepted = chat("accepted", REMOTE, 10, "newer accepted activity");
     accepted.source_epoch = Some(7);
-    store.record_app_event(&accepted).unwrap();
+    app.record_app_event(&accepted).unwrap();
 
-    let before = store
+    let before = app
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
@@ -2614,11 +2649,10 @@ fn secure_prune_does_not_resurrect_a_pending_preview_displaced_by_accepted_activ
         Some("accepted")
     );
 
-    store
-        .secure_prune_app_events_before(GROUP, 20, LOCAL, &no_mentions)
+    app.secure_prune_app_events_before(GROUP, 20, LOCAL, &no_mentions)
         .unwrap();
 
-    let after_prune = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    let after_prune = app.chat_list_row(GROUP).unwrap().expect("chat row");
     assert!(
         after_prune.last_message.is_none(),
         "the older pending send must stay displaced after its accepted witness is pruned"
@@ -2636,10 +2670,9 @@ fn secure_prune_does_not_resurrect_a_pending_preview_displaced_by_accepted_activ
         .unwrap();
     assert!(accepted_high_water > 0);
 
-    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    app.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
     assert!(
-        store
-            .chat_list_row(GROUP)
+        app.chat_list_row(GROUP)
             .unwrap()
             .expect("rebuilt chat row")
             .last_message
@@ -2650,7 +2683,7 @@ fn secure_prune_does_not_resurrect_a_pending_preview_displaced_by_accepted_activ
 
 #[test]
 fn secure_prune_keeps_chat_preview_on_canonical_latest_epoch() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     let mut pruned = chat("pruned", REMOTE, 10, "old");
     pruned.source_epoch = Some(6);
     store.record_app_event(&pruned).unwrap();
@@ -2677,7 +2710,7 @@ fn secure_prune_keeps_chat_preview_on_canonical_latest_epoch() {
 
 #[test]
 fn unread_starts_after_first_open_and_advances_by_visible_kind9() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .record_app_event(&chat("old", REMOTE, 10, "before first open"))
         .unwrap();
@@ -2722,7 +2755,7 @@ fn unread_starts_after_first_open_and_advances_by_visible_kind9() {
 
 #[test]
 fn remote_group_system_event_advances_preview_unread_and_read_marker() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .record_app_event(&chat("old", REMOTE, 10, "before role change"))
         .unwrap();
@@ -2774,7 +2807,7 @@ fn every_membership_and_admin_system_type_signals_activity() {
         GROUP_SYSTEM_TYPE_ADMIN_ADDED,
         GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
     ] {
-        let store = setup_store();
+        let store = setup_store().app_storage();
         store
             .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
             .unwrap();
@@ -2804,7 +2837,7 @@ fn every_membership_and_admin_system_type_signals_activity() {
 
 #[test]
 fn own_group_system_event_advances_preview_without_becoming_unread() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .record_app_event(&chat("old", REMOTE, 10, "before role change"))
         .unwrap();
@@ -2839,7 +2872,7 @@ fn own_group_system_event_advances_preview_without_becoming_unread() {
 
 #[test]
 fn group_system_payload_does_not_increment_mentions() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .initialize_chat_read_state(LOCAL, GROUP, &mentions_local)
         .unwrap();
@@ -2863,7 +2896,7 @@ fn group_system_payload_does_not_increment_mentions() {
 
 #[test]
 fn unrelated_group_system_event_does_not_signal_chat_list_activity() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .record_app_event(&chat("old", REMOTE, 10, "existing preview"))
         .unwrap();
@@ -2899,7 +2932,7 @@ fn unrelated_group_system_event_does_not_signal_chat_list_activity() {
 
 #[test]
 fn invalidated_group_activity_is_removed_from_preview_and_unread() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .record_app_event(&chat("old", REMOTE, 10, "existing preview"))
         .unwrap();
@@ -2947,7 +2980,7 @@ fn direct_conversation_does_not_project_admin_activity() {
     let mut direct = group();
     direct.profile_name.clear();
     direct.member_count = Some(2);
-    let store = setup_store_with_group(direct);
+    let store = setup_store_with_group(direct).app_storage();
     store
         .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
@@ -2973,7 +3006,7 @@ fn direct_conversation_does_not_project_admin_activity() {
 
 #[test]
 fn secure_prune_refreshes_unread_count_mentions_and_first_message_atomically() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     let mentions = |plaintext: &str, _tags: &[Vec<String>]| plaintext.contains("@local");
     store
         .initialize_chat_read_state(LOCAL, GROUP, &mentions)
@@ -3010,7 +3043,7 @@ fn secure_prune_refreshes_unread_count_mentions_and_first_message_atomically() {
 
 #[test]
 fn secure_prune_preserves_a_newer_group_system_preview() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
@@ -3055,6 +3088,7 @@ fn secure_prune_preserves_a_newer_group_system_preview() {
 #[test]
 fn secure_prune_retains_pruned_group_system_activity_as_the_sort_anchor() {
     let store = setup_store();
+    let app = store.app_storage();
     {
         let conn = store.lock().unwrap();
         conn.execute(
@@ -3063,23 +3097,20 @@ fn secure_prune_retains_pruned_group_system_activity_as_the_sort_anchor() {
         )
         .unwrap();
     }
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+    app.initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
-    store
-        .record_app_event(&chat("older-chat", REMOTE, 100, "older activity"))
+    app.record_app_event(&chat("older-chat", REMOTE, 100, "older activity"))
         .unwrap();
-    store
-        .record_app_event(&group_system(
-            "pruned-role-change",
-            REMOTE,
-            200,
-            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
-            r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#,
-        ))
-        .unwrap();
+    app.record_app_event(&group_system(
+        "pruned-role-change",
+        REMOTE,
+        200,
+        GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+        r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#,
+    ))
+    .unwrap();
 
-    let before = store
+    let before = app
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
@@ -3089,11 +3120,10 @@ fn secure_prune_retains_pruned_group_system_activity_as_the_sort_anchor() {
         "pruned-role-change"
     );
 
-    store
-        .secure_prune_app_events_before(GROUP, 201, LOCAL, &no_mentions)
+    app.secure_prune_app_events_before(GROUP, 201, LOCAL, &no_mentions)
         .unwrap();
 
-    let after = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    let after = app.chat_list_row(GROUP).unwrap().expect("chat row");
     assert!(after.last_message.is_none());
     assert_eq!(after.activity_sort_at, 200);
     let retained_activity_sort_at = store
@@ -3107,10 +3137,9 @@ fn secure_prune_retains_pruned_group_system_activity_as_the_sort_anchor() {
         .unwrap();
     assert_eq!(retained_activity_sort_at, 200);
 
-    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
     assert_eq!(
-        store
-            .chat_list_row(GROUP)
+        app.chat_list_row(GROUP)
             .unwrap()
             .expect("rebuilt chat row")
             .activity_sort_at,
@@ -3125,7 +3154,7 @@ fn invalidated_kind9_tombstones_do_not_count_as_unread() {
     // invalidated rows are kept as "did not reach the group" tombstones, not
     // markable chat rows, so the read pointer can never advance past them. They
     // must not keep `unread_count` pinned above zero.
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
@@ -3180,7 +3209,7 @@ fn invalidated_kind9_tombstones_do_not_count_as_unread() {
 
 #[test]
 fn own_kind9_send_clears_existing_unread_without_counting_as_unread() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
@@ -3222,6 +3251,7 @@ fn chat_list_preview_skips_invalidated_kind9_tombstone() {
     // wins. This mirrors the invalidation_status filter already applied to
     // unread-count queries in #443.
     let store = setup_store();
+    let app = store.app_storage();
 
     // Pin conversation creation below the message timestamps so the activity
     // anchor is driven by the kind-9 rows (not the wall-clock creation default),
@@ -3236,16 +3266,14 @@ fn chat_list_preview_skips_invalidated_kind9_tombstone() {
     }
 
     // Visible delivered chat.
-    store
-        .record_app_event(&chat("visible", REMOTE, 10, "real message"))
+    app.record_app_event(&chat("visible", REMOTE, 10, "real message"))
         .unwrap();
     // Losing-branch chat that arrives "later" by sender-claimed time.
-    store
-        .record_app_event(&chat("phantom", REMOTE, 11, "losing branch"))
+    app.record_app_event(&chat("phantom", REMOTE, 11, "losing branch"))
         .unwrap();
 
     // Before invalidation the latest row wins, as usual.
-    let row = store
+    let row = app
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
@@ -3255,15 +3283,14 @@ fn chat_list_preview_skips_invalidated_kind9_tombstone() {
     assert_eq!(row.activity_sort_at, 11);
 
     // Convergence invalidates the losing-branch row (kept as a tombstone).
-    store
-        .invalidate_app_event_by_message_id(GROUP, "phantom", "LosingBranch")
+    app.invalidate_app_event_by_message_id(GROUP, "phantom", "LosingBranch")
         .unwrap();
 
     // Preview and sort anchor must fall back to the visible delivered message,
     // not the invalidated tombstone. The MAX-preserve upsert must not conflate
     // a convergence tombstone with a pruned message: the phantom anchor is
     // lowered rather than staying permanently pinned at 11.
-    let row = store
+    let row = app
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
@@ -3274,7 +3301,7 @@ fn chat_list_preview_skips_invalidated_kind9_tombstone() {
     assert_eq!(row.activity_sort_at, 10);
 
     // The cached projection read path agrees with the refresh path.
-    let cached = store
+    let cached = app
         .chat_list_rows(crate::ChatListQuery::default())
         .unwrap()
         .pop()
@@ -3287,8 +3314,8 @@ fn chat_list_preview_skips_invalidated_kind9_tombstone() {
 
     // And the completeness check considers the projection up to date, so a
     // subsequent ensure pass is a no-op rather than perpetually rebuilding.
-    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    let after_ensure = store
+    app.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let after_ensure = app
         .chat_list_rows(crate::ChatListQuery::default())
         .unwrap()
         .pop()
@@ -3305,7 +3332,7 @@ fn chat_list_preview_is_empty_when_only_invalidated_kind9_exists() {
     // When every kind:9 row in a group is an invalidated tombstone, the
     // chat-list preview must be absent rather than anchored on a losing-branch
     // message.
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .record_app_event(&chat("phantom", REMOTE, 11, "losing branch"))
         .unwrap();
@@ -3322,7 +3349,7 @@ fn chat_list_preview_is_empty_when_only_invalidated_kind9_exists() {
 
 #[test]
 fn unread_p_tag_mention_of_local_account_counts() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
@@ -3348,7 +3375,7 @@ fn unread_p_tag_mention_of_local_account_counts() {
 
 #[test]
 fn unread_inline_mention_of_local_account_counts() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
@@ -3368,7 +3395,7 @@ fn unread_inline_mention_of_local_account_counts() {
 
 #[test]
 fn unread_mention_of_other_account_does_not_count() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
@@ -3394,7 +3421,7 @@ fn unread_mention_of_other_account_does_not_count() {
 
 #[test]
 fn targeted_refresh_classifies_only_changed_unread_messages() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
@@ -3448,25 +3475,21 @@ fn targeted_refresh_classifies_only_changed_unread_messages() {
 #[test]
 fn later_targeted_refresh_rebuilds_when_an_earlier_message_is_still_dirty() {
     let store = setup_store();
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+    let app = store.app_storage();
+    app.initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
-    store
-        .record_app_event(&chat("first", REMOTE, 10, "first"))
+    app.record_app_event(&chat("first", REMOTE, 10, "first"))
         .unwrap();
-    store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+    app.refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap();
 
     // Model a process stop between this timeline commit and its targeted
     // chat-list refresh.
-    store
-        .record_app_event(&chat("second", REMOTE, 20, "second"))
+    app.record_app_event(&chat("second", REMOTE, 20, "second"))
         .unwrap();
-    store
-        .record_app_event(&chat("third", REMOTE, 30, "third"))
+    app.record_app_event(&chat("third", REMOTE, 30, "third"))
         .unwrap();
-    let row = store
+    let row = app
         .refresh_chat_list_row_for_messages(LOCAL, GROUP, &["third".to_owned()], &no_mentions)
         .unwrap()
         .expect("chat row");
@@ -3484,8 +3507,8 @@ fn later_targeted_refresh_rebuilds_when_an_earlier_message_is_still_dirty() {
         assert_eq!(dirty_messages, 0);
     }
 
-    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    let row = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    app.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let row = app.chat_list_row(GROUP).unwrap().expect("chat row");
     assert_eq!(row.unread_count, 3);
     let conn = store.lock().unwrap();
     let dirty: i64 = conn
@@ -3504,32 +3527,29 @@ fn targeted_refresh_leaves_other_groups_dirty_work_untouched() {
     let mut other_group = group();
     other_group.group_id_hex = OTHER_GROUP.to_owned();
     let store = SqliteAccountStorage::in_memory().unwrap();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                groups: vec![group(), other_group],
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
+    let app = store.app_storage();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            groups: vec![group(), other_group],
+            ..StoredAccountState::default()
+        },
+        256,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
+    app.initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+    app.initialize_chat_read_state(LOCAL, OTHER_GROUP, &no_mentions)
         .unwrap();
-    store
-        .initialize_chat_read_state(LOCAL, OTHER_GROUP, &no_mentions)
-        .unwrap();
-    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
 
     let mut missed = chat("missed", REMOTE, 10, "other group");
     missed.group_id_hex = OTHER_GROUP.to_owned();
-    store.record_app_event(&missed).unwrap();
-    store
-        .record_app_event(&chat("current", REMOTE, 20, "current group"))
+    app.record_app_event(&missed).unwrap();
+    app.record_app_event(&chat("current", REMOTE, 20, "current group"))
         .unwrap();
-    let row = store
+    let row = app
         .refresh_chat_list_row_for_messages(LOCAL, GROUP, &["current".to_owned()], &no_mentions)
         .unwrap()
         .expect("chat row");
@@ -3554,22 +3574,20 @@ fn targeted_refresh_requires_per_group_membership_readiness_after_upgrade() {
     let mut other_group = group();
     other_group.group_id_hex = SECOND_GROUP.to_owned();
     let store = SqliteAccountStorage::in_memory().unwrap();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                groups: vec![group(), other_group],
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
+    let app = store.app_storage();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            groups: vec![group(), other_group],
+            ..StoredAccountState::default()
+        },
+        256,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
+    app.initialize_chat_read_state(LOCAL, GROUP, &mentions_local)
         .unwrap();
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &mentions_local)
-        .unwrap();
-    store
-        .initialize_chat_read_state(LOCAL, SECOND_GROUP, &mentions_local)
+    app.initialize_chat_read_state(LOCAL, SECOND_GROUP, &mentions_local)
         .unwrap();
     let mut historical = chat_with_tags(
         "h-old",
@@ -3579,9 +3597,8 @@ fn targeted_refresh_requires_per_group_membership_readiness_after_upgrade() {
         vec![vec!["p".to_owned(), LOCAL.to_owned()]],
     );
     historical.group_id_hex = SECOND_GROUP.to_owned();
-    store.record_app_event(&historical).unwrap();
-    store
-        .refresh_chat_list_row(LOCAL, SECOND_GROUP, &mentions_local)
+    app.record_app_event(&historical).unwrap();
+    app.refresh_chat_list_row(LOCAL, SECOND_GROUP, &mentions_local)
         .unwrap();
 
     // Reproduce the post-migration state: old chat-list rows exist, but no
@@ -3599,17 +3616,15 @@ fn targeted_refresh_requires_per_group_membership_readiness_after_upgrade() {
         .unwrap();
     }
 
-    store
-        .record_app_event(&chat("g-new", REMOTE, 20, "new in first group"))
+    app.record_app_event(&chat("g-new", REMOTE, 20, "new in first group"))
         .unwrap();
-    store
-        .refresh_chat_list_row_for_messages(LOCAL, GROUP, &["g-new".to_owned()], &mentions_local)
+    app.refresh_chat_list_row_for_messages(LOCAL, GROUP, &["g-new".to_owned()], &mentions_local)
         .unwrap();
 
     let mut new_in_second = chat("h-new", REMOTE, 20, "new in second group");
     new_in_second.group_id_hex = SECOND_GROUP.to_owned();
-    store.record_app_event(&new_in_second).unwrap();
-    let row = store
+    app.record_app_event(&new_in_second).unwrap();
+    let row = app
         .refresh_chat_list_row_for_messages(
             LOCAL,
             SECOND_GROUP,
@@ -3625,7 +3640,7 @@ fn targeted_refresh_requires_per_group_membership_readiness_after_upgrade() {
 
 #[test]
 fn already_read_mention_does_not_count_as_unread_mention() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     // A mention arrives, then the client reads it: it is before the read marker
     // and must not contribute to the unread-mention count.
     store
@@ -3657,7 +3672,7 @@ fn already_read_mention_does_not_count_as_unread_mention() {
 
 #[test]
 fn self_sent_mention_does_not_count_as_unread_mention() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     store
         .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
@@ -3689,22 +3704,20 @@ fn ensure_chat_list_rows_corrects_stale_unread_mention_count() {
     // complete, but `unread_mention_count` defaults to 0. `ensure_chat_list_rows`
     // must recompute the mention count per group and rebuild rows that are wrong.
     let store = setup_store();
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+    let app = store.app_storage();
+    app.initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
-    store
-        .record_app_event(&chat_with_tags(
-            "ping",
-            REMOTE,
-            10,
-            "mention",
-            vec![vec!["p".to_owned(), LOCAL.to_owned()]],
-        ))
-        .unwrap();
+    app.record_app_event(&chat_with_tags(
+        "ping",
+        REMOTE,
+        10,
+        "mention",
+        vec![vec!["p".to_owned(), LOCAL.to_owned()]],
+    ))
+    .unwrap();
     // Build the projection WITHOUT mention awareness (count stays 0), then
     // simulate the post-migration default explicitly.
-    store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+    app.refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap();
     {
         let conn = store.lock().unwrap();
@@ -3736,8 +3749,8 @@ fn ensure_chat_list_rows_corrects_stale_unread_mention_count() {
         assert_eq!(dirty_messages, 0);
     }
 
-    store.ensure_chat_list_rows(LOCAL, &mentions_local).unwrap();
-    let row = store
+    app.ensure_chat_list_rows(LOCAL, &mentions_local).unwrap();
+    let row = app
         .chat_list_rows(crate::ChatListQuery::default())
         .unwrap()
         .pop()
@@ -3750,23 +3763,21 @@ fn ensure_chat_list_rows_corrects_stale_unread_mention_count() {
 #[test]
 fn ensure_chat_list_rows_reconciles_pre_group_system_projection() {
     let store = setup_store();
-    store
-        .record_app_event(&chat("old", REMOTE, 10, "before first open"))
+    let app = store.app_storage();
+    app.record_app_event(&chat("old", REMOTE, 10, "before first open"))
         .unwrap();
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+    app.initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
 
     let system_at = unix_now_seconds() + 1;
-    store
-        .record_app_event(&group_system(
-            "role-change",
-            REMOTE,
-            system_at,
-            GROUP_SYSTEM_TYPE_ADMIN_ADDED,
-            r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#,
-        ))
-        .unwrap();
+    app.record_app_event(&group_system(
+        "role-change",
+        REMOTE,
+        system_at,
+        GROUP_SYSTEM_TYPE_ADMIN_ADDED,
+        r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#,
+    ))
+    .unwrap();
     let mut newest_chat = chat(
         "newest-chat",
         REMOTE,
@@ -3774,8 +3785,8 @@ fn ensure_chat_list_rows_reconciles_pre_group_system_projection() {
         "newer visible preview",
     );
     newest_chat.source_epoch = Some(system_at + 1);
-    store.record_app_event(&newest_chat).unwrap();
-    let current = store
+    app.record_app_event(&newest_chat).unwrap();
+    let current = app
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
@@ -3802,8 +3813,8 @@ fn ensure_chat_list_rows_reconciles_pre_group_system_projection() {
         .unwrap();
     }
 
-    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    let reconciled = store.chat_list_row(GROUP).unwrap().expect("chat row");
+    app.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let reconciled = app.chat_list_row(GROUP).unwrap().expect("chat row");
     assert_eq!(reconciled.unread_count, 2);
     let projection_version: i64 = store
         .lock()
@@ -3821,14 +3832,14 @@ fn ensure_chat_list_rows_reconciles_pre_group_system_projection() {
 fn account_unread_total_is_zero_on_empty_store() {
     let store = setup_store();
 
-    let total = store.account_unread_total().unwrap();
+    let total = store.app_storage().account_unread_total().unwrap();
     assert_eq!(total, AccountUnreadTotal::default());
     assert!(!total.has_unread());
 }
 
 #[test]
 fn account_unread_total_aggregates_materialized_projection() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     // Establish a read baseline on existing history, then receive two new
     // remote kind-9 messages so they count as unread.
     store
@@ -3863,7 +3874,7 @@ fn account_unread_total_aggregates_materialized_projection() {
 fn account_unread_total_excludes_archived_conversations() {
     let mut group = group();
     group.archived = true;
-    let store = setup_store_with_group(group);
+    let store = setup_store_with_group(group).app_storage();
     store
         .record_app_event(&chat("old", REMOTE, 10, "before first open"))
         .unwrap();
@@ -3894,19 +3905,16 @@ fn account_unread_total_excludes_archived_conversations() {
 /// row, returning the store. The single conversation has `unread_count == 1`.
 fn setup_store_with_one_unread() -> SqliteAccountStorage {
     let store = setup_store();
-    store
-        .record_app_event(&chat("old", REMOTE, 10, "before first open"))
+    let app = store.app_storage();
+    app.record_app_event(&chat("old", REMOTE, 10, "before first open"))
         .unwrap();
-    store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+    app.refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap();
-    store
-        .initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
+    app.initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
-    store
-        .record_app_event(&chat("new", REMOTE, 11, "after first open"))
+    app.record_app_event(&chat("new", REMOTE, 11, "after first open"))
         .unwrap();
-    let row = store
+    let row = app
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .expect("chat row");
@@ -3916,7 +3924,7 @@ fn setup_store_with_one_unread() -> SqliteAccountStorage {
 
 #[test]
 fn chat_list_row_reports_a_self_leave_as_left() {
-    let store = setup_store_with_one_unread();
+    let store = setup_store_with_one_unread().app_storage();
 
     store
         .set_group_self_membership(GROUP, SelfMembership::Left)
@@ -3931,7 +3939,7 @@ fn chat_list_row_reports_a_self_leave_as_left() {
 
 #[test]
 fn account_unread_total_suppresses_removed_self_membership_group() {
-    let store = setup_store_with_one_unread();
+    let store = setup_store_with_one_unread().app_storage();
 
     // Default 'member' membership still counts.
     let total = store.account_unread_total().unwrap();
@@ -3950,7 +3958,7 @@ fn account_unread_total_suppresses_removed_self_membership_group() {
 
 #[test]
 fn account_unread_total_suppresses_left_self_membership_group() {
-    let store = setup_store_with_one_unread();
+    let store = setup_store_with_one_unread().app_storage();
 
     // A voluntary self-leave is also a terminal "no longer a member" state, so
     // it suppresses the group's unread exactly like an involuntary removal.
@@ -3965,7 +3973,7 @@ fn account_unread_total_suppresses_left_self_membership_group() {
 
 #[test]
 fn account_unread_total_preserves_member_self_membership_group() {
-    let store = setup_store_with_one_unread();
+    let store = setup_store_with_one_unread().app_storage();
 
     // Default state (no observed self-removal) is 'member' and must preserve the
     // unread count: uncertainty never suppresses.
@@ -3984,7 +3992,7 @@ fn account_unread_total_preserves_member_self_membership_group() {
 
 #[test]
 fn account_unread_total_unsuppresses_after_rejoin() {
-    let store = setup_store_with_one_unread();
+    let store = setup_store_with_one_unread().app_storage();
 
     store
         .set_group_self_membership(GROUP, SelfMembership::Removed)
@@ -4022,7 +4030,7 @@ fn account_unread_total_preserves_rows_without_account_group_row() {
         conn.pragma_update(None, "foreign_keys", true).unwrap();
     }
 
-    let total = store.account_unread_total().unwrap();
+    let total = store.app_storage().account_unread_total().unwrap();
     assert_eq!(total.unread_count, 1);
     assert_eq!(total.unread_conversations, 1);
 }
@@ -4033,7 +4041,7 @@ fn chat_in(group_id_hex: &str, id: &str, sender: &str, at: u64, plaintext: &str)
     event
 }
 
-fn materialize_one_unread(store: &SqliteAccountStorage, group_id_hex: &str) {
+fn materialize_one_unread(store: &SqliteAppStorage, group_id_hex: &str) {
     store
         .record_app_event(&chat_in(
             group_id_hex,
@@ -4090,7 +4098,7 @@ fn put_disband_tombstone_for(store: &SqliteAccountStorage, group_id_hex: &str) {
 fn account_unread_total_includes_pending_invite_attention() {
     let mut pending = group();
     pending.pending_confirmation = true;
-    let store = setup_store_with_group(pending);
+    let store = setup_store_with_group(pending).app_storage();
     store
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap();
@@ -4104,7 +4112,7 @@ fn account_unread_total_includes_pending_invite_attention() {
 
 #[test]
 fn account_unread_total_does_not_double_count_unread_plus_manual() {
-    let store = setup_store_with_one_unread();
+    let store = setup_store_with_one_unread().app_storage();
     store
         .set_chat_manually_unread(LOCAL, GROUP, true, &no_mentions)
         .unwrap();
@@ -4119,7 +4127,7 @@ fn account_unread_total_does_not_double_count_unread_plus_manual() {
 fn account_unread_total_counts_pending_invite_once_without_counting_its_unread_messages() {
     let mut pending = group();
     pending.pending_confirmation = true;
-    let store = setup_store_with_group(pending);
+    let store = setup_store_with_group(pending).app_storage();
     materialize_one_unread(&store, GROUP);
 
     let total = store.account_unread_total().unwrap();
@@ -4133,7 +4141,7 @@ fn account_unread_total_excludes_archived_attention_only_rows() {
     let mut archived_pending = group();
     archived_pending.pending_confirmation = true;
     archived_pending.archived = true;
-    let store = setup_store_with_group(archived_pending);
+    let store = setup_store_with_group(archived_pending).app_storage();
     store
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap();
@@ -4149,42 +4157,37 @@ fn account_unread_total_excludes_archived_attention_only_rows() {
 #[test]
 fn account_unread_total_suppresses_left_removed_and_disbanded_attention() {
     let store = setup_store_with_group(group());
-    store
-        .set_chat_manually_unread(LOCAL, GROUP, true, &no_mentions)
+    let app = store.app_storage();
+    app.set_chat_manually_unread(LOCAL, GROUP, true, &no_mentions)
         .unwrap();
     assert_eq!(
-        store
-            .account_unread_total()
+        app.account_unread_total()
             .unwrap()
             .attention_only_conversations,
         1
     );
 
-    store
-        .set_group_self_membership(GROUP, SelfMembership::Left)
+    app.set_group_self_membership(GROUP, SelfMembership::Left)
         .unwrap();
     assert_eq!(
-        store.account_unread_total().unwrap(),
+        app.account_unread_total().unwrap(),
         AccountUnreadTotal::default()
     );
 
-    store
-        .set_group_self_membership(GROUP, SelfMembership::Member)
+    app.set_group_self_membership(GROUP, SelfMembership::Member)
         .unwrap();
-    store
-        .set_group_self_membership(GROUP, SelfMembership::Removed)
+    app.set_group_self_membership(GROUP, SelfMembership::Removed)
         .unwrap();
     assert_eq!(
-        store.account_unread_total().unwrap(),
+        app.account_unread_total().unwrap(),
         AccountUnreadTotal::default()
     );
 
-    store
-        .set_group_self_membership(GROUP, SelfMembership::Member)
+    app.set_group_self_membership(GROUP, SelfMembership::Member)
         .unwrap();
     put_disband_tombstone_for(&store, GROUP);
     assert_eq!(
-        store.account_unread_total().unwrap(),
+        app.account_unread_total().unwrap(),
         AccountUnreadTotal::default()
     );
 }
@@ -4196,7 +4199,7 @@ fn account_unread_total_sums_distinct_attention_only_rows() {
         pending_confirmation: true,
         ..group()
     };
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -4224,7 +4227,7 @@ fn account_unread_total_sums_distinct_attention_only_rows() {
 fn set_group_self_membership_survives_projection_resave() {
     // A routine projection re-save (profile/avatar metadata) must not clobber the
     // self_membership owned by the sync membership-change path.
-    let store = setup_store_with_one_unread();
+    let store = setup_store_with_one_unread().app_storage();
     store
         .set_group_self_membership(GROUP, SelfMembership::Removed)
         .unwrap();
@@ -4262,7 +4265,7 @@ fn account_group_ids_defaulting_to_member_lists_only_default_rows() {
         group_id_hex: "22".to_owned(),
         ..group()
     };
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -4324,7 +4327,9 @@ fn set_group_self_membership_propagates_backend_errors() {
         conn.pragma_update(None, "foreign_keys", false).unwrap();
         conn.execute_batch("DROP TABLE account_groups;").unwrap();
     }
-    let result = store.set_group_self_membership(GROUP, SelfMembership::Removed);
+    let result = store
+        .app_storage()
+        .set_group_self_membership(GROUP, SelfMembership::Removed);
     assert!(
         result.is_err(),
         "a failed self_membership projection write must return an error, not silently succeed"
@@ -4339,14 +4344,15 @@ fn chat_list_rows_report_the_durable_leave_request_at_read_time() {
     // failure or a cold launch — this read-time derivation is the only way the
     // chat list can tell that the user asked to leave.
     let store = setup_store();
+    let app = store.app_storage();
     let group_id = GroupId::new(hex::decode(GROUP).unwrap());
     store
         .put_group(&sample_group(group_id.clone(), 3, 0))
         .unwrap();
-    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    app.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
 
     // No request yet: the field is absent, not defaulted to some sentinel.
-    let row = store.chat_list_row(GROUP).unwrap().unwrap();
+    let row = app.chat_list_row(GROUP).unwrap().unwrap();
     assert_eq!(row.leave_requested_at_ms, None);
     assert_eq!(row.self_membership, SelfMembership::Member);
 
@@ -4360,10 +4366,10 @@ fn chat_list_rows_report_the_durable_leave_request_at_read_time() {
 
     // Visible through both read paths without any projection rebuild, and while
     // membership is still `Member` — that is the whole point.
-    let row = store.chat_list_row(GROUP).unwrap().unwrap();
+    let row = app.chat_list_row(GROUP).unwrap().unwrap();
     assert_eq!(row.leave_requested_at_ms, Some(1_700_000_000_123));
     assert_eq!(row.self_membership, SelfMembership::Member);
-    let rows = store
+    let rows = app
         .chat_list_rows(ChatListQuery {
             include_archived: true,
         })
@@ -4373,10 +4379,9 @@ fn chat_list_rows_report_the_durable_leave_request_at_read_time() {
 
     // Read-time derivation means a rebuild neither clears nor staleness-flags the
     // value: the projection has no column for it.
-    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
     assert_eq!(
-        store
-            .chat_list_row(GROUP)
+        app.chat_list_row(GROUP)
             .unwrap()
             .unwrap()
             .leave_requested_at_ms,
@@ -4394,8 +4399,7 @@ fn chat_list_rows_report_the_durable_leave_request_at_read_time() {
     // so the derived value has to disappear with it and not linger.
     store.clear_leave_request(&group_id).unwrap();
     assert_eq!(
-        store
-            .chat_list_row(GROUP)
+        app.chat_list_row(GROUP)
             .unwrap()
             .unwrap()
             .leave_requested_at_ms,
@@ -4422,17 +4426,17 @@ fn three_groups() -> Vec<StoredAccountGroup> {
 #[test]
 fn pinned_chats_are_manual_first_and_survive_projection_rebuilds() {
     let store = SqliteAccountStorage::in_memory().unwrap();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                groups: three_groups(),
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
+    let app = store.app_storage();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            groups: three_groups(),
+            ..StoredAccountState::default()
+        },
+        256,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
     {
         let conn = store.lock().unwrap();
         conn.execute(
@@ -4446,8 +4450,8 @@ fn pinned_chats_are_manual_first_and_survive_projection_rebuilds() {
         )
         .unwrap();
     }
-    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    let initial = store
+    app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let initial = app
         .chat_list_rows(ChatListQuery::default())
         .unwrap()
         .into_iter()
@@ -4456,39 +4460,33 @@ fn pinned_chats_are_manual_first_and_survive_projection_rebuilds() {
     assert_eq!(initial, vec!["22", "33", "11"]);
 
     assert_eq!(
-        store.set_chat_pinned("11", true).unwrap().ordered_group_ids,
+        app.set_chat_pinned("11", true).unwrap().ordered_group_ids,
         vec!["11"]
     );
     assert_eq!(
-        store.set_chat_pinned("33", true).unwrap().ordered_group_ids,
+        app.set_chat_pinned("33", true).unwrap().ordered_group_ids,
         vec!["33", "11"]
     );
     // Re-pinning is idempotent and does not move an existing pin.
     assert_eq!(
-        store.set_chat_pinned("11", true).unwrap().ordered_group_ids,
+        app.set_chat_pinned("11", true).unwrap().ordered_group_ids,
         vec!["33", "11"]
     );
     assert_eq!(
-        store
-            .set_chat_pinned("11", false)
-            .unwrap()
-            .ordered_group_ids,
+        app.set_chat_pinned("11", false).unwrap().ordered_group_ids,
         vec!["33"]
     );
     // Re-unpinning is also idempotent.
     assert_eq!(
-        store
-            .set_chat_pinned("11", false)
-            .unwrap()
-            .ordered_group_ids,
+        app.set_chat_pinned("11", false).unwrap().ordered_group_ids,
         vec!["33"]
     );
     assert_eq!(
-        store.set_chat_pinned("11", true).unwrap().ordered_group_ids,
+        app.set_chat_pinned("11", true).unwrap().ordered_group_ids,
         vec!["11", "33"]
     );
 
-    let rows = store.chat_list_rows(ChatListQuery::default()).unwrap();
+    let rows = app.chat_list_rows(ChatListQuery::default()).unwrap();
     assert_eq!(
         rows.iter()
             .map(|row| row.group_id_hex.as_str())
@@ -4502,10 +4500,9 @@ fn pinned_chats_are_manual_first_and_survive_projection_rebuilds() {
         vec![(true, Some(0)), (true, Some(1)), (false, None)]
     );
 
-    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
     assert_eq!(
-        store
-            .chat_list_rows(ChatListQuery::default())
+        app.chat_list_rows(ChatListQuery::default())
             .unwrap()
             .into_iter()
             .filter(|row| row.pinned)
@@ -4515,21 +4512,17 @@ fn pinned_chats_are_manual_first_and_survive_projection_rebuilds() {
     );
 
     assert_eq!(
-        store
-            .set_pinned_chat_order(&["33".to_owned(), "11".to_owned()])
+        app.set_pinned_chat_order(&["33".to_owned(), "11".to_owned()])
             .unwrap()
             .ordered_group_ids,
         vec!["33", "11"]
     );
-    store
-        .record_app_event(&chat("newest", REMOTE, 1_000, "new activity"))
+    app.record_app_event(&chat("newest", REMOTE, 1_000, "new activity"))
         .unwrap();
-    store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+    app.refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap();
     assert_eq!(
-        store
-            .chat_list_rows(ChatListQuery::default())
+        app.chat_list_rows(ChatListQuery::default())
             .unwrap()
             .into_iter()
             .map(|row| row.group_id_hex)
@@ -4544,7 +4537,7 @@ fn pin_validation_and_unarchived_eligibility_are_explicit() {
     groups[0].self_membership = SelfMembership::Left;
     groups[1].pending_confirmation = true;
     groups[2].self_membership = SelfMembership::Removed;
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -4595,52 +4588,50 @@ fn pin_validation_and_unarchived_eligibility_are_explicit() {
 #[test]
 fn archiving_and_deleting_clear_pins_without_restoring_them() {
     let store = SqliteAccountStorage::in_memory().unwrap();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                groups: three_groups(),
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
-    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
-    store.set_chat_pinned("11", true).unwrap();
-    store.set_chat_pinned("33", true).unwrap();
+    let app = store.app_storage();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            groups: three_groups(),
+            ..StoredAccountState::default()
+        },
+        256,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
+    app.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    app.set_chat_pinned("11", true).unwrap();
+    app.set_chat_pinned("33", true).unwrap();
 
     let mut archived_groups = three_groups();
     archived_groups[2].archived = true;
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                groups: archived_groups,
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
-    let remaining = store.chat_list_row("11").unwrap().unwrap();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            groups: archived_groups,
+            ..StoredAccountState::default()
+        },
+        256,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
+    let remaining = app.chat_list_row("11").unwrap().unwrap();
     assert!(remaining.pinned);
     assert_eq!(remaining.pinned_position, Some(0));
-    let archived = store.chat_list_row("33").unwrap().unwrap();
+    let archived = app.chat_list_row("33").unwrap().unwrap();
     assert!(!archived.pinned);
 
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                groups: three_groups(),
-                ..StoredAccountState::default()
-            },
-            256,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
-    assert!(!store.chat_list_row("33").unwrap().unwrap().pinned);
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            groups: three_groups(),
+            ..StoredAccountState::default()
+        },
+        256,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
+    assert!(!app.chat_list_row("33").unwrap().unwrap().pinned);
 
     assert!(store.delete_local_group_data("11").unwrap().did_delete());
     let pin_count = {
@@ -4661,7 +4652,9 @@ fn pinned_order_survives_encrypted_database_reopen() {
     let path = directory.path().join("chat-pins.sqlite3");
     let key = SqlCipherKey::new("chat pin persistence key").unwrap();
     {
-        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key)
+            .unwrap()
+            .app_storage();
         store
             .save_account_projection_state(
                 &StoredAccountState {
@@ -4680,6 +4673,7 @@ fn pinned_order_survives_encrypted_database_reopen() {
 
     let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let pinned = reopened
+        .app_storage()
         .chat_list_rows(ChatListQuery::default())
         .unwrap()
         .into_iter()
@@ -4696,7 +4690,7 @@ fn pinned_order_survives_encrypted_database_reopen() {
 fn account_attention_missing_base_rows_are_explicit_and_acceptance_reveals_retained_counts() {
     let mut pending = group();
     pending.pending_confirmation = true;
-    let store = setup_store_with_group(pending.clone());
+    let store = setup_store_with_group(pending.clone()).app_storage();
     assert!(matches!(
         store.account_attention_total(),
         Err(cgka_traits::storage::StorageError::NotFound)
@@ -4729,7 +4723,7 @@ fn account_attention_missing_base_rows_are_explicit_and_acceptance_reveals_retai
 
 #[test]
 fn accepted_edit_changes_selected_preview_without_activity_or_unread() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     let mentions = |body: &str, _: &[Vec<String>]| body.contains("@me");
     store
         .record_app_event(&chat("older", REMOTE, 1, "older"))
@@ -4773,7 +4767,7 @@ fn accepted_edit_changes_selected_preview_without_activity_or_unread() {
 
 #[test]
 fn system_preview_carries_exact_subject_and_authenticated_provenance() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     let payload = r#"{"v":1,"system_type":"member_added","text":"Member added","data":{"actor":"bb","subject":"cc"}}"#;
     store
         .record_app_event(&group_system(
@@ -4805,13 +4799,14 @@ fn system_preview_carries_exact_subject_and_authenticated_provenance() {
 #[test]
 fn system_preview_provenance_does_not_trust_member_claims_or_stale_payloads() {
     let store = setup_store();
+    let app = store.app_storage();
     let payload = r#"{"v":1,"system_type":"member_added","text":"Member added","data":{"actor":"forged","subject":"victim"}}"#;
     let mut event = group_system("spoof", REMOTE, 50, GROUP_SYSTEM_TYPE_MEMBER_ADDED, payload);
     event.direction = "received".into();
     event.source_message_id_hex = Some("inner".into());
     event.origin_commit_id = None;
-    store.record_app_event(&event).unwrap();
-    let message = store.timeline_message(GROUP, "spoof").unwrap().unwrap();
+    app.record_app_event(&event).unwrap();
+    let message = app.timeline_message(GROUP, "spoof").unwrap().unwrap();
     let system = message.group_system.unwrap();
     assert_eq!(
         system.provenance,
@@ -4821,7 +4816,7 @@ fn system_preview_provenance_does_not_trust_member_claims_or_stale_payloads() {
     assert!(system.subject_account_id_hex.is_none());
     // Existing activity selection may retain this assertion, but the preview
     // must carry the same explicit untrusted verdict as the timeline.
-    let preview = store
+    let preview = app
         .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap()
         .unwrap()
@@ -4832,12 +4827,11 @@ fn system_preview_provenance_does_not_trust_member_claims_or_stale_payloads() {
     event.direction = "system".into();
     event.source_message_id_hex = None;
     event.origin_commit_id = Some("commit".into());
-    store.record_app_event(&event).unwrap();
-    store
-        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+    app.record_app_event(&event).unwrap();
+    app.refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
         .unwrap();
     store.lock().unwrap().execute("UPDATE chat_list_rows SET last_message_preview = replace(last_message_preview, 'victim', 'tampered') WHERE group_id_hex = ?1", [GROUP]).unwrap();
-    let system = store
+    let system = app
         .chat_list_row(GROUP)
         .unwrap()
         .unwrap()
@@ -4859,6 +4853,7 @@ fn system_preview_survives_restart_and_revalidation_with_exact_multisubject_sele
     let key = SqlCipherKey::new("system preview test key").unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     store
+        .app_storage()
         .save_account_projection_state(
             &StoredAccountState {
                 label: "alice".into(),
@@ -4884,8 +4879,9 @@ fn system_preview_survives_restart_and_revalidation_with_exact_multisubject_sele
             let id = format!("{i}-{subject}");
             let mut event = group_system(&id, REMOTE, 100 + i as u64, kind, &payload);
             event.origin_commit_id = Some("multi".into());
-            store.record_app_event(&event).unwrap();
+            store.app_storage().record_app_event(&event).unwrap();
             let row = store
+                .app_storage()
                 .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
                 .unwrap()
                 .unwrap();
@@ -4903,6 +4899,7 @@ fn system_preview_survives_restart_and_revalidation_with_exact_multisubject_sele
             assert_eq!(
                 preview.group_system,
                 store
+                    .app_storage()
                     .timeline_message(GROUP, &id)
                     .unwrap()
                     .unwrap()
@@ -4911,13 +4908,16 @@ fn system_preview_survives_restart_and_revalidation_with_exact_multisubject_sele
         }
     }
     let before = store
+        .app_storage()
         .chat_list_row(GROUP)
         .unwrap()
         .unwrap()
         .last_message
         .unwrap();
     drop(store);
-    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key)
+        .unwrap()
+        .app_storage();
     assert_eq!(
         store
             .chat_list_row(GROUP)
@@ -4961,7 +4961,7 @@ fn system_preview_survives_restart_and_revalidation_with_exact_multisubject_sele
 
 #[test]
 fn authenticated_system_preview_without_commit_attribution_keeps_subject() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     let payload = r#"{"v":1,"system_type":"member_removed","text":"You were removed","data":{"subject":"aa"}}"#;
     let mut event = group_system(
         "self-removal-no-commit",
@@ -5006,7 +5006,7 @@ fn authenticated_system_preview_without_commit_attribution_keeps_subject() {
 
 #[test]
 fn deletion_provenance_changes_refresh_chat_preview() {
-    let store = setup_store();
+    let store = setup_store().app_storage();
     let target = "01".repeat(32);
     store
         .record_app_event(&chat(&target, REMOTE, 1, "body"))

@@ -1,6 +1,7 @@
 //! One bounded local maintenance step. Shared snapshots are released before account writes.
 use super::{presentation_peer, select_chat_presentation};
 use crate::{AppError, UserProfileMetadata};
+use storage_sqlite::SqliteAppStorage;
 use storage_sqlite::{
     CHAT_PRESENTATION_BATCH_LIMIT, ChatPresentationActivePeer, ChatPresentationCatchUp,
     ChatPresentationInput, ChatPresentationVersion, SqliteAccountStorage, SqliteSharedStorage,
@@ -15,15 +16,12 @@ pub(crate) fn prepare_batch(
     shared: &SqliteSharedStorage,
     local: &str,
 ) -> Result<bool, AppError> {
-    let initialized = prepare_base_rows(account, local)?;
+    let initialized = prepare_base_rows(&account.app_storage(), local)?;
     Ok(maintain(account, shared, local)? || initialized)
 }
 
 /// Initialize one bounded batch without preparing unrelated selected values.
-pub(crate) fn prepare_base_rows(
-    account: &SqliteAccountStorage,
-    local: &str,
-) -> Result<bool, AppError> {
+pub(crate) fn prepare_base_rows(account: &SqliteAppStorage, local: &str) -> Result<bool, AppError> {
     let classifier = crate::MarmotApp::chat_list_mention_classifier(local);
     let mut initialized = false;
     for group in account.pending_chat_presentation_rows()? {
@@ -89,7 +87,8 @@ pub(crate) fn maintain(
     shared: &SqliteSharedStorage,
     local: &str,
 ) -> Result<bool, AppError> {
-    let checkpoint = account.chat_presentation_checkpoint()?;
+    let account_app = account.app_storage();
+    let checkpoint = account_app.chat_presentation_checkpoint()?;
     let head = shared.directory_presentation_version()?;
     let mut next = checkpoint.state.clone();
     if next.shared_epoch != head.store_epoch {
@@ -100,10 +99,10 @@ pub(crate) fn maintain(
             revision: head.revision,
             ..Default::default()
         };
-        return commit_progress(account, &checkpoint, &next, &[]);
+        return commit_progress(&account_app, &checkpoint, &next, &[]);
     }
     if next.reconciling {
-        let inputs = account.chat_presentation_inputs_after(next.reconcile_after.as_deref())?;
+        let inputs = account_app.chat_presentation_inputs_after(next.reconcile_after.as_deref())?;
         next.reconcile_after = inputs
             .last()
             .map(|input| input.group_id_hex.clone())
@@ -113,13 +112,13 @@ pub(crate) fn maintain(
             next.reconcile_after = None;
         }
         let values = prepare(shared, local, &next.shared_epoch, inputs)?;
-        return commit_progress(account, &checkpoint, &next, &values);
+        return commit_progress(&account_app, &checkpoint, &next, &values);
     }
     // New dependencies hydrate directly even when their profile predates the watermark.
-    let pending = account.pending_chat_presentation_inputs()?;
+    let pending = account_app.pending_chat_presentation_inputs()?;
     if !pending.is_empty() {
         let values = prepare(shared, local, &next.shared_epoch, pending)?;
-        return commit_progress(account, &checkpoint, &next, &values);
+        return commit_progress(&account_app, &checkpoint, &next, &values);
     }
     if let Some(mut active) = next.active.clone() {
         let current = shared.directory_presentation(&active.member_id_hex)?;
@@ -130,9 +129,9 @@ pub(crate) fn maintain(
             // Coalescing moved this identity past other unprocessed revisions. Abandon the old
             // cursor but keep the watermark; advancing it to the newer revision would skip them.
             next.active = None;
-            return commit_progress(account, &checkpoint, &next, &[]);
+            return commit_progress(&account_app, &checkpoint, &next, &[]);
         }
-        let groups = account
+        let groups = account_app
             .chat_presentation_dependents(&active.member_id_hex, active.after_group.as_deref())?;
         active.after_group = groups.last().cloned().or(active.after_group);
         if groups.len() < CHAT_PRESENTATION_BATCH_LIMIT {
@@ -143,12 +142,12 @@ pub(crate) fn maintain(
         }
         let mut inputs = Vec::with_capacity(groups.len());
         for group in groups {
-            if let Some(input) = account.chat_presentation_input(&group)? {
+            if let Some(input) = account_app.chat_presentation_input(&group)? {
                 inputs.push(input);
             }
         }
         let values = prepare(shared, local, &next.shared_epoch, inputs)?;
-        return commit_progress(account, &checkpoint, &next, &values);
+        return commit_progress(&account_app, &checkpoint, &next, &values);
     }
     if next.revision == head.revision {
         return Ok(false);
@@ -158,7 +157,7 @@ pub(crate) fn maintain(
         return Ok(true);
     }
     for change in &changes.changes {
-        if account
+        if account_app
             .chat_presentation_dependents(&change.member_id_hex, None)?
             .is_empty()
         {
@@ -175,11 +174,11 @@ pub(crate) fn maintain(
     if changes.changes.is_empty() {
         next.revision = changes.head.revision;
     }
-    commit_progress(account, &checkpoint, &next, &[])
+    commit_progress(&account_app, &checkpoint, &next, &[])
 }
 
 fn commit_progress(
-    account: &SqliteAccountStorage,
+    account: &SqliteAppStorage,
     checkpoint: &storage_sqlite::ChatPresentationCheckpoint,
     next: &ChatPresentationCatchUp,
     values: &[(ChatPresentationInput, StoredChatPresentation)],
@@ -195,7 +194,7 @@ fn commit_progress(
 /// Prepare only missing selections required by a bounded screen window. This does
 /// not advance the account-wide catch-up checkpoint or wait for unrelated rows.
 pub(crate) fn prepare_window(
-    account: &SqliteAccountStorage,
+    account: &SqliteAppStorage,
     shared: &SqliteSharedStorage,
     local: &str,
     groups: &[String],

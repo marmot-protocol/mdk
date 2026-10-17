@@ -1,5 +1,6 @@
 //! Selected composer metadata and revision-checked mutations.
 use super::*;
+use crate::SqliteAppStorage;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct MessageDraftRevision {
@@ -94,7 +95,7 @@ pub enum MessageDraftRevisionError {
     Storage(#[from] StorageError),
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// One read snapshot, keyed by group; never hydrates attachment plaintext.
     pub fn selected_message_draft(&self, group: &str) -> StorageResult<SelectedMessageDraft> {
         self.connection
@@ -187,26 +188,6 @@ impl SqliteAccountStorage {
         })
     }
 
-    /// Install the app owner's coalesced wakeup. The callback must not panic.
-    /// Nested writes defer notification until the outer transaction commits.
-    #[doc(hidden)]
-    pub fn set_message_draft_commit_observer(&self, observer: MessageDraftCommitObserver) {
-        *self
-            .draft_commit_observer
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(observer);
-    }
-    pub(crate) fn notify_message_draft_committed(&self, group: &str) {
-        let observer = self
-            .draft_commit_observer
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        if let Some(observer) = observer {
-            let group = group.to_owned();
-            self.connection.after_commit(move || observer(&group));
-        }
-    }
     /// Bind one submitted revision to the exact outgoing event. This is not
     /// acceptance and retains draft bytes. Only the existing outbox write can
     /// consume this binding, in the same transaction as accepting its payload.

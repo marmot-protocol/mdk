@@ -92,7 +92,9 @@ impl AppClient {
             )
             .into());
         }
-        self.restore_persisted_epoch_backfill_intents(storage.pending_epoch_backfill_intents()?);
+        self.restore_persisted_epoch_backfill_intents(
+            storage.app_storage().pending_epoch_backfill_intents()?,
+        );
         self.released_backfill_reload_pending = false;
         Ok(released)
     }

@@ -1,5 +1,6 @@
 //! Durable user intent and coalesced transfer metadata, in the existing job store.
 use super::*;
+use crate::SqliteAppStorage;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachmentDownloadPolicy {
@@ -105,7 +106,7 @@ pub struct AttachmentTransferFrame {
     pub next_expiry: Option<u64>,
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Pause automatic network work without invalidating verified publication.
     /// A live claim stays charged until its interrupted owner settles; promotion
     /// before settlement cannot refund a still-running attempt.
@@ -803,7 +804,7 @@ impl SqliteAccountStorage {
     }
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Resolve a live acquisition slot; presentation-only emoji metadata is unnecessary here.
     pub fn attachment_control_entry(
         &self,

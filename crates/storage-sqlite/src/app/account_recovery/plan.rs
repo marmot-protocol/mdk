@@ -1,5 +1,8 @@
 //! Frozen recovery scopes and atomic, revision-checked outcome checkpoints.
 use super::*;
+#[cfg(test)]
+use crate::SqliteAccountStorage;
+use crate::SqliteAppStorage;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,7 +455,7 @@ fn scope_budgets_exhausted(
     Ok(uncertified > 0)
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// The quiet streak that decides parking for one obligation: the shortest
     /// among the scopes that still count (neither qualified nor with their
     /// retained window certified), as the parking rule reads them. `None` when
@@ -966,11 +969,12 @@ mod tests {
 
     fn fixture() -> (SqliteAccountStorage, RecoveryRevisionFence, u64, [u8; 16]) {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.ensure_account_projection("alice").unwrap();
-        store.mark_account_delivery_recovery("alice", 1, 1).unwrap();
-        let fence = store.recovery_revision_fence().unwrap();
+        let app = store.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        app.mark_account_delivery_recovery("alice", 1, 1).unwrap();
+        let fence = app.recovery_revision_fence().unwrap();
         let id = fence.obligations[0].0;
-        let attempt = store
+        let attempt = app
             .reserve_recovery_attempt(&fence, 1000, 15000, false)
             .unwrap()
             .unwrap()
@@ -1017,7 +1021,7 @@ mod tests {
 
     #[test]
     fn quiet_streaks_belong_to_each_scope_and_goal() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         store.ensure_account_projection("alice").unwrap();
         store.mark_account_delivery_recovery("alice", 1, 1).unwrap();
         let loss = store.recovery_revision_fence().unwrap().obligations[0].0;
@@ -1113,7 +1117,7 @@ mod tests {
     /// unserved budget; an answered comparison starts that budget over.
     #[test]
     fn unserved_streaks_park_dead_required_relays() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         store.ensure_account_projection("alice").unwrap();
         store.mark_account_delivery_recovery("alice", 1, 1).unwrap();
         let loss = store.recovery_revision_fence().unwrap().obligations[0].0;
@@ -1190,10 +1194,26 @@ mod tests {
     #[test]
     fn route_change_keeps_progress_of_unchanged_scopes() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.ensure_account_projection("alice").unwrap();
-        store.mark_account_delivery_recovery("alice", 1, 1).unwrap();
-        let loss = store.recovery_revision_fence().unwrap().obligations[0].0;
-        assert!(!store.observe_recovery_route_snapshot([1; 32]).unwrap());
+        store
+            .app_storage()
+            .ensure_account_projection("alice")
+            .unwrap();
+        store
+            .app_storage()
+            .mark_account_delivery_recovery("alice", 1, 1)
+            .unwrap();
+        let loss = store
+            .app_storage()
+            .recovery_revision_fence()
+            .unwrap()
+            .obligations[0]
+            .0;
+        assert!(
+            !store
+                .app_storage()
+                .observe_recovery_route_snapshot([1; 32])
+                .unwrap()
+        );
         let route = |scope_id: u64, group: u8, relays: &[&str]| {
             let mut scope = plan(relays);
             scope.scope_id = scope_id;
@@ -1208,14 +1228,16 @@ mod tests {
         // and certificates.
         type Progress<'a> = &'a [(u64, RecoveryPassProgress, Vec<RecoveryEndpointCheckpoint>)];
         let pass = |scopes: &[RecoveryScopePlan], progress: Progress| {
-            let fence = store.recovery_revision_fence().unwrap();
+            let fence = store.app_storage().recovery_revision_fence().unwrap();
             now.set(now.get() + 100_000);
             let attempt = store
+                .app_storage()
                 .reserve_recovery_attempt(&fence, now.get(), 1_000, false)
                 .unwrap()
                 .expect("a retryable pass is reserved")
                 .attempt_serial;
             let tokens = store
+                .app_storage()
                 .install_recovery_scope_plan(&fence, attempt, loss, scopes)
                 .unwrap()
                 .unwrap();
@@ -1228,6 +1250,7 @@ mod tests {
                 .map(|(scope, progress, _)| (*scope, *progress))
                 .collect::<Vec<_>>();
             store
+                .app_storage()
                 .checkpoint_recovery_comparison(
                     &fence,
                     attempt,
@@ -1238,7 +1261,9 @@ mod tests {
                 )
                 .unwrap();
         };
-        let scopes = |store: &SqliteAccountStorage| store.recovery_scope_snapshots(loss).unwrap();
+        let scopes = |store: &SqliteAccountStorage| {
+            store.app_storage().recovery_scope_snapshots(loss).unwrap()
+        };
         use RecoveryPassProgress::{Progressed, Quiet};
 
         // Scope 0 certifies; scopes 1 and 2 answer quietly twice.
@@ -1256,12 +1281,27 @@ mod tests {
             ],
         );
         pass(&before, &[(1, Quiet, Vec::new()), (2, Quiet, Vec::new())]);
-        let revision = store.recovery_revision_fence().unwrap().obligations[0].1;
+        let revision = store
+            .app_storage()
+            .recovery_revision_fence()
+            .unwrap()
+            .obligations[0]
+            .1;
 
         // A group create adds route 3; route 2's required relays change.
-        assert!(store.observe_recovery_route_snapshot([2; 32]).unwrap());
+        assert!(
+            store
+                .app_storage()
+                .observe_recovery_route_snapshot([2; 32])
+                .unwrap()
+        );
         assert_eq!(
-            store.recovery_revision_fence().unwrap().obligations[0].1,
+            store
+                .app_storage()
+                .recovery_revision_fence()
+                .unwrap()
+                .obligations[0]
+                .1,
             revision,
             "a route change is not new evidence"
         );
@@ -1296,7 +1336,7 @@ mod tests {
     /// parks the request after its own three quiet comparisons.
     #[test]
     fn a_certified_explicit_window_leaves_parking_to_the_unsearched_routes() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let explicit = store
             .request_recovery(
                 RecoveryRequest::ExplicitHistory {
@@ -1376,6 +1416,7 @@ mod tests {
         let mut goal = plan(&["a", "b"]);
         goal.required_endpoints = vec!["a".into()];
         let token = store
+            .app_storage()
             .install_recovery_scope_plan(&fence, attempt, id, &[goal])
             .unwrap()
             .unwrap()
@@ -1385,6 +1426,7 @@ mod tests {
         failed.exhaustive = false;
         assert!(
             store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -1400,12 +1442,14 @@ mod tests {
         let mut refused = plan(&["a"]);
         refused.required_endpoints = vec!["a".into(), "c".into()];
         let token = store
+            .app_storage()
             .install_recovery_scope_plan(&fence, attempt, id, &[refused])
             .unwrap()
             .unwrap()
             .remove(0);
         assert!(
             !store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -1418,6 +1462,7 @@ mod tests {
         );
         assert!(
             store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -1436,23 +1481,27 @@ mod tests {
             let (store, mut fence, mut attempt, mut id) = fixture();
             if history {
                 id = store
+                    .app_storage()
                     .request_recovery(RecoveryRequest::IncrementalHistory, 2)
                     .unwrap()
                     .id;
-                fence = store.recovery_revision_fence().unwrap();
+                fence = store.app_storage().recovery_revision_fence().unwrap();
                 attempt = store
+                    .app_storage()
                     .reserve_recovery_attempt(&fence, 20000, 30000, false)
                     .unwrap()
                     .unwrap()
                     .attempt_serial;
             }
             let token = store
+                .app_storage()
                 .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
                 .unwrap()
                 .unwrap()
                 .remove(0);
             assert!(
                 store
+                    .app_storage()
                     .checkpoint_recovery_obligation(
                         &fence,
                         attempt,
@@ -1471,7 +1520,7 @@ mod tests {
                     .unwrap()
                     .1,
             };
-            let retry = store.recovery_retry_state().unwrap();
+            let retry = store.app_storage().recovery_retry_state().unwrap();
             store
                 .lock()
                 .unwrap()
@@ -1489,16 +1538,17 @@ mod tests {
                 .unwrap();
             assert!(
                 !store
+                    .app_storage()
                     .recovery_obligation_is_satisfied(ticket.id, ticket.revision)
                     .unwrap()
             );
-            let pending = store.pending_recovery_demands().unwrap();
+            let pending = store.app_storage().pending_recovery_demands().unwrap();
             let demand = pending
                 .iter()
                 .find(|d| d.ticket.id == id)
                 .expect("invalidated success must become selectable without restart");
             assert!(demand.ticket.revision > ticket.revision);
-            assert_eq!(store.recovery_retry_state().unwrap(), retry);
+            assert_eq!(store.app_storage().recovery_retry_state().unwrap(), retry);
         }
     }
 
@@ -1510,6 +1560,7 @@ mod tests {
         for release_before_consumption in [false, true] {
             let (store, fence, attempt, id) = fixture();
             let token = store
+                .app_storage()
                 .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
                 .unwrap()
                 .unwrap()
@@ -1536,6 +1587,7 @@ mod tests {
             );
             assert!(
                 store
+                    .app_storage()
                     .checkpoint_recovery_obligation(
                         &fence,
                         attempt,
@@ -1551,12 +1603,13 @@ mod tests {
     #[test]
     fn review_retirement_preserves_alternate_known_copy_and_maintenance_boundary() {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
         store
             .lock()
             .unwrap()
             .execute_batch("INSERT INTO cgka_groups(id,epoch,record) VALUES(x'01',1,x'00')")
             .unwrap();
-        let ticket = store
+        let ticket = app
             .request_recovery(
                 RecoveryRequest::KnownEvent {
                     group_id: &[1],
@@ -1565,8 +1618,8 @@ mod tests {
                 1,
             )
             .unwrap();
-        let fence = store.recovery_revision_fence().unwrap();
-        let attempt = store
+        let fence = app.recovery_revision_fence().unwrap();
+        let attempt = app
             .reserve_recovery_attempt(&fence, 1, 15000, false)
             .unwrap()
             .unwrap()
@@ -1589,7 +1642,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let tokens = store
+        let tokens = app
             .install_recovery_scope_plan(&fence, attempt, ticket.id, &goals)
             .unwrap()
             .unwrap();
@@ -1602,15 +1655,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(
-            store
-                .checkpoint_recovery_obligation(
-                    &fence,
-                    attempt,
-                    ticket.id,
-                    &updates,
-                    RecoveryEligibility::Retry
-                )
-                .unwrap()
+            app.checkpoint_recovery_obligation(
+                &fence,
+                attempt,
+                ticket.id,
+                &updates,
+                RecoveryEligibility::Retry
+            )
+            .unwrap()
         );
         for route in [1u8, 2] {
             store
@@ -1622,13 +1674,12 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(
-                store
-                    .recovery_obligation_is_satisfied(ticket.id, ticket.revision)
+                app.recovery_obligation_is_satisfied(ticket.id, ticket.revision)
                     .unwrap(),
                 route == 1
             );
         }
-        let maintenance = store
+        let maintenance = app
             .request_recovery(
                 RecoveryRequest::MaintenanceBoundary {
                     group_id: &[1],
@@ -1637,14 +1688,14 @@ mod tests {
                 2,
             )
             .unwrap();
-        let mut fence = store.recovery_revision_fence().unwrap();
+        let mut fence = app.recovery_revision_fence().unwrap();
         fence.obligations.retain(|(id, _)| *id == maintenance.id);
-        let attempt = store
+        let attempt = app
             .reserve_recovery_attempt(&fence, 20000, 30000, false)
             .unwrap()
             .unwrap()
             .attempt_serial;
-        let token = store
+        let token = app
             .install_recovery_scope_plan(&fence, attempt, maintenance.id, &[plan(&["a", "b"])])
             .unwrap()
             .unwrap()
@@ -1654,15 +1705,14 @@ mod tests {
         boundary.exhaustive = false;
         boundary.admission_complete = false;
         assert!(
-            store
-                .checkpoint_recovery_obligation(
-                    &fence,
-                    attempt,
-                    maintenance.id,
-                    &[checkpoint(&token, vec![boundary])],
-                    RecoveryEligibility::Retry
-                )
-                .unwrap()
+            app.checkpoint_recovery_obligation(
+                &fence,
+                attempt,
+                maintenance.id,
+                &[checkpoint(&token, vec![boundary])],
+                RecoveryEligibility::Retry
+            )
+            .unwrap()
         );
         store
             .connection
@@ -1672,8 +1722,7 @@ mod tests {
             })
             .unwrap();
         assert!(
-            store
-                .recovery_obligation_is_satisfied(maintenance.id, maintenance.revision)
+            app.recovery_obligation_is_satisfied(maintenance.id, maintenance.revision)
                 .unwrap()
         );
     }
@@ -1687,6 +1736,7 @@ mod tests {
         for count in [1, 1024] {
             let (store, fence, attempt, id) = fixture();
             store
+                .app_storage()
                 .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
                 .unwrap()
                 .unwrap();
@@ -1722,7 +1772,7 @@ mod tests {
 
     #[test]
     fn review_plan_install_rejects_unresolved_scope_left_behind() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let ticket = store
             .request_recovery(RecoveryRequest::IncrementalHistory, 1)
             .unwrap();
@@ -1767,8 +1817,9 @@ mod tests {
     #[test]
     fn review_owner_can_release_capacity_hold_without_forgiving_retry() {
         let (store, fence, attempt, id) = fixture();
-        let retry = store.recovery_retry_state().unwrap();
+        let retry = store.app_storage().recovery_retry_state().unwrap();
         let token = store
+            .app_storage()
             .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
             .unwrap()
             .unwrap()
@@ -1779,6 +1830,7 @@ mod tests {
         ] {
             assert!(
                 !store
+                    .app_storage()
                     .checkpoint_recovery_obligation(
                         &fence,
                         attempt,
@@ -1789,13 +1841,16 @@ mod tests {
                     .unwrap()
             );
             assert_eq!(
-                store.pending_recovery_demands().unwrap()[0].eligibility,
+                store.app_storage().pending_recovery_demands().unwrap()[0].eligibility,
                 eligibility
             );
         }
-        assert_eq!(store.recovery_retry_state().unwrap(), retry);
+        assert_eq!(store.app_storage().recovery_retry_state().unwrap(), retry);
         assert_eq!(
-            store.recovery_eligible_revision_fence(false).unwrap(),
+            store
+                .app_storage()
+                .recovery_eligible_revision_fence(false)
+                .unwrap(),
             fence
         );
     }
@@ -1804,6 +1859,7 @@ mod tests {
     fn review_new_system_request_cannot_reuse_old_completion() {
         for known in [false, true] {
             let store = SqliteAccountStorage::in_memory().unwrap();
+            let app = store.app_storage();
             store
                 .lock()
                 .unwrap()
@@ -1820,15 +1876,15 @@ mod tests {
                     RecoveryRequest::IncrementalHistory
                 }
             };
-            let ticket = store.request_recovery(request(), 1).unwrap();
-            let fence = store.recovery_revision_fence().unwrap();
-            let retry = store
+            let ticket = app.request_recovery(request(), 1).unwrap();
+            let fence = app.recovery_revision_fence().unwrap();
+            let retry = app
                 .reserve_recovery_attempt(&fence, 1, 15_000, false)
                 .unwrap()
                 .unwrap();
             let mut goal = plan(&["a", "b"]);
             goal.known_event_id = known.then_some(event);
-            let token = store
+            let token = app
                 .install_recovery_scope_plan(&fence, retry.attempt_serial, ticket.id, &[goal])
                 .unwrap()
                 .unwrap()
@@ -1836,37 +1892,35 @@ mod tests {
             let mut proof = checkpoint(&token, vec![covered("a"), covered("b")]);
             proof.retained_known_event = known;
             assert!(
-                store
-                    .checkpoint_recovery_obligation(
-                        &fence,
-                        retry.attempt_serial,
-                        ticket.id,
-                        &[proof],
-                        RecoveryEligibility::Retry
-                    )
-                    .unwrap()
+                app.checkpoint_recovery_obligation(
+                    &fence,
+                    retry.attempt_serial,
+                    ticket.id,
+                    &[proof],
+                    RecoveryEligibility::Retry
+                )
+                .unwrap()
             );
-            let next = store.request_recovery(request(), 2000).unwrap();
+            let next = app.request_recovery(request(), 2000).unwrap();
             assert_eq!(next.id, ticket.id);
             assert!(
                 next.revision > ticket.revision,
                 "new demand needs a new revision after completion"
             );
             assert!(
-                !store
-                    .recovery_obligation_is_satisfied(ticket.id, ticket.revision)
+                !app.recovery_obligation_is_satisfied(ticket.id, ticket.revision)
                     .unwrap()
             );
             assert_eq!(
-                store.pending_recovery_demands().unwrap()[0].ticket.revision,
+                app.pending_recovery_demands().unwrap()[0].ticket.revision,
                 next.revision
             );
             assert_eq!(
-                store.request_recovery(request(), 3000).unwrap().revision,
+                app.request_recovery(request(), 3000).unwrap().revision,
                 next.revision,
                 "duplicate pending joins must remain idempotent"
             );
-            assert_eq!(store.recovery_retry_state().unwrap(), retry);
+            assert_eq!(app.recovery_retry_state().unwrap(), retry);
         }
     }
 
@@ -1910,6 +1964,7 @@ mod tests {
                     goal.since_seconds = Some(now - 5);
                     goal.until_seconds = now;
                     let mut token = store
+                        .app_storage()
                         .install_recovery_scope_plan(
                             &fence,
                             attempt,
@@ -1921,6 +1976,7 @@ mod tests {
                         .remove(0);
                     assert!(
                         !store
+                            .app_storage()
                             .checkpoint_recovery_obligation(
                                 &fence,
                                 attempt,
@@ -1931,6 +1987,7 @@ mod tests {
                             .unwrap()
                     );
                     let watermarks = store
+                        .app_storage()
                         .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
                         .unwrap();
                     store
@@ -1944,11 +2001,16 @@ mod tests {
                         )
                         .unwrap();
                     assert!(
-                        store.recovery_revision_fence().unwrap().inventory_revision
+                        store
+                            .app_storage()
+                            .recovery_revision_fence()
+                            .unwrap()
+                            .inventory_revision
                             > fence.inventory_revision
                     );
                     assert!(
                         store
+                            .app_storage()
                             .install_recovery_scope_plan(
                                 &fence,
                                 attempt,
@@ -1960,13 +2022,15 @@ mod tests {
                         "global inventory changes must still reject stale plan installation"
                     );
                     if replace_session {
-                        fence = store.recovery_revision_fence().unwrap();
+                        fence = store.app_storage().recovery_revision_fence().unwrap();
                         attempt = store
+                            .app_storage()
                             .reserve_recovery_attempt(&fence, 20_000, 30_000, false)
                             .unwrap()
                             .unwrap()
                             .attempt_serial;
                         token = store
+                            .app_storage()
                             .install_recovery_scope_plan(&fence, attempt, id, &[goal])
                             .unwrap()
                             .unwrap()
@@ -1974,6 +2038,7 @@ mod tests {
                     }
                     assert!(
                         store
+                            .app_storage()
                             .checkpoint_recovery_obligation(
                                 &fence,
                                 attempt,
@@ -1986,6 +2051,7 @@ mod tests {
                     );
                     assert!(
                         store
+                            .app_storage()
                             .acknowledge_recovery_loss(&fence, id, &watermarks)
                             .unwrap()
                     );
@@ -1999,16 +2065,19 @@ mod tests {
         for complete_first in [false, true] {
             let (store, fence, attempt, id) = fixture();
             let token = store
+                .app_storage()
                 .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
                 .unwrap()
                 .unwrap()
                 .remove(0);
             let watermarks = store
+                .app_storage()
                 .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
                 .unwrap();
             if complete_first {
                 assert!(
                     store
+                        .app_storage()
                         .checkpoint_recovery_obligation(
                             &fence,
                             attempt,
@@ -2033,6 +2102,7 @@ mod tests {
             );
             assert!(
                 !store
+                    .app_storage()
                     .checkpoint_recovery_obligation(
                         &fence,
                         attempt,
@@ -2044,6 +2114,7 @@ mod tests {
             );
             assert!(
                 !store
+                    .app_storage()
                     .acknowledge_recovery_loss(&fence, id, &watermarks)
                     .unwrap()
             );
@@ -2074,16 +2145,19 @@ mod tests {
             goal.since_seconds = None;
             goal.until_seconds = now;
             let token = store
+                .app_storage()
                 .install_recovery_scope_plan(&fence, attempt, id, &[goal])
                 .unwrap()
                 .unwrap()
                 .remove(0);
             let watermarks = store
+                .app_storage()
                 .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
                 .unwrap();
             if complete_before_removal {
                 assert!(
                     store
+                        .app_storage()
                         .checkpoint_recovery_obligation(
                             &fence,
                             attempt,
@@ -2094,7 +2168,7 @@ mod tests {
                         .unwrap()
                 );
             }
-            let before_failure = store.recovery_revision_fence().unwrap();
+            let before_failure = store.app_storage().recovery_revision_fence().unwrap();
             store.lock().unwrap().execute_batch("CREATE TRIGGER reject_scope_invalidation BEFORE UPDATE ON account_recovery_scopes BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
             assert!(
                 store
@@ -2108,7 +2182,10 @@ mod tests {
                     )
                     .is_err()
             );
-            assert_eq!(store.recovery_revision_fence().unwrap(), before_failure);
+            assert_eq!(
+                store.app_storage().recovery_revision_fence().unwrap(),
+                before_failure
+            );
             assert!(
                 store
                     .app_storage()
@@ -2120,7 +2197,7 @@ mod tests {
                     )
                     .unwrap()
             );
-            assert!(store.recovery_scope_snapshots(id).unwrap()[0].token == token);
+            assert!(store.app_storage().recovery_scope_snapshots(id).unwrap()[0].token == token);
             store
                 .lock()
                 .unwrap()
@@ -2138,6 +2215,7 @@ mod tests {
                 .unwrap();
             assert!(
                 !store
+                    .app_storage()
                     .checkpoint_recovery_obligation(
                         &fence,
                         attempt,
@@ -2149,11 +2227,13 @@ mod tests {
             );
             assert!(
                 !store
+                    .app_storage()
                     .acknowledge_recovery_loss(&fence, id, &watermarks)
                     .unwrap()
             );
             assert_eq!(
                 store
+                    .app_storage()
                     .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
                     .unwrap()
                     .len(),
@@ -2185,6 +2265,7 @@ mod tests {
                 )
                 .unwrap();
             let token = store
+                .app_storage()
                 .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a"])])
                 .unwrap()
                 .unwrap()
@@ -2196,6 +2277,7 @@ mod tests {
             boundary.first_boundary = false;
             assert!(
                 !store
+                    .app_storage()
                     .checkpoint_recovery_obligation(
                         &fence,
                         attempt,
@@ -2208,6 +2290,7 @@ mod tests {
             boundary.first_boundary = true;
             assert_eq!(
                 store
+                    .app_storage()
                     .checkpoint_recovery_obligation(
                         &fence,
                         attempt,
@@ -2235,6 +2318,7 @@ mod tests {
         ] {
             let (store, fence, attempt, id) = fixture();
             let tokens = store
+                .app_storage()
                 .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
                 .unwrap()
                 .unwrap();
@@ -2242,6 +2326,7 @@ mod tests {
             missing.outcome = outcome;
             assert!(
                 !store
+                    .app_storage()
                     .checkpoint_recovery_obligation(
                         &fence,
                         attempt,
@@ -2260,6 +2345,7 @@ mod tests {
             unretained.admission_complete = false;
             assert!(
                 !store
+                    .app_storage()
                     .checkpoint_recovery_obligation(
                         &fence,
                         attempt,
@@ -2275,6 +2361,7 @@ mod tests {
             );
             assert!(
                 store
+                    .app_storage()
                     .checkpoint_recovery_obligation(
                         &fence,
                         attempt,
@@ -2299,14 +2386,16 @@ mod tests {
         let mut second = first.clone();
         second.scope_id = 1;
         let tokens = store
+            .app_storage()
             .install_recovery_scope_plan(&fence, attempt, id, &[first, second])
             .unwrap()
             .unwrap();
-        let before = store.recovery_scope_snapshots(id).unwrap();
+        let before = store.app_storage().recovery_scope_snapshots(id).unwrap();
         let mut stale = tokens[1].clone();
         stale.revision += 1;
         assert!(
             !store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -2327,7 +2416,7 @@ mod tests {
                 )
                 .unwrap()
         );
-        let after = store.recovery_scope_snapshots(id).unwrap();
+        let after = store.app_storage().recovery_scope_snapshots(id).unwrap();
         assert_eq!(after.len(), before.len());
         for (after, before) in after.iter().zip(&before) {
             assert!(
@@ -2336,13 +2425,17 @@ mod tests {
             );
             assert_eq!(after.retained_known_event, before.retained_known_event);
         }
-        assert_eq!(store.recovery_revision_fence().unwrap(), fence);
+        assert_eq!(
+            store.app_storage().recovery_revision_fence().unwrap(),
+            fence
+        );
     }
 
     #[test]
     fn eose_is_not_coverage_and_partial_qualified_coverage_survives_new_attempt() {
         let (store, fence, attempt, id) = fixture();
         let token = store
+            .app_storage()
             .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
             .unwrap()
             .unwrap()
@@ -2351,6 +2444,7 @@ mod tests {
         eose_only.exhaustive = false;
         assert!(
             !store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -2362,6 +2456,7 @@ mod tests {
         );
         assert!(
             !store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -2372,16 +2467,19 @@ mod tests {
                 .unwrap()
         );
         let next = store
+            .app_storage()
             .reserve_recovery_attempt(&fence, 16000, 30000, false)
             .unwrap()
             .unwrap();
         let token = store
+            .app_storage()
             .install_recovery_scope_plan(&fence, next.attempt_serial, id, &[plan(&["b"])])
             .unwrap()
             .unwrap()
             .remove(0);
         assert!(
             store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     next.attempt_serial,
@@ -2391,7 +2489,13 @@ mod tests {
                 )
                 .unwrap()
         );
-        assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+        assert!(
+            store
+                .app_storage()
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_none()
+        );
         // Plane acknowledgment is still required before reclaiming this guard.
         assert_eq!(
             store
@@ -2411,15 +2515,18 @@ mod tests {
     fn same_token_count_growth_fences_completion_before_owner_import() {
         let (store, fence, attempt, id) = fixture();
         let token = store
+            .app_storage()
             .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
             .unwrap()
             .unwrap()
             .remove(0);
         store
+            .app_storage()
             .record_account_delivery_loss("alice", 1, 2, 11)
             .unwrap();
         assert!(
             !store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -2429,13 +2536,20 @@ mod tests {
                 )
                 .unwrap()
         );
-        assert!(store.account_delivery_recovery("alice").unwrap().is_some());
+        assert!(
+            store
+                .app_storage()
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
     fn failed_completion_rolls_back_its_checkpoint_and_keeps_pending_intent() {
         let (store, fence, attempt, id) = fixture();
         let token = store
+            .app_storage()
             .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
             .unwrap()
             .unwrap()
@@ -2450,6 +2564,7 @@ mod tests {
             .unwrap();
         assert!(
             store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -2466,6 +2581,7 @@ mod tests {
             .unwrap();
         assert!(
             !store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -2476,7 +2592,13 @@ mod tests {
                 .unwrap(),
             "failed transaction must not leave qualified endpoint checkpoints behind"
         );
-        assert!(store.account_delivery_recovery("alice").unwrap().is_some());
+        assert!(
+            store
+                .app_storage()
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -2492,12 +2614,13 @@ mod tests {
             )
             .unwrap();
         let token = store
+            .app_storage()
             .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a"])])
             .unwrap()
             .unwrap()
             .remove(0);
         let result: StorageResult<()> = store.with_transaction(|storage| {
-            assert!(storage.checkpoint_recovery_obligation(
+            assert!(storage.app_storage().checkpoint_recovery_obligation(
                 &fence,
                 attempt,
                 id,
@@ -2511,6 +2634,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             !store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -2521,7 +2645,7 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            store.recovery_scope_snapshots(id).unwrap()[0]
+            store.app_storage().recovery_scope_snapshots(id).unwrap()[0]
                 .checkpoints
                 .is_empty()
         );
@@ -2531,6 +2655,7 @@ mod tests {
     fn unversioned_goal_expansion_and_unknown_formats_fail_closed() {
         let (store, fence, attempt, id) = fixture();
         store
+            .app_storage()
             .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
             .unwrap()
             .unwrap();
@@ -2538,6 +2663,7 @@ mod tests {
         additional.scope_id = 1;
         assert!(
             store
+                .app_storage()
                 .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"]), additional])
                 .is_err()
         );
@@ -2545,6 +2671,7 @@ mod tests {
         widened.until_seconds = 11;
         assert!(
             store
+                .app_storage()
                 .install_recovery_scope_plan(&fence, attempt, id, &[widened])
                 .is_err()
         );
@@ -2555,6 +2682,7 @@ mod tests {
             .unwrap();
         assert!(
             store
+                .app_storage()
                 .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
                 .is_err()
         );
@@ -2572,6 +2700,7 @@ mod tests {
             )
             .unwrap();
         let token = store
+            .app_storage()
             .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a"])])
             .unwrap()
             .unwrap()
@@ -2582,6 +2711,7 @@ mod tests {
         boundary.outcome = RecoveryScopeOutcome::Partial;
         assert!(
             store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -2608,12 +2738,14 @@ mod tests {
         alternate.required_endpoints = vec!["b".into()];
         alternate.admitted_endpoints = vec!["b".into()];
         let token = store
+            .app_storage()
             .install_recovery_scope_plan(&fence, attempt, id, &[known, alternate])
             .unwrap()
             .unwrap()
             .remove(0);
         assert!(
             !store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -2627,6 +2759,7 @@ mod tests {
         retained.retained_known_event = true;
         assert!(
             store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -2644,12 +2777,14 @@ mod tests {
         id: [u8; 16],
     ) {
         let token = store
+            .app_storage()
             .install_recovery_scope_plan(fence, attempt, id, &[plan(&["a", "b"])])
             .unwrap()
             .unwrap()
             .remove(0);
         assert!(
             store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     fence,
                     attempt,
@@ -2664,13 +2799,39 @@ mod tests {
     #[test]
     fn interrupted_plane_ack_rearms_on_open_without_forgiving_retry_cost() {
         let (store, fence, attempt, id) = fixture();
-        let retry = store.recovery_retry_state().unwrap();
+        let retry = store.app_storage().recovery_retry_state().unwrap();
         qualify_loss(&store, &fence, attempt, id);
-        assert_eq!(store.restore_unacknowledged_recovery_loss().unwrap(), 1);
-        assert!(store.account_delivery_recovery("alice").unwrap().is_some());
-        assert_eq!(store.recovery_retry_state().unwrap(), retry);
-        assert!(store.recovery_revision_fence().unwrap().obligations[0].1 > fence.obligations[0].1);
-        assert_eq!(store.restore_unacknowledged_recovery_loss().unwrap(), 0);
+        assert_eq!(
+            store
+                .app_storage()
+                .restore_unacknowledged_recovery_loss()
+                .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .app_storage()
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(store.app_storage().recovery_retry_state().unwrap(), retry);
+        assert!(
+            store
+                .app_storage()
+                .recovery_revision_fence()
+                .unwrap()
+                .obligations[0]
+                .1
+                > fence.obligations[0].1
+        );
+        assert_eq!(
+            store
+                .app_storage()
+                .restore_unacknowledged_recovery_loss()
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -2678,29 +2839,48 @@ mod tests {
         for use_snapshot in [false, true] {
             let (store, fence, attempt, id) = fixture();
             let watermarks = store
+                .app_storage()
                 .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
                 .unwrap();
             let snapshot = store
+                .app_storage()
                 .recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
                 .unwrap();
             let acknowledge = || {
                 if use_snapshot {
-                    store.acknowledge_recovery_loss_snapshot(&fence, id, &snapshot)
+                    store
+                        .app_storage()
+                        .acknowledge_recovery_loss_snapshot(&fence, id, &snapshot)
                 } else {
-                    store.acknowledge_recovery_loss(&fence, id, &watermarks)
+                    store
+                        .app_storage()
+                        .acknowledge_recovery_loss(&fence, id, &watermarks)
                 }
             };
             assert!(!acknowledge().unwrap());
             qualify_loss(&store, &fence, attempt, id);
             assert!(acknowledge().unwrap());
-            assert_eq!(store.restore_unacknowledged_recovery_loss().unwrap(), 0);
+            assert_eq!(
+                store
+                    .app_storage()
+                    .restore_unacknowledged_recovery_loss()
+                    .unwrap(),
+                0
+            );
             assert!(
                 store
+                    .app_storage()
                     .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
                     .unwrap()
                     .is_empty()
             );
-            assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+            assert!(
+                store
+                    .app_storage()
+                    .account_delivery_recovery("alice")
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 
@@ -2709,16 +2889,22 @@ mod tests {
         for use_snapshot in [false, true] {
             let (store, fence, attempt, id) = fixture();
             let watermarks = store
+                .app_storage()
                 .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
                 .unwrap();
             let snapshot = store
+                .app_storage()
                 .recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
                 .unwrap();
             let acknowledge = || {
                 if use_snapshot {
-                    store.acknowledge_recovery_loss_snapshot(&fence, id, &snapshot)
+                    store
+                        .app_storage()
+                        .acknowledge_recovery_loss_snapshot(&fence, id, &snapshot)
                 } else {
-                    store.acknowledge_recovery_loss(&fence, id, &watermarks)
+                    store
+                        .app_storage()
+                        .acknowledge_recovery_loss(&fence, id, &watermarks)
                 }
             };
             qualify_loss(&store, &fence, attempt, id);
@@ -2738,17 +2924,28 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 store
+                    .app_storage()
                     .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
                     .unwrap()
                     .len(),
                 1
             );
             store
+                .app_storage()
                 .record_account_delivery_loss("alice", 1, 2, 11)
                 .unwrap();
             assert!(!acknowledge().unwrap());
-            store.synchronize_account_delivery_loss("alice").unwrap();
-            assert!(store.account_delivery_recovery("alice").unwrap().is_some());
+            store
+                .app_storage()
+                .synchronize_account_delivery_loss("alice")
+                .unwrap();
+            assert!(
+                store
+                    .app_storage()
+                    .account_delivery_recovery("alice")
+                    .unwrap()
+                    .is_some()
+            );
             assert!(!acknowledge().unwrap());
         }
     }
@@ -2756,12 +2953,33 @@ mod tests {
     #[test]
     fn low_level_retirement_does_not_become_an_interrupted_completion() {
         let (store, _, _, _) = fixture();
-        assert!(store.clear_account_delivery_recovery("alice", 1).unwrap());
-        assert_eq!(store.restore_unacknowledged_recovery_loss().unwrap(), 0);
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+        assert!(
+            store
+                .app_storage()
+                .clear_account_delivery_recovery("alice", 1)
+                .unwrap()
+        );
         assert_eq!(
             store
+                .app_storage()
+                .restore_unacknowledged_recovery_loss()
+                .unwrap(),
+            0
+        );
+        store
+            .app_storage()
+            .synchronize_account_delivery_loss("alice")
+            .unwrap();
+        assert!(
+            store
+                .app_storage()
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .app_storage()
                 .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
                 .unwrap()
                 .len(),
@@ -2778,6 +2996,7 @@ mod tests {
             .execute_batch("UPDATE account_recovery_obligations SET eligibility=3")
             .unwrap();
         store
+            .app_storage()
             .record_account_recovery_loss(
                 "alice",
                 RecoveryLossCause::NotificationConsumer,
@@ -2786,24 +3005,38 @@ mod tests {
                 10,
             )
             .unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        let all = store.recovery_revision_fence().unwrap();
+        store
+            .app_storage()
+            .synchronize_account_delivery_loss("alice")
+            .unwrap();
+        let all = store.app_storage().recovery_revision_fence().unwrap();
         assert_eq!(all.obligations.len(), 2);
         assert!(
             store
+                .app_storage()
                 .reserve_recovery_attempt(&all, 16000, 30000, false)
                 .unwrap()
                 .is_none()
         );
-        let eligible = store.recovery_eligible_revision_fence(false).unwrap();
+        let eligible = store
+            .app_storage()
+            .recovery_eligible_revision_fence(false)
+            .unwrap();
         assert_eq!(eligible.obligations.len(), 1);
         assert!(
             store
+                .app_storage()
                 .reserve_recovery_attempt(&eligible, 16000, 30000, false)
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(store.recovery_eligible_revision_fence(true).unwrap(), all);
+        assert_eq!(
+            store
+                .app_storage()
+                .recovery_eligible_revision_fence(true)
+                .unwrap(),
+            all
+        );
     }
     #[test]
     fn file_reopen_restores_completion_guard_and_frozen_checkpoint() {
@@ -2812,10 +3045,11 @@ mod tests {
         let key = crate::SqlCipherKey::new("recovery scope reopen test").unwrap();
         let (fence, retry, id) = {
             let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-            store.ensure_account_projection("alice").unwrap();
-            store.mark_account_delivery_recovery("alice", 1, 1).unwrap();
-            let fence = store.recovery_revision_fence().unwrap();
-            let retry = store
+            let app = store.app_storage();
+            app.ensure_account_projection("alice").unwrap();
+            app.mark_account_delivery_recovery("alice", 1, 1).unwrap();
+            let fence = app.recovery_revision_fence().unwrap();
+            let retry = app
                 .reserve_recovery_attempt(&fence, 1000, 15000, false)
                 .unwrap()
                 .unwrap();
@@ -2823,7 +3057,9 @@ mod tests {
             qualify_loss(&store, &fence, retry.attempt_serial, id);
             (fence, retry, id)
         };
-        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let reopened = SqliteAccountStorage::open_encrypted(&path, &key)
+            .unwrap()
+            .app_storage();
         let scopes = reopened.recovery_scope_snapshots(id).unwrap();
         assert_eq!(scopes.len(), 1);
         assert_eq!(scopes[0].plan.until_seconds, 10);
@@ -2849,21 +3085,25 @@ mod tests {
     fn compatible_late_scope_evidence_survives_unrelated_attempt_but_not_replacement() {
         let (store, fence, attempt, id) = fixture();
         let token = store
+            .app_storage()
             .install_recovery_scope_plan(&fence, attempt, id, &[plan(&["a", "b"])])
             .unwrap()
             .unwrap()
             .remove(0);
         let other = store
+            .app_storage()
             .request_recovery(RecoveryRequest::IncrementalHistory, 1000)
             .unwrap();
-        let mut selected = store.recovery_revision_fence().unwrap();
+        let mut selected = store.app_storage().recovery_revision_fence().unwrap();
         selected.obligations.retain(|(id, _)| *id == other.id);
         store
+            .app_storage()
             .reserve_recovery_attempt(&selected, 16000, 30000, false)
             .unwrap()
             .unwrap();
         assert!(
             !store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -2873,17 +3113,20 @@ mod tests {
                 )
                 .unwrap()
         );
-        let current = store.recovery_revision_fence().unwrap();
+        let current = store.app_storage().recovery_revision_fence().unwrap();
         let next = store
+            .app_storage()
             .reserve_recovery_attempt(&current, 46000, 30000, false)
             .unwrap()
             .unwrap();
         store
+            .app_storage()
             .install_recovery_scope_plan(&current, next.attempt_serial, id, &[plan(&["a", "b"])])
             .unwrap()
             .unwrap();
         assert!(
             !store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -2893,38 +3136,63 @@ mod tests {
                 )
                 .unwrap()
         );
-        assert!(store.account_delivery_recovery("alice").unwrap().is_some());
+        assert!(
+            store
+                .app_storage()
+                .account_delivery_recovery("alice")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
     fn unchanged_route_policy_reopen_does_not_rearm_but_changed_policy_preserves_retry_cost() {
         let (store, _, _, _) = fixture();
-        assert!(!store.observe_recovery_route_snapshot([1; 32]).unwrap());
+        assert!(
+            !store
+                .app_storage()
+                .observe_recovery_route_snapshot([1; 32])
+                .unwrap()
+        );
         store
             .lock()
             .unwrap()
             .execute_batch("UPDATE account_recovery_obligations SET eligibility=3")
             .unwrap();
-        let before = store.recovery_revision_fence().unwrap();
-        let retry = store.recovery_retry_state().unwrap();
-        assert!(!store.observe_recovery_route_snapshot([1; 32]).unwrap());
+        let before = store.app_storage().recovery_revision_fence().unwrap();
+        let retry = store.app_storage().recovery_retry_state().unwrap();
+        assert!(
+            !store
+                .app_storage()
+                .observe_recovery_route_snapshot([1; 32])
+                .unwrap()
+        );
         assert!(
             store
+                .app_storage()
                 .recovery_eligible_revision_fence(false)
                 .unwrap()
                 .obligations
                 .is_empty()
         );
-        assert!(store.observe_recovery_route_snapshot([2; 32]).unwrap());
-        let after = store.recovery_revision_fence().unwrap();
+        assert!(
+            store
+                .app_storage()
+                .observe_recovery_route_snapshot([2; 32])
+                .unwrap()
+        );
+        let after = store.app_storage().recovery_revision_fence().unwrap();
         assert_eq!(after.route_revision, before.route_revision + 1);
         assert_eq!(
             after.obligations, before.obligations,
             "a route change rechecks demand but is not new evidence"
         );
-        assert_eq!(store.recovery_retry_state().unwrap(), retry);
+        assert_eq!(store.app_storage().recovery_retry_state().unwrap(), retry);
         assert_eq!(
-            store.recovery_eligible_revision_fence(false).unwrap(),
+            store
+                .app_storage()
+                .recovery_eligible_revision_fence(false)
+                .unwrap(),
             after
         );
     }

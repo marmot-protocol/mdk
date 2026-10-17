@@ -1,5 +1,7 @@
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 use crate::base::connection::CachedSql;
-use crate::{SqliteAccountStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
+use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::StorageResult;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -16,7 +18,7 @@ pub struct PendingWelcomeDeliveryRecord {
     pub recorded_at: u64,
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Record (or re-record) a pending welcome delivery. Idempotent on
     /// `message_id_hex`: re-recording overwrites the group, recipient, and
     /// timestamp rather than inserting a duplicate.
@@ -128,7 +130,7 @@ mod tests {
 
     #[test]
     fn record_then_list_roundtrips_fields() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         store
             .record_pending_welcome_delivery("aa", "bb", "cc", 7)
             .unwrap();
@@ -147,7 +149,7 @@ mod tests {
 
     #[test]
     fn re_record_same_message_updates_in_place() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         store
             .record_pending_welcome_delivery("aa", "bb", "cc", 7)
             .unwrap();
@@ -170,7 +172,7 @@ mod tests {
 
     #[test]
     fn batch_failure_rolls_back_every_welcome_intent() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let records = vec![
             PendingWelcomeDeliveryRecord {
                 message_id_hex: "first".to_owned(),
@@ -197,7 +199,7 @@ mod tests {
 
     #[test]
     fn clear_removes_exactly_one() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         store
             .record_pending_welcome_delivery("aa", "bb", "cc", 1)
             .unwrap();
@@ -215,7 +217,7 @@ mod tests {
 
     #[test]
     fn list_orders_by_recorded_at() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         store
             .record_pending_welcome_delivery("c", "g", "r", 30)
             .unwrap();
@@ -249,7 +251,10 @@ mod tests {
             )
             .unwrap();
 
-        let error = store.list_pending_welcome_deliveries().unwrap_err();
+        let error = store
+            .app_storage()
+            .list_pending_welcome_deliveries()
+            .unwrap_err();
         assert!(matches!(
             error,
             cgka_traits::storage::StorageError::Serialization(_)

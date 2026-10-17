@@ -294,7 +294,10 @@ async fn run_receive_selected_comparison(shutdown_while_held: bool) {
         .expect("initial periodic comparison has joined the worker")
         .unwrap()
         .unwrap();
-    let storage = reopened_app.account_storage(&alice.label).unwrap();
+    let storage = reopened_app
+        .account_storage(&alice.label)
+        .unwrap()
+        .app_storage();
     let slot = storage.recovery_comparison().unwrap();
     assert!(slot.pending());
     assert_ne!(

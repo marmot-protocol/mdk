@@ -2,7 +2,7 @@
 use super::*;
 
 struct Reservation<'a> {
-    store: &'a SqliteAccountStorage,
+    store: &'a SqliteAppStorage,
     token: &'a [u8],
     nonce: Vec<u8>,
     published: bool,
@@ -32,7 +32,7 @@ impl Drop for Reservation<'_> {
 }
 
 pub(super) fn complete(
-    store: &SqliteAccountStorage,
+    store: &SqliteAppStorage,
     job: &AttachmentAcquisition,
     reader: &mut dyn std::io::Read,
     len: u64,

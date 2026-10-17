@@ -1,5 +1,6 @@
 //! Captured, immutable system provenance for one bounded conversation page.
 use super::*;
+use crate::SqliteAppStorage;
 
 const MAX_CONVERSATION_SYSTEM_BYTES: usize = 16 * 1024;
 
@@ -31,7 +32,7 @@ impl ConversationPresentationPage {
             .map(|m| m.plaintext.as_str())
     }
 }
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Batch-check locally synthesized direction, absent inner source,
     /// exact payload and epoch using one bounded VALUES join.
     /// No roster/history scan, no row-by-row locks and no payload copies.

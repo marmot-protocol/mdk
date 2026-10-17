@@ -21,4 +21,10 @@ impl SqliteAppStorage {
     pub fn is_closed(&self) -> bool {
         self.connection.is_closed()
     }
+
+    /// Whether `other` is a clone of this same opened database handle, not
+    /// merely another connection to the same file.
+    pub fn shares_connection_with(&self, other: &SqliteAppStorage) -> bool {
+        self.connection.same_as(&other.connection)
+    }
 }

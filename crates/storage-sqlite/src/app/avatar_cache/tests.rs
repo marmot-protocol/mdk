@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 
 #[test]
 fn avatar_cache_available_on_account_open_without_engine() {
@@ -15,12 +17,12 @@ fn image(value: u8, size: usize) -> AvatarImage {
     // owned by the acquisition layer, not these persistence fixtures.
     AvatarImage::new(vec![value; size], AvatarImageFormat::Png, 16, 16).unwrap()
 }
-fn bind(store: &SqliteAccountStorage, owner: &str) -> AvatarAssetRef {
+fn bind(store: &SqliteAppStorage, owner: &str) -> AvatarAssetRef {
     store
         .bind_avatar_source(owner, "selected-source-key")
         .unwrap()
 }
-fn publish(store: &SqliteAccountStorage, reference: &AvatarAssetRef, image: &AvatarImage) {
+fn publish(store: &SqliteAppStorage, reference: &AvatarAssetRef, image: &AvatarImage) {
     assert_eq!(
         store.publish_avatar(reference, 0, image, None).unwrap(),
         AvatarPublishResult::Published {
@@ -28,7 +30,7 @@ fn publish(store: &SqliteAccountStorage, reference: &AvatarAssetRef, image: &Ava
         }
     );
 }
-fn ready(store: &SqliteAccountStorage, reference: &AvatarAssetRef) -> AvatarAssetRead {
+fn ready(store: &SqliteAppStorage, reference: &AvatarAssetRef) -> AvatarAssetRead {
     let result = store.read_avatar(reference, 10).unwrap();
     assert_eq!(result.status.availability, AvatarAvailability::Ready);
     result
@@ -40,22 +42,28 @@ fn avatar_bytes_survive_encrypted_reopen_without_engine_or_network() {
     let path = dir.path().join("account.sqlite3");
     let key = crate::SqlCipherKey::new("avatar-test-key").unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    let reference = bind(&store, "profile-owner");
+    let app = store.app_storage();
+    let reference = bind(&app, "profile-owner");
     let original = image(42, 4096);
-    publish(&store, &reference, &original);
+    publish(&app, &reference, &original);
     assert_eq!(
-        store
-            .bind_avatar_source("profile-owner", "selected-source-key")
+        app.bind_avatar_source("profile-owner", "selected-source-key")
             .unwrap(),
         reference
     );
     store.close().unwrap();
     let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     assert_eq!(
-        reopened.avatar_reference("profile-owner").unwrap(),
+        reopened
+            .app_storage()
+            .avatar_reference("profile-owner")
+            .unwrap(),
         Some(reference.clone())
     );
-    assert_eq!(ready(&reopened, &reference).image, Some(original));
+    assert_eq!(
+        ready(&reopened.app_storage(), &reference).image,
+        Some(original)
+    );
     reopened.close().unwrap();
     let file = std::fs::read(&path).unwrap();
     assert!(!file.starts_with(b"SQLite format 3"));
@@ -72,7 +80,7 @@ fn avatar_bytes_survive_encrypted_reopen_without_engine_or_network() {
 
 #[test]
 fn source_replacement_and_aba_reject_old_reads_publications_and_cleanup() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let old = store.bind_avatar_source("owner", "source-a").unwrap();
     let bytes = image(1, 16);
     publish(&store, &old, &bytes);
@@ -107,7 +115,7 @@ fn source_replacement_and_aba_reject_old_reads_publications_and_cleanup() {
 
 #[test]
 fn source_reference_and_content_revision_fence_out_of_order_refresh() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let reference = bind(&store, "owner");
     let first = image(1, 8);
     assert_eq!(
@@ -152,10 +160,11 @@ fn source_reference_and_content_revision_fence_out_of_order_refresh() {
 #[test]
 fn account_isolation_reset_and_terminal_close_fence_handles() {
     let a = SqliteAccountStorage::in_memory().unwrap();
-    let b = SqliteAccountStorage::in_memory().unwrap();
-    let reference = bind(&a, "owner");
+    let a_app = a.app_storage();
+    let b = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let reference = bind(&a_app, "owner");
     let bytes = image(7, 16);
-    publish(&a, &reference, &bytes);
+    publish(&a_app, &reference, &bytes);
     let b_ref = bind(&b, "owner");
     // Even a matching token from another account is rejected by its store epoch.
     let forged = AvatarAssetRef {
@@ -178,14 +187,14 @@ fn account_isolation_reset_and_terminal_close_fence_handles() {
             [],
         )
         .unwrap();
-    assert_eq!(a.avatar_cache_usage().unwrap().entries, 0);
+    assert_eq!(a_app.avatar_cache_usage().unwrap().entries, 0);
     assert_eq!(
-        a.publish_avatar(&reference, 1, &bytes, None).unwrap(),
+        a_app.publish_avatar(&reference, 1, &bytes, None).unwrap(),
         AvatarPublishResult::Superseded
     );
-    let new = bind(&a, "owner");
-    publish(&a, &new, &bytes);
-    let clone = a.clone();
+    let new = bind(&a_app, "owner");
+    publish(&a_app, &new, &bytes);
+    let clone = a.app_storage();
     a.close().unwrap();
     assert!(matches!(
         clone.read_avatar(&new, 0),
@@ -203,7 +212,7 @@ fn account_isolation_reset_and_terminal_close_fence_handles() {
 
 #[test]
 fn lru_eviction_uses_reads_not_status_and_old_completion_cannot_refill() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let limits = Limits {
         entries: 3,
         bytes: 12,
@@ -252,7 +261,7 @@ fn lru_eviction_uses_reads_not_status_and_old_completion_cannot_refill() {
 
 #[test]
 fn missing_mappings_are_bounded_and_eviction_preserves_current_binding() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let limits = Limits {
         entries: 2,
         bytes: 16,
@@ -286,13 +295,14 @@ fn missing_mappings_are_bounded_and_eviction_preserves_current_binding() {
 #[test]
 fn eviction_failure_rolls_back_publication_and_previously_evicted_entries() {
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let a = bind(&store, "a");
-    let b = bind(&store, "b");
-    let c = bind(&store, "c");
+    let app = store.app_storage();
+    let a = bind(&app, "a");
+    let b = bind(&app, "b");
+    let c = bind(&app, "c");
     let old = image(1, 5);
-    publish(&store, &a, &old);
-    publish(&store, &b, &old);
-    publish(&store, &c, &old);
+    publish(&app, &a, &old);
+    publish(&app, &b, &old);
+    publish(&app, &c, &old);
     store
         .lock()
         .unwrap()
@@ -301,7 +311,7 @@ fn eviction_failure_rolls_back_publication_and_previously_evicted_entries() {
          WHEN OLD.owner_key = 'b' BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
         )
         .unwrap();
-    let result = store.publish_avatar_with_limits(
+    let result = app.publish_avatar_with_limits(
         &c,
         1,
         &image(2, 8),
@@ -313,14 +323,14 @@ fn eviction_failure_rolls_back_publication_and_previously_evicted_entries() {
     );
     assert!(result.is_err());
     assert_eq!(
-        store.avatar_cache_usage().unwrap(),
+        app.avatar_cache_usage().unwrap(),
         AvatarCacheUsage {
             entries: 3,
             byte_count: 15
         }
     );
     for reference in [&a, &b, &c] {
-        let actual = ready(&store, reference);
+        let actual = ready(&app, reference);
         assert_eq!(actual.status.content_revision, 1);
         assert_eq!(actual.image, Some(old.clone()));
     }
@@ -329,9 +339,10 @@ fn eviction_failure_rolls_back_publication_and_previously_evicted_entries() {
 #[test]
 fn avatar_schema_rejects_text_payloads_and_digests() {
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let reference = bind(&store, "owner");
+    let app = store.app_storage();
+    let reference = bind(&app, "owner");
     let original = image(42, 16);
-    publish(&store, &reference, &original);
+    publish(&app, &reference, &original);
 
     for sql in [
         // SQLite length(TEXT) counts characters, which would undercount bytes.
@@ -343,46 +354,47 @@ fn avatar_schema_rejects_text_payloads_and_digests() {
             error.sqlite_error_code(),
             Some(rusqlite::ErrorCode::ConstraintViolation)
         );
-        assert_eq!(store.avatar_cache_usage().unwrap().byte_count, 16);
-        assert_eq!(ready(&store, &reference).image, Some(original.clone()));
+        assert_eq!(app.avatar_cache_usage().unwrap().byte_count, 16);
+        assert_eq!(ready(&app, &reference).image, Some(original.clone()));
     }
 }
 
 #[test]
 fn corrupt_bytes_become_a_repairable_miss_and_fence_old_refresh() {
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let reference = bind(&store, "owner");
+    let app = store.app_storage();
+    let reference = bind(&app, "owner");
     let bytes = image(1, 16);
-    publish(&store, &reference, &bytes);
+    publish(&app, &reference, &bytes);
     store
         .lock()
         .unwrap()
         .execute("UPDATE avatar_assets SET bytes = zeroblob(16)", [])
         .unwrap();
-    let result = store.read_avatar(&reference, 0).unwrap();
+    let result = app.read_avatar(&reference, 0).unwrap();
     assert_eq!(result.status.availability, AvatarAvailability::Missing);
     assert_eq!(result.status.content_revision, 2);
     assert!(result.repaired);
-    assert!(!store.read_avatar(&reference, 0).unwrap().repaired);
+    assert!(!app.read_avatar(&reference, 0).unwrap().repaired);
     assert!(result.image.is_none());
-    assert_eq!(store.avatar_cache_usage().unwrap().byte_count, 0);
+    assert_eq!(app.avatar_cache_usage().unwrap().byte_count, 0);
     assert_eq!(
-        store.publish_avatar(&reference, 1, &bytes, None).unwrap(),
+        app.publish_avatar(&reference, 1, &bytes, None).unwrap(),
         AvatarPublishResult::Superseded
     );
     assert_eq!(
-        store.publish_avatar(&reference, 2, &bytes, None).unwrap(),
+        app.publish_avatar(&reference, 2, &bytes, None).unwrap(),
         AvatarPublishResult::Published {
             content_revision: 3
         }
     );
-    assert_eq!(ready(&store, &reference).image, Some(bytes));
+    assert_eq!(ready(&app, &reference).image, Some(bytes));
 }
 
 #[test]
 fn concurrent_publications_have_one_winner() {
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let reference = bind(&store, "owner");
+    let reference = bind(&store.app_storage(), "owner");
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let threads: Vec<_> = (1..=2)
         .map(|value| {
@@ -392,6 +404,7 @@ fn concurrent_publications_have_one_winner() {
             std::thread::spawn(move || {
                 barrier.wait();
                 store
+                    .app_storage()
                     .publish_avatar(&reference, 0, &image(value, 8), None)
                     .unwrap()
             })
@@ -415,12 +428,17 @@ fn concurrent_publications_have_one_winner() {
             .count(),
         1
     );
-    assert_eq!(ready(&store, &reference).status.content_revision, 1);
+    assert_eq!(
+        ready(&store.app_storage(), &reference)
+            .status
+            .content_revision,
+        1
+    );
 }
 
 #[test]
 fn clear_cache_invalidates_all_generations_but_shared_views_share_one_owner() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let first_view = bind(&store, "owner");
     let second_view = bind(&store, "owner");
     assert_eq!(first_view, second_view);
@@ -435,7 +453,7 @@ fn clear_cache_invalidates_all_generations_but_shared_views_share_one_owner() {
 
 #[test]
 fn bounds_and_errors_do_not_expose_source_or_image_material() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let source = "sensitive-url-or-material".repeat(100);
     let error = store
         .bind_avatar_source("owner", &source)
@@ -475,9 +493,10 @@ fn local_avatar_reads_do_not_scan_other_entries() {
     use crate::base::query_work_test_support::{QUERY_MEASUREMENT, measure};
     let _measurement = QUERY_MEASUREMENT.lock().unwrap();
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let reference = bind(&store, "target");
-    publish(&store, &reference, &image(1, 16));
-    let (small, small_steps) = measure(&store, || store.read_avatar(&reference, 0).unwrap());
+    let app = store.app_storage();
+    let reference = bind(&app, "target");
+    publish(&app, &reference, &image(1, 16));
+    let (small, small_steps) = measure(&store, || app.read_avatar(&reference, 0).unwrap());
     {
         let conn = store.lock().unwrap();
         conn.execute_batch(
@@ -490,17 +509,17 @@ fn local_avatar_reads_do_not_scan_other_entries() {
         )
         .unwrap();
     }
-    let (large, large_steps) = measure(&store, || store.read_avatar(&reference, 0).unwrap());
+    let (large, large_steps) = measure(&store, || app.read_avatar(&reference, 0).unwrap());
     assert_eq!(large, small);
     assert!(
         large_steps <= small_steps + 20,
         "read SQL work grew: {small_steps} -> {large_steps}"
     );
     assert!(large_steps < 500, "unbounded local read: {large_steps}");
-    let (state, status_steps) = measure(&store, || store.avatar_status(&reference, 0).unwrap());
+    let (state, status_steps) = measure(&store, || app.avatar_status(&reference, 0).unwrap());
     assert_eq!(state.availability, AvatarAvailability::Ready);
     assert!(status_steps < 100, "unbounded status read: {status_steps}");
-    let (same, bind_steps) = measure(&store, || bind(&store, "target"));
+    let (same, bind_steps) = measure(&store, || bind(&app, "target"));
     assert_eq!(same, reference);
     assert!(
         bind_steps < 500,
@@ -508,8 +527,7 @@ fn local_avatar_reads_do_not_scan_other_entries() {
     );
     let (_, publish_steps) = measure(&store, || {
         assert_eq!(
-            store
-                .publish_avatar(&reference, 1, &image(2, 16), None)
+            app.publish_avatar(&reference, 1, &image(2, 16), None)
                 .unwrap(),
             AvatarPublishResult::Published {
                 content_revision: 2
@@ -520,14 +538,14 @@ fn local_avatar_reads_do_not_scan_other_entries() {
         publish_steps < 30_000,
         "publication exceeded bounded metadata work: {publish_steps}"
     );
-    let new = bind(&store, "new-owner");
+    let new = bind(&app, "new-owner");
     assert_eq!(
-        store.avatar_cache_usage().unwrap().entries,
+        app.avatar_cache_usage().unwrap().entries,
         MAX_AVATAR_CACHE_ENTRIES
     );
-    assert_eq!(store.avatar_reference("owner-1").unwrap(), None);
+    assert_eq!(app.avatar_reference("owner-1").unwrap(), None);
     assert_eq!(
-        store.avatar_status(&new, 0).unwrap().availability,
+        app.avatar_status(&new, 0).unwrap().availability,
         AvatarAvailability::Missing
     );
 }
@@ -535,45 +553,44 @@ fn local_avatar_reads_do_not_scan_other_entries() {
 #[test]
 fn failed_source_rebind_and_counter_overflow_preserve_previous_pixels() {
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let reference = bind(&store, "owner");
+    let app = store.app_storage();
+    let reference = bind(&app, "owner");
     let bytes = image(1, 16);
-    publish(&store, &reference, &bytes);
+    publish(&app, &reference, &bytes);
     // Failure after the UPSERT but before commit must not clear the old avatar.
     assert!(
-        store
-            .bind_avatar_source_with_limits(
-                "owner",
-                "new",
-                Limits {
-                    entries: 0,
-                    bytes: 16
-                }
-            )
-            .is_err()
+        app.bind_avatar_source_with_limits(
+            "owner",
+            "new",
+            Limits {
+                entries: 0,
+                bytes: 16
+            }
+        )
+        .is_err()
     );
     assert_eq!(
-        store.avatar_reference("owner").unwrap(),
+        app.avatar_reference("owner").unwrap(),
         Some(reference.clone())
     );
-    assert_eq!(ready(&store, &reference).image, Some(bytes.clone()));
+    assert_eq!(ready(&app, &reference).image, Some(bytes.clone()));
     store
         .lock()
         .unwrap()
         .execute("UPDATE avatar_assets SET content_revision = ?1", [i64::MAX])
         .unwrap();
     assert!(
-        store
-            .publish_avatar(&reference, i64::MAX as u64, &image(2, 16), None)
+        app.publish_avatar(&reference, i64::MAX as u64, &image(2, 16), None)
             .is_err()
     );
-    assert_eq!(ready(&store, &reference).image, Some(bytes));
+    assert_eq!(ready(&app, &reference).image, Some(bytes));
     store
         .lock()
         .unwrap()
         .execute("UPDATE avatar_cache_meta SET access_seq = ?1", [i64::MAX])
         .unwrap();
-    assert!(store.bind_avatar_source("owner", "new").is_err());
-    assert_eq!(store.avatar_reference("owner").unwrap(), Some(reference));
+    assert!(app.bind_avatar_source("owner", "new").is_err());
+    assert_eq!(app.avatar_reference("owner").unwrap(), Some(reference));
 }
 
 #[test]
@@ -582,8 +599,9 @@ fn avatar_recency_counter_widening_does_not_rewrite_blob_pages() {
     let path = dir.path().join("avatar-wal.db");
     let key = crate::SqlCipherKey::new("avatar-wal-test-key").unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    let reference = bind(&store, "owner");
-    publish(&store, &reference, &image(42, MAX_AVATAR_BYTES));
+    let app = store.app_storage();
+    let reference = bind(&app, "owner");
+    publish(&app, &reference, &image(42, MAX_AVATAR_BYTES));
     {
         let conn = store.lock().unwrap();
         conn.execute("UPDATE avatar_cache_meta SET access_seq = 126", [])
@@ -596,7 +614,7 @@ fn avatar_recency_counter_widening_does_not_rewrite_blob_pages() {
     // SQLite integer encoding widens at 128. LRU bookkeeping must not rewrite
     // the adjacent 10 MiB image when that happens.
     for _ in 0..3 {
-        ready(&store, &reference);
+        ready(&app, &reference);
     }
     store
         .lock()
@@ -604,7 +622,7 @@ fn avatar_recency_counter_widening_does_not_rewrite_blob_pages() {
         .execute("UPDATE avatar_cache_meta SET access_seq = 32766", [])
         .unwrap();
     for _ in 0..3 {
-        assert_eq!(bind(&store, "owner"), reference);
+        assert_eq!(bind(&app, "owner"), reference);
     }
     let wal_bytes = std::fs::metadata(path.with_extension("db-wal"))
         .unwrap()
@@ -620,41 +638,41 @@ fn avatar_recency_counter_widening_does_not_rewrite_blob_pages() {
 #[test]
 fn removing_live_avatar_invalidates_shared_views_and_preserves_other_owners() {
     let store = SqliteAccountStorage::in_memory().unwrap();
-    let reference = bind(&store, "removed");
-    let another_view = bind(&store, "removed");
-    let other = bind(&store, "retained");
+    let app = store.app_storage();
+    let reference = bind(&app, "removed");
+    let another_view = bind(&app, "removed");
+    let other = bind(&app, "retained");
     let bytes = image(1, 16);
-    publish(&store, &reference, &bytes);
-    publish(&store, &other, &bytes);
-    assert!(store.remove_avatar_source(&reference).unwrap());
+    publish(&app, &reference, &bytes);
+    publish(&app, &other, &bytes);
+    assert!(app.remove_avatar_source(&reference).unwrap());
     assert_eq!(
-        store.avatar_cache_usage().unwrap(),
+        app.avatar_cache_usage().unwrap(),
         AvatarCacheUsage {
             entries: 1,
             byte_count: 16
         }
     );
-    assert_eq!(store.avatar_reference("removed").unwrap(), None);
+    assert_eq!(app.avatar_reference("removed").unwrap(), None);
     assert_eq!(
-        store
-            .read_avatar(&another_view, 0)
+        app.read_avatar(&another_view, 0)
             .unwrap()
             .status
             .availability,
         AvatarAvailability::Invalidated
     );
     assert_eq!(
-        store.publish_avatar(&reference, 1, &bytes, None).unwrap(),
+        app.publish_avatar(&reference, 1, &bytes, None).unwrap(),
         AvatarPublishResult::Superseded
     );
-    assert_eq!(ready(&store, &other).image, Some(bytes));
-    assert_ne!(bind(&store, "removed"), reference);
+    assert_eq!(ready(&app, &other).image, Some(bytes));
+    assert_ne!(bind(&app, "removed"), reference);
     let recency: i64 = store
         .lock()
         .unwrap()
         .query_row("SELECT count(*) FROM avatar_access", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(recency as u64, store.avatar_cache_usage().unwrap().entries);
+    assert_eq!(recency as u64, app.avatar_cache_usage().unwrap().entries);
 }
 
 #[test]
@@ -677,7 +695,7 @@ fn selected_url(key: &str) -> crate::SelectedAvatar {
 
 #[test]
 fn avatar_acquisition_coalesces_retries_and_retains_stale_bytes() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let selected = selected_url("same");
     let reference = store
         .request_avatar_acquisition("owner", &selected, false)
@@ -725,25 +743,38 @@ fn avatar_attempts_survive_reopen_and_fence_late_completion() {
     let key = crate::SqlCipherKey::new("avatar jobs fixture").unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let reference = store
+        .app_storage()
         .request_avatar_acquisition("owner", &selected_url("a"), false)
         .unwrap()
         .unwrap();
-    let abandoned = store.claim_avatar_acquisition(0).unwrap().unwrap();
+    let abandoned = store
+        .app_storage()
+        .claim_avatar_acquisition(0)
+        .unwrap()
+        .unwrap();
     store.close().unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    store.resume_avatar_acquisition().unwrap();
-    let resumed = store.claim_avatar_acquisition(0).unwrap().unwrap();
+    store.app_storage().resume_avatar_acquisition().unwrap();
+    let resumed = store
+        .app_storage()
+        .claim_avatar_acquisition(0)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         store
+            .app_storage()
             .complete_avatar_acquisition(&abandoned, &image(1, 8), None)
             .unwrap(),
         AvatarPublishResult::Superseded
     );
     store
+        .app_storage()
         .complete_avatar_acquisition(&resumed, &image(2, 8), None)
         .unwrap();
     store.close().unwrap();
-    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key)
+        .unwrap()
+        .app_storage();
     assert_eq!(ready(&store, &reference).image, Some(image(2, 8)));
     assert!(
         store
@@ -755,7 +786,7 @@ fn avatar_attempts_survive_reopen_and_fence_late_completion() {
 
 #[test]
 fn avatar_source_replacement_eviction_and_blocked_failures_do_not_refill() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let a = store
         .request_avatar_acquisition("chat:group", &selected_url("a"), false)
         .unwrap()
@@ -813,30 +844,30 @@ fn avatar_source_replacement_eviction_and_blocked_failures_do_not_refill() {
 #[test]
 fn avatar_demand_and_publication_roll_back_with_enclosing_transaction() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     let result: StorageResult<()> = store.connection.with_transaction(|| {
-        store.request_avatar_acquisition("owner", &selected_url("a"), false)?;
+        app.request_avatar_acquisition("owner", &selected_url("a"), false)?;
         Err(invalid("injected outer failure"))
     });
     assert!(result.is_err());
-    assert!(store.avatar_reference("owner").unwrap().is_none());
-    assert!(store.claim_avatar_acquisition(0).unwrap().is_none());
-    let reference = store
+    assert!(app.avatar_reference("owner").unwrap().is_none());
+    assert!(app.claim_avatar_acquisition(0).unwrap().is_none());
+    let reference = app
         .request_avatar_acquisition("owner", &selected_url("a"), false)
         .unwrap()
         .unwrap();
-    let job = store.claim_avatar_acquisition(0).unwrap().unwrap();
+    let job = app.claim_avatar_acquisition(0).unwrap().unwrap();
     store.lock().unwrap().execute_batch("CREATE TRIGGER reject_job_finish BEFORE UPDATE OF state ON avatar_acquisition WHEN NEW.state = 0 BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
     assert!(
-        store
-            .complete_avatar_acquisition(&job, &image(1, 8), None)
+        app.complete_avatar_acquisition(&job, &image(1, 8), None)
             .is_err()
     );
     assert_eq!(
-        store.avatar_status(&reference, 0).unwrap().availability,
+        app.avatar_status(&reference, 0).unwrap().availability,
         AvatarAvailability::Missing
     );
     assert_eq!(
-        store.avatar_acquisition_state(&reference).unwrap(),
+        app.avatar_acquisition_state(&reference).unwrap(),
         Some(AvatarAcquisitionState::Fetching)
     );
     store
@@ -844,29 +875,26 @@ fn avatar_demand_and_publication_roll_back_with_enclosing_transaction() {
         .unwrap()
         .execute_batch("DROP TRIGGER reject_job_finish;")
         .unwrap();
-    store
-        .complete_avatar_acquisition(&job, &image(1, 8), None)
+    app.complete_avatar_acquisition(&job, &image(1, 8), None)
         .unwrap();
 }
 
 #[test]
 fn avatar_visible_priority_and_corruption_repair_are_durable() {
     let store = SqliteAccountStorage::in_memory().unwrap();
-    store
-        .request_avatar_acquisition("background", &selected_url("background"), false)
+    let app = store.app_storage();
+    app.request_avatar_acquisition("background", &selected_url("background"), false)
         .unwrap();
-    let visible = store
+    let visible = app
         .request_avatar_acquisition("visible", &selected_url("visible"), true)
         .unwrap()
         .unwrap();
-    let first = store.claim_avatar_acquisition(0).unwrap().unwrap();
+    let first = app.claim_avatar_acquisition(0).unwrap().unwrap();
     assert_eq!(first.reference, visible);
-    store
-        .complete_avatar_acquisition(&first, &image(1, 8), None)
+    app.complete_avatar_acquisition(&first, &image(1, 8), None)
         .unwrap();
-    let background = store.claim_avatar_acquisition(0).unwrap().unwrap();
-    store
-        .complete_avatar_acquisition(&background, &image(2, 8), None)
+    let background = app.claim_avatar_acquisition(0).unwrap().unwrap();
+    app.complete_avatar_acquisition(&background, &image(2, 8), None)
         .unwrap();
     store
         .lock()
@@ -877,15 +905,11 @@ fn avatar_visible_priority_and_corruption_repair_are_durable() {
         )
         .unwrap();
     assert_eq!(
-        store.read_avatar(&visible, 0).unwrap().status.availability,
+        app.read_avatar(&visible, 0).unwrap().status.availability,
         AvatarAvailability::Missing
     );
     assert_eq!(
-        store
-            .claim_avatar_acquisition(0)
-            .unwrap()
-            .unwrap()
-            .reference,
+        app.claim_avatar_acquisition(0).unwrap().unwrap().reference,
         visible
     );
 }
@@ -898,6 +922,7 @@ fn seed_avatar_group(store: &SqliteAccountStorage) {
 #[test]
 fn avatar_identity_placeholder_updates_are_fenced_and_eviction_stops_maintenance() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed_avatar_group(&store);
     let absent = crate::SelectedAvatar::Placeholder {
         stable_seed: "seed".into(),
@@ -912,65 +937,49 @@ fn avatar_identity_placeholder_updates_are_fenced_and_eviction_stops_maintenance
         ..v1.clone()
     };
     assert!(
-        store
-            .request_identity_avatar_acquisition("group", "member", &absent, &v1)
+        app.request_identity_avatar_acquisition("group", "member", &absent, &v1)
             .unwrap()
             .is_none()
     );
-    let identities = store.requested_avatar_identities_after("").unwrap();
+    let identities = app.requested_avatar_identities_after("").unwrap();
     assert_eq!(identities.len(), 1);
-    store
-        .maintain_identity_avatar_acquisition(&identities[0], &selected_url("new"), &v2)
+    app.maintain_identity_avatar_acquisition(&identities[0], &selected_url("new"), &v2)
         .unwrap();
-    let reference = store
-        .avatar_reference(&identities[0].owner)
-        .unwrap()
-        .unwrap();
-    store
-        .maintain_identity_avatar_acquisition(&identities[0], &absent, &v1)
+    let reference = app.avatar_reference(&identities[0].owner).unwrap().unwrap();
+    app.maintain_identity_avatar_acquisition(&identities[0], &absent, &v1)
         .unwrap();
     assert_eq!(
-        store.avatar_reference(&identities[0].owner).unwrap(),
+        app.avatar_reference(&identities[0].owner).unwrap(),
         Some(reference.clone())
     );
-    store
-        .maintain_identity_avatar_acquisition(&identities[0], &absent, &v2)
+    app.maintain_identity_avatar_acquisition(&identities[0], &absent, &v2)
         .unwrap();
     assert!(
-        store
-            .avatar_reference(&identities[0].owner)
+        app.avatar_reference(&identities[0].owner)
             .unwrap()
             .is_none()
     );
-    assert_eq!(
-        store.requested_avatar_identities_after("").unwrap().len(),
-        1
-    );
-    store
-        .maintain_identity_avatar_acquisition(&identities[0], &selected_url("new"), &v2)
+    assert_eq!(app.requested_avatar_identities_after("").unwrap().len(), 1);
+    app.maintain_identity_avatar_acquisition(&identities[0], &selected_url("new"), &v2)
         .unwrap();
-    store
-        .bind_avatar_source_with_limits(
-            "other",
-            "source",
-            Limits {
-                entries: 1,
-                bytes: 8,
-            },
-        )
-        .unwrap();
+    app.bind_avatar_source_with_limits(
+        "other",
+        "source",
+        Limits {
+            entries: 1,
+            bytes: 8,
+        },
+    )
+    .unwrap();
     assert!(
-        store
-            .requested_avatar_identities_after("")
+        app.requested_avatar_identities_after("")
             .unwrap()
             .is_empty()
     );
-    store
-        .maintain_identity_avatar_acquisition(&identities[0], &selected_url("new"), &v2)
+    app.maintain_identity_avatar_acquisition(&identities[0], &selected_url("new"), &v2)
         .unwrap();
     assert!(
-        store
-            .avatar_reference(&identities[0].owner)
+        app.avatar_reference(&identities[0].owner)
             .unwrap()
             .is_none()
     );
@@ -981,7 +990,9 @@ fn avatar_identity_placeholder_updates_are_fenced_and_eviction_stops_maintenance
 fn avatar_local_read_timing_by_encoded_size() {
     let dir = tempfile::tempdir().unwrap();
     let key = crate::SqlCipherKey::new("avatar timing fixture").unwrap();
-    let store = SqliteAccountStorage::open_encrypted(dir.path().join("account.db"), &key).unwrap();
+    let store = SqliteAccountStorage::open_encrypted(dir.path().join("account.db"), &key)
+        .unwrap()
+        .app_storage();
     for size in [256 * 1024, 1024 * 1024, MAX_AVATAR_BYTES] {
         let reference = store
             .bind_avatar_source("timing", &format!("size-{size}"))
@@ -1004,7 +1015,7 @@ fn avatar_local_read_timing_by_encoded_size() {
 
 #[test]
 fn avatar_expired_attempt_lease_recovers_failed_completion_storage() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
         .request_avatar_acquisition("owner", &selected_url("a"), false)
         .unwrap();
@@ -1025,18 +1036,18 @@ fn avatar_expired_attempt_lease_recovers_failed_completion_storage() {
 #[test]
 fn avatar_identity_bytes_are_removed_with_the_local_conversation() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed_avatar_group(&store);
     let version = crate::ChatPresentationVersion {
         store_epoch: vec![9; 16],
         revision: 1,
     };
-    let reference = store
+    let reference = app
         .request_identity_avatar_acquisition("group", "member", &selected_url("a"), &version)
         .unwrap()
         .unwrap();
-    let job = store.claim_avatar_acquisition(0).unwrap().unwrap();
-    store
-        .complete_avatar_acquisition(&job, &image(1, 8), None)
+    let job = app.claim_avatar_acquisition(0).unwrap().unwrap();
+    app.complete_avatar_acquisition(&job, &image(1, 8), None)
         .unwrap();
     store
         .lock()
@@ -1047,16 +1058,15 @@ fn avatar_identity_bytes_are_removed_with_the_local_conversation() {
         )
         .unwrap();
     assert!(
-        store
-            .requested_avatar_identities_after("")
+        app.requested_avatar_identities_after("")
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        store.avatar_status(&reference, 0).unwrap().availability,
+        app.avatar_status(&reference, 0).unwrap().availability,
         AvatarAvailability::Invalidated
     );
-    assert_eq!(store.avatar_cache_usage().unwrap().byte_count, 0);
+    assert_eq!(app.avatar_cache_usage().unwrap().byte_count, 0);
 }
 
 #[test]
@@ -1069,11 +1079,13 @@ fn avatar_idle_maintenance_needs_no_write_transaction() {
         .unwrap();
     assert!(
         !store
+            .app_storage()
             .bootstrap_avatar_acquisition()
             .expect("empty bootstrap is read-only")
     );
     assert!(
         store
+            .app_storage()
             .claim_avatar_acquisition(100)
             .expect("no due demand is read-only")
             .is_none()
@@ -1082,7 +1094,7 @@ fn avatar_idle_maintenance_needs_no_write_transaction() {
 
 #[test]
 fn avatar_retry_budget_enters_daily_probes_and_recovers() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let reference = store
         .request_avatar_acquisition("owner", &selected_url("a"), false)
         .unwrap()
@@ -1152,6 +1164,7 @@ fn avatar_retry_budget_enters_daily_probes_and_recovers() {
 #[test]
 fn avatar_bootstrap_survives_unchanged_presentation_rewrite() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed_avatar_group(&store);
     let value = crate::StoredChatPresentation {
         presentation: crate::ConversationPresentation {
@@ -1183,75 +1196,69 @@ fn avatar_bootstrap_survives_unchanged_presentation_rewrite() {
             [],
         )
         .unwrap();
-    let input = store.chat_presentation_input("group").unwrap().unwrap();
+    let input = app.chat_presentation_input("group").unwrap().unwrap();
     assert_eq!(
-        store.store_chat_presentation(&input, &value).unwrap(),
+        app.store_chat_presentation(&input, &value).unwrap(),
         crate::ChatPresentationWrite::Applied
     );
-    assert!(!store.bootstrap_avatar_acquisition().unwrap());
-    let job = store
+    assert!(!app.bootstrap_avatar_acquisition().unwrap());
+    let job = app
         .claim_avatar_acquisition(0)
         .unwrap()
         .expect("unchanged presentation must not consume upgrade demand");
     assert!(job.descriptor == value.presentation.avatar);
-    store
-        .complete_avatar_acquisition(&job, &image(1, 8), None)
+    app.complete_avatar_acquisition(&job, &image(1, 8), None)
         .unwrap();
-    store.remove_avatar_source(&job.reference).unwrap();
-    store
-        .maintain_chat_avatar(
-            "group",
-            Some(&value.presentation.avatar),
-            &value.presentation.avatar,
-        )
-        .unwrap();
-    store.bootstrap_avatar_acquisition().unwrap();
-    assert!(store.claim_avatar_acquisition(0).unwrap().is_none());
+    app.remove_avatar_source(&job.reference).unwrap();
+    app.maintain_chat_avatar(
+        "group",
+        Some(&value.presentation.avatar),
+        &value.presentation.avatar,
+    )
+    .unwrap();
+    app.bootstrap_avatar_acquisition().unwrap();
+    assert!(app.claim_avatar_acquisition(0).unwrap().is_none());
 }
 
 #[test]
 fn avatar_identity_demand_survives_directory_generation_catchup() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed_avatar_group(&store);
-    let checkpoint = store.chat_presentation_checkpoint().unwrap();
+    let checkpoint = app.chat_presentation_checkpoint().unwrap();
     let mut state = checkpoint.state.clone();
     state.shared_epoch = vec![1; 16];
-    store
-        .commit_chat_presentation_batch(&checkpoint, &state, &[])
+    app.commit_chat_presentation_batch(&checkpoint, &state, &[])
         .unwrap();
     let version = crate::ChatPresentationVersion {
         store_epoch: vec![9; 16],
         revision: 1,
     };
     assert!(
-        store
-            .request_identity_avatar_acquisition("group", "member", &selected_url("a"), &version)
+        app.request_identity_avatar_acquisition("group", "member", &selected_url("a"), &version)
             .unwrap()
             .is_none()
     );
-    let pending = store
+    let pending = app
         .avatar_target_presentation("group", Some("member"), &selected_url("a"), 0)
         .unwrap()
         .unwrap();
-    let requested = store
+    let requested = app
         .request_avatar_target(&pending.target, &selected_url("a"), Some(&version), 0)
         .unwrap();
     assert_eq!(requested.target, pending.target);
     assert_eq!(requested.status.availability, AvatarAvailability::Missing);
     assert!(requested.reference.is_none());
-    let registered = store.requested_avatar_identities_after("").unwrap();
+    let registered = app.requested_avatar_identities_after("").unwrap();
     assert_eq!(registered.len(), 1);
-    let checkpoint = store.chat_presentation_checkpoint().unwrap();
+    let checkpoint = app.chat_presentation_checkpoint().unwrap();
     state.shared_epoch = version.store_epoch.clone();
-    store
-        .commit_chat_presentation_batch(&checkpoint, &state, &[])
+    app.commit_chat_presentation_batch(&checkpoint, &state, &[])
         .unwrap();
-    store
-        .maintain_identity_avatar_acquisition(&registered[0], &selected_url("a"), &version)
+    app.maintain_identity_avatar_acquisition(&registered[0], &selected_url("a"), &version)
         .unwrap();
     assert!(
-        store
-            .avatar_reference(&registered[0].owner)
+        app.avatar_reference(&registered[0].owner)
             .unwrap()
             .is_some()
     );
@@ -1259,7 +1266,7 @@ fn avatar_identity_demand_survives_directory_generation_catchup() {
 
 #[test]
 fn avatar_native_reference_and_byte_budget_preserve_source_fencing() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let reference = bind(&store, "owner");
     publish(&store, &reference, &image(7, 16));
     let decoded = AvatarAssetRef::from_opaque(&reference.to_opaque()).unwrap();
@@ -1285,21 +1292,29 @@ fn avatar_native_reference_and_byte_budget_preserve_source_fencing() {
 #[test]
 fn avatar_screen_targets_reject_another_account_or_recreated_conversation() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed_avatar_group(&store);
-    let asset = store
+    let asset = app
         .avatar_target_presentation("group", None, &selected_url("a"), 0)
         .unwrap()
         .unwrap();
     let target = AvatarAssetTarget::from_opaque(&asset.target.to_opaque()).unwrap();
     assert_eq!(
-        store.resolve_avatar_target(&target).unwrap().as_deref(),
+        app.resolve_avatar_target(&target).unwrap().as_deref(),
         Some("group")
     );
     let other = SqliteAccountStorage::in_memory().unwrap();
     seed_avatar_group(&other);
-    assert!(other.resolve_avatar_target(&target).unwrap().is_none());
+    assert!(
+        other
+            .app_storage()
+            .resolve_avatar_target(&target)
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
         other
+            .app_storage()
             .request_avatar_target(&target, &selected_url("a"), None, 0)
             .unwrap()
             .status
@@ -1315,10 +1330,9 @@ fn avatar_screen_targets_reject_another_account_or_recreated_conversation() {
         )
         .unwrap();
     seed_avatar_group(&store);
-    assert!(store.resolve_avatar_target(&target).unwrap().is_none());
+    assert!(app.resolve_avatar_target(&target).unwrap().is_none());
     assert_eq!(
-        store
-            .request_avatar_target(&target, &selected_url("a"), None, 0)
+        app.request_avatar_target(&target, &selected_url("a"), None, 0)
             .unwrap()
             .status
             .availability,
@@ -1354,31 +1368,30 @@ fn avatar_target_lookup_uses_the_conversation_incarnation_index() {
 #[test]
 fn avatar_screen_and_byte_read_availability_agree_at_freshness_boundary() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed_avatar_group(&store);
     let selected = selected_url("a");
     let version = crate::ChatPresentationVersion {
         store_epoch: vec![9; 16],
         revision: 1,
     };
-    let reference = store
+    let reference = app
         .request_identity_avatar_acquisition("group", "member", &selected, &version)
         .unwrap()
         .unwrap();
     let screen = |now| {
-        store
-            .avatar_target_presentation("group", Some("member"), &selected, now)
+        app.avatar_target_presentation("group", Some("member"), &selected, now)
             .unwrap()
             .unwrap()
             .status
     };
-    assert_eq!(screen(0), store.read_avatar(&reference, 0).unwrap().status);
-    store
-        .publish_avatar(&reference, 0, &image(1, 16), Some(10))
+    assert_eq!(screen(0), app.read_avatar(&reference, 0).unwrap().status);
+    app.publish_avatar(&reference, 0, &image(1, 16), Some(10))
         .unwrap();
     for now in [9, 10, 11] {
         assert_eq!(
             screen(now),
-            store.read_avatar(&reference, now).unwrap().status
+            app.read_avatar(&reference, now).unwrap().status
         );
     }
 }

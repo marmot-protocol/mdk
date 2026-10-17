@@ -2,9 +2,8 @@ use super::*;
 use crate::MarmotApp;
 use marmot_account::AccountHome;
 use sha2::{Digest, Sha256};
-use storage_sqlite::{
-    SqliteAccountStorage, StoredAccountGroup, StoredAccountState, StoredAppEvent,
-};
+use storage_sqlite::SqliteAppStorage;
+use storage_sqlite::{StoredAccountGroup, StoredAccountState, StoredAppEvent};
 const GROUP: &str = "abababababababababababababababab";
 fn group(pending: bool) -> StoredAccountGroup {
     StoredAccountGroup {
@@ -52,7 +51,7 @@ fn target() -> AttachmentLocalTarget {
         attachment_index: 0,
     }
 }
-fn seed(store: &SqliteAccountStorage, bytes: &[u8]) {
+fn seed(store: &SqliteAppStorage, bytes: &[u8]) {
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -118,7 +117,7 @@ async fn attachment_local_access_is_bounded_offline_and_survives_reopen() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let store = app.account_storage("alice").unwrap();
     let body = vec![42; MAX_ATTACHMENT_LOCAL_READ_BYTES + 17];
-    seed(&store, &body);
+    seed(&store.app_storage(), &body);
     let runtime = app.runtime();
     let group = GroupId::new(vec![0xab; 16]);
     let mut stale = target();
@@ -195,7 +194,7 @@ async fn attachment_local_access_is_bounded_offline_and_survives_reopen() {
             .len(),
         17
     );
-    let store = app.account_storage("alice").unwrap();
+    let store = app.account_storage("alice").unwrap().app_storage();
     store
         .set_group_self_membership(GROUP, storage_sqlite::SelfMembership::Left)
         .unwrap();
@@ -234,7 +233,7 @@ async fn attachment_local_access_rejects_unbounded_inputs_without_starting_worke
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let store = app.account_storage("alice").unwrap();
-    seed(&store, b"");
+    seed(&store.app_storage(), b"");
     let runtime = app.runtime();
     let group = GroupId::new(vec![0xab; 16]);
     let asset = runtime
@@ -289,6 +288,7 @@ async fn attachment_local_access_rejects_unbounded_inputs_without_starting_worke
             .is_err()
     );
     store
+        .app_storage()
         .invalidate_app_event_by_message_id(
             GROUP,
             &target().message_id_hex,
@@ -322,7 +322,7 @@ async fn attachment_progress_stream_observes_removal_without_network_or_erasing_
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let store = app.account_storage("alice").unwrap();
-    seed(&store, b"retained");
+    seed(&store.app_storage(), b"retained");
     let runtime = app.runtime();
     let group = GroupId::new(vec![0xab; 16]);
     let stream = runtime

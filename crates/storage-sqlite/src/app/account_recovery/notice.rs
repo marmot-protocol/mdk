@@ -1,6 +1,9 @@
 //! Parked recovery that hosts show as "history may be incomplete", and its one
 //! ending besides qualified completion: explicit, user-authorized retirement.
 use super::*;
+#[cfg(test)]
+use crate::SqliteAccountStorage;
+use crate::SqliteAppStorage;
 
 /// `incomplete_reason` recorded with `state = 2` when the user retires a parked
 /// obligation: the history may be incomplete. Retirement is its own outcome and
@@ -41,7 +44,7 @@ fn parked(rows: Vec<ParkedRow>) -> StorageResult<Vec<ParkedRecoveryObligation>> 
         .collect()
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Every pending obligation parked for explicit deep repair, oldest first.
     /// The set is input-relative to unresolved demand keys, never a history log.
     pub fn parked_recovery_obligations(&self) -> StorageResult<Vec<ParkedRecoveryObligation>> {
@@ -223,7 +226,10 @@ mod tests {
 
     fn fixture() -> SqliteAccountStorage {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.ensure_account_projection("alice").unwrap();
+        store
+            .app_storage()
+            .ensure_account_projection("alice")
+            .unwrap();
         store
     }
 
@@ -246,14 +252,16 @@ mod tests {
     /// Run one attempt for the selected obligation that certifies nothing and
     /// parks it, as the owner does after its fruitless comparison budget.
     fn park(store: &SqliteAccountStorage, id: [u8; 16]) -> RecoveryDemandTicket {
-        let mut fence = store.recovery_revision_fence().unwrap();
+        let mut fence = store.app_storage().recovery_revision_fence().unwrap();
         fence.obligations.retain(|(candidate, _)| *candidate == id);
         let attempt = store
+            .app_storage()
             .reserve_recovery_attempt(&fence, 1_000, 15_000, true)
             .unwrap()
             .unwrap()
             .attempt_serial;
         let token = store
+            .app_storage()
             .install_recovery_scope_plan(&fence, attempt, id, &[scope()])
             .unwrap()
             .unwrap()
@@ -271,6 +279,7 @@ mod tests {
         };
         assert!(
             !store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -281,6 +290,7 @@ mod tests {
                 .unwrap()
         );
         let notice = store
+            .app_storage()
             .parked_recovery_obligations()
             .unwrap()
             .into_iter()
@@ -296,14 +306,16 @@ mod tests {
         id: [u8; 16],
         scopes: &[RecoveryScopePlan],
     ) -> Option<RecoveryDemandTicket> {
-        let mut fence = store.recovery_revision_fence().unwrap();
+        let mut fence = store.app_storage().recovery_revision_fence().unwrap();
         fence.obligations.retain(|(candidate, _)| *candidate == id);
         let attempt = store
+            .app_storage()
             .reserve_recovery_attempt(&fence, 1_000, 15_000, true)
             .unwrap()
             .unwrap()
             .attempt_serial;
         let tokens = store
+            .app_storage()
             .install_recovery_scope_plan(&fence, attempt, id, scopes)
             .unwrap()
             .unwrap();
@@ -317,6 +329,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(
             !store
+                .app_storage()
                 .checkpoint_recovery_obligation(
                     &fence,
                     attempt,
@@ -327,6 +340,7 @@ mod tests {
                 .unwrap()
         );
         store
+            .app_storage()
             .parked_recovery_obligations()
             .unwrap()
             .into_iter()
@@ -337,22 +351,20 @@ mod tests {
     #[test]
     fn a_dismissed_incremental_notice_returns_only_for_a_new_stuck_route() {
         let store = fixture();
-        let incremental = store
+        let app = store.app_storage();
+        let incremental = app
             .request_recovery(RecoveryRequest::IncrementalHistory, 1)
             .unwrap();
         let ticket = try_park(&store, incremental.id, &[scope()]).expect("first notice");
         assert!(
-            store
-                .retire_parked_recovery_obligation(incremental.id, ticket.revision, 2_000)
+            app.retire_parked_recovery_obligation(incremental.id, ticket.revision, 2_000)
                 .unwrap()
         );
         // The next start's comparison still runs against the dismissed debt.
-        store
-            .join_recovery_comparison(&[1; 16], 3_000, &[scope()])
+        app.join_recovery_comparison(&[1; 16], 3_000, &[scope()])
             .unwrap();
         assert!(
-            store
-                .pending_recovery_demands()
+            app.pending_recovery_demands()
                 .unwrap()
                 .iter()
                 .any(|demand| demand.ticket.id == incremental.id),
@@ -363,24 +375,21 @@ mod tests {
             "the same stuck route is the condition the user dismissed"
         );
         assert!(
-            !store
-                .pending_recovery_demands()
+            !app.pending_recovery_demands()
                 .unwrap()
                 .iter()
                 .any(|demand| demand.ticket.id == incremental.id),
             "it is retired again, never counted as coverage"
         );
         assert!(
-            !store
-                .recovery_obligation_is_satisfied(incremental.id, ticket.revision)
+            !app.recovery_obligation_is_satisfied(incremental.id, ticket.revision)
                 .unwrap()
         );
         // A route whose required relays changed is a new condition.
         let mut moved = scope();
         moved.required_endpoints = vec!["b".into()];
         moved.admitted_endpoints = vec!["b".into()];
-        store
-            .join_recovery_comparison(&[2; 16], 4_000, &[moved.clone()])
+        app.join_recovery_comparison(&[2; 16], 4_000, &[moved.clone()])
             .unwrap();
         assert!(
             try_park(&store, incremental.id, &[moved]).is_some(),
@@ -390,6 +399,7 @@ mod tests {
 
     fn loss_obligation(store: &SqliteAccountStorage) -> [u8; 16] {
         store
+            .app_storage()
             .pending_recovery_demands()
             .unwrap()
             .into_iter()
@@ -414,14 +424,14 @@ mod tests {
     #[test]
     fn parking_lists_one_occurrence_with_cause_and_time() {
         let store = fixture();
-        store
-            .mark_account_delivery_recovery_bounded("alice", 7, 3, Some(5))
+        let app = store.app_storage();
+        app.mark_account_delivery_recovery_bounded("alice", 7, 3, Some(5))
             .unwrap();
         let id = loss_obligation(&store);
-        assert!(store.parked_recovery_obligations().unwrap().is_empty());
+        assert!(app.parked_recovery_obligations().unwrap().is_empty());
         let before = crate::base::codec::unix_now_ms() as u64;
         let ticket = park(&store, id);
-        let notices = store.parked_recovery_obligations().unwrap();
+        let notices = app.parked_recovery_obligations().unwrap();
         assert_eq!(notices.len(), 1);
         assert!(notices[0].ticket == ticket);
         assert_eq!(notices[0].cause, RecoveryCause::QueueLoss);
@@ -432,7 +442,7 @@ mod tests {
         let again = park(&store, id);
         assert!(again == ticket);
         assert_eq!(
-            store.parked_recovery_obligations().unwrap()[0].parked_at_ms,
+            app.parked_recovery_obligations().unwrap()[0].parked_at_ms,
             first
         );
     }
@@ -440,24 +450,22 @@ mod tests {
     #[test]
     fn retirement_is_its_own_outcome_and_never_coverage() {
         let store = fixture();
-        store
-            .mark_account_delivery_recovery_bounded("alice", 7, 3, Some(5))
+        let app = store.app_storage();
+        app.mark_account_delivery_recovery_bounded("alice", 7, 3, Some(5))
             .unwrap();
         let id = loss_obligation(&store);
         let ticket = park(&store, id);
-        let fence = store.recovery_revision_fence().unwrap();
-        let snapshot = store
+        let fence = app.recovery_revision_fence().unwrap();
+        let snapshot = app
             .recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
             .unwrap();
         assert!(
-            !store
-                .retire_parked_recovery_obligation(id, ticket.revision + 1, 2_000)
+            !app.retire_parked_recovery_obligation(id, ticket.revision + 1, 2_000)
                 .unwrap(),
             "an unknown occurrence changes nothing"
         );
         assert!(
-            store
-                .retire_parked_recovery_obligation(id, ticket.revision, 2_000)
+            app.retire_parked_recovery_obligation(id, ticket.revision, 2_000)
                 .unwrap()
         );
         assert_eq!(
@@ -468,26 +476,20 @@ mod tests {
                 ticket.revision as i64 + 1
             )
         );
-        assert!(store.parked_recovery_obligations().unwrap().is_empty());
-        assert!(store.pending_recovery_demands().unwrap().is_empty());
-        assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+        assert!(app.parked_recovery_obligations().unwrap().is_empty());
+        assert!(app.pending_recovery_demands().unwrap().is_empty());
+        assert!(app.account_delivery_recovery("alice").unwrap().is_none());
         for revision in [ticket.revision, ticket.revision + 1] {
-            assert!(
-                !store
-                    .recovery_obligation_is_satisfied(id, revision)
-                    .unwrap()
-            );
+            assert!(!app.recovery_obligation_is_satisfied(id, revision).unwrap());
         }
         assert!(
-            !store
-                .acknowledge_recovery_loss_snapshot(&fence, id, &snapshot)
+            !app.acknowledge_recovery_loss_snapshot(&fence, id, &snapshot)
                 .unwrap(),
             "retired loss can never be acknowledged as covered"
         );
-        assert_eq!(store.restore_unacknowledged_recovery_loss().unwrap(), 0);
+        assert_eq!(app.restore_unacknowledged_recovery_loss().unwrap(), 0);
         assert!(
-            store
-                .recovery_revision_fence()
+            app.recovery_revision_fence()
                 .unwrap()
                 .obligations
                 .is_empty(),
@@ -496,21 +498,18 @@ mod tests {
         // The retired watermark stays so a delayed duplicate cannot rearm it,
         // but it no longer bounds any loss goal.
         assert_eq!(
-            store
-                .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
+            app.recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
-            store
-                .recovery_loss_goal_floor("alice", RecoveryLossCause::Queue)
+            app.recovery_loss_goal_floor("alice", RecoveryLossCause::Queue)
                 .unwrap(),
             None
         );
         assert!(
-            !store
-                .retire_parked_recovery_obligation(id, ticket.revision, 2_000)
+            !app.retire_parked_recovery_obligation(id, ticket.revision, 2_000)
                 .unwrap(),
             "a second dismissal of the same occurrence is stale"
         );
@@ -519,81 +518,72 @@ mod tests {
     #[test]
     fn duplicate_observations_cannot_rearm_retired_loss() {
         let store = fixture();
-        store.mark_account_delivery_recovery("alice", 7, 3).unwrap();
-        store
-            .record_account_delivery_loss("alice", 9, 2, 10)
-            .unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
+        let app = store.app_storage();
+        app.mark_account_delivery_recovery("alice", 7, 3).unwrap();
+        app.record_account_delivery_loss("alice", 9, 2, 10).unwrap();
+        app.synchronize_account_delivery_loss("alice").unwrap();
         let id = loss_obligation(&store);
         let ticket = park(&store, id);
         assert!(
-            store
-                .retire_parked_recovery_obligation(id, ticket.revision, 2_000)
+            app.retire_parked_recovery_obligation(id, ticket.revision, 2_000)
                 .unwrap()
         );
-        let retired = store.recovery_revision_fence().unwrap();
+        let retired = app.recovery_revision_fence().unwrap();
         // The same generations observed again by the writer, the worker and
         // an import, in either token order, change nothing.
         for token in [7, 9] {
             let count = if token == 7 { 3 } else { 2 };
-            store
-                .record_account_delivery_loss("alice", token, count, 11)
+            app.record_account_delivery_loss("alice", token, count, 11)
                 .unwrap();
-            store
-                .mark_account_delivery_recovery("alice", token, count)
+            app.mark_account_delivery_recovery("alice", token, count)
                 .unwrap();
-            store.synchronize_account_delivery_loss("alice").unwrap();
+            app.synchronize_account_delivery_loss("alice").unwrap();
         }
-        assert_eq!(store.recovery_revision_fence().unwrap(), retired);
+        assert_eq!(app.recovery_revision_fence().unwrap(), retired);
         assert_eq!(row(&store, id).0, 2);
-        assert!(store.parked_recovery_obligations().unwrap().is_empty());
+        assert!(app.parked_recovery_obligations().unwrap().is_empty());
     }
 
     #[test]
     fn new_loss_after_retirement_is_a_new_occurrence() {
         for grown in [false, true] {
             let store = fixture();
-            store.mark_account_delivery_recovery("alice", 7, 3).unwrap();
+            let app = store.app_storage();
+            app.mark_account_delivery_recovery("alice", 7, 3).unwrap();
             let id = loss_obligation(&store);
             let first = park(&store, id);
             assert!(
-                store
-                    .retire_parked_recovery_obligation(id, first.revision, 2_000)
+                app.retire_parked_recovery_obligation(id, first.revision, 2_000)
                     .unwrap()
             );
             if grown {
                 // More drops in the retired generation are loss the
                 // retirement never covered.
-                store
-                    .record_account_delivery_loss_bounded("alice", 7, 4, 12, Some(8))
+                app.record_account_delivery_loss_bounded("alice", 7, 4, 12, Some(8))
                     .unwrap();
             } else {
-                store
-                    .record_account_delivery_loss_bounded("alice", 11, 1, 12, Some(8))
+                app.record_account_delivery_loss_bounded("alice", 11, 1, 12, Some(8))
                     .unwrap();
             }
-            store.synchronize_account_delivery_loss("alice").unwrap();
+            app.synchronize_account_delivery_loss("alice").unwrap();
             let (state, reason, revision) = row(&store, id);
             assert_eq!((state, reason), (0, None));
             assert!(revision as u64 > first.revision + 1);
-            assert!(store.account_delivery_recovery("alice").unwrap().is_some());
+            assert!(app.account_delivery_recovery("alice").unwrap().is_some());
             // Only the new charge bounds the reopened goal.
             assert_eq!(
-                store
-                    .recovery_loss_goal_floor("alice", RecoveryLossCause::Queue)
+                app.recovery_loss_goal_floor("alice", RecoveryLossCause::Queue)
                     .unwrap(),
                 if grown { None } else { Some(8) }
             );
             let second = park(&store, id);
             assert!(second != first);
             assert!(
-                !store
-                    .retire_parked_recovery_obligation(id, first.revision, 3_000)
+                !app.retire_parked_recovery_obligation(id, first.revision, 3_000)
                     .unwrap()
             );
             assert!(
-                store
-                    .retire_parked_recovery_obligation(id, second.revision, 3_000)
+                app.retire_parked_recovery_obligation(id, second.revision, 3_000)
                     .unwrap()
             );
         }
@@ -602,27 +592,24 @@ mod tests {
     #[test]
     fn unimported_loss_makes_a_retirement_stale() {
         let store = fixture();
-        store.mark_account_delivery_recovery("alice", 7, 3).unwrap();
+        let app = store.app_storage();
+        app.mark_account_delivery_recovery("alice", 7, 3).unwrap();
         let id = loss_obligation(&store);
         let ticket = park(&store, id);
         // The off-worker writer recorded more loss that no import joined yet.
-        store
-            .record_account_delivery_loss("alice", 7, 5, 11)
-            .unwrap();
+        app.record_account_delivery_loss("alice", 7, 5, 11).unwrap();
         assert!(
-            !store
-                .retire_parked_recovery_obligation(id, ticket.revision, 2_000)
+            !app.retire_parked_recovery_obligation(id, ticket.revision, 2_000)
                 .unwrap()
         );
         assert_eq!(row(&store, id).0, 0);
-        store.synchronize_account_delivery_loss("alice").unwrap();
+        app.synchronize_account_delivery_loss("alice").unwrap();
         assert!(
-            !store
-                .retire_parked_recovery_obligation(id, ticket.revision, 2_000)
+            !app.retire_parked_recovery_obligation(id, ticket.revision, 2_000)
                 .unwrap(),
             "the import rearmed the obligation under a new revision"
         );
-        assert!(store.parked_recovery_obligations().unwrap().is_empty());
+        assert!(app.parked_recovery_obligations().unwrap().is_empty());
     }
 
     #[test]
@@ -632,27 +619,27 @@ mod tests {
         let key = SqlCipherKey::new("history notice retirement").unwrap();
         let (id, ticket) = {
             let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-            store.ensure_account_projection("alice").unwrap();
-            store.mark_account_delivery_recovery("alice", 7, 3).unwrap();
+            let app = store.app_storage();
+            app.ensure_account_projection("alice").unwrap();
+            app.mark_account_delivery_recovery("alice", 7, 3).unwrap();
             let id = loss_obligation(&store);
             let ticket = park(&store, id);
             assert!(
-                store
-                    .retire_parked_recovery_obligation(id, ticket.revision, 2_000)
+                app.retire_parked_recovery_obligation(id, ticket.revision, 2_000)
                     .unwrap()
             );
             (id, ticket)
         };
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        store.restore_unacknowledged_recovery_loss().unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        store.restore_recovery_waiters().unwrap();
+        let app = store.app_storage();
+        app.restore_unacknowledged_recovery_loss().unwrap();
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        app.restore_recovery_waiters().unwrap();
         assert_eq!(row(&store, id).0, 2);
-        assert!(store.parked_recovery_obligations().unwrap().is_empty());
-        assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+        assert!(app.parked_recovery_obligations().unwrap().is_empty());
+        assert!(app.account_delivery_recovery("alice").unwrap().is_none());
         assert!(
-            !store
-                .retire_parked_recovery_obligation(id, ticket.revision, 3_000)
+            !app.retire_parked_recovery_obligation(id, ticket.revision, 3_000)
                 .unwrap()
         );
     }
@@ -660,44 +647,41 @@ mod tests {
     #[test]
     fn retired_epoch_gap_reopens_only_for_a_higher_epoch() {
         let store = fixture();
+        let app = store.app_storage();
         store.put_group(&sample_group(gid(1), 7, 2)).unwrap();
         let arm = |epoch| {
-            store
-                .arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
-                    group_id_hex: hex::encode(gid(1).as_slice()),
-                    stalled_epoch: epoch,
-                }])
-                .unwrap()
+            app.arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(gid(1).as_slice()),
+                stalled_epoch: epoch,
+            }])
+            .unwrap()
         };
         arm(7);
-        let id = store.pending_recovery_demands().unwrap()[0].ticket.id;
+        let id = app.pending_recovery_demands().unwrap()[0].ticket.id;
         let ticket = park(&store, id);
-        let group = store
+        let group = app
             .parked_group_recovery_obligations(gid(1).as_slice())
             .unwrap();
         assert_eq!(group.len(), 1);
         assert_eq!(group[0].cause, RecoveryCause::EpochGap);
         assert_eq!(group[0].group_id.as_deref(), Some(gid(1).as_slice()));
         assert!(
-            store
-                .parked_group_recovery_obligations(gid(2).as_slice())
+            app.parked_group_recovery_obligations(gid(2).as_slice())
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            store
-                .retire_parked_recovery_obligation(id, ticket.revision, 2_000)
+            app.retire_parked_recovery_obligation(id, ticket.revision, 2_000)
                 .unwrap()
         );
         arm(7);
         assert_eq!(row(&store, id).0, 2);
-        assert!(store.pending_epoch_backfill_intents().unwrap().is_empty());
+        assert!(app.pending_epoch_backfill_intents().unwrap().is_empty());
         arm(8);
         assert_eq!(row(&store, id).0, 0);
-        assert_eq!(store.pending_epoch_backfill_intents().unwrap().len(), 1);
+        assert_eq!(app.pending_epoch_backfill_intents().unwrap().len(), 1);
         assert!(
-            store
-                .parked_group_recovery_obligations(gid(1).as_slice())
+            app.parked_group_recovery_obligations(gid(1).as_slice())
                 .unwrap()
                 .is_empty()
         );
@@ -710,21 +694,20 @@ mod tests {
     #[test]
     fn epoch_gap_stays_open_at_its_stalled_epoch_until_cleared_or_left_behind() {
         let store = fixture();
+        let app = store.app_storage();
         store.put_group(&sample_group(gid(1), 7, 2)).unwrap();
         let group = gid(1);
         let open_since = |group: &cgka_traits::GroupId, epoch| {
-            store
-                .epoch_gap_recovery_open_since(group.as_slice(), epoch)
+            app.epoch_gap_recovery_open_since(group.as_slice(), epoch)
                 .unwrap()
         };
         assert_eq!(open_since(&group, 7), None);
         let before = crate::base::codec::unix_now_seconds_i64() as u64 * 1_000;
-        store
-            .arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
-                group_id_hex: hex::encode(group.as_slice()),
-                stalled_epoch: 7,
-            }])
-            .unwrap();
+        app.arm_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+            group_id_hex: hex::encode(group.as_slice()),
+            stalled_epoch: 7,
+        }])
+        .unwrap();
         let since = open_since(&group, 7).expect("an armed gap is open");
         assert!(since >= before);
         // A reorg back below the stalled epoch is still behind.
@@ -733,7 +716,7 @@ mod tests {
         assert_eq!(open_since(&group, 8), None);
         assert_eq!(open_since(&gid(2), 7), None);
 
-        let id = store.pending_recovery_demands().unwrap()[0].ticket.id;
+        let id = app.pending_recovery_demands().unwrap()[0].ticket.id;
         let ticket = park(&store, id);
         assert_eq!(
             open_since(&group, 7),
@@ -741,8 +724,7 @@ mod tests {
             "parked recovery has not proven the device caught up"
         );
         assert!(
-            store
-                .retire_parked_recovery_obligation(id, ticket.revision, 2_000)
+            app.retire_parked_recovery_obligation(id, ticket.revision, 2_000)
                 .unwrap()
         );
         assert_eq!(
@@ -751,44 +733,41 @@ mod tests {
             "dismissing the notice leaves the device on the stalled epoch"
         );
         assert_eq!(open_since(&group, 8), None);
-        store
-            .clear_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
-                group_id_hex: hex::encode(group.as_slice()),
-                stalled_epoch: 7,
-            }])
-            .unwrap();
+        app.clear_epoch_backfill_intents(&[crate::StoredEpochBackfillIntent {
+            group_id_hex: hex::encode(group.as_slice()),
+            stalled_epoch: 7,
+        }])
+        .unwrap();
         assert_eq!(open_since(&group, 7), None);
     }
 
     #[test]
     fn retired_history_requests_reopen_as_fresh_demand() {
         let store = fixture();
-        let incremental = store
+        let app = store.app_storage();
+        let incremental = app
             .request_recovery(RecoveryRequest::IncrementalHistory, 1)
             .unwrap();
         let stale = park(&store, incremental.id);
         // A startup comparison join is new evidence: it unparks the debt.
-        store
-            .join_recovery_comparison(&[1; 16], 1_000, &[scope()])
+        app.join_recovery_comparison(&[1; 16], 1_000, &[scope()])
             .unwrap();
-        assert!(store.parked_recovery_obligations().unwrap().is_empty());
+        assert!(app.parked_recovery_obligations().unwrap().is_empty());
         assert!(
-            !store
-                .retire_parked_recovery_obligation(incremental.id, stale.revision, 2_000)
+            !app.retire_parked_recovery_obligation(incremental.id, stale.revision, 2_000)
                 .unwrap()
         );
         let ticket = park(&store, incremental.id);
-        assert!(store.recovery_comparison().unwrap().pending());
+        assert!(app.recovery_comparison().unwrap().pending());
         assert!(
-            store
-                .retire_parked_recovery_obligation(incremental.id, ticket.revision, 2_000)
+            app.retire_parked_recovery_obligation(incremental.id, ticket.revision, 2_000)
                 .unwrap()
         );
         assert!(
-            !store.recovery_comparison().unwrap().pending(),
+            !app.recovery_comparison().unwrap().pending(),
             "the comparison slot served only the retired debt"
         );
-        let reopened = store
+        let reopened = app
             .request_recovery(RecoveryRequest::IncrementalHistory, 3_000)
             .unwrap();
         assert_eq!(reopened.id, incremental.id);
@@ -796,7 +775,7 @@ mod tests {
         assert!(reopened.revision > ticket.revision + 1);
 
         let operation = [5; 16];
-        let explicit = store
+        let explicit = app
             .request_recovery(
                 RecoveryRequest::ExplicitHistory {
                     operation_id: &operation,
@@ -806,8 +785,7 @@ mod tests {
             .unwrap();
         let ticket = park(&store, explicit.id);
         assert!(
-            store
-                .retire_parked_recovery_obligation(explicit.id, ticket.revision, 2_000)
+            app.retire_parked_recovery_obligation(explicit.id, ticket.revision, 2_000)
                 .unwrap()
         );
         assert_eq!(
@@ -822,7 +800,7 @@ mod tests {
                 .unwrap(),
             0
         );
-        let next = store
+        let next = app
             .request_recovery(
                 RecoveryRequest::ExplicitHistory {
                     operation_id: &[6; 16],

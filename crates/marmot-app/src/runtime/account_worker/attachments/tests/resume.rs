@@ -1,6 +1,7 @@
 use super::*;
 use crate::media::attachment_resume::AttachmentResume;
 use sha2::{Digest, Sha256};
+use storage_sqlite::SqliteAppStorage;
 use storage_sqlite::{ATTACHMENT_CHECKPOINT_BYTES, AttachmentPartialIdentity};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -45,6 +46,7 @@ async fn client_at_with_mode(
     client.state.groups.retain(|g| g.group_id_hex != GROUP);
     client.state.groups.push(projection(reference));
     store
+        .app_storage()
         .remember_encrypted_media_epoch_secret(
             GROUP,
             crate::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
@@ -55,12 +57,12 @@ async fn client_at_with_mode(
     (client, store)
 }
 fn claim(store: &SqliteAccountStorage) -> AttachmentAcquisition {
+    let app = store.app_storage();
     let now = crate::unix_now_seconds();
-    store.resume_attachment_acquisitions(now, 64).unwrap();
-    admit_demands(store, now, true).unwrap();
-    let asset = store.due_attachment_acquisitions(now, 1).unwrap().remove(0);
-    store
-        .claim_attachment_acquisition(&asset, now, now + 1200)
+    app.resume_attachment_acquisitions(now, 64).unwrap();
+    admit_demands(&app, now, true).unwrap();
+    let asset = app.due_attachment_acquisitions(now, 1).unwrap().remove(0);
+    app.claim_attachment_acquisition(&asset, now, now + 1200)
         .unwrap()
         .unwrap()
 }
@@ -82,7 +84,7 @@ fn resume_context(
             .unwrap()
             .try_into()
             .unwrap(),
-        media: test_media(store, dir),
+        media: test_media(&store.app_storage(), dir),
         directory: dir.into(),
         policy: storage_sqlite::AttachmentDownloadPolicy {
             automatic: true,
@@ -95,7 +97,7 @@ fn resume_context(
 
 /// A media store over the account's own `media/` directory, where the app's
 /// store (which publishes and sweeps) finds the same wire checkpoints.
-fn test_media(store: &SqliteAccountStorage, dir: &std::path::Path) -> crate::AccountMediaStore {
+fn test_media(store: &SqliteAppStorage, dir: &std::path::Path) -> crate::AccountMediaStore {
     media_store::MediaStore::new(
         AccountHome::open(dir)
             .account_dir("alice")
@@ -134,9 +136,11 @@ fn checkpoint(
     bytes: &[u8],
     clock: fn() -> u64,
 ) -> bool {
-    test_media(store, dir)
+    test_media(&store.app_storage(), dir)
         .checkpoint_append(
-            &store.attachment_checkpoint(job, identity.clone(), clock),
+            &store
+                .app_storage()
+                .attachment_checkpoint(job, identity.clone(), clock),
             0,
             bytes,
         )
@@ -151,7 +155,7 @@ fn saved_prefix(
 ) -> Option<Vec<u8>> {
     crate::media::attachment_resume::read_checkpoint(
         store,
-        &test_media(store, dir),
+        &test_media(&store.app_storage(), dir),
         job,
         crate::unix_now_seconds(),
         64 * 1024 * 1024,
@@ -290,6 +294,7 @@ async fn file_attachment_resume_survives_irregular_chunks_and_publishes_authenti
     .unwrap();
     assert_eq!(
         store
+            .app_storage()
             .attachment_acquisition_status(&job.reference)
             .unwrap()
             .unwrap()
@@ -555,6 +560,7 @@ async fn check_resume_failure(failure: ResumeFailure) {
     );
     assert!(
         store
+            .app_storage()
             .read_retained_attachment(&job.reference, crate::unix_now_seconds(), 0, 10)
             .unwrap()
             .is_none()
@@ -589,6 +595,7 @@ async fn check_disk_reserve(length: ResponseLength) {
     let job = claim(&store);
     assert!(
         store
+            .app_storage()
             .promote_attachment_demand(&job.reference, crate::unix_now_seconds())
             .unwrap()
     );
@@ -596,7 +603,7 @@ async fn check_disk_reserve(length: ResponseLength) {
     context.automatic = false;
     let (updates, mut progress) = tokio::sync::watch::channel(());
     context.updates = Some(updates);
-    let server_store = store.clone();
+    let server_store = store.app_storage();
     let mut policy = context.policy.clone();
     let unavailable_reserve = fs4::total_space(dir.path()).unwrap().saturating_add(1);
     let server = tokio::spawn(async move {
@@ -656,6 +663,7 @@ async fn check_disk_reserve(length: ResponseLength) {
     );
     assert!(
         store
+            .app_storage()
             .read_retained_attachment(&job.reference, crate::unix_now_seconds(), 0, 10)
             .unwrap()
             .is_none()
@@ -709,6 +717,7 @@ async fn file_attachment_corrupt_ciphertext_is_terminal_and_never_readable() {
     );
     assert!(
         store
+            .app_storage()
             .read_retained_attachment(&job.reference, crate::unix_now_seconds(), 0, 10)
             .unwrap()
             .is_none()
@@ -860,6 +869,7 @@ async fn attachment_resume_interrupted_transfer_reopens_and_publishes_verified_b
     ));
     assert_eq!(
         store
+            .app_storage()
             .load_attachment_partial(&old, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
             .unwrap()
             .unwrap()
@@ -900,6 +910,7 @@ async fn attachment_resume_interrupted_transfer_reopens_and_publishes_verified_b
     complete(&client, &job, Ok(result)).unwrap();
     assert_eq!(
         store
+            .app_storage()
             .attachment_acquisition_status(&job.reference)
             .unwrap()
             .unwrap()
@@ -908,6 +919,7 @@ async fn attachment_resume_interrupted_transfer_reopens_and_publishes_verified_b
     );
     assert!(
         store
+            .app_storage()
             .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
             .unwrap()
             .is_none()
@@ -1086,6 +1098,7 @@ async fn attachment_resume_validates_ranges_and_restarts_incompatible_responses(
             );
             assert_eq!(
                 store
+                    .app_storage()
                     .load_attachment_partial(
                         &job,
                         crate::unix_now_seconds(),
@@ -1141,6 +1154,7 @@ async fn attachment_resume_cancellation_keeps_only_committed_ciphertext() {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if store
+                .app_storage()
                 .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
                 .unwrap()
                 .is_some_and(|p| p.received == ATTACHMENT_CHECKPOINT_BYTES as u64)
@@ -1157,6 +1171,7 @@ async fn attachment_resume_cancellation_keeps_only_committed_ciphertext() {
     let next = claim(&store);
     assert_eq!(
         store
+            .app_storage()
             .load_attachment_partial(&next, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
             .unwrap()
             .unwrap()
@@ -1209,6 +1224,7 @@ async fn attachment_resume_without_strong_validator_uses_full_download() {
         );
         assert!(
             store
+                .app_storage()
                 .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
                 .unwrap()
                 .is_none()
@@ -1494,6 +1510,7 @@ async fn attachment_resume_complete_small_body_does_not_write_checkpoint() {
     assert_eq!(result.plaintext, b"small complete attachment");
     assert!(
         store
+            .app_storage()
             .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
             .unwrap()
             .is_none()
@@ -1550,6 +1567,7 @@ async fn attachment_resume_full_disk_during_checkpoint_write_parks() {
         result.as_ref().err()
     );
     let part = store
+        .app_storage()
         .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
         .unwrap()
         .unwrap();
@@ -1593,6 +1611,7 @@ async fn attachment_resume_disabled_acquisition_still_prunes_expired_checkpoints
     ));
     assert!(
         store
+            .app_storage()
             .load_attachment_partial(&job, earlier, 10, None)
             .unwrap()
             .is_some()
@@ -1608,6 +1627,7 @@ async fn attachment_resume_disabled_acquisition_still_prunes_expired_checkpoints
     .unwrap();
     assert!(
         store
+            .app_storage()
             .load_attachment_partial(&job, earlier, 10, None)
             .unwrap()
             .is_none()
@@ -1686,6 +1706,7 @@ async fn attachment_resume_hash_failure_clears_redirected_replacement() {
     // must discard that representation even though the candidate URL differs.
     assert!(
         store
+            .app_storage()
             .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
             .unwrap()
             .is_none()
@@ -1771,6 +1792,7 @@ async fn attachment_resume_hash_miss_retries_from_zero_after_reopen() {
             assert!(matches!(result, Err(AttachmentDownloadFailure::Retry(_))));
             assert!(
                 store
+                    .app_storage()
                     .load_attachment_partial(
                         &job,
                         crate::unix_now_seconds(),
@@ -1782,6 +1804,7 @@ async fn attachment_resume_hash_miss_retries_from_zero_after_reopen() {
             );
             complete(&client, &job, result).unwrap();
             let status = store
+                .app_storage()
                 .attachment_acquisition_status(&job.reference)
                 .unwrap()
                 .unwrap();
@@ -1789,13 +1812,20 @@ async fn attachment_resume_hash_miss_retries_from_zero_after_reopen() {
                 status.state,
                 storage_sqlite::AttachmentAcquisitionState::RetryScheduled
             );
-            assert_eq!(store.retained_attachment_byte_count().unwrap(), 0);
+            assert_eq!(
+                store
+                    .app_storage()
+                    .retained_attachment_byte_count()
+                    .unwrap(),
+                0
+            );
             store.close().unwrap();
             drop(client);
             drop(store);
             let (client, store) = client_at(dir.path(), &reference, false).await;
             let now = status.due.unwrap();
             let job = store
+                .app_storage()
                 .claim_attachment_acquisition(&job.reference, now, now + 1200)
                 .unwrap()
                 .unwrap();
@@ -1818,6 +1848,7 @@ async fn attachment_resume_hash_miss_retries_from_zero_after_reopen() {
             complete(&client, &job, result).unwrap();
             assert_eq!(
                 store
+                    .app_storage()
                     .attachment_acquisition_status(&job.reference)
                     .unwrap()
                     .unwrap()
@@ -1864,11 +1895,13 @@ async fn attachment_controls_interrupt_http_and_release_capacity_without_publish
         schedule(&client, &shared, &http, &mut admission).unwrap();
         started.await.unwrap();
         let entry = store
+            .app_storage()
             .attachment_history_page(GROUP, 1, None)
             .unwrap()
             .entries
             .remove(0);
         let asset = store
+            .app_storage()
             .attachment_transfer_status(
                 GROUP,
                 &entry.message_id_hex,
@@ -1886,10 +1919,14 @@ async fn attachment_controls_interrupt_http_and_release_capacity_without_publish
                 super::super::super::super::attachment_controls::default_policy(&client.app.config);
             policy.automatic = false;
             store
+                .app_storage()
                 .set_attachment_download_policy(&policy, crate::unix_now_seconds())
                 .unwrap();
         } else {
-            store.cancel_attachment_acquisition(&asset).unwrap();
+            store
+                .app_storage()
+                .cancel_attachment_acquisition(&asset)
+                .unwrap();
         }
         shared.attachment_cancellations.send_modify(|_| {});
         let done = tokio::time::timeout(Duration::from_secs(3), completions.recv())
@@ -1913,6 +1950,7 @@ async fn attachment_controls_interrupt_http_and_release_capacity_without_publish
         );
         assert_eq!(
             store
+                .app_storage()
                 .attachment_transfer_status(
                     GROUP,
                     &entry.message_id_hex,
@@ -1976,6 +2014,7 @@ async fn attachment_body_idle_deadline_releases_global_capacity_and_retries() {
     assert_eq!(shared.attachment_transfer.available_permits(), 1);
     assert_eq!(
         store
+            .app_storage()
             .attachment_acquisition_status(&asset)
             .unwrap()
             .unwrap()
@@ -2040,8 +2079,12 @@ async fn attachment_http_attempt_budget_includes_transport_retries() {
                 .is_err()
         );
         let now = crate::unix_now_seconds();
-        store.fail_attachment_acquisition(&job, Some(now)).unwrap();
+        store
+            .app_storage()
+            .fail_attachment_acquisition(&job, Some(now))
+            .unwrap();
         match store
+            .app_storage()
             .claim_attachment_acquisition(&asset, now, now + 1200)
             .unwrap()
         {
@@ -2052,6 +2095,7 @@ async fn attachment_http_attempt_budget_includes_transport_retries() {
     assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 16);
     assert!(
         store
+            .app_storage()
             .attachment_transfer_candidates(crate::unix_now_seconds(), 64, true)
             .unwrap()
             .is_empty()
@@ -2113,7 +2157,7 @@ async fn attachment_revocation_prevents_retry_and_old_approval_cannot_restore_it
     let job = claim(&store);
     let mut resume = resume_context(&store, &job, dir.path(), &reference);
     resume.permission = runtime.shared.attachment_permissions.lease(
-        &store.attachment_store_identity().unwrap(),
+        &store.app_storage().attachment_store_identity().unwrap(),
         &reference.media_type,
     );
     assert!(resume.permission.is_some());
@@ -2219,7 +2263,13 @@ async fn attachment_retained_media_body_is_not_downloaded_again() {
         schedule(&client, &runtime.shared, &http, &mut admission).unwrap();
     }
     // Retained in the media store, not the database's byte tables.
-    assert_eq!(store.retained_attachment_byte_count().unwrap(), 0);
+    assert_eq!(
+        store
+            .app_storage()
+            .retained_attachment_byte_count()
+            .unwrap(),
+        0
+    );
     assert!(!admission.is_waiting());
     server.await.unwrap();
 }
@@ -2288,15 +2338,18 @@ async fn attachment_verified_http_body_publishes_after_permission_and_policy_rev
     assert!(result.is_ok());
     assert!(finishing.load(std::sync::atomic::Ordering::Acquire));
     store
+        .app_storage()
         .pause_automatic_attachments(crate::unix_now_seconds())
         .unwrap();
     let mut policy = store
+        .app_storage()
         .attachment_download_policy(
             &super::super::super::super::attachment_controls::default_policy(&client.app.config),
         )
         .unwrap();
     policy.automatic = false;
     store
+        .app_storage()
         .set_attachment_download_policy(&policy, crate::unix_now_seconds())
         .unwrap();
     // Both completion and cancellation are ready. Completion owns the body.
@@ -2405,6 +2458,7 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
     ));
     complete(&client, &job, result).unwrap();
     let status = store
+        .app_storage()
         .attachment_acquisition_status(&job.reference)
         .unwrap()
         .unwrap();
@@ -2415,6 +2469,7 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
     assert_eq!(status.due, None, "no timer runs while parked");
     assert_eq!(
         store
+            .app_storage()
             .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, 20, true)
             .unwrap()
             .unwrap()
@@ -2425,6 +2480,7 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
     let free = fs4::available_space(dir.path()).unwrap();
     assert_eq!(
         store
+            .app_storage()
             .readmit_storage_blocked_attachments(
                 now,
                 unavailable_reserve,
@@ -2438,6 +2494,7 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
     );
     assert_eq!(
         store
+            .app_storage()
             .readmit_storage_blocked_attachments(
                 now,
                 0,
@@ -2452,6 +2509,7 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
         1
     );
     let status = store
+        .app_storage()
         .attachment_acquisition_status(&job.reference)
         .unwrap()
         .unwrap();
@@ -2461,6 +2519,7 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
     );
     let due = status.due.unwrap();
     let next = store
+        .app_storage()
         .claim_attachment_acquisition(&job.reference, due, due + 180)
         .unwrap()
         .unwrap();
@@ -2475,6 +2534,7 @@ async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_f
     complete(&client, &next, result).unwrap();
     assert_eq!(
         store
+            .app_storage()
             .attachment_acquisition_status(&next.reference)
             .unwrap()
             .unwrap()
@@ -2520,6 +2580,7 @@ async fn attachment_missing_on_every_locator_fails_without_retry() {
     assert!(matches!(&result, Err(AttachmentDownloadFailure::Stop(_))));
     complete(&client, &job, result).unwrap();
     let status = store
+        .app_storage()
         .attachment_acquisition_status(&job.reference)
         .unwrap()
         .unwrap();
@@ -2531,6 +2592,7 @@ async fn attachment_missing_on_every_locator_fails_without_retry() {
     let now = crate::unix_now_seconds();
     assert_eq!(
         store
+            .app_storage()
             .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
             .unwrap()
             .unwrap()
@@ -2539,6 +2601,7 @@ async fn attachment_missing_on_every_locator_fails_without_retry() {
     );
     assert!(
         store
+            .app_storage()
             .explicitly_retry_attachment(&job.reference, now)
             .unwrap()
     );
@@ -2609,13 +2672,14 @@ async fn promoted_body_revocation_order(pause_first: bool) {
     );
     let job = claim(&store);
     let deadline = store
+        .app_storage()
         .attachment_acquisition_status(&job.reference)
         .unwrap()
         .unwrap()
         .due;
     let mut resume = resume_context(&store, &job, dir.path(), &reference);
     resume.permission = runtime.shared.attachment_permissions.lease(
-        &store.attachment_store_identity().unwrap(),
+        &store.app_storage().attachment_store_identity().unwrap(),
         &reference.media_type,
     );
     let (updates, mut progress) = tokio::sync::watch::channel(());
@@ -2640,11 +2704,13 @@ async fn promoted_body_revocation_order(pause_first: bool) {
         // Freeze the durable pause before upgrading intent; the HTTP poll stays
         // held so the test controls the storage race rather than timer ordering.
         store
+            .app_storage()
             .pause_automatic_attachments(crate::unix_now_seconds())
             .unwrap();
     }
     assert!(
         store
+            .app_storage()
             .promote_attachment_demand(&job.reference, crate::unix_now_seconds())
             .unwrap()
     );
@@ -2657,6 +2723,7 @@ async fn promoted_body_revocation_order(pause_first: bool) {
     assert_eq!(result.plaintext, body);
     assert_eq!(
         store
+            .app_storage()
             .attachment_acquisition_status(&job.reference)
             .unwrap()
             .unwrap()
@@ -2665,6 +2732,7 @@ async fn promoted_body_revocation_order(pause_first: bool) {
     );
     assert_eq!(
         store
+            .app_storage()
             .complete_attachment_acquisition(
                 &job,
                 &result.plaintext,

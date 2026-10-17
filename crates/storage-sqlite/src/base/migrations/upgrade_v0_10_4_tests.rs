@@ -159,6 +159,7 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
     // Forward migration through the production open path.
     let key = SqlCipherKey::new(FIXTURE_KEY).unwrap();
     let store = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+    let app = store.app_storage();
     assert_eq!(
         store.migration_summary().0,
         MIGRATIONS.len() - V0_10_4_LATEST_MIGRATION
@@ -208,13 +209,12 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
         assert_eq!(cursor(&conn), Some(PERSISTED_CURSOR));
         assert_eq!(retained_routes(&conn), before_routes);
     }
-    assert!(store.parked_recovery_obligations().unwrap().is_empty());
+    assert!(app.parked_recovery_obligations().unwrap().is_empty());
 
     // The first account load stamps the retained route once.
     let first_load = 1_800_000_000;
     assert_eq!(
-        store
-            .stamp_unrecorded_prior_route_switches(first_load)
+        app.stamp_unrecorded_prior_route_switches(first_load)
             .unwrap(),
         1
     );
@@ -223,8 +223,7 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
     expected[0].1[0]["replaced_at"] = first_load.into();
     assert_eq!(stamped, expected);
     assert_eq!(
-        store
-            .stamp_unrecorded_prior_route_switches(first_load + 600)
+        app.stamp_unrecorded_prior_route_switches(first_load + 600)
             .unwrap(),
         0
     );
@@ -236,6 +235,7 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
     assert_eq!(reopened.migration_summary().0, 0);
     assert_eq!(
         reopened
+            .app_storage()
             .stamp_unrecorded_prior_route_switches(first_load + 86_400)
             .unwrap(),
         0
@@ -245,7 +245,13 @@ fn v0_10_4_account_upgrades_without_losing_state_or_raising_notices() {
         assert_eq!(retained_routes(&conn), stamped);
         assert_eq!(cursor(&conn), Some(PERSISTED_CURSOR));
     }
-    assert!(reopened.parked_recovery_obligations().unwrap().is_empty());
+    assert!(
+        reopened
+            .app_storage()
+            .parked_recovery_obligations()
+            .unwrap()
+            .is_empty()
+    );
     reopened.close().unwrap();
 
     // v0.10.4 refuses the upgraded database instead of misreading it.
