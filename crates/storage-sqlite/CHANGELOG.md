@@ -7,9 +7,12 @@
 - Migration 0113 advances account storage to schema 113 on first open. Older
   binaries reject the upgraded database; downgrade is unsupported. It rebuilds
   `media_files` to allow a `staged` state (an outgoing body its upload owns,
-  not yet referenced) and adds `outgoing_attachment_uploads.file_id`. Deleting
-  an upload, or pointing it at another file, deletes a still-staged file's key;
-  a promoted file is kept (mdk#2314 step 3).
+  not yet referenced) and adds `outgoing_attachment_uploads.file_id`. A media
+  file now lives while a slot references it or an upload owns it, so an
+  upload shared by several messages keeps its promoted file for the ones still
+  waiting. Deleting an upload, or pointing it at another file, deletes a
+  still-staged file's key, and a promoted one no slot references (mdk#2314
+  step 3).
 - `promote_attachment_uploads` skips uploads that have a media store file;
   promote those through `MediaStore::promote` with an
   `AttachmentUploadPromotion`.

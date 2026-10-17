@@ -274,6 +274,10 @@ pub enum PromotedOutcome {
     /// Nothing to attach: the target refused (fences, removal) or `id` is no
     /// longer its file. A staged row is left as it is.
     Superseded,
+    /// Every slot already held its body, so the owner had nothing left to
+    /// fill: it was consumed, and the staged row deleted with it. The store
+    /// unlinks the file.
+    Released,
 }
 
 /// Promotion of a staged (or already promoted) file into the slots of a
@@ -284,7 +288,8 @@ pub trait PromoteTarget {
     /// the row's category and digest is `Present`, attach the twin and delete
     /// `id`'s row (`Existing`); an `Absent` twin is marked lost; otherwise
     /// mark `id` ready and attach it (`Ready`). If `id` is already ready,
-    /// attach it without a twin check (`Ready`). A presence error is
-    /// returned and nothing changes.
+    /// attach it without a twin check (`Ready`). If every slot already holds
+    /// its body and the owner is consumed, a still-staged `id` goes with it
+    /// (`Released`). A presence error is returned and nothing changes.
     fn commit_promoted(&self, id: FileId, present: Presence<'_>) -> CatalogResult<PromotedOutcome>;
 }

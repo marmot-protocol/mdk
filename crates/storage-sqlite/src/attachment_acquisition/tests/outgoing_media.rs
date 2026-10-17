@@ -205,3 +205,122 @@ fn releasing_a_staged_upload_keeps_the_upload_row() {
     assert_eq!(store.attachment_upload_file(&token).unwrap(), None);
     assert!(!media.path(&id).exists());
 }
+
+/// Stage `BODY` into a fresh upload bound to `message`'s slot.
+fn stage_upload(
+    store: &SqliteAccountStorage,
+    media: &MediaStore<crate::SqliteMediaCatalog>,
+    message: &str,
+) -> (Vec<u8>, media_store::FileId) {
+    let token = store
+        .reserve_attachment_upload(GROUP, 3, 11)
+        .unwrap()
+        .unwrap();
+    let StageOutcome::Staged { id, .. } = media
+        .stage(
+            &store.attachment_upload_stage(&token),
+            Category::Retained,
+            &mut std::io::Cursor::new(BODY),
+            BODY.len() as u64,
+            11,
+            &|| false,
+        )
+        .unwrap()
+    else {
+        panic!("staged");
+    };
+    store
+        .bind_attachment_uploads(
+            std::slice::from_ref(&token),
+            &[(selected(message).slot, digest())],
+        )
+        .unwrap();
+    (token, id)
+}
+
+/// An upload two messages share keeps its promoted file while the second
+/// still waits for it, even after the first message's attachment is
+/// removed; the second then promotes the same file, and the file goes only
+/// once neither a slot nor the upload holds it.
+#[test]
+fn a_shared_upload_keeps_its_file_for_the_message_still_waiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let media = media(&dir, &store);
+    let (token, id) = staged_send(&store, &media, "first");
+    let mut second = source("second");
+    second.direction = "sent".into();
+    store.record_app_event(&second).unwrap();
+
+    assert_eq!(
+        media
+            .promote(
+                &store.attachment_upload_promotion(GROUP, "first", &token, || 12),
+                id
+            )
+            .unwrap(),
+        PromoteOutcome::Ready
+    );
+    assert_eq!(
+        store.attachment_upload_file(&token).unwrap(),
+        Some(id),
+        "the second message still owns the upload"
+    );
+    store.remove_local_attachment(GROUP, "first", 0).unwrap();
+    assert_eq!(media.file_state(&id).unwrap(), Some(FileState::Ready));
+
+    assert_eq!(
+        media
+            .promote(
+                &store.attachment_upload_promotion(GROUP, "second", &token, || 12),
+                id
+            )
+            .unwrap(),
+        PromoteOutcome::Ready
+    );
+    assert_eq!(
+        store.attachment_upload_file(&token).unwrap(),
+        None,
+        "consumed"
+    );
+    assert_eq!(media.file_state(&id).unwrap(), Some(FileState::Ready));
+    store.remove_local_attachment(GROUP, "second", 0).unwrap();
+    assert_eq!(
+        media.file_state(&id).unwrap(),
+        None,
+        "no slot or upload holds it"
+    );
+}
+
+/// When every slot already holds its body, the upload has nothing left to
+/// fill: it is consumed and its staged copy released, not kept until expiry.
+#[test]
+fn an_upload_whose_slots_are_already_filled_is_released() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let media = media(&dir, &store);
+    let (first, first_id) = staged_send(&store, &media, "filled");
+    assert_eq!(
+        media
+            .promote(
+                &store.attachment_upload_promotion(GROUP, "filled", &first, || 12),
+                first_id
+            )
+            .unwrap(),
+        PromoteOutcome::Ready
+    );
+    let (token, id) = stage_upload(&store, &media, "filled");
+    assert_eq!(
+        media
+            .promote(
+                &store.attachment_upload_promotion(GROUP, "filled", &token, || 12),
+                id
+            )
+            .unwrap(),
+        PromoteOutcome::Released
+    );
+    assert_eq!(store.attachment_upload_file(&token).unwrap(), None);
+    assert_eq!(media.file_state(&id).unwrap(), None);
+    assert!(!media.path(&id).exists());
+    assert_eq!(media.file_state(&first_id).unwrap(), Some(FileState::Ready));
+}

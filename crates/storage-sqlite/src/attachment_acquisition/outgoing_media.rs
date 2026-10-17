@@ -282,6 +282,9 @@ impl AttachmentUploadPromotion {
         };
         let mut file = id;
         let mut outcome = PromotedOutcome::Superseded;
+        // A slot that already holds its body needs nothing from this upload,
+        // but still counts toward consuming it.
+        let mut satisfied = false;
         for Candidate { entry } in self.candidates(now)? {
             let AttachmentDemand::Requested(asset) =
                 self.storage
@@ -290,19 +293,26 @@ impl AttachmentUploadPromotion {
                 continue;
             };
             let conn = self.storage.lock()?;
-            let eligible: bool = conn
+            // The legacy path also fences quarantined uploads; a file-backed
+            // upload is never quarantined (its body is authenticated by the
+            // store on every read), so that conjunct does not apply here.
+            let (eligible, already): (bool, bool) = conn
                 .query_row(
                     "SELECT NOT EXISTS(SELECT 1 FROM retained_attachment_files f WHERE f.token=?1 AND f.completed=0)
-                     AND cancelled=0 AND (state<>4 OR body_completed=1)
-                     AND NOT (state=3 AND (EXISTS(SELECT 1 FROM retained_attachment_bytes rb WHERE rb.token=?1)
+                     AND cancelled=0 AND (state<>4 OR body_completed=1),
+                     state=3 AND (EXISTS(SELECT 1 FROM retained_attachment_bytes rb WHERE rb.token=?1)
                          OR EXISTS(SELECT 1 FROM media_file_refs mr JOIN media_files mf ON mf.id=mr.file_id
-                             WHERE mr.token=?1 AND mf.state=1)))
+                             WHERE mr.token=?1 AND mf.state=1))
                      FROM attachment_acquisition WHERE token=?1",
                     [&asset.token],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .storage()?;
             if !eligible {
+                continue;
+            }
+            if already {
+                satisfied = true;
                 continue;
             }
             if staged {
@@ -361,7 +371,7 @@ impl AttachmentUploadPromotion {
             )
             .storage()?;
         }
-        if outcome != PromotedOutcome::Superseded {
+        if outcome != PromotedOutcome::Superseded || satisfied {
             let conn = self.storage.lock()?;
             // The upload is consumed unless another message still needs it.
             if !staging_has_unfulfilled_owner(&conn, &self.token, now, None)? {
@@ -370,6 +380,15 @@ impl AttachmentUploadPromotion {
                     [&self.token],
                 )
                 .storage()?;
+                if outcome == PromotedOutcome::Superseded {
+                    // Nothing was attached. A still-staged file went with its
+                    // upload; an already promoted one is kept by its slots.
+                    outcome = if staged {
+                        PromotedOutcome::Released
+                    } else {
+                        PromotedOutcome::Ready
+                    };
+                }
             }
         }
         Ok(outcome)

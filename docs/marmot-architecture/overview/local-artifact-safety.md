@@ -1,7 +1,7 @@
 ---
 title: "Local Artifact Safety"
 created: 2026-07-02
-updated: 2026-10-15
+updated: 2026-10-17
 tags: [marmot, overview, security, filesystem, permissions]
 status: overview
 ---
@@ -111,10 +111,11 @@ account database stays the authority: each file's random key and state live in i
   not Rust's `sync_all` (`F_FULLFSYNC`). Other platforms use `fsync`.
 - **Delete the key, then the file.** Deleting the row under `secure_delete` is the real erase. The unlink that follows
   is best effort, and the sweep removes any file whose row is gone.
-- **Outgoing bodies are staged files.** A send seals the host's source into an encrypted store file that stays
-  `staged` under its outgoing upload row, with no plaintext copy. The upload streams from it. When the message is
-  published, one transaction marks it `ready` and attaches it. Deleting the upload row deletes a still-staged file's key,
-  and the sweep unlinks the file.
+- **Staged files are owned by their upload row.** An outgoing body can be sealed into an encrypted store file that
+  stays `staged` under its `outgoing_attachment_uploads` row, and promotion marks it `ready` and attaches it in one
+  transaction. A file lives while a slot references it or an upload owns it. Deleting the upload row deletes a
+  still-staged file's key, and the sweep unlinks the file. (The send path still snapshots plaintext into
+  `media-staging/` until mdk#2314 step 3b moves it onto staged files.)
 - **Download checkpoints are `.wire` files.** A resumable download appends the received Blossom ciphertext (already
   encrypted to the group, never plaintext) to `<shard>/<id>.wire`, created at 0600. The media store owns the
   sequence: the `attachment_partial` row commits before the file exists and is deleted before the file is unlinked,

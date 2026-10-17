@@ -6,9 +6,12 @@
 //! `media_files` is rebuilt to widen its state check; the triggers that
 //! name it are dropped and recreated around the rebuild.
 //! `outgoing_attachment_uploads.file_id` records an upload's staged (or
-//! promoted) file. Deleting the upload row, or pointing it at another file,
-//! deletes a still-staged row (its key); a promoted file is left alone. A
-//! store reset deletes every media row and clears the column.
+//! promoted) file. A file lives while a slot references it or an upload
+//! owns it: an upload shared by several messages keeps its promoted file
+//! while one of them still waits for it. Deleting the upload row, or pointing
+//! it at another file, deletes a still-staged row (its key), and a promoted
+//! one that no slot references any more. A store reset deletes every media
+//! row and clears the column.
 use crate::SqliteResultExt;
 use cgka_traits::StorageError;
 use cgka_traits::storage::StorageResult;
@@ -51,10 +54,6 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         WHEN (SELECT state FROM media_files WHERE id=NEW.file_id) IS NOT 1 BEGIN
             SELECT RAISE(ABORT,'media file reference requires a ready file');
         END;
-        CREATE TRIGGER media_file_refs_last AFTER DELETE ON media_file_refs
-        WHEN NOT EXISTS(SELECT 1 FROM media_file_refs WHERE file_id=OLD.file_id) BEGIN
-            DELETE FROM media_files WHERE id=OLD.file_id AND state IN (1,2);
-        END;
         CREATE TRIGGER media_files_store_reset AFTER UPDATE OF store_epoch ON chat_presentation_meta
         WHEN OLD.store_epoch IS NOT NEW.store_epoch BEGIN
             DELETE FROM media_file_refs;
@@ -66,11 +65,20 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             ON outgoing_attachment_uploads(file_id) WHERE file_id IS NOT NULL;
         CREATE TRIGGER outgoing_upload_staged_released AFTER DELETE ON outgoing_attachment_uploads
         WHEN OLD.file_id IS NOT NULL BEGIN
-            DELETE FROM media_files WHERE id=OLD.file_id AND state=3;
+            DELETE FROM media_files WHERE id=OLD.file_id AND (state=3 OR (state IN (1,2)
+                AND NOT EXISTS(SELECT 1 FROM media_file_refs WHERE file_id=OLD.file_id)
+                AND NOT EXISTS(SELECT 1 FROM outgoing_attachment_uploads WHERE file_id=OLD.file_id)));
         END;
         CREATE TRIGGER outgoing_upload_staged_replaced AFTER UPDATE OF file_id ON outgoing_attachment_uploads
         WHEN OLD.file_id IS NOT NULL AND OLD.file_id IS NOT NEW.file_id BEGIN
-            DELETE FROM media_files WHERE id=OLD.file_id AND state=3;
+            DELETE FROM media_files WHERE id=OLD.file_id AND (state=3 OR (state IN (1,2)
+                AND NOT EXISTS(SELECT 1 FROM media_file_refs WHERE file_id=OLD.file_id)
+                AND NOT EXISTS(SELECT 1 FROM outgoing_attachment_uploads WHERE file_id=OLD.file_id)));
+        END;
+        CREATE TRIGGER media_file_refs_last AFTER DELETE ON media_file_refs
+        WHEN NOT EXISTS(SELECT 1 FROM media_file_refs WHERE file_id=OLD.file_id)
+            AND NOT EXISTS(SELECT 1 FROM outgoing_attachment_uploads WHERE file_id=OLD.file_id) BEGIN
+            DELETE FROM media_files WHERE id=OLD.file_id AND state IN (1,2);
         END;",
     )
     .storage()

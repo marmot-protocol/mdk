@@ -110,6 +110,9 @@ pub enum PromoteOutcome {
     Existing(FileId),
     /// Nothing was attached; a staged file is kept for its owner.
     Superseded,
+    /// Every slot already held its body; the owner and its staged copy are
+    /// gone.
+    Released,
 }
 
 /// Aggregate counts from one sweep batch.
@@ -485,6 +488,12 @@ impl<C: MediaCatalog> MediaStore<C> {
                 Ok(PromoteOutcome::Existing(twin))
             }
             PromotedOutcome::Superseded => Ok(PromoteOutcome::Superseded),
+            PromotedOutcome::Released => {
+                // The target deleted the staged row with its owner.
+                self.forget_reader(&id);
+                let _ = remove_if_present(&self.path(&id));
+                Ok(PromoteOutcome::Released)
+            }
         }
     }
 
