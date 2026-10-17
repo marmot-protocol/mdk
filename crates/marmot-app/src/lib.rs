@@ -4660,9 +4660,15 @@ impl MarmotApp {
             spill_storage
                 .spill_account_deliveries(
                     deliveries,
-                    relay_plane::ACCOUNT_DELIVERY_SPILL_LIMITS,
+                    client::delivery_spill::ACCOUNT_DELIVERY_SPILL_LIMITS,
                     unix_now_seconds(),
                 )
+                .map(|dispositions| {
+                    dispositions
+                        .into_iter()
+                        .map(client::delivery_spill::plane_spill_disposition)
+                        .collect()
+                })
                 .map_err(|error| {
                     if error.is_closed() {
                         relay_plane::AccountDeliveryRecoveryMarkerError::Closed

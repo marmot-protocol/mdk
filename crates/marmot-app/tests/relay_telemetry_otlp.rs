@@ -224,13 +224,13 @@ async fn export_once_pushes_otlp_metrics_over_http() {
             "http://{host}:{}/custom/v1/metrics?tenant=one%2Ftwo",
             addr.port()
         );
-        let exporter = relay_plane
-            .telemetry_exporter(
-                RelayTelemetryExportConfig::enabled(endpoint.clone())
-                    .with_runtime_config(runtime_config(endpoint)),
-                consent_permit(),
-            )
-            .expect("opted-in exporter is constructed");
+        let exporter = marmot_app::RelayTelemetryExporter::new(
+            &relay_plane,
+            RelayTelemetryExportConfig::enabled(endpoint.clone())
+                .with_runtime_config(runtime_config(endpoint)),
+            consent_permit(),
+        )
+        .expect("opted-in exporter is constructed");
 
         let count = exporter
             .export_once(None)
@@ -274,14 +274,14 @@ async fn export_retries_transient_collector_failures_within_interval() {
 
     let relay_plane = MarmotRelayPlane::full_history();
     let endpoint = format!("http://{addr}/v1/metrics");
-    let exporter = relay_plane
-        .telemetry_exporter(
-            RelayTelemetryExportConfig::enabled(endpoint.clone())
-                .with_interval(Duration::from_secs(1))
-                .with_runtime_config(runtime_config(endpoint)),
-            consent_permit(),
-        )
-        .expect("opted-in exporter is constructed");
+    let exporter = marmot_app::RelayTelemetryExporter::new(
+        &relay_plane,
+        RelayTelemetryExportConfig::enabled(endpoint.clone())
+            .with_interval(Duration::from_secs(1))
+            .with_runtime_config(runtime_config(endpoint)),
+        consent_permit(),
+    )
+    .expect("opted-in exporter is constructed");
 
     let count = exporter
         .export_once_with_retries(None)
@@ -455,13 +455,13 @@ async fn relay_telemetry_host_safety_redirect_never_reaches_target() {
     // Respond if the vulnerable client follows, so the regression fails promptly.
     let (tx, mut rx) = oneshot::channel();
     let redirect_server = tokio::spawn(capture_one_request(target, tx));
-    let exporter = MarmotRelayPlane::full_history()
-        .telemetry_exporter(
-            RelayTelemetryExportConfig::enabled(endpoint.clone())
-                .with_runtime_config(runtime_config(endpoint)),
-            consent_permit(),
-        )
-        .unwrap();
+    let exporter = marmot_app::RelayTelemetryExporter::new(
+        &MarmotRelayPlane::full_history(),
+        RelayTelemetryExportConfig::enabled(endpoint.clone())
+            .with_runtime_config(runtime_config(endpoint)),
+        consent_permit(),
+    )
+    .unwrap();
     let result = exporter.export_once(None).await;
     server.await.unwrap();
     let received = tokio::time::timeout(Duration::from_millis(150), &mut rx).await;
@@ -487,14 +487,14 @@ async fn relay_telemetry_host_safety_stalled_push_keeps_export_window_deadline()
         std::future::pending::<()>().await;
         drop(stream);
     });
-    let exporter = MarmotRelayPlane::full_history()
-        .telemetry_exporter(
-            RelayTelemetryExportConfig::enabled(endpoint.clone())
-                .with_interval(Duration::from_millis(250))
-                .with_runtime_config(runtime_config(endpoint)),
-            consent_permit(),
-        )
-        .unwrap();
+    let exporter = marmot_app::RelayTelemetryExporter::new(
+        &MarmotRelayPlane::full_history(),
+        RelayTelemetryExportConfig::enabled(endpoint.clone())
+            .with_interval(Duration::from_millis(250))
+            .with_runtime_config(runtime_config(endpoint)),
+        consent_permit(),
+    )
+    .unwrap();
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         exporter.export_once_with_retries(None),

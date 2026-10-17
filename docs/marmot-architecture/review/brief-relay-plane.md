@@ -103,17 +103,19 @@ Each PR is green on its own and changes no behaviour.
    - Move `DirectorySyncPlan` into the plane, and turn its constructor into app-side builder functions. The caller in
      `directory/methods.rs` and the local-account versus discovered-user batching tests in `directory/sync.rs` switch
      to them unchanged.
-   - Add the export-gate trait and the plane-owned spill types.
+   - Add the export-gate trait and the plane-owned spill disposition. The spill limits are storage policy only the
+     app uses, so they move to the worker side of the spill.
    - Call the adapter's proxy builder directly.
-   - Turn `telemetry_exporter` into a free constructor.
-   - Put the test hooks behind `cfg(any(test, feature = "test-support"))`.
-   - Add the narrow test-support accessors that the eight app-level tests need. Some read private plane fields, for
-     example `notification_lag_with_a_legacy_retained_route_stays_bounded` reads
-     `app.relay_plane.inner.transport.sdk_relay_client` (`relay_plane/tests.rs:5500-5506`). Rewrite those assertions
-     to use the accessors, so PR 2 can move the tests without dropping any.
-   - Adapt `relay_label_resolution_is_gated_behind_opt_in` to the new export-gate trait. Today it builds the app's
-     `RelayTelemetryRuntimeConfig` from `crate::config` (`relay_plane/tests.rs:33-51`) and the
-     `RelayTelemetryExportConfig` values the gate replaces (`:2352-2360`).
+   - Turn `telemetry_exporter` into a constructor on the app's `RelayTelemetryExporter`.
+   - Add the narrow `#[cfg(test)]` accessors that the eight app-level tests need, and rewrite the assertions that
+     read private plane fields to use them, so PR 2 can move the tests without dropping any. For example
+     `notification_lag_with_a_legacy_retained_route_stays_bounded` read
+     `app.relay_plane.inner.transport.sdk_relay_client` (`relay_plane/tests.rs:5500-5506`); it now calls
+     `sdk_relay_client_for_test`.
+   - Adapt `relay_label_resolution_is_gated_behind_opt_in` to the new export-gate trait. It built the app's
+     `RelayTelemetryRuntimeConfig` and `RelayTelemetryExportConfig` from `crate::config`; it now uses a stand-in
+     `TestExportGate`, and a `config.rs` test pins that the export config's gate implementation matches
+     `export_allowed`.
    - Proof: `relay_plane/` has no production `crate::` or `storage_sqlite::` imports.
 2. **Move the eight tests that build a whole `MarmotApp` or runtime** out of `relay_plane/tests.rs` into the app's
    tests, using the accessors from PR 1. Tests only.
@@ -127,6 +129,9 @@ Each PR is green on its own and changes no behaviour.
    - The shim re-exports only `pub` items. Widen to `pub` every `pub(crate)` item the rest of `marmot-app` names
      today: the account adapter's methods, the other plane methods the app calls, and types such as
      `AccountDeliveryReceive` and `RelaySafetyPolicy`.
+   - Put the test hooks and accessors behind `cfg(any(test, feature = "test-support"))` on `transport-nostr`.
+     PR 1 cannot: a `marmot-app` feature would compile these `pub(crate)` items with no caller under CI's
+     `--all-features`, which `-D warnings` rejects.
    - `cfg(test)` is set only on the crate under test, never on its dependencies. Enable `test-support` through
      `marmot-app`'s dev-dependency on `transport-nostr`, so `cargo test -p marmot-app` compiles the hooks and
      accessors its tests call, while a normal build, and so the shipped library, leaves them out.

@@ -16,6 +16,26 @@ use crate::AppError;
 use crate::relay_plane::AccountDeliveryReceive;
 use crate::unix_now_seconds;
 
+/// Durable spill bounds for one account database.
+pub(crate) const ACCOUNT_DELIVERY_SPILL_LIMITS: storage_sqlite::DeliverySpillLimits =
+    storage_sqlite::DeliverySpillLimits {
+        max_rows: 8_192,
+        max_bytes: 16 * 1024 * 1024,
+    };
+
+/// The relay plane's view of what the store did with one spilled delivery.
+pub(crate) fn plane_spill_disposition(
+    disposition: storage_sqlite::DeliverySpillDisposition,
+) -> crate::relay_plane::DeliverySpillDisposition {
+    use crate::relay_plane::DeliverySpillDisposition as Plane;
+    use storage_sqlite::DeliverySpillDisposition as Stored;
+    match disposition {
+        Stored::Stored => Plane::Stored,
+        Stored::AlreadySeen => Plane::AlreadySeen,
+        Stored::Full => Plane::Full,
+    }
+}
+
 const SPILL_READ_BATCH: usize = 32;
 /// About three hours of doubling retries. A row still unadmitted after that
 /// is removed and recorded as queue loss, so recovery keeps an obligation.
@@ -273,8 +293,9 @@ mod tests {
     };
     use marmot_account::AccountHome;
 
+    use super::ACCOUNT_DELIVERY_SPILL_LIMITS;
     use super::SPILL_MAX_ATTEMPTS;
-    use crate::relay_plane::{ACCOUNT_DELIVERY_SPILL_LIMITS, MarmotRelayPlane};
+    use crate::relay_plane::MarmotRelayPlane;
     use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
     use crate::{MarmotApp, unix_now_seconds};
 

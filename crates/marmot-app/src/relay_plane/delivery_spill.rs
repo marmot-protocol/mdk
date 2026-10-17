@@ -16,7 +16,6 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use cgka_traits::{MemberId, TransportDelivery};
-use storage_sqlite::{DeliverySpillDisposition, DeliverySpillLimits};
 
 use super::{
     AccountDeliveryOverflowState, AccountDeliveryRecoveryMarker,
@@ -33,11 +32,18 @@ pub(crate) type AccountDeliverySpillStore = Arc<
         + 'static,
 >;
 
-/// Durable spill bounds for one account database.
-pub(crate) const ACCOUNT_DELIVERY_SPILL_LIMITS: DeliverySpillLimits = DeliverySpillLimits {
-    max_rows: 8_192,
-    max_bytes: 16 * 1024 * 1024,
-};
+/// What the account's store did with one delivery the spill writer handed
+/// it. The store's own result maps onto this in the closure `open_account`
+/// builds, so the plane does not depend on the storage crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeliverySpillDisposition {
+    /// Durably held for later admission, including a copy already spilled.
+    Stored,
+    /// Already durably seen and not released for redelivery: nothing to keep.
+    AlreadySeen,
+    /// No room within the store's limits: the delivery is lost.
+    Full,
+}
 /// Bytes and deliveries the router may hand off before the writer catches
 /// up. Each delivery is charged its payload plus a fixed allowance for the ID,
 /// route and source metadata it retains, so empty payloads are still bounded.

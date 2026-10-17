@@ -34,10 +34,7 @@ use transport_nostr_adapter::{
     SubscriptionAttempt,
 };
 
-use crate::config::RelayTelemetryExportConfig;
 use transport_nostr_peeler::NostrTransportEvent;
-
-use crate::directory::DirectorySyncPlan;
 
 mod delivery_spill;
 mod directory;
@@ -52,11 +49,30 @@ pub use telemetry::{
     EngineReorgMetrics, RelayRollupEntry, RelayTelemetryRollup, RelayTelemetrySnapshot,
 };
 
-pub(crate) use delivery_spill::{ACCOUNT_DELIVERY_SPILL_LIMITS, AccountDeliverySpillStore};
+/// The opt-in that relay-identity resolution requires. The app's export
+/// configuration implements it, so the plane does not depend on the app's
+/// config types.
+pub(crate) trait RelayExportGate: Send + Sync {
+    /// Export is opted in with a TLS (or loopback) endpoint, authorization
+    /// and resource metadata.
+    fn export_allowed(&self) -> bool;
+}
+
+/// Every relay client the plane builds routes through the process SOCKS5
+/// configuration: the same builder `crate::network_proxy::nostr_builder`
+/// returns, called here so the plane does not reach into the app for it.
+pub(crate) fn nostr_builder() -> nostr_sdk::prelude::ClientBuilder {
+    transport_nostr_adapter::network_proxy::nostr_builder(
+        transport_nostr_adapter::network_proxy::socks5_proxy(),
+    )
+}
+
+pub(crate) use delivery_spill::{AccountDeliverySpillStore, DeliverySpillDisposition};
 pub(crate) use directory::{
     DirectoryEventQuery, DirectoryFetchOutcome, DirectoryFetchRequest, DirectoryInspectionError,
     DirectoryRelayEventRecord, DirectoryRelayFetcher, DirectoryRelayPlane, DirectoryRelayStats,
-    DirectorySubscriptionFilter, DirectorySubscriptionSyncSummary, NostrSdkDirectoryRelayFetcher,
+    DirectorySubscriptionFilter, DirectorySubscriptionSyncSummary, DirectorySyncBatch,
+    DirectorySyncPlan, NostrSdkDirectoryRelayFetcher,
 };
 pub(crate) use safety::{RelaySafetyPolicy, recovery_required_endpoints, same_relay};
 pub(crate) use telemetry::rollup_from_snapshots;
@@ -305,6 +321,17 @@ pub(crate) enum AccountDeliveryWait {
     /// Spilled rows became durable while the queue was empty.
     SpillReady,
     Closed,
+}
+
+/// Keeps one account's delivery-loss state alive and compares it by identity.
+#[cfg(test)]
+pub(crate) struct DeliveryOverflowIdentity(Arc<AccountDeliveryOverflowState>);
+
+#[cfg(test)]
+impl DeliveryOverflowIdentity {
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 #[derive(Default)]
@@ -1423,7 +1450,7 @@ impl MarmotRelayPlane {
             .transport
             .sdk_relay_client
             .as_ref()
-            .map(|_| NostrSdkRelayClient::from_builder(crate::network_proxy::nostr_builder()));
+            .map(|_| NostrSdkRelayClient::from_builder(nostr_builder()));
         MarmotRelayPlaneAccountAdapter {
             account_id,
             relay_plane: self.clone(),
@@ -1747,19 +1774,19 @@ impl MarmotRelayPlane {
     /// boundary.
     ///
     /// Crate-private and reachable only through the exporter. It returns `None`
-    /// unless [`RelayTelemetryExportConfig::export_allowed`] holds (the same
-    /// gate as [`MarmotRelayPlane::telemetry_exporter`]); only then does it mint
+    /// unless [`RelayExportGate::export_allowed`] holds (the same gate the
+    /// app's exporter constructor applies); only then does it mint
     /// a [`RelayExportConsent`] and ask the adapter to reverse-map indices to
     /// relay URLs. No other code path turns a device-local index into a relay
     /// URL. See the privacy contract in `relay-observability.md`.
     pub(crate) async fn resolve_relay_labels(
         &self,
-        config: &RelayTelemetryExportConfig,
+        gate: &dyn RelayExportGate,
     ) -> Option<RelayLabelResolution> {
-        // Same gate as `telemetry_exporter`: resolution cannot happen unless
-        // export is opted in with a TLS/loopback endpoint, auth, and resource
-        // metadata.
-        if !config.export_allowed() {
+        // Same gate as the exporter constructor: resolution cannot happen
+        // unless export is opted in with a TLS/loopback endpoint, auth, and
+        // resource metadata.
+        if !gate.export_allowed() {
             return None;
         }
         let consent = RelayExportConsent::affirm();
@@ -2305,6 +2332,23 @@ impl MarmotRelayPlane {
             .transport
             .eose_repair_settle_ms
             .store(settle.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// The SDK relay client the plane runs on, for tests that build a whole
+    /// app and so cannot reach the plane's private state.
+    #[cfg(test)]
+    pub(crate) fn sdk_relay_client_for_test(&self) -> Option<NostrSdkRelayClient> {
+        self.inner.transport.sdk_relay_client.clone()
+    }
+
+    /// Unexpected notification-consumer exits the plane has recorded.
+    #[cfg(test)]
+    pub(crate) fn notification_forwarder_unexpected_exits_for_test(&self) -> u64 {
+        self.inner
+            .transport
+            .notification_forwarder_health
+            .snapshot()
+            .unexpected_exits
     }
 }
 
@@ -3928,6 +3972,24 @@ impl MarmotRelayPlaneAccountAdapter {
 
     pub(crate) fn pending_delivery_overflow(&self) -> Option<AccountDeliveryOverflow> {
         self.delivery_overflow.pending_snapshot()
+    }
+
+    /// This account's delivery-loss state, so a test can check that a
+    /// replacement adapter inherited it rather than starting fresh.
+    #[cfg(test)]
+    pub(crate) fn delivery_overflow_identity_for_test(&self) -> DeliveryOverflowIdentity {
+        DeliveryOverflowIdentity(self.delivery_overflow.clone())
+    }
+
+    /// Notification losses this account's delivery route has recorded,
+    /// whether or not a loss is still pending.
+    #[cfg(test)]
+    pub(crate) fn notification_losses_for_test(&self) -> u64 {
+        self.delivery_overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notification_losses
     }
 
     /// Begin (or resume after process restart) the recovery job required by a

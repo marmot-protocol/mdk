@@ -30,26 +30,7 @@ use tokio::sync::Notify;
 use transport_nostr_adapter::{NostrRelayEvent, NostrSubscription};
 use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NOSTR_SOURCE, NostrPeelerError};
 
-use crate::config::{RelayTelemetryResource, RelayTelemetryRuntimeConfig};
-use crate::directory::DirectorySyncBatch;
-
 use super::*;
-
-fn relay_telemetry_runtime_config() -> RelayTelemetryRuntimeConfig {
-    RelayTelemetryRuntimeConfig {
-        otlp_endpoint: Some("https://otlp.example.org/v1/metrics".to_owned()),
-        authorization_bearer_token: Some("token".to_owned()),
-        resource: Some(RelayTelemetryResource {
-            service_version: "1.4.2".to_owned(),
-            service_instance_id: "8e1ca50b-05a2-4c31-a31c-1e69c75a9366".to_owned(),
-            deployment_environment: "staging".to_owned(),
-            tenant: "mdk-ios".to_owned(),
-            os_type: "ios".to_owned(),
-            os_version: "17.5".to_owned(),
-            device_model_identifier: None,
-        }),
-    }
-}
 
 #[test]
 fn subscription_rebuild_since_treats_future_cursor_as_corrupted() {
@@ -1395,12 +1376,7 @@ async fn managed_account_worker_keeps_its_session_through_notification_lag() {
         "a lag neither reopens the session nor re-subscribes"
     );
     assert_eq!(
-        relay_plane
-            .inner
-            .transport
-            .notification_forwarder_health
-            .snapshot()
-            .unexpected_exits,
+        relay_plane.notification_forwarder_unexpected_exits_for_test(),
         0
     );
 
@@ -2330,6 +2306,16 @@ async fn telemetry_rollup_is_empty_without_observed_relay_traffic() {
     assert!(rollup.engine.is_none());
 }
 
+/// Stands in for the app's export configuration, which is either opted in
+/// or not; `config.rs` tests what makes it so.
+struct TestExportGate(bool);
+
+impl RelayExportGate for TestExportGate {
+    fn export_allowed(&self) -> bool {
+        self.0
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_label_resolution_is_gated_behind_opt_in() {
     let relay = Arc::new(RecordingRelayClient::default());
@@ -2348,30 +2334,18 @@ async fn relay_label_resolution_is_gated_behind_opt_in() {
         .await
         .unwrap();
 
-    // Off by default: no opt-in means no relay-identity resolution at all.
-    let disabled = RelayTelemetryExportConfig::disabled();
-    assert!(relay_plane.resolve_relay_labels(&disabled).await.is_none());
-
-    // Opted in but no endpoint: still no resolution (same gate as the
-    // exporter).
-    let no_endpoint = RelayTelemetryExportConfig {
-        enabled: true,
-        ..Default::default()
-    };
+    // Not opted in: no relay-identity resolution at all.
     assert!(
         relay_plane
-            .resolve_relay_labels(&no_endpoint)
+            .resolve_relay_labels(&TestExportGate(false))
             .await
             .is_none()
     );
 
-    // Opted in with a TLS endpoint and runtime metadata: the export boundary
-    // resolves the opaque index for the activated inbox endpoint back to its
-    // relay URL.
-    let enabled = RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
-        .with_runtime_config(relay_telemetry_runtime_config());
+    // Opted in: the export boundary resolves the opaque index for the
+    // activated inbox endpoint back to its relay URL.
     let resolution = relay_plane
-        .resolve_relay_labels(&enabled)
+        .resolve_relay_labels(&TestExportGate(true))
         .await
         .expect("opt-in resolves labels");
     assert!(!resolution.is_empty());
@@ -2744,9 +2718,9 @@ async fn full_account_queue_spills_before_it_omits() {
             .map(|delivery| {
                 if spill.len() < 2 {
                     spill.push(delivery.clone());
-                    storage_sqlite::DeliverySpillDisposition::Stored
+                    DeliverySpillDisposition::Stored
                 } else {
-                    storage_sqlite::DeliverySpillDisposition::Full
+                    DeliverySpillDisposition::Full
                 }
             })
             .collect())
@@ -2906,10 +2880,7 @@ async fn transient_spill_store_failures_are_retried_instead_of_lost() {
         if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
             return Err(AccountDeliveryRecoveryMarkerError::Retryable);
         }
-        Ok(vec![
-            storage_sqlite::DeliverySpillDisposition::Stored;
-            deliveries.len()
-        ])
+        Ok(vec![DeliverySpillDisposition::Stored; deliveries.len()])
     });
     let adapter = relay_plane.account_adapter_with_recovery_marker(
         alice.clone(),
@@ -2947,10 +2918,7 @@ async fn replaced_adapter_wakes_when_an_earlier_spill_write_commits() {
         while !gate.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(5));
         }
-        Ok(vec![
-            storage_sqlite::DeliverySpillDisposition::Stored;
-            deliveries.len()
-        ])
+        Ok(vec![DeliverySpillDisposition::Stored; deliveries.len()])
     });
     let first = relay_plane.account_adapter_with_recovery_marker(
         alice.clone(),
@@ -3020,10 +2988,7 @@ async fn replacement_after_retirement_shares_an_in_flight_spill_write() {
                 std::thread::sleep(Duration::from_millis(5));
             }
             if outcome == Outcome::Commit {
-                Ok(vec![
-                    storage_sqlite::DeliverySpillDisposition::Stored;
-                    deliveries.len()
-                ])
+                Ok(vec![DeliverySpillDisposition::Stored; deliveries.len()])
             } else {
                 Err(AccountDeliveryRecoveryMarkerError::Closed)
             }
@@ -3119,12 +3084,8 @@ async fn pending_spill_wakeup_wins_over_a_ready_live_queue() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
     let alice = MemberId::new(vec![0xA1; 32]);
-    let store: AccountDeliverySpillStore = Arc::new(|deliveries| {
-        Ok(vec![
-            storage_sqlite::DeliverySpillDisposition::Stored;
-            deliveries.len()
-        ])
-    });
+    let store: AccountDeliverySpillStore =
+        Arc::new(|deliveries| Ok(vec![DeliverySpillDisposition::Stored; deliveries.len()]));
     let adapter = relay_plane.account_adapter_with_recovery_marker(
         alice.clone(),
         relay.clone(),
@@ -3152,10 +3113,7 @@ async fn spill_hand_off_bounds_deliveries_with_empty_payloads() {
         while !gate.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(5));
         }
-        Ok(vec![
-            storage_sqlite::DeliverySpillDisposition::Stored;
-            deliveries.len()
-        ])
+        Ok(vec![DeliverySpillDisposition::Stored; deliveries.len()])
     });
     let spill = delivery_spill::AccountDeliverySpill::new(
         store,
@@ -3252,10 +3210,7 @@ fn recording_spill_store() -> (
     let spill = kept.clone();
     let store: AccountDeliverySpillStore = Arc::new(move |deliveries| {
         spill.lock().unwrap().extend(deliveries.iter().cloned());
-        Ok(vec![
-            storage_sqlite::DeliverySpillDisposition::Stored;
-            deliveries.len()
-        ])
+        Ok(vec![DeliverySpillDisposition::Stored; deliveries.len()])
     });
     (store, kept)
 }
@@ -5029,26 +4984,17 @@ async fn notification_loss_is_durable_and_survives_receiver_replacement() {
             .unwrap()
             .is_none()
     );
-    let prior = client.adapter.delivery_overflow.clone();
+    let prior = client.adapter.delivery_overflow_identity_for_test();
     drop(client);
     let mut replacement = client_on_app_relay_plane(&app, "alice").await;
-    assert!(Arc::ptr_eq(&prior, &replacement.adapter.delivery_overflow));
+    assert!(prior.same_as(&replacement.adapter.delivery_overflow_identity_for_test()));
     let attempt = replacement
         .adapter
         .start_delivery_overflow_recovery(loss.marker_token);
     // An unexpected consumer exit still closes the route.
     app.relay_plane
         .simulate_notification_consumer_exit_for_test();
-    assert_eq!(
-        replacement
-            .adapter
-            .delivery_overflow
-            .inner
-            .lock()
-            .unwrap()
-            .notification_losses,
-        1
-    );
+    assert_eq!(replacement.adapter.notification_losses_for_test(), 1);
     // A lag whose control record cannot reach the closed queue, and whose
     // floor is unknown.
     app.relay_plane.simulate_notification_lag_for_test(
@@ -5290,7 +5236,7 @@ async fn sdk_account_worker_keeps_serving_through_notification_lag() {
         .unwrap();
     runtime.group_members(&alice.label, &group).await.unwrap();
     let plane = runtime.shared_services().relay_plane().clone();
-    let sdk = plane.inner.transport.sdk_relay_client.clone().unwrap();
+    let sdk = plane.sdk_relay_client_for_test().unwrap();
     let floor = sdk.notification_loss_floor_for_account(&account).await;
     assert!(
         matches!(floor, NostrNotificationLossFloor::Since(_)),
@@ -5422,7 +5368,7 @@ async fn notification_lag_while_post_join_maintenance_is_live_stays_bounded() {
     );
 
     let plane = app.relay_plane.clone();
-    let sdk = plane.inner.transport.sdk_relay_client.clone().unwrap();
+    let sdk = plane.sdk_relay_client_for_test().unwrap();
     let floor = sdk.notification_loss_floor_for_account(&account).await;
     assert_eq!(
         floor,
@@ -5497,13 +5443,7 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
     let app = crate::MarmotApp::with_relay_and_config(dir.path(), url, config());
     let mut client = crate::tests::client_on_app_relay_plane(&app, &alice.label).await;
     client.prepare_transport().await.unwrap();
-    let sdk = app
-        .relay_plane
-        .inner
-        .transport
-        .sdk_relay_client
-        .clone()
-        .unwrap();
+    let sdk = app.relay_plane.sdk_relay_client_for_test().unwrap();
     let floor = sdk.notification_loss_floor_for_account(&account).await;
     assert!(
         matches!(floor, NostrNotificationLossFloor::Since(_)),
@@ -5712,7 +5652,7 @@ async fn cancelled_reopen_retirement_cannot_remove_a_replacement_context() {
     use nostr_sdk::prelude::Keys;
 
     let plane = MarmotRelayPlane::from_sdk(None, true);
-    let sdk = plane.inner.transport.sdk_relay_client.clone().unwrap();
+    let sdk = plane.sdk_relay_client_for_test().unwrap();
     let keys = Keys::generate();
     let alice = MemberId::new(keys.public_key().to_bytes().to_vec());
     sdk.register_account(alice.clone(), Arc::new(keys.clone()))

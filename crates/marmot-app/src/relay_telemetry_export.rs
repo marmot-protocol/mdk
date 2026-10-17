@@ -9,7 +9,7 @@
 //!
 //! ## Privacy contract, enforced structurally here
 //!
-//! - **Opt-in, off by default (req. 1).** [`MarmotRelayPlane::telemetry_exporter`]
+//! - **Opt-in, off by default (req. 1).** [`RelayTelemetryExporter::new`]
 //!   is the single construction gate: it returns `None` unless export is
 //!   enabled and a full metrics URL, bearer token, and resource metadata are
 //!   configured. No exporter, no resolution, no push.
@@ -1848,8 +1848,9 @@ pub enum RelayExportError {
     Status(u16),
 }
 
-impl MarmotRelayPlane {
-    /// Build an opt-in relay-telemetry exporter — the single construction gate.
+impl RelayTelemetryExporter {
+    /// Build an opt-in relay-telemetry exporter over `relay_plane` — the
+    /// single construction gate.
     ///
     /// Returns `None` unless [`RelayTelemetryExportConfig::export_allowed`]
     /// holds — opted in, an endpoint is configured, and that endpoint is TLS
@@ -1857,11 +1858,11 @@ impl MarmotRelayPlane {
     /// metadata is present. Off-by-default opt-in is structurally enforced: with
     /// no exporter there is no resolution and no push, and relay identities are
     /// never sent over a non-TLS transport.
-    pub fn telemetry_exporter(
-        &self,
+    pub fn new(
+        relay_plane: &MarmotRelayPlane,
         mut config: RelayTelemetryExportConfig,
         permit: crate::DiagnosticsPermit,
-    ) -> Option<RelayTelemetryExporter> {
+    ) -> Option<Self> {
         if let Some(resource) = &mut config.resource {
             resource.service_instance_id = permit.diagnostic_id.clone();
         }
@@ -1875,14 +1876,14 @@ impl MarmotRelayPlane {
                 // contract.
                 tracing::warn!(
                     target: "marmot_app::relay_telemetry_export",
-                    method = "telemetry_exporter",
+                    method = "new",
                     "relay telemetry export disabled: url, authorization, or resource metadata missing",
                 );
             }
             return None;
         }
         Some(RelayTelemetryExporter {
-            relay_plane: self.clone(),
+            relay_plane: relay_plane.clone(),
             config,
             permit,
             baseline: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -1900,7 +1901,7 @@ struct ExportCollectionPeriod {
 
 /// Opt-in exporter that pushes relay telemetry to a first-party OTLP collector.
 ///
-/// Only constructed by [`MarmotRelayPlane::telemetry_exporter`] when opted in.
+/// Only constructed by [`RelayTelemetryExporter::new`] when opted in.
 #[derive(Clone)]
 pub struct RelayTelemetryExporter {
     permit: crate::DiagnosticsPermit,
@@ -2291,9 +2292,12 @@ mod otlp {
             };
             let plane = crate::MarmotRelayPlane::full_history();
             assert!(
-                plane
-                    .telemetry_exporter(complete.clone(), crate::product_analytics::test_permit())
-                    .is_some()
+                crate::RelayTelemetryExporter::new(
+                    &plane,
+                    complete.clone(),
+                    crate::product_analytics::test_permit()
+                )
+                .is_some()
             );
             for case in 0..7 {
                 let mut config = complete.clone();
@@ -2309,9 +2313,12 @@ mod otlp {
                 // Construction is the only entrance to export; no exporter
                 // exists on these paths to invoke a DNS resolver or HTTP push.
                 assert!(
-                    plane
-                        .telemetry_exporter(config, crate::product_analytics::test_permit())
-                        .is_none()
+                    crate::RelayTelemetryExporter::new(
+                        &plane,
+                        config,
+                        crate::product_analytics::test_permit()
+                    )
+                    .is_none()
                 );
             }
             assert!(
@@ -2473,18 +2480,17 @@ mod otlp {
             };
 
             let fixture = AccountPublishFixture::activate().await;
-            let exporter = fixture
-                .plane
-                .telemetry_exporter(
-                    RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
-                        .with_runtime_config(RelayTelemetryRuntimeConfig {
-                            otlp_endpoint: Some("https://otlp.example/v1/metrics".into()),
-                            authorization_bearer_token: Some("token".into()),
-                            resource: Some(test_resource()),
-                        }),
-                    crate::product_analytics::test_permit(),
-                )
-                .expect("opted-in exporter");
+            let exporter = crate::RelayTelemetryExporter::new(
+                &fixture.plane,
+                RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+                    .with_runtime_config(RelayTelemetryRuntimeConfig {
+                        otlp_endpoint: Some("https://otlp.example/v1/metrics".into()),
+                        authorization_bearer_token: Some("token".into()),
+                        resource: Some(test_resource()),
+                    }),
+                crate::product_analytics::test_permit(),
+            )
+            .expect("opted-in exporter");
             let (primed, _) = exporter.since_baseline(exporter.build_batch(None).await);
             let primed_value = |name: &str| match primed
                 .points
