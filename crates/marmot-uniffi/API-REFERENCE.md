@@ -3518,7 +3518,7 @@ pub fn new() -> std::sync::Arc<Self>
 
 Create one control per file-backed operation; it is never reused across operations.
 
-[Source](src/conversions/media.rs#L376)
+[Source](src/conversions/media.rs#L377)
 
 ### `MediaFileTransferControlFfi::cancel`
 
@@ -3530,7 +3530,7 @@ pub fn cancel(&self)
 
 Request cancellation. Preparation, body transfer and server fallback stop at the next chunk; nothing is published when cancellation is observed before message admission starts. Admission is not interruptible once started, even before durable acceptance returns; cancellation cannot retract an admitted message.
 
-[Source](src/conversions/media.rs#L382)
+[Source](src/conversions/media.rs#L383)
 
 ### `MediaFileTransferControlFfi::is_cancelled`
 
@@ -3542,7 +3542,7 @@ pub fn is_cancelled(&self) -> bool
 
 Whether `cancel` was called. It is not an outcome: await the operation's result.
 
-[Source](src/conversions/media.rs#L386)
+[Source](src/conversions/media.rs#L387)
 
 ### `MediaFileTransferControlFfi::processed_bytes`
 
@@ -3552,9 +3552,9 @@ Whether `cancel` was called. It is not an outcome: await the operation's result.
 pub fn processed_bytes(&self) -> u64
 ```
 
-Monotonic local work counter across snapshot, encryption and upload of the current attachment. Not a percentage or a delivery signal.
+Monotonic local work counter across the copy into the encrypted media store, the digest pass and the transfer of the current attachment. Not a percentage or a delivery signal.
 
-[Source](src/conversions/media.rs#L390)
+[Source](src/conversions/media.rs#L391)
 
 ### `max_file_media_ciphertext_bytes`
 
@@ -3566,7 +3566,7 @@ pub fn max_file_media_ciphertext_bytes() -> u64
 
 Per-batch ciphertext ceiling for file-backed uploads (an implementation resource bound, not protocol).
 
-[Source](src/conversions/media.rs#L398)
+[Source](src/conversions/media.rs#L399)
 
 </details>
 
