@@ -55,6 +55,10 @@ pub enum FileState {
     /// The row was ready but its file is gone (crash or external deletion).
     /// Distinct from deliberate removal, which deletes the row.
     Lost,
+    /// The file is complete and synced, and a domain row (an outgoing upload)
+    /// owns it, but no slot references it yet. It survives restarts while
+    /// its owner exists and becomes `Ready` when promoted.
+    Staged,
 }
 
 /// A pending row to insert before its file exists.
@@ -119,6 +123,13 @@ pub trait MediaCatalog: Send + Sync {
     /// unlinks a wire file only when this is `None`, and trims a file longer
     /// than the recorded length back to it.
     fn wire_partial_received(&self, id: FileId) -> CatalogResult<Option<u64>>;
+    /// What a read of a staged file needs: its key and length. `None` when
+    /// `id` is not staged.
+    fn staged_file(&self, id: FileId) -> CatalogResult<Option<ReadyFile>>;
+    /// Deletes the row only if it is staged and no domain row owns it: the
+    /// sweep's backstop for an owner that went away without releasing it.
+    /// Returns whether it did.
+    fn abandon_unowned_staged(&self, id: FileId) -> CatalogResult<bool>;
 }
 
 /// What one existence check found for a ready file.
@@ -229,4 +240,51 @@ pub trait CheckpointTarget {
     /// Deletes this target's checkpoint row and returns its wire file, which
     /// the store unlinks after the commit.
     fn clear(&self) -> CatalogResult<Option<FileId>>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StagedOutcome {
+    /// The file is staged and recorded on its owner.
+    Staged,
+    /// The owner no longer accepts the file. The row is left pending; the
+    /// store abandons it.
+    Superseded,
+}
+
+/// One staged body's owner: an outgoing upload that keeps its file local
+/// before and during the upload. Each method is **one transaction** and does
+/// no file I/O.
+pub trait StageTarget {
+    /// If `id` is still pending and the owner still accepts it, records the
+    /// body's `digest`, marks the row staged and records `id` on the owner.
+    fn commit_staged(&self, id: FileId, digest: &[u8; 32]) -> CatalogResult<StagedOutcome>;
+    /// Detaches the owner from its staged file `id` and deletes that row (its
+    /// key). Returns whether it deleted one; the store unlinks the file. A
+    /// file already promoted to ready is not deleted.
+    fn release_staged(&self, id: FileId) -> CatalogResult<bool>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromotedOutcome {
+    /// `id` is ready and attached to the target's slots.
+    Ready,
+    /// A present ready twin with the same content was attached instead, and
+    /// `id`'s staged row deleted; the store unlinks its file.
+    Existing(FileId),
+    /// Nothing to attach: the target refused (fences, removal) or `id` is no
+    /// longer its file. A staged row is left as it is.
+    Superseded,
+}
+
+/// Promotion of a staged (or already promoted) file into the slots of a
+/// published message. One transaction, calling `present` at most once, for
+/// the ready twin (see [`Presence`]).
+pub trait PromoteTarget {
+    /// If `id` is staged: apply the target's fences; when a ready twin with
+    /// the row's category and digest is `Present`, attach the twin and delete
+    /// `id`'s row (`Existing`); an `Absent` twin is marked lost; otherwise
+    /// mark `id` ready and attach it (`Ready`). If `id` is already ready,
+    /// attach it without a twin check (`Ready`). A presence error is
+    /// returned and nothing changes.
+    fn commit_promoted(&self, id: FileId, present: Presence<'_>) -> CatalogResult<PromotedOutcome>;
 }

@@ -69,6 +69,18 @@ impl Harness for MemoryHarness {
     fn end_checkpoint(&self, slot: u32) {
         self.catalog.end_checkpoint(slot);
     }
+
+    fn stage_target(&self, slot: u32) -> Box<dyn StageTarget + '_> {
+        Box::new(self.catalog.stage_target(slot))
+    }
+
+    fn promote_target(&self, slot: u32) -> Box<dyn PromoteTarget + '_> {
+        Box::new(self.catalog.promote_target(slot))
+    }
+
+    fn end_stage_owner(&self, slot: u32) {
+        self.catalog.end_stage_owner(slot);
+    }
 }
 
 #[test]
@@ -603,4 +615,84 @@ fn the_sweep_leaves_an_unrecorded_append_in_flight_alone() {
         restored(&store, &catalog.checkpoint(0)).unwrap(),
         b"abcdef".to_vec()
     );
+}
+
+fn stage_body(
+    store: &MediaStore<MemoryCatalog>,
+    catalog: &MemoryCatalog,
+    slot: u32,
+    content: &[u8],
+) -> MediaResult<StageOutcome> {
+    store.stage(
+        &catalog.stage_target(slot),
+        Category::Retained,
+        &mut Cursor::new(content),
+        content.len() as u64,
+        NOW,
+        &|| false,
+    )
+}
+
+/// A promotion the domain refuses (the slot was removed) attaches nothing
+/// and keeps the staged file for its owner.
+#[test]
+fn a_refused_promotion_keeps_the_staged_file() {
+    let (harness, store) = fixture();
+    let catalog = &harness.catalog;
+    let StageOutcome::Staged { id, .. } = stage_body(&store, catalog, 0, b"kept").unwrap() else {
+        panic!("staged");
+    };
+    catalog.supersede(0);
+    assert_eq!(
+        store.promote(&catalog.promote_target(0), id).unwrap(),
+        PromoteOutcome::Superseded
+    );
+    assert_eq!(store.file_state(&id).unwrap(), Some(FileState::Staged));
+    assert_eq!(files(&harness.root()), 1);
+}
+
+/// A full disk or a cancellation while sealing leaves no row and no file.
+#[test]
+fn a_failed_stage_leaves_nothing() {
+    let (harness, store) = fixture();
+    let catalog = &harness.catalog;
+    store.simulate_full_disk_for_test(true);
+    assert_eq!(
+        stage_body(&store, catalog, 0, b"full"),
+        Err(MediaError::Capacity)
+    );
+    store.simulate_full_disk_for_test(false);
+    assert_eq!(
+        store.stage(
+            &catalog.stage_target(0),
+            Category::Retained,
+            &mut Cursor::new(b"cancelled"),
+            9,
+            NOW,
+            &|| true,
+        ),
+        Err(MediaError::Cancelled)
+    );
+    assert_eq!(catalog.page(None, 10).unwrap().len(), 0);
+    assert_eq!(files(&harness.root()), 0);
+}
+
+/// A staged reader, like a ready one, refuses reads once the store closes.
+#[test]
+fn closing_the_store_stops_staged_reads() {
+    let (harness, store) = fixture();
+    let StageOutcome::Staged { id, .. } =
+        stage_body(&store, &harness.catalog, 0, &[7; 200_000]).unwrap()
+    else {
+        panic!("staged");
+    };
+    let mut reader = store.open_staged_reader(&id).unwrap().unwrap();
+    let mut first = [0; 10];
+    reader.read_exact(&mut first).unwrap();
+    store.close();
+    assert!(reader.read_exact(&mut first).is_err());
+    assert!(matches!(
+        store.open_staged_reader(&id),
+        Err(MediaError::Closed)
+    ));
 }

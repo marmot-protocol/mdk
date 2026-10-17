@@ -23,11 +23,11 @@ The encrypted per-file media store (mdk#2314). Human overview: [`README.md`](REA
 | Path | Owns |
 | --- | --- |
 | `src/format.rs` | File format: header, header-salted HKDF payload key, 64 KiB OpenSSL ChaCha20-Poly1305 segments, streaming writer (poisoned after a failure), offset reader. |
-| `src/catalog.rs` | `FileId`, `Category`, `FileState`, and the traits other crates implement: `MediaCatalog` (store-wide rows), `PublishTarget` (one publication's one-transaction commits) and `CheckpointTarget` (one download checkpoint's row: current, begin, record, clear). |
-| `src/store.rs` | `MediaStore`: intent-first publish, presence-checked reuse, `attach_existing` (reuse before a download), close-checked readers that hold their key, a small idle-limited reader cache for `read_at`, `unlink_released`, `.wire` download checkpoints (`checkpoint_append`/`restore`/`clear`/`reader` over a `CheckpointTarget`, with a per-checkpoint lock; `CheckpointReader` reads a finished checkpoint in place and `finish` unlinks it once its row is gone; the private `WireFile` handle), the bounded sweep, the close latch and in-flight set. `sync_file` (plain `fsync` on Apple). |
-| `src/disk.rs` | `DiskPolicy` admission (reserve plus the bytes a write needs), `DiskPolicy::download_need` (the one rule for what a download still writes) and `free_space`. The reserve comes from the caller's config; the crate never chooses one. |
+| `src/catalog.rs` | `FileId`, `Category`, `FileState`, and the traits other crates implement: `MediaCatalog` (store-wide rows), `PublishTarget` (one publication's one-transaction commits), `CheckpointTarget` (one download checkpoint's row: current, begin, record, clear), `StageTarget` (one staged body's owner: commit, release) and `PromoteTarget` (one promotion into a message's slots). `FileState::Staged` is a complete body an owner holds before any slot references it. |
+| `src/store.rs` | `MediaStore`: intent-first publish, presence-checked reuse, `attach_existing` (reuse before a download), close-checked readers that hold their key, a small idle-limited reader cache for `read_at`, `unlink_released`, staged publication (`stage`/`promote`/`release_staged`/`open_staged_reader` over a `StageTarget` and a `PromoteTarget`), `.wire` download checkpoints (`checkpoint_append`/`restore`/`clear`/`reader` over a `CheckpointTarget`, with a per-checkpoint lock; `CheckpointReader` reads a finished checkpoint in place and `finish` unlinks it once its row is gone; the private `WireFile` handle), the bounded sweep, the close latch and in-flight set. `sync_file` (plain `fsync` on Apple). |
+| `src/disk.rs` | `DiskPolicy` admission (reserve plus the bytes a write needs), `DiskPolicy::download_need` (the one rule for what a download still writes; `checkpoint_needed` inverts it), `DiskPolicy::send_need` (what a send writes locally) and `free_space`. The reserve comes from the caller's config; the crate never chooses one. |
 | `src/error.rs` | `MediaError`: fixed, privacy-safe messages. |
-| `src/memory.rs`, `src/conformance.rs` | `catalog-conformance` feature: an in-memory catalog and the conformance suite every catalog must pass (publish crash table, reuse of a lost twin, release, supersession and reset during a write; checkpoint append/restore/clear, replacement, attempt fencing, crash tails and missing files). |
+| `src/memory.rs`, `src/conformance.rs` | `catalog-conformance` feature: an in-memory catalog and the conformance suite every catalog must pass (publish crash table, reuse of a lost twin, release, supersession and reset during a write; checkpoint append/restore/clear, replacement, attempt fencing, crash tails and missing files; staged files across restarts, a crash before the staged commit, a refused commit, an ended owner, release, and promotion with a present or missing twin). |
 | `src/format_tests.rs`, `src/store_tests.rs`, `testdata/age/` | Vendored C2SP CCTV age payload vectors; format tests; the in-memory conformance run and store tests (modes, close, sweep bounds, corruption). |
 
 ## Rules
@@ -48,9 +48,12 @@ The encrypted per-file media store (mdk#2314). Human overview: [`README.md`](REA
 - The sweep unlinks any wire file `wire_partial_received` does not claim and trims an unrecorded tail back to the
   recorded length. A `WireFile` is in the in-flight set from before its first append until it drops; the sweep skips
   in-flight wire files and holds the in-flight lock from that check through any trim.
+- A staged row survives restarts only while its owner holds it: `Pending` keeps meaning a write in progress, and the
+  sweep reclaims any pending row no live process owns. Promotion moves `staged` to `ready` and attaches slots in one
+  transaction, checking at most one ready twin; a release or an ended owner deletes the row (key) before the file.
 - Every download disk check goes through `DiskPolicy::download_need`. Do not add another formula for what a download
   still writes.
-- `PublishTarget` commits and `CheckpointTarget` calls are one transaction each in the implementing catalog. Any change to their contract changes
+- `PublishTarget`, `CheckpointTarget`, `StageTarget` and `PromoteTarget` calls are one transaction each in the implementing catalog. Any change to their contract changes
   `conformance.rs` in the same commit, and every catalog (`storage-sqlite`, the in-memory one) must keep passing it.
 - One `MediaStore` (and its clones) per account: the in-flight set that protects live publishes from the sweep is
   per instance.

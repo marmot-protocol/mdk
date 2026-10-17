@@ -23,6 +23,7 @@ use crate::{SqliteAccountStorage, SqliteResultExt, u64_to_i64};
 const STATE_PENDING: i64 = 0;
 const STATE_READY: i64 = 1;
 const STATE_LOST: i64 = 2;
+pub(crate) const STATE_STAGED: i64 = 3;
 
 fn category_sql(category: Category) -> i64 {
     match category {
@@ -35,6 +36,7 @@ fn state_from_sql(state: i64) -> FileState {
     match state {
         STATE_PENDING => FileState::Pending,
         STATE_READY => FileState::Ready,
+        STATE_STAGED => FileState::Staged,
         _ => FileState::Lost,
     }
 }
@@ -126,22 +128,23 @@ impl MediaCatalog for SqliteMediaCatalog {
     }
 
     fn ready_file(&self, id: FileId) -> CatalogResult<Option<ReadyFile>> {
+        self.run(|conn| file_in_state(conn, id, STATE_READY))
+    }
+
+    fn staged_file(&self, id: FileId) -> CatalogResult<Option<ReadyFile>> {
+        self.run(|conn| file_in_state(conn, id, STATE_STAGED))
+    }
+
+    fn abandon_unowned_staged(&self, id: FileId) -> CatalogResult<bool> {
         self.run(|conn| {
-            let row: Option<(Zeroizing<Vec<u8>>, i64)> = conn
-                .query_row(
-                    "SELECT file_key,byte_len FROM media_files WHERE id=?1 AND state=?2",
-                    params![id.as_bytes().as_slice(), STATE_READY],
-                    |row| Ok((Zeroizing::new(row.get(0)?), row.get(1)?)),
+            Ok(conn
+                .execute(
+                    "DELETE FROM media_files WHERE id=?1 AND state=?2
+                     AND NOT EXISTS(SELECT 1 FROM outgoing_attachment_uploads WHERE file_id=?1)",
+                    params![id.as_bytes().as_slice(), STATE_STAGED],
                 )
-                .optional()
-                .storage()?;
-            row.map(|(key, byte_len)| {
-                u64::try_from(byte_len)
-                    .ok()
-                    .and_then(|byte_len| ReadyFile::from_key_bytes(&key, byte_len))
-                    .ok_or_else(|| StorageError::Corruption("invalid media file row".into()))
-            })
-            .transpose()
+                .storage()?
+                == 1)
         })
     }
 
@@ -196,7 +199,26 @@ impl MediaCatalog for SqliteMediaCatalog {
 }
 
 /// Ready → lost, overwriting the key with zeroes.
-fn mark_lost_in(conn: &Connection, id: FileId) -> StorageResult<bool> {
+/// The key and length of `id` when its row is in `state`.
+fn file_in_state(conn: &Connection, id: FileId, state: i64) -> StorageResult<Option<ReadyFile>> {
+    let row: Option<(Zeroizing<Vec<u8>>, i64)> = conn
+        .query_row(
+            "SELECT file_key,byte_len FROM media_files WHERE id=?1 AND state=?2",
+            params![id.as_bytes().as_slice(), state],
+            |row| Ok((Zeroizing::new(row.get(0)?), row.get(1)?)),
+        )
+        .optional()
+        .storage()?;
+    row.map(|(key, byte_len)| {
+        u64::try_from(byte_len)
+            .ok()
+            .and_then(|byte_len| ReadyFile::from_key_bytes(&key, byte_len))
+            .ok_or_else(|| StorageError::Corruption("invalid media file row".into()))
+    })
+    .transpose()
+}
+
+pub(crate) fn mark_lost_in(conn: &Connection, id: FileId) -> StorageResult<bool> {
     Ok(conn
         .execute(
             "UPDATE media_files SET state=?2,file_key=zeroblob(32) WHERE id=?1 AND state=?3",

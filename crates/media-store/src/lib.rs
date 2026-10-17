@@ -23,15 +23,15 @@ pub mod memory;
 
 pub use catalog::{
     CatalogError, CatalogResult, Category, CheckpointStart, CheckpointTarget, ExistingOutcome,
-    FileId, FilePresence, FileState, MediaCatalog, NewFile, Presence, PublishTarget, ReadyFile,
-    ReadyOutcome,
+    FileId, FilePresence, FileState, MediaCatalog, NewFile, Presence, PromoteTarget,
+    PromotedOutcome, PublishTarget, ReadyFile, ReadyOutcome, StageTarget, StagedOutcome,
 };
 pub use disk::{Admission, DiskPolicy, free_space};
 pub use error::{MediaError, MediaResult};
 pub use format::FileKey;
 pub use store::{
     CHECKPOINT_APPEND_MAX, CheckpointReader, MEDIA_DIRECTORY, MediaReader, MediaStore,
-    PublishOutcome, SweepReport, sync_file,
+    PromoteOutcome, PublishOutcome, StageOutcome, SweepReport, sync_file,
 };
 
 #[cfg(test)]

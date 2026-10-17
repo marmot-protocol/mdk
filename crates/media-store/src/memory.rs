@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::catalog::{
     CatalogError, CatalogResult, Category, CheckpointStart, CheckpointTarget, ExistingOutcome,
-    FileId, FilePresence, FileState, MediaCatalog, NewFile, Presence, PublishTarget, ReadyFile,
-    ReadyOutcome,
+    FileId, FilePresence, FileState, MediaCatalog, NewFile, Presence, PromoteTarget,
+    PromotedOutcome, PublishTarget, ReadyFile, ReadyOutcome, StageTarget, StagedOutcome,
 };
 
 struct Row {
@@ -30,6 +30,8 @@ struct State {
     /// Each slot's current download attempt; older attempts are fenced.
     attempts: HashMap<u32, u32>,
     wires_made: u64,
+    /// Outgoing owners by slot, and the staged (or promoted) file each holds.
+    stage_owners: HashMap<u32, Option<FileId>>,
 }
 
 impl State {
@@ -174,6 +176,36 @@ impl MemoryCatalog {
             .remove(&slot);
     }
 
+    /// The stage target of `slot`'s outgoing owner, creating the owner.
+    pub fn stage_target(&self, slot: u32) -> MemoryStage {
+        self.state()
+            .expect("catalog open")
+            .stage_owners
+            .entry(slot)
+            .or_default();
+        MemoryStage {
+            catalog: self.clone(),
+            slot,
+        }
+    }
+
+    /// Promotion of `slot`'s owner's file into the slot itself.
+    pub fn promote_target(&self, slot: u32) -> MemoryPromotion {
+        MemoryPromotion {
+            catalog: self.clone(),
+            slot,
+        }
+    }
+
+    /// The outgoing owner of `slot` goes away without releasing its file,
+    /// as expiry or an abandoned send would; the sweep releases the file.
+    pub fn end_stage_owner(&self, slot: u32) {
+        self.state()
+            .expect("catalog open")
+            .stage_owners
+            .remove(&slot);
+    }
+
     /// Deletes a row directly, as a committed key-first deletion does.
     pub fn delete_row(&self, id: FileId) {
         self.state().expect("catalog open").rows.remove(&id);
@@ -237,6 +269,30 @@ impl MediaCatalog for MemoryCatalog {
             .values()
             .find(|(wire, _)| *wire == id)
             .map(|(_, received)| *received))
+    }
+
+    fn staged_file(&self, id: FileId) -> CatalogResult<Option<ReadyFile>> {
+        self.key_lookups.fetch_add(1, Ordering::Relaxed);
+        Ok(self
+            .state()?
+            .rows
+            .get(&id)
+            .filter(|row| row.state == FileState::Staged)
+            .and_then(|row| ReadyFile::from_key_bytes(&row.key, row.byte_len)))
+    }
+
+    fn abandon_unowned_staged(&self, id: FileId) -> CatalogResult<bool> {
+        let mut state = self.state()?;
+        let staged = state
+            .rows
+            .get(&id)
+            .is_some_and(|row| row.state == FileState::Staged);
+        let owned = state.stage_owners.values().any(|held| *held == Some(id));
+        if staged && !owned {
+            state.rows.remove(&id);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn page(&self, after: Option<FileId>, limit: usize) -> CatalogResult<Vec<(FileId, FileState)>> {
@@ -382,5 +438,88 @@ impl CheckpointTarget for MemoryCheckpoint {
             return Ok(None);
         }
         Ok(state.checkpoints.remove(&self.slot).map(|(wire, _)| wire))
+    }
+}
+
+/// One slot's outgoing owner in a `MemoryCatalog`.
+pub struct MemoryStage {
+    catalog: MemoryCatalog,
+    slot: u32,
+}
+
+impl StageTarget for MemoryStage {
+    fn commit_staged(&self, id: FileId, digest: &[u8; 32]) -> CatalogResult<StagedOutcome> {
+        let mut state = self.catalog.state()?;
+        if !state.stage_owners.contains_key(&self.slot) {
+            return Ok(StagedOutcome::Superseded);
+        }
+        match state.rows.get_mut(&id) {
+            Some(row) if row.state == FileState::Pending => {
+                row.state = FileState::Staged;
+                row.digest = *digest;
+            }
+            _ => return Ok(StagedOutcome::Superseded),
+        }
+        state.stage_owners.insert(self.slot, Some(id));
+        Ok(StagedOutcome::Staged)
+    }
+
+    fn release_staged(&self, id: FileId) -> CatalogResult<bool> {
+        let mut state = self.catalog.state()?;
+        if state.stage_owners.get(&self.slot) != Some(&Some(id)) {
+            return Ok(false);
+        }
+        state.stage_owners.insert(self.slot, None);
+        let staged = state
+            .rows
+            .get(&id)
+            .is_some_and(|row| row.state == FileState::Staged);
+        if staged {
+            state.rows.remove(&id);
+        }
+        Ok(staged)
+    }
+}
+
+/// Promotion of a slot owner's staged file into the slot.
+pub struct MemoryPromotion {
+    catalog: MemoryCatalog,
+    slot: u32,
+}
+
+impl PromoteTarget for MemoryPromotion {
+    fn commit_promoted(&self, id: FileId, present: Presence<'_>) -> CatalogResult<PromotedOutcome> {
+        let mut state = self.catalog.state()?;
+        if state.stage_owners.get(&self.slot) != Some(&Some(id))
+            || state.superseded.contains(&self.slot)
+        {
+            return Ok(PromotedOutcome::Superseded);
+        }
+        let Some(row) = state.rows.get(&id) else {
+            return Ok(PromotedOutcome::Superseded);
+        };
+        match row.state {
+            FileState::Ready => {
+                state.attach(self.slot, id);
+                return Ok(PromotedOutcome::Ready);
+            }
+            FileState::Staged => {}
+            _ => return Ok(PromotedOutcome::Superseded),
+        }
+        let (category, digest) = (row.category, row.digest);
+        if let Some((twin, byte_len)) = state.ready_twin(category, &digest, Some(id)) {
+            if present(twin, byte_len)? == FilePresence::Present {
+                state.rows.remove(&id);
+                state.stage_owners.insert(self.slot, Some(twin));
+                state.attach(self.slot, twin);
+                return Ok(PromotedOutcome::Existing(twin));
+            }
+            state.mark_lost(twin);
+        }
+        if let Some(row) = state.rows.get_mut(&id) {
+            row.state = FileState::Ready;
+        }
+        state.attach(self.slot, id);
+        Ok(PromotedOutcome::Ready)
     }
 }

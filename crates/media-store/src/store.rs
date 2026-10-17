@@ -18,6 +18,12 @@
 //!   shard.
 //! - **Reuse:** identical content is stored once, but a ready row is reused
 //!   only if its file is on disk; a missing one is marked `lost` instead.
+//! - **Staged publication (outgoing):** like publish, but the third step
+//!   marks the row `staged` under an owner (an outgoing upload) instead of
+//!   `ready`. The file is complete and survives restarts while its owner
+//!   exists; promotion later makes it `ready` and attaches slots, in one
+//!   transaction. An owner that goes away releases its staged row (key first,
+//!   then the file); the sweep backstops an unowned staged row.
 //! - **Download checkpoints:** a resumable download's ciphertext goes to an
 //!   append-only `<shard>/<id>.wire` file through a [`CheckpointTarget`]. The
 //!   row commits before its file exists and is deleted before the file is.
@@ -46,7 +52,8 @@ use zeroize::Zeroizing;
 
 use crate::catalog::{
     CatalogError, CatalogResult, Category, CheckpointTarget, ExistingOutcome, FileId, FilePresence,
-    FileState, MediaCatalog, NewFile, PublishTarget, ReadyOutcome,
+    FileState, MediaCatalog, NewFile, PromoteTarget, PromotedOutcome, PublishTarget, ReadyOutcome,
+    StageTarget, StagedOutcome,
 };
 use crate::error::{MediaError, MediaResult, io_error};
 use crate::format::{
@@ -84,6 +91,27 @@ pub enum PublishOutcome {
     Superseded,
 }
 
+/// The result of [`MediaStore::stage`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageOutcome {
+    /// The body is staged in `id` under its owner; `digest` is its SHA-256,
+    /// computed while sealing.
+    Staged { id: FileId, digest: [u8; 32] },
+    /// The owner no longer accepts the body; nothing was kept.
+    Superseded,
+}
+
+/// The result of [`MediaStore::promote`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromoteOutcome {
+    /// The staged file is ready and attached.
+    Ready,
+    /// An identical ready file was attached instead; the staged copy is gone.
+    Existing(FileId),
+    /// Nothing was attached; a staged file is kept for its owner.
+    Superseded,
+}
+
 /// Aggregate counts from one sweep batch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SweepReport {
@@ -92,6 +120,8 @@ pub struct SweepReport {
     pub pending_removed: u64,
     pub orphans_unlinked: u64,
     pub lost_marked: u64,
+    /// Staged rows no owner held any more, deleted with their files.
+    pub staged_released: u64,
     /// Wire checkpoints cut back to their recorded length.
     pub wire_tails_trimmed: u64,
     /// The batch finished a full pass over rows and shard directories.
@@ -400,6 +430,106 @@ impl<C: MediaCatalog> MediaStore<C> {
         )
     }
 
+    /// Stages an outgoing body: the intent row, then the sealed and synced
+    /// file, then one transaction that marks the row `staged` under
+    /// `target`'s owner. The digest is computed while sealing, since a host
+    /// source has none to trust until it has been read. Unlike [`publish`]
+    /// there is no content reuse here: an identical ready file is attached
+    /// at promotion. A failed or refused step abandons the row, then the
+    /// file. A full volume or database is [`MediaError::Capacity`].
+    ///
+    /// [`publish`]: Self::publish
+    pub fn stage(
+        &self,
+        target: &dyn StageTarget,
+        category: Category,
+        body: &mut dyn Read,
+        byte_len: u64,
+        now: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> MediaResult<StageOutcome> {
+        self.inner.ensure_open()?;
+        // The pending row's digest is unknown until the body is read; the
+        // staged commit records the real one. Pending rows are never twins.
+        let (id, key, _in_flight) = self.insert_pending(category, byte_len, &[0; 32], now)?;
+        let result = self
+            .write_body_hashed(&id, &key, body, byte_len, cancelled)
+            .and_then(|digest| {
+                self.inner.ensure_open()?;
+                Ok((target.commit_staged(id, &digest)?, digest))
+            });
+        match result {
+            Ok((StagedOutcome::Staged, digest)) => Ok(StageOutcome::Staged { id, digest }),
+            Ok((StagedOutcome::Superseded, _)) => {
+                self.abandon(&id);
+                Ok(StageOutcome::Superseded)
+            }
+            Err(error) => {
+                self.abandon(&id);
+                Err(error)
+            }
+        }
+    }
+
+    /// Promotes the staged (or already promoted) file `id` into `target`'s
+    /// slots in one transaction, reusing a present identical ready file when
+    /// there is one. A replaced staged copy is unlinked after the commit.
+    pub fn promote(&self, target: &dyn PromoteTarget, id: FileId) -> MediaResult<PromoteOutcome> {
+        self.inner.ensure_open()?;
+        match target.commit_promoted(id, &|twin, byte_len| self.present(twin, byte_len))? {
+            PromotedOutcome::Ready => Ok(PromoteOutcome::Ready),
+            PromotedOutcome::Existing(twin) => {
+                // The target deleted the staged row; only its file remains.
+                self.forget_reader(&id);
+                let _ = remove_if_present(&self.path(&id));
+                Ok(PromoteOutcome::Existing(twin))
+            }
+            PromotedOutcome::Superseded => Ok(PromoteOutcome::Superseded),
+        }
+    }
+
+    /// Releases the staged file `id` from `target`'s owner: the row (key)
+    /// first, then the file. Returns whether a staged row was deleted. The
+    /// sweep removes a file this misses.
+    pub fn release_staged(&self, target: &dyn StageTarget, id: FileId) -> MediaResult<bool> {
+        self.inner.ensure_open()?;
+        if !target.release_staged(id)? {
+            return Ok(false);
+        }
+        self.forget_reader(&id);
+        let _ = remove_if_present(&self.path(&id));
+        Ok(true)
+    }
+
+    /// Opens a staged file for reading, as an upload streams it. `None`
+    /// means `id` is not staged (released, promoted or never staged). The
+    /// reader holds the key and refuses reads once the store closes.
+    pub fn open_staged_reader(&self, id: &FileId) -> MediaResult<Option<MediaReader<C>>> {
+        self.inner.ensure_open()?;
+        let Some(row) = self.inner.catalog.staged_file(*id)? else {
+            return Ok(None);
+        };
+        let file = match File::open(self.path(id)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(MediaError::Corruption("staged media file is missing"));
+            }
+            Err(error) => return Err(io_error(&error)),
+        };
+        let reader = MediaFileReader::open(file, &row.key, &id.0)?;
+        if reader.plaintext_bytes() != row.byte_len {
+            return Err(MediaError::Corruption(
+                "media file length differs from its row",
+            ));
+        }
+        Ok(Some(MediaReader {
+            inner: self.inner.clone(),
+            id: *id,
+            reader,
+            position: 0,
+        }))
+    }
+
     /// Step 1: the intent row, registered as in flight before it commits.
     pub(crate) fn insert_pending(
         &self,
@@ -437,6 +567,23 @@ impl<C: MediaCatalog> MediaStore<C> {
         digest: &[u8; 32],
         cancelled: &dyn Fn() -> bool,
     ) -> MediaResult<()> {
+        if self.write_body_hashed(id, key, body, byte_len, cancelled)? != *digest {
+            return Err(MediaError::InvalidBody("media body digest mismatch"));
+        }
+        Ok(())
+    }
+
+    /// [`Self::write_body`] without an expected digest: seals and syncs the
+    /// body and returns the SHA-256 it computed. A length mismatch is
+    /// rejected here; a digest mismatch is the caller's to judge.
+    pub(crate) fn write_body_hashed(
+        &self,
+        id: &FileId,
+        key: &FileKey,
+        body: &mut dyn Read,
+        byte_len: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> MediaResult<[u8; 32]> {
         #[cfg(any(test, feature = "test-support"))]
         if self.inner.full_disk_for_test.load(Ordering::Acquire) {
             return Err(MediaError::Capacity);
@@ -470,11 +617,9 @@ impl<C: MediaCatalog> MediaStore<C> {
         if written != byte_len {
             return Err(MediaError::InvalidBody("media body shorter than declared"));
         }
-        if <[u8; 32]>::from(hasher.finalize()) != *digest {
-            return Err(MediaError::InvalidBody("media body digest mismatch"));
-        }
         let file = writer.finish()?;
-        sync_file(&file).map_err(|e| io_error(&e))
+        sync_file(&file).map_err(|e| io_error(&e))?;
+        Ok(hasher.finalize().into())
     }
 
     /// Failed publish: drop the row (and key) first, then the file. Anything
@@ -807,6 +952,7 @@ impl<C: MediaCatalog> MediaStore<C> {
         if report.pending_removed
             + report.orphans_unlinked
             + report.lost_marked
+            + report.staged_released
             + report.wire_tails_trimmed
             > 0
         {
@@ -816,6 +962,7 @@ impl<C: MediaCatalog> MediaStore<C> {
                 pending_removed = report.pending_removed,
                 orphans_unlinked = report.orphans_unlinked,
                 lost_marked = report.lost_marked,
+                staged_released = report.staged_released,
                 wire_tails_trimmed = report.wire_tails_trimmed,
                 "media store sweep reclaimed state"
             );
@@ -855,6 +1002,15 @@ impl<C: MediaCatalog> MediaStore<C> {
                     Err(error) => return Err(io_error(&error)),
                 },
                 FileState::Lost => {}
+                // An owned staged row is kept across restarts; only one no
+                // owner holds is released, key first.
+                FileState::Staged => {
+                    if self.inner.catalog.abandon_unowned_staged(*id)? {
+                        self.forget_reader(id);
+                        remove_if_present(&self.path(id)).map_err(|e| io_error(&e))?;
+                        report.staged_released += 1;
+                    }
+                }
             }
         }
         if rows.len() < limit {

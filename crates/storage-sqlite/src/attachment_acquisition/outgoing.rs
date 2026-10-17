@@ -4,8 +4,8 @@ use super::*;
 /// Valid staged bytes always win over HTTP; deliberate Retry may reacquire a quarantined body.
 pub(super) const STAGED_UPLOAD_MATCH: &str = "NOT EXISTS(SELECT 1 FROM outgoing_attachment_uploads u JOIN attachment_history h ON h.group_id_hex=u.group_id_hex AND h.source_epoch=u.source_epoch AND h.slot_json=u.slot_json JOIN app_events a ON a.group_id_hex=h.group_id_hex AND a.message_id_hex=h.message_id_hex WHERE h.group_id_hex=q.group_id_hex AND h.message_id_hex=q.message_id_hex AND h.attachment_index=q.attachment_index AND a.direction='sent' AND (u.quarantined=0 OR q.explicit_request=0))";
 
-const UPLOAD_TTL_SECONDS: u64 = 7 * 24 * 3600;
-const MAX_STAGED_UPLOADS: i64 = 256;
+pub(super) const UPLOAD_TTL_SECONDS: u64 = 7 * 24 * 3600;
+pub(super) const MAX_STAGED_UPLOADS: i64 = 256;
 /// Every file-backed staging/promotion copy moves at most this many bytes per step.
 pub const ATTACHMENT_STAGING_CHUNK_BYTES: usize = 64 * 1024;
 const BODY_TABLE: &str = "outgoing_attachment_upload_bodies";
@@ -191,6 +191,7 @@ impl SqliteAccountStorage {
                 JOIN account_groups g USING(group_id_hex)
                 JOIN outgoing_attachment_uploads u ON u.group_id_hex=h.group_id_hex AND u.source_epoch=h.source_epoch AND u.slot_json=h.slot_json
                 WHERE h.group_id_hex=?1 AND h.message_id_hex=?2 AND h.visible=1 AND a.direction='sent' AND g.pending_confirmation=0
+                AND u.file_id IS NULL
                 AND (a.retention_expires_at IS NULL OR a.retention_expires_at>?3)
                 AND NOT EXISTS(SELECT 1 FROM attachment_removal_suppression r WHERE r.group_id_hex=h.group_id_hex AND r.message_id_hex=h.message_id_hex AND r.attachment_index=h.attachment_index)
                 ORDER BY h.attachment_index,u.token").storage()?;
@@ -578,7 +579,7 @@ pub(super) fn read_some(reader: &mut dyn std::io::Read, buffer: &mut [u8]) -> St
 
 /// Only live unfulfilled source slots or pending sends need staging. A satisfied
 /// or retired sibling cannot pin quota; exclusion anticipates the current copy.
-fn staging_has_unfulfilled_owner(
+pub(super) fn staging_has_unfulfilled_owner(
     conn: &Connection,
     token: &[u8],
     now: u64,

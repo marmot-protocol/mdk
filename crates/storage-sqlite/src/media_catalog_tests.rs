@@ -4,7 +4,9 @@ use std::io::Cursor;
 use std::path::PathBuf;
 
 use media_store::conformance::{self, Harness};
-use media_store::{CheckpointTarget, MEDIA_DIRECTORY, MediaStore, PublishOutcome};
+use media_store::{
+    CheckpointTarget, MEDIA_DIRECTORY, MediaStore, PromoteTarget, PublishOutcome, StageTarget,
+};
 use sha2::{Digest, Sha256};
 
 use super::*;
@@ -23,6 +25,8 @@ struct SqliteHarness {
     slots: RefCell<HashMap<u32, (Vec<u8>, AttachmentAssetRef)>>,
     /// Each slot's claimed download attempt, for its checkpoint target.
     jobs: RefCell<HashMap<u32, AttachmentAcquisition>>,
+    /// Each staging slot's sent message and outgoing upload token.
+    uploads: RefCell<HashMap<u32, (String, Vec<u8>)>>,
 }
 
 impl SqliteHarness {
@@ -45,6 +49,7 @@ impl SqliteHarness {
             storage,
             slots: RefCell::new(HashMap::new()),
             jobs: RefCell::new(HashMap::new()),
+            uploads: RefCell::new(HashMap::new()),
         }
     }
 
@@ -123,6 +128,54 @@ impl SqliteHarness {
             .expect("the slot's download is claimed");
         self.jobs.borrow_mut().insert(slot, job.clone());
         job
+    }
+
+    /// A sent message for staging slot `slot` and an outgoing upload bound
+    /// to its attachment's source descriptor, created on first use.
+    fn upload(&self, slot: u32) -> (String, Vec<u8>) {
+        if let Some(upload) = self.uploads.borrow().get(&slot) {
+            return upload.clone();
+        }
+        let message = format!("{:064x}", slot + 0x1000);
+        let tag = vec![
+            "imeta".to_owned(),
+            "m image/png".to_owned(),
+            format!("x {}", hex::encode([8; 32])),
+        ];
+        self.storage
+            .record_app_event(&StoredAppEvent {
+                group_id_hex: GROUP.into(),
+                message_id_hex: message.clone(),
+                source_message_id_hex: Some(message.clone()),
+                source_epoch: Some(1),
+                direction: "sent".into(),
+                sender: "author".into(),
+                plaintext: String::new(),
+                kind: 9,
+                tags: vec![tag.clone()],
+                recorded_at: NOW,
+                received_at: NOW,
+                origin_commit_id: None,
+                moderation_grant: false,
+            })
+            .unwrap();
+        let token = self
+            .storage
+            .reserve_attachment_upload(GROUP, 1, NOW)
+            .unwrap()
+            .expect("an upload slot is free");
+        self.storage
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE outgoing_attachment_uploads SET slot_json=?2 WHERE token=?1",
+                rusqlite::params![token, serde_json::to_string(&tag).unwrap()],
+            )
+            .unwrap();
+        self.uploads
+            .borrow_mut()
+            .insert(slot, (message.clone(), token.clone()));
+        (message, token)
     }
 
     fn sql(&self, sql: &str, param: &[u8]) {
@@ -209,6 +262,26 @@ impl Harness for SqliteHarness {
         self.sql(
             "DELETE FROM attachment_partial WHERE token=?1",
             &self.token(slot),
+        );
+    }
+
+    fn stage_target(&self, slot: u32) -> Box<dyn StageTarget + '_> {
+        Box::new(self.storage.attachment_upload_stage(&self.upload(slot).1))
+    }
+
+    fn promote_target(&self, slot: u32) -> Box<dyn PromoteTarget + '_> {
+        let (message, token) = self.upload(slot);
+        Box::new(
+            self.storage
+                .attachment_upload_promotion(GROUP, &message, &token, || NOW),
+        )
+    }
+
+    /// Expiry, an abandoned send or group deletion: the upload row goes.
+    fn end_stage_owner(&self, slot: u32) {
+        self.sql(
+            "DELETE FROM outgoing_attachment_uploads WHERE token=?1",
+            &self.upload(slot).1,
         );
     }
 }

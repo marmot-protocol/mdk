@@ -44,6 +44,12 @@ impl DiskPolicy {
             .max(body)
     }
 
+    /// Bytes sending a `body`-byte attachment writes locally: its staged
+    /// file. The wire ciphertext streams to the server and is never stored.
+    pub fn send_need(body: u64) -> u64 {
+        body
+    }
+
     /// The inverse of [`Self::download_need`]: the fewest checkpointed bytes
     /// with which a download of `body` bytes still writes at most
     /// `available`, or `None` when even a complete checkpoint leaves too

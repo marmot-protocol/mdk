@@ -4,6 +4,15 @@
 
 ### Breaking changes
 
+- Migration 0113 advances account storage to schema 113 on first open. Older
+  binaries reject the upgraded database; downgrade is unsupported. It rebuilds
+  `media_files` to allow a `staged` state (an outgoing body its upload owns,
+  not yet referenced) and adds `outgoing_attachment_uploads.file_id`. Deleting
+  an upload, or pointing it at another file, deletes a still-staged file's key;
+  a promoted file is kept (mdk#2314 step 3).
+- `promote_attachment_uploads` skips uploads that have a media store file;
+  promote those through `MediaStore::promote` with an
+  `AttachmentUploadPromotion`.
 - Migration 0111 advances account storage to schema 111 on first open. Older
   binaries reject the upgraded database; downgrade is unsupported. It adds
   `cgka_messages.openmls_content` and `openmls_epoch`, which every write
@@ -49,6 +58,15 @@
 - `AttachmentTransferState` adds `StorageBlocked`; update exhaustive matches.
 
 ### Added
+
+- File-backed outgoing uploads on the media store (mdk#2314 step 3):
+  `reserve_attachment_upload` reserves an upload row before its body is staged,
+  `attachment_upload_stage` returns its `AttachmentUploadStage`
+  (`media_store::StageTarget`), `attachment_upload_promotion` returns an
+  `AttachmentUploadPromotion` (`media_store::PromoteTarget`) for a published
+  message, and `attachment_upload_file` locates the staged file for the upload.
+  `SqliteMediaCatalog` implements the new `staged_file` and
+  `abandon_unowned_staged` catalog methods.
 
 - `MessageStorage::list_openmls_messages_in_states` leaves out, in SQL, the rows
   an `OpenMlsContentFilter` excludes (delivered applications at or below an

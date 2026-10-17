@@ -238,6 +238,8 @@ mod migration_0110_media_files;
 mod migration_0111_message_openmls_content;
 #[path = "migrations/0112_wire_partials.rs"]
 mod migration_0112_wire_partials;
+#[path = "migrations/0113_staged_media.rs"]
+mod migration_0113_staged_media;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -928,6 +930,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0112_wire_partials",
         suspend_foreign_keys: &[],
         apply: migration_0112_wire_partials::apply,
+    },
+    Migration {
+        version: 113,
+        name: "0113_staged_media",
+        suspend_foreign_keys: crate::migrations::migration_0113_staged_media::SUSPEND_FOREIGN_KEYS,
+        apply: migration_0113_staged_media::apply,
     },
 ];
 

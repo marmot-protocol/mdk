@@ -3858,4 +3858,5 @@ fn array_publication_declares_length_and_skips_the_trigger_rewrite() {
 
 mod outgoing;
 mod outgoing_files;
+mod outgoing_media;
 mod promotion;

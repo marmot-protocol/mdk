@@ -16,10 +16,10 @@ use sha2::{Digest, Sha256};
 
 use crate::catalog::{
     CatalogError, Category, CheckpointTarget, ExistingOutcome, FileId, FileState, MediaCatalog,
-    PublishTarget, ReadyOutcome,
+    PromoteTarget, PublishTarget, ReadyOutcome, StageTarget,
 };
 use crate::format::MediaFileWriter;
-use crate::store::{MediaStore, PublishOutcome};
+use crate::store::{MediaStore, PromoteOutcome, PublishOutcome, StageOutcome};
 
 /// One fresh catalog with a store root, as an implementation provides it.
 pub trait Harness {
@@ -49,6 +49,15 @@ pub trait Harness {
     /// Deletes `slot`'s checkpoint row without touching its file, as
     /// completion, expiry or a terminal failure do in the domain.
     fn end_checkpoint(&self, slot: u32);
+    /// The stage target of `slot`'s outgoing owner (an upload), creating the
+    /// owner if needed.
+    fn stage_target(&self, slot: u32) -> Box<dyn StageTarget + '_>;
+    /// Promotion of `slot`'s owner's staged file into the slot, as
+    /// publishing the message that carries it does.
+    fn promote_target(&self, slot: u32) -> Box<dyn PromoteTarget + '_>;
+    /// `slot`'s owner goes away in the domain (expiry, an abandoned send)
+    /// without the store releasing its file.
+    fn end_stage_owner(&self, slot: u32);
 }
 
 const NOW: u64 = 1_000;
@@ -167,6 +176,13 @@ pub fn run_all<H: Harness>(make: &dyn Fn() -> H) {
     a_missing_or_short_wire_file_discards_the_checkpoint(make());
     wire_checkpoints_live_exactly_as_long_as_their_rows(make());
     a_checkpoint_reader_reads_the_recorded_bytes_and_outlives_its_row(make());
+    staged_files_survive_restarts_until_promoted(make());
+    a_crash_before_the_staged_commit_leaves_nothing(make());
+    a_refused_staged_commit_leaves_nothing(make());
+    an_ended_owner_releases_its_staged_file(make());
+    releasing_a_staged_file_deletes_its_key_then_the_file(make());
+    promotion_attaches_a_present_twin_instead(make());
+    promotion_skips_a_twin_whose_file_is_gone(make());
 }
 
 pub fn publish_reads_back_and_reuses_identical_content<H: Harness>(harness: H) {
@@ -755,4 +771,177 @@ pub fn a_checkpoint_reader_reads_the_recorded_bytes_and_outlives_its_row<H: Harn
     store.close();
     let mut byte = [0; 1];
     assert!(reader.read(&mut byte).is_err());
+}
+
+fn staged<H: Harness>(
+    harness: &H,
+    store: &MediaStore<H::Catalog>,
+    slot: u32,
+    content: &[u8],
+) -> FileId {
+    match store
+        .stage(
+            harness.stage_target(slot).as_ref(),
+            Category::Retained,
+            &mut Cursor::new(content),
+            content.len() as u64,
+            NOW,
+            &|| false,
+        )
+        .expect("stage")
+    {
+        StageOutcome::Staged { id, digest: sealed } => {
+            assert_eq!(
+                sealed,
+                digest(content),
+                "the digest is computed while sealing"
+            );
+            id
+        }
+        other => panic!("expected a staged file, got {other:?}"),
+    }
+}
+
+fn read_staged<C: MediaCatalog>(store: &MediaStore<C>, id: &FileId) -> Option<Vec<u8>> {
+    let mut reader = store.open_staged_reader(id).expect("open staged reader")?;
+    let mut out = Vec::new();
+    reader.read_to_end(&mut out).expect("read");
+    Some(out)
+}
+
+/// A staged file is complete, readable for its upload, invisible to slot
+/// reads, and kept across a restart and the sweep while its owner exists.
+/// Promotion makes it ready and attached.
+pub fn staged_files_survive_restarts_until_promoted<H: Harness>(mut harness: H) {
+    let content = body(90_000, 11);
+    let id = staged(&harness, &store(&harness), 0, &content);
+    harness.restart();
+    let store = store(&harness);
+    assert_eq!(store.file_state(&id).unwrap(), Some(FileState::Staged));
+    assert!(store.open_reader(&id).unwrap().is_none(), "not ready yet");
+    assert_eq!(read_staged(&store, &id).unwrap(), content);
+    sweep_all(&store);
+    assert_eq!(store.file_state(&id).unwrap(), Some(FileState::Staged));
+    assert_eq!(files_on_disk(&harness), 1);
+
+    assert_eq!(
+        store
+            .promote(harness.promote_target(0).as_ref(), id)
+            .unwrap(),
+        PromoteOutcome::Ready
+    );
+    assert_eq!(store.file_state(&id).unwrap(), Some(FileState::Ready));
+    assert_eq!(read_all(&store, &id).unwrap(), content);
+    assert!(store.open_staged_reader(&id).unwrap().is_none());
+}
+
+/// A crash after the body is sealed but before the staged commit leaves a
+/// pending row and its file; the sweep reclaims both.
+pub fn a_crash_before_the_staged_commit_leaves_nothing<H: Harness>(mut harness: H) {
+    let content = body(40_000, 12);
+    let id = {
+        let store = store(&harness);
+        let (id, key, in_flight) = store
+            .insert_pending(Category::Retained, content.len() as u64, &[0; 32], NOW)
+            .unwrap();
+        store
+            .write_body_hashed(
+                &id,
+                &key,
+                &mut Cursor::new(&content),
+                content.len() as u64,
+                &|| false,
+            )
+            .unwrap();
+        std::mem::forget(in_flight);
+        id
+    };
+    harness.restart();
+    let store = store(&harness);
+    assert!(store.open_staged_reader(&id).unwrap().is_none());
+    assert_eq!(sweep_all(&store), (1, 0, 0));
+    assert_eq!(files_on_disk(&harness), 0);
+}
+
+/// An owner that is gone by the staged commit keeps nothing: the store
+/// abandons the row, then the file.
+pub fn a_refused_staged_commit_leaves_nothing<H: Harness>(harness: H) {
+    let store = store(&harness);
+    let target = harness.stage_target(0);
+    harness.end_stage_owner(0);
+    let content = body(30_000, 13);
+    assert_eq!(
+        store
+            .stage(
+                target.as_ref(),
+                Category::Retained,
+                &mut Cursor::new(&content),
+                content.len() as u64,
+                NOW,
+                &|| false,
+            )
+            .unwrap(),
+        StageOutcome::Superseded
+    );
+    assert_eq!(rows(&harness.catalog()), 0);
+    assert_eq!(files_on_disk(&harness), 0);
+}
+
+/// An owner that ends in the domain without releasing its file (expiry, an
+/// abandoned send) leaves nothing once the sweep has run.
+pub fn an_ended_owner_releases_its_staged_file<H: Harness>(harness: H) {
+    let store = store(&harness);
+    let id = staged(&harness, &store, 0, &body(20_000, 14));
+    harness.end_stage_owner(0);
+    sweep_all(&store);
+    assert_eq!(store.file_state(&id).unwrap(), None);
+    assert_eq!(files_on_disk(&harness), 0);
+}
+
+/// Releasing a staged file deletes its row (key), then its file; a second
+/// release finds nothing.
+pub fn releasing_a_staged_file_deletes_its_key_then_the_file<H: Harness>(harness: H) {
+    let store = store(&harness);
+    let id = staged(&harness, &store, 0, &body(25_000, 15));
+    let target = harness.stage_target(0);
+    assert!(store.release_staged(target.as_ref(), id).unwrap());
+    assert_eq!(store.file_state(&id).unwrap(), None);
+    assert_eq!(files_on_disk(&harness), 0);
+    assert!(!store.release_staged(target.as_ref(), id).unwrap());
+}
+
+/// Promotion attaches a ready file with the same content whose file is on
+/// disk, and drops the staged copy (row, then file).
+pub fn promotion_attaches_a_present_twin_instead<H: Harness>(harness: H) {
+    let store = store(&harness);
+    let content = body(60_000, 16);
+    let twin = published(&harness, &store, 1, &content);
+    let id = staged(&harness, &store, 0, &content);
+    assert_eq!(
+        store
+            .promote(harness.promote_target(0).as_ref(), id)
+            .unwrap(),
+        PromoteOutcome::Existing(twin)
+    );
+    assert_eq!(store.file_state(&id).unwrap(), None);
+    assert_eq!(files_on_disk(&harness), 1);
+    assert_eq!(read_all(&store, &twin).unwrap(), content);
+}
+
+/// A twin whose file is gone is marked lost, and the staged file is
+/// promoted itself.
+pub fn promotion_skips_a_twin_whose_file_is_gone<H: Harness>(harness: H) {
+    let store = store(&harness);
+    let content = body(60_000, 17);
+    let twin = published(&harness, &store, 1, &content);
+    std::fs::remove_file(store.path(&twin)).unwrap();
+    let id = staged(&harness, &store, 0, &content);
+    assert_eq!(
+        store
+            .promote(harness.promote_target(0).as_ref(), id)
+            .unwrap(),
+        PromoteOutcome::Ready
+    );
+    assert_eq!(store.file_state(&twin).unwrap(), Some(FileState::Lost));
+    assert_eq!(read_all(&store, &id).unwrap(), content);
 }

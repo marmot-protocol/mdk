@@ -1144,6 +1144,8 @@ pub use controls::{
 };
 
 mod outgoing;
+mod outgoing_media;
 #[cfg(test)]
 pub(crate) use outgoing::copy_staged_body_for_test;
 pub use outgoing::{ATTACHMENT_STAGING_CHUNK_BYTES, AttachmentUploadSource};
+pub use outgoing_media::{AttachmentUploadPromotion, AttachmentUploadStage};

@@ -27,12 +27,17 @@ database, which this crate reaches through a catalog trait implemented by `stora
   serialize. An append is at most `CHECKPOINT_APPEND_MAX` bytes, so a crash can leave at most that much unrecorded;
   reopening and the sweep cut it off. A finished checkpoint is read in place through `checkpoint_reader`, which keeps
   its file open (the sweep and an unlink leave it alone) until `finish` unlinks a file whose row is gone.
+- **Staged publication** (`stage`, `promote`, `release_staged`, `open_staged_reader`): an outgoing body is sealed into
+  a store file that stays `staged` under its owner (an outgoing upload) through the upload and across restarts, then
+  becomes `ready` and attached when the message is published, reusing an identical ready file if one is on disk. An
+  owner that goes away releases its staged file, key first; the sweep releases a staged row no owner holds.
 - **Disk admission** (`DiskPolicy`): the caller supplies the reserve from its configuration; the crate only measures
   free space (`free_space`) and compares. `DiskPolicy::download_need` is the one rule for what a download still
   writes: the rest of its wire file and its store file, less what is already checkpointed, never less than the store
-  file.
-- **The catalog traits**: `MediaCatalog` (store-wide rows), `PublishTarget` (one publication's commit) and
-  `CheckpointTarget` (one download checkpoint's row), implemented on the account database by `storage-sqlite`. The `catalog-conformance` feature exports the suite every
+  file. `DiskPolicy::send_need` is the rule for a send: its staged file, since the upload streams.
+- **The catalog traits**: `MediaCatalog` (store-wide rows), `PublishTarget` (one publication's commit),
+  `CheckpointTarget` (one download checkpoint's row), `StageTarget` (one staged body's owner) and `PromoteTarget` (one
+  promotion into a published message's slots), implemented on the account database by `storage-sqlite`. The `catalog-conformance` feature exports the suite every
   implementation must pass, and an in-memory catalog.
 
 Later steps of mdk#2314 add handoff leases and the evictable cache category, and move the rest of attachments onto
