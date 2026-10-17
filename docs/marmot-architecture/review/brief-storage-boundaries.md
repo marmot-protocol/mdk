@@ -23,7 +23,8 @@ another crate's internals.
 - Step 5 moves the engine's account-record storage proxy up into `marmot-session`, and step 8 splits this crate
   into a protocol store and an app store. Both need to know exactly where the two sides touch. Today nothing
   in the crate says so.
-- It needs no code from step 2, so it can run while the relay plane moves.
+- It needs no code from step 2. It still starts after step 2, one extraction at a time; see
+  [Sequencing against step 2](#sequencing-against-step-2).
 - It is the storage review (Pass 1 system C), scoped to what the plan needs.
 
 ## What the crate is today
@@ -69,10 +70,10 @@ where it can go away.
 | 2 | The engine's confirm transaction consumes drafts and local submissions and fires the app's draft observer | `storage/outbound.rs:41,48,60` and `:244,250,263` | `cross::consume_drafts_in_confirm` | Keep, behind a hook the app store registers (step 8) |
 | 3 | Message release writes the app recovery ledger and `seen_events`, and reads `account_state`; group and route deletion delete the ledger's inventory | `storage/messages.rs:110,118,319-326,354,1298-1305`; `account_recovery::delete_inventory_tx` from `storage/groups.rs:164` and `storage/transport_routes.rs:75,108,153` | `cross::release_for_replay`, `cross::consume_released_receipts` and `cross::delete_recovery_inventory` | Step 8: an app-side journal the engine writes and the app consumes |
 | 4 | Group and route deletion clear NIP-77 reconciliation rows | The `transport_reconciliation_*` deletes: `storage/groups.rs:173-192`; `storage/transport_routes.rs:81,87,118,128,163,173` | `cross::clear_reconciliation_for_group` and `..._for_route` | When reconciliation moves to `transport-nostr` |
-| 5 | Local forget and delete span both sides in one wipe | `account_projection.rs:1442-1602` | `cross::forget_group_local_data` (the wipe moves there whole) | Keep: a local delete must be atomic |
-| 6 | App tables cascade from `cgka_groups` | Migrations 0055:10, 0067:9, 0092:26,51 | Listed in `cross/README.md` | Step 8 decides per table |
+| 5 | Local forget and delete span both sides in one wipe | `account_projection.rs:1427-1602`: `forget_group_local_data` calls `GroupStorage::is_group_forgotten` (`:1437`), then the wipe | `cross::forget_group_local_data` (the function moves there whole, with its trait call) | Keep: a local delete must be atomic |
+| 6 | App tables cascade from `cgka_groups` | Migrations 0055:10, 0067:9, 0092:26 | Listed in `cross/README.md` | Step 8 decides per table |
 | 7 | Engine-table triggers maintain the chat list | Migrations 0071:13-16 and 0072:70-178 (12 triggers) | Listed in `cross/README.md` | Step 8: replace with the outbox, or keep as schema |
-| 8 | App reads join engine tables | `chat_list.rs:7-11,2533`, `chat_list/pages.rs:357-362`, `timeline/capture.rs:65-66`, `timeline.rs:1296-1316`, `account_projection.rs:1511-1514,1752,1882,1908`, `delivery_spill.rs:88-91` | Read-only engine views in `cross/` | Step 8: published read views |
+| 8 | App reads join engine tables, and `chat_list.rs` imports protocol modules | `chat_list.rs:7-11` (imports of `storage::disband_requests` and `storage::leave_requests`), `chat_list.rs:2533`, `chat_list/pages.rs:357-362`, `timeline/capture.rs:65-66`, `timeline.rs:1296-1316`, `account_projection.rs:1511-1514,1752,1882,1908`, `delivery_spill.rs:88-91` | Read-only engine views in `cross/` | Step 8: published read views |
 | 9 | The app writes the engine's authority outbox | `timeline/reports.rs:555-620` | `cross::backfill_authority_request` | Step 8 |
 | 10 | App writes invalidate the engine's MLS cache | `connection.rs:1604-1621` (`PRAGMA data_version`) | Stays in `base/`, documented | Keep while both sides share a file |
 | 11 | One migration ledger | `migrations.rs:258-932`; strict order at `:1020` | Stays in `base/` | Keep: one file, one ledger |
@@ -112,7 +113,8 @@ are callable wherever the type is.
 protocol traits. `marmot-app` reaches app storage through the new handle, and only `cross/` holds both. The handle
 shares the account's existing connection and lifecycle, so it opens no second connection and closing the account
 storage closes it too. It is the type the app store crate gets in step 8, so the work is not thrown away. It is
-mechanical but wide: about 318 call sites in `marmot-app` change from `storage.x()` to `app_storage.x()`.
+mechanical but wide: every `marmot-app` call to the app methods it uses, about 318 of them by a name-match count,
+changes from `storage.x()` to `app_storage.x()`.
 
 Declined: stopping at folders, visibility and `cross/`, which would leave the wall a convention until step 8.
 
@@ -127,17 +129,21 @@ Each PR is green on its own and changes no behaviour or schema.
    tables.
 2. **Introduce `cross/`.** Move each coupling's code into its named function: the protocol modules' 8 reaches
    into `account_recovery` (including the 4 `delete_inventory_tx` calls) and 1 into `message_drafts`, the wipe from
-   `account_projection`, the authority backfill from `timeline/reports`. The callees stay where they are, at
-   `pub(crate)`. Add `cross/README.md` for the schema-level couplings (#6, #7, #10, #11) with migration
+   `account_projection`, the authority backfill from `timeline/reports`. Move `chat_list.rs`'s imports of
+   `storage::disband_requests` and `storage::leave_requests` (`chat_list.rs:7-11`), the one production
+   app-to-protocol module path outside the wipe, behind coupling 8's read views. The callees stay where they are,
+   at `pub(crate)`. Add `cross/README.md` for the schema-level couplings (#6, #7, #10, #11) with migration
    citations.
 3. **Narrow visibility and add the boundary test.** Switch the four app transactions in coupling C to
    `SharedConnection::with_transaction` first. Helpers only their own folder uses become folder-private; the ones
-   `cross/` calls stay `pub(crate)`. The test fails on any path from `protocol/` into `app/` or `transport/`, or back,
-   outside `cross/`.
+   `cross/` calls stay `pub(crate)`. The test fails on any production path from `protocol/` into `app/` or
+   `transport/`, or back, outside `cross/`. `#[cfg(test)]` code is exempt: protocol tests seed app state, for
+   example `ensure_account_projection` at `storage/messages.rs:1491` and `record_transport_reconciliation_item` at
+   `storage/groups.rs:354`.
 4. **The app handle type**, in mechanical slices: introduce `SqliteAppStorage` over the account's connection, move
    the app and transport methods to it a folder at a time, and repoint `marmot-app` and `cgka-session`'s draft
-   observer. Extend the boundary test: protocol code never names `SqliteAppStorage`, and app code never calls the
-   protocol traits on `SqliteAccountStorage` outside `cross/`.
+   observer. Extend the boundary test: protocol production code never names `SqliteAppStorage`, and app production
+   code never calls the protocol traits on `SqliteAccountStorage` outside `cross/`; tests may hold both handles.
 5. **Tracing targets.** Rename the 18 targets to the new module paths in one PR, and update the docs and simulator
    filters that match them.
 
@@ -145,8 +151,8 @@ Each PR is green on its own and changes no behaviour or schema.
 
 Step 4 starts after step 2, one extraction at a time. If parallel work is wanted: PRs 1–3 touch only
 `storage-sqlite` (and its `AGENTS.md` files), so they don't collide with the relay-plane move. PR 4 rewrites about
-318 `marmot-app` call sites and must wait until step 2's crate move (its PR 3) and caller repoint (its PR 4) have
-landed.
+`marmot-app`'s calls to about 318 app methods (a name-match count) and must wait until step 2's crate move (its
+PR 3) and caller repoint (its PR 4) have landed.
 
 ## Proof that behaviour is unchanged
 
@@ -168,7 +174,7 @@ landed.
 | --- | --- |
 | Self-inspection tests split their own file by function name (`messages.rs:2351`, `message_drafts.rs:735`, `value_store.rs:891,920`, `shared.rs:770,879`) | Move the functions they inspect with them, or repoint the tests in the same PR |
 | `pub(super)` items in `transport_routes.rs` and `messages.rs:995` assume `storage/` moves as one unit | Move `storage/` whole into `protocol/` |
-| App test modules import `crate::storage::test_support` (`recovery_health.rs:92`, `transport_reconciliation.rs:455,554`, `account_recovery/*`, `delivery_spill.rs:319`, `migrations.rs:1248`) | Move `test_support` to `base/` and keep a re-export |
+| 28 files import `crate::storage::test_support`, 13 of them outside `storage/` (for example `recovery_health.rs:92`, `transport_reconciliation.rs:455,554`, `account_recovery/*`, `chat_list/tests.rs:2`, `timeline/tests.rs:1410`, `timeline/opening/tests.rs:925`, `message_drafts/revisioned/tests.rs:82`, `delivery_spill.rs:319`, `migrations.rs:1248`) | Move `test_support` to `base/` and repoint every importer in PR 1. Keep no `crate::storage::test_support` re-export: after the move it would be a protocol path the boundary test rejects |
 | Tracing targets stop matching module paths after PR 1 | PR 5 renames them; the observability rule is met again then |
 | 20 docs pages and `scripts/test_select_ci_tests.py:63` cite `storage-sqlite/src/...` paths | Update the AGENTS tables in PR 1; repoint docs citations as each is next edited, except architecture pages that state current structure |
 | Wide diffs collide with concurrent storage work, such as the media store (#2314) | Land PR 1 in a quiet window; it is moves only and rebases mechanically |
