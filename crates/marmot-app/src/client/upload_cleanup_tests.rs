@@ -91,7 +91,7 @@ async fn closed_storage_refuses_staging_but_not_a_completed_upload() {
         )
         .await
         .unwrap();
-    assert_eq!(completed, result);
+    assert_eq!(completed.0, result);
 }
 
 /// Rows in `table` of the fixture database.
@@ -885,4 +885,66 @@ async fn a_completed_upload_dropped_before_admission_is_released() {
     .expect("the unadmitted upload and its staged file are released");
     server.abort();
     let _ = server.await;
+}
+
+/// An upload-only completion hands back its uploads still armed: if its
+/// descriptors never reach the caller, dropping the handoff releases the
+/// upload and its staged file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undelivered_upload_only_result_is_released() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client
+        .create_group("undelivered upload", &[])
+        .await
+        .unwrap();
+    let connection = fault_connection(&app);
+    let bytes = b"completed upload";
+    let (reference, _) = crate::media::tests::attachment_worker_fixture(bytes);
+    let result = MediaUploadResult {
+        attachments: vec![crate::media::MediaUploadAttachmentResult {
+            reference,
+            encrypted_size_bytes: bytes.len() as u64 + 16,
+        }],
+        sent: None,
+    };
+    let staging = crate::media::outgoing::SendStaging::open(&app, "alice", &group, 3).unwrap();
+    let mut uploads = crate::media::outgoing::OutgoingUploads::new(app.clone(), "alice".into());
+    staging
+        .stage(uploads.tokens_mut(), bytes.len() as u64, |media, target| {
+            crate::media::outgoing::stage_body(
+                media,
+                target,
+                &mut &bytes[..],
+                bytes.len() as u64,
+                &|| false,
+            )
+        })
+        .unwrap();
+    staging.bind(uploads.tokens(), &result).unwrap();
+    let mut completion = finish();
+    completion.group_id = group.clone();
+    completion.should_send = false;
+    let (completed, handoff) = client
+        .finish_encrypted_media_upload(completion, result.clone(), uploads)
+        .await
+        .unwrap();
+    assert_eq!(completed, result);
+    let handoff = handoff.expect("an upload-only result hands its uploads back armed");
+    assert_eq!(count(&connection, "outgoing_attachment_uploads"), 1);
+    drop(handoff);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while count(&connection, "outgoing_attachment_uploads") != 0
+            || media_files_on_disk(&app) != 0
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the undelivered upload and its staged file are released");
 }

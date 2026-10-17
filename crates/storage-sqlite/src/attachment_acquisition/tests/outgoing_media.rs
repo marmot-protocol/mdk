@@ -402,9 +402,9 @@ fn an_upload_with_a_lost_file_is_dropped() {
     let (token, id) = staged_send(&store, &media, "lost");
     protect(&store, "lost");
     assert!(!store.drop_lost_attachment_upload(&token, id).unwrap());
+    // Promotion runs before any read or sweep notices the missing file: it
+    // must mark it lost, not record the slot as retained.
     std::fs::remove_file(media.path(&id)).unwrap();
-    assert!(media.open_staged_reader(&id).unwrap().is_none());
-    assert_eq!(media.file_state(&id).unwrap(), Some(FileState::Lost));
     assert_eq!(
         media
             .promote(
@@ -414,6 +414,17 @@ fn an_upload_with_a_lost_file_is_dropped() {
             .unwrap(),
         PromoteOutcome::Superseded
     );
+    assert_eq!(media.file_state(&id).unwrap(), Some(FileState::Lost));
+    let retained: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM attachment_acquisition WHERE state=3 OR body_completed=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, 0, "the slot is not recorded as retained");
     assert!(store.drop_lost_attachment_upload(&token, id).unwrap());
     assert_eq!(store.attachment_upload_file(&token).unwrap(), None);
     assert_eq!(media.file_state(&id).unwrap(), None);

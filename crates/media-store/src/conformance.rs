@@ -947,8 +947,8 @@ pub fn promotion_skips_a_twin_whose_file_is_gone<H: Harness>(harness: H) {
     assert_eq!(read_all(&store, &id).unwrap(), content);
 }
 
-/// A staged file that vanished is marked lost (key zeroed), by a read or
-/// by the sweep, and can no longer be promoted.
+/// A staged file that vanished is marked lost (key zeroed), by a read, by
+/// the sweep or by promotion itself, and can no longer be promoted.
 pub fn a_missing_staged_file_is_lost_and_never_promoted<H: Harness>(harness: H) {
     let store = store(&harness);
     let read = staged(&harness, &store, 0, &body(20_000, 18));
@@ -966,4 +966,30 @@ pub fn a_missing_staged_file_is_lost_and_never_promoted<H: Harness>(harness: H) 
     std::fs::remove_file(store.path(&swept)).unwrap();
     sweep_all(&store);
     assert_eq!(store.file_state(&swept).unwrap(), Some(FileState::Lost));
+
+    // Promotion itself checks the file: one that vanished, or was cut
+    // short, before any read or sweep noticed is marked lost, not attached.
+    let promoted = staged(&harness, &store, 4, &body(20_000, 20));
+    std::fs::remove_file(store.path(&promoted)).unwrap();
+    assert_eq!(
+        store
+            .promote(harness.promote_target(4).as_ref(), promoted)
+            .unwrap(),
+        PromoteOutcome::Superseded
+    );
+    assert_eq!(store.file_state(&promoted).unwrap(), Some(FileState::Lost));
+    let short = staged(&harness, &store, 6, &body(20_000, 21));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(store.path(&short))
+        .unwrap()
+        .set_len(100)
+        .unwrap();
+    assert_eq!(
+        store
+            .promote(harness.promote_target(6).as_ref(), short)
+            .unwrap(),
+        PromoteOutcome::Superseded
+    );
+    assert_eq!(store.file_state(&short).unwrap(), Some(FileState::Lost));
 }

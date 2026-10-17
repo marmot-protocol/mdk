@@ -4169,13 +4169,15 @@ async fn complete_media_http(
             respond,
             started_at,
         } => {
-            let result = match result {
-                Ok((result, uploads)) => {
-                    client
-                        .finish_encrypted_media_upload(finish, result, *uploads)
-                        .await
-                }
-                Err(err) => Err(err),
+            let (result, handoff) = match result {
+                Ok((result, uploads)) => match client
+                    .finish_encrypted_media_upload(finish, result, *uploads)
+                    .await
+                {
+                    Ok((result, handoff)) => (Ok(result), handoff),
+                    Err(err) => (Err(err), None),
+                },
+                Err(err) => (Err(err), None),
             };
             // Mixed uploads are one batch attempt, classified as other.
             let media_type = result
@@ -4198,7 +4200,13 @@ async fn complete_media_http(
                 result.is_ok(),
                 media_type,
             );
-            let _ = respond.send(result);
+            // An upload-only result's uploads stay armed until the caller has
+            // its descriptors; if it is gone, dropping them releases them.
+            if respond.send(result).is_ok()
+                && let Some(handoff) = handoff
+            {
+                handoff.into_tokens();
+            }
         }
         MediaHttpCompletion::Download {
             result,

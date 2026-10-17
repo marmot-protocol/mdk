@@ -5191,8 +5191,14 @@ impl AppClient {
             .prepare_encrypted_media_upload(group_id, request)
             .await?;
         let (result, uploads) = http.run().await?;
-        self.finish_encrypted_media_upload(finish, result, uploads)
-            .await
+        let (result, handoff) = self
+            .finish_encrypted_media_upload(finish, result, uploads)
+            .await?;
+        // Returned to the caller here: the descriptors are delivered.
+        if let Some(handoff) = handoff {
+            handoff.into_tokens();
+        }
+        Ok(result)
     }
 
     /// Cheap exclusive-client setup for an encrypted-media upload. The returned
@@ -5301,15 +5307,22 @@ impl AppClient {
     }
 
     /// Complete a successful upload. `uploads` keeps owning the staged
-    /// uploads until a message admits them (or an upload-only request hands
-    /// them back); a cancellation or a refused send releases them, and so
-    /// does dropping this future before admission.
+    /// uploads until a message admits them; a cancellation or a refused send
+    /// releases them, and so does dropping this future before admission. An
+    /// upload-only request returns the guard still armed: whoever delivers
+    /// the descriptors disarms it once the caller has them.
     pub(crate) async fn finish_encrypted_media_upload(
         &mut self,
         finish: EncryptedMediaUploadFinish,
         mut result: MediaUploadResult,
         uploads: crate::media::outgoing::OutgoingUploads,
-    ) -> Result<MediaUploadResult, AppError> {
+    ) -> Result<
+        (
+            MediaUploadResult,
+            Option<crate::media::outgoing::OutgoingUploads>,
+        ),
+        AppError,
+    > {
         if let Some(control) = &finish.control
             && let Err(error) = control.check()
         {
@@ -5319,8 +5332,7 @@ impl AppClient {
         if !finish.should_send {
             // Upload only: the host sends the references later, and admission
             // then protects the bound uploads; unsent ones expire.
-            uploads.into_tokens();
-            return Ok(result);
+            return Ok((result, Some(uploads)));
         }
         let attachments = result
             .attachments
@@ -5368,7 +5380,7 @@ impl AppClient {
             );
         }
         result.sent = Some(summary);
-        Ok(result)
+        Ok((result, None))
     }
 
     pub async fn download_media(

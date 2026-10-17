@@ -476,9 +476,18 @@ impl<C: MediaCatalog> MediaStore<C> {
 
     /// Promotes the staged (or already promoted) file `id` into `target`'s
     /// slots in one transaction, reusing a present identical ready file when
-    /// there is one. A replaced staged copy is unlinked after the commit.
+    /// there is one. A replaced staged copy is unlinked after the commit. A
+    /// staged file missing from disk, or of the wrong length, is marked lost
+    /// instead and nothing is attached (`Superseded`), so its owner can fall
+    /// back rather than fill slots with a body that is gone.
     pub fn promote(&self, target: &dyn PromoteTarget, id: FileId) -> MediaResult<PromoteOutcome> {
         self.inner.ensure_open()?;
+        if let Some(row) = self.inner.catalog.staged_file(id)?
+            && self.present(id, row.byte_len)? == FilePresence::Absent
+        {
+            self.inner.lose(&id);
+            return Ok(PromoteOutcome::Superseded);
+        }
         match target.commit_promoted(id, &|twin, byte_len| self.present(twin, byte_len))? {
             PromotedOutcome::Ready => Ok(PromoteOutcome::Ready),
             PromotedOutcome::Existing(twin) => {
