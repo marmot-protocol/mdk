@@ -46,7 +46,7 @@ use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
     BlossomHttpTransport, DEFAULT_BLOSSOM_SERVER_URLS, EncryptedMediaVersion, MediaOperationPolicy,
     download_encrypted_media_with_transport, fetch_group_image_with_transport,
-    is_loopback_http_endpoint, prepare_group_image_upload, upload_encrypted_media_retaining,
+    is_loopback_http_endpoint, prepare_group_image_upload, upload_encrypted_media,
     upload_group_image, upload_prepared_group_image,
 };
 use crate::messages::{
@@ -221,63 +221,187 @@ pub(crate) struct EncryptedMediaUploadHttp {
 }
 
 impl EncryptedMediaUploadHttp {
-    pub(crate) async fn run(self) -> Result<(MediaUploadResult, Vec<Vec<u8>>), AppError> {
-        let request = match self.request {
-            crate::media::file_transfer::MediaUploadPayload::Files(request, control) => {
-                return run_file_upload(
-                    request,
-                    control,
-                    self.source_epoch,
-                    self.media_secret,
-                    self.nostr_signer,
-                    self.version,
-                    self.default_endpoints,
-                    self.allowed_locator_kinds,
-                    self.allow_loopback_http,
-                    self.transport,
-                    self.retention_app,
-                    self.retention_account,
-                    self.retention_group,
-                )
-                .await;
+    /// Stages every body in the media store, uploads, then binds the uploads
+    /// to their descriptors. A body the disk cannot hold refuses the send
+    /// with the storage-full error; any failure releases what was staged.
+    /// The returned guard still owns the uploads: the finish phase hands them
+    /// on, or dropping it unfinished releases them.
+    pub(crate) async fn run(
+        self,
+    ) -> Result<(MediaUploadResult, crate::media::outgoing::OutgoingUploads), AppError> {
+        let mut uploads = crate::media::outgoing::OutgoingUploads::new(
+            self.retention_app.clone(),
+            self.retention_account.clone(),
+        );
+        let app = self.retention_app.clone();
+        let account = self.retention_account.clone();
+        let group = self.retention_group.clone();
+        let source_epoch = self.source_epoch;
+        let control = match &self.request {
+            crate::media::file_transfer::MediaUploadPayload::Files(_, control) => {
+                Some(control.clone())
             }
-            crate::media::file_transfer::MediaUploadPayload::Bytes(request) => request,
+            crate::media::file_transfer::MediaUploadPayload::Bytes(_) => None,
         };
-        let (result, plaintext) = upload_encrypted_media_retaining(
-            request,
-            self.source_epoch,
-            self.media_secret.as_ref(),
-            self.nostr_signer.as_ref(),
-            MediaOperationPolicy {
-                version: self.version,
-                default_endpoints: &self.default_endpoints,
-                allowed_locator_kinds: &self.allowed_locator_kinds,
-                allow_loopback_http: self.allow_loopback_http,
-            },
-            &self.transport,
-        )
-        .await?;
-        let descriptors = result.clone();
-        let upload_tokens = tokio::task::spawn_blocking(move || {
-            stage_uploaded_media(
-                &self.retention_app,
-                &self.retention_account,
-                &self.retention_group,
-                self.source_epoch,
-                &descriptors,
-                &plaintext,
-            )
+        let staging = tokio::task::spawn_blocking(move || {
+            crate::media::outgoing::SendStaging::open(&app, &account, &group, source_epoch)
         })
         .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_else(|| {
-            tracing::warn!(target: "marmot_app::media", method = "outgoing_retention_stage",
-                "optional outgoing retention unavailable");
-            Vec::new()
-        });
-        Ok((result, upload_tokens))
+        .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
+        let result = match staging {
+            Ok(staging) => self.upload(Arc::new(staging), &mut uploads).await,
+            Err(error) => Err(error),
+        };
+        let result = match result.and_then(|result| {
+            control.as_ref().map_or(Ok(()), |control| control.check())?;
+            Ok(result)
+        }) {
+            Ok(result) => result,
+            Err(error) => {
+                uploads.release().await;
+                return Err(error);
+            }
+        };
+        Ok((result, uploads))
     }
+
+    async fn upload(
+        self,
+        staging: Arc<crate::media::outgoing::SendStaging>,
+        uploads: &mut crate::media::outgoing::OutgoingUploads,
+    ) -> Result<MediaUploadResult, AppError> {
+        let policy = MediaOperationPolicy {
+            version: self.version,
+            default_endpoints: &self.default_endpoints,
+            allowed_locator_kinds: &self.allowed_locator_kinds,
+            allow_loopback_http: self.allow_loopback_http,
+        };
+        let result = match self.request {
+            crate::media::file_transfer::MediaUploadPayload::Files(request, control) => {
+                request.validate()?;
+                let servers = crate::media::upload_servers(request.blossom_server.clone(), policy)?;
+                let descriptors = request
+                    .attachments
+                    .iter()
+                    .map(|attachment| {
+                        crate::media::outgoing::OutgoingDescriptor::new(
+                            attachment.file_name.clone(),
+                            &attachment.media_type,
+                            attachment.dim.clone(),
+                            attachment.thumbhash.clone(),
+                            self.version,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, AppError>>()?;
+                let (stage, stage_control) = (staging.clone(), control.clone());
+                // The blocking task owns the reservations it makes until this
+                // await hands them back; if this future is dropped first, the
+                // task's result drops and releases them.
+                let mut staged = uploads.handoff();
+                let (staged, sources) = tokio::task::spawn_blocking(move || {
+                    let sources = stage_file_sources(
+                        &stage,
+                        staged.tokens_mut(),
+                        request.attachments,
+                        descriptors,
+                        stage_control,
+                    );
+                    (staged, sources)
+                })
+                .await
+                .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
+                uploads.absorb(staged);
+                crate::media::outgoing::upload_staged(
+                    staging.media(),
+                    sources?,
+                    &servers,
+                    self.source_epoch,
+                    self.media_secret.as_ref(),
+                    self.nostr_signer.as_ref(),
+                    policy,
+                    &self.transport,
+                    control,
+                )
+                .await?
+            }
+            crate::media::file_transfer::MediaUploadPayload::Bytes(request) => {
+                crate::media::validate_media_upload_batch(&request.attachments)?;
+                let stage = staging.clone();
+                let mut reserved = uploads.handoff();
+                let (request, reserved, staged) = tokio::task::spawn_blocking(move || {
+                    let staged = request.attachments.iter().try_for_each(|attachment| {
+                        let len = attachment.plaintext.len() as u64;
+                        stage
+                            .stage(reserved.tokens_mut(), len, |media, target| {
+                                crate::media::outgoing::stage_body(
+                                    media,
+                                    target,
+                                    &mut std::io::Cursor::new(&attachment.plaintext),
+                                    len,
+                                    &|| false,
+                                )
+                            })
+                            .map(|_| ())
+                    });
+                    (request, reserved, staged)
+                })
+                .await
+                .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
+                uploads.absorb(reserved);
+                staged?;
+                upload_encrypted_media(
+                    request,
+                    self.source_epoch,
+                    self.media_secret.as_ref(),
+                    self.nostr_signer.as_ref(),
+                    policy,
+                    &self.transport,
+                )
+                .await?
+            }
+        };
+        // Binding is mandatory: an unbound upload would sit staged until it
+        // expired. The message itself has not been sent yet.
+        let tokens = uploads.tokens().to_vec();
+        let descriptors = result.clone();
+        tokio::task::spawn_blocking(move || staging.bind(&tokens, &descriptors))
+            .await
+            .map_err(|_| AppError::BlockingTask("media staging failed".into()))??;
+        Ok(result)
+    }
+}
+
+/// Stages each host file in turn, within the aggregate wire bound. Blocking.
+fn stage_file_sources(
+    staging: &crate::media::outgoing::SendStaging,
+    tokens: &mut Vec<Vec<u8>>,
+    attachments: Vec<crate::MediaFileUploadAttachmentRequest>,
+    descriptors: Vec<crate::media::outgoing::OutgoingDescriptor>,
+    control: Arc<crate::MediaFileTransferControl>,
+) -> Result<Vec<crate::media::outgoing::StagedSource>, AppError> {
+    use crate::media::file_transfer::{MAX_FILE_MEDIA_CIPHERTEXT_BYTES, MEDIA_AEAD_TAG_BYTES};
+    let mut total = 0u64;
+    let mut sources = Vec::with_capacity(attachments.len());
+    for (attachment, descriptor) in attachments.into_iter().zip(descriptors) {
+        control.check()?;
+        let source = crate::media::outgoing::HostSource::open(
+            std::path::Path::new(&attachment.source_path),
+            attachment.expected_size,
+            control.clone(),
+        )?;
+        let len = source.len();
+        total = total
+            .checked_add(len + MEDIA_AEAD_TAG_BYTES)
+            .filter(|total| *total <= MAX_FILE_MEDIA_CIPHERTEXT_BYTES)
+            .ok_or_else(|| {
+                AppError::InvalidEncryptedMedia("file attachments exceed transfer bound".into())
+            })?;
+        let (file, digest) = staging.stage(tokens, len, |media, target| {
+            crate::media::outgoing::stage_host_source(media, target, source)
+        })?;
+        sources.push(descriptor.staged(file, len, digest));
+    }
+    Ok(sources)
 }
 
 pub(crate) struct EncryptedMediaUploadFinish {
@@ -307,267 +431,6 @@ pub(crate) fn preserve_encrypted_media_upload_error(
         );
     }
     error
-}
-
-/// Stage and bind one successful HTTP batch atomically. Refusal affects
-/// local retention only; publication and upload completion remain independent.
-fn stage_uploaded_media(
-    app: &MarmotApp,
-    account: &str,
-    group: &GroupId,
-    source_epoch: u64,
-    result: &MediaUploadResult,
-    plaintext: &[SecretBytes],
-) -> Result<Vec<Vec<u8>>, AppError> {
-    let storage = app.account_storage(account)?;
-    let now = crate::unix_now_seconds();
-    if storage.prune_attachment_uploads(now, 64).is_err() {
-        tracing::warn!(target: "marmot_app::media", method = "outgoing_retention_prune",
-                "optional outgoing retention cleanup deferred");
-    }
-    if plaintext.len() != result.attachments.len() {
-        return Err(AppError::InvalidEncryptedMedia(
-            "outgoing retention buffer unavailable".into(),
-        ));
-    }
-    let policy = storage.attachment_download_policy(
-        &crate::runtime::attachment_controls::default_policy(&app.config),
-    )?;
-    let bytes = plaintext
-        .iter()
-        .map(|bytes| bytes.as_slice())
-        .collect::<Vec<_>>();
-    let total = bytes.iter().map(|b| b.len() as u64).sum::<u64>();
-    if fs4::available_space(app.account_dir(account)).unwrap_or(0)
-        < policy.disk_reserve.saturating_add(total.saturating_mul(4))
-    {
-        return Err(AppError::InvalidEncryptedMedia(
-            "outgoing retention disk reserve unavailable".into(),
-        ));
-    }
-    let slots = result
-        .attachments
-        .iter()
-        .map(|a| {
-            Ok((
-                serde_json::to_value(a.reference.imeta_tag()).map_err(|_| {
-                    AppError::InvalidEncryptedMedia("invalid upload descriptor".into())
-                })?,
-                crate::media::media_hash_from_reference(&a.reference)?,
-            ))
-        })
-        .collect::<Result<Vec<_>, AppError>>()?;
-    cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
-        let tokens = storage.stage_attachment_uploads(
-            &hex::encode(group.as_slice()),
-            source_epoch,
-            &bytes,
-            now,
-            policy.retained_bytes,
-        )?;
-        storage.bind_attachment_uploads(&tokens, &slots)?;
-        Ok::<_, AppError>(tokens)
-    })
-}
-
-/// Network-only file-backed upload job. It owns everything it needs so the
-/// account worker keeps polling; publication stays in the finish phase. Every
-/// snapshot is prepared before the first PUT. A cancellation observed after
-/// HTTP completes skips optional retention, abandons anything staged and
-/// prevents publication; nothing has been admitted at that point.
-#[allow(clippy::too_many_arguments)]
-async fn run_file_upload(
-    request: crate::MediaFileUploadRequest,
-    control: Arc<crate::MediaFileTransferControl>,
-    source_epoch: u64,
-    media_secret: SecretBytes,
-    nostr_signer: Arc<dyn MarmotNostrSigner>,
-    version: EncryptedMediaVersion,
-    default_endpoints: Vec<AppBlobEndpoint>,
-    allowed_locator_kinds: Vec<String>,
-    allow_loopback_http: bool,
-    transport: BlossomHttpTransport,
-    app: MarmotApp,
-    account: String,
-    group: GroupId,
-) -> Result<(MediaUploadResult, Vec<Vec<u8>>), AppError> {
-    let directory = crate::media::file_transfer::media_staging_directory(&app, &account);
-    let (result, plaintext) = crate::media::file_transfer::upload_files_retaining(
-        request,
-        source_epoch,
-        media_secret.as_ref(),
-        nostr_signer.as_ref(),
-        MediaOperationPolicy {
-            version,
-            default_endpoints: &default_endpoints,
-            allowed_locator_kinds: &allowed_locator_kinds,
-            allow_loopback_http,
-        },
-        &transport,
-        directory,
-        control.clone(),
-    )
-    .await?;
-    control.check()?;
-    let descriptors = result.clone();
-    let staging_app = app.clone();
-    let staging_account = account.clone();
-    let staging_control = control.clone();
-    let staged = tokio::task::spawn_blocking(move || {
-        let staged = stage_uploaded_media_files(
-            &staging_app,
-            &staging_account,
-            &group,
-            source_epoch,
-            &descriptors,
-            &plaintext,
-            &staging_control,
-        );
-        // Private snapshots are removed on this blocking thread, not the runtime.
-        drop(plaintext);
-        staged
-    })
-    .await;
-    let tokens = match staged {
-        Ok(Ok(tokens)) => tokens,
-        _ => {
-            tracing::warn!(target: "marmot_app::media", method = "outgoing_retention_stage",
-                "optional outgoing file retention unavailable");
-            Vec::new()
-        }
-    };
-    if let Err(error) = control.check() {
-        let cleanup = app.account_storage(&account).and_then(|storage| {
-            storage
-                .abandon_attachment_uploads(&tokens)
-                .map_err(AppError::from)
-        });
-        return Err(preserve_encrypted_media_upload_error(error, cleanup));
-    }
-    Ok((result, tokens))
-}
-
-/// File-backed twin of [`stage_uploaded_media`]: the same prune, quota, disk
-/// reserve and atomic binding, but each body streams from its
-/// private snapshot in bounded chunks. The exact uploaded `imeta` descriptors
-/// are bound; a descriptor whose plaintext digest differs from its snapshot is
-/// refused before any write. Refusal affects optional retention only.
-fn stage_uploaded_media_files(
-    app: &MarmotApp,
-    account: &str,
-    group: &GroupId,
-    source_epoch: u64,
-    result: &MediaUploadResult,
-    plaintext: &[crate::media::file_transfer::PrivateMediaFile],
-    control: &crate::MediaFileTransferControl,
-) -> Result<Vec<Vec<u8>>, AppError> {
-    control.check()?;
-    let storage = app.account_storage(account)?;
-    let now = crate::unix_now_seconds();
-    if storage.prune_attachment_uploads(now, 64).is_err() {
-        tracing::warn!(target: "marmot_app::media", method = "outgoing_retention_prune",
-                "optional outgoing retention cleanup deferred");
-    }
-    if plaintext.len() != result.attachments.len() {
-        return Err(AppError::InvalidEncryptedMedia(
-            "outgoing retention buffer unavailable".into(),
-        ));
-    }
-    if plaintext
-        .iter()
-        .any(|file| file.len > storage_sqlite::MAX_RETAINED_FILE_ATTACHMENT_BYTES)
-    {
-        return Err(AppError::InvalidEncryptedMedia(
-            "outgoing retention exceeds storage bound".into(),
-        ));
-    }
-    let policy = storage.attachment_download_policy(
-        &crate::runtime::attachment_controls::default_policy(&app.config),
-    )?;
-    let total = plaintext
-        .iter()
-        .fold(0u64, |total, file| total.saturating_add(file.len));
-    if fs4::available_space(app.account_dir(account)).unwrap_or(0)
-        < policy.disk_reserve.saturating_add(total.saturating_mul(4))
-    {
-        return Err(AppError::InvalidEncryptedMedia(
-            "outgoing retention disk reserve unavailable".into(),
-        ));
-    }
-    let slots = result
-        .attachments
-        .iter()
-        .zip(plaintext)
-        .map(|(attachment, file)| {
-            let digest = crate::media::media_hash_from_reference(&attachment.reference)?;
-            if digest != file.digest {
-                return Err(AppError::InvalidEncryptedMedia(
-                    "outgoing retention descriptor mismatch".into(),
-                ));
-            }
-            Ok((
-                serde_json::to_value(attachment.reference.imeta_tag()).map_err(|_| {
-                    AppError::InvalidEncryptedMedia("invalid upload descriptor".into())
-                })?,
-                digest,
-            ))
-        })
-        .collect::<Result<Vec<_>, AppError>>()?;
-    let mut readers = plaintext
-        .iter()
-        .map(|file| file.reader())
-        .collect::<Result<Vec<_>, AppError>>()?;
-    let mut sources = readers
-        .iter_mut()
-        .zip(plaintext)
-        .map(|(reader, file)| storage_sqlite::AttachmentUploadSource {
-            reader: reader as &mut dyn std::io::Read,
-            len: file.len,
-            digest: file.digest,
-        })
-        .collect::<Vec<_>>();
-    stage_and_bind_media_files(
-        &storage,
-        &hex::encode(group.as_slice()),
-        source_epoch,
-        &mut sources,
-        now,
-        policy.retained_bytes,
-        control,
-        &slots,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn stage_and_bind_media_files(
-    storage: &storage_sqlite::SqliteAccountStorage,
-    group: &str,
-    source_epoch: u64,
-    sources: &mut [storage_sqlite::AttachmentUploadSource<'_>],
-    now: u64,
-    byte_budget: u64,
-    control: &crate::MediaFileTransferControl,
-    slots: &[(serde_json::Value, [u8; 32])],
-) -> Result<Vec<Vec<u8>>, AppError> {
-    // Staging owns its short chunk transactions. An outer transaction here
-    // would retain the account connection throughout every file read/hash.
-    let tokens = storage.stage_attachment_upload_files(
-        group,
-        source_epoch,
-        sources,
-        now,
-        byte_budget,
-        &|| control.is_cancelled(),
-    )?;
-    // Binding is already an atomic, short transaction. On refusal, compensate
-    // the unowned reservation without replacing the primary binding error.
-    if let Err(error) = storage.bind_attachment_uploads(&tokens, slots) {
-        let cleanup = storage
-            .abandon_attachment_uploads(&tokens)
-            .map_err(AppError::from);
-        return Err(preserve_encrypted_media_upload_error(error.into(), cleanup));
-    }
-    Ok(tokens)
 }
 
 pub(crate) struct EncryptedMediaDownloadHttp {
@@ -5317,8 +5180,8 @@ impl AppClient {
         )
     }
 
-    /// Upload independently of optional retention; local staging happens only
-    /// after PUT succeeds and cannot reject a send under quota or disk pressure.
+    /// Stage every body in the media store, upload, then send. A body the
+    /// disk cannot hold fails with the storage-full error before any upload.
     pub async fn upload_media(
         &mut self,
         group_id: &GroupId,
@@ -5327,9 +5190,15 @@ impl AppClient {
         let (http, finish) = self
             .prepare_encrypted_media_upload(group_id, request)
             .await?;
-        let (result, upload_tokens) = http.run().await?;
-        self.finish_encrypted_media_upload(finish, result, upload_tokens)
-            .await
+        let (result, uploads) = http.run().await?;
+        let (result, handoff) = self
+            .finish_encrypted_media_upload(finish, result, uploads)
+            .await?;
+        // Returned to the caller here: the descriptors are delivered.
+        if let Some(handoff) = handoff {
+            handoff.into_tokens();
+        }
+        Ok(result)
     }
 
     /// Cheap exclusive-client setup for an encrypted-media upload. The returned
@@ -5437,29 +5306,33 @@ impl AppClient {
         ))
     }
 
-    /// Complete successful HTTP independently of best-effort local retention.
+    /// Complete a successful upload. `uploads` keeps owning the staged
+    /// uploads until a message admits them; a cancellation or a refused send
+    /// releases them, and so does dropping this future before admission. An
+    /// upload-only request returns the guard still armed: whoever delivers
+    /// the descriptors disarms it once the caller has them.
     pub(crate) async fn finish_encrypted_media_upload(
         &mut self,
         finish: EncryptedMediaUploadFinish,
         mut result: MediaUploadResult,
-        upload_tokens: Vec<Vec<u8>>,
-    ) -> Result<MediaUploadResult, AppError> {
+        uploads: crate::media::outgoing::OutgoingUploads,
+    ) -> Result<
+        (
+            MediaUploadResult,
+            Option<crate::media::outgoing::OutgoingUploads>,
+        ),
+        AppError,
+    > {
         if let Some(control) = &finish.control
             && let Err(error) = control.check()
         {
-            return Err(preserve_encrypted_media_upload_error(
-                error,
-                self.app
-                    .account_storage(&self.state.label)
-                    .and_then(|storage| {
-                        storage
-                            .abandon_attachment_uploads(&upload_tokens)
-                            .map_err(AppError::from)
-                    }),
-            ));
+            uploads.release().await;
+            return Err(error);
         }
         if !finish.should_send {
-            return Ok(result);
+            // Upload only: the host sends the references later, and admission
+            // then protects the bound uploads; unsent ones expire.
+            return Ok((result, Some(uploads)));
         }
         let attachments = result
             .attachments
@@ -5477,21 +5350,14 @@ impl AppClient {
         {
             Ok(summary) => summary,
             Err(error) => {
-                // Committed pending/canonical sources protect staging even if optional
-                // owner protection failed. The storage
-                // fence preserves accepted sends even if their host wait fails.
-                return Err(preserve_encrypted_media_upload_error(
-                    error,
-                    self.app
-                        .account_storage(&self.state.label)
-                        .and_then(|storage| {
-                            storage
-                                .abandon_attachment_uploads(&upload_tokens)
-                                .map_err(AppError::from)
-                        }),
-                ));
+                // An admitted pending or canonical source keeps its uploads:
+                // the release leaves any upload a message still carries.
+                uploads.release().await;
+                return Err(error);
             }
         };
+        // Admitted: the message's descriptors own the uploads now.
+        uploads.into_tokens();
         // The post-publish projection now durably references this source
         // epoch. Persist again so a prior final-reference retirement cannot
         // suppress the secret needed by the newly retained message.
@@ -5514,7 +5380,7 @@ impl AppClient {
             );
         }
         result.sent = Some(summary);
-        Ok(result)
+        Ok((result, None))
     }
 
     pub async fn download_media(

@@ -1203,6 +1203,8 @@ jobs:
             -s integrations/hermes/tests/marmot -p test_presence_host_contract.py -v
 
       - name: Real Hermes authorization and deterministic Marmot E2E
+        # About 10 s of work; bound a hang well inside the job's 30 minutes.
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           # The deterministic runner sources the pinned dev root, runs

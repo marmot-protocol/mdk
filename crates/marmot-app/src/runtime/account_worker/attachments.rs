@@ -33,6 +33,10 @@ pub(super) struct Admission {
     permit: Option<OwnedSemaphorePermit>,
     /// The media sweep running on the blocking pool, if any.
     media_sweep: Option<tokio::task::JoinHandle<()>>,
+    /// The outgoing upload promotion pass running on the blocking pool, if
+    /// any, and where the next one resumes.
+    upload_promotion: Option<tokio::task::JoinHandle<()>>,
+    upload_cursor: Arc<std::sync::Mutex<Option<storage_sqlite::AttachmentUploadOwner>>>,
 }
 
 /// Starts a media sweep on the blocking pool unless one is still running:
@@ -59,6 +63,51 @@ fn spawn_media_sweep(admission: &mut Admission, media: AccountMediaStore, until_
         }
     }));
 }
+/// Starts one page of outgoing upload promotion on the blocking pool unless
+/// one is still running. Each run resumes after the last, so uploads that
+/// cannot promote yet never starve the rest; a promotion wakes attachment
+/// observers.
+fn spawn_upload_promotion(
+    admission: &mut Admission,
+    storage: SqliteAccountStorage,
+    media: AccountMediaStore,
+    updates: tokio::sync::watch::Sender<()>,
+) {
+    if admission
+        .upload_promotion
+        .as_ref()
+        .is_some_and(|task| !task.is_finished())
+    {
+        return;
+    }
+    let cursor = admission.upload_cursor.clone();
+    admission.upload_promotion = Some(tokio::task::spawn_blocking(move || {
+        let after = cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        match crate::media::outgoing::promote_uploads(
+            &storage,
+            &media,
+            after.as_ref(),
+            crate::media::outgoing::UPLOAD_PROMOTION_BATCH,
+        ) {
+            Ok((next, promoted)) => {
+                *cursor
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+                if promoted {
+                    updates.send_modify(|_| {});
+                }
+            }
+            Err(_) => {
+                tracing::warn!(target: "marmot_app::runtime", method = "outgoing_upload_promotion",
+                    "outgoing upload promotion deferred");
+            }
+        }
+    }));
+}
+
 impl Admission {
     pub(super) fn is_waiting(&self) -> bool {
         self.waiting.is_some()
@@ -280,6 +329,8 @@ pub(super) fn schedule(
     let host_managed = client.app.config.attachment_acquisition_mode
         == crate::AttachmentAcquisitionMode::HostManaged;
     let identity = storage.attachment_store_identity()?;
+    // Legacy uploads (bodies in SQLCipher) keep their own recovery until
+    // they expire; file-backed ones promote through the media store.
     if storage
         .recover_attachment_uploads(now, 32, policy.retained_bytes)
         .is_err()
@@ -287,6 +338,14 @@ pub(super) fn schedule(
         tracing::warn!(target: "marmot_app::runtime", method = "outgoing_retention_recovery",
             "optional outgoing retention recovery deferred");
     }
+    spawn_upload_promotion(
+        admission,
+        storage.clone(),
+        client
+            .app
+            .account_media_store(&client.state.label, &storage)?,
+        shared.attachment_updates.clone(),
+    );
     let resumed = if policy.automatic {
         storage.resume_permitted_attachments(
             now,

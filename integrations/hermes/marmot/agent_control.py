@@ -10,13 +10,30 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, Optional, TypeVar
 
 PROTOCOL = "marmot.agent-control.v2"
 MAX_FRAME_BYTES = 1024 * 1024
 SEND_MEDIA_COMPLETION_TIMEOUT_S = 15 * 60.0
 WRITER_CLOSE_TIMEOUT_S = 1.0
 _DEFAULT_READ_TIMEOUT = object()
+_T = TypeVar("_T")
+
+
+async def bounded_wait(awaitable: Awaitable[_T], timeout: Optional[float]) -> _T:
+    """Await with a deadline without ever dropping a cancellation.
+
+    Python 3.11's ``asyncio.wait_for`` returns the result when a cancel lands
+    in the loop turns its awaitable completes, so a cancelled loop keeps
+    running and a teardown that awaits it hangs. ``asyncio.timeout`` (3.11+,
+    Hermes' floor) propagates the cancel. Older interpreters, such as the
+    doctor's system ``python3``, keep ``wait_for``.
+    """
+    deadline = getattr(asyncio, "timeout", None)
+    if deadline is None:
+        return await asyncio.wait_for(awaitable, timeout)
+    async with deadline(timeout):
+        return await awaitable
 
 _EXPECTED_RESPONSE_TYPES = {
     "account_list": frozenset({"account_list"}),
@@ -98,7 +115,7 @@ class MarmotAgentControlClient:
         writer: Optional[asyncio.StreamWriter] = None
         try:
             try:
-                reader, writer = await asyncio.wait_for(
+                reader, writer = await bounded_wait(
                     asyncio.open_unix_connection(
                         self.socket_path,
                         limit=MAX_FRAME_BYTES + 1,
@@ -731,7 +748,7 @@ class MarmotAgentControlClient:
         writer: Optional[asyncio.StreamWriter] = None
         try:
             try:
-                reader, writer = await asyncio.wait_for(
+                reader, writer = await bounded_wait(
                     asyncio.open_unix_connection(
                         self.socket_path,
                         limit=MAX_FRAME_BYTES + 1,
@@ -799,7 +816,7 @@ class MarmotAgentControlClient:
         writer.write(frame)
         write_timeout = self.request_timeout if timeout is None else float(timeout)
         try:
-            await asyncio.wait_for(writer.drain(), timeout=write_timeout)
+            await bounded_wait(writer.drain(), timeout=write_timeout)
         except asyncio.TimeoutError as exc:
             raise AgentControlError(
                 "timed out while writing agent control request",
@@ -819,7 +836,7 @@ class MarmotAgentControlClient:
             if read_timeout is None:
                 raw = await reader.readuntil(b"\n")
             else:
-                raw = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=float(read_timeout))
+                raw = await bounded_wait(reader.readuntil(b"\n"), timeout=float(read_timeout))
         except asyncio.TimeoutError as exc:
             raise AgentControlError(
                 "timed out while reading agent control response",
@@ -940,7 +957,7 @@ def _normalize_stream_capability(value: Any) -> str:
 async def _close_writer(writer: asyncio.StreamWriter) -> None:
     writer.close()
     try:
-        await asyncio.wait_for(writer.wait_closed(), timeout=WRITER_CLOSE_TIMEOUT_S)
+        await bounded_wait(writer.wait_closed(), timeout=WRITER_CLOSE_TIMEOUT_S)
     except (asyncio.TimeoutError, BrokenPipeError, ConnectionError, OSError):
         pass
 

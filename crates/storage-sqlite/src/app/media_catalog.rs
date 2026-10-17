@@ -221,8 +221,8 @@ fn file_in_state(conn: &Connection, id: FileId, state: i64) -> StorageResult<Opt
 pub(crate) fn mark_lost_in(conn: &Connection, id: FileId) -> StorageResult<bool> {
     Ok(conn
         .execute(
-            "UPDATE media_files SET state=?2,file_key=zeroblob(32) WHERE id=?1 AND state=?3",
-            params![id.as_bytes().as_slice(), STATE_LOST, STATE_READY],
+            "UPDATE media_files SET state=?2,file_key=zeroblob(32) WHERE id=?1 AND state IN (?3,?4)",
+            params![id.as_bytes().as_slice(), STATE_LOST, STATE_READY, STATE_STAGED],
         )
         .storage()?
         == 1)

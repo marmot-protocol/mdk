@@ -1,7 +1,7 @@
 ---
 title: "Extraction Brief — Relay Plane into transport-nostr"
 created: 2026-10-15
-updated: 2026-10-16
+updated: 2026-10-17
 tags: [marmot, architecture, review, extraction-brief, transport, nostr]
 status: proposed, needs approval before implementation
 ---
@@ -52,7 +52,7 @@ follow-up. It is out of scope here.
 | Per-account publish clients and their cache (`relay_client_for_account_id`, about 11 call sites in `lib.rs`, `directory/`, onboarding, push, blocks) | about 100 | Moves in its own PR (PR 5), together with the eviction rules |
 | `network_proxy.rs` | 38 | Stays. The plane calls the adapter's `nostr_builder` directly. |
 | `collector_host_safety.rs`, `relay_telemetry_export.rs` | 2,197 | Stay for now, then go to `marmot-observability` (step 6). The exporter's `impl MarmotRelayPlane` block becomes a free constructor. |
-| `AppTransportRouting`, `AppKeyPackagePublisher` (`lib.rs`) | about 350 | Stay for this move; each has its own later brief (see Out of scope). `AppTransportRouting` merges with `marmot-account`'s copy into the one routing implementation on `marmot-device-runtime`; `AppKeyPackagePublisher`'s KeyPackage event format goes to `transport-nostr` ([core-structure §4](core-structure.md#4-proposed-target-structure)). |
+| `AppTransportRouting`, `AppKeyPackagePublisher` (`lib.rs`) | about 350 | Stay for this move; each has its own later brief (see Out of scope). `AppTransportRouting` merges with `marmot-account`'s copy into the one routing implementation on `marmot-session`; `AppKeyPackagePublisher`'s KeyPackage event format goes to `transport-nostr` ([core-structure §4](core-structure.md#4-proposed-target-structure)). |
 | Worker-side spill reader and loss import (`client/delivery_spill.rs`, `client/recovery.rs`) | — | Stay: they are app storage and ingest |
 
 ## Edges to cut before moving
@@ -178,7 +178,7 @@ These build on the moved crate, each as its own design brief:
 - typed size handling and pre-publish checks (#2334);
 - routing derivation: the `NostrRoutingV1` decode the engine does today, which goes to `transport-nostr`;
 - merging `AppTransportRouting` with `marmot-account`'s `StaticTransportRouting` into the one routing implementation
-  on `marmot-device-runtime`;
+  on `marmot-session`;
 - the KeyPackage event format;
 - the directory crate (step 3);
 - folding the adapter's SDK client into `transport-nostr`.
@@ -192,5 +192,7 @@ These build on the moved crate, each as its own design brief:
 
 ## Open questions
 
-1. Is the name `transport-nostr` confirmed? This is question 4 in [core-structure §6](core-structure.md#6-questions-for-the-product-owner).
-2. Keep the tracing target `marmot_app::relay_plane` through the move? The recommendation is yes.
+1. Keep the tracing target `marmot_app::relay_plane` through the move? The recommendation is yes.
+
+Answered: the name `transport-nostr` is confirmed (2026-10-17, decision 4 in
+[core-structure §6](core-structure.md#6-product-owner-decisions)).

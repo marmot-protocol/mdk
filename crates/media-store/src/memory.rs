@@ -55,7 +55,7 @@ impl State {
 
     fn mark_lost(&mut self, id: FileId) -> bool {
         match self.rows.get_mut(&id) {
-            Some(row) if row.state == FileState::Ready => {
+            Some(row) if matches!(row.state, FileState::Ready | FileState::Staged) => {
                 row.state = FileState::Lost;
                 row.key = [0; 32];
                 true

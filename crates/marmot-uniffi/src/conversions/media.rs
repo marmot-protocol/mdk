@@ -293,8 +293,8 @@ impl From<MediaUploadRequestFfi> for MediaUploadRequest {
 }
 
 /// One host-local file attachment. `source_path` names a regular file the
-/// process can open (not a symlink); it is snapshotted privately before any
-/// upload and never enters message tags. `expected_size`, when set, must equal
+/// process can open (not a symlink); it is copied into the account's encrypted
+/// media store before any upload and never enters message tags. `expected_size`, when set, must equal
 /// the opened file's length. Debug output omits every field.
 #[derive(Clone, uniffi::Record)]
 pub struct MediaFileUploadAttachmentRequestFfi {

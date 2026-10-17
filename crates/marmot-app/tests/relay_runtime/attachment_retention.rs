@@ -80,6 +80,21 @@ async fn genuine_outgoing_upload_is_local_after_confirmed_send_and_restart() {
             })
             .collect::<Vec<_>>();
         let started = Instant::now();
+        // The account worker promotes the staged uploads once the send is
+        // confirmed.
+        timeout(Duration::from_secs(30), async {
+            while runtime
+                .attachment_local_assets("alice", &group, targets.clone())
+                .await
+                .unwrap()
+                .iter()
+                .any(Option::is_none)
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         check_local_bytes(&runtime, &group, &targets, &bodies).await;
         let local_ms = started.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(blossom.ledger.puts.load(Ordering::SeqCst), bodies.len());
@@ -119,8 +134,7 @@ async fn genuine_outgoing_upload_is_local_after_confirmed_send_and_restart() {
             })
         );
         if token_send {
-            check_failed_token_admission_releases_upload(&reopened, &group, &blossom, &bodies)
-                .await;
+            check_failed_token_admission_releases_upload(&reopened, &group, &blossom).await;
         }
         reopened.shutdown_and_close().await.unwrap();
         // Execute reads in a fresh native process while this fixture ledger remains alive.
@@ -222,26 +236,13 @@ fn fixture_bodies() -> Vec<Vec<u8>> {
     ]
 }
 
-/// A token conflict after PUT releases its unowned reservation, proven by an
-/// immediately affordable second upload at the exact remaining quota.
+/// A token conflict after PUT releases its unowned upload, and the next
+/// upload stages and completes without any download.
 async fn check_failed_token_admission_releases_upload(
     runtime: &MarmotAppRuntime,
     group: &GroupId,
     blossom: &MockBlossom,
-    bodies: &[Vec<u8>],
 ) {
-    runtime
-        .set_attachment_download_policy(
-            "alice",
-            marmot_app::AttachmentDownloadPolicy {
-                automatic: false,
-                retained_bytes: bodies.iter().map(|b| b.len() as u64).sum::<u64>() + 1024,
-                disk_reserve: 0,
-                transfer_limit: 1024,
-            },
-        )
-        .await
-        .unwrap();
     let request = || MediaUploadRequest {
         attachments: vec![MediaUploadAttachmentRequest {
             file_name: "generated-conflict.bin".into(),

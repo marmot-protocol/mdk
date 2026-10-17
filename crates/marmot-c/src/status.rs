@@ -158,6 +158,10 @@ pub enum MarmotStatus {
     /// The edit target is missing, not a chat message, sent by another
     /// account, deleted, or withdrawn by convergence; nothing was published.
     InvalidEditTarget = 105,
+    /// No room on the device: free space would fall below the disk reserve,
+    /// or the volume or database is full. A send refuses an attachment it
+    /// cannot stage before uploading anything; retry once space is free.
+    StorageFull = 106,
 }
 
 thread_local! {
@@ -291,6 +295,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::GroupCatchingUp { .. } => MarmotStatus::GroupCatchingUp,
         MarmotKitError::GroupCommitUndelivered { .. } => MarmotStatus::GroupCommitUndelivered,
         MarmotKitError::StorageClosed { .. } => MarmotStatus::StorageClosed,
+        MarmotKitError::StorageFull { .. } => MarmotStatus::StorageFull,
         MarmotKitError::GroupSendQueueFull { .. } => MarmotStatus::GroupSendQueueFull,
         MarmotKitError::CreatedGroupProjectionUnavailable { .. } => {
             MarmotStatus::CreatedGroupProjectionUnavailable
@@ -510,6 +515,9 @@ mod tests {
             MarmotKitError::StorageClosed {
                 details: "d".into(),
             },
+            MarmotKitError::StorageFull {
+                details: "d".into(),
+            },
             MarmotKitError::SecretNotFound {
                 details: "d".into(),
             },
@@ -542,7 +550,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            96,
+            97,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -565,6 +573,12 @@ mod tests {
         assert_eq!(
             status_from_error(&MarmotKitError::InvalidEditTarget) as i32,
             105
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::StorageFull {
+                details: "d".into()
+            }) as i32,
+            106
         );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,

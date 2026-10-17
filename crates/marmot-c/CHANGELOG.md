@@ -11,6 +11,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 - Add `marmot_cached_public_event_previews` and `marmot_resolve_public_event_preview` (record `MarmotPublicEventPreview`, enum `MarmotPublicEventPreviewState`, freed with `marmot_public_event_preview_free` / `marmot_public_event_preview_list_free`) for cached public Nostr event previews (mdk#1547), and `MARMOT_STATUS_INVALID_PUBLIC_EVENT_REFERENCES` (103) for a read of more than 16 references. Use matching regenerated headers and libraries.
 
+- Add `MARMOT_STATUS_STORAGE_FULL` (106): the device has no room for the operation (mdk#2314).
+  Media uploads return it when an attachment cannot be stored locally beyond the disk reserve,
+  before anything is uploaded; a full disk or database elsewhere also returns it instead of the
+  generic runtime status. Use matching regenerated headers and libraries.
+
 - Add `MARMOT_STATUS_DIRECTORY_LOOKUP_INCOMPLETE` (104): a relay-list or KeyPackage lookup for an
   account ran out of time or relay coverage, so nothing is known to be missing (mdk#2302). Offer
   retry. These failures previously returned the generic runtime status. Use matching regenerated

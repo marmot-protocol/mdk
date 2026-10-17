@@ -69,8 +69,9 @@ pub enum AttachmentAcquisitionMode {
 /// Automatic attachment policy. Downloaded bodies are retained in the
 /// account's encrypted media store with no byte quota: free disk above
 /// `minimum_free_disk_bytes` is the only gate (mdk#2314).
-/// `retained_bytes_per_account` still bounds legacy database copies of sent
-/// attachments until outgoing bodies move to the media store. No automatic
+/// Sent bodies are kept there too, under the same free-disk gate.
+/// `retained_bytes_per_account` only bounds the promotion of legacy database
+/// copies of sent attachments staged by earlier releases. No automatic
 /// eviction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachmentAcquisitionPolicy {

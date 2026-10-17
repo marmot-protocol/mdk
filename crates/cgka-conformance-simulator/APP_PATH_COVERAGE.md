@@ -195,7 +195,10 @@ field untouched and reported as a conflict when it changed it; a removal is re-q
 members; an invite retains durable recovery material while the app obtains fresh KeyPackages and reissues it (#1735). Re-issue is bounded to
 two attempts. Terminal and reissued decisions reach the host as `MarmotAppEvent::GroupChangeSuperseded { kind, outcome, reason }`
 (UniFFI and C ABI mirrors), and `run_due_maintenance` re-derives a missed announcement from the stored disposition.
-Journey 08 now requires both edits in the settled state; `crates/marmot-app/tests/relay_runtime.rs` races two admins
+Journey 08 now requires both edits in the settled state. The loser publishes its re-queued edit on its next scheduled
+convergence pass, about 1.1 s after the supersession, so members can agree on the winner-only state for longer than
+the harness's 1 s quiet window; the journey settles again while a missing accepted edit's latest notice is `Reissued`,
+inside the same 60 s budget. `crates/marmot-app/tests/relay_runtime.rs` races two admins
 on a real relay for the re-issued and the conflict outcome, and `crates/cgka-engine/tests/distributed_convergence.rs`
 pins the field rule, the bounded re-issue, and the horizon garbage collection.
 

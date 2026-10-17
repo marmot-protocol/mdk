@@ -53,9 +53,10 @@ pub use app::attachment_acquisition::{
     AttachmentAcquisitionState, AttachmentAcquisitionStatus, AttachmentAssetRef,
     AttachmentCheckpoint, AttachmentDemand, AttachmentPartial, AttachmentPartialIdentity,
     AttachmentPermissionCategory, AttachmentPublication, AttachmentPublishResult,
-    AttachmentUploadPromotion, AttachmentUploadSource, AttachmentUploadStage,
-    AttachmentWorkerDemand, MAX_ATTACHMENT_LOCAL_READ_BYTES, MAX_RETAINED_ATTACHMENT_BYTES,
-    MAX_RETAINED_FILE_ATTACHMENT_BYTES, RetainedAttachmentAsset, RetainedAttachmentRead,
+    AttachmentUploadOwner, AttachmentUploadPromotion, AttachmentUploadSource,
+    AttachmentUploadStage, AttachmentWorkerDemand, MAX_ATTACHMENT_LOCAL_READ_BYTES,
+    MAX_RETAINED_ATTACHMENT_BYTES, MAX_RETAINED_FILE_ATTACHMENT_BYTES, RetainedAttachmentAsset,
+    RetainedAttachmentRead,
 };
 pub use app::attachment_history::{
     AccountAttachmentCursor, AccountAttachmentEntry, AccountAttachmentHistoryError,

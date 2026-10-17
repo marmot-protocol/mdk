@@ -114,8 +114,8 @@ account database stays the authority: each file's random key and state live in i
 - **Staged files are owned by their upload row.** An outgoing body can be sealed into an encrypted store file that
   stays `staged` under its `outgoing_attachment_uploads` row, and promotion marks it `ready` and attaches it in one
   transaction. A file lives while a slot references it or an upload owns it. Deleting the upload row deletes a
-  still-staged file's key, and the sweep unlinks the file. (The send path still snapshots plaintext into
-  `media-staging/` until mdk#2314 step 3b moves it onto staged files.)
+  still-staged file's key, and the sweep unlinks the file. Sends stage every body this way before uploading and
+  stream the wire ciphertext from the staged file, so no plaintext snapshot or ciphertext temp file is written.
 - **Download checkpoints are `.wire` files.** A resumable download appends the received Blossom ciphertext (already
   encrypted to the group, never plaintext) to `<shard>/<id>.wire`, created at 0600. The media store owns the
   sequence: the `attachment_partial` row commits before the file exists and is deleted before the file is unlinked,

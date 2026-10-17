@@ -264,6 +264,24 @@ class AgentControlClientTests(unittest.IsolatedAsyncioTestCase):
     async def start_server(self, handler):
         self.server = await asyncio.start_unix_server(handler, path=self.socket_path)
 
+    async def test_bounded_read_propagates_cancel_that_arrives_with_its_frame(self):
+        # A subscription read that swallowed teardown's cancel would keep the
+        # inbound listener reconnecting and hang disconnect() (Python 3.11).
+        client = self.adapter.MarmotAgentControlClient(self.socket_path)
+        frame = json.dumps({"marmot_agent_control": "marmot.agent-control.v2", "id": "1"}).encode()
+        for turns in range(4):
+            reader = asyncio.StreamReader()
+            read = asyncio.create_task(client._read_envelope(reader))
+            await asyncio.sleep(0)
+            reader.feed_data(frame + b"\n")
+            for _ in range(turns):
+                await asyncio.sleep(0)
+            if read.done():
+                continue
+            read.cancel()
+            with self.assertRaises(asyncio.CancelledError, msg=f"{turns} turns after the frame"):
+                await read
+
     async def test_group_profile_update_sends_only_selected_fields(self):
         requests = []
 
@@ -1420,6 +1438,21 @@ class ReadinessProbeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(ambiguous["state"], "account_unselected")
         self.assertFalse(ambiguous["home_resolved"])
+
+
+class CancellationSafeTimeoutTests(unittest.TestCase):
+    def test_gateway_modules_bound_awaits_with_bounded_wait(self):
+        # Hermes runs on Python 3.11, where asyncio.wait_for can drop a cancel
+        # that arrives as its awaitable completes. Only bounded_wait's own
+        # pre-3.11 fallback (the doctor's system python3) may call it.
+        fallback = "return await asyncio.wait_for(awaitable, timeout)"
+        offenders = [
+            f"{name}:{number}"
+            for name in ("adapter.py", "agent_control.py")
+            for number, line in enumerate((PLUGIN_DIR / name).read_text().splitlines(), 1)
+            if "asyncio.wait_for(" in line and line.strip() != fallback
+        ]
+        self.assertEqual(offenders, [])
 
 
 class MediaCapabilityContractTests(unittest.TestCase):
@@ -7940,6 +7973,31 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         return self.adapter_module.MarmotPlatformAdapter(
             self.config_cls(extra=merged), client=client if client is not None else object()
         )
+
+    async def test_spool_retry_loop_stops_when_cancelled_as_its_wakeup_fires(self):
+        # On Python 3.11, asyncio.wait_for returns the inner result when a
+        # cancel lands in the loop turns its event fires. A retry loop built
+        # on it then outlives _stop_inbound_tasks and disconnect() hangs.
+        adapter = self.make_adapter()
+        # Keep each pass to the wait itself; the spool is never opened here.
+        adapter._inbound_spool_admission_enabled = False
+        try:
+            for turns in range(4):
+                retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
+                adapter._inbound_spool_retry_task = retry
+                await asyncio.sleep(0)
+                adapter._inbound_spool_wakeup.set()
+                for _ in range(turns):
+                    await asyncio.sleep(0)
+                stop = asyncio.create_task(adapter._stop_inbound_tasks())
+                done, _ = await asyncio.wait({stop}, timeout=5)
+                if not done:
+                    retry.cancel()
+                    await asyncio.wait({stop}, timeout=5)
+                    self.fail(f"retry loop ignored cancellation {turns} turns after its wakeup")
+                self.assertTrue(retry.cancelled())
+        finally:
+            await adapter.disconnect()
 
     async def test_cancelled_worker_claim_is_released_after_sqlite_finishes(self):
         import threading

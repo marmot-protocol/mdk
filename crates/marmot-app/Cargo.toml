@@ -70,7 +70,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-media-store = { workspace = true, features = ["test-support"] }
+media-store = { workspace = true, features = ["catalog-conformance", "test-support"] }
 storage-sqlite = { workspace = true, features = ["test-support"] }
 tokio-tungstenite.workspace = true
 keyring-core.workspace = true

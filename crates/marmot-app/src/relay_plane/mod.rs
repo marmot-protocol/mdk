@@ -43,6 +43,8 @@ mod directory_wire;
 pub(crate) mod publish_accounting_tests;
 mod safety;
 mod telemetry;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use safety::{RelayEndpointClassification, RelayEndpointPolicy, retired_relay_hosts};
 pub use telemetry::{

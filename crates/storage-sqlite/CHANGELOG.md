@@ -13,6 +13,11 @@
   waiting. Deleting an upload, or pointing it at another file, deletes a
   still-staged file's key, and a promoted one no slot references (mdk#2314
   step 3).
+- `attachment_upload_owners` pages file-backed uploads, with each sent message
+  of a confirmed group that carries their descriptor, for promotion (owner rows
+  are not required, so a failed owner registration cannot strand one), and `drop_lost_attachment_upload` deletes
+  an upload whose media file was lost (with that row), so its message falls
+  back to downloading. New `AttachmentUploadOwner` record.
 - `promote_attachment_uploads` skips uploads that have a media store file;
   promote those through `MediaStore::promote` with an
   `AttachmentUploadPromotion`.

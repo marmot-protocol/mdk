@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use cgka_traits::engine::{SupersededIntentKind, SupersededIntentOutcome};
 use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_account::MaintenanceTiming;
 use marmot_app::{
@@ -165,6 +166,17 @@ pub struct ConcurrentMutationReport {
     pub admitted_publications: usize,
 }
 
+/// One `GroupChangeSuperseded` notice a participant's runtime published
+/// (mdk#1734): convergence superseded a group change the device had already
+/// reported as saved, and `outcome` says what the runtime did with it. A
+/// `Reissued` change publishes again on the author's next scheduled
+/// convergence pass. Carries no identifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupersededGroupChange {
+    pub kind: SupersededIntentKind,
+    pub outcome: SupersededIntentOutcome,
+}
+
 #[derive(Default)]
 struct Topology {
     relay_pair: bool,
@@ -271,6 +283,8 @@ struct Participant {
     last_error_kind: Option<String>,
     background_errors: Vec<String>,
     runtime_events_observed: usize,
+    /// Every superseded-change notice drained so far, oldest first.
+    superseded_group_changes: Vec<(GroupId, SupersededGroupChange)>,
     cached_members: BTreeMap<String, Vec<String>>,
     cached_epochs: BTreeMap<String, u64>,
     offline_observation: Option<AppRuntimeObservationV1>,
@@ -438,6 +452,7 @@ impl AppRuntimeHarness {
                     last_error_kind: None,
                     background_errors: Vec::new(),
                     runtime_events_observed: 0,
+                    superseded_group_changes: Vec::new(),
                     cached_members: BTreeMap::new(),
                     cached_epochs: BTreeMap::new(),
                     offline_observation: None,
@@ -822,6 +837,22 @@ impl AppRuntimeHarness {
     /// Public account identity, for reproducible ordering of concurrent authors.
     pub fn account_identity(&self, client: &str) -> Result<&str, SubjectError> {
         Ok(&self.participant(client)?.account_id)
+    }
+
+    /// Superseded-change notices `client`'s runtime published for the active
+    /// scenario group, oldest first, as of the latest observation or catch-up.
+    pub fn superseded_group_changes(
+        &self,
+        client: &str,
+    ) -> Result<Vec<SupersededGroupChange>, SubjectError> {
+        let group_id = self.active_group()?;
+        Ok(self
+            .participant(client)?
+            .superseded_group_changes
+            .iter()
+            .filter(|(group, _)| *group == group_id)
+            .map(|(_, change)| *change)
+            .collect())
     }
 
     /// Read the supported app recovery snapshot for the active scenario group.
@@ -2568,6 +2599,25 @@ pub(crate) fn opaque_public_identity(account: &str) -> String {
     )
 }
 
+/// The group and public outcome of a `GroupChangeSuperseded` event.
+fn superseded_group_change(event: &MarmotAppEvent) -> Option<(GroupId, SupersededGroupChange)> {
+    match event {
+        MarmotAppEvent::GroupChangeSuperseded {
+            group_id,
+            kind,
+            outcome,
+            ..
+        } => Some((
+            group_id.clone(),
+            SupersededGroupChange {
+                kind: *kind,
+                outcome: *outcome,
+            },
+        )),
+        _ => None,
+    }
+}
+
 fn drain_runtime_events(participant: &mut Participant) -> Result<(), SubjectError> {
     if let Some(ParticipantRuntime::Remote(_)) = participant.runtime.as_ref() {
         let summary = participant.runtime()?.drain_events().map_err(app_error)?;
@@ -2577,6 +2627,9 @@ fn drain_runtime_events(participant: &mut Participant) -> Result<(), SubjectErro
         participant.background_errors.extend(summary.errors);
         let excess = participant.background_errors.len().saturating_sub(8);
         participant.background_errors.drain(..excess);
+        participant
+            .superseded_group_changes
+            .extend(summary.superseded_group_changes);
         return Ok(());
     }
     let Some(events) = participant.events.as_mut() else {
@@ -2588,6 +2641,9 @@ fn drain_runtime_events(participant: &mut Participant) -> Result<(), SubjectErro
             Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
             Err(_) => break,
         };
+        participant
+            .superseded_group_changes
+            .extend(superseded_group_change(&event));
         if let MarmotAppEvent::AccountError(error) = event {
             if participant.background_errors.len() == 8 {
                 participant.background_errors.remove(0);

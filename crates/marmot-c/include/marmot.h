@@ -216,6 +216,12 @@ enum MarmotStatus
    * account, deleted, or withdrawn by convergence; nothing was published.
    */
   MARMOT_STATUS_INVALID_EDIT_TARGET = 105,
+  /**
+   * No room on the device: free space would fall below the disk reserve,
+   * or the volume or database is full. A send refuses an attachment it
+   * cannot stage before uploading anything; retry once space is free.
+   */
+  MARMOT_STATUS_STORAGE_FULL = 106,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

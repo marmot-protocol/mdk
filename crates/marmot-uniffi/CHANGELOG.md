@@ -20,6 +20,12 @@
   Swift/Kotlin handling and regenerate bindings with the matching native
   library; render a storage prompt rather than a retry timer. See
   [the attachment access contract](ATTACHMENT-ACCESS.md).
+- `MarmotKitError` adds `StorageFull { details }` (mdk#2314): the device has no room for the
+  operation. `upload_media`, `upload_media_files` and their token-aware twins return it when an
+  attachment cannot be stored locally beyond the disk reserve, before anything is uploaded;
+  such sends previously went out without a local copy. A full disk or database elsewhere also
+  maps here instead of `Runtime`. Ask the user to free space. Regenerate bindings and update
+  exhaustive Swift `switch` / Kotlin `when` handling.
 - `MarmotKitError` adds `InvalidEditTarget`, returned by `edit_message` (see Fixed). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 - `MarmotKitError` adds `GroupCommitUndelivered`: a group change was refused because the group's last change has not reached every group relay yet (mdk#2255). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 

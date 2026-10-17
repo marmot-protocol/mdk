@@ -305,37 +305,27 @@ header/library; returned automatic-request records use
 
 ## Genuine outgoing retention
 
-Migration 101 attempts private staging in the encrypted per-account database after a
-successful HTTP upload. Retention shares the existing byte quota and checks free-disk
-reserve and SQLite/WAL headroom, without evicting retained assets. Quota, disk, staging
-capacity or storage failures skip optional retention; they cannot reject the upload
-or prevent sending. Existing upload file/count/aggregate limits remain unchanged.
-The optional store accepts at most 256 outstanding staged uploads.
+Every send keeps its bodies in the account's encrypted media store (mdk#2314), so the
+sender reads its own attachments locally without downloading them. Before the first
+upload, each body is copied into a store file owned by an outgoing upload row. The
+ciphertext is never written to disk: one pass over the stored copy computes its digest
+for the upload's authorization, and each server attempt streams it again. After a
+successful upload the row is bound to the exact imeta descriptor.
 
-Staging and binding to exact successful imeta descriptors commit together. Pending
-sends protect staged bytes without creating a readable source. Core message projection,
-confirmation and chat-list updates commit before optional ownership and promotion run.
-The callback waits for the outermost transaction; retention failures do not roll back
-an accepted message. Direct and token-based sends share this path. Original source
-identity remains authoritative through optimistic-to-confirmed reconciliation.
+Free disk is the only limit: no retained-byte budget applies. A body the volume cannot
+hold beyond the attachment policy's disk reserve fails with `StorageFull` (C:
+`MARMOT_STATUS_STORAGE_FULL`) before anything is uploaded or published. The account holds
+at most 256 outstanding uploads; beyond that a send fails until earlier ones publish or
+expire. A failed binding or other local fault after the upload also fails the send, which
+publishes nothing. Failed and cancelled sends release their uploads and stored copies.
 
-An exclusive staged body moves into canonical retention without additional quota,
-even after the budget is lowered. Copies for shared source slots require capacity.
-Bounded rotating local recovery follows confirmed source descriptors as well as owner
-rows, preserving crash recovery when optional owner registration fails. Known unadmitted
-failures release staging; live pending/canonical sources protect it during cleanup and
-past the seven-day orphan TTL. Rejected, invalidated, expired, cancelled or removed
-sources cannot pin a satisfied sibling's reservation.
+Pending sends protect their uploads without creating a readable source. Once the message
+is confirmed, the account worker promotes each stored copy into the message's slots,
+reusing an identical retained file when one exists; visibility, cancellation and removal
+fences apply first. An upload whose stored copy is missing or corrupt is dropped, and its
+message downloads its own media like a received one. Uploads never sent expire after
+seven days, and the worker's media sweep removes stored copies no upload owns after a
+crash. Account or group deletion releases account-scoped uploads.
 
-Proven length/digest corruption clears the poisoned body and records unavailable
-completion for its eligible sources, preventing automatic reacquisition. SQL and I/O
-failures keep bytes retryable. Outgoing maintenance failures do not block incoming
-acquisition. Account/group deletion releases account-scoped staging; visibility,
-cancellation and removal fences still apply before canonical promotion.
-
-Once retained, local reads need neither automatic downloads nor a relay worker and
-survive process restart. Clients must adopt a matching reviewed artifact and qualify
-presentation-cache and device lifecycle paths. Native fixture results belong to the
-[implementation PR evidence](https://github.com/marmot-protocol/mdk/pull/2142#issuecomment-5946856165);
-they do not qualify Android artifact adoption or physical-device behavior. Large-send
-streaming remains separate work.
+Uploads staged in the database by earlier releases keep their previous promotion path,
+budget and corruption handling until they expire.

@@ -18,7 +18,6 @@ use transport_nostr_peeler::MarmotNostrSigner;
 
 use crate::app_telemetry::{AppPerformanceOperation, AppPerformanceTelemetry};
 use crate::{AppError, ChatListAttachmentKind, SendSummary};
-use cgka_traits::SecretBytes;
 
 mod blossom;
 mod crypto;
@@ -27,6 +26,7 @@ pub(crate) use blossom::fetch_blossom_file_with_transport;
 #[cfg(test)]
 pub(crate) use crypto::{derive_media_file_key, media_aad};
 pub(crate) mod file_transfer;
+pub(crate) mod outgoing;
 pub(crate) use crypto::media_hash_from_reference;
 mod group_image;
 mod host_safety;
@@ -741,8 +741,8 @@ pub(crate) struct MediaOperationPolicy<'a> {
     pub(crate) allow_loopback_http: bool,
 }
 
-/// Test-only compatibility helper; production also carries optional local bytes.
-#[cfg(test)]
+/// Encrypts and uploads an in-memory batch. A send stages each body in the
+/// media store first (mdk#2314); this never keeps a copy of its own.
 pub(crate) async fn upload_encrypted_media(
     request: MediaUploadRequest,
     source_epoch: u64,
@@ -751,35 +751,41 @@ pub(crate) async fn upload_encrypted_media(
     policy: MediaOperationPolicy<'_>,
     transport: &BlossomHttpTransport,
 ) -> Result<MediaUploadResult, AppError> {
-    upload_encrypted_media_retaining(
-        request,
-        source_epoch,
-        media_secret,
-        signer,
-        policy,
-        transport,
-    )
-    .await
-    .map(|(result, _)| result)
-}
-
-/// Recover the uploaded buffer locally for optional retention after PUT succeeds.
-/// No whole-batch plaintext clone or network reacquisition is required.
-pub(crate) async fn upload_encrypted_media_retaining(
-    request: MediaUploadRequest,
-    source_epoch: u64,
-    media_secret: &[u8],
-    signer: &dyn MarmotNostrSigner,
-    policy: MediaOperationPolicy<'_>,
-    transport: &BlossomHttpTransport,
-) -> Result<(MediaUploadResult, Vec<SecretBytes>), AppError> {
     if request.attachments.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(
             "media upload requires at least one attachment".into(),
         ));
     }
     validate_media_upload_batch(&request.attachments)?;
-    let upload_servers = match request.blossom_server {
+    let upload_servers = upload_servers(request.blossom_server, policy)?;
+    let mut attachments = Vec::with_capacity(request.attachments.len());
+    for attachment in request.attachments {
+        attachments.push(
+            upload_encrypted_media_attachment(
+                attachment,
+                source_epoch,
+                media_secret,
+                signer,
+                &upload_servers,
+                policy,
+                transport,
+            )
+            .await?,
+        );
+    }
+    Ok(MediaUploadResult {
+        attachments,
+        sent: None,
+    })
+}
+
+/// The Blossom servers an upload tries in order: the explicit one, or the
+/// group's default endpoints.
+pub(crate) fn upload_servers(
+    explicit: Option<String>,
+    policy: MediaOperationPolicy<'_>,
+) -> Result<Vec<String>, AppError> {
+    let servers = match explicit {
         Some(server) => vec![server],
         None => policy
             .default_endpoints
@@ -787,41 +793,12 @@ pub(crate) async fn upload_encrypted_media_retaining(
             .map(|endpoint| endpoint.base_url.clone())
             .collect::<Vec<_>>(),
     };
-    if upload_servers.is_empty() {
+    if servers.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(
             "group policy has no usable Blossom endpoint for upload".into(),
         ));
     }
-    let mut attachments = Vec::with_capacity(request.attachments.len());
-    let mut plaintext = Vec::with_capacity(request.attachments.len());
-    for attachment in request.attachments {
-        let (uploaded, retained) = upload_encrypted_media_attachment(
-            attachment,
-            source_epoch,
-            media_secret,
-            signer,
-            &upload_servers,
-            policy,
-            transport,
-        )
-        .await?;
-        attachments.push(uploaded);
-        if let Some(retained) = retained {
-            plaintext.push(retained);
-        }
-    }
-    if plaintext.len() != attachments.len() {
-        plaintext.clear();
-        tracing::warn!(target: "marmot_app::media", method = "outgoing_retention_capture",
-            "optional outgoing retention buffer unavailable");
-    }
-    Ok((
-        MediaUploadResult {
-            attachments,
-            sent: None,
-        },
-        plaintext,
-    ))
+    Ok(servers)
 }
 
 /// Validate the existing aggregate upload bound independently of optional retention.
@@ -856,7 +833,7 @@ async fn upload_encrypted_media_attachment(
     upload_servers: &[String],
     policy: MediaOperationPolicy<'_>,
     transport: &BlossomHttpTransport,
-) -> Result<(MediaUploadAttachmentResult, Option<SecretBytes>), AppError> {
+) -> Result<MediaUploadAttachmentResult, AppError> {
     if request.plaintext.is_empty() {
         return Err(AppError::InvalidEncryptedMedia(
             "media plaintext cannot be empty".into(),
@@ -892,10 +869,9 @@ async fn upload_encrypted_media_attachment(
         .map_err(|_| AppError::InvalidEncryptedMedia("media encryption failed".into()))?;
     let encrypted_size_bytes = encrypted.len() as u64;
     let ciphertext_sha256 = hex::encode(Sha256::digest(&encrypted));
-    let encrypted = Bytes::from(encrypted);
     let url = upload_blossom_blob_with_fallback(
         upload_servers,
-        encrypted.clone(),
+        Bytes::from(encrypted),
         &ciphertext_sha256,
         signer,
         transport,
@@ -925,24 +901,10 @@ async fn upload_encrypted_media_attachment(
         policy.allowed_locator_kinds,
         policy.allow_loopback_http,
     )?;
-    // Transport clones normally retire before this point. If any survive, skip
-    // retention instead of allocating a second full-size buffer.
-    let plaintext = if encrypted.is_unique() {
-        let mut bytes = zeroize::Zeroizing::new(Vec::from(encrypted));
-        cipher
-            .decrypt_in_place(Nonce::from_slice(&nonce), &aad, &mut *bytes)
-            .ok()
-            .map(|()| SecretBytes::new(std::mem::take(&mut *bytes)))
-    } else {
-        None
-    };
-    Ok((
-        MediaUploadAttachmentResult {
-            encrypted_size_bytes,
-            reference,
-        },
-        plaintext,
-    ))
+    Ok(MediaUploadAttachmentResult {
+        encrypted_size_bytes,
+        reference,
+    })
 }
 
 fn validate_media_plaintext_len(plaintext_bytes: u64) -> Result<(), AppError> {

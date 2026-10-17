@@ -62,13 +62,17 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the job's `AttachmentCheckpoint` target; never open or truncate a wire file here. Every download disk check uses
   `DiskPolicy::download_need` (worker admission, readmission and the attempt's checks share `capacity`);
   keep Range validation, protected partials and complete-body authentication separate from native progress/access.
-  `media/file_transfer.rs` owns file-backed upload preparation: private owner-only snapshots under the account's
-  `media-staging/`, streaming EVP ChaCha20-Poly1305 that reproduces the in-memory wire bytes, the download side's
-  `DownloadedFileBody` (ciphertext in the job's `.wire` checkpoint, held open by the store's `CheckpointReader`, or
-  one staging file without a validator; authenticated into a discard sink before the receipt and decrypted by
-  `DecryptingReader` straight into the store publish; never write a plaintext file for a download), and the
-  `MediaFileTransferControl` cancellation/progress handle. Prepare every snapshot before the first PUT, keep chunks
-  at 64 KiB, and stage retention through `stage_attachment_upload_files` (never a whole-file `Vec`).
+  `media/file_transfer.rs` owns the download side's `DownloadedFileBody` (ciphertext in the job's `.wire` checkpoint,
+  held open by the store's `CheckpointReader`, or one `media-staging/` file without a validator; authenticated into a
+  discard sink before the receipt and decrypted by `DecryptingReader` straight into the store publish; never write a
+  plaintext file for a download) and the `MediaFileTransferControl` cancellation/progress handle.
+- `media/outgoing.rs` owns the send path on the media store (mdk#2314 step 3): `SendStaging` admits each body with
+  `DiskPolicy::send_need` (a shortfall is `StorageError::Capacity`, which bindings surface as `StorageFull`), reserves
+  an `outgoing_attachment_uploads` row and stages the body as that row's file before the first PUT; `upload_staged`
+  hashes the wire ciphertext in one pass over the staged file and streams it again per server attempt with
+  `EncryptingReader` (never write ciphertext or a plaintext snapshot to disk); `OutgoingUploads` releases every upload
+  of a failed or dropped send (rows, then files). The worker's `promote_uploads` pass promotes owned uploads of
+  confirmed messages and drops uploads whose file was lost. Keep chunks at 64 KiB and never build a whole-file `Vec`.
 - Downloaded attachment bodies are retained in the account's encrypted media store (`media-store` crate,
   `MarmotApp::account_media_store`, one per account; mdk#2314). Callers pass the database handle they already hold, so
   creating a store never opens a database; creation is admitted under the storage lifecycle guard like an open. Every media store call (publish, reuse check, reads,

@@ -476,9 +476,18 @@ impl<C: MediaCatalog> MediaStore<C> {
 
     /// Promotes the staged (or already promoted) file `id` into `target`'s
     /// slots in one transaction, reusing a present identical ready file when
-    /// there is one. A replaced staged copy is unlinked after the commit.
+    /// there is one. A replaced staged copy is unlinked after the commit. A
+    /// staged file missing from disk, or of the wrong length, is marked lost
+    /// instead and nothing is attached (`Superseded`), so its owner can fall
+    /// back rather than fill slots with a body that is gone.
     pub fn promote(&self, target: &dyn PromoteTarget, id: FileId) -> MediaResult<PromoteOutcome> {
         self.inner.ensure_open()?;
+        if let Some(row) = self.inner.catalog.staged_file(id)?
+            && self.present(id, row.byte_len)? == FilePresence::Absent
+        {
+            self.inner.lose(&id);
+            return Ok(PromoteOutcome::Superseded);
+        }
         match target.commit_promoted(id, &|twin, byte_len| self.present(twin, byte_len))? {
             PromotedOutcome::Ready => Ok(PromoteOutcome::Ready),
             PromotedOutcome::Existing(twin) => {
@@ -511,8 +520,11 @@ impl<C: MediaCatalog> MediaStore<C> {
     }
 
     /// Opens a staged file for reading, as an upload streams it. `None`
-    /// means `id` is not staged (released, promoted or never staged). The
-    /// reader holds the key and refuses reads once the store closes.
+    /// means `id` is not staged (released, promoted, lost or never staged).
+    /// A staged row whose file is missing, or fails verification, is marked
+    /// lost first (key zeroed), exactly like a ready one, so it can never be
+    /// promoted. The reader holds the key and refuses reads once the store
+    /// closes.
     pub fn open_staged_reader(&self, id: &FileId) -> MediaResult<Option<MediaReader<C>>> {
         self.inner.ensure_open()?;
         let Some(row) = self.inner.catalog.staged_file(*id)? else {
@@ -521,16 +533,23 @@ impl<C: MediaCatalog> MediaStore<C> {
         let file = match File::open(self.path(id)) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(MediaError::Corruption("staged media file is missing"));
+                self.inner.lose(id);
+                return Ok(None);
             }
             Err(error) => return Err(io_error(&error)),
         };
-        let reader = MediaFileReader::open(file, &row.key, &id.0)?;
-        if reader.plaintext_bytes() != row.byte_len {
-            return Err(MediaError::Corruption(
-                "media file length differs from its row",
-            ));
-        }
+        let verified = MediaFileReader::open(file, &row.key, &id.0)
+            .map_err(MediaError::from)
+            .and_then(|reader| {
+                if reader.plaintext_bytes() == row.byte_len {
+                    Ok(reader)
+                } else {
+                    Err(MediaError::Corruption(
+                        "media file length differs from its row",
+                    ))
+                }
+            });
+        let reader = self.inner.lose_on_corruption(id, verified)?;
         Ok(Some(MediaReader {
             inner: self.inner.clone(),
             id: *id,
@@ -1018,6 +1037,19 @@ impl<C: MediaCatalog> MediaStore<C> {
                         self.forget_reader(id);
                         remove_if_present(&self.path(id)).map_err(|e| io_error(&e))?;
                         report.staged_released += 1;
+                        continue;
+                    }
+                    // An owned staged row whose file is gone can never be
+                    // uploaded or promoted: mark it lost, like a ready one.
+                    match std::fs::symlink_metadata(self.path(id)) {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            self.forget_reader(id);
+                            if self.inner.catalog.mark_lost(*id)? {
+                                report.lost_marked += 1;
+                            }
+                        }
+                        Err(error) => return Err(io_error(&error)),
                     }
                 }
             }

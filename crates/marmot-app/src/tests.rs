@@ -8,6 +8,7 @@ mod key_package_selection;
 mod message_journeys;
 mod publication_progress;
 mod quarantine_receive;
+mod relay_plane_runtime;
 mod replaceable_delivery;
 mod report_backfill;
 mod suspension_close;

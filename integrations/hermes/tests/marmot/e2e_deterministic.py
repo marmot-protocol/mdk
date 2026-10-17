@@ -15,6 +15,7 @@ the Marmot plugin's inbound subscription plus durable ``send_final`` path.
 from __future__ import annotations
 
 import asyncio
+import faulthandler
 import importlib.util
 import json
 import os
@@ -300,6 +301,9 @@ async def run() -> None:
 
 
 def main() -> None:
+    # Every wait here is bounded at 5 s. A hang elsewhere (adapter teardown)
+    # dumps every thread's stack and exits instead of idling until CI cancels.
+    faulthandler.dump_traceback_later(120, exit=True)
     asyncio.run(run())
 
 

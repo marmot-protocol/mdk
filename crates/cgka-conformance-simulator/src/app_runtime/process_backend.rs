@@ -65,6 +65,8 @@ pub(crate) fn history_repair_outcome(
 pub(super) struct EventSummary {
     pub count: usize,
     pub errors: Vec<String>,
+    #[serde(default)]
+    pub superseded_group_changes: Vec<(GroupId, super::SupersededGroupChange)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -676,6 +678,9 @@ impl ParticipantServer {
                     match self.events.try_recv() {
                         Ok(event) => {
                             summary.count += 1;
+                            summary
+                                .superseded_group_changes
+                                .extend(super::superseded_group_change(&event));
                             if let marmot_app::MarmotAppEvent::AccountError(e) = event {
                                 summary.errors.push(e.message);
                                 if summary.errors.len() > 8 {

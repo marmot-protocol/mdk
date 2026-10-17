@@ -14,6 +14,13 @@
 - `AppError::MissingKeyPackage` is now `{ account, reason: MissingKeyPackageReason }`.
   `ObsoleteOnly` means a completed lookup found only legacy-profile KeyPackages, so the
   recipient must update and publish a current one; `NotFound` keeps the previous meaning.
+- Sends stage every attachment body in the account's media store before the
+  first upload (mdk#2314 step 3). A body the disk cannot hold beyond the
+  attachment policy's disk reserve fails with
+  `AppError::Storage(StorageError::Capacity)` before anything is uploaded or
+  published, instead of sending without a local copy. A full upload table
+  (256 uploads awaiting publication) or a failed binding after the upload
+  also fails the send, which publishes nothing.
 - `AttachmentTransferState` adds `StorageBlocked`: free disk cannot cover the
   publication reserve for the body. Update exhaustive matches; the job keeps
   its checkpoint and readmits once space frees or on explicit Retry.
@@ -25,6 +32,15 @@
   (mdk#2314). Identical content is stored once and attached without downloading
   again. `read_attachment_asset` reads either layout unchanged; existing bodies
   stay in the database until a later migration.
+- Sent attachment bodies are kept as encrypted media store files owned by
+  their upload, and the wire ciphertext streams from that file in two passes
+  (digest, then each PUT): no plaintext snapshot, ciphertext temp file or
+  SQLCipher copy is written, and no retained-byte budget or 4x disk rule
+  applies. The account worker promotes each upload into the sent message's
+  slots once the message is confirmed; an upload whose file was lost is
+  dropped so the message downloads its own media. Uploads staged in the
+  database by earlier releases keep their previous promotion until they
+  expire.
 - The retained-byte budget (`retained_bytes_per_account`) no longer gates
   downloads, so a full budget cannot leave downloads waiting in `RetryScheduled`.
   Free disk is the only limit: a full disk parks the job as `StorageBlocked`.

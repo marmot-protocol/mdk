@@ -33,6 +33,9 @@ The Hermes counterpart of `integrations/openclaw/marmot`. Read `README.md` and `
 
 - Treat release installs (`install-hermes-marmot.sh`) and dev harness scripts (`just hermes-dev-*`) as the operational
   verification path for end-to-end behavior.
+- Bound awaits in `adapter.py` and `agent_control.py` with `bounded_wait`, never `asyncio.wait_for`. On Python 3.11
+  `wait_for` can drop a cancellation that arrives as its awaitable completes, so a cancelled loop keeps running and
+  `disconnect()` waits forever. `test_adapter.py` guards both modules.
 - Keep the adapter's effective-configuration resolution and the doctor's projection in `diagnostics.py`
   aligned in the same change, with parity tests for enablement, dotenv/YAML precedence, welcomers,
   socket/account/auth, home and media settings. Projection drift can contact the wrong endpoint or

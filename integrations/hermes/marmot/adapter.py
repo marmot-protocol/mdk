@@ -37,6 +37,7 @@ from .agent_control import (
     _DEFAULT_READ_TIMEOUT,
     _normalize_hex,
     _normalize_stream_capability,
+    bounded_wait,
 )
 from .ambient_context import AmbientContextStore
 from . import diagnostics as marmot_diagnostics
@@ -1590,7 +1591,7 @@ class PresenceReactions:
                 await asyncio.sleep(delay)
             try:
                 method = self.adapter._add_reaction if add else self.adapter._remove_reaction
-                if await asyncio.wait_for(method(group, target, emoji), timeout=5):
+                if await bounded_wait(method(group, target, emoji), timeout=5):
                     return True
             except asyncio.CancelledError:
                 raise
@@ -1849,7 +1850,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             normalized_group = str(group_id_hex or "")
         fallback = _fallback_chat_name(normalized_group)
         try:
-            return await asyncio.wait_for(
+            return await bounded_wait(
                 self._lookup_current_chat_name(
                     group_id_hex,
                     account_id_hex=account_id_hex,
@@ -2681,7 +2682,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                         retryable=True,
                     )
                 try:
-                    response = await asyncio.wait_for(
+                    response = await bounded_wait(
                         self.client.send_media(
                             account_id,
                             normalized_chat_id,
@@ -3427,7 +3428,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
     async def _run_inbound_spool_retry_loop(self) -> None:
         while True:
             try:
-                await asyncio.wait_for(self._inbound_spool_wakeup.wait(), timeout=1.0)
+                await bounded_wait(self._inbound_spool_wakeup.wait(), timeout=1.0)
             except asyncio.TimeoutError:
                 pass
             self._inbound_spool_wakeup.clear()

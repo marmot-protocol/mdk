@@ -436,26 +436,34 @@ pub(crate) async fn upload_blossom_blob_with_content_type(
     .await
 }
 
+/// One stream of a file-backed upload body.
+pub(crate) type FileUploadStream = futures::stream::BoxStream<'static, std::io::Result<Vec<u8>>>;
+
+/// A file-backed upload body: its length and SHA-256, known before the PUT,
+/// and a fresh stream of it from its first byte for each server attempt.
+pub(crate) struct FileUploadBody {
+    pub(crate) len: u64,
+    pub(crate) digest: [u8; 32],
+    pub(crate) open: Box<dyn Fn() -> Result<FileUploadStream, AppError> + Send + Sync>,
+}
+
+/// Streams one file-backed body to `server`. Reports progress as twice the
+/// body length plus the bytes sent, after the stage and hash passes.
 pub(crate) async fn upload_blossom_file(
     server: &str,
-    file: &super::file_transfer::PrivateMediaFile,
+    file: &FileUploadBody,
     signer: &dyn MarmotNostrSigner,
     transport: &BlossomHttpTransport,
     control: std::sync::Arc<super::file_transfer::MediaFileTransferControl>,
 ) -> Result<String, AppError> {
     use futures::TryStreamExt;
     control.check()?;
-    let reader = tokio::fs::File::from_std(file.reader()?);
     let mut sent = 0u64;
     let total = file.len;
     let progress = control.clone();
     let (upload_progress, upload_observer) = tokio::sync::watch::channel(());
     let stream_progress = upload_progress.clone();
-    let stream = tokio_util::io::ReaderStream::with_capacity(
-        reader,
-        super::file_transfer::FILE_TRANSFER_BUFFER_BYTES,
-    )
-    .and_then(move |chunk| {
+    let stream = (file.open)()?.and_then(move |chunk| {
         sent = sent.saturating_add(chunk.len() as u64);
         let result = if progress.is_cancelled() {
             Err(std::io::Error::new(
