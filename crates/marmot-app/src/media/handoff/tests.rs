@@ -101,25 +101,56 @@ fn a_failed_release_stays_leased_for_a_retry() {
     assert_eq!(live_leases_under(directory.path()), 0);
 }
 
-/// A finished copy that never reached the host is discarded with its lease.
+thread_local! {
+    static DISCARDED_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Notes that a discard ran on this thread.
+pub(super) fn record_discard_thread() {
+    DISCARDED_HERE.with(|here| here.set(true));
+}
+
+/// A finished copy that never reached the host is discarded with its lease,
+/// on the runtime's blocking pool even when it is dropped on another thread
+/// (a host cancelling a finished call), never on the dropping thread.
 #[test]
-fn an_undelivered_copy_is_discarded() {
+fn an_undelivered_copy_is_discarded_on_the_blocking_pool() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .build()
+        .unwrap();
     let directory = tempfile::tempdir().unwrap();
     let lease = "44".repeat(16);
     let copy = directory.path().join(&lease);
     std::fs::create_dir_all(&copy).unwrap();
     std::fs::write(copy.join("left.bin"), b"plaintext").unwrap();
     lock_leases().insert(lease.clone(), copy.clone());
-    let pending = PendingHandoff(Some(AttachmentHandoff {
+    let handoff = AttachmentHandoff {
         lease: lease.clone(),
         path: copy.join("left.bin"),
         byte_count: 9,
         media_type: "application/octet-stream".into(),
         file_name: "left.bin".into(),
-    }));
-    drop(pending);
-    assert!(!copy.exists());
-    assert_eq!(live_leases_under(directory.path()), 0);
+    };
+    // Made on the blocking pool, as `open` does.
+    let pending = runtime
+        .block_on(runtime.spawn_blocking(move || PendingHandoff::new(handoff)))
+        .unwrap();
+    // Dropped on a plain host thread.
+    std::thread::spawn(move || {
+        drop(pending);
+        assert!(
+            !DISCARDED_HERE.with(std::cell::Cell::get),
+            "the dropping thread does no file I/O"
+        );
+    })
+    .join()
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while copy.exists() || live_leases_under(directory.path()) != 0 {
+        assert!(std::time::Instant::now() < deadline, "discarded");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// A write that fills the volume is the storage-full error, as a known

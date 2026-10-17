@@ -208,27 +208,51 @@ fn remove_lease(lease: &str) -> std::io::Result<()> {
 /// Best-effort removal for a copy nobody will release: the lease is
 /// forgotten even if deletion fails, so the next wipe reclaims the files.
 fn discard_lease(lease: &str) {
+    #[cfg(test)]
+    tests::record_discard_thread();
     if remove_lease(lease).is_err() {
         lock_leases().remove(lease);
     }
 }
 
 /// A finished copy that has not reached the host yet. Dropping it (the
-/// opening call was abandoned while the copy ran on the blocking pool)
-/// discards the copy; [`Self::deliver`] hands it over.
-pub(crate) struct PendingHandoff(Option<AttachmentHandoff>);
+/// opening call was abandoned) discards the copy; [`Self::deliver`] hands it
+/// over. A drop can happen on any thread (a host cancelling a finished call
+/// drops the stored result where it cancels), so the deletion is sent to
+/// the blocking pool of the runtime that made the copy.
+pub(crate) struct PendingHandoff {
+    handoff: Option<AttachmentHandoff>,
+    runtime: Option<tokio::runtime::Handle>,
+}
 
 impl PendingHandoff {
+    /// Wraps a registered copy made on the current runtime's blocking pool.
+    fn new(handoff: AttachmentHandoff) -> Self {
+        Self {
+            handoff: Some(handoff),
+            runtime: tokio::runtime::Handle::try_current().ok(),
+        }
+    }
+
     /// The host now holds the lease and must release it.
     pub(crate) fn deliver(mut self) -> AttachmentHandoff {
-        self.0.take().expect("a pending handoff is delivered once")
+        self.handoff
+            .take()
+            .expect("a pending handoff is delivered once")
     }
 }
 
 impl Drop for PendingHandoff {
     fn drop(&mut self) {
-        if let Some(handoff) = self.0.take() {
-            discard_lease(&handoff.lease);
+        let Some(handoff) = self.handoff.take() else {
+            return;
+        };
+        match &self.runtime {
+            Some(runtime) => {
+                runtime.spawn_blocking(move || discard_lease(&handoff.lease));
+            }
+            // Made outside a runtime: this thread is already a blocking one.
+            None => discard_lease(&handoff.lease),
         }
     }
 }
@@ -274,13 +298,13 @@ pub(crate) fn open(
     lock_leases().insert(lease.clone(), directory.clone());
     let path = directory.join(&source.file_name);
     match write_copy(app, account, storage, &source, &directory, &path, control) {
-        Ok(true) => Ok(Some(PendingHandoff(Some(AttachmentHandoff {
+        Ok(true) => Ok(Some(PendingHandoff::new(AttachmentHandoff {
             lease,
             path,
             byte_count: source.byte_count,
             media_type: source.media_type,
             file_name: source.file_name,
-        })))),
+        }))),
         Ok(false) => {
             discard_lease(&lease);
             Ok(None)

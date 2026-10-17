@@ -577,7 +577,7 @@ pub async fn open_attachment_handoff( &self, account_ref: String, group_id_hex: 
 
 Write a plaintext copy of one retained attachment for an OS surface that needs a real file (the Android package installer, the share sheet, "open with", Quick Look) and lend it under a lease. Use it only for those surfaces; in-app display and playback keep using `read_attachment_asset`. `None` means the attachment is not held locally, exactly as `attachment_local_assets` reports it; no download is started. The copy is `<account>/handoff/<lease>/<file_name>`, created owner-only, where `file_name` is the attachment's own name made safe (basename only, no separators, control characters or edge dots, at most 128 bytes) with an extension from the media type when it had none. It stays until `release_attachment_handoff`, account removal, or the account worker's next start in a new process; `shutdown_and_close` refuses new handoffs but keeps existing copies, and removing the attachment does not revoke a lease. Each call makes a separate copy. `control` reports copied bytes and cancels the copy, which then leaves nothing. A copy the disk cannot hold beyond the attachment policy's `disk_reserve` fails with `StorageFull`. Works for bodies in the media store and in the legacy database layout. See [the handoff contract](ATTACHMENT-ACCESS.md#handoff-leases).
 
-[Source](src/commands/attachment_access.rs#L70)
+[Source](src/commands/attachment_access.rs#L74)
 
 ### `Marmot::release_attachment_handoff`
 
@@ -587,7 +587,7 @@ pub async fn release_attachment_handoff(&self, lease: String) -> Result<(), Marm
 
 Delete a handoff copy once the OS surface is done with it (the installer or share activity returned, the controller was dismissed). Idempotent: an unknown or already released lease succeeds; a malformed one is rejected. Do not use the path afterwards.
 
-[Source](src/commands/attachment_access.rs#L87)
+[Source](src/commands/attachment_access.rs#L91)
 
 ### `AttachmentTransferSubscription::next`
 
