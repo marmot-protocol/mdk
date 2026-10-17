@@ -362,7 +362,7 @@ Answered 2026-10-17:
    explicit.
 3. **`AppClient` stops being public**, unless a strong reason appears.
 4. **Names:** `transport-nostr`, `marmot-components` and `marmot-observability` are agreed. The per-account runtime
-   crate is `marmot-session`, not `marmot-session`: `marmot-account` keeps identity, files and secrets, which
+   crate is `marmot-session`, not `marmot-device-runtime`: `marmot-account` keeps identity, files and secrets, which
    the bindings, CLI and agent use, and a plain `marmot-runtime` would sit beside `MarmotAppRuntime`, the Tokio
    runtimes and MarmotKit's runtime.
 5. **White Noise's deployment defaults move into configuration that hosts pass in**, and
