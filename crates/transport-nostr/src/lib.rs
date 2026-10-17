@@ -135,6 +135,10 @@ struct MarmotRelayPlaneInner {
     transport: Arc<RelayPlaneTransport>,
     directory: DirectoryRelayPlane,
     directory_subscription_sync: Mutex<()>,
+    /// One signer-bound publisher per account. Setup publishes and the managed
+    /// account worker share this client so the worker can reuse the same relay
+    /// pool instead of constructing another TCP/TLS/WebSocket stack.
+    account_publish_clients: std::sync::Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>,
 }
 
 struct RelayPlaneTransport {
@@ -1382,10 +1386,57 @@ impl MarmotRelayPlane {
                 transport,
                 directory: DirectoryRelayPlane::new(directory_fetcher),
                 directory_subscription_sync: Mutex::new(()),
+                account_publish_clients: std::sync::Mutex::new(HashMap::new()),
             }),
         };
         this.spawn_router();
         this
+    }
+
+    /// The account's signer-bound publish client, built on first use with the
+    /// plane's proxy-aware builder and shared by every later caller.
+    ///
+    /// The signer is ignored on a cache hit. A caller that replaces an
+    /// account's signer must call [`Self::evict_account_publish_client`]
+    /// first; registering an external signer and dropping an account's
+    /// caches do.
+    #[doc(hidden)]
+    pub fn account_publish_client(
+        &self,
+        account_id_hex: &str,
+        signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+    ) -> Arc<dyn NostrRelayClient> {
+        let mut clients = self
+            .inner
+            .account_publish_clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        clients
+            .entry(account_id_hex.to_owned())
+            .or_insert_with(|| {
+                let client = nostr_builder()
+                    .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
+                        transport_nostr_peeler::SdkSigner(signer.clone()),
+                    ))
+                    .build();
+                let account_id =
+                    MemberId::new(hex::decode(account_id_hex).expect("validated account identity"));
+                Arc::new(NostrSdkRelayClient::with_account_signer(
+                    client, account_id, signer,
+                ))
+            })
+            .clone()
+    }
+
+    /// Forgets the account's publish client, so the next
+    /// [`Self::account_publish_client`] builds one with the current signer.
+    #[doc(hidden)]
+    pub fn evict_account_publish_client(&self, account_id_hex: &str) {
+        self.inner
+            .account_publish_clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(account_id_hex);
     }
 
     /// Build an account adapter without durable queue-overflow recovery.

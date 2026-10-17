@@ -70,7 +70,7 @@ use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
     NostrAccountRelayListKind, NostrAccountRelayListPublication, NostrEventPublishRequest,
     NostrKeyPackagePublication, NostrKeyPackagePublisher, NostrNip65RelayListPublication,
-    NostrNip65RelaySet, NostrRelayClient, NostrSdkRelayClient, parse_nip65_relay_set,
+    NostrNip65RelaySet, NostrRelayClient, parse_nip65_relay_set,
 };
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
@@ -567,10 +567,6 @@ pub struct MarmotApp {
     product_analytics: ProductAnalytics,
     startup_diagnostics: startup_diagnostics::NativeStartupDiagnostics,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
-    /// One signer-bound publisher per account. Setup publishes and the managed
-    /// account worker share this client so the worker can reuse the same relay
-    /// pool instead of constructing another TCP/TLS/WebSocket stack.
-    account_publish_clients: Arc<Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>>,
     public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
     /// In-memory view of the persisted per-kind authoring floors; see
     /// `sign_replaceable_identity_event`.
@@ -1712,7 +1708,6 @@ impl MarmotApp {
             product_analytics,
             startup_diagnostics: Default::default(),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
-            account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1810,7 +1805,6 @@ impl MarmotApp {
             product_analytics,
             startup_diagnostics: Default::default(),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
-            account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -7241,10 +7235,8 @@ impl MarmotApp {
             .send(label.to_owned());
         if let Ok(account) = self.account_home().account(label) {
             let _ = self.abort_public_indexer_copies_for_account(&account.account_id_hex);
-            self.account_publish_clients
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&account.account_id_hex);
+            self.relay_plane
+                .evict_account_publish_client(&account.account_id_hex);
         }
         self.account_storages
             .lock()
@@ -7318,28 +7310,8 @@ impl MarmotApp {
         if let Some(client) = &self.test_relay_client {
             return client.clone();
         }
-        let mut clients = self
-            .account_publish_clients
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // The signer is intentionally ignored on a cache hit. Callers that
-        // replace an account signer must evict this entry first, as
-        // register_external_signer and drop_account_caches do today.
-        clients
-            .entry(account_id_hex.to_owned())
-            .or_insert_with(|| {
-                let client = network_proxy::nostr_builder()
-                    .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
-                        transport_nostr_peeler::SdkSigner(signer.clone()),
-                    ))
-                    .build();
-                let account_id =
-                    MemberId::new(hex::decode(account_id_hex).expect("validated account identity"));
-                Arc::new(NostrSdkRelayClient::with_account_signer(
-                    client, account_id, signer,
-                ))
-            })
-            .clone()
+        self.relay_plane
+            .account_publish_client(account_id_hex, signer)
     }
 
     #[cfg(test)]
@@ -7388,10 +7360,8 @@ impl MarmotApp {
             }
         }
         drop(signers);
-        self.account_publish_clients
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&account.account_id_hex);
+        self.relay_plane
+            .evict_account_publish_client(&account.account_id_hex);
         Ok(())
     }
 
