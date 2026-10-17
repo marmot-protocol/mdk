@@ -619,3 +619,49 @@ async fn an_abandoned_handoff_leaves_no_copy() {
     .expect("the abandoned copy and its lease are discarded");
     runtime.shutdown_and_close().await.unwrap();
 }
+
+/// A copy that finished while its opening call was not being polled (the
+/// result is stored, not yet collected) is discarded when that call is
+/// dropped, with its lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_but_uncollected_handoff_is_discarded() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    let body = vec![5u8; 4096];
+    seed(&store, &body);
+    let runtime = app.runtime();
+    let group = GroupId::new(vec![0xab; 16]);
+    let control = std::sync::Arc::new(crate::MediaFileTransferControl::default());
+    let mut opening =
+        Box::pin(runtime.open_attachment_handoff("alice", &group, target(), control.clone()));
+    assert!(futures::poll!(&mut opening).is_pending());
+    let handoffs = crate::media::handoff::handoff_directory(&app, "alice");
+    // The copy completes on the blocking pool while nobody polls the call.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while control.processed_bytes() < body.len() as u64 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        handoff_entries(&app),
+        1,
+        "the finished copy waits to be collected"
+    );
+    drop(opening);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while handoff_entries(&app) != 0 || crate::media::handoff::live_leases_under(&handoffs) != 0
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the uncollected copy and its lease are discarded");
+    runtime.shutdown_and_close().await.unwrap();
+}

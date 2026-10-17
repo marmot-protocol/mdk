@@ -564,11 +564,6 @@ Read 1..=1048576 bytes at an offset from an opaque local asset reference. Unavai
 
 [Source](src/commands/attachment_access.rs#L46)
 
-</details>
-
-<details>
-<summary>commands/attachment_controls.rs</summary>
-
 ### `Marmot::open_attachment_handoff`
 
 ```rust
@@ -588,6 +583,11 @@ pub async fn release_attachment_handoff(&self, lease: String) -> Result<(), Marm
 Delete a handoff copy once the OS surface is done with it (the installer or share activity returned, the controller was dismissed). Idempotent: an unknown or already released lease succeeds; a malformed one is rejected. Do not use the path afterwards.
 
 [Source](src/commands/attachment_access.rs#L91)
+
+</details>
+
+<details>
+<summary>commands/attachment_controls.rs</summary>
 
 ### `AttachmentTransferSubscription::next`
 

@@ -166,3 +166,38 @@ fn a_full_volume_during_the_copy_is_storage_full() {
         AppError::InvalidEncryptedMedia(_)
     ));
 }
+
+/// A discard whose runtime is gone before it runs forgets the lease, so the
+/// next wipe reclaims the copy rather than sparing it.
+#[test]
+fn a_discard_lost_with_its_runtime_leaves_the_copy_to_the_wipe() {
+    let directory = tempfile::tempdir().unwrap();
+    let lease = "55".repeat(16);
+    let copy = directory.path().join(&lease);
+    std::fs::create_dir_all(&copy).unwrap();
+    std::fs::write(copy.join("left.bin"), b"plaintext").unwrap();
+    lock_leases().insert(lease.clone(), copy.clone());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    let handoff = AttachmentHandoff {
+        lease: lease.clone(),
+        path: copy.join("left.bin"),
+        byte_count: 9,
+        media_type: "application/octet-stream".into(),
+        file_name: "left.bin".into(),
+    };
+    let pending = runtime
+        .block_on(runtime.spawn_blocking(move || PendingHandoff::new(handoff)))
+        .unwrap();
+    runtime.shutdown_background();
+    drop(pending);
+    assert_eq!(
+        live_leases_under(directory.path()),
+        0,
+        "an unrun discard does not leave the lease protected"
+    );
+    assert_eq!(wipe_stale(directory.path()), 1);
+    assert!(!copy.exists());
+}

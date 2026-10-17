@@ -36,6 +36,16 @@ it does not validate prose. Counts are reported by the tool rather than duplicat
 <details>
 <summary>marmot_a…</summary>
 
+### `marmot_attachment_handoff_free`
+
+```c
+void marmot_attachment_handoff_free(struct MarmotAttachmentHandoff *ptr);
+```
+
+Free a `MarmotAttachmentHandoff` record and its strings. This frees memory only: it does not release the lease or delete the copy; call `marmot_release_attachment_handoff` for that. NULL is a no-op.
+
+[Header contract](include/marmot.h#L6072)
+
 ### `marmot_attachment_local_asset_list_free`
 
 ```c
@@ -3102,6 +3112,16 @@ Return the initial snapshot. Free with marmot_onboarding_snapshot_free.
 
 [Header contract](include/marmot.h#L10903)
 
+### `marmot_open_attachment_handoff`
+
+```c
+MarmotStatus marmot_open_attachment_handoff(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const struct MarmotAttachmentLocalTarget *target, const struct MarmotMediaFileTransferControl *control, struct MarmotAttachmentHandoff **out);
+```
+
+Blocking handoff copy. Writes NULL with `MARMOT_STATUS_OK` when the attachment is not held locally, and `MARMOT_STATUS_STORAGE_FULL` when the disk cannot hold the copy beyond the reserve. Inputs are borrowed for the call; the control may be queried or cancelled from another thread. Free the record with `marmot_attachment_handoff_free`. See the [shared contract](../marmot-uniffi/API-REFERENCE.md#marmotopen_attachment_handoff).
+
+[Header contract](include/marmot.h#L6085)
+
 ### `marmot_open_presented_chat_list`
 
 ```c
@@ -3526,26 +3546,6 @@ MarmotStatus marmot_read_attachment_asset(const struct MarmotClient *client, con
 Read a bounded range (1..=1048576 bytes) from a local reference. No network fallback. Rechecks source visibility/expiry on every call. Offset at/beyond EOF returns available=true and empty bytes. An obsolete or wrong-account reference is unavailable. Free the result with `marmot_attachment_local_bytes_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotread_attachment_asset) · [Header contract](include/marmot.h#L6199)
-
-### `marmot_attachment_handoff_free`
-
-```c
-void marmot_attachment_handoff_free(struct MarmotAttachmentHandoff *ptr);
-```
-
-Free a `MarmotAttachmentHandoff` record and its strings. This frees memory only: it does not release the lease or delete the copy; call `marmot_release_attachment_handoff` for that. NULL is a no-op.
-
-[Header contract](include/marmot.h#L6072)
-
-### `marmot_open_attachment_handoff`
-
-```c
-MarmotStatus marmot_open_attachment_handoff(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, const struct MarmotAttachmentLocalTarget *target, const struct MarmotMediaFileTransferControl *control, struct MarmotAttachmentHandoff **out);
-```
-
-Blocking handoff copy. Writes NULL with `MARMOT_STATUS_OK` when the attachment is not held locally, and `MARMOT_STATUS_STORAGE_FULL` when the disk cannot hold the copy beyond the reserve. Inputs are borrowed for the call; the control may be queried or cancelled from another thread. Free the record with `marmot_attachment_handoff_free`. See the [shared contract](../marmot-uniffi/API-REFERENCE.md#marmotopen_attachment_handoff).
-
-[Header contract](include/marmot.h#L6085)
 
 ### `marmot_release_attachment_handoff`
 

@@ -249,10 +249,33 @@ impl Drop for PendingHandoff {
         };
         match &self.runtime {
             Some(runtime) => {
-                runtime.spawn_blocking(move || discard_lease(&handoff.lease));
+                let orphan = Orphan(Some(handoff.lease));
+                runtime.spawn_blocking(move || orphan.discard());
             }
             // Made outside a runtime: this thread is already a blocking one.
             None => discard_lease(&handoff.lease),
+        }
+    }
+}
+
+/// A discarded lease on its way to the blocking pool. If the task never
+/// runs (the runtime stopped or rejected it), dropping this forgets the
+/// lease without file I/O, so the next wipe reclaims the copy instead of
+/// sparing an unreachable lease.
+struct Orphan(Option<String>);
+
+impl Orphan {
+    fn discard(mut self) {
+        if let Some(lease) = self.0.take() {
+            discard_lease(&lease);
+        }
+    }
+}
+
+impl Drop for Orphan {
+    fn drop(&mut self) {
+        if let Some(lease) = self.0.take() {
+            lock_leases().remove(&lease);
         }
     }
 }
