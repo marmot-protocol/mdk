@@ -249,6 +249,7 @@ pub use media::file_transfer::{
     MAX_FILE_MEDIA_CIPHERTEXT_BYTES, MediaFileTransferControl, MediaFileUploadAttachmentRequest,
     MediaFileUploadRequest,
 };
+pub use media::handoff::AttachmentHandoff;
 pub use media::{
     DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS, ENCRYPTED_MEDIA_VERSION,
     EncryptedMediaVersion, MAX_ENCRYPTED_MEDIA_BLOB_BYTES, MAX_GROUP_IMAGE_BYTES,

@@ -81,6 +81,36 @@ or filesystem paths cross the ABI.
 
 Progress and controls are described below. C9 owns released-artifact integration and real-device measurements.
 
+## Handoff leases
+
+Some OS surfaces need a real plaintext file rather than offset reads: the Android package
+installer, the share sheet, "open with", and iOS Quick Look. For those, call
+`openAttachmentHandoff` with the same source slot as `attachmentLocalAssets`. MDK writes a
+private copy and lends it under a lease; `null` means the attachment is not held locally,
+and no download is started. Keep in-app display and playback on `readAttachmentAsset`.
+
+- **The file.** `path` is `<account>/handoff/<lease>/<fileName>`, created owner-only.
+  `fileName` is the attachment's own name made safe, with an extension from the media type
+  when it had none, so installers and share targets recognise it.
+- **Releasing.** Call `releaseAttachmentHandoff(lease)` when the surface is done: when the
+  installer or share activity returns on Android, or the controller is dismissed on iOS.
+  Release is idempotent. Do not use the path afterwards.
+- **What else deletes it.** Account removal, and the account worker's next start in a new
+  process, which removes copies no live lease holds. Suspending through
+  `shutdown_and_close` refuses new handoffs but keeps existing copies, so a share in
+  progress survives a suspend and resume. Removing the attachment does not revoke a lease.
+- **Copying.** `control` reports copied bytes and cancels; a cancelled or failed copy
+  leaves nothing. A copy the disk cannot hold beyond the policy's disk reserve fails with
+  `StorageFull`. Each call makes a separate copy.
+- **Exposing it.** On Android, serve the file through a `FileProvider` path for
+  `accounts/*/handoff/` and grant read access with a content URI, never the raw path. On
+  iOS, pass the file URL to `UIActivityViewController` or Quick Look. Exclude the account
+  directory from iCloud and Android auto-backup, as for `media/`.
+
+These copies are the only plaintext files MDK writes. C hosts use
+`marmot_open_attachment_handoff`, `marmot_release_attachment_handoff`, and
+`marmot_attachment_handoff_free` (which frees the record only, not the lease).
+
 ## Transfer progress and controls (C8-D2)
 
 `attachmentTransferSnapshot` and `subscribeAttachmentTransfers` accept the same bounded

@@ -53,6 +53,34 @@ impl From<Option<zeroize::Zeroizing<Vec<u8>>>> for AttachmentLocalBytesFfi {
         }
     }
 }
+/// A plaintext copy of a retained attachment lent to the host (a handoff
+/// lease). Pass `path` to the OS surface that needs a file, then call
+/// `release_attachment_handoff` with `lease` when it is done.
+#[derive(Clone, uniffi::Record)]
+pub struct AttachmentHandoffFfi {
+    /// Opaque lease id for `release_attachment_handoff`.
+    pub lease: String,
+    /// Absolute path of the private plaintext copy under the account's
+    /// `handoff/` directory. Valid until the lease is released.
+    pub path: String,
+    pub byte_count: u64,
+    pub media_type: String,
+    /// The file's name: the attachment's own name made safe, with an
+    /// extension from the media type when it had none.
+    pub file_name: String,
+}
+impl From<app::AttachmentHandoff> for AttachmentHandoffFfi {
+    fn from(v: app::AttachmentHandoff) -> Self {
+        Self {
+            lease: v.lease,
+            path: v.path.to_string_lossy().into_owned(),
+            byte_count: v.byte_count,
+            media_type: v.media_type,
+            file_name: v.file_name,
+        }
+    }
+}
+redact!(AttachmentHandoffFfi);
 redact!(AttachmentLocalTargetFfi);
 redact!(AttachmentLocalAssetFfi);
 redact!(AttachmentLocalBytesFfi);
