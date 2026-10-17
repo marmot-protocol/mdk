@@ -751,3 +751,77 @@ async fn staging_does_not_hold_an_account_transaction() {
     );
     crate::media::outgoing::release_outgoing_uploads(app.clone(), "alice".into(), tokens).await;
 }
+
+/// A send dropped while its body is still being staged (a caller timing out
+/// its upload) releases the reserved upload and its staged file once the
+/// staging task finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_dropped_during_staging_releases_its_upload() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::default().with_allow_loopback_blob_endpoints(true),
+    )
+    .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client
+        .create_group("generated dropped staging", &[])
+        .await
+        .unwrap();
+    let connection = fault_connection(&app);
+    let source_dir = tempfile::tempdir().unwrap();
+    let path = source_dir.path().join("generated.bin");
+    let len = 96 * 1024 * 1024u64;
+    std::fs::File::create(&path).unwrap().set_len(len).unwrap();
+    let control = Arc::new(crate::MediaFileTransferControl::default());
+    let request = crate::MediaFileUploadRequest {
+        attachments: vec![crate::MediaFileUploadAttachmentRequest {
+            source_path: path.to_string_lossy().into_owned(),
+            expected_size: Some(len),
+            file_name: "generated.bin".into(),
+            media_type: "application/octet-stream".into(),
+            dim: None,
+            thumbhash: None,
+        }],
+        caption: None,
+        send: false,
+        // Never reached: the send is dropped while staging.
+        blossom_server: Some("http://127.0.0.1:9".into()),
+        message_tags: Vec::new(),
+    };
+    let (http, _finish) = client
+        .prepare_encrypted_media_upload_payload(
+            &group,
+            crate::media::file_transfer::MediaUploadPayload::Files(request, control.clone()),
+        )
+        .await
+        .unwrap();
+    let send = tokio::spawn(http.run());
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while control.processed_bytes() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    send.abort();
+    assert!(send.await.unwrap_err().is_cancelled());
+    assert!(
+        control.processed_bytes() < len,
+        "the send was dropped while its body was staging"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while count(&connection, "outgoing_attachment_uploads") != 0
+            || media_files_on_disk(&app) != 0
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the dropped send's upload and staged file are released");
+    assert_eq!(count(&connection, "media_files"), 0);
+}

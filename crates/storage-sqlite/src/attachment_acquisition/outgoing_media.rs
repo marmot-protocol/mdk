@@ -18,8 +18,9 @@ use super::outgoing::{MAX_STAGED_UPLOADS, UPLOAD_TTL_SECONDS, staging_has_unfulf
 use super::*;
 use crate::media_catalog::{STATE_STAGED, attach_slot, catalog_error};
 
-/// A file-backed upload and one published message that owns it: what the
-/// worker promotes ([`SqliteAccountStorage::attachment_upload_promotion`]).
+/// A file-backed upload and one sent message that carries its descriptor:
+/// what the worker promotes
+/// ([`SqliteAccountStorage::attachment_upload_promotion`]).
 #[derive(Clone, PartialEq, Eq)]
 pub struct AttachmentUploadOwner {
     pub token: Vec<u8>,
@@ -104,10 +105,13 @@ impl SqliteAccountStorage {
         Ok(file.flatten().and_then(|id| FileId::from_slice(&id)))
     }
 
-    /// Up to `limit` file-backed uploads owned by a sent message of a
-    /// confirmed group, in `(token, group, message)` order after `after`.
-    /// The worker pages through them with its own cursor and promotes each;
-    /// the promotion target applies every other fence.
+    /// Up to `limit` (upload, message) pairs to promote: a file-backed,
+    /// bound upload and a visible slot of a sent message in a confirmed group
+    /// that carries its exact descriptor, in `(token, group, message)` order
+    /// after `after`. Found through the descriptor, not the owner rows, so an
+    /// upload whose optional owner registration failed still promotes. The
+    /// worker pages with its own cursor; the promotion target applies every
+    /// other fence.
     pub fn attachment_upload_owners(
         &self,
         after: Option<&AttachmentUploadOwner>,
@@ -123,14 +127,17 @@ impl SqliteAccountStorage {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
-                "SELECT o.token,o.group_id_hex,o.message_id_hex,u.file_id
-                 FROM outgoing_attachment_upload_owners o
-                 JOIN outgoing_attachment_uploads u ON u.token=o.token
-                 JOIN app_events a ON a.group_id_hex=o.group_id_hex AND a.message_id_hex=o.message_id_hex
-                 JOIN account_groups g ON g.group_id_hex=o.group_id_hex
-                 WHERE u.file_id IS NOT NULL AND a.direction='sent' AND g.pending_confirmation=0
-                 AND (o.token,o.group_id_hex,o.message_id_hex)>(?1,?2,?3)
-                 ORDER BY o.token,o.group_id_hex,o.message_id_hex LIMIT ?4",
+                "SELECT u.token,h.group_id_hex,h.message_id_hex,u.file_id
+                 FROM outgoing_attachment_uploads u
+                 JOIN attachment_history h ON h.group_id_hex=u.group_id_hex
+                     AND h.source_epoch=u.source_epoch AND h.slot_json=u.slot_json
+                 JOIN app_events a ON a.group_id_hex=h.group_id_hex AND a.message_id_hex=h.message_id_hex
+                 JOIN account_groups g ON g.group_id_hex=h.group_id_hex
+                 WHERE u.file_id IS NOT NULL AND h.visible=1 AND a.direction='sent'
+                 AND g.pending_confirmation=0
+                 AND (u.token,h.group_id_hex,h.message_id_hex)>(?1,?2,?3)
+                 GROUP BY u.token,h.group_id_hex,h.message_id_hex
+                 ORDER BY u.token,h.group_id_hex,h.message_id_hex LIMIT ?4",
             )
             .storage()?;
         let rows = stmt

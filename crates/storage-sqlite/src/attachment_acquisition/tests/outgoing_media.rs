@@ -333,22 +333,38 @@ fn protect(store: &SqliteAccountStorage, message: &str) {
         .unwrap();
 }
 
-/// The worker's promotion page lists a file-backed upload only once a sent
-/// message owns it, in token order, resuming after its cursor.
+/// The worker's promotion page lists a bound file-backed upload with each
+/// sent message carrying its descriptor, in token order, resuming after its
+/// cursor.
 #[test]
 fn owned_file_backed_uploads_are_paged_for_promotion() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteAccountStorage::in_memory().unwrap();
     let media = media(&dir, &store);
-    let (first, first_file) = staged_send(&store, &media, "first");
-    let (second, _) = staged_send(&store, &media, "second");
+    seed(&store, "unbound");
+    let unbound = store
+        .reserve_attachment_upload(GROUP, 3, 11)
+        .unwrap()
+        .unwrap();
+    media
+        .stage(
+            &store.attachment_upload_stage(&unbound),
+            Category::Retained,
+            &mut std::io::Cursor::new(BODY),
+            BODY.len() as u64,
+            11,
+            &|| false,
+        )
+        .unwrap();
     assert!(
         store.attachment_upload_owners(None, 8).unwrap().is_empty(),
-        "an unowned upload waits for its message"
+        "an upload not yet bound to a descriptor is never promoted"
     );
-    protect(&store, "first");
-    protect(&store, "second");
-    // The fixture's sends share one descriptor, so each message owns both
+    // Bound uploads are found through the sent message's descriptor, with or
+    // without owner rows.
+    let (first, first_file) = staged_send(&store, &media, "first");
+    let (second, _) = staged_send(&store, &media, "second");
+    // The fixture's sends share one descriptor, so each message carries both
     // uploads: four (upload, message) pairs.
     let all = store.attachment_upload_owners(None, 8).unwrap();
     let key =
@@ -407,4 +423,115 @@ fn an_upload_with_a_lost_file_is_dropped() {
             .unwrap(),
         "the slot no longer waits for an upload"
     );
+}
+
+/// A file-backed upload whose optional owner registration failed survives
+/// both abandonment paths while its pending or confirmed message carries it,
+/// and the worker's page still finds and promotes it after a reopen.
+#[test]
+fn ownerless_file_backed_uploads_survive_abandonment_and_promote() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ownerless.sqlite");
+    let key = SqlCipherKey::new("generated-ownerless-key").unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let files = media(&dir, &store);
+    seed(&store, "seed");
+    for (id, pending) in [("pending-ownerless", true), ("confirmed-ownerless", false)] {
+        let mut event = source(id);
+        event.direction = "sent".into();
+        if pending {
+            event.source_message_id_hex = None;
+            event.source_epoch = None;
+        }
+        store.record_app_event(&event).unwrap();
+        let token = store
+            .reserve_attachment_upload(GROUP, 3, 11)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            files
+                .stage(
+                    &store.attachment_upload_stage(&token),
+                    Category::Retained,
+                    &mut std::io::Cursor::new(BODY),
+                    BODY.len() as u64,
+                    11,
+                    &|| false,
+                )
+                .unwrap(),
+            StageOutcome::Staged { .. }
+        ));
+        store
+            .bind_attachment_uploads(
+                std::slice::from_ref(&token),
+                &[(selected(id).slot, digest())],
+            )
+            .unwrap();
+        sql(
+            &store,
+            "CREATE TRIGGER fail_owner BEFORE INSERT ON outgoing_attachment_upload_owners BEGIN SELECT RAISE(ABORT,'generated owner fault'); END;",
+        );
+        assert!(
+            store
+                .protect_attachment_uploads(GROUP, id, &event.tags)
+                .is_err()
+        );
+        sql(&store, "DROP TRIGGER fail_owner");
+        store.abandon_attachment_uploads(&[token]).unwrap();
+        store
+            .abandon_bound_attachment_uploads(GROUP, &[selected(id).slot])
+            .unwrap();
+    }
+    let staged: i64 = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM outgoing_attachment_uploads WHERE file_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(staged, 2, "both uploads survive abandonment");
+    drop(files);
+    store.close().unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let files = media(&dir, &store);
+    let mut event = source("pending-ownerless");
+    event.direction = "sent".into();
+    store.record_app_event(&event).unwrap();
+    let mut promoted = 0;
+    for owner in store.attachment_upload_owners(None, 8).unwrap() {
+        let target = store.attachment_upload_promotion(
+            &owner.group_id_hex,
+            &owner.message_id_hex,
+            &owner.token,
+            || 20,
+        );
+        if matches!(
+            files.promote(&target, owner.file).unwrap(),
+            PromoteOutcome::Ready | PromoteOutcome::Existing(_)
+        ) {
+            promoted += 1;
+        }
+    }
+    assert!(promoted > 0);
+    for id in ["pending-ownerless", "confirmed-ownerless"] {
+        let asset = request(&store, id);
+        let file: Vec<u8> = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT file_id FROM media_file_refs WHERE token=?1",
+                [&asset.token],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut reader = files
+            .open_reader(&media_store::FileId::from_slice(&file).unwrap())
+            .unwrap()
+            .unwrap();
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut body).unwrap();
+        assert_eq!(body, BODY, "{id}");
+    }
 }

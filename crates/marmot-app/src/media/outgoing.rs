@@ -599,9 +599,20 @@ impl OutgoingUploads {
         }
     }
 
-    /// Records uploads reserved for this send.
-    pub(crate) fn extend(&mut self, tokens: Vec<Vec<u8>>) {
-        self.tokens.extend(tokens);
+    /// An empty guard for the same account, to move into a blocking task that
+    /// reserves uploads. If its result is never awaited, dropping it releases
+    /// what it reserved.
+    pub(crate) fn handoff(&self) -> Self {
+        Self::new(self.app.clone(), self.account.clone())
+    }
+
+    /// Takes over the uploads `other` reserved.
+    pub(crate) fn absorb(&mut self, mut other: Self) {
+        self.tokens.append(&mut other.tokens);
+    }
+
+    pub(crate) fn tokens_mut(&mut self) -> &mut Vec<Vec<u8>> {
+        &mut self.tokens
     }
 
     pub(crate) fn tokens(&self) -> &[Vec<u8>] {

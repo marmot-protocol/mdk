@@ -290,20 +290,23 @@ impl EncryptedMediaUploadHttp {
                     })
                     .collect::<Result<Vec<_>, AppError>>()?;
                 let (stage, stage_control) = (staging.clone(), control.clone());
-                let (tokens, sources) = tokio::task::spawn_blocking(move || {
-                    let mut tokens = Vec::new();
+                // The blocking task owns the reservations it makes until this
+                // await hands them back; if this future is dropped first, the
+                // task's result drops and releases them.
+                let mut staged = uploads.handoff();
+                let (staged, sources) = tokio::task::spawn_blocking(move || {
                     let sources = stage_file_sources(
                         &stage,
-                        &mut tokens,
+                        staged.tokens_mut(),
                         request.attachments,
                         descriptors,
                         stage_control,
                     );
-                    (tokens, sources)
+                    (staged, sources)
                 })
                 .await
                 .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
-                uploads.extend(tokens);
+                uploads.absorb(staged);
                 crate::media::outgoing::upload_staged(
                     staging.media(),
                     sources?,
@@ -320,12 +323,12 @@ impl EncryptedMediaUploadHttp {
             crate::media::file_transfer::MediaUploadPayload::Bytes(request) => {
                 crate::media::validate_media_upload_batch(&request.attachments)?;
                 let stage = staging.clone();
-                let (request, tokens, staged) = tokio::task::spawn_blocking(move || {
-                    let mut tokens = Vec::new();
+                let mut reserved = uploads.handoff();
+                let (request, reserved, staged) = tokio::task::spawn_blocking(move || {
                     let staged = request.attachments.iter().try_for_each(|attachment| {
                         let len = attachment.plaintext.len() as u64;
                         stage
-                            .stage(&mut tokens, len, |media, target| {
+                            .stage(reserved.tokens_mut(), len, |media, target| {
                                 crate::media::outgoing::stage_body(
                                     media,
                                     target,
@@ -336,11 +339,11 @@ impl EncryptedMediaUploadHttp {
                             })
                             .map(|_| ())
                     });
-                    (request, tokens, staged)
+                    (request, reserved, staged)
                 })
                 .await
                 .map_err(|_| AppError::BlockingTask("media staging failed".into()))?;
-                uploads.extend(tokens);
+                uploads.absorb(reserved);
                 staged?;
                 upload_encrypted_media(
                     request,
@@ -5173,8 +5176,8 @@ impl AppClient {
         )
     }
 
-    /// Upload independently of optional retention; local staging happens only
-    /// after PUT succeeds and cannot reject a send under quota or disk pressure.
+    /// Stage every body in the media store, upload, then send. A body the
+    /// disk cannot hold fails with the storage-full error before any upload.
     pub async fn upload_media(
         &mut self,
         group_id: &GroupId,
