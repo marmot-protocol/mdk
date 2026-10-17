@@ -50,8 +50,8 @@ sides' tables.
 Every module adds inherent methods to one type, `SqliteAccountStorage` (`connection.rs:1050`), whose
 `connection` and `openmls` fields are `pub(crate)` (`connection.rs:1050-1057`). It has 387 `pub` inherent methods,
 not counting six feature-gated ones: 17 in protocol or base modules and 370 app or transport. `marmot-app` calls
-about 318 of them (name-match count, hypothesis), through the concrete type: there is no app-side trait. So protocol code reaches app code by method
-call, not by path. `forget_group_local_data`, `accept_local_submission_tx` and `notify_message_draft_committed` are
+about 318 of them (name-match count, hypothesis), through the concrete type: there is no app-side trait. So
+protocol code reaches app code by method call, not by path. `forget_group_local_data`, `accept_local_submission_tx` and `notify_message_draft_committed` are
 examples. Moving files into `protocol/` and `app/` alone would not stop any of those calls (hypothesis, but it
 follows from Rust's visibility rules: an inherent `pub` method is callable from anywhere the type is).
 
