@@ -11,8 +11,9 @@ status: proposed, needs approval before implementation
 Step 4 of the [core structure plan](core-structure.md#5-sequencing). It splits `storage-sqlite` into a protocol side
 and an app side inside the crate, defined by which side owns each table, so the later split into a protocol store and
 an app store (step 8) is a review of a boundary that already holds, not an excavation. No behaviour or schema change.
-Counts and `path:line` citations are at master `e9ecb12e0`; the crate is unchanged at `4e0c486f0`. Following the
-[review's evidence rules](README.md#evidence-rules), statements are observed in source unless marked (hypothesis).
+Counts and `path:line` citations, including those in other crates, are at master `e9ecb12e0`. Master has moved since
+(#2380 adds migration 0113, for example); the allow-list PR 2 generates, not these numbers, is the record. Following
+the [review's evidence rules](README.md#evidence-rules), statements are observed in source unless marked (hypothesis).
 
 Product-owner decisions this brief assumes (2026-10-17): one database file per account-device stays, unless a strong
 reason to split appears; each crate is a black box with a clean interface, and nothing reaches into another crate's
@@ -157,10 +158,13 @@ Each PR is green on its own and changes no behaviour or schema.
    diff is large), deleting its allow-list lines as it goes. Switch the plain transactions to
    `SharedConnection::with_transaction`. Write `cross/README.md` for the schema-level kinds. When this is done, the
    allow-list holds only the schema links and the migration 9 reconcile.
-4. **The app handle type**, in mechanical slices: introduce `SqliteAppStorage` over the account's connection, move
-   the app and transport methods to it a folder at a time, and repoint `marmot-app` and `cgka-session`'s draft
-   observer. The names test adds two checks: protocol production code never names `SqliteAppStorage`, and app
-   production code outside `cross/` never calls the protocol traits; tests may hold both handles.
+4. **The app handle type**, in mechanical slices: introduce `SqliteAppStorage` over the account's connection, move the
+   app and transport methods to it a folder at a time, and repoint the callers the compiler finds, `marmot-app` above
+   all. The draft-commit observer is the exception: `cgka-session` installs it on the engine's storage (`cgka-session`
+   `lib.rs:490-495`) and the confirm path fires it on that same value (`storage/outbound.rs:60`), so its slot and setter
+   stay on `SqliteAccountStorage`, in `cross/`. It is `cgka-session`'s only app-side call on that storage. The names
+   test adds two checks: protocol production code never names `SqliteAppStorage`, and app production code outside
+   `cross/` never calls the protocol traits; tests may hold both handles.
 5. **Tracing targets.** Rename the hard-coded targets (20 today, 3 of them in test files) to the new module paths in
    one PR, and update the docs and simulator filters that match them.
 
@@ -176,7 +180,7 @@ PR 4) have landed.
 - Each PR on its own: `cargo test -p storage-sqlite`, including the migration assurance, upgrade-fixture and
   snapshot tests; `cargo test -p cgka-engine` (its 36 test files use this crate); `cargo test -p marmot-app`;
   `just simulator-smoke`.
-- No schema change: the migration count stays 112, and a fresh database's `sqlite_master` and its
+- No schema change: the migration count does not change, and a fresh database's `sqlite_master` and its
   `cgka_schema_migrations` `(version, name)` rows, ordered by version, are identical before and after (add a test
   that compares them). The ledger's `applied_at_unix_seconds` column (`migrations.rs:1010-1013`) records when each
   migration ran, so it is left out of the comparison.
