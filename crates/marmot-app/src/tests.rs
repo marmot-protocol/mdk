@@ -546,7 +546,7 @@ pub(crate) struct ScriptedPushRelayClient {
 
 #[derive(Default)]
 pub(crate) struct MemberResolutionDirectoryFetcher {
-    pub(crate) requests: std::sync::Mutex<Vec<crate::relay_plane::DirectoryFetchRequest>>,
+    pub(crate) requests: std::sync::Mutex<Vec<transport_nostr::DirectoryFetchRequest>>,
     events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     events_by_endpoint:
         std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
@@ -598,11 +598,11 @@ impl MemberResolutionDirectoryFetcher {
 }
 
 #[async_trait]
-impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher {
+impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher {
     async fn fetch_directory_events(
         &self,
-        request: crate::relay_plane::DirectoryFetchRequest,
-    ) -> Result<Vec<crate::relay_plane::DirectoryRelayEventRecord>, String> {
+        request: transport_nostr::DirectoryFetchRequest,
+    ) -> Result<Vec<transport_nostr::DirectoryRelayEventRecord>, String> {
         self.requests.lock().unwrap().push(request.clone());
         let gate = {
             let mut fetch_gate = self.fetch_gate.lock().unwrap();
@@ -687,7 +687,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
                 .unwrap()
                 .iter()
                 .filter(|event| matches_query(event))
-                .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
+                .map(|event| transport_nostr::DirectoryRelayEventRecord {
                     endpoints: request.endpoints.clone(),
                     event: event.clone(),
                 })
@@ -702,7 +702,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
                     .into_iter()
                     .flatten()
                     .filter(|event| matches_query(event))
-                    .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
+                    .map(|event| transport_nostr::DirectoryRelayEventRecord {
                         endpoints: vec![endpoint.clone()],
                         event: event.clone(),
                     })
@@ -712,15 +712,15 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
 
     async fn fetch_directory_events_with_completion(
         &self,
-        request: crate::relay_plane::DirectoryFetchRequest,
-    ) -> Result<crate::relay_plane::DirectoryFetchOutcome, String> {
+        request: transport_nostr::DirectoryFetchRequest,
+    ) -> Result<transport_nostr::DirectoryFetchOutcome, String> {
         if self
             .reject_multi_author_incomplete
             .load(std::sync::atomic::Ordering::SeqCst)
             && request.queries.iter().any(|query| query.authors.len() > 1)
         {
             self.requests.lock().unwrap().push(request);
-            return Ok(crate::relay_plane::DirectoryFetchOutcome::default());
+            return Ok(transport_nostr::DirectoryFetchOutcome::default());
         }
         let incomplete_kind = *self.incomplete_query_kind.lock().unwrap();
         let complete = !self
@@ -748,7 +748,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
                 .cmp(&a.event.created_at)
                 .then_with(|| b.event.id.cmp(&a.event.id))
         });
-        let mut retained = Vec::<crate::relay_plane::DirectoryRelayEventRecord>::new();
+        let mut retained = Vec::<transport_nostr::DirectoryRelayEventRecord>::new();
         let mut complete = complete;
         for endpoint in &endpoints {
             for query in &queries {
@@ -769,7 +769,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
                             existing.endpoints.push(endpoint.clone());
                         }
                     } else {
-                        retained.push(crate::relay_plane::DirectoryRelayEventRecord {
+                        retained.push(transport_nostr::DirectoryRelayEventRecord {
                             endpoints: vec![endpoint.clone()],
                             event: record.event.clone(),
                         });
@@ -777,7 +777,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
                 }
             }
         }
-        Ok(crate::relay_plane::DirectoryFetchOutcome {
+        Ok(transport_nostr::DirectoryFetchOutcome {
             records: retained,
             complete,
         })
@@ -1038,11 +1038,11 @@ impl ScriptedPushRelayClient {
 // Directory reads must use the same simulated relay publications as writes;
 // invitation tests can no longer rely on a local KeyPackage cache shortcut.
 #[async_trait]
-impl crate::relay_plane::DirectoryRelayFetcher for ScriptedPushRelayClient {
+impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
     async fn fetch_directory_events(
         &self,
-        request: crate::relay_plane::DirectoryFetchRequest,
-    ) -> Result<Vec<crate::relay_plane::DirectoryRelayEventRecord>, String> {
+        request: transport_nostr::DirectoryFetchRequest,
+    ) -> Result<Vec<transport_nostr::DirectoryRelayEventRecord>, String> {
         Ok(self
             .published_events
             .lock()
@@ -1050,7 +1050,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for ScriptedPushRelayClient {
             .iter()
             .filter(|event| request.queries.iter().any(|query| query.matches(event)))
             .cloned()
-            .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
+            .map(|event| transport_nostr::DirectoryRelayEventRecord {
                 endpoints: request.endpoints.clone(),
                 event,
             })
@@ -10120,11 +10120,11 @@ fn newer_all_read_nip65_list_clears_stale_write_targets() {
     let status = relay_list_status_from_records(
         &account_id,
         vec![
-            crate::relay_plane::DirectoryRelayEventRecord {
+            transport_nostr::DirectoryRelayEventRecord {
                 endpoints: vec![TransportEndpoint("wss://source.example".into())],
                 event: newer,
             },
-            crate::relay_plane::DirectoryRelayEventRecord {
+            transport_nostr::DirectoryRelayEventRecord {
                 endpoints: vec![TransportEndpoint("wss://source.example".into())],
                 event: older,
             },
@@ -10156,7 +10156,7 @@ fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
             String::new(),
         );
         event.created_at = created_at;
-        crate::relay_plane::DirectoryRelayEventRecord {
+        transport_nostr::DirectoryRelayEventRecord {
             endpoints: vec![TransportEndpoint("wss://source.example".into())],
             event,
         }
@@ -10210,7 +10210,7 @@ fn stale_live_relay_list_events_do_not_replace_newer_cached_lists() {
                 String::new(),
             );
             event.created_at = created_at;
-            crate::relay_plane::DirectoryRelayEventRecord {
+            transport_nostr::DirectoryRelayEventRecord {
                 endpoints: vec![TransportEndpoint("wss://source.example".into())],
                 event,
             }
@@ -10252,7 +10252,7 @@ fn zero_timestamp_relay_list_event_populates_legacy_empty_state() {
     );
     event.created_at = 0;
 
-    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+    app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
         endpoints: vec![TransportEndpoint("wss://source.example".into())],
         event,
     })
@@ -10792,7 +10792,7 @@ fn same_second_multiline_bio_does_not_replace_cached_single_line_bio() {
                 serde_json::json!({ "name": "bob", "about": "one\ntwo" }).to_string(),
             );
             event.created_at = created_at;
-            app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+            app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
                 endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
                 event,
             })
@@ -10950,7 +10950,7 @@ fn directory_entry_reconciles_nostr_components_independently() {
         String::new(),
     );
     stale_event.created_at = 15;
-    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+    app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
         event: stale_event,
         endpoints: vec![TransportEndpoint("wss://source.example".into())],
     })
@@ -11692,7 +11692,7 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
     let follows = (0..total_follows)
         .map(|index| format!("{:064x}", index + 1000))
         .collect::<Vec<_>>();
-    let record = crate::relay_plane::DirectoryRelayEventRecord {
+    let record = transport_nostr::DirectoryRelayEventRecord {
         endpoints: vec![TransportEndpoint("wss://relay.example".to_owned())],
         event: contact_list_event(&author, &follows),
     };
@@ -11771,7 +11771,7 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
         .to_string(),
     );
     event.created_at = 1_700_000_867;
-    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+    app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
         endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
         event,
     })
@@ -11873,7 +11873,7 @@ fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
         .to_string(),
     );
     event.created_at = 1_700_000_868;
-    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+    app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
         endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
         event,
     })
@@ -12432,7 +12432,7 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
             app.relay_plane
                 .disable_account_delivery_spill_for_test(client.adapter.account_id())
         );
-        const HISTORY: usize = crate::relay_plane::ACCOUNT_DELIVERY_BUFFER + 16;
+        const HISTORY: usize = transport_nostr::ACCOUNT_DELIVERY_BUFFER + 16;
         for index in 0..HISTORY {
             let event = epoch_gap_probe(
                 &group.nostr_routing.nostr_group_id_hex,
@@ -12446,7 +12446,7 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
             loop {
                 let health = app.relay_plane.relay_health().await;
                 if health.account_delivery_dropped
-                    >= (HISTORY - crate::relay_plane::ACCOUNT_DELIVERY_BUFFER) as u64
+                    >= (HISTORY - transport_nostr::ACCOUNT_DELIVERY_BUFFER) as u64
                 {
                     break;
                 }
@@ -12466,7 +12466,7 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
                     .unwrap();
                 if watermarks.len() == 1
                     && watermarks[0].observed_count
-                        == (HISTORY - crate::relay_plane::ACCOUNT_DELIVERY_BUFFER) as u64
+                        == (HISTORY - transport_nostr::ACCOUNT_DELIVERY_BUFFER) as u64
                 {
                     break;
                 }
@@ -12739,7 +12739,7 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
         }
         app.save_state(&client.state).unwrap();
         let mut expected = Vec::new();
-        for index in 0..crate::relay_plane::ACCOUNT_DELIVERY_BUFFER + NEW {
+        for index in 0..transport_nostr::ACCOUNT_DELIVERY_BUFFER + NEW {
             let event = probe(index);
             expected.push(event.id.clone());
             inject_epoch_gap_probe(&app, event).await;
@@ -12784,7 +12784,7 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
         // would. The in-memory queue is gone; the durable spill is not.
         for _ in 0..4 {
             let received = client.receive_next_delivery().await.unwrap();
-            let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+            let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
                 panic!("a spill never creates a loss generation");
             };
             client.ingest_received_delivery(*delivery).await.unwrap();
@@ -12802,7 +12802,7 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
                     .await
                     .expect("spilled rows are admitted after reopen")
                     .unwrap();
-            let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+            let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
                 panic!("a spill never creates a loss generation");
             };
             client.ingest_received_delivery(*delivery).await.unwrap();
@@ -12816,7 +12816,7 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
         );
         // The queue kept the oldest injections; every later one was spilled.
         let receipts = client.transport_receipts().unwrap();
-        for id in &expected[crate::relay_plane::ACCOUNT_DELIVERY_BUFFER..] {
+        for id in &expected[transport_nostr::ACCOUNT_DELIVERY_BUFFER..] {
             assert!(receipts.contains(id), "a spilled delivery was admitted");
         }
         assert!(!client.delivery_overflow_recovery_pending);
@@ -12858,11 +12858,11 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         let release = release_marker.clone();
         let attempts = marker_attempts.clone();
         let storage = app.account_storage("alice").unwrap();
-        let marker: crate::relay_plane::AccountDeliveryRecoveryMarker =
+        let marker: transport_nostr::AccountDeliveryRecoveryMarker =
             Arc::new(move |marker_token, dropped, _| {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if !release.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err(crate::relay_plane::AccountDeliveryRecoveryMarkerError::Retryable);
+                    return Err(transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable);
                 }
                 storage
                     .record_account_delivery_loss(
@@ -12873,9 +12873,9 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
                     )
                     .map_err(|error| {
                         if error.is_closed() {
-                            crate::relay_plane::AccountDeliveryRecoveryMarkerError::Closed
+                            transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
                         } else {
-                            crate::relay_plane::AccountDeliveryRecoveryMarkerError::Retryable
+                            transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
                         }
                     })
             });
@@ -12904,7 +12904,7 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
             )
             .await;
             let received = client.receive_next_delivery().await.unwrap();
-            let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+            let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
                 panic!("the pre-overflow delivery must not produce a control record");
             };
             client
@@ -12919,9 +12919,9 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
 
         let newest = cursor_before + 2_000;
         let mut omitted_timestamp = 0;
-        for index in 0..=crate::relay_plane::ACCOUNT_DELIVERY_BUFFER {
+        for index in 0..=transport_nostr::ACCOUNT_DELIVERY_BUFFER {
             let created_at = newest.saturating_sub(index as u64);
-            if index == crate::relay_plane::ACCOUNT_DELIVERY_BUFFER {
+            if index == transport_nostr::ACCOUNT_DELIVERY_BUFFER {
                 omitted_timestamp = created_at;
             }
             inject_epoch_gap_probe(
@@ -12943,7 +12943,7 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         .expect("overflow must start its one marker worker");
 
         let received = client.receive_next_delivery().await.unwrap();
-        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+        let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
             panic!("the retained newest-first prefix must precede the overflow signal");
         };
         client
@@ -13256,7 +13256,7 @@ impl LiveCursorFixture {
                 .await
                 .expect("a delivery is ready")
                 .unwrap();
-        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+        let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
             panic!("a live delivery must not produce a control record");
         };
         let event_id = hex::encode(delivery.message.id.as_slice());
@@ -13316,7 +13316,7 @@ fn live_ingest_keeps_the_cursor_until_every_subscription_replayed_stored_history
         )
         .await;
         let received = client.receive_next_delivery().await.unwrap();
-        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+        let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
             panic!("a live delivery must not produce a control record");
         };
         client.ingest_received_delivery(*delivery).await.unwrap();
@@ -13540,9 +13540,9 @@ fn live_ingest_keeps_the_cursor_behind_a_queue_omission_after_replay() {
         );
         let marker_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts = marker_attempts.clone();
-        let marker: crate::relay_plane::AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _| {
+        let marker: transport_nostr::AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _| {
             attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(crate::relay_plane::AccountDeliveryRecoveryMarkerError::Retryable)
+            Err(transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable)
         });
         assert!(
             fixture
@@ -13550,7 +13550,7 @@ fn live_ingest_keeps_the_cursor_behind_a_queue_omission_after_replay() {
                 .relay_plane
                 .set_account_delivery_recovery_marker_for_test(&fixture.account_id, marker)
         );
-        for index in 0..=crate::relay_plane::ACCOUNT_DELIVERY_BUFFER {
+        for index in 0..=transport_nostr::ACCOUNT_DELIVERY_BUFFER {
             inject_epoch_gap_probe(
                 &fixture.app,
                 fixture.probe(
@@ -17336,7 +17336,7 @@ async fn a_deferred_open_never_subscribes_a_departed_groups_route() {
         .await
         .expect("the removal commit must fan out to bob's group route")
         .unwrap();
-    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+    let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
         panic!("the test did not overflow its account delivery queue");
     };
     bob_client
@@ -17600,7 +17600,7 @@ async fn an_admin_removal_clears_the_removed_devices_group_routes() {
         .await
         .expect("the removal commit must fan out to bob's group route")
         .unwrap();
-    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+    let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
         panic!("the test did not overflow its account delivery queue");
     };
     bob_client
@@ -17749,7 +17749,7 @@ async fn a_routing_rebuild_after_a_removal_does_not_resubscribe_the_removed_grou
         .await
         .expect("the removal commit must fan out to bob's group route")
         .unwrap();
-    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+    let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
         panic!("the test did not overflow its account delivery queue");
     };
     bob_client
@@ -17854,7 +17854,7 @@ async fn a_removed_device_fails_a_composer_send_before_projecting_a_row() {
         .await
         .expect("the removal commit must fan out to bob's group route")
         .unwrap();
-    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+    let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
         panic!("the test did not overflow its account delivery queue");
     };
     bob_client
@@ -20140,7 +20140,7 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
         .await
         .expect("locally fanned-out application message")
         .unwrap();
-    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = delivery else {
+    let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = delivery else {
         panic!("the test did not overflow its account delivery queue");
     };
     let delivery = *delivery;
@@ -20219,7 +20219,7 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
                 .await
                 .expect("redelivered application message")
                 .unwrap();
-        let crate::relay_plane::AccountDeliveryReceive::Delivery(redelivery) = redelivery else {
+        let transport_nostr::AccountDeliveryReceive::Delivery(redelivery) = redelivery else {
             panic!("the test did not overflow its account delivery queue");
         };
         let redelivery = *redelivery;
@@ -22654,8 +22654,7 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                         .await
                         .unwrap()
                         .unwrap();
-                        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) =
-                            received
+                        let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received
                         else {
                             panic!("unexpected overflow")
                         };
@@ -24454,7 +24453,7 @@ fn group_create_relay_options_preserve_defaults_and_enforce_host_safety() {
         vec![],
         vec!["ws://127.0.0.1:1234".into()],
         vec!["wss://192.168.1.1".into()],
-        crate::relay_plane::retired_relay_hosts()
+        transport_nostr::retired_relay_hosts()
             .into_iter()
             .map(|host| format!("wss://{host}"))
             .collect(),

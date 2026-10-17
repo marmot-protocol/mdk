@@ -1,10 +1,10 @@
 //! Account-private block policy and NIP-51 synchronization.
-use crate::relay_plane::DirectoryEventQuery;
 use crate::{AppError, MarmotApp};
 use cgka_traits::{TransportEndpoint, TransportEndpointFailureKind};
 use nostr::prelude::{EventBuilder, FinalizeEventAsync, Kind, PublicKey, Tag, Timestamp};
 use std::sync::Arc;
 use storage_sqlite::{PendingBlockPublication, StoredBlockList};
+use transport_nostr::DirectoryEventQuery;
 use transport_nostr_peeler::{NostrTransportEvent, SdkSigner};
 
 pub use storage_sqlite::{BlockListSnapshot, BlockedUser};

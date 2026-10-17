@@ -13,8 +13,8 @@ use storage_sqlite::SpilledDelivery;
 
 use super::AppClient;
 use crate::AppError;
-use crate::relay_plane::AccountDeliveryReceive;
 use crate::unix_now_seconds;
+use transport_nostr::AccountDeliveryReceive;
 
 /// Durable spill bounds for one account database.
 pub(crate) const ACCOUNT_DELIVERY_SPILL_LIMITS: storage_sqlite::DeliverySpillLimits =
@@ -26,9 +26,9 @@ pub(crate) const ACCOUNT_DELIVERY_SPILL_LIMITS: storage_sqlite::DeliverySpillLim
 /// The relay plane's view of what the store did with one spilled delivery.
 pub(crate) fn plane_spill_disposition(
     disposition: storage_sqlite::DeliverySpillDisposition,
-) -> crate::relay_plane::DeliverySpillDisposition {
-    use crate::relay_plane::DeliverySpillDisposition as Plane;
+) -> transport_nostr::DeliverySpillDisposition {
     use storage_sqlite::DeliverySpillDisposition as Stored;
+    use transport_nostr::DeliverySpillDisposition as Plane;
     match disposition {
         Stored::Stored => Plane::Stored,
         Stored::AlreadySeen => Plane::AlreadySeen,
@@ -295,9 +295,9 @@ mod tests {
 
     use super::ACCOUNT_DELIVERY_SPILL_LIMITS;
     use super::SPILL_MAX_ATTEMPTS;
-    use crate::relay_plane::MarmotRelayPlane;
     use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
     use crate::{MarmotApp, unix_now_seconds};
+    use transport_nostr::MarmotRelayPlane;
 
     fn delivery(id: u8) -> TransportDelivery {
         TransportDelivery {
@@ -549,7 +549,7 @@ mod tests {
         }
         assert!(matches!(
             received,
-            Some(crate::relay_plane::AccountDeliveryReceive::Delivery(d)) if *d == delivery(5)
+            Some(transport_nostr::AccountDeliveryReceive::Delivery(d)) if *d == delivery(5)
         ));
     }
 

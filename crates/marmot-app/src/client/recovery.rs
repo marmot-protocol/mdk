@@ -103,11 +103,11 @@ impl Drop for RecoveryCallerGuard {
 /// The account worker's sole active grant prevents overlap with another attempt.
 /// Durable loss and its cursor guard remain armed.
 pub(super) struct RecoveryLossAttemptGuard {
-    adapter: crate::relay_plane::MarmotRelayPlaneAccountAdapter,
+    adapter: transport_nostr::MarmotRelayPlaneAccountAdapter,
     armed: bool,
 }
 impl RecoveryLossAttemptGuard {
-    pub(super) fn new(adapter: crate::relay_plane::MarmotRelayPlaneAccountAdapter) -> Self {
+    pub(super) fn new(adapter: transport_nostr::MarmotRelayPlaneAccountAdapter) -> Self {
         Self {
             adapter,
             armed: true,
@@ -297,7 +297,7 @@ impl FrozenRecoveryInventory {
         &self,
         summary: &transport_nostr_adapter::NostrReconciliationSummary,
     ) -> (storage_sqlite::RecoveryComparisonOutcome, bool, bool) {
-        use crate::relay_plane::same_relay;
+        use transport_nostr::same_relay;
         let compared = self.work.endpoints();
         let named = |list: &[cgka_traits::TransportEndpoint], endpoint: &str| {
             list.iter()
@@ -746,7 +746,7 @@ impl AppClient {
                         transport_group_id: Option<[u8; 32]>,
                         endpoints: &[cgka_traits::TransportEndpoint]| {
             let admitted = self.adapter.recovery_admitted_endpoints(endpoints);
-            let required = crate::relay_plane::recovery_required_endpoints(
+            let required = transport_nostr::recovery_required_endpoints(
                 &admitted,
                 &self.app.config.recovery_operated_relays,
             );
@@ -1090,7 +1090,7 @@ impl AppClient {
     pub(super) fn finish_qualified_recovery_loss(
         &mut self,
         grant: &AttemptGrant,
-        attempt: crate::relay_plane::AccountDeliveryOverflow,
+        attempt: transport_nostr::AccountDeliveryOverflow,
     ) -> Result<bool, AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
         if grant.loss.is_empty() {
@@ -1178,7 +1178,7 @@ impl AppClient {
     /// that cause reclaims it. Returns whether the fence was released.
     pub(super) fn release_retired_delivery_loss(
         &mut self,
-        observed: Option<crate::relay_plane::AccountDeliveryOverflow>,
+        observed: Option<transport_nostr::AccountDeliveryOverflow>,
     ) -> Result<bool, AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
         if storage.pending_recovery_demands()?.iter().any(|demand| {
@@ -1383,7 +1383,7 @@ impl AppClient {
                     let admitted = self
                         .adapter
                         .recovery_admitted_endpoints(&routing.local_inbox_endpoints);
-                    let endpoints = crate::relay_plane::recovery_required_endpoints(
+                    let endpoints = transport_nostr::recovery_required_endpoints(
                         &admitted,
                         &self.app.config.recovery_operated_relays,
                     );
@@ -1429,7 +1429,7 @@ impl AppClient {
                             StorageError::Serialization("invalid recovery transport route".into())
                         })?;
                     let admitted = self.adapter.recovery_admitted_endpoints(&route.endpoints);
-                    let endpoints = crate::relay_plane::recovery_required_endpoints(
+                    let endpoints = transport_nostr::recovery_required_endpoints(
                         &admitted,
                         &self.app.config.recovery_operated_relays,
                     );

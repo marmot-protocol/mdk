@@ -21,5 +21,5 @@ publishes, and below [`marmot-app`](../marmot-app/README.md), which drives it pe
   plane callbacks for them.
 - No MLS peeling (`transport-nostr-peeler`) and no relay socket mechanics (`transport-nostr-adapter`, `nostr-sdk`).
 
-`marmot-app` still reaches the plane as `crate::relay_plane`, a re-export of this crate, until its callers are
-repointed. See the [relay-plane brief](../../docs/marmot-architecture/review/brief-relay-plane.md).
+`marmot-app` drives it through `transport_nostr::`. See the
+[relay-plane brief](../../docs/marmot-architecture/review/brief-relay-plane.md) for how it moved out of the app.

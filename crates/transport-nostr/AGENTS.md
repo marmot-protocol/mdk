@@ -31,9 +31,8 @@ not depend on `marmot-app` or `storage-sqlite`. The app supplies storage and pol
   tracing target stays `marmot_app::relay_plane` until the brief's later rename.
 - Test hooks and accessors (`*_for_test`, `test_support`) are `cfg(any(test, feature = "test-support"))`.
   `marmot-app` enables `test-support` only through its dev-dependency; never enable it in app artifacts.
-- `marmot-app` re-exports this crate as `relay_plane`. Widen an item to `pub` only when another crate names it.
-  `marmot-app` also re-exports `MarmotRelayPlane` and `MarmotRelayPlaneAccountAdapter` to hosts, so methods on them
-  that only the app calls are `#[doc(hidden)] pub`.
+- Widen an item to `pub` only when another crate names it. `marmot-app` re-exports `MarmotRelayPlane` and
+  `MarmotRelayPlaneAccountAdapter` to hosts, so methods on them that only the app calls are `#[doc(hidden)] pub`.
 - Construct `MarmotRelayPlane` inside a Tokio runtime. `spawn_router` returns early without one, so construction
   succeeds and nothing is routed. Follow-up: take an explicit runtime handle.
 - Shutdown aborts the router and the notification forwarders, but does not join the spill writer (`delivery_spill.rs`

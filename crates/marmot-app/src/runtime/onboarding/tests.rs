@@ -1,10 +1,10 @@
 use super::*;
-use crate::relay_plane::{DirectoryFetchRequest, DirectoryRelayFetcher};
 use async_trait::async_trait;
 use cgka_traits::{MemberId, TransportAdapterError};
 use nostr::prelude::{FinalizeEvent, ToBech32};
 use parking_lot::Mutex as FixtureMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use transport_nostr::{DirectoryFetchRequest, DirectoryRelayFetcher};
 use transport_nostr_adapter::{NostrPublishOutcome, NostrRelayClient, NostrSubscription};
 
 #[derive(Default)]
@@ -17,7 +17,7 @@ struct Network {
     fail_reads: AtomicBool,
     return_off_filter_events: AtomicBool,
     fail_index_only: AtomicBool,
-    inspection_errors: FixtureMutex<HashMap<String, crate::relay_plane::DirectoryInspectionError>>,
+    inspection_errors: FixtureMutex<HashMap<String, transport_nostr::DirectoryInspectionError>>,
     inspected_endpoints: FixtureMutex<Vec<String>>,
     zero_acks: AtomicBool,
     block_publish: AtomicBool,
@@ -31,7 +31,7 @@ impl DirectoryRelayFetcher for Network {
         request: DirectoryFetchRequest,
     ) -> Result<Vec<DirectoryRelayEventRecord>, String> {
         assert!(
-            crate::relay_plane::RelaySafetyPolicy::default()
+            transport_nostr::RelaySafetyPolicy::default()
                 .classify_endpoints(request.endpoints.iter().map(|e| e.0.clone()).collect())
                 .iter()
                 .all(|e| e.policy == RelayEndpointPolicy::Allowed)
@@ -85,7 +85,7 @@ impl DirectoryRelayFetcher for Network {
         &self,
         request: DirectoryFetchRequest,
         _signer: Option<Arc<dyn transport_nostr_peeler::MarmotNostrSigner>>,
-    ) -> Result<Vec<DirectoryRelayEventRecord>, crate::relay_plane::DirectoryInspectionError> {
+    ) -> Result<Vec<DirectoryRelayEventRecord>, transport_nostr::DirectoryInspectionError> {
         self.inspected_endpoints
             .lock()
             .extend(request.endpoints.iter().map(|endpoint| endpoint.0.clone()));
@@ -99,7 +99,7 @@ impl DirectoryRelayFetcher for Network {
         }
         self.fetch_directory_events(request)
             .await
-            .map_err(|_| crate::relay_plane::DirectoryInspectionError::TimedOut)
+            .map_err(|_| transport_nostr::DirectoryInspectionError::TimedOut)
     }
 }
 
@@ -505,7 +505,7 @@ async fn mixed_health_relay_steps_advance_the_checkpoint_without_publication() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transient_endpoint_failures_are_warnings_when_another_declared_route_completes() {
-    use crate::relay_plane::DirectoryInspectionError;
+    use transport_nostr::DirectoryInspectionError;
 
     let (_directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -558,7 +558,7 @@ async fn transient_endpoint_failures_are_warnings_when_another_declared_route_co
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_completed_read_route_can_prove_inspection_when_the_declared_write_route_times_out() {
-    use crate::relay_plane::DirectoryInspectionError;
+    use transport_nostr::DirectoryInspectionError;
 
     let (_directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -602,7 +602,7 @@ async fn a_completed_read_route_can_prove_inspection_when_the_declared_write_rou
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_directionality_and_inconclusive_checks_never_produce_false_readiness() {
-    use crate::relay_plane::DirectoryInspectionError;
+    use transport_nostr::DirectoryInspectionError;
 
     let (_directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
@@ -854,7 +854,7 @@ impl NostrRelayClient for Network {
         _: usize,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
         assert!(
-            crate::relay_plane::RelaySafetyPolicy::default()
+            transport_nostr::RelaySafetyPolicy::default()
                 .classify_endpoints(endpoints.iter().map(|e| e.0.clone()).collect())
                 .iter()
                 .all(|e| e.policy == RelayEndpointPolicy::Allowed)
@@ -2874,7 +2874,7 @@ fn fail_public_indexers(network: &Network) {
     for indexer in crate::default_directory_discovery_relays() {
         errors.insert(
             indexer.0,
-            crate::relay_plane::DirectoryInspectionError::TimedOut,
+            transport_nostr::DirectoryInspectionError::TimedOut,
         );
     }
 }

@@ -19,7 +19,7 @@ use transport_nostr_adapter::{
 };
 use transport_nostr_peeler::NostrTransportEvent;
 
-use crate::relay_plane::{
+use transport_nostr::{
     AccountDeliveryReceive, DirectoryFetchRequest, DirectoryRelayEventRecord, DirectoryRelayFetcher,
 };
 
@@ -715,7 +715,7 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join() {
-    use crate::relay_plane::{AccountDeliveryReceive, MarmotRelayPlane};
+    use transport_nostr::{AccountDeliveryReceive, MarmotRelayPlane};
     let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
     let config = || crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);

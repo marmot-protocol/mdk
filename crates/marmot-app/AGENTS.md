@@ -335,8 +335,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `epoch_stall.rs` (epoch-gap backfill detection), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/comparison_job.rs` (the one recovery comparison
   job).
-- `relay_plane` in `src/lib.rs` re-exports [`transport-nostr`](../transport-nostr/AGENTS.md), the shared relay plane,
-  so its old paths keep working until callers are repointed.
+- The shared relay plane is the [`transport-nostr`](../transport-nostr/AGENTS.md) crate; name its items as
+  `transport_nostr::`.
 - `src/directory/`: also `cached_search.rs` (network-free cross-account search), `search.rs` (streaming web-of-trust
   search), `open_ranking.rs` (bounded Vertex Open Ranking discovery), `member_key_packages.rs` (set-oriented roster
   KeyPackage resolution for create/invite).

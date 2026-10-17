@@ -164,7 +164,7 @@ impl ComparisonRouteWorkResult {
         &self,
         endpoints: &[cgka_traits::TransportEndpoint],
     ) -> Vec<cgka_traits::TransportEndpoint> {
-        use crate::relay_plane::same_relay;
+        use transport_nostr::same_relay;
         match self {
             Self::Skipped => Vec::new(),
             Self::TimedOut | Self::Returned(Err(_) | Ok(None)) => endpoints.to_vec(),
@@ -255,7 +255,7 @@ impl Drop for ComparisonNetworkJob {
 /// Ask the relays that failed an epoch-gap route's comparison for the route's
 /// newest events, inside the comparison window and what remains of the pass.
 async fn fetch_epoch_gap_window(
-    adapter: &crate::relay_plane::MarmotRelayPlaneAccountAdapter,
+    adapter: &transport_nostr::MarmotRelayPlaneAccountAdapter,
     transport_group_id: [u8; 32],
     endpoints: Vec<cgka_traits::TransportEndpoint>,
     since: u64,
@@ -626,7 +626,7 @@ impl AppClient {
                         super::super::audit_recovery::RouteAcquisition::from_summary(&summary);
                     acquisition.retrieved = events.len();
                     if let Some(inventory) = inventory {
-                        use crate::relay_plane::same_relay;
+                        use transport_nostr::same_relay;
                         let endpoints = inventory.work.endpoints();
                         let unattributed = summary.failed_endpoints.len() < summary.relays_failed
                             || summary.failed_endpoints.iter().any(|failed| {

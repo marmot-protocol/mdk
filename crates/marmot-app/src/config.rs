@@ -904,7 +904,7 @@ impl RelayTelemetryExportConfig {
     }
 }
 
-impl crate::relay_plane::RelayExportGate for RelayTelemetryExportConfig {
+impl transport_nostr::RelayExportGate for RelayTelemetryExportConfig {
     fn export_allowed(&self) -> bool {
         RelayTelemetryExportConfig::export_allowed(self)
     }
@@ -1035,7 +1035,7 @@ mod tests {
 
     #[test]
     fn relay_export_gate_is_the_export_allowed_check() {
-        use crate::relay_plane::RelayExportGate;
+        use transport_nostr::RelayExportGate;
         let configs = [
             RelayTelemetryExportConfig::disabled(),
             RelayTelemetryExportConfig {

@@ -21,13 +21,13 @@ use transport_nostr_adapter::{
 use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::error::{AppError, MissingKeyPackageReason};
-use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 use crate::{
     AccountKeyPackageInventoryEntry, AccountKeyPackageLocalState, AccountKeyPackageRecord,
     AccountKeyPackageRelayEvent, AccountRelayListBootstrap, AccountRelayListStatus,
     DirectoryFreshness, DirectoryKeyPackage, DirectorySelection, FetchedKeyPackage,
     UserDirectoryRecord, push_unique_strings, relay_list_state_from_event, sort_directory_records,
 };
+use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 
 /// Evidence from a complete supplementary lookup, used only to restrict the
 /// direct diagnostic API's existing future-record cache fallback.

@@ -15,7 +15,6 @@
 //! later; the wrap is dropped once a relay accepts it.
 //!
 //! See `docs/marmot-architecture/moderation-reports.md` for the wire format.
-use crate::relay_plane::RelayEndpointPolicy;
 use crate::{AppError, MarmotApp, ReportReason};
 use cgka_traits::{TransportEndpoint, TransportEndpointFailure, TransportEndpointFailureKind};
 use marmot_account::AccountHomeError;
@@ -26,6 +25,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use storage_sqlite::{ModerationReportOutboxEntry, ModerationReportOutboxOutcome};
 use tokio::sync::watch;
+use transport_nostr::RelayEndpointPolicy;
 use transport_nostr_adapter::{NostrRelayClient, NostrSdkRelayClient};
 use transport_nostr_peeler::NostrTransportEvent;
 

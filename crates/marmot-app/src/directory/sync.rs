@@ -10,11 +10,11 @@ use cgka_traits::TransportEndpoint;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
-use crate::relay_plane::{DirectorySyncBatch, DirectorySyncPlan};
 use crate::{
     AppError, KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
     KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, MarmotRelayPlane, blocking_app_task,
 };
+use transport_nostr::{DirectorySyncBatch, DirectorySyncPlan};
 
 pub(crate) const DIRECTORY_SYNC_USER_BATCH_SIZE: usize = 200;
 
@@ -283,7 +283,7 @@ async fn run_directory_sync_worker(
     relay_plane: MarmotRelayPlane,
     mut commands: mpsc::Receiver<DirectorySyncCommand>,
     mut directory_events: tokio::sync::broadcast::Receiver<
-        crate::relay_plane::DirectoryRelayPlaneEvent,
+        transport_nostr::DirectoryRelayPlaneEvent,
     >,
     rebuild_queued: Arc<AtomicBool>,
 ) {
@@ -352,7 +352,7 @@ async fn run_directory_sync_worker(
             }
             event = directory_events.recv() => {
                 match event {
-                    Ok(crate::relay_plane::DirectoryRelayPlaneEvent::Record(record)) => {
+                    Ok(transport_nostr::DirectoryRelayPlaneEvent::Record(record)) => {
                         let app = app.clone();
                         if record.event.kind == crate::user_blocks::MUTE_LIST_KIND {
                             if block_adoptions.len() < MAX_BLOCK_ADOPTIONS {
@@ -368,7 +368,7 @@ async fn run_directory_sync_worker(
                             let _ = blocking_app_task(move || app.ingest_directory_relay_event(record)).await;
                         }
                     }
-                    Ok(crate::relay_plane::DirectoryRelayPlaneEvent::RecoveryRequired)
+                    Ok(transport_nostr::DirectoryRelayPlaneEvent::RecoveryRequired)
                     | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         request_block_reconcile(&app, &mut block_rebuilds, &mut block_task);
                         if recovery_rebuilds.request() {
@@ -672,8 +672,8 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blocked_account_lock_does_not_stall_directory_drain_or_rebuild_completion() {
-        use crate::relay_plane::{DirectoryRelayEventRecord, DirectoryRelayPlaneEvent};
         use std::time::Duration;
+        use transport_nostr::{DirectoryRelayEventRecord, DirectoryRelayPlaneEvent};
         use transport_nostr_peeler::NostrTransportEvent;
 
         let dir = tempfile::tempdir().unwrap();

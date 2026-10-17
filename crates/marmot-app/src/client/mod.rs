@@ -722,7 +722,7 @@ pub struct AppClient {
     /// Account-queue placement counts at this client's previous
     /// `transport_cursor_advanced` row (or its open), so each row reports
     /// what changed since.
-    pub(crate) cursor_audit_placements: crate::relay_plane::AccountDeliveryPlacementCounts,
+    pub(crate) cursor_audit_placements: transport_nostr::AccountDeliveryPlacementCounts,
     /// Group-system timeline rows synthesized during the most recent publish
     /// path. The runtime account worker drains this after each command and
     /// broadcasts `ProjectionUpdated` so live timeline subscriptions refresh.

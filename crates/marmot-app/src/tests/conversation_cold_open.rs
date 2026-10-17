@@ -428,7 +428,7 @@ async fn cold_open_before_hydration_and_after_runtime_restart_keeps_history_loca
 async fn cold_open_storage_and_hydration_timings() {
     for count in [200, 5_000] {
         let h = History::new(count).await;
-        let plane = crate::relay_plane::MarmotRelayPlane::new(None, h.relay.clone());
+        let plane = transport_nostr::MarmotRelayPlane::new(None, h.relay.clone());
         let mut client = h
             .app
             .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)

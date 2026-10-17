@@ -123,10 +123,6 @@ mod nostr_verification;
 mod notifications;
 mod projection;
 mod publisher_sequences;
-mod relay_plane {
-    //! The relay plane lives in `transport-nostr`; this keeps its old paths.
-    pub use transport_nostr::*;
-}
 mod relay_telemetry_export;
 mod root_closers;
 mod root_runtime_lease;
@@ -283,11 +279,6 @@ pub use profile_pseudonyms::{default_profile_pseudonym, random_profile_pseudonym
 pub use public_event_preview::{
     MAX_PUBLIC_EVENT_REFERENCES, PublicEventPreview, PublicEventPreviewRead,
 };
-pub use relay_plane::{
-    EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
-    RelayEndpointClassification, RelayEndpointPolicy, RelayPlaneHealth, RelayRollupEntry,
-    RelayTelemetryRollup, RelayTelemetrySnapshot, retired_relay_hosts,
-};
 pub use relay_telemetry_export::{
     ExportHistogram, ExportMetricPoint, ExportMetricValue, RelayExportError,
     RelayTelemetryExportBatch, RelayTelemetryExporter, build_export_batch,
@@ -300,6 +291,11 @@ pub use storage_sqlite::{
     TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
     TimelinePagination, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
     select_reusable_direct_conversation,
+};
+pub use transport_nostr::{
+    EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
+    RelayEndpointClassification, RelayEndpointPolicy, RelayPlaneHealth, RelayRollupEntry,
+    RelayTelemetryRollup, RelayTelemetrySnapshot, retired_relay_hosts,
 };
 pub use transport_nostr_adapter::{
     DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
@@ -376,7 +372,7 @@ use key_package_records::{
     validated_cached_key_package,
 };
 use projection::LegacyAccountProjectionDb;
-use relay_plane::DirectoryRelayEventRecord as RelayEventRecord;
+use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 
 const LEGACY_ACCOUNT_APP_DB_FILE: &str = "app.sqlite3";
 const LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER: &str = "legacy-account-projection-v1";
@@ -4640,7 +4636,7 @@ impl MarmotApp {
             self.relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone());
         let recovery_storage = self.account_storage(label)?;
         let recovery_label = label.to_owned();
-        let recovery_marker: relay_plane::AccountDeliveryRecoveryMarker =
+        let recovery_marker: transport_nostr::AccountDeliveryRecoveryMarker =
             Arc::new(move |marker_token, dropped, earliest_created_at| {
                 recovery_storage
                     .record_account_delivery_loss_bounded(
@@ -4652,14 +4648,14 @@ impl MarmotApp {
                     )
                     .map_err(|error| {
                         if error.is_closed() {
-                            relay_plane::AccountDeliveryRecoveryMarkerError::Closed
+                            transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
                         } else {
-                            relay_plane::AccountDeliveryRecoveryMarkerError::Retryable
+                            transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
                         }
                     })
             });
         let spill_storage = self.account_storage(label)?;
-        let spill_store: relay_plane::AccountDeliverySpillStore = Arc::new(move |deliveries| {
+        let spill_store: transport_nostr::AccountDeliverySpillStore = Arc::new(move |deliveries| {
             spill_storage
                 .spill_account_deliveries(
                     deliveries,
@@ -4674,9 +4670,9 @@ impl MarmotApp {
                 })
                 .map_err(|error| {
                     if error.is_closed() {
-                        relay_plane::AccountDeliveryRecoveryMarkerError::Closed
+                        transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
                     } else {
-                        relay_plane::AccountDeliveryRecoveryMarkerError::Retryable
+                        transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
                     }
                 })
         });
@@ -7349,7 +7345,7 @@ impl MarmotApp {
     #[cfg(test)]
     fn with_test_relay_client<C>(mut self, client: Arc<C>) -> Self
     where
-        C: NostrRelayClient + crate::relay_plane::DirectoryRelayFetcher + 'static,
+        C: NostrRelayClient + transport_nostr::DirectoryRelayFetcher + 'static,
     {
         self.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
             None,
@@ -7475,7 +7471,7 @@ impl MarmotApp {
     fn new_nostr_routing(&self, relays: Option<Vec<String>>) -> Result<NostrRoutingV1, AppError> {
         let mut nostr_group_id = [0_u8; 32];
         OsRng.fill_bytes(&mut nostr_group_id);
-        let relays = relay_plane::RelaySafetyPolicy::with_allow_loopback(
+        let relays = transport_nostr::RelaySafetyPolicy::with_allow_loopback(
             self.config.allow_loopback_relay_endpoints,
         )
         .sanitize_endpoints(

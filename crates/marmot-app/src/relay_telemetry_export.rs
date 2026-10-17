@@ -34,7 +34,7 @@ use crate::app_telemetry::{
     AppPerformanceOperationSnapshot, AppPerformanceSnapshot, SyncFailureClassification,
 };
 use crate::config::RelayTelemetryExportConfig;
-use crate::relay_plane::{EngineReorgMetrics, MarmotRelayPlane, RelayTelemetryRollup};
+use transport_nostr::{EngineReorgMetrics, MarmotRelayPlane, RelayTelemetryRollup};
 
 #[cfg(feature = "otlp-export")]
 use crate::app_telemetry::AppPerformanceTelemetry;
@@ -2475,7 +2475,7 @@ mod otlp {
             use std::time::UNIX_EPOCH;
 
             use crate::config::{RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig};
-            use crate::relay_plane::test_support::{AccountPublishFixture, PublishScript};
+            use transport_nostr::test_support::{AccountPublishFixture, PublishScript};
 
             let fixture = AccountPublishFixture::activate().await;
             let exporter = crate::RelayTelemetryExporter::new(

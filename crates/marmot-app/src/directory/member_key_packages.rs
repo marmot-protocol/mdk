@@ -24,8 +24,8 @@ use crate::key_package_records::{
     fresh_relay_list_status_from_records, merge_relay_list_status,
     preferred_fresh_key_package_from_records,
 };
-use crate::relay_plane::{DirectoryEventQuery, DirectoryFetchOutcome};
 use crate::{AccountRelayListStatus, AppError, FetchedKeyPackage, MarmotApp};
+use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome};
 
 /// Maximum authors placed in one Nostr directory filter.
 pub(crate) const MEMBER_RESOLUTION_AUTHORS_PER_QUERY: usize = 32;
@@ -211,7 +211,7 @@ struct MemberTarget {
     account_id_hex: String,
     relay_lists: AccountRelayListStatus,
     cached_relay_lists: AccountRelayListStatus,
-    relay_records: Vec<crate::relay_plane::DirectoryRelayEventRecord>,
+    relay_records: Vec<transport_nostr::DirectoryRelayEventRecord>,
 }
 
 #[derive(Default)]
@@ -585,7 +585,7 @@ impl MarmotApp {
     fn relay_lists_from_records(
         &self,
         target: &MemberTarget,
-        records: Vec<crate::relay_plane::DirectoryRelayEventRecord>,
+        records: Vec<transport_nostr::DirectoryRelayEventRecord>,
         endpoints: &[TransportEndpoint],
     ) -> AccountRelayListStatus {
         let mut status = fresh_relay_list_status_from_records(

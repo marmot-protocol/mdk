@@ -14,11 +14,11 @@ struct CrashRelay {
 }
 
 #[async_trait]
-impl crate::relay_plane::DirectoryRelayFetcher for CrashRelay {
+impl transport_nostr::DirectoryRelayFetcher for CrashRelay {
     async fn fetch_directory_events(
         &self,
-        request: crate::relay_plane::DirectoryFetchRequest,
-    ) -> Result<Vec<crate::relay_plane::DirectoryRelayEventRecord>, String> {
+        request: transport_nostr::DirectoryFetchRequest,
+    ) -> Result<Vec<transport_nostr::DirectoryRelayEventRecord>, String> {
         self.inner.fetch_directory_events(request).await
     }
 }
