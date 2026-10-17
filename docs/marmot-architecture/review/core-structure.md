@@ -31,8 +31,9 @@ the citations behind it. §4 and §5 are proposals, not findings.
    `MarmotAccountSession` and `SharedServices` that don't exist. The public runtime mostly forwards calls: 179 of its
    250 public methods are thin delegations, and a feature crosses four hand-written layers.
 3. **`storage-sqlite` is the app's whole data model with a protocol store inside it.** (Observed; §2.2.) Protocol
-   persistence is 16% of its production code. It exposes 389 public app methods next to 119 storage-trait methods, 84%
-   of them used by `marmot-app`, and its protocol code behaves differently depending on app tables.
+   persistence is 16% of its production code. It exposes 366 public app and transport methods next to 122
+   storage-trait methods, about 82% of its public methods are used by `marmot-app`, and its protocol code behaves
+   differently depending on app tables.
 4. **The lower stack has three identical wrappers and no layer narrows the surface.** (Observed; §2.3 and §2.4.) The
    account runtime makes 34 pass-throughs and hands out the session directly. The session makes 119 more. The engine
    exposes 153 methods, about 38 of which are a storage proxy for account records plus the app's audit sink.
@@ -112,16 +113,17 @@ references 48 recovery symbols.
 
 ### 2.2 `storage-sqlite`: two stores in one type
 
-- **The callers are the app.** One concrete type, `SqliteAccountStorage`, carries 389 public app methods and 119
-  storage-trait methods. About 84% of the public methods are used by `marmot-app`, and about 62 have no production
-  caller outside the crate. 236 of its 251 re-exports are app DTOs.
+- **The callers are the app.** One concrete type, `SqliteAccountStorage`, carries 387 public inherent methods, 366
+  of them app or transport, and 122 storage-trait methods. `marmot-app` calls about 318 of the public methods (a
+  name-match count). 239 of its 257 re-exports are app DTOs. These counts are at `e9ecb12e0`, from the
+  [step 4 brief](brief-storage-boundaries.md).
 - **It breaks a stated rule.** The root `AGENTS.md` says to keep transport-specific code out of storage crates. This
   crate holds NIP-77 reconciliation, relay-plane spill, NIP-51 block lists, the NIP-59 moderation outbox, Nostr route
   rows and Blossom upload secrets.
 - **The protocol implementation depends on app state.** Message release checks whether an `account_state` row exists.
   The engine's local-forget path wipes about 20 app tables. The outbound path consumes drafts and local submissions,
   and fires an observer registered through `cgka-session`.
-- **The schema is jointly owned.** Twelve of 110 migrations touch both protocol and app tables. Thirteen live triggers
+- **The schema is jointly owned.** Ten of 112 migrations touch both protocol and app tables (twelve if `locally_forgotten_groups` counts as app). Thirteen live triggers
   touch protocol tables: twelve rewrite `chat_list_rows` when engine leave and disband tables change, and one guards
   `cgka_groups` inserts. About 42 more cross between app domains. One of those resets the new media catalog whenever a
   presentation table's `store_epoch` changes (`migrations/0110_media_files.rs:51`). That is what #2314 specifies for a
@@ -344,7 +346,7 @@ Each step can ship on its own.
 | 1 | `media-store` crate (#2314) | In progress, and the template for the rest | — |
 | 2 | Relay plane into `transport-nostr` ([brief](brief-relay-plane.md)) | The most separable seam; gives Pass 1 E's fixes a home | about 5.1k lines move |
 | 3 | Directory crate | Already owns its state; makes no account-storage calls | about 11–13k |
-| 4 | `storage-sqlite` internal boundaries: `protocol/`, `app/` and an explicit `cross/` module listing the 11 couplings ([brief](brief-storage-boundaries.md)) | Makes the split reviewable before any crate moves; no behaviour change | Moves only |
+| 4 | `storage-sqlite` internal boundaries: `protocol/`, `app/` and an explicit `cross/` module for the 15 couplings (the 11 in §2.2 plus four the brief found) ([brief](brief-storage-boundaries.md)) | Makes the split reviewable before any crate moves; no behaviour change | Moves, then the `SqliteAppStorage` handle: about 318 `marmot-app` call sites |
 | 5 | Lower stack: merge the session into `marmot-session`, split off `marmot-account`, move the engine's storage proxy and audit ownership up, re-export config types | The two fixes that touch this code have landed: #2338 and #2341, which closed #2323 | Touches about 10 `marmot-app` files and `marmot-account` |
 | 6 | `marmot-observability` for the exporters, plus an observer interface | Removes the largest `marmot-app` domain | about 7–8k |
 | 7 | Inside `marmot-app`: break up `AppClient` along Pass 1 B's roles; make sync and recovery one owned subsystem; take onboarding out of `AccountManager`; remove duplicated state | Depends on the runtime work (multi-thread runtime session) | Large |
