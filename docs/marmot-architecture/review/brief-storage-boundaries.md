@@ -69,12 +69,12 @@ where it can go away.
 | --- | --- | --- | --- | --- |
 | 1 | The app's projection checkpoint acknowledges the engine outbox in its own transaction | `account_projection.rs:1313-1319` (in `save_account_projection`, `:1046`) | `cross::acknowledge_outbox_in_projection` | Keep: one transaction must cover both (core-structure §2.5) |
 | 2 | The engine's confirm transaction consumes drafts and local submissions and fires the app's draft observer | `storage/outbound.rs:41,48,60` and `:244,250,263` | `cross::consume_drafts_in_confirm` | Keep, behind a hook the app store registers (step 8) |
-| 3 | Message release writes the app recovery ledger and `seen_events`, and reads `account_state`; group and route deletion delete the ledger's inventory | `storage/messages.rs:110,118,319-326,354,1298-1305`; `account_recovery::delete_inventory_tx` from `storage/groups.rs:164` and `storage/transport_routes.rs:75,108,153` | `cross::release_for_replay`, `cross::consume_released_receipts` and `cross::delete_recovery_inventory` | Step 8: an app-side journal the engine writes and the app consumes |
+| 3 | Message release writes the app recovery ledger and `seen_events`, and reads `account_state`; group and route deletion delete the ledger's inventory | `storage/messages.rs:110,118,319-326,354,1298-1305`; `account_recovery::delete_inventory_tx` from `storage/groups.rs:164`, `storage/transport_routes.rs:75,108,153` and `storage/messages.rs:1304` | `cross::release_for_replay`, `cross::consume_released_receipts` and `cross::delete_recovery_inventory` | Step 8: an app-side journal the engine writes and the app consumes |
 | 4 | Group and route deletion clear NIP-77 reconciliation rows | The `transport_reconciliation_*` deletes: `storage/groups.rs:173-192`; `storage/transport_routes.rs:81,87,118,128,163,173` | `cross::clear_reconciliation_for_group` and `..._for_route` | When reconciliation moves to `transport-nostr` |
-| 5 | Local forget and delete span both sides in one wipe | `account_projection.rs:1427-1440` (`forget_group_local_data`, which calls `GroupStorage::is_group_forgotten` at `:1437`) and `:1442-1649` (`delete_local_group_data_inner`, the wipe, including `storage::groups::delete_group_tx` at `:1572`) | Both functions move to `cross/` whole; the public `delete_local_group_data` (`:1420-1425`) stays in `app/` and calls them | Keep: a local delete must be atomic |
+| 5 | Local forget and delete span both sides in one wipe | `account_projection.rs:1427-1440` (`forget_group_local_data`, which calls `GroupStorage::is_group_forgotten` at `:1437`) and `:1442-1649` (`delete_local_group_data_inner`, the wipe, including `storage::groups::delete_group_tx` at `:1572`) | Both functions move to `cross/` whole. Their callers stay put and call `cross/`: the engine's `GroupStorage::forget_group_local` (`storage/groups.rs:10-12`) in `protocol/`, and the public `delete_local_group_data` (`account_projection.rs:1420-1425`) in `app/` | Keep: a local delete must be atomic |
 | 6 | App tables cascade from `cgka_groups` | Migrations 0055:10, 0067:9, 0092:26 | Listed in `cross/README.md` | Step 8 decides per table |
 | 7 | Engine-table triggers maintain the chat list | 13 triggers on protocol tables: the twelve chat-list triggers in migration 0072:70-178 (insert, update and delete on `cgka_leave_requests`, `cgka_disband_requests`, `cgka_disband_candidates` and `cgka_disband_tombstones`) plus the `reject_forgotten_group_insert` guard on `cgka_groups` in 0071:13-16 | Listed in `cross/README.md` | Step 8: replace with the outbox, or keep as schema |
-| 8 | App reads join engine tables, and `chat_list.rs` imports protocol modules | `chat_list.rs:7-11` (imports of `storage::disband_requests` and `storage::leave_requests`), `chat_list.rs:2533`, `chat_list/pages.rs:357-362`, `timeline/capture.rs:65-66`, `timeline.rs:1296-1316`, `account_projection.rs:1511-1514,1752,1882,1908`, `delivery_spill.rs:88-91` | Read-only engine views in `cross/` | Step 8: published read views |
+| 8 | App reads join engine tables, and `chat_list.rs` imports protocol modules | `chat_list.rs:7-11` (imports of `storage::disband_requests` and `storage::leave_requests`), `account_projection.rs:1150-1151` (`save_account_projection` reads `locally_forgotten_groups` inside its transaction), `chat_list.rs:2533`, `chat_list/pages.rs:357-362`, `timeline/capture.rs:65-66`, `timeline.rs:1296-1316`, `account_projection.rs:1511-1514,1752,1882,1908`, `delivery_spill.rs:88-91` | Read-only engine views in `cross/` | Step 8: published read views |
 | 9 | The app writes the engine's authority outbox | `timeline/reports.rs:555-620` | `cross::backfill_authority_request` | Step 8 |
 | 10 | App writes invalidate the engine's MLS cache | `connection.rs:1604-1621` (`PRAGMA data_version`) | Stays in `base/`, documented | Keep while both sides share a file |
 | 11 | One migration ledger | `migrations.rs:258-932`; strict order at `:1020` | Stays in `base/` | Keep: one file, one ledger |
@@ -114,7 +114,7 @@ are callable wherever the type is.
 protocol traits. `marmot-app` reaches app storage through the new handle, and only `cross/` holds both.
 `marmot-app` builds the handle from the `SqliteAccountStorage` it already opens for the account (marmot-app
 `lib.rs:6636`) and keeps it beside that storage. It shares that connection, so it opens no second connection, and the
-closer already registered for that storage in `root_closers` (`lib.rs:4580`) closes both; after close, its calls fail
+closer already registered for that storage in `root_closers` (`lib.rs:6653`) closes both; after close, its calls fail
 the way the account storage's do. The engine's session keeps only its own storage handle and never receives
 `SqliteAppStorage`. It is the type the app store crate gets in step 8, so the work is not thrown away. It is
 mechanical but wide: every `marmot-app` call to the app methods it uses, about 318 of them by a name-match count,
@@ -131,16 +131,18 @@ Each PR is green on its own and changes no behaviour or schema.
    `#[path]` attributes in `migrations.rs` and the 6 others, and the `include_str!`/`include_bytes!` fixtures. Keep the
    hard-coded tracing targets (17 in non-test files, 3 in test files) unchanged in this PR. Update the crate and nested
    `AGENTS.md` key-file tables.
-2. **Introduce `cross/`.** Move each coupling's code into its named function: the protocol modules' 8 reaches
-   into `account_recovery` (including the 4 `delete_inventory_tx` calls) and 1 into `message_drafts`; the wipe
+2. **Introduce `cross/`.** Move each coupling's code into its named function: the protocol modules' 8 reaches into
+   `account_recovery` (the five `delete_inventory_tx` calls at `storage/groups.rs:164`,
+   `storage/transport_routes.rs:75,108,153` and `storage/messages.rs:1304`, `arm_released_epoch_tx` at
+   `messages.rs:110`, and `invalidate_inventory_tx` at `:118,354`) and 1 into `message_drafts`; the wipe
    (`forget_group_local_data` and `delete_local_group_data_inner`, coupling 5); the authority backfill from
-   `timeline/reports`. Also move the couplings that are SQL in the caller, which the path test cannot catch: the
-   outbox acknowledgement (coupling 1), the reconciliation deletes (coupling 4) and `complete_group_local_reset`'s
-   media-secret write (coupling A). Move `chat_list.rs`'s imports of
-   `storage::disband_requests` and `storage::leave_requests` (`chat_list.rs:7-11`), the one production
-   app-to-protocol module path outside the wipe, behind coupling 8's read views. The callees stay where they are,
-   at `pub(crate)`. Add `cross/README.md` for the schema-level couplings (#6, #7, #10, #11) with migration
-   citations.
+   `timeline/reports`. Also move the couplings that are SQL in the caller, which the path test cannot catch: the outbox
+   acknowledgement (coupling 1), the reconciliation deletes (coupling 4) and `complete_group_local_reset`'s media-secret
+   write (coupling A). Move `chat_list.rs`'s imports of `storage::disband_requests` and `storage::leave_requests`
+   (`chat_list.rs:7-11`), the one production app-to-protocol module path outside the wipe, behind coupling 8's read
+   views, and the `locally_forgotten_groups` probe in `save_account_projection` (`account_projection.rs:1150-1151`)
+   behind a `cross/` view it calls within the same transaction. The callees stay where they are, at `pub(crate)`. Add
+   `cross/README.md` for the schema-level couplings (#6, #7, #10, #11) with migration citations.
 3. **Narrow visibility and add the boundary test.** Switch the four app transactions in coupling C to
    `SharedConnection::with_transaction` first. Helpers only their own folder uses become folder-private; the ones
    `cross/` calls stay `pub(crate)`. The test fails on any production path from `protocol/` into `app/` or
