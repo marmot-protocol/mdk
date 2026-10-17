@@ -1514,11 +1514,7 @@ impl SqliteAccountStorage {
             })?;
             let active_route_ids = {
                 let mut statement = conn
-                    .prepare_cached(
-                        "SELECT transport_group_id
-                         FROM cgka_transport_group_routes
-                         WHERE group_id = ?1",
-                    )
+                    .prepare_cached(crate::cross::views::GROUP_ROUTE_IDS_SQL)
                     .storage()?;
                 statement
                     .query_map(params![group_id], |row| row.get::<_, Vec<u8>>(0))
@@ -1642,13 +1638,7 @@ impl SqliteAccountStorage {
         Ok(self
             .lock()?
             .execute_cached(
-                "DELETE FROM local_group_deletion_frontiers
-                 WHERE group_id_hex = ?1
-                   AND message_insert_order < (
-                       SELECT insert_order
-                       FROM cgka_messages
-                       WHERE id = ?2 AND group_id = ?3
-                   )",
+                crate::cross::views::CLEAR_DELETION_FRONTIER_IF_OLDER_SQL,
                 params![group_id_hex, message_id.as_slice(), group_id],
             )
             .storage()?
@@ -1670,11 +1660,7 @@ impl SqliteAccountStorage {
         })?;
         self.lock()?
             .query_row_cached(
-                "SELECT EXISTS(
-                    SELECT 1
-                    FROM cgka_messages
-                    WHERE id = ?1 AND group_id = ?2 AND insert_order > ?3
-                 )",
+                crate::cross::views::MESSAGE_NEWER_THAN_FRONTIER_SQL,
                 params![
                     message_id.as_slice(),
                     group_id,

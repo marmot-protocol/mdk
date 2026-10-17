@@ -17,8 +17,10 @@ the list only shrinks. The plan is the
 | `projection.rs` | The projection checkpoint acknowledging the engine outbox and probing forgotten groups, in its own transaction | `app/account_projection.rs` |
 | `authority.rs` | The app queueing backfilled authority requests in the engine's outbox | `app/timeline/reports.rs` |
 | `wipe.rs` | The local-forget wipe: a group's app data, and on an engine forget its engine rows and forget marker, in one transaction | `protocol/storage/groups.rs` (`forget_group_local`), `app/account_projection.rs` (`delete_local_group_data`) |
+| `views.rs` | App reads of engine tables: the chat list's leave and disband state, branch-withdrawal origins, a conversation's group state, a group's routes, the local-deletion frontier's message order, and the spill's released-receipt check | `app/chat_list.rs`, `app/chat_list/pages.rs`, `app/timeline.rs`, `app/timeline/capture.rs`, `app/account_projection.rs`, `app/transport/delivery_spill.rs` |
 
-The next step 4 PR moves the app's reads of engine tables in, as read views.
+Outside the schema links below, the only lines left on the list are the account handle's three in
+`base/connection.rs`, which step 4 PR 4 removes when `SqliteAccountStorage` moves to `protocol/`.
 
 ## Schema links that stay
 

@@ -87,8 +87,7 @@ fn already_seen(conn: &Connection, event_id: &[u8]) -> StorageResult<bool> {
     // Release journals the ID before the app's seen ring is rewritten, so a
     // journaled receipt still needs redelivery even while `seen_events` lists it.
     conn.query_row_cached(
-        "SELECT EXISTS(SELECT 1 FROM seen_events WHERE event_id=?1)
-            AND NOT EXISTS(SELECT 1 FROM cgka_released_transport_receipts WHERE id=?2)",
+        crate::cross::views::DELIVERY_ALREADY_SEEN_SQL,
         params![hex::encode(event_id), event_id],
         |row| row.get(0),
     )
