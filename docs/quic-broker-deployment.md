@@ -95,3 +95,79 @@ quic://quic-broker.ipf.dev:4450
 
 It uses a certificate for `quic-broker.ipf.dev`, so clients should use normal platform trust and must not pass
 `--insecure-local`.
+
+### How production runs
+
+The production host runs the broker binary natively under systemd, not the container:
+
+- `marmot-quic-broker.service` runs as user `quic` with
+  `/usr/local/bin/marmot-quic-broker --bind [::]:4450 --cert-pem /etc/quic/cert.pem --key-pem /etc/quic/key.pem --json`.
+- certbot renews the `quic-broker.ipf.dev` certificate. Its deploy hook,
+  `/etc/letsencrypt/renewal-hooks/deploy/quic-broker`, installs `fullchain.pem` and `privkey.pem` into `/etc/quic`
+  readable by group `quic`, then restarts the unit.
+- The binary has no `--version`. Record the image tag and binary SHA-256 when you deploy. The startup JSON line in
+  `journalctl -u marmot-quic-broker` shows the certificate fingerprint and the active limits.
+
+### Redeploying production
+
+Deploy the binary from a `master` image tag so the build matches CI. The image is amd64-only and its binary needs
+glibc 2.36 or newer. Extract the binary on any machine with Docker:
+
+```sh
+tag=sha-<12-char-commit>
+docker create --platform linux/amd64 --name broker-extract \
+  ghcr.io/marmot-protocol/mdk/marmot-quic-broker:$tag
+docker cp broker-extract:/usr/local/bin/marmot-quic-broker ./marmot-quic-broker
+docker rm broker-extract
+shasum -a 256 marmot-quic-broker
+```
+
+Copy it to the host. As root, stage it and prove it loads the production certificate and negotiates the ALPN on
+loopback before you replace the running binary:
+
+```sh
+install -o root -g root -m 0755 marmot-quic-broker /usr/local/bin/marmot-quic-broker.new
+runuser -u quic -- /usr/local/bin/marmot-quic-broker.new --bind 127.0.0.1:14451 \
+  --cert-pem /etc/quic/cert.pem --key-pem /etc/quic/key.pem --json &
+openssl s_client -quic -alpn marmot.quic_broker.v1 -connect 127.0.0.1:14451 \
+  -servername quic-broker.ipf.dev -verify_hostname quic-broker.ipf.dev -verify_return_error -brief </dev/null
+kill %1
+```
+
+Then keep the running binary for rollback, swap, and restart:
+
+```sh
+cd /usr/local/bin
+cp -p marmot-quic-broker "marmot-quic-broker.$(date -u +%Y%m%d)"
+mv marmot-quic-broker.new marmot-quic-broker
+systemctl restart marmot-quic-broker
+journalctl -u marmot-quic-broker -n 3 --no-pager
+```
+
+To roll back, move the dated copy back over `marmot-quic-broker` and restart the unit. Finish with the checks below.
+
+### Checking the deployed broker
+
+Clients require the ALPN `marmot.quic_broker.v1`, and so does every broker build since mdk#320. A broker built before
+that sets no ALPN: rustls then closes the handshake with `no_application_protocol` (TLS alert 120, shown as
+`peer doesn't support any known protocol`), so every current client fails. The alert arrives before the server sends
+its certificate, so it can also hide certificate problems. Check the ALPN after every deploy. OpenSSL 3.2 or newer can
+make the QUIC handshake without a Rust build:
+
+```sh
+openssl s_client -quic -alpn marmot.quic_broker.v1 \
+  -connect quic-broker.ipf.dev:4450 -servername quic-broker.ipf.dev \
+  -verify_hostname quic-broker.ipf.dev -verify_return_error -brief </dev/null
+```
+
+A current broker prints `CONNECTION ESTABLISHED`, `Protocol version: QUICv1`, and `Verification: OK`. A broker
+without the ALPN prints `quic_do_handshake:protocol is shutdown`. Add `-4` or `-6` to check each address family.
+macOS `/usr/bin/openssl` is LibreSSL and has no `-quic`; use Homebrew `openssl@3`. OpenSSL requires an ALPN for QUIC,
+so it cannot reproduce a client that offers none.
+
+The end-to-end check publishes and subscribes through the production broker with platform trust. It tries each
+resolved address until one round-trips:
+
+```sh
+cargo test -p transport-quic-broker --test public_endpoint -- --ignored
+```
