@@ -110,7 +110,7 @@ fn retained_mutations_do_not_materialize_old_payloads() {
                 peak < MAX_EXTRA,
                 "deletion materialized a retained body: declared={declared}, cascade={cascade}, extra_bytes={peak}"
             );
-            tracing::info!(target: "storage_sqlite::mutation_memory", method = "retained_delete",
+            tracing::info!(target: "storage_sqlite::base::migrations::media_open_upgrade_tests", method = "retained_delete",
                 mib, declared, cascade, extra_bytes = peak, "synthetic deletion allocation bound verified");
             transaction.rollback().unwrap();
             assert_eq!(
@@ -147,7 +147,7 @@ fn retained_mutations_do_not_materialize_old_payloads() {
                     peak < MAX_EXTRA,
                     "replacement materialized the old retained body: declared={declared}, extra_bytes={peak}"
                 );
-                tracing::info!(target: "storage_sqlite::mutation_memory", method = "retained_replace",
+                tracing::info!(target: "storage_sqlite::base::migrations::media_open_upgrade_tests", method = "retained_replace",
                     mib, declared, extra_bytes = peak, "synthetic replacement allocation bound verified");
                 assert_eq!(
                     transaction

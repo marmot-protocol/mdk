@@ -51,7 +51,7 @@ static SQLCIPHER_PLATFORM_LIMIT_REPORTED: Once = Once::new();
 fn report_sqlcipher_platform_limit_once(report_once: &Once) {
     report_once.call_once(|| {
         tracing::warn!(
-            target: "storage_sqlite::connection",
+            target: "storage_sqlite::base::connection",
             method = "configure_cipher_memory_security",
             configured = true,
             lock_posture = "platform_limited",
@@ -301,7 +301,7 @@ impl CloseableConnection {
         // rollback-journal databases, which is why the failure is not fatal.
         if let Err(error) = connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
             tracing::debug!(
-                target: "storage_sqlite::connection",
+                target: "storage_sqlite::base::connection",
                 method = "close",
                 error_kind = sqlite_error_kind(&error),
                 "wal checkpoint before close failed; closing anyway",
@@ -1730,7 +1730,7 @@ mod tests {
         S: Subscriber,
     {
         fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
-            if event.metadata().target() == "storage_sqlite::connection"
+            if event.metadata().target() == "storage_sqlite::base::connection"
                 && event.metadata().level() == &tracing::Level::WARN
             {
                 let mut visitor = PlatformLimitVisitor::default();

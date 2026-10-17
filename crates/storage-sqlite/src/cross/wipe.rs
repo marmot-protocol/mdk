@@ -239,7 +239,7 @@ impl SqliteAccountStorage {
                 // leave the durable intent for a later retry instead of inviting
                 // the caller to restore projection state that was already erased.
                 tracing::warn!(
-                    target: "storage_sqlite::account_projection",
+                    target: "storage_sqlite::cross::wipe",
                     method = "delete_local_group_data",
                     "secure-delete checkpoint cleanup remains pending after committed local deletion"
                 );

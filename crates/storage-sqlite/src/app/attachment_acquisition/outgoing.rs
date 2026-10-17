@@ -167,7 +167,7 @@ impl SqliteAppStorage {
                 Ok(())
             })();
             if result.is_err() {
-                tracing::warn!(target: "storage_sqlite::attachments", method = "outgoing_retention_after_commit",
+                tracing::warn!(target: "storage_sqlite::app::attachment_acquisition::outgoing", method = "outgoing_retention_after_commit",
                     "optional outgoing retention deferred");
             }
         });

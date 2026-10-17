@@ -22,7 +22,7 @@ impl Drop for Batch<'_> {
             Ok(())
         });
         if result.is_err() {
-            tracing::debug!(target: "storage_sqlite::attachments", method = "file_staging_cleanup",
+            tracing::debug!(target: "storage_sqlite::app::attachment_acquisition::file_staging", method = "file_staging_cleanup",
                 "unbound upload cleanup deferred");
         }
     }

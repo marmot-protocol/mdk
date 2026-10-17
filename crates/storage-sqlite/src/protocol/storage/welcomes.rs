@@ -55,7 +55,7 @@ impl WelcomeStorage for SqliteAccountStorage {
                 Ok(welcome) => welcomes.push(welcome),
                 Err(StorageError::Serialization(_)) => {
                     tracing::warn!(
-                        target: "storage_sqlite::welcomes",
+                        target: "storage_sqlite::protocol::storage::welcomes",
                         method = "list_welcomes",
                         "skipping an undecodable pending welcome"
                     );

@@ -583,7 +583,7 @@ fn file_backed_create_group_tail_benchmark_matrix() {
         let baseline_with_read = measure_create_tail(samples, invitees, true, true);
         let optimized = measure_create_tail(samples, invitees, false, false);
         tracing::info!(
-            target: "storage_sqlite::chat_list",
+            target: "storage_sqlite::app::chat_list::tests",
             method = "file_backed_create_group_tail_benchmark_matrix",
             invitees,
             samples,

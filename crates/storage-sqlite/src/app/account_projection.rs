@@ -2033,7 +2033,7 @@ impl SqliteAppStorage {
         outcome.erasure_pending = finish.erasure_pending;
         if outcome.pruned_media_epoch_secrets > 0 {
             tracing::debug!(
-                target: "storage_sqlite::retention",
+                target: "storage_sqlite::app::account_projection",
                 method = mode.trace_method(),
                 pruned_media_epoch_secrets = outcome.pruned_media_epoch_secrets,
                 "retired encrypted-media epoch secrets after final retained references expired"
@@ -3273,7 +3273,7 @@ pub(crate) fn combine_secure_delete_operation_and_restore<T>(
                 // here would falsely tell callers that the deletion did not
                 // happen and could make them restore stale projection state.
                 tracing::warn!(
-                    target: "storage_sqlite::account_projection",
+                    target: "storage_sqlite::app::account_projection",
                     method = "combine_secure_delete_operation_and_restore",
                     "secure-delete pragma restoration failed after committed operation"
                 );

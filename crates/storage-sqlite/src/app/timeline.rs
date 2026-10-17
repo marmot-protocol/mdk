@@ -1538,7 +1538,7 @@ impl SqliteAppStorage {
         };
         {
             let _span = tracing::debug_span!(
-                target: "storage_sqlite::timeline",
+                target: "storage_sqlite::app::timeline",
                 "reply_preview_hydration",
                 method = "message_timeline"
             )
@@ -2856,7 +2856,7 @@ fn collect_media_ciphertext_hashes(tags: &[Vec<String>], out: &mut BTreeSet<Stri
     }
     if malformed_media_hashes > 0 {
         tracing::debug!(
-            target: "storage_sqlite::retention",
+            target: "storage_sqlite::app::timeline",
             method = "collect_media_hashes",
             malformed_media_hashes,
             "ignored malformed media hashes during secure prune"
@@ -3389,7 +3389,7 @@ fn select_timeline_rows_tx(
 ) -> StorageResult<Vec<TimelineMessageRecord>> {
     let (sql, params) = timeline_query_sql(query, pagination, canonical_group_order, hide_blocked)?;
     let _span = tracing::debug_span!(
-        target: "storage_sqlite::timeline",
+        target: "storage_sqlite::app::timeline",
         "timeline_select",
         method = "message_timeline"
     )
