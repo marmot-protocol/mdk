@@ -14,9 +14,11 @@ the list only shrinks. The plan is the
 | `groups.rs` | Lifting the media-secret retirement barrier when a forgotten group rejoins | `protocol/storage/groups.rs` |
 | `release.rs` | Message release for replay: whether an app owns the messages, retiring seen-ring and inventory entries, arming or invalidating the recovery ledger | `protocol/storage/messages.rs` |
 | `outbound.rs` | The confirm path consuming the local submission and the draft a message came from, and waking the app's draft observer | `protocol/storage/outbound.rs` |
+| `projection.rs` | The projection checkpoint acknowledging the engine outbox and probing forgotten groups, in its own transaction | `app/account_projection.rs` |
+| `authority.rs` | The app queueing backfilled authority requests in the engine's outbox | `app/timeline/reports.rs` |
+| `wipe.rs` | The local-forget wipe: a group's app data, and on an engine forget its engine rows and forget marker, in one transaction | `protocol/storage/groups.rs` (`forget_group_local`), `app/account_projection.rs` (`delete_local_group_data`) |
 
-Later step 4 PRs move the app-side crossings in: the projection checkpoint acknowledging the engine outbox, the
-authority backfill, the local-forget wipe, and app reads of engine tables.
+The next step 4 PR moves the app's reads of engine tables in, as read views.
 
 ## Schema links that stay
 
