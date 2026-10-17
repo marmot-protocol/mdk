@@ -4,7 +4,6 @@
 # See docs/marmot-architecture/review/brief-storage-boundaries.md.
 
 # Module paths that name the other side (the base handle names both: it holds the OpenMLS store and the draft observer).
-path app/account_projection.rs crate::protocol::storage::groups
 path app/chat_list.rs crate::protocol::storage::disband_requests
 path app/chat_list.rs crate::protocol::storage::leave_requests
 path base/connection.rs crate::app::message_drafts
@@ -12,17 +11,10 @@ path base/connection.rs crate::protocol::openmls_storage
 path base/connection.rs crate::protocol::storage::snapshots
 
 # Calls through self or Self to a method the other side defines.
-method app/account_projection.rs is_group_forgotten
-method protocol/storage/groups.rs forget_group_local_data
 
 # SQL naming the other side's tables. base/migrations.rs: the legacy migration 9 reconcile adds a column to two app tables.
-sql app/account_projection.rs cgka_disband_tombstones
-sql app/account_projection.rs cgka_groups
 sql app/account_projection.rs cgka_messages
 sql app/account_projection.rs cgka_transport_group_routes
-sql app/account_projection.rs cgka_welcomes
-sql app/account_projection.rs locally_forgotten_groups
-sql app/account_projection.rs pending_application_events
 sql app/chat_list.rs cgka_disband_tombstones
 sql app/chat_list/pages.rs cgka_disband_candidates
 sql app/chat_list/pages.rs cgka_disband_requests
@@ -30,8 +22,6 @@ sql app/chat_list/pages.rs cgka_leave_requests
 sql app/timeline.rs cgka_messages
 sql app/timeline/capture.rs cgka_disband_tombstones
 sql app/timeline/capture.rs cgka_leave_requests
-sql app/timeline/reports.rs cgka_messages
-sql app/timeline/reports.rs pending_application_authority
 sql app/transport/delivery_spill.rs cgka_released_transport_receipts
 sql base/migrations.rs app_events
 sql base/migrations.rs message_timeline

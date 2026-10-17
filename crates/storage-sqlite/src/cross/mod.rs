@@ -3,7 +3,10 @@
 //! crossing; `base::boundary_tests` lets only this folder name both sides.
 //! The crossings still to move are listed in `allow-list.txt`; see `README.md`.
 
+pub(crate) mod authority;
 pub(crate) mod groups;
 pub(crate) mod outbound;
+pub(crate) mod projection;
 pub(crate) mod release;
 pub(crate) mod routes;
+mod wipe;
