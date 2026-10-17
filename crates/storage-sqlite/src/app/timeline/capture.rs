@@ -61,10 +61,7 @@ fn capture_tx(
     let draft = crate::app::message_drafts::revisioned::selected_tx(conn, group)?;
     let (archived, admin_keys_hex, leave_request_pending, disbanded) = conn
         .query_row_cached(
-            "SELECT archived, admin_keys_hex,
-             EXISTS(SELECT 1 FROM cgka_leave_requests WHERE group_id = ?2),
-             EXISTS(SELECT 1 FROM cgka_disband_tombstones WHERE group_id = ?2)
-         FROM account_groups WHERE group_id_hex = ?1",
+            crate::cross::views::CONVERSATION_GROUP_STATE_SQL,
             params![group, group_bytes],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
