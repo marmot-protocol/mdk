@@ -21,9 +21,9 @@ use transport_nostr_peeler::{KIND_MARMOT_GROUP_MESSAGE, NostrTransportEvent};
 use super::*;
 
 /// Matches `transport_nostr_adapter`'s private delivery channel capacity.
-pub(crate) const SHARED_DELIVERY_BUFFER: usize = 1024;
+pub const SHARED_DELIVERY_BUFFER: usize = 1024;
 
-pub(crate) enum PublishScript {
+pub enum PublishScript {
     Accept,
     Empty,
     Error,
@@ -31,16 +31,16 @@ pub(crate) enum PublishScript {
     Wait,
 }
 
-pub(crate) struct CountingClient {
+pub struct CountingClient {
     pub calls: AtomicUsize,
-    pub(crate) accounts: StdMutex<Vec<MemberId>>,
+    pub accounts: StdMutex<Vec<MemberId>>,
     script: StdMutex<PublishScript>,
     entered: StdMutex<Option<oneshot::Sender<()>>>,
     release: StdMutex<Option<oneshot::Receiver<()>>>,
 }
 
 impl CountingClient {
-    pub(crate) fn new(script: PublishScript) -> Arc<Self> {
+    pub fn new(script: PublishScript) -> Arc<Self> {
         Arc::new(Self {
             calls: AtomicUsize::new(0),
             accounts: StdMutex::new(Vec::new()),
@@ -50,11 +50,11 @@ impl CountingClient {
         })
     }
 
-    pub(crate) fn set_script(&self, script: PublishScript) {
+    pub fn set_script(&self, script: PublishScript) {
         *self.script.lock().expect("script lock") = script;
     }
 
-    pub(crate) fn arm_wait(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pub fn arm_wait(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (entered_tx, entered_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
         *self.entered.lock().expect("entered lock") = Some(entered_tx);
@@ -127,7 +127,7 @@ impl NostrRelayClient for CountingClient {
     }
 }
 
-pub(crate) fn group_event(content: &str, transport_group_id: &[u8]) -> NostrTransportEvent {
+pub fn group_event(content: &str, transport_group_id: &[u8]) -> NostrTransportEvent {
     let mut event = NostrTransportEvent {
         id: String::new(),
         pubkey: "33".repeat(32),
@@ -141,7 +141,7 @@ pub(crate) fn group_event(content: &str, transport_group_id: &[u8]) -> NostrTran
     event
 }
 
-pub(crate) struct AccountPublishFixture {
+pub struct AccountPublishFixture {
     pub plane: MarmotRelayPlane,
     pub adapter: MarmotRelayPlaneAccountAdapter,
     pub client: Arc<CountingClient>,
@@ -152,7 +152,7 @@ pub(crate) struct AccountPublishFixture {
 }
 
 impl AccountPublishFixture {
-    pub(crate) async fn activate() -> Self {
+    pub async fn activate() -> Self {
         let client = CountingClient::new(PublishScript::Accept);
         let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), client.clone());
         let account_id = MemberId::new(vec![0xA1; 32]);
@@ -187,7 +187,7 @@ impl AccountPublishFixture {
         }
     }
 
-    pub(crate) fn request(&self, required_acks: usize) -> TransportPublishRequest {
+    pub fn request(&self, required_acks: usize) -> TransportPublishRequest {
         TransportPublishRequest {
             account_id: self.account_id.clone(),
             message: self.message.clone(),
@@ -200,7 +200,7 @@ impl AccountPublishFixture {
         }
     }
 
-    pub(crate) async fn publish(
+    pub async fn publish(
         &self,
         script: PublishScript,
         required_acks: usize,
@@ -211,7 +211,7 @@ impl AccountPublishFixture {
 
     /// Start one account publish, wait until it is inside the relay client,
     /// then drop it.
-    pub(crate) async fn cancel_in_flight(&self) {
+    pub async fn cancel_in_flight(&self) {
         let (entered, _release) = self.client.arm_wait();
         let adapter = self.adapter.clone();
         let request = self.request(1);

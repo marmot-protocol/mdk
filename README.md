@@ -138,6 +138,7 @@ still land on the same epoch and group state. The engine — not relay order or 
 | | [`media-store`](crates/media-store/README.md) | Encrypted per-file media store: file format and file lifecycle |
 | Transport | [`transport-nostr-peeler`](crates/transport-nostr-peeler/README.md) | Nostr event ⇄ engine message boundary |
 | | [`transport-nostr-adapter`](crates/transport-nostr-adapter/README.md) | Relay I/O behind an injectable client |
+| | [`transport-nostr`](crates/transport-nostr/README.md) | The relay plane: per-account relay sessions, delivery and directory fetches |
 | | [`transport-quic-stream`](crates/transport-quic-stream/README.md) | QUIC transport for live agent text previews |
 | | [`transport-quic-broker`](crates/transport-quic-broker/README.md) | Memory-only preview broker (`marmot-quic-broker`); [deployment](docs/quic-broker-deployment.md) |
 | App | [`marmot-account`](crates/marmot-account/README.md) | Account homes, key storage, transport orchestration |

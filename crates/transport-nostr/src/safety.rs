@@ -43,7 +43,7 @@ pub fn retired_relay_hosts() -> Vec<String> {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RelaySafetyPolicy {
+pub struct RelaySafetyPolicy {
     max_endpoints_per_route: usize,
     /// Dev/test opt-in for loopback relay endpoints
     /// (`MarmotAppConfig::allow_loopback_relay_endpoints`). Off by default:
@@ -62,17 +62,14 @@ impl Default for RelaySafetyPolicy {
 }
 
 impl RelaySafetyPolicy {
-    pub(crate) fn with_allow_loopback(allow_loopback: bool) -> Self {
+    pub fn with_allow_loopback(allow_loopback: bool) -> Self {
         Self {
             allow_loopback,
             ..Self::default()
         }
     }
 
-    pub(crate) fn classify_endpoints(
-        &self,
-        endpoints: Vec<String>,
-    ) -> Vec<RelayEndpointClassification> {
+    pub fn classify_endpoints(&self, endpoints: Vec<String>) -> Vec<RelayEndpointClassification> {
         endpoints
             .into_iter()
             .map(|endpoint| self.classify_endpoint(endpoint))
@@ -214,7 +211,7 @@ impl RelaySafetyPolicy {
         kept
     }
 
-    pub(crate) fn sanitize_endpoints(
+    pub fn sanitize_endpoints(
         &self,
         endpoints: Vec<TransportEndpoint>,
         context: &str,
@@ -246,10 +243,7 @@ impl RelaySafetyPolicy {
 }
 
 impl super::MarmotRelayPlaneAccountAdapter {
-    pub(crate) fn recovery_admitted_endpoints(
-        &self,
-        endpoints: &[TransportEndpoint],
-    ) -> Vec<String> {
+    pub fn recovery_admitted_endpoints(&self, endpoints: &[TransportEndpoint]) -> Vec<String> {
         let admitted: std::collections::HashSet<_> = self
             .relay_plane
             .inner
@@ -276,7 +270,7 @@ impl super::MarmotRelayPlaneAccountAdapter {
 
 /// Whether two endpoint spellings name the same relay. Parsing normalizes
 /// case and default ports, which a route's signed spelling may not.
-pub(crate) fn same_relay(left: &str, right: &str) -> bool {
+pub fn same_relay(left: &str, right: &str) -> bool {
     left == right
         || matches!(
             (RelayUrl::parse(left.trim()), RelayUrl::parse(right.trim())),
@@ -290,7 +284,7 @@ pub(crate) fn same_relay(left: &str, right: &str) -> bool {
 /// operated relay requires all of its admitted relays, so its history can
 /// still certify. A relay the plane refuses, such as a retired or unsafe
 /// host, or one past the per-route cap, is never compared and never required.
-pub(crate) fn recovery_required_endpoints(admitted: &[String], operated: &[String]) -> Vec<String> {
+pub fn recovery_required_endpoints(admitted: &[String], operated: &[String]) -> Vec<String> {
     let operated = operated
         .iter()
         .filter_map(|relay| RelayUrl::parse(relay.trim()).ok())

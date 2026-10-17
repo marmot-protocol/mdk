@@ -13,6 +13,7 @@ members = [
     "crates/incident-replay",
     "crates/transport-nostr-peeler",
     "crates/transport-nostr-adapter",
+    "crates/transport-nostr",
     "crates/transport-quic-stream",
     "crates/transport-quic-broker",
     "crates/agent-stream-compose",
@@ -148,6 +149,7 @@ storage-sqlite = { path = "crates/storage-sqlite" }
 cgka-conformance-simulator = { path = "crates/cgka-conformance-simulator" }
 transport-nostr-peeler = { path = "crates/transport-nostr-peeler" }
 transport-nostr-adapter = { path = "crates/transport-nostr-adapter" }
+transport-nostr = { path = "crates/transport-nostr" }
 transport-quic-stream = { path = "crates/transport-quic-stream" }
 transport-quic-broker = { path = "crates/transport-quic-broker" }
 agent-stream-compose = { path = "crates/agent-stream-compose" }

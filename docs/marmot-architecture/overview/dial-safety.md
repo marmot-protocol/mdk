@@ -1,7 +1,7 @@
 ---
 title: "Dial Safety"
 created: 2026-07-04
-updated: 2026-10-09
+updated: 2026-10-17
 tags: [marmot, overview, security, network, ssrf, transport]
 status: overview
 ---
@@ -52,7 +52,7 @@ loopback / private / link-local / CGNAT / metadata endpoint is an SSRF vector, a
 | Agent-stream broker watch (quinn) | `crates/marmot-app/src/runtime/agent_stream_watch.rs`: `resolve_broker_addr` validates + pins; `broker_trust_for_candidate` keys `InsecureLocal` on the literal candidate host + `insecure_local`. |
 | Agent-connector broker dial (quinn) | `crates/marmot-app/src/runtime/agent_publisher.rs` reuses runtime broker validation + pinning and TLS trust selection, gated on `AgentConnectorConfig::allow_insecure_local_broker` + literal loopback. |
 | CLI stream (quinn) | `crates/cli/src/commands/stream.rs`: `resolve_quic_candidate_addr` (`socket_addr_is_unsafe`); explicit `stream send` `--connect` (direct and `--broker`) uses `broker_trust` / `stream_trust` → `ensure_public_quic_endpoint` (`reject_non_public_socket_addr(addr, false)`) or `ensure_insecure_local_endpoint`. A family-matched unspecified client bind is source routing only, not destination authorization. |
-| Nostr relays (nostr-sdk) | `crates/marmot-app/src/relay_plane/safety.rs`: `RelaySafetyPolicy::sanitize_endpoints` → `reject_unsafe_relay_host`, the single funnel for activation, group sync, publish, and directory routes. |
+| Nostr relays (nostr-sdk) | `crates/transport-nostr/src/safety.rs`: `RelaySafetyPolicy::sanitize_endpoints` → `reject_unsafe_relay_host`, the single funnel for activation, group sync, publish, and directory routes. |
 | QUIC broker client connect timeout | Shared QUIC-preview hardening (`connect_with_timeout` / `QUIC_PREVIEW_CONNECT_TIMEOUT`, #710), applied at both broker client connects in `crates/transport-quic-broker/src/client.rs`. |
 
 Collector and forensic-audit HTTP details — structural URL gates, per-attempt resolve/validate/pin, disabled

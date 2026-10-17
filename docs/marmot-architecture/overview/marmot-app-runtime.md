@@ -1,7 +1,7 @@
 ---
 title: "Marmot App Runtime Shape"
 created: 2026-05-19
-updated: 2026-10-15
+updated: 2026-10-17
 tags: [marmot, overview, app-runtime, daemon, tui]
 status: implemented-first-slice
 ---
@@ -107,8 +107,8 @@ graceful cleanup.
 
 `marmot-app`'s integration suites (`crates/marmot-app/tests/`, including `relay_runtime`) drive whole runtimes on a
 two-worker multi-thread test runtime, so ordering that only holds on one thread fails in CI. A test that needs one
-thread stays on the current-thread flavor and says why. The unit-level suites under `src/runtime/` and
-`src/relay_plane/` still run on one thread: many of them build exact interleavings, and they have not yet been made
+thread stays on the current-thread flavor and says why. The unit-level suites under `src/runtime/` and in
+`transport-nostr` still run on one thread: many of them build exact interleavings, and they have not yet been made
 independent of scheduling.
 
 ## Relay Plane And Adapter

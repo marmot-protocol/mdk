@@ -22,7 +22,7 @@ pub(super) struct DirectoryWireTransport {
 }
 
 impl DirectoryWireTransport {
-    pub(super) fn new(transport: Arc<dyn WebSocketTransport>) -> Self {
+    pub fn new(transport: Arc<dyn WebSocketTransport>) -> Self {
         Self {
             transport,
             events: Arc::default(),

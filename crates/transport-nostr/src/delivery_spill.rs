@@ -23,7 +23,7 @@ use super::{
     enqueue_account_delivery_overflow_signal, omit_account_delivery, persist_retired_queue_loss,
 };
 
-pub(crate) type AccountDeliverySpillStore = Arc<
+pub type AccountDeliverySpillStore = Arc<
     dyn Fn(
             &[TransportDelivery],
         ) -> Result<Vec<DeliverySpillDisposition>, AccountDeliveryRecoveryMarkerError>
@@ -36,7 +36,7 @@ pub(crate) type AccountDeliverySpillStore = Arc<
 /// it. The store's own result maps onto this in the closure `open_account`
 /// builds, so the plane does not depend on the storage crate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DeliverySpillDisposition {
+pub enum DeliverySpillDisposition {
     /// Durably held for later admission, including a copy already spilled.
     Stored,
     /// Already durably seen and not released for redelivery: nothing to keep.
@@ -80,7 +80,7 @@ struct Handoff {
 }
 
 impl AccountDeliverySpill {
-    pub(super) fn new(
+    pub fn new(
         store: AccountDeliverySpillStore,
         account_id: MemberId,
         transport: Weak<RelayPlaneTransport>,

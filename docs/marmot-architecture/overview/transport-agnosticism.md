@@ -1,7 +1,7 @@
 ---
 title: "Transport Agnosticism — Where the Wiring Stops and How to Finish It"
 created: 2026-08-23
-updated: 2026-08-23
+updated: 2026-10-17
 tags: [marmot, overview, transport, nostr, architecture, working-note]
 status: working-note
 ---
@@ -89,7 +89,7 @@ profiles in `marmot-app` speak concrete `NostrTransportEvent` over `NostrRelayCl
 `NostrSdkDirectoryRelayFetcher`:
 
 - `marmot-app/src/directory/member_key_packages.rs` (`resolve_member_key_packages*`),
-- `marmot-app/src/relay_plane/directory.rs` — `DirectoryRelayFetcher` is `pub(crate)`;
+- `transport-nostr/src/directory.rs` — `DirectoryRelayFetcher` is `pub` for `marmot-app`;
   the only impl is `NostrSdkDirectoryRelayFetcher`,
 - `marmot-app/src/key_package_records.rs` — record validation consumes
   `NostrTransportEvent` directly,
@@ -110,7 +110,7 @@ looks like," all ws/wss-and-DNS shaped:
   component),
 - `crates/transport-nostr-peeler/src/peeler.rs::validate_welcome_relays` (attacker-controlled
   welcome `relays` tag, issue #392),
-- `marmot-app/src/relay_plane/safety.rs` (`evaluate_relay_url` / `reject_unsafe_relay_host`,
+- `transport-nostr/src/safety.rs` (`evaluate_relay_url` / `reject_unsafe_relay_host`,
   the dial chokepoint).
 
 There is no endpoint value type owned by the traits layer; each layer re-parses strings. The FIPS
@@ -252,7 +252,7 @@ behind a documented "transitional" note.
 - Welcome-relay validation (#392) and dial-safety discipline (`dial-safety.md`) stay strict per
   scheme; a new scheme adds rules, never bypasses them.
 - Privacy-safe telemetry/observability contracts apply to every adapter impl by construction
-  (`relay_plane/telemetry.rs` patterns; aggregate-only, no endpoints/pubkeys in logs).
+  (`transport-nostr/src/telemetry.rs` patterns; aggregate-only, no endpoints/pubkeys in logs).
 - Multi-step state-change discipline (`multi-step-state-changes.md`) applies to the bundle
   install itself: validate-before-mutate, no partial bundles observable.
 - `crates/traits` stays free of nostr-sdk dependencies; Nostr specifics live in default impls

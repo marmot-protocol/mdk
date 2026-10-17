@@ -23,7 +23,7 @@ const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
 
 /// Stable errors for a bounded, isolated relay inspection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DirectoryInspectionError {
+pub enum DirectoryInspectionError {
     Unreachable,
     TimedOut,
     AuthenticationRequired,
@@ -40,36 +40,36 @@ enum DirectoryRelayConnectOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct DirectoryEventQuery {
-    pub(crate) kind: u64,
-    pub(crate) authors: Vec<String>,
-    pub(crate) limit: usize,
-    pub(crate) reference: Option<(char, String)>,
+pub struct DirectoryEventQuery {
+    pub kind: u64,
+    pub authors: Vec<String>,
+    pub limit: usize,
+    pub reference: Option<(char, String)>,
     pub(crate) since: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DirectoryRelayEventRecord {
-    pub(crate) endpoints: Vec<TransportEndpoint>,
-    pub(crate) event: NostrTransportEvent,
+pub struct DirectoryRelayEventRecord {
+    pub endpoints: Vec<TransportEndpoint>,
+    pub event: NostrTransportEvent,
 }
 
 /// The directory subscriptions the plane keeps live: the relays to read and
 /// one batch per REQ. The app decides the batching policy and builds it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DirectorySyncPlan {
-    pub(crate) endpoints: Vec<TransportEndpoint>,
-    pub(crate) watched_user_count: usize,
-    pub(crate) batches: Vec<DirectorySyncBatch>,
+pub struct DirectorySyncPlan {
+    pub endpoints: Vec<TransportEndpoint>,
+    pub watched_user_count: usize,
+    pub batches: Vec<DirectorySyncBatch>,
 }
 
 /// One directory REQ: its subscription id, authors, kinds and floor.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DirectorySyncBatch {
-    pub(crate) subscription_id: String,
-    pub(crate) authors: Vec<String>,
-    pub(crate) kinds: Vec<u64>,
-    pub(crate) since: Option<u64>,
+pub struct DirectorySyncBatch {
+    pub subscription_id: String,
+    pub authors: Vec<String>,
+    pub kinds: Vec<u64>,
+    pub since: Option<u64>,
 }
 
 /// The `(authors, kinds)` an active directory subscription was issued with.
@@ -82,13 +82,13 @@ pub(crate) struct DirectorySyncBatch {
 /// and kinds are kept as the canonical hex / `u64` already present in the
 /// [`DirectorySyncBatch`], so matching is a plain membership check.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DirectorySubscriptionFilter {
+pub struct DirectorySubscriptionFilter {
     authors: HashSet<String>,
     kinds: HashSet<u64>,
 }
 
 impl DirectorySubscriptionFilter {
-    pub(crate) fn new(authors: Vec<String>, kinds: Vec<u64>) -> Self {
+    pub fn new(authors: Vec<String>, kinds: Vec<u64>) -> Self {
         Self {
             authors: authors.into_iter().collect(),
             kinds: kinds.into_iter().collect(),
@@ -101,9 +101,9 @@ impl DirectorySubscriptionFilter {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DirectoryFetchRequest {
-    pub(crate) endpoints: Vec<TransportEndpoint>,
-    pub(crate) queries: Vec<DirectoryEventQuery>,
+pub struct DirectoryFetchRequest {
+    pub endpoints: Vec<TransportEndpoint>,
+    pub queries: Vec<DirectoryEventQuery>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -113,7 +113,7 @@ struct DirectoryFetchKey {
 }
 
 #[derive(Clone)]
-pub(crate) struct DirectoryRelayPlane {
+pub struct DirectoryRelayPlane {
     fetcher: Arc<dyn DirectoryRelayFetcher>,
     state: Arc<Mutex<DirectoryRelayPlaneState>>,
 }
@@ -136,7 +136,7 @@ struct DirectoryRelayPlaneState {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DirectoryRelayStats {
+pub struct DirectoryRelayStats {
     pub(crate) inflight_fetches: usize,
     pub(crate) active_subscriptions: usize,
     pub(crate) auth_required_routes: usize,
@@ -149,23 +149,23 @@ pub(crate) struct DirectoryRelayStats {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DirectorySubscriptionSyncSummary {
-    pub(crate) active_subscriptions: usize,
-    pub(crate) subscriptions_created: usize,
-    pub(crate) subscriptions_removed: usize,
+pub struct DirectorySubscriptionSyncSummary {
+    pub active_subscriptions: usize,
+    pub subscriptions_created: usize,
+    pub subscriptions_removed: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DirectoryFetchOutcome {
-    pub(crate) records: Vec<DirectoryRelayEventRecord>,
-    pub(crate) complete: bool,
+pub struct DirectoryFetchOutcome {
+    pub records: Vec<DirectoryRelayEventRecord>,
+    pub complete: bool,
 }
 
 type DirectoryFetchResult = Result<Vec<DirectoryRelayEventRecord>, String>;
 type DirectoryCompletionResult = Result<DirectoryFetchOutcome, String>;
 
 #[async_trait]
-pub(crate) trait DirectoryRelayFetcher: Send + Sync {
+pub trait DirectoryRelayFetcher: Send + Sync {
     async fn fetch_directory_events(
         &self,
         request: DirectoryFetchRequest,
@@ -195,7 +195,7 @@ pub(crate) trait DirectoryRelayFetcher: Send + Sync {
 }
 
 #[derive(Clone)]
-pub(crate) struct NostrSdkDirectoryRelayFetcher {
+pub struct NostrSdkDirectoryRelayFetcher {
     client: NostrSdkClient,
 }
 
@@ -212,7 +212,7 @@ impl Drop for ScopedInspectionClient {
 }
 
 impl DirectoryEventQuery {
-    pub(crate) fn new(kind: u64, mut authors: Vec<String>, limit: usize) -> Self {
+    pub fn new(kind: u64, mut authors: Vec<String>, limit: usize) -> Self {
         authors.sort();
         authors.dedup();
         Self {
@@ -224,7 +224,7 @@ impl DirectoryEventQuery {
         }
     }
 
-    pub(crate) fn deletion_reference(
+    pub fn deletion_reference(
         account: &str,
         name: char,
         value: String,
@@ -274,7 +274,7 @@ impl DirectoryEventQuery {
         }
     }
 
-    pub(crate) fn matches(&self, event: &NostrTransportEvent) -> bool {
+    pub fn matches(&self, event: &NostrTransportEvent) -> bool {
         self.kind == event.kind
             && self.authors.contains(&event.pubkey)
             && self.since.is_none_or(|since| event.created_at >= since)
@@ -287,7 +287,7 @@ impl DirectoryEventQuery {
 }
 
 impl DirectoryFetchRequest {
-    pub(crate) fn new(
+    pub fn new(
         mut endpoints: Vec<TransportEndpoint>,
         mut queries: Vec<DirectoryEventQuery>,
     ) -> Result<Self, String> {
@@ -329,7 +329,7 @@ impl DirectoryRelayPlane {
     ) -> Result<Vec<DirectoryRelayEventRecord>, DirectoryInspectionError> {
         self.fetcher.inspect_directory_events(request, signer).await
     }
-    pub(crate) fn new(fetcher: Arc<dyn DirectoryRelayFetcher>) -> Self {
+    pub fn new(fetcher: Arc<dyn DirectoryRelayFetcher>) -> Self {
         Self {
             fetcher,
             state: Arc::new(Mutex::new(DirectoryRelayPlaneState::default())),
@@ -689,11 +689,11 @@ pub(super) fn anonymous_directory_client() -> NostrSdkClient {
 }
 
 impl NostrSdkDirectoryRelayFetcher {
-    pub(crate) fn new(client: NostrSdkClient) -> Self {
+    pub fn new(client: NostrSdkClient) -> Self {
         Self { client }
     }
 
-    pub(crate) fn standalone() -> Self {
+    pub fn standalone() -> Self {
         Self::new(anonymous_directory_client())
     }
 }
@@ -847,9 +847,9 @@ impl NostrSdkDirectoryRelayFetcher {
 
 /// Verified events from one public-event read, and whether every requested
 /// relay connected and reached its end of stored events.
-pub(crate) struct PublicEventFetch {
-    pub(crate) events: Vec<Event>,
-    pub(crate) complete: bool,
+pub struct PublicEventFetch {
+    pub events: Vec<Event>,
+    pub complete: bool,
 }
 
 /// One bounded, anonymous read of public events matching `filters`.
@@ -857,7 +857,7 @@ pub(crate) struct PublicEventFetch {
 /// Uses an owned client like [`DirectoryRelayFetcher::fetch_directory_events`],
 /// so hint relays never join a long-lived pool. Signatures are verified here;
 /// callers still match every event against the reference they asked for.
-pub(crate) async fn fetch_public_events(
+pub async fn fetch_public_events(
     endpoints: &[TransportEndpoint],
     filters: Vec<Filter>,
     max_events: usize,

@@ -1,0 +1,7 @@
+# Every relay client the plane builds must follow the process SOCKS5 policy.
+# Build them through `crate::nostr_builder()`, which wraps the adapter's proxy-aware builder.
+disallowed-methods = [
+    { path = "nostr_sdk::client::Client::builder", reason = "use crate::nostr_builder()" },
+    { path = "nostr_sdk::client::Client::new", reason = "use crate::nostr_builder()" },
+    { path = "nostr_sdk::client::ClientBuilder::new", reason = "use crate::nostr_builder()" },
+]

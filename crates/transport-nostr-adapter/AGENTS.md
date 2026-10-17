@@ -106,8 +106,8 @@ for reconnect/backoff and relay status mechanics.
   telemetry and the audit queue.
 - Keep real relay clients behind `NostrRelayClient`.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.
-- Relay endpoints are host-safety filtered before any connect at the `RelaySafetyPolicy` chokepoint in `marmot-app`
-  (`crates/marmot-app/src/relay_plane/safety.rs`); relay hosts that are non-public IP literals are rejected, and literal
+- Relay endpoints are host-safety filtered before any connect at the `RelaySafetyPolicy` chokepoint in `transport-nostr`
+  (`crates/transport-nostr/src/safety.rs`); relay hosts that are non-public IP literals are rejected, and literal
   loopback hosts are rejected too unless the dev loopback flag is set (the flag admits loopback only —
   private/link-local/CGNAT literals stay rejected). A new relay-connect path must go through that chokepoint, not around
   it. See `docs/marmot-architecture/overview/dial-safety.md`.

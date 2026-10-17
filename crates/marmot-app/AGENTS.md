@@ -246,7 +246,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   ends; one that releases early lets a failed ingest's checkpoint pass the delivery.
 - Keep Nostr group routing sourced from `marmot.transport.nostr.routing.v1` component bytes; relay filtering may affect
   connections, but must not rewrite signed routing state. Relay endpoints pass through the `RelaySafetyPolicy`
-  host-safety chokepoint (`src/relay_plane/safety.rs`), and agent-stream broker candidates through
+  host-safety chokepoint (`transport-nostr`'s `src/safety.rs`), and agent-stream broker candidates through
   `src/runtime/agent_stream_watch.rs`, before any connect; both follow the one dial discipline in
   `docs/marmot-architecture/overview/dial-safety.md` (validate + pin, trust from config, loopback only under an explicit
   dev flag). Do not add an outbound relay/broker path that bypasses them.
@@ -281,7 +281,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Keep local test relay code in tests; production app runtime should talk to Nostr relay URLs through the adapter.
 - Do not print or log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key
   material.
-- Keep the relay-telemetry export path in the `src/relay_plane/` module (rollup in `relay_plane/telemetry.rs`) and
+- Keep the relay-telemetry export path in the relay plane (`transport-nostr`, rollup in its `src/telemetry.rs`) and
   `relay_telemetry_export.rs` (exporter, including the `RelayTelemetryExporter::new` constructor). It is
   opt-in and off by default: `RelayTelemetryExporter::new` is the single construction gate, relay-identity
   resolution requires it (through the plane's `RelayExportGate`, which the export config implements), and export
@@ -290,8 +290,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   build. Keep per-attempt collector DNS validation and pinning in `collector_host_safety.rs`: validate
   every address, pin reqwest, disable redirects/system proxies, and retain TLS verification. Explicit SOCKS5 routing
   must send the validated IP rather than delegate HTTP DNS to the proxy. Build every relay client with
-  `network_proxy::nostr_builder()` (inside `relay_plane/`, its own `nostr_builder()`, which calls the same adapter
-  builder) and every HTTP client through `network_proxy::http_builder()`; `clippy.toml` rejects
+  `network_proxy::nostr_builder()` (in `transport-nostr`, its own `nostr_builder()`, which calls the same adapter
+  builder; that crate's `clippy.toml` holds the same ban) and every HTTP client through `network_proxy::http_builder()`; `clippy.toml` rejects
   direct `nostr_sdk`/`reqwest` constructors. Allow that lint only where a fresh reqwest builder goes straight into
   `http_builder()` or in local test fixtures. Only exact `localhost` or a
   loopback IP literal is a local-test endpoint, and all its addresses must be loopback. The default build includes this
@@ -331,8 +331,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `epoch_stall.rs` (epoch-gap backfill detection), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/comparison_job.rs` (the one recovery comparison
   job).
-- `src/relay_plane/`: `mod.rs` (shared relay plane), `safety.rs` (relay dial chokepoint), `directory.rs` (directory
-  fetches/subscriptions), `delivery_spill.rs` (durable overflow tail for a full account queue), `telemetry.rs`.
+- `relay_plane` in `src/lib.rs` re-exports [`transport-nostr`](../transport-nostr/AGENTS.md), the shared relay plane,
+  so its old paths keep working until callers are repointed.
 - `src/directory/`: also `cached_search.rs` (network-free cross-account search), `search.rs` (streaming web-of-trust
   search), `open_ranking.rs` (bounded Vertex Open Ranking discovery), `member_key_packages.rs` (set-oriented roster
   KeyPackage resolution for create/invite).

@@ -3781,6 +3781,7 @@ dependencies = [
  "tokio-tungstenite 0.28.0",
  "tokio-util",
  "tracing",
+ "transport-nostr",
  "transport-nostr-adapter",
  "transport-nostr-peeler",
  "transport-quic-broker",
@@ -6931,6 +6932,28 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "transport-nostr"
+version = "0.13.0"
+dependencies = [
+ "async-trait",
+ "cgka-traits",
+ "futures",
+ "hex",
+ "nostr 0.45.5",
+ "nostr-relay-builder",
+ "nostr-sdk",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+ "tracing",
+ "transport-nostr-adapter",
+ "transport-nostr-peeler",
+ "url",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-09-28
+updated: 2026-10-17
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -203,7 +203,7 @@ When adding a map, task set, counter, or temp artifact to a long-lived process:
 No new long-lived runtime collection or database schema is introduced. These are
 local-access bounds, not convergence or recovery policy.
 
-### Account delivery spill (`marmot-app/src/relay_plane/delivery_spill.rs`, `storage-sqlite/src/delivery_spill.rs`)
+### Account delivery spill (`transport-nostr/src/delivery_spill.rs`, `storage-sqlite/src/delivery_spill.rs`)
 
 | Structure | Bound | Reclamation |
 | --- | --- | --- |

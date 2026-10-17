@@ -123,7 +123,10 @@ mod nostr_verification;
 mod notifications;
 mod projection;
 mod publisher_sequences;
-mod relay_plane;
+mod relay_plane {
+    //! The relay plane lives in `transport-nostr`; this keeps its old paths.
+    pub use transport_nostr::*;
+}
 mod relay_telemetry_export;
 mod root_closers;
 mod root_runtime_lease;

@@ -44,6 +44,7 @@ on:
       - crates/media-store/**
       - crates/storage-sqlite/**
       - crates/traits/**
+      - crates/transport-nostr/**
       - crates/transport-nostr-adapter/**
       - crates/transport-nostr-peeler/**
       - crates/transport-quic-broker/**

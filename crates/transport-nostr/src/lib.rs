@@ -43,8 +43,8 @@ mod directory_wire;
 pub(crate) mod publish_accounting_tests;
 mod safety;
 mod telemetry;
-#[cfg(test)]
-pub(crate) mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 pub use safety::{RelayEndpointClassification, RelayEndpointPolicy, retired_relay_hosts};
 pub use telemetry::{
@@ -54,7 +54,7 @@ pub use telemetry::{
 /// The opt-in that relay-identity resolution requires. The app's export
 /// configuration implements it, so the plane does not depend on the app's
 /// config types.
-pub(crate) trait RelayExportGate: Send + Sync {
+pub trait RelayExportGate: Send + Sync {
     /// Export is opted in with a TLS (or loopback) endpoint, authorization
     /// and resource metadata.
     fn export_allowed(&self) -> bool;
@@ -69,27 +69,27 @@ pub(crate) fn nostr_builder() -> nostr_sdk::prelude::ClientBuilder {
     )
 }
 
-pub(crate) use delivery_spill::{AccountDeliverySpillStore, DeliverySpillDisposition};
-pub(crate) use directory::{
+pub use delivery_spill::{AccountDeliverySpillStore, DeliverySpillDisposition};
+pub use directory::{
     DirectoryEventQuery, DirectoryFetchOutcome, DirectoryFetchRequest, DirectoryInspectionError,
     DirectoryRelayEventRecord, DirectoryRelayFetcher, DirectoryRelayPlane, DirectoryRelayStats,
     DirectorySubscriptionFilter, DirectorySubscriptionSyncSummary, DirectorySyncBatch,
     DirectorySyncPlan, NostrSdkDirectoryRelayFetcher,
 };
-pub(crate) use safety::{RelaySafetyPolicy, recovery_required_endpoints, same_relay};
-pub(crate) use telemetry::rollup_from_snapshots;
+pub use safety::{RelaySafetyPolicy, recovery_required_endpoints, same_relay};
+pub use telemetry::rollup_from_snapshots;
 
 // Re-exported so the in-tree `tests` module (which uses `super::*`) keeps
 // reaching these names unchanged after the split moved their only non-test
 // uses into the submodules above.
 #[cfg(test)]
-pub(crate) use cgka_traits::TransportPublishTarget;
+pub use cgka_traits::TransportPublishTarget;
 #[cfg(test)]
-pub(crate) use transport_nostr_adapter::{
+pub use transport_nostr_adapter::{
     DurationHistogramSnapshot, NostrAdapterMetrics, RelayDeliverySpread, RelaySyncSnapshot,
 };
 
-pub(crate) const ACCOUNT_DELIVERY_BUFFER: usize = 1024;
+pub const ACCOUNT_DELIVERY_BUFFER: usize = 1024;
 const DIRECTORY_EVENT_BUFFER: usize = 1024;
 pub(crate) const DIRECTORY_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
 const RELAY_PLANE_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
@@ -175,21 +175,21 @@ struct EoseRepairReports {
 
 /// One finished lag-lost EOSE repair pass, for its audit row.
 #[derive(Clone, Debug)]
-pub(crate) struct EoseRepairReport {
+pub struct EoseRepairReport {
     /// The lagging receiver's account, or `None` for a receiver shared
     /// across accounts.
-    pub(crate) scope: Option<MemberId>,
+    pub scope: Option<MemberId>,
     /// Whether this pass followed an earlier one that left relays
     /// unrepaired, rather than a lag directly.
-    pub(crate) follow_up: bool,
+    pub follow_up: bool,
     /// Lags folded into this pass while its receiver settled.
-    pub(crate) lags: u64,
-    pub(crate) summary: transport_nostr_adapter::EoseReissueSummary,
+    pub lags: u64,
+    pub summary: transport_nostr_adapter::EoseReissueSummary,
     /// Whether a follow-up repair was scheduled for the failed relays.
-    pub(crate) follow_up_scheduled: bool,
+    pub follow_up_scheduled: bool,
     /// Earlier reports for this scope dropped at the queue bound, carried
     /// forward onto this one when they were evicted.
-    pub(crate) dropped_before: u64,
+    pub dropped_before: u64,
 }
 
 /// A lag-lost EOSE repair waiting for its receiver to settle.
@@ -205,7 +205,7 @@ struct EoseRepairSchedule {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum DirectoryRelayPlaneEvent {
+pub enum DirectoryRelayPlaneEvent {
     Record(DirectoryRelayEventRecord),
     RecoveryRequired,
 }
@@ -262,7 +262,7 @@ struct AccountDeliveryRoute {
 /// Persists a queue-loss generation: its marker token, dropped count and the
 /// earliest wire `created_at` among the dropped deliveries (`None` if any is
 /// unknown).
-pub(crate) type AccountDeliveryRecoveryMarker = Arc<
+pub type AccountDeliveryRecoveryMarker = Arc<
     dyn Fn(u64, u64, Option<u64>) -> Result<(), AccountDeliveryRecoveryMarkerError>
         + Send
         + Sync
@@ -270,7 +270,7 @@ pub(crate) type AccountDeliveryRecoveryMarker = Arc<
 >;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AccountDeliveryRecoveryMarkerError {
+pub enum AccountDeliveryRecoveryMarkerError {
     Retryable,
     Closed,
 }
@@ -285,40 +285,40 @@ enum AccountDeliveryEvent {
 /// overflow generation. The account identity never leaves the private route
 /// registry; callers see only counts, queue depth, and elapsed time.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct AccountDeliveryOverflow {
-    pub(crate) generation: u64,
-    pub(crate) marker_token: u64,
-    pub(crate) dropped: u64,
+pub struct AccountDeliveryOverflow {
+    pub generation: u64,
+    pub marker_token: u64,
+    pub dropped: u64,
     /// Earliest wire `created_at` among this generation's dropped
     /// deliveries, or `None` when any of them is unknown.
-    pub(crate) earliest_dropped: Option<u64>,
-    pub(crate) notification_losses: u64,
-    pub(crate) notification_token: u64,
+    pub earliest_dropped: Option<u64>,
+    pub notification_losses: u64,
+    pub notification_token: u64,
     /// Lowest REQ `since` floor among this generation's notification lags, or
     /// `None` when any lag's floor is unknown.
-    pub(crate) notification_floor: Option<u64>,
-    pub(crate) queue_depth: usize,
-    pub(crate) elapsed_ms: u64,
+    pub notification_floor: Option<u64>,
+    pub queue_depth: usize,
+    pub elapsed_ms: u64,
 }
 
 /// Cumulative placements one account queue made, as counts only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct AccountDeliveryPlacementCounts {
-    pub(crate) spilled_below_floor: u64,
-    pub(crate) spilled_queue_full: u64,
-    pub(crate) spill_already_seen: u64,
-    pub(crate) queue_dropped: u64,
+pub struct AccountDeliveryPlacementCounts {
+    pub spilled_below_floor: u64,
+    pub spilled_queue_full: u64,
+    pub spill_already_seen: u64,
+    pub queue_dropped: u64,
 }
 
 #[derive(Debug)]
-pub(crate) enum AccountDeliveryReceive {
+pub enum AccountDeliveryReceive {
     Delivery(Box<TransportDelivery>),
     Overflow(AccountDeliveryOverflow),
 }
 
 /// What woke a waiting account consumer.
 #[derive(Debug)]
-pub(crate) enum AccountDeliveryWait {
+pub enum AccountDeliveryWait {
     Received(AccountDeliveryReceive),
     /// Spilled rows became durable while the queue was empty.
     SpillReady,
@@ -326,12 +326,12 @@ pub(crate) enum AccountDeliveryWait {
 }
 
 /// Keeps one account's delivery-loss state alive and compares it by identity.
-#[cfg(test)]
-pub(crate) struct DeliveryOverflowIdentity(Arc<AccountDeliveryOverflowState>);
+#[cfg(any(test, feature = "test-support"))]
+pub struct DeliveryOverflowIdentity(Arc<AccountDeliveryOverflowState>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl DeliveryOverflowIdentity {
-    pub(crate) fn same_as(&self, other: &Self) -> bool {
+    pub fn same_as(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
@@ -1282,7 +1282,7 @@ impl MarmotRelayPlane {
         Self::new_with_loopback(subscription_rebuild_lookback, relay_client, false)
     }
 
-    pub(crate) fn new_with_loopback(
+    pub fn new_with_loopback(
         subscription_rebuild_lookback: Option<Duration>,
         relay_client: Arc<dyn NostrRelayClient>,
         allow_loopback: bool,
@@ -1298,8 +1298,8 @@ impl MarmotRelayPlane {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_with_directory_fetcher_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_with_directory_fetcher_for_test(
         subscription_rebuild_lookback: Option<Duration>,
         relay_client: Arc<dyn NostrRelayClient>,
         directory_fetcher: Arc<dyn DirectoryRelayFetcher>,
@@ -1383,7 +1383,7 @@ impl MarmotRelayPlane {
         self.account_adapter_with_recovery_marker(account_id, publish_client, None, None)
     }
 
-    pub(crate) fn account_adapter_with_recovery_marker(
+    pub fn account_adapter_with_recovery_marker(
         &self,
         account_id: MemberId,
         publish_client: Arc<dyn NostrRelayClient>,
@@ -1467,12 +1467,12 @@ impl MarmotRelayPlane {
 
     /// Place one delivery exactly as the router does, synchronously, so a
     /// test can land it at a chosen point inside a cursor commit.
-    #[cfg(test)]
-    pub(crate) fn route_account_delivery_for_test(&self, delivery: TransportDelivery) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn route_account_delivery_for_test(&self, delivery: TransportDelivery) {
         route_account_delivery(&self.inner.transport, delivery);
     }
 
-    pub(crate) fn sanitize_relay_endpoints(
+    pub fn sanitize_relay_endpoints(
         &self,
         endpoints: Vec<TransportEndpoint>,
         context: &str,
@@ -1564,7 +1564,7 @@ impl MarmotRelayPlane {
     /// consumes a shared report another account could record.
     /// Drain the relay refusals of `account`'s live subscriptions since the
     /// last drain, for its `subscription_refused` audit row.
-    pub(crate) fn take_subscription_refusals(
+    pub fn take_subscription_refusals(
         &self,
         account: &MemberId,
     ) -> transport_nostr_adapter::SubscriptionRefusalReports {
@@ -1574,7 +1574,7 @@ impl MarmotRelayPlane {
             .take_subscription_refusals(account)
     }
 
-    pub(crate) fn take_eose_repair_reports(
+    pub fn take_eose_repair_reports(
         &self,
         account: &MemberId,
         shared: bool,
@@ -1680,7 +1680,7 @@ impl MarmotRelayPlane {
     /// is cancelled first, the reaper's `deactivate_account_context` retires
     /// the same context before a replacement may register; detached work here
     /// could instead remove that replacement's context.
-    pub(crate) async fn retire_account_session_transport(&self, account_id: &MemberId) {
+    pub async fn retire_account_session_transport(&self, account_id: &MemberId) {
         let forwarder = self
             .inner
             .transport
@@ -1699,7 +1699,7 @@ impl MarmotRelayPlane {
 
     /// Retire a stopped account worker's subscriptions and immutable SDK
     /// authenticator before a replacement worker can register a fresh signer.
-    pub(crate) async fn deactivate_account_context(
+    pub async fn deactivate_account_context(
         &self,
         account_id: &MemberId,
     ) -> Result<(), TransportAdapterError> {
@@ -1781,7 +1781,7 @@ impl MarmotRelayPlane {
     /// a [`RelayExportConsent`] and ask the adapter to reverse-map indices to
     /// relay URLs. No other code path turns a device-local index into a relay
     /// URL. See the privacy contract in `relay-observability.md`.
-    pub(crate) async fn resolve_relay_labels(
+    pub async fn resolve_relay_labels(
         &self,
         gate: &dyn RelayExportGate,
     ) -> Option<RelayLabelResolution> {
@@ -1821,7 +1821,7 @@ impl MarmotRelayPlane {
         rollup_from_snapshots(spread, sync, metrics, health, engine)
     }
 
-    pub(crate) async fn fetch_directory_events(
+    pub async fn fetch_directory_events(
         &self,
         endpoints: Vec<TransportEndpoint>,
         queries: Vec<DirectoryEventQuery>,
@@ -1839,7 +1839,7 @@ impl MarmotRelayPlane {
     /// Bounded read of public events for a message-content reference. Relay
     /// hints come from other people's messages, so every endpoint passes the
     /// discovered-endpoint safety rule; unsafe ones are dropped, not fatal.
-    pub(crate) async fn fetch_public_events(
+    pub async fn fetch_public_events(
         &self,
         endpoints: Vec<TransportEndpoint>,
         filters: Vec<Filter>,
@@ -1855,7 +1855,7 @@ impl MarmotRelayPlane {
         directory::fetch_public_events(&endpoints, filters, max_events).await
     }
 
-    pub(crate) async fn fetch_directory_events_with_completion(
+    pub async fn fetch_directory_events_with_completion(
         &self,
         endpoints: Vec<TransportEndpoint>,
         queries: Vec<DirectoryEventQuery>,
@@ -1870,7 +1870,7 @@ impl MarmotRelayPlane {
             .await
     }
 
-    pub(crate) async fn inspect_directory_events(
+    pub async fn inspect_directory_events(
         &self,
         endpoint: TransportEndpoint,
         query: DirectoryEventQuery,
@@ -1897,7 +1897,7 @@ impl MarmotRelayPlane {
     /// another account published; see
     /// [`RelaySafetyPolicy::retain_safe_endpoints`]. What survives is still
     /// sanitized at the dial chokepoint.
-    pub(crate) fn retain_safe_discovered_endpoints(
+    pub fn retain_safe_discovered_endpoints(
         &self,
         endpoints: Vec<TransportEndpoint>,
         context: &str,
@@ -1907,13 +1907,11 @@ impl MarmotRelayPlane {
             .retain_safe_endpoints(endpoints, context)
     }
 
-    pub(crate) fn subscribe_directory_events(
-        &self,
-    ) -> broadcast::Receiver<DirectoryRelayPlaneEvent> {
+    pub fn subscribe_directory_events(&self) -> broadcast::Receiver<DirectoryRelayPlaneEvent> {
         self.inner.transport.directory_events.subscribe()
     }
 
-    pub(crate) async fn sync_directory_user_subscriptions(
+    pub async fn sync_directory_user_subscriptions(
         &self,
         plan: DirectorySyncPlan,
         force_rebuild: bool,
@@ -2229,8 +2227,8 @@ impl MarmotRelayPlane {
         *router = Some(handle);
     }
 
-    #[cfg(test)]
-    pub(crate) async fn handle_relay_event_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn handle_relay_event_for_test(
         &self,
         relay_event: transport_nostr_adapter::NostrRelayEvent,
     ) -> Result<usize, TransportAdapterError> {
@@ -2241,8 +2239,8 @@ impl MarmotRelayPlane {
             .await
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_account_delivery_recovery_marker_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_account_delivery_recovery_marker_for_test(
         &self,
         account_id: &MemberId,
         marker: AccountDeliveryRecoveryMarker,
@@ -2256,8 +2254,8 @@ impl MarmotRelayPlane {
     }
 
     /// Exercise the loss tier directly: a full queue omits instead of spilling.
-    #[cfg(test)]
-    pub(crate) fn disable_account_delivery_spill_for_test(&self, account_id: &MemberId) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn disable_account_delivery_spill_for_test(&self, account_id: &MemberId) -> bool {
         let mut routes = account_deliveries_write(&self.inner.transport.account_deliveries);
         routes
             .get_mut(account_id)
@@ -2269,8 +2267,8 @@ impl MarmotRelayPlane {
     /// way [`handle_relay_notification`] does for an SDK-backed plane. An
     /// injected relay client produces no relay messages of its own, so tests
     /// that need a subscription's end of stored events drive this seam.
-    #[cfg(test)]
-    pub(crate) async fn handle_relay_eose_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn handle_relay_eose_for_test(
         &self,
         endpoint: TransportEndpoint,
         subscription_id: String,
@@ -2284,8 +2282,8 @@ impl MarmotRelayPlane {
 
     /// Report a relay's `CLOSED` for one subscription on one endpoint, the
     /// way the SDK notification forwarder does.
-    #[cfg(test)]
-    pub(crate) async fn handle_relay_closed_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn handle_relay_closed_for_test(
         &self,
         endpoint: TransportEndpoint,
         subscription_id: String,
@@ -2300,8 +2298,8 @@ impl MarmotRelayPlane {
 
     /// Drive every managed account worker through its receive-error reconnect
     /// path: an unexpected notification consumer exit closes inbound delivery.
-    #[cfg(test)]
-    pub(crate) fn simulate_notification_consumer_exit_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn simulate_notification_consumer_exit_for_test(&self) {
         recover_relay_notification_forwarder(
             &self.inner.transport,
             RelayNotificationConsumerExit::Closed,
@@ -2311,8 +2309,8 @@ impl MarmotRelayPlane {
     /// Record a lag on one account's notification consumer, as its scoped
     /// forwarder does with the floor its SDK context read at the lag. Inbound
     /// delivery stays open.
-    #[cfg(test)]
-    pub(crate) fn simulate_notification_lag_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn simulate_notification_lag_for_test(
         &self,
         account_id: &MemberId,
         skipped_notifications: u64,
@@ -2328,8 +2326,8 @@ impl MarmotRelayPlane {
 
     /// Shorten how long a receiver must go without another lag before its
     /// lag-lost EOSE repair runs.
-    #[cfg(test)]
-    pub(crate) fn set_eose_repair_settle_for_test(&self, settle: Duration) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_eose_repair_settle_for_test(&self, settle: Duration) {
         self.inner
             .transport
             .eose_repair_settle_ms
@@ -2338,14 +2336,14 @@ impl MarmotRelayPlane {
 
     /// The SDK relay client the plane runs on, for tests that build a whole
     /// app and so cannot reach the plane's private state.
-    #[cfg(test)]
-    pub(crate) fn sdk_relay_client_for_test(&self) -> Option<NostrSdkRelayClient> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn sdk_relay_client_for_test(&self) -> Option<NostrSdkRelayClient> {
         self.inner.transport.sdk_relay_client.clone()
     }
 
     /// Unexpected notification-consumer exits the plane has recorded.
-    #[cfg(test)]
-    pub(crate) fn notification_forwarder_unexpected_exits_for_test(&self) -> u64 {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn notification_forwarder_unexpected_exits_for_test(&self) -> u64 {
         self.inner
             .transport
             .notification_forwarder_health
@@ -3369,7 +3367,7 @@ fn push_eose_repair_report(transport: &RelayPlaneTransport, report: EoseRepairRe
 }
 
 impl MarmotRelayPlaneAccountAdapter {
-    pub(super) async fn publish_signed_event(
+    pub async fn publish_signed_event(
         &self,
         fallback: &dyn NostrRelayClient,
         endpoints: &[TransportEndpoint],
@@ -3509,7 +3507,7 @@ impl MarmotRelayPlaneAccountAdapter {
 
     /// Explicit catch-up must reissue even settled, matching subscriptions.
     /// Cancellation leaves reuse disabled until an activation succeeds.
-    pub(crate) async fn require_fresh_activation(&self) {
+    pub async fn require_fresh_activation(&self) {
         *self.incremental_activation.lock().await = None;
     }
 
@@ -3518,13 +3516,13 @@ impl MarmotRelayPlaneAccountAdapter {
     /// id), and the key its registrations bucket under on the shared relay
     /// plane. Draining the `subscription_rebuild` row uses this so a rebuild is
     /// attributed to exactly the account whose subscribes produced it.
-    pub(crate) fn account_id(&self) -> &MemberId {
+    pub fn account_id(&self) -> &MemberId {
         &self.account_id
     }
 
     /// Read only the live activation ordinal for worker-owned comparison
     /// admission. An SDK connection generation is a different lifetime.
-    pub(crate) async fn account_subscription_attempt(&self) -> Option<SubscriptionAttempt> {
+    pub async fn account_subscription_attempt(&self) -> Option<SubscriptionAttempt> {
         self.relay_plane
             .inner
             .transport
@@ -3533,7 +3531,7 @@ impl MarmotRelayPlaneAccountAdapter {
             .await
     }
 
-    pub(crate) async fn reconcile_inbox_history(
+    pub async fn reconcile_inbox_history(
         &self,
         endpoints: Vec<TransportEndpoint>,
         local_items: &[NostrReconciliationItem],
@@ -3590,7 +3588,7 @@ impl MarmotRelayPlaneAccountAdapter {
         Ok(Some(result?))
     }
 
-    pub(crate) async fn reconcile_group_history(
+    pub async fn reconcile_group_history(
         &self,
         group: TransportGroupSubscription,
         local_items: &[NostrReconciliationItem],
@@ -3658,7 +3656,7 @@ impl MarmotRelayPlaneAccountAdapter {
     /// coverage. Relays send the page newest first, so only a page a relay
     /// ended itself holds its oldest events; a relay cut short by a budget or
     /// the deadline, and a request the plane refuses, contribute nothing.
-    pub(crate) async fn acquire_group_window(
+    pub async fn acquire_group_window(
         &self,
         transport_group_id: [u8; 32],
         endpoints: Vec<TransportEndpoint>,
@@ -3705,7 +3703,7 @@ impl MarmotRelayPlaneAccountAdapter {
 
     /// This account's deliveries for one owned comparison event. The worker
     /// admits them directly, never through the live queue.
-    pub(crate) async fn recovered_deliveries(
+    pub async fn recovered_deliveries(
         &self,
         event: transport_nostr_adapter::NostrRelayEvent,
     ) -> Result<Vec<TransportDelivery>, TransportAdapterError> {
@@ -3720,7 +3718,7 @@ impl MarmotRelayPlaneAccountAdapter {
     /// Install a group's post-join maintenance REQ, floored at `since` so a
     /// notification lag while it is live stays bounded. `None` requests the
     /// group's full history.
-    pub(crate) async fn install_group_maintenance_subscription(
+    pub async fn install_group_maintenance_subscription(
         &self,
         group: TransportGroupSubscription,
         recovery_attempt: u64,
@@ -3754,7 +3752,7 @@ impl MarmotRelayPlaneAccountAdapter {
             .await
     }
 
-    pub(crate) async fn group_maintenance_any_eose(&self, subscription_id: &str) -> Option<bool> {
+    pub async fn group_maintenance_any_eose(&self, subscription_id: &str) -> Option<bool> {
         self.relay_plane
             .inner
             .transport
@@ -3765,7 +3763,7 @@ impl MarmotRelayPlaneAccountAdapter {
 
     /// Operational capability identity only; SDK presence proves neither
     /// endpoint availability nor exhaustive historical coverage.
-    pub(crate) fn recovery_comparison_capability_key(&self) -> &'static [u8] {
+    pub fn recovery_comparison_capability_key(&self) -> &'static [u8] {
         if self.relay_plane.inner.transport.sdk_relay_client.is_some() {
             b"sdk-bounded-comparison-v1"
         } else {
@@ -3773,7 +3771,7 @@ impl MarmotRelayPlaneAccountAdapter {
         }
     }
 
-    pub(crate) async fn group_maintenance_endpoint_eose(
+    pub async fn group_maintenance_endpoint_eose(
         &self,
         subscription_id: &str,
         endpoint: &TransportEndpoint,
@@ -3791,7 +3789,7 @@ impl MarmotRelayPlaneAccountAdapter {
     ///
     /// The epoch-gap backfill drain reads this to tell a relay that has
     /// finished replaying stored history from one that has simply gone quiet.
-    pub(crate) async fn account_subscription_eose(&self) -> AccountSubscriptionEose {
+    pub async fn account_subscription_eose(&self) -> AccountSubscriptionEose {
         let mut eose = self
             .relay_plane
             .inner
@@ -3805,7 +3803,7 @@ impl MarmotRelayPlaneAccountAdapter {
         eose
     }
 
-    pub(crate) async fn receive_account_delivery(
+    pub async fn receive_account_delivery(
         &self,
     ) -> Result<Option<AccountDeliveryReceive>, TransportAdapterError> {
         let event = self.delivery_rx.lock().await.recv().await;
@@ -3813,7 +3811,7 @@ impl MarmotRelayPlaneAccountAdapter {
     }
 
     /// The next queued item, if one is ready now.
-    pub(crate) fn try_receive_account_delivery(&self) -> Option<AccountDeliveryReceive> {
+    pub fn try_receive_account_delivery(&self) -> Option<AccountDeliveryReceive> {
         let event = self.delivery_rx.try_lock().ok()?.try_recv().ok()?;
         Some(self.account_delivery_receive(event))
     }
@@ -3821,7 +3819,7 @@ impl MarmotRelayPlaneAccountAdapter {
     /// Wait for a queued item, or for spilled rows to become durable. A
     /// pending spill wakeup wins, so a continuously ready live queue cannot
     /// hide it; it fires once per writer batch, so live input is not starved.
-    pub(crate) async fn receive_account_delivery_or_spill(&self) -> AccountDeliveryWait {
+    pub async fn receive_account_delivery_or_spill(&self) -> AccountDeliveryWait {
         let mut delivery_rx = self.delivery_rx.lock().await;
         tokio::select! {
             biased;
@@ -3863,7 +3861,7 @@ impl MarmotRelayPlaneAccountAdapter {
     /// its current cursor. The restart floor rises here, before the commit's
     /// save runs, so a delivery that arrives during that save and falls below
     /// it is spilled rather than queued.
-    pub(crate) fn seal_transport_cursor(&self, candidate: Option<u64>) -> Option<u64> {
+    pub fn seal_transport_cursor(&self, candidate: Option<u64>) -> Option<u64> {
         self.delivery_overflow.seal_cursor(
             self.delivery_epoch,
             self.cursor_lookback_secs(),
@@ -3880,13 +3878,13 @@ impl MarmotRelayPlaneAccountAdapter {
     /// or its queue generation ends. An event this
     /// queue holds no pin for, such as one read back from the spill, has
     /// nothing to release.
-    pub(crate) fn release_account_delivery(&self, id: &MessageId) {
+    pub fn release_account_delivery(&self, id: &MessageId) {
         self.delivery_overflow.release(self.delivery_epoch, id);
     }
 
     /// A sealed commit's save failed and `restored` is still the persisted
     /// cursor. Undo the floor its seal raised.
-    pub(crate) fn unseal_transport_cursor(&self, restored: Option<u64>) {
+    pub fn unseal_transport_cursor(&self, restored: Option<u64>) {
         self.delivery_overflow
             .unseal_cursor(self.cursor_lookback_secs(), restored);
     }
@@ -3896,13 +3894,13 @@ impl MarmotRelayPlaneAccountAdapter {
     /// and the router stops spilling below. `reached` is what the seal
     /// returned, not the cursor the commit persisted, which may be an earlier
     /// live promotion's. A live commit never settles.
-    pub(crate) fn settle_transport_cursor(&self, reached: Option<u64>) {
+    pub fn settle_transport_cursor(&self, reached: Option<u64>) {
         self.delivery_overflow
             .settle_cursor(self.cursor_lookback_secs(), reached, false);
     }
 
     /// Record the cursor the account opened with.
-    pub(crate) fn open_transport_cursor(&self, persisted: Option<u64>) {
+    pub fn open_transport_cursor(&self, persisted: Option<u64>) {
         self.delivery_overflow
             .settle_cursor(self.cursor_lookback_secs(), persisted, true);
     }
@@ -3911,7 +3909,7 @@ impl MarmotRelayPlaneAccountAdapter {
     /// with, or one a drain checkpoint, settled loss or retired notice made
     /// durable. Only the account worker settles, so this cannot change
     /// between the worker's read and its next seal.
-    pub(crate) fn transport_cursor_settled(&self) -> bool {
+    pub fn transport_cursor_settled(&self) -> bool {
         self.delivery_overflow
             .inner
             .lock()
@@ -3924,7 +3922,7 @@ impl MarmotRelayPlaneAccountAdapter {
     /// Cumulative account-queue placement counts for the transport-cursor
     /// audit row. Relaxed counters: a reader sees a recent value, never a
     /// torn one, and the row reports differences between two reads.
-    pub(crate) fn delivery_placement_counts(&self) -> AccountDeliveryPlacementCounts {
+    pub fn delivery_placement_counts(&self) -> AccountDeliveryPlacementCounts {
         let metrics = &self.delivery_overflow.metrics;
         AccountDeliveryPlacementCounts {
             spilled_below_floor: metrics.spill_diverted_below_floor.load(Ordering::Relaxed),
@@ -3936,13 +3934,13 @@ impl MarmotRelayPlaneAccountAdapter {
 
     /// Process-local overflow evidence becomes visible at the exact omission,
     /// before marker I/O or the queued control record can complete.
-    pub(crate) fn notification_loss_persisted(&self, observed: AccountDeliveryOverflow) {
+    pub fn notification_loss_persisted(&self, observed: AccountDeliveryOverflow) {
         self.delivery_overflow.notification_persisted(observed);
     }
 
     /// Unacknowledged loss, or a spilled delivery that is not yet durable,
     /// keeps the transport cursor from advancing.
-    pub(crate) fn delivery_loss_blocks_cursor(&self) -> bool {
+    pub fn delivery_loss_blocks_cursor(&self) -> bool {
         let state = self
             .delivery_overflow
             .inner
@@ -3951,7 +3949,7 @@ impl MarmotRelayPlaneAccountAdapter {
         state.pending || state.spill_in_flight > 0
     }
 
-    pub(crate) fn unpersisted_notification_loss(&self) -> Option<AccountDeliveryOverflow> {
+    pub fn unpersisted_notification_loss(&self) -> Option<AccountDeliveryOverflow> {
         let state = self
             .delivery_overflow
             .inner
@@ -3963,7 +3961,7 @@ impl MarmotRelayPlaneAccountAdapter {
 
     /// Whether a queued or deferred control record will still report the
     /// pending loss generation to this account's consumer.
-    pub(crate) fn delivery_overflow_signal_outstanding(&self) -> bool {
+    pub fn delivery_overflow_signal_outstanding(&self) -> bool {
         let state = self
             .delivery_overflow
             .inner
@@ -3972,21 +3970,21 @@ impl MarmotRelayPlaneAccountAdapter {
         state.pending && state.signal_queued
     }
 
-    pub(crate) fn pending_delivery_overflow(&self) -> Option<AccountDeliveryOverflow> {
+    pub fn pending_delivery_overflow(&self) -> Option<AccountDeliveryOverflow> {
         self.delivery_overflow.pending_snapshot()
     }
 
     /// This account's delivery-loss state, so a test can check that a
     /// replacement adapter inherited it rather than starting fresh.
-    #[cfg(test)]
-    pub(crate) fn delivery_overflow_identity_for_test(&self) -> DeliveryOverflowIdentity {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn delivery_overflow_identity_for_test(&self) -> DeliveryOverflowIdentity {
         DeliveryOverflowIdentity(self.delivery_overflow.clone())
     }
 
     /// Notification losses this account's delivery route has recorded,
     /// whether or not a loss is still pending.
-    #[cfg(test)]
-    pub(crate) fn notification_losses_for_test(&self) -> u64 {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn notification_losses_for_test(&self) -> u64 {
         self.delivery_overflow
             .inner
             .lock()
@@ -3996,7 +3994,7 @@ impl MarmotRelayPlaneAccountAdapter {
 
     /// Begin (or resume after process restart) the recovery job required by a
     /// durable account-delivery loss marker.
-    pub(crate) fn start_delivery_overflow_recovery(
+    pub fn start_delivery_overflow_recovery(
         &self,
         durable_marker_token: u64,
     ) -> AccountDeliveryOverflow {
@@ -4006,42 +4004,39 @@ impl MarmotRelayPlaneAccountAdapter {
     /// Resolve only the exact overflow prefix the replay started against. A
     /// newer omitted delivery keeps the generation pending and forces another
     /// unfloored attempt.
-    pub(crate) fn finish_delivery_overflow_recovery(
+    pub fn finish_delivery_overflow_recovery(
         &self,
         attempt: AccountDeliveryOverflow,
     ) -> Option<u64> {
         self.delivery_overflow.finish_recovery(attempt)
     }
 
-    pub(crate) fn restore_delivery_overflow_guard(&self, durable_marker_token: u64) {
+    pub fn restore_delivery_overflow_guard(&self, durable_marker_token: u64) {
         self.delivery_overflow
             .restore_recovery_guard(durable_marker_token);
     }
 
-    pub(crate) fn record_delivery_overflow_recovery_success(&self, elapsed_ms: u64) {
+    pub fn record_delivery_overflow_recovery_success(&self, elapsed_ms: u64) {
         self.delivery_overflow.record_recovery_success(elapsed_ms);
     }
 
     /// The pending loss generation, including one a recovery attempt holds.
-    pub(crate) fn pending_delivery_overflow_generation(&self) -> Option<AccountDeliveryOverflow> {
+    pub fn pending_delivery_overflow_generation(&self) -> Option<AccountDeliveryOverflow> {
         self.delivery_overflow.pending_generation()
     }
 
     /// Release the cursor fence for loss the account owner retired, only if
     /// `observed` is still exactly the pending generation. Never counts a
     /// recovery success. Returns true when no plane loss remains pending.
-    pub(crate) fn retire_delivery_overflow(
-        &self,
-        observed: Option<AccountDeliveryOverflow>,
-    ) -> bool {
+    pub fn retire_delivery_overflow(&self, observed: Option<AccountDeliveryOverflow>) -> bool {
         self.delivery_overflow.retire_recovery(observed)
     }
 
-    pub(crate) fn fail_delivery_overflow_recovery(&self) {
+    pub fn fail_delivery_overflow_recovery(&self) {
         self.delivery_overflow.fail_recovery();
     }
 
-    pub(crate) async fn remove_group_maintenance_subscription(
+    pub async fn remove_group_maintenance_subscription(
         &self,
         subscription_id: &str,
     ) -> Result<(), TransportAdapterError> {

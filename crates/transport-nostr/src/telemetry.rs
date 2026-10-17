@@ -143,7 +143,7 @@ pub struct EngineReorgMetrics {
 
 /// Reshape the adapter snapshots into the export-ready rollup. Pure so the
 /// aggregation is unit-testable without a live relay plane.
-pub(crate) fn rollup_from_snapshots(
+pub fn rollup_from_snapshots(
     spread: RelayDeliverySpread,
     sync: RelaySyncSnapshot,
     metrics: NostrAdapterMetrics,
