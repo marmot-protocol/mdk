@@ -23,8 +23,11 @@ The crate is split by which side owns each table; see the
 | `src/app/transport/` | App storage specific to one transport (NIP-77, NIP-51, relay-plane spill, NIP-59 outbox, QUIC sequences, prepared Blossom uploads), kept together for a later move. |
 | `src/shared.rs`, `src/shared/` | The separate shared database. |
 
-Put new code on the side that owns its tables. Code that must touch both sides goes in `cross/` once step 4 PR 3 adds
-it; until then, name any new crossing in the PR description.
+Put new code on the side that owns its tables. `src/base/boundary_tests.rs` fails on any crossing between the sides
+(SQL naming the other side's tables, a `crate::` path or a `self` call into the other side, or a cross-side foreign key
+or trigger) that is missing from `src/cross/allow-list.txt`, and on a listed one that no longer occurs. Do not add a
+line to make a change pass: code that must touch both sides goes in `cross/` once step 4 PR 3 adds it, and until then
+a new line needs its reason in the PR description. A new table needs an owner in `src/base/table_owners.rs`.
 
 ## Key files
 
@@ -34,6 +37,7 @@ it; until then, name any new crossing in the PR description.
 | `src/base/codec.rs` | JSON serialization helpers and SQLite error mapping. |
 | `src/base/migrations.rs` | Rust migration runner and migration tests. |
 | `src/base/test_support.rs` | Shared storage test fixtures for both sides' tests. |
+| `src/base/table_owners.rs`, `src/base/boundary_tests.rs`, `src/cross/allow-list.txt` | The owning side of every table; the boundary tests and the crossings still to move. |
 | `src/base/migrations/` | Numbered Rust migration bodies plus upgrade/query-work tests; see its local `AGENTS.md`. |
 | `src/protocol/storage/` | Marmot engine storage tables by concern; see its local `AGENTS.md`. |
 | `src/protocol/storage/snapshots/` | Snapshot/checkpoint capture, restoration and the consistent replay-state fingerprint; see its local `AGENTS.md`. |
