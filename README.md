@@ -173,29 +173,27 @@ cargo test -p <crate>        # targeted tests for the crate you changed
 just ci                      # full local parity with GitHub CI (slow)
 ```
 
-Pull requests run native tests for changed workspace crates and their transitive
-dependents, using the `ci-pr` nextest profile. It retains ordinary regressions and
-focused CLI/runtime journeys while deferring named scale cases and exhaustive
-matrices. Changes to Rust test sources use `ci-full` for the affected crates.
-Direct edits to CLI or app code also run that crate's complete dedicated
-integration suite. Dependency-only consumers retain the focused journeys.
-Shared build inputs and unknown paths fall back to the full workspace. Formatting,
-dependency audit, contract checks and workspace clippy keep their existing coverage.
-This first pass still compiles the workspace test archive with the existing unified
-features; selection reduces test execution, not the workspace compilation gate.
+Pull requests run a pre-check of a few minutes: formatting, the static and
+contract gates, dependency audit, workspace clippy and the WASM build. They run
+no tests. The merge queue runs the full matrix on the exact commit it merges:
+workspace tests with the `ci-full` nextest profile, the CLI and relay end-to-end
+suites, simulator lanes, C bindings, iOS clippy, Windows filesystem contracts,
+Tamarin, Hermes and installer checks. `Required CI` must pass there before a
+change lands. Master pushes run CI only to refresh the Rust dependency caches
+that pull requests and merge groups restore, and only when `Cargo.lock`, a
+`Cargo.toml`, the toolchain pin, Cargo config or `ci.yml` changes.
 
-Add `ci:full` and re-run all jobs to request full workspace tests and complete
-Android/Apple candidate packaging. For packaging alone, use `ci:android` or
-`ci:apple`, then re-run all candidate-workflow jobs or push a new commit. Ordinary
-PRs skip complete native candidate packaging, including Android target compilation
+Add `ci:full` and re-run all jobs to run the full matrix on a pull request,
+along with complete Android/Apple candidate packaging. `ci:apple` adds the iOS
+clippy lane and Apple packaging, and `ci:android` adds Android packaging; for
+packaging, re-run all candidate-workflow jobs or push a new commit. Ordinary PRs
+skip complete native candidate packaging, including Android target compilation
 and linking; use the opt-in when a change needs that signal before merging.
-`master`, merge groups and manual
-main-CI runs use `ci-full`; master CI runs are not cancelled by later pushes,
-including while queued. Existing nightly and weekly campaigns retain their wider
-coverage. These profiles do not change local `just test` or `just ci` selection.
-Preserving every master test run can increase queues during merge bursts,
-especially on the shared macOS runners. Broker image publishing stays serialized
-per ref so an older build cannot overwrite a newer `latest` image.
+Candidate packaging also runs on master when its inputs change, and weekly.
+Existing nightly and weekly campaigns retain their wider coverage. These
+profiles do not change local `just test` or `just ci` selection. Broker image
+publishing stays serialized per ref so an older build cannot overwrite a newer
+`latest` image.
 
 Common targeted runs:
 

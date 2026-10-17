@@ -205,5 +205,51 @@ class PackagingPolicyTests(unittest.TestCase):
                 self.assertEqual(result.returncode == 0, expected)
 
 
+class MergeGatePolicyTests(unittest.TestCase):
+    def test_only_the_merge_queue_and_opt_ins_select_the_full_matrix(self):
+        script = workflow_step("ci.yml", "Select CI mode")
+        for event, full_label, expected in [
+            ("pull_request", "false", "precheck"),
+            ("pull_request", "true", "full"),
+            ("merge_group", "false", "full"),
+            ("workflow_dispatch", "false", "full"),
+            ("push", "false", "warm"),
+        ]:
+            with self.subTest(event=event, full_label=full_label), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "output"
+                subprocess.run(["bash", "-c", script], check=True, capture_output=True, timeout=10,
+                               env={**os.environ, "EVENT_NAME": event, "FULL_CI": full_label,
+                                    "GITHUB_OUTPUT": str(output)})
+                self.assertEqual(output.read_text(), f"ci_mode={expected}\n")
+
+    def test_required_ci_rejects_skipped_jobs_in_full_runs(self):
+        script = workflow_step("ci.yml", "Require every selected core CI job to succeed")
+        passed = {"changes": {"result": "success"}, "rust-test": {"result": "success"}}
+        skipped = {**passed, "rust-test": {"result": "skipped"}}
+        failed = {**passed, "rust-test": {"result": "failure"}}
+        for event, mode, needs, expected in [
+            ("pull_request", "precheck", skipped, True),
+            ("pull_request", "precheck", failed, False),
+            ("pull_request", "full", skipped, False),
+            ("merge_group", "full", passed, True),
+            ("merge_group", "full", skipped, False),
+            ("merge_group", "precheck", skipped, False),
+            ("merge_group", "", skipped, False),
+            ("push", "warm", skipped, True),
+        ]:
+            with self.subTest(event=event, mode=mode, needs=needs):
+                result = subprocess.run(["bash", "-c", script], capture_output=True, timeout=10,
+                                        env={**os.environ, "EVENT_NAME": event, "CI_MODE": mode,
+                                             "NEEDS": json.dumps(needs)})
+                self.assertEqual(result.returncode == 0, expected)
+
+    def test_required_ci_aggregates_every_job(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        jobs = set(re.findall(r"(?m)^  ([a-z0-9-]+):$", workflow.split("\njobs:\n", 1)[1]))
+        required = workflow.split("\n  required-ci:\n", 1)[1].split("\n    needs:\n", 1)[1]
+        needs = set(re.findall(r"(?m)^      - ([a-z0-9-]+)$", required.split("\n    runs-on:", 1)[0]))
+        self.assertEqual(needs, jobs - {"required-ci"})
+
+
 if __name__ == "__main__":
     unittest.main()
