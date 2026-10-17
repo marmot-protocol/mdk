@@ -137,7 +137,9 @@ header and native library. Acceptance is local ownership, not peer receipt.
 
 `upload_media_files_with_client_token` has the same admission contract for
 file-backed attachments (`source_path` instead of a plaintext byte array). Every
-attachment is snapshotted, encrypted and uploaded before admission. Its
+attachment is stored in the account's media store and uploaded before
+admission; a source the disk cannot hold fails with `StorageFull` and admits
+nothing. Its
 `MediaFileTransferControlFfi` is the only cancellation input. Cancellation
 observed before admission starts returns an error and admits nothing; an upload
 that already completed is left unreferenced on the server. Dropping the host's

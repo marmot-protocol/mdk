@@ -277,6 +277,14 @@ pub enum MarmotKitError {
     /// new `Marmot` when the app resumes.
     #[error("storage closed: {details}")]
     StorageClosed { details: String },
+    /// The device has no room for this operation: free space would fall
+    /// below the configured disk reserve, or the volume or database is full.
+    /// A send refuses an attachment its disk cannot stage, before anything
+    /// is uploaded or published (mdk#2314). Typed so hosts can tell the user
+    /// to free space instead of reporting a generic failure; retry once
+    /// space is available.
+    #[error("storage full: {details}")]
+    StorageFull { details: String },
     /// The account exists but its raw private key could not be located in the
     /// keystore — e.g. a public-only / watch-only account, or a secret that was
     /// never loaded. Distinct, typed variant (#543) so a key-backup surface can
@@ -601,6 +609,11 @@ impl From<&AppError> for MarmotKitError {
             AppError::Storage(storage_err) if storage_err.is_closed() => Self::StorageClosed {
                 details: storage_err.to_string(),
             },
+            AppError::Storage(storage_err @ cgka_traits::StorageError::Capacity(_)) => {
+                Self::StorageFull {
+                    details: storage_err.to_string(),
+                }
+            }
             AppError::ExternalSignerUnavailable(account) => Self::ExternalSignerUnavailable {
                 account: account.clone(),
             },
@@ -680,6 +693,11 @@ impl MarmotKitError {
             EngineError::Storage(storage_err) if storage_err.is_closed() => Self::StorageClosed {
                 details: storage_err.to_string(),
             },
+            EngineError::Storage(storage_err @ cgka_traits::StorageError::Capacity(_)) => {
+                Self::StorageFull {
+                    details: storage_err.to_string(),
+                }
+            }
             other => Self::Runtime {
                 details: other.to_string(),
             },
@@ -982,6 +1000,22 @@ mod tests {
             matches!(ffi, MarmotKitError::StorageBusy { .. }),
             "direct AppError::Storage(Busy) must map to StorageBusy, got {ffi:?}"
         );
+    }
+
+    #[test]
+    fn a_full_disk_crosses_ffi_as_storage_full() {
+        let app_err = AppError::Storage(StorageError::Capacity("no room".to_string()));
+        assert!(matches!(
+            MarmotKitError::from(app_err),
+            MarmotKitError::StorageFull { .. }
+        ));
+        let engine_err = AppError::Account(AccountError::Engine(EngineError::Storage(
+            StorageError::Capacity("no room".to_string()),
+        )));
+        assert!(matches!(
+            MarmotKitError::from(engine_err),
+            MarmotKitError::StorageFull { .. }
+        ));
     }
 
     #[test]

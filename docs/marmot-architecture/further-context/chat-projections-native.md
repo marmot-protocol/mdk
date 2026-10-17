@@ -1,7 +1,7 @@
 ---
 title: "Native chat-list and account-attention handoff"
 created: 2026-09-14
-updated: 2026-09-19
+updated: 2026-10-17
 status: implementation
 ---
 
@@ -58,7 +58,7 @@ complete native navigation contract. Do not persist sequences as restart tokens.
 page. `ChatWindowInvalidLimit` and `ChatWindowAnchorOutside` reject bad commands.
 `ChatWindowClosed` requires reopening. `ChatWindowQuery` reports a terminal internal
 navigation failure. App failures retain the existing typed errors, including
-StorageBusy, StorageClosed and RuntimeStopping. Runtime read failures retain the
+StorageBusy, StorageClosed, StorageFull and RuntimeStopping. Runtime read failures retain the
 refresh/retry behavior documented by M2/M3; an account-catalog error is a stream
 error, not an empty account set.
 

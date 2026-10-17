@@ -324,3 +324,87 @@ fn an_upload_whose_slots_are_already_filled_is_released() {
     assert!(!media.path(&id).exists());
     assert_eq!(media.file_state(&first_id).unwrap(), Some(FileState::Ready));
 }
+
+/// The message owning `message`'s upload, as admission records it.
+fn protect(store: &SqliteAccountStorage, message: &str) {
+    let tag: Vec<String> = serde_json::from_value(selected(message).slot).unwrap();
+    store
+        .protect_attachment_uploads(GROUP, message, &[tag])
+        .unwrap();
+}
+
+/// The worker's promotion page lists a file-backed upload only once a sent
+/// message owns it, in token order, resuming after its cursor.
+#[test]
+fn owned_file_backed_uploads_are_paged_for_promotion() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let media = media(&dir, &store);
+    let (first, first_file) = staged_send(&store, &media, "first");
+    let (second, _) = staged_send(&store, &media, "second");
+    assert!(
+        store.attachment_upload_owners(None, 8).unwrap().is_empty(),
+        "an unowned upload waits for its message"
+    );
+    protect(&store, "first");
+    protect(&store, "second");
+    // The fixture's sends share one descriptor, so each message owns both
+    // uploads: four (upload, message) pairs.
+    let all = store.attachment_upload_owners(None, 8).unwrap();
+    let key =
+        |owner: &crate::AttachmentUploadOwner| (owner.token.clone(), owner.message_id_hex.clone());
+    let mut sorted = all.iter().map(key).collect::<Vec<_>>();
+    sorted.sort();
+    assert_eq!(all.iter().map(key).collect::<Vec<_>>(), sorted);
+    assert_eq!(all.len(), 4);
+    assert!(all.iter().any(|owner| owner.token == second));
+    assert!(
+        all.iter()
+            .filter(|owner| owner.token == first)
+            .all(|owner| owner.file == first_file)
+    );
+    let mut paged = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store.attachment_upload_owners(after.as_ref(), 1).unwrap();
+        let Some(last) = page.last().cloned() else {
+            break;
+        };
+        paged.extend(page);
+        after = Some(last);
+    }
+    assert_eq!(paged, all);
+}
+
+/// An upload whose staged file was lost is deleted, with the lost row, so
+/// its message downloads its own media; a present file is never dropped.
+#[test]
+fn an_upload_with_a_lost_file_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let media = media(&dir, &store);
+    let (token, id) = staged_send(&store, &media, "lost");
+    protect(&store, "lost");
+    assert!(!store.drop_lost_attachment_upload(&token, id).unwrap());
+    std::fs::remove_file(media.path(&id)).unwrap();
+    assert!(media.open_staged_reader(&id).unwrap().is_none());
+    assert_eq!(media.file_state(&id).unwrap(), Some(FileState::Lost));
+    assert_eq!(
+        media
+            .promote(
+                &store.attachment_upload_promotion(GROUP, "lost", &token, || 12),
+                id
+            )
+            .unwrap(),
+        PromoteOutcome::Superseded
+    );
+    assert!(store.drop_lost_attachment_upload(&token, id).unwrap());
+    assert_eq!(store.attachment_upload_file(&token).unwrap(), None);
+    assert_eq!(media.file_state(&id).unwrap(), None);
+    assert!(
+        !store
+            .attachment_source_has_upload(GROUP, "lost", 0)
+            .unwrap(),
+        "the slot no longer waits for an upload"
+    );
+}

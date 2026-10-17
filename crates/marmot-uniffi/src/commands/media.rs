@@ -145,7 +145,10 @@ impl Marmot {
     }
 
     /// Encrypt plaintext attachments, upload the ciphertext blobs, and
-    /// optionally send the resulting media references into the group.
+    /// optionally send the resulting media references into the group. Each
+    /// body is first kept in the account's encrypted media store; one the disk
+    /// cannot hold beyond its reserve fails with `StorageFull` before anything
+    /// is uploaded.
     pub async fn upload_media(
         &self,
         account_ref: String,
@@ -161,10 +164,13 @@ impl Marmot {
         upload.try_into().map_err(media_reference_error)
     }
 
-    /// File-backed `upload_media`: each `source_path` is snapshotted and
-    /// encrypted into private temporary files with bounded buffers before the
-    /// first upload, so large attachments never cross the FFI as byte arrays.
-    /// Ordered server fallback re-sends the identical ciphertext. `control`
+    /// File-backed `upload_media`: each `source_path` is copied into the
+    /// account's encrypted media store with bounded buffers before the first
+    /// upload, so large attachments never cross the FFI as byte arrays, and
+    /// the ciphertext streams from that copy without being written to disk.
+    /// A source the disk cannot hold beyond its reserve fails with
+    /// `StorageFull` before anything is uploaded. Ordered server fallback
+    /// re-sends the identical ciphertext. `control`
     /// reports progress and cancels preparation, transfer and fallback; a
     /// cancellation observed before message admission starts returns an error
     /// and nothing is published. Admission is not interruptible once started.

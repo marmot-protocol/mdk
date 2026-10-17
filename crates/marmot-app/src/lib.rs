@@ -6680,7 +6680,7 @@ impl MarmotApp {
         // Keep source/retention and chat-list refresh atomic: a refresh failure
         // must leave the accepted fanout able to reconstruct its completion.
         let storage = self.account_storage(label)?;
-        cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+        let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
             let storage_update = storage.record_app_event_with_source(
                 &stored_app_event_from_projection(message, received_at),
                 message.retention,
@@ -6695,7 +6695,12 @@ impl MarmotApp {
                 );
             }
             self.app_projection_update(label, storage_update)
-        })
+        })?;
+        if message.direction == "sent" {
+            // The worker promotes the message's staged uploads.
+            self.presentation_signals.wake();
+        }
+        Ok(update)
     }
 
     /// Reconcile a local publication with its engine-stamped source authority.
@@ -6707,7 +6712,7 @@ impl MarmotApp {
     ) -> Result<AppProjectionUpdate, AppError> {
         let now = unix_now_seconds();
         let storage = self.account_storage(label)?;
-        cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+        let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
             let storage_update = storage.record_app_event_with_source(
                 &stored_app_event_from_projection(message, now),
                 message.retention,
@@ -6722,7 +6727,12 @@ impl MarmotApp {
                 );
             }
             self.app_projection_update(label, storage_update)
-        })
+        })?;
+        if message.direction == "sent" {
+            // The worker promotes the message's staged uploads.
+            self.presentation_signals.wake();
+        }
+        Ok(update)
     }
 
     /// Finalize accepted source authority and retry outgoing byte promotion even
@@ -6768,6 +6778,8 @@ impl MarmotApp {
                 .map(|update| self.app_projection_update(label, update))
                 .transpose()
         })?;
+        // The worker promotes the message's staged uploads.
+        self.presentation_signals.wake();
         if update.is_some()
             && let Some(observation) = observation
         {

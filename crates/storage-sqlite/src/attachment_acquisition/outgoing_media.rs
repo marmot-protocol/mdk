@@ -18,6 +18,23 @@ use super::outgoing::{MAX_STAGED_UPLOADS, UPLOAD_TTL_SECONDS, staging_has_unfulf
 use super::*;
 use crate::media_catalog::{STATE_STAGED, attach_slot, catalog_error};
 
+/// A file-backed upload and one published message that owns it: what the
+/// worker promotes ([`SqliteAccountStorage::attachment_upload_promotion`]).
+#[derive(Clone, PartialEq, Eq)]
+pub struct AttachmentUploadOwner {
+    pub token: Vec<u8>,
+    pub group_id_hex: String,
+    pub message_id_hex: String,
+    pub file: FileId,
+}
+
+impl std::fmt::Debug for AttachmentUploadOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachmentUploadOwner")
+            .finish_non_exhaustive()
+    }
+}
+
 /// The outgoing upload row that owns one staged body.
 pub struct AttachmentUploadStage {
     storage: SqliteAccountStorage,
@@ -85,6 +102,86 @@ impl SqliteAccountStorage {
             .optional()
             .storage()?;
         Ok(file.flatten().and_then(|id| FileId::from_slice(&id)))
+    }
+
+    /// Up to `limit` file-backed uploads owned by a sent message of a
+    /// confirmed group, in `(token, group, message)` order after `after`.
+    /// The worker pages through them with its own cursor and promotes each;
+    /// the promotion target applies every other fence.
+    pub fn attachment_upload_owners(
+        &self,
+        after: Option<&AttachmentUploadOwner>,
+        limit: usize,
+    ) -> StorageResult<Vec<AttachmentUploadOwner>> {
+        let (token, group, message) = after.map_or((&[][..], "", ""), |owner| {
+            (
+                owner.token.as_slice(),
+                owner.group_id_hex.as_str(),
+                owner.message_id_hex.as_str(),
+            )
+        });
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT o.token,o.group_id_hex,o.message_id_hex,u.file_id
+                 FROM outgoing_attachment_upload_owners o
+                 JOIN outgoing_attachment_uploads u ON u.token=o.token
+                 JOIN app_events a ON a.group_id_hex=o.group_id_hex AND a.message_id_hex=o.message_id_hex
+                 JOIN account_groups g ON g.group_id_hex=o.group_id_hex
+                 WHERE u.file_id IS NOT NULL AND a.direction='sent' AND g.pending_confirmation=0
+                 AND (o.token,o.group_id_hex,o.message_id_hex)>(?1,?2,?3)
+                 ORDER BY o.token,o.group_id_hex,o.message_id_hex LIMIT ?4",
+            )
+            .storage()?;
+        let rows = stmt
+            .query_map(
+                params![
+                    token,
+                    group,
+                    message,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(token, group_id_hex, message_id_hex, file)| {
+                Some(AttachmentUploadOwner {
+                    token,
+                    group_id_hex,
+                    message_id_hex,
+                    file: FileId::from_slice(&file)?,
+                })
+            })
+            .collect())
+    }
+
+    /// Deletes upload `token` if its file `file` was lost (missing or
+    /// corrupt): no owner can be served from it, so its messages fall back
+    /// to downloading their own media. The lost row goes with it unless a
+    /// slot still references it. Returns whether the upload was deleted.
+    pub fn drop_lost_attachment_upload(&self, token: &[u8], file: FileId) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let deleted = self
+                .lock()?
+                .execute(
+                    "DELETE FROM outgoing_attachment_uploads WHERE token=?1 AND file_id=?2
+                     AND EXISTS(SELECT 1 FROM media_files WHERE id=?2 AND state=2)",
+                    params![token, file.as_bytes().as_slice()],
+                )
+                .storage()?;
+            Ok(deleted == 1)
+        })
     }
 
     /// The stage target of the upload `token`.

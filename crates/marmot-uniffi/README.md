@@ -981,8 +981,12 @@ whole-file byte array across the binding. `uploadMediaFilesWithClientToken`
 preserves durable local-send admission; probe `localSendStatus` after an unknown
 outcome before another upload. Keep the host source valid until return, use one
 `MediaFileTransferControlFfi` per operation, and explicitly cancel it rather than
-only dropping the host's wait. All sources are privately snapshotted before PUT.
-The counter is monotonic processed bytes, not a percentage.
+only dropping the host's wait. Every source is copied into the account's
+encrypted media store before PUT, and the ciphertext streams from that copy
+without being written to disk. A source the disk cannot hold beyond the
+attachment policy's disk reserve fails with `StorageFull` before anything is
+uploaded; ask the user to free space. The counter is monotonic processed bytes
+(copy, digest pass, then transfer), not a percentage.
 
 Cancellation observed before message admission starts prevents publication.
 Admission is not interruptible once started, including while durable acceptance
@@ -996,8 +1000,9 @@ fall through, while signer denial and cancellation stop the operation. An
 explicit endpoint override intentionally selects only that endpoint. Receiver
 acquisition streams large bodies into private files, resumes protected ciphertext
 where valid, and authenticates before publishing bounded readable local assets.
-Automatic transfer policy and account retention quotas remain separate. Preview
-limits and the legacy byte-array API bounds are not increased.
+The stored copy becomes the sender's local attachment once the message is
+confirmed, with no retention budget. Preview limits and the legacy byte-array
+API bounds are not increased.
 
 See [the upload reference](API-REFERENCE.md#marmotupload_media_files) and
 [local-send ownership](LOCAL-SENDS.md). C hosts use the

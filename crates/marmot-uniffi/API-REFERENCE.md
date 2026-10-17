@@ -2213,9 +2213,9 @@ Backward-compatible single-attachment send helper. Prefer `send_media_attachment
 pub async fn upload_media( &self, account_ref: String, group_id_hex: String, request: MediaUploadRequestFfi, ) -> Result<MediaUploadResultFfi, MarmotKitError>
 ```
 
-Encrypt plaintext attachments, upload the ciphertext blobs, and optionally send the resulting media references into the group.
+Encrypt plaintext attachments, upload the ciphertext blobs, and optionally send the resulting media references into the group. Each body is first kept in the account's encrypted media store, so the sender reads its own attachments locally once the message is confirmed; a body the disk cannot hold beyond the attachment policy's `disk_reserve` fails with `StorageFull` before anything is uploaded.
 
-[Source](src/commands/media.rs#L149)
+[Source](src/commands/media.rs#L152)
 
 ### `Marmot::upload_media_files`
 
@@ -2225,11 +2225,11 @@ Encrypt plaintext attachments, upload the ciphertext blobs, and optionally send 
 pub async fn upload_media_files( &self, account_ref: String, group_id_hex: String, request: MediaFileUploadRequestFfi, control: Arc<MediaFileTransferControlFfi>, ) -> Result<MediaUploadResultFfi, MarmotKitError>
 ```
 
-File-backed `upload_media` for large attachments. Each `source_path` (a regular file, not a symlink; `expected_size` must match when set) is snapshotted and encrypted into owner-only temporary files under the account directory with 64 KiB buffers before the first PUT, so plaintext never crosses the FFI as a byte array. Ordered server fallback re-sends identical ciphertext from offset 0; a server whose descriptor omits or mismatches `sha256`/`size` fails over. The batch ciphertext ceiling is `max_file_media_ciphertext_bytes()`, including each 16-byte AEAD tag. Optional local retention uses the file-backed bound and existing account quota; a retention failure does not reject an otherwise successful upload. Explicit large acquisitions stream ciphertext into private files and authenticate it before bounded local publication; resumable ciphertext checkpoints never grant readable plaintext. Legacy array APIs retain their smaller bounds. `control` reports monotonic `processed_bytes` and cancels preparation, transfer and fallback. There is no dedicated cancellation error variant: after an error, `control.is_cancelled()` distinguishes requested cancellation (`InvalidMediaReference`, detail `media transfer cancelled`). Snapshots are deleted on completion or failure; after a crash, the next account worker start or file upload removes snapshots older than 24 hours.
+File-backed `upload_media` for large attachments. Each `source_path` (a regular file, not a symlink; `expected_size` must match when set, and the file must not change while it is read) is copied into the account's encrypted media store with 64 KiB buffers before the first PUT, so plaintext never crosses the FFI as a byte array. A source the disk cannot hold beyond the attachment policy's `disk_reserve` fails with `StorageFull` before anything is uploaded. The ciphertext is never written to disk: one pass over the stored copy computes its digest, and each PUT streams it again. Ordered server fallback re-sends identical ciphertext from offset 0; a server whose descriptor omits or mismatches `sha256`/`size` fails over. The batch ciphertext ceiling is `max_file_media_ciphertext_bytes()`, including each 16-byte AEAD tag. The stored copy becomes the sender's local attachment once the message is confirmed; no retention budget applies. Explicit large acquisitions stream ciphertext into private files and authenticate it before bounded local publication; resumable ciphertext checkpoints never grant readable plaintext. Legacy array APIs retain their smaller bounds. `control` reports monotonic `processed_bytes` and cancels preparation, transfer and fallback. There is no dedicated cancellation error variant: after an error, `control.is_cancelled()` distinguishes requested cancellation (`InvalidMediaReference`, detail `media transfer cancelled`). A failed or cancelled upload deletes its stored copies; after a crash, the account worker's media sweep removes copies no upload owns, and an upload that is never sent expires after seven days. `processed_bytes` covers the copy, the digest pass and the transfer.
 
 File-backed uploads have no fixed worker-response timeout; per-endpoint network deadlines still apply. Cancellation observed before message admission starts prevents publication. Admission is not interruptible once started, including while durable acceptance is pending.
 
-[Source](src/commands/media.rs#L173)
+[Source](src/commands/media.rs#L179)
 
 ### `Marmot::download_media`
 
@@ -2241,7 +2241,7 @@ pub async fn download_media( &self, account_ref: String, group_id_hex: String, r
 
 Fetch an encrypted media blob and decrypt it using the group's encrypted media component secret.
 
-[Source](src/commands/media.rs#L203)
+[Source](src/commands/media.rs#L209)
 
 ### `Marmot::list_media`
 
@@ -2253,7 +2253,7 @@ pub fn list_media( &self, account_ref: String, group_id_hex: String, limit: Opti
 
 Typed media references projected from group message history. Host apps can pass a returned `reference` back to `download_media`.
 
-[Source](src/commands/media.rs#L224)
+[Source](src/commands/media.rs#L230)
 
 </details>
 
@@ -4481,7 +4481,7 @@ See [local sends](LOCAL-SENDS.md) for cancellation and epoch-bound media handlin
 pub async fn upload_media_files_with_client_token( &self, account_ref: String, group_id_hex: String, request: MediaFileUploadRequestFfi, control: Arc<MediaFileTransferControlFfi>, client_token: String, ) -> Result<MediaUploadSubmissionFfi, MarmotKitError>
 ```
 
-File-backed `upload_media_with_client_token`: every attachment is prepared and uploaded before durable token admission. Cancellation observed before admission starts returns an error and admits nothing. Once admission starts it is not interruptible, even before durable acceptance returns; follow `local_send_status` and timeline delivery, including uncertain-delivery handling. Admission rejects references from a source epoch that is no longer current. There is no fixed worker-response timeout; per-endpoint network deadlines still apply.
+File-backed `upload_media_with_client_token`: every attachment is stored locally and uploaded before durable token admission; a source the disk cannot hold fails with `StorageFull` before anything is uploaded. Cancellation observed before admission starts returns an error and admits nothing. Once admission starts it is not interruptible, even before durable acceptance returns; follow `local_send_status` and timeline delivery, including uncertain-delivery handling. Admission rejects references from a source epoch that is no longer current. There is no fixed worker-response timeout; per-endpoint network deadlines still apply.
 
 [Source](src/commands/local_submissions.rs#L178)
 
