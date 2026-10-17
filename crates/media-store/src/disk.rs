@@ -50,6 +50,12 @@ impl DiskPolicy {
         body
     }
 
+    /// Bytes a handoff copy of a `body`-byte attachment writes: the plaintext
+    /// file the host borrows.
+    pub fn handoff_need(body: u64) -> u64 {
+        body
+    }
+
     /// The inverse of [`Self::download_need`]: the fewest checkpointed bytes
     /// with which a download of `body` bytes still writes at most
     /// `available`, or `None` when even a complete checkpoint leaves too

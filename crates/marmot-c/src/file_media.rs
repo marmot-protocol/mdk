@@ -72,7 +72,7 @@ impl MarmotMediaFileUploadRequest {
 
 /// One operation's control. Query/cancel concurrently; never free during any call on the handle.
 pub struct MarmotMediaFileTransferControl {
-    inner: Arc<MediaFileTransferControlFfi>,
+    pub(crate) inner: Arc<MediaFileTransferControlFfi>,
 }
 impl CFree for MarmotMediaFileTransferControl {
     unsafe fn free_in_place(&mut self) {}
