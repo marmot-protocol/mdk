@@ -1290,7 +1290,6 @@ impl MarmotRelayPlane {
     }
 
     /// Call inside a Tokio runtime; see [`MarmotRelayPlane`].
-    #[doc(hidden)]
     pub fn new(
         subscription_rebuild_lookback: Option<Duration>,
         relay_client: Arc<dyn NostrRelayClient>,

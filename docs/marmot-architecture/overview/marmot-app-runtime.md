@@ -107,9 +107,10 @@ graceful cleanup.
 
 `marmot-app`'s integration suites (`crates/marmot-app/tests/`, including `relay_runtime`) drive whole runtimes on a
 two-worker multi-thread test runtime, so ordering that only holds on one thread fails in CI. A test that needs one
-thread stays on the current-thread flavor and says why. The unit-level suites under `src/runtime/` and in
-`transport-nostr` still run on one thread: many of them build exact interleavings, and they have not yet been made
-independent of scheduling.
+thread stays on the current-thread flavor and says why. The unit-level suites under `src/runtime/` still run on one
+thread: many of them build exact interleavings, and they have not yet been made independent of scheduling.
+`transport-nostr`'s suite runs on the same two-worker multi-thread runtime, apart from a few current-thread and
+paused-clock tests.
 
 ## Relay Plane And Adapter
 
