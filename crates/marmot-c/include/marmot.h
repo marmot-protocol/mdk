@@ -9874,7 +9874,7 @@ MarmotStatus marmot_media_file_transfer_control_is_cancelled(const struct Marmot
                                                              uint8_t *out);
 
 /**
- * Read monotonic processed bytes, not a percentage (preparation and retries can exceed file length).
+ * Read monotonic processed bytes, not a percentage (the copy, digest pass, transfer and retries can exceed file length).
  * # Safety
  * control must be live; out writable; no concurrent free.
  */

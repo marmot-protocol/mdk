@@ -5344,7 +5344,7 @@ Create one owned control per file upload. The required output is checked and cle
 MarmotStatus marmot_media_file_transfer_control_processed_bytes(const struct MarmotMediaFileTransferControl *control, uint64_t *out);
 ```
 
-Read monotonic processed bytes into a required cleared output. Preparation, encryption and retries can exceed the source length; this is not a percentage. Query concurrently without freeing the handle.
+Read monotonic processed bytes into a required cleared output. It counts the copy into the encrypted media store, the digest pass and the transfer, including retries, so it can exceed the source length; this is not a percentage. Query concurrently without freeing the handle.
 
 [Header contract](include/marmot.h#L9881)
 
