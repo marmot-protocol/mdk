@@ -366,9 +366,6 @@ fn selected_attachments_tx(
     .collect()
 }
 
-/// Post-commit wakeup only; consumers reload the durable selected revision.
-pub type MessageDraftCommitObserver = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
-
 pub(crate) enum DraftAcceptance<'a> {
     Payload(&'a [u8]),
     Event(&'a str),

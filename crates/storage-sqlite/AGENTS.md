@@ -5,14 +5,15 @@ recovery-ledger contracts: [`README.md`](README.md).
 
 ## Scope
 
-`SqliteAccountStorage` implements `cgka_traits::StorageProvider` with Marmot metadata and custom OpenMLS storage in one
-encrypted SQLite database. One database file belongs to one Marmot account-device identity. App storage has its
-own handle, `SqliteAppStorage` (`src/app/handle.rs`): it shares the account's connection, and
-`SqliteAccountStorage::app_storage()` (`src/cross/handles.rs`) is the only way to get one. Every app and transport
-method is on it. `SqliteAccountStorage` keeps the protocol traits, the open and close lifecycle, and the `cross/`
-entry points that span both sides (`delete_local_group_data`, the draft observer's setter). A new app method goes on
-`SqliteAppStorage`; one that must also touch protocol state in the same transaction goes in `cross/`. Protocol and
-base code never call `app_storage()`; the names test treats that call as a crossing. `shared.rs`'s
+`SqliteAccountStorage` (`src/protocol/handle.rs`) implements `cgka_traits::StorageProvider` with Marmot metadata and
+custom OpenMLS storage in one encrypted SQLite database. One database file belongs to one Marmot account-device
+identity. App storage has its own handle, `SqliteAppStorage` (`src/app/handle.rs`): it shares the account's connection,
+and `SqliteAccountStorage::app_storage()` (`src/cross/handles.rs`) is the only way to get one. Every app and transport
+method is on it. `SqliteAccountStorage` keeps the protocol traits, the open and close lifecycle, and the `cross/` entry
+points that span both sides (`delete_local_group_data`, the draft observer's setter). A new app method goes on
+`SqliteAppStorage`; one that must also touch protocol state in the same transaction goes in `cross/`. Protocol and base
+code never call `app_storage()`, and app code outside `cross/` never names `SqliteAccountStorage` or a trait protocol
+code implements for it; the names test treats each as a crossing (tests may hold both handles). `shared.rs`'s
 `SqliteSharedStorage` is a deliberate exception: a separate, non-account-scoped database for cross-identity state — do
 not "fix" it into the per-account database.
 
@@ -24,7 +25,7 @@ The crate is split by which side owns each table; see the
 | Folder | Holds |
 | --- | --- |
 | `src/base/` | Connection, codec, migration runner and bodies, open progress, test support. Both sides build on it. |
-| `src/protocol/` | The engine's storage: the `StorageProvider` impls (`provider.rs`), `storage/` and `openmls_storage/`. |
+| `src/protocol/` | The engine's storage: its handle (`handle.rs`), the `StorageProvider` impls (`provider.rs`), `storage/` and `openmls_storage/`. |
 | `src/app/` | App storage: projections, timeline, chat list, recovery ledger, drafts, attachments, avatars, media catalog. |
 | `src/app/transport/` | App storage specific to one transport (NIP-77, NIP-51, relay-plane spill, NIP-59 outbox, QUIC sequences, prepared Blossom uploads), kept together for a later move. |
 | `src/cross/` | Code that must touch both sides in one transaction, one named function per crossing; its `README.md` lists them. |
@@ -40,11 +41,13 @@ reason in the PR description. A new table needs an owner in `src/base/table_owne
 
 | Path | Owns |
 | --- | --- |
-| `src/base/connection.rs` | SQLCipher key application, operational PRAGMAs, options, aggregate handle. |
+| `src/base/connection.rs` | SQLCipher key application, operational PRAGMAs, options, the shared connection and opening an account database. |
+| `src/protocol/handle.rs` | `SqliteAccountStorage`, the engine's handle: open, close and the lifecycle around the shared connection. |
+| `src/app/handle.rs` | `SqliteAppStorage`, the app side's handle over the same connection. |
 | `src/base/codec.rs` | JSON serialization helpers and SQLite error mapping. |
 | `src/base/migrations.rs` | Rust migration runner and migration tests. |
 | `src/base/test_support.rs` | Shared storage test fixtures for both sides' tests. |
-| `src/base/table_owners.rs`, `src/base/boundary_tests.rs`, `src/cross/allow-list.txt` | The owning side of every table; the boundary tests and the crossings still to move. |
+| `src/base/table_owners.rs`, `src/base/boundary_tests.rs`, `src/cross/allow-list.txt` | The owning side of every table; the boundary tests and the crossings that stay. |
 | `src/base/migrations/` | Numbered Rust migration bodies plus upgrade/query-work tests; see its local `AGENTS.md`. |
 | `src/protocol/storage/` | Marmot engine storage tables by concern; see its local `AGENTS.md`. |
 | `src/protocol/storage/snapshots/` | Snapshot/checkpoint capture, restoration and the consistent replay-state fingerprint; see its local `AGENTS.md`. |
@@ -71,7 +74,7 @@ reason in the PR description. A new table needs an owner in `src/base/table_owne
 | `src/app/attachment_acquisition/outgoing_media.rs` | File-backed outgoing uploads on the media store (mdk#2314 step 3): `reserve_attachment_upload`, `AttachmentUploadStage` (the upload row as the staged file's owner) and `AttachmentUploadPromotion` (the message's slot fences, attaching the file instead of copying bytes). Rows with `file_id` carry no bytes; legacy rows keep `outgoing.rs`'s promotion until they expire. No retained-byte budget. |
 | `src/app/attachment_acquisition/checkpoint.rs` | `AttachmentCheckpoint`: a claimed job's checkpoint as the media store's `CheckpointTarget`. The store drives the file and the order of steps; each target call is one transaction under the job's fences. |
 | `src/app/media_catalog.rs` | The account database's side of the [`media-store`](../media-store/AGENTS.md) crate: `media_files`/`media_file_refs` rows (migration 0110), the `MediaCatalog` impl, per-use `PublishTarget`s and their one-transaction ready commits, reference release. Runs the crate's catalog conformance suite. No media file I/O here. |
-| `src/app/media_store_bench.rs`, `examples/media_store_bench.rs` | `media-store-benchmarks` feature: the `media-store` file format against the SQLCipher retained path, runnable on devices (mdk#2314 step 0). |
+| `src/media_store_bench.rs`, `examples/media_store_bench.rs` | `media-store-benchmarks` feature: the `media-store` file format against the SQLCipher retained path, runnable on devices (mdk#2314 step 0). |
 | `src/app/attachment_history.rs` | Bounded canonical attachment-slot discovery and per-group revision-fenced cursors; source/visibility triggers maintain the derived index. |
 | `src/app/timeline.rs` | Materialized message-timeline aggregation; `timeline/` holds capture, edits, opening (`conversation_open` / `conversation_window`), presentation, and reports. |
 | `src/app/avatar_cache.rs` | Account-scoped encoded avatar storage, source generations, local reads and eviction; `avatar_cache/acquisition.rs` owns durable demand/retry state and `avatar_cache/access.rs` owns opaque screen targets/local metadata. |

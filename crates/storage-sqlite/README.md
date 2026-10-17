@@ -23,11 +23,11 @@ group snapshots and rollback must be atomic across Marmot records and group-scop
 The crate is split by which side owns each table (see the
 [step 4 brief](../../docs/marmot-architecture/review/brief-storage-boundaries.md)):
 
-- `base/` — SQLCipher keying, connection setup and options, the aggregate `SqliteAccountStorage` handle, the codec,
-  and the account/session migration runner with its numbered bodies (`base/migrations/`).
-- `protocol/` — the engine's storage: the `StorageProvider` impls, `storage/` (Marmot engine tables by concern:
-  groups, messages, snapshots, outbound intents, Welcomes, capabilities, convergence, maintenance, transport routes and
-  more) and `openmls_storage/` (the custom OpenMLS adapter).
+- `base/` — SQLCipher keying, connection setup and options, opening an account database, the codec, and the
+  account/session migration runner with its numbered bodies (`base/migrations/`).
+- `protocol/` — the engine's storage: its handle `SqliteAccountStorage` (`handle.rs`), the `StorageProvider` impls,
+  `storage/` (Marmot engine tables by concern: groups, messages, snapshots, outbound intents, Welcomes, capabilities,
+  convergence, maintenance, transport routes and more) and `openmls_storage/` (the custom OpenMLS adapter).
 - `app/` — app-facing projections and account state: account event projection, chat list, the materialized timeline
   and conversation opening, message drafts, attachments, avatar cache, encrypted-media secrets, account recovery, and
   `media_catalog.rs`, the metadata for the encrypted per-file media store in the

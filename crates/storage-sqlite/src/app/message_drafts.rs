@@ -1,8 +1,7 @@
 pub(crate) mod revisioned;
 pub use revisioned::{
-    ChatListDraftVersion, MessageDraftCommitObserver, MessageDraftRevision,
-    MessageDraftRevisionError, SelectedMessageDraft, SelectedMessageDraftAttachment,
-    SelectedMessageDraftContent,
+    ChatListDraftVersion, MessageDraftRevision, MessageDraftRevisionError, SelectedMessageDraft,
+    SelectedMessageDraftAttachment, SelectedMessageDraftContent,
 };
 
 #[cfg(test)]

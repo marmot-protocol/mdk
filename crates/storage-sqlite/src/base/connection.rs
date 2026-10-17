@@ -1,4 +1,3 @@
-use crate::protocol::openmls_storage::SqliteOpenMlsStorage;
 use crate::{SqliteResultExt, base::migrations};
 use cgka_traits::storage::{StorageError, StorageResult};
 use std::fmt;
@@ -1043,21 +1042,6 @@ impl fmt::Debug for SqlCipherKey {
     }
 }
 
-#[derive(Clone)]
-pub struct SqliteAccountStorage {
-    pub(crate) draft_commit_observer:
-        Arc<Mutex<Option<crate::app::message_drafts::revisioned::MessageDraftCommitObserver>>>,
-    migrations_applied: usize,
-    migration_duration: Duration,
-    pub(crate) connection: SharedConnection,
-    pub(crate) openmls: SqliteOpenMlsStorage,
-}
-
-#[deprecated(
-    note = "renamed to SqliteAccountStorage; SqliteStorage will be removed once downstream crates have migrated"
-)]
-pub type SqliteStorage = SqliteAccountStorage;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqliteStorageOptions {
     pub busy_timeout_ms: u64,
@@ -1119,244 +1103,128 @@ impl SqliteSynchronous {
     }
 }
 
-impl SqliteAccountStorage {
-    /// Neutral open-time result. Existing ledger entries are not new migrations.
-    pub fn migration_summary(&self) -> (usize, Duration) {
-        (self.migrations_applied, self.migration_duration)
-    }
+/// An account database opened, keyed and migrated, before a handle wraps it.
+pub(crate) struct OpenedAccount {
+    pub(crate) connection: SharedConnection,
+    pub(crate) migrations_applied: usize,
+    pub(crate) migration_duration: Duration,
+}
 
-    /// Export one group's convergence/OpenMLS state, including any durable
-    /// convergence pass, for a sensitive test-only replay capsule.
-    #[cfg(feature = "test-conformance-replay")]
-    pub fn export_conformance_replay_snapshot(
-        &self,
-        group_id: &cgka_traits::types::GroupId,
-    ) -> StorageResult<Vec<u8>> {
-        crate::protocol::storage::snapshots::export_replay(self, group_id)
-    }
+/// Open an in-memory account database with `options` and every migration.
+pub(crate) fn open_account_in_memory(
+    options: SqliteStorageOptions,
+) -> StorageResult<OpenedAccount> {
+    let connection = rusqlite::Connection::open_in_memory().storage()?;
+    apply_cipher_pragmas(&connection, &options)?;
+    finish_account_open(connection, options, None)
+}
 
-    /// Restore a sensitive test-only conformance replay snapshot into this
-    /// account-device database.
-    #[cfg(feature = "test-conformance-replay")]
-    pub fn import_conformance_replay_snapshot(
-        &self,
-        group_id: &cgka_traits::types::GroupId,
-        snapshot: &[u8],
-    ) -> StorageResult<()> {
-        crate::protocol::storage::snapshots::import_replay(self, group_id, snapshot)
+/// Test-only in-memory database copied from one migrated template per
+/// process. Harnesses that open thousands of short-lived databases would
+/// otherwise replay every migration for each. Opening the copy still runs
+/// the migration ledger check, which finds nothing to apply.
+#[cfg(feature = "test-migrated-template")]
+pub(crate) fn open_account_in_memory_from_migrated_template(
+    options: SqliteStorageOptions,
+) -> StorageResult<OpenedAccount> {
+    static TEMPLATE: std::sync::OnceLock<Mutex<rusqlite::Connection>> = std::sync::OnceLock::new();
+    if TEMPLATE.get().is_none() {
+        let template_options = SqliteStorageOptions {
+            cipher_memory_security: false,
+            ..options.clone()
+        };
+        let mut template = rusqlite::Connection::open_in_memory().storage()?;
+        apply_cipher_pragmas(&template, &template_options)?;
+        apply_operational_pragmas(&template, &template_options)?;
+        migrations::run_all_observed(&mut template, None)?;
+        // A concurrent first caller may win; either template is complete.
+        let _ = TEMPLATE.set(Mutex::new(template));
     }
+    let template = TEMPLATE
+        .get()
+        .expect("template was just initialized")
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut connection = rusqlite::Connection::open_in_memory().storage()?;
+    apply_cipher_pragmas(&connection, &options)?;
+    rusqlite::backup::Backup::new(&template, &mut connection)
+        .storage()?
+        .run_to_completion(std::ffi::c_int::MAX, Duration::ZERO, None)
+        .storage()?;
+    drop(template);
+    finish_account_open(connection, options, None)
+}
 
-    pub fn in_memory() -> StorageResult<Self> {
-        Self::in_memory_with_options(SqliteStorageOptions::default())
-    }
+/// Create private database files before opening and observing the unpublished connection.
+pub(crate) fn open_account_encrypted(
+    path: &Path,
+    key: &SqlCipherKey,
+    options: SqliteStorageOptions,
+    observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
+) -> StorageResult<OpenedAccount> {
+    ensure_private_db_files(path)?;
+    let connection = rusqlite::Connection::open(path).storage()?;
+    open_account_unkeyed(connection, key, options, observer)
+}
 
-    pub fn in_memory_with_options(options: SqliteStorageOptions) -> StorageResult<Self> {
-        let connection = rusqlite::Connection::open_in_memory().storage()?;
-        apply_cipher_pragmas(&connection, &options)?;
-        Self::from_connection_with_options(connection, options)
-    }
+/// Pin cipher configuration before key application, reporting each boundary before it can block.
+pub(crate) fn open_account_unkeyed(
+    connection: rusqlite::Connection,
+    key: &SqlCipherKey,
+    options: SqliteStorageOptions,
+    observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
+) -> StorageResult<OpenedAccount> {
+    crate::base::open_progress::observe(
+        observer,
+        crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::CipherConfiguration),
+    );
+    apply_cipher_pragmas(&connection, &options)?;
+    crate::base::open_progress::observe(
+        observer,
+        crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::CipherKeyApplication),
+    );
+    apply_sqlcipher_key(&connection, key)?;
+    finish_account_open(connection, options, observer)
+}
 
-    /// Test-only in-memory storage copied from one migrated template per
-    /// process. Harnesses that open thousands of short-lived databases would
-    /// otherwise replay every migration for each. Opening the copy still runs
-    /// the migration ledger check, which finds nothing to apply.
-    #[cfg(feature = "test-migrated-template")]
-    pub fn in_memory_from_migrated_template(options: SqliteStorageOptions) -> StorageResult<Self> {
-        static TEMPLATE: std::sync::OnceLock<Mutex<rusqlite::Connection>> =
-            std::sync::OnceLock::new();
-        if TEMPLATE.get().is_none() {
-            let template_options = SqliteStorageOptions {
-                cipher_memory_security: false,
-                ..options.clone()
-            };
-            let mut template = rusqlite::Connection::open_in_memory().storage()?;
-            apply_cipher_pragmas(&template, &template_options)?;
-            apply_operational_pragmas(&template, &template_options)?;
-            migrations::run_all_observed(&mut template, None)?;
-            // A concurrent first caller may win; either template is complete.
-            let _ = TEMPLATE.set(Mutex::new(template));
-        }
-        let template = TEMPLATE
-            .get()
-            .expect("template was just initialized")
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut connection = rusqlite::Connection::open_in_memory().storage()?;
-        apply_cipher_pragmas(&connection, &options)?;
-        rusqlite::backup::Backup::new(&template, &mut connection)
-            .storage()?
-            .run_to_completion(std::ffi::c_int::MAX, Duration::ZERO, None)
-            .storage()?;
-        drop(template);
-        Self::from_connection_with_options(connection, options)
-    }
+/// Apply operational settings and all pending migrations before sharing a closeable connection.
+pub(crate) fn finish_account_open(
+    mut connection: rusqlite::Connection,
+    options: SqliteStorageOptions,
+    observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
+) -> StorageResult<OpenedAccount> {
+    crate::base::open_progress::observe(
+        observer,
+        crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::OperationalPragmas),
+    );
+    apply_operational_pragmas(&connection, &options)?;
+    connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
+    let migration_started = std::time::Instant::now();
+    let migrations_applied = migrations::run_all_observed(&mut connection, observer)?;
+    let migration_duration = migration_started.elapsed();
+    Ok(OpenedAccount {
+        connection: SharedConnection::new(connection),
+        migrations_applied,
+        migration_duration,
+    })
+}
 
-    /// Open a private encrypted account store with the standard privacy and durability defaults.
-    pub fn open_encrypted(path: impl AsRef<Path>, key: &SqlCipherKey) -> StorageResult<Self> {
-        Self::open_encrypted_with_options(path, key, SqliteStorageOptions::default())
-    }
-
-    /// Apply the caller's cipher/operational options and pending migrations before publishing the store.
-    pub fn open_encrypted_with_options(
-        path: impl AsRef<Path>,
-        key: &SqlCipherKey,
-        options: SqliteStorageOptions,
-    ) -> StorageResult<Self> {
-        Self::open_encrypted_observed_options(path, key, options, None)
-    }
-
-    /// Observe fixed phases and migration numbers without exposing database paths, SQL or keys.
-    /// Callback faults are isolated; ordinary callers keep the same defaults and no callback.
-    pub fn open_encrypted_observed(
-        path: impl AsRef<Path>,
-        key: &SqlCipherKey,
-        observer: &dyn Fn(crate::StorageOpenProgress),
-    ) -> StorageResult<Self> {
-        Self::open_encrypted_observed_options(
-            path,
-            key,
-            SqliteStorageOptions::default(),
-            Some(observer),
-        )
-    }
-    /// Create private database files before opening and observing the unpublished connection.
-    fn open_encrypted_observed_options(
-        path: impl AsRef<Path>,
-        key: &SqlCipherKey,
-        options: SqliteStorageOptions,
-        observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
-    ) -> StorageResult<Self> {
-        let path = path.as_ref();
-        ensure_private_db_files(path)?;
-        let connection = rusqlite::Connection::open(path).storage()?;
-        Self::from_unkeyed_observed(connection, key, options, observer)
-    }
-    /// Exercise raw unkeyed connections with production keying defaults and no diagnostic callback.
-    #[cfg(test)]
-    fn from_unkeyed_encrypted_connection_with_options(
-        connection: rusqlite::Connection,
-        key: &SqlCipherKey,
-        options: SqliteStorageOptions,
-    ) -> StorageResult<Self> {
-        Self::from_unkeyed_observed(connection, key, options, None)
-    }
-    /// Pin cipher configuration before key application, reporting each boundary before it can block.
-    fn from_unkeyed_observed(
-        connection: rusqlite::Connection,
-        key: &SqlCipherKey,
-        options: SqliteStorageOptions,
-        observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
-    ) -> StorageResult<Self> {
-        crate::base::open_progress::observe(
-            observer,
-            crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::CipherConfiguration),
-        );
-        apply_cipher_pragmas(&connection, &options)?;
-        crate::base::open_progress::observe(
-            observer,
-            crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::CipherKeyApplication),
-        );
-        apply_sqlcipher_key(&connection, key)?;
-        Self::from_connection_observed(connection, options, observer)
-    }
-    /// Finish an existing connection without recording progress; options and migrations remain identical.
-    pub(crate) fn from_connection_with_options(
-        connection: rusqlite::Connection,
-        options: SqliteStorageOptions,
-    ) -> StorageResult<Self> {
-        Self::from_connection_observed(connection, options, None)
-    }
-    /// Apply operational settings and all pending migrations before sharing a closeable connection.
-    fn from_connection_observed(
-        mut connection: rusqlite::Connection,
-        options: SqliteStorageOptions,
-        observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
-    ) -> StorageResult<Self> {
-        crate::base::open_progress::observe(
-            observer,
-            crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::OperationalPragmas),
-        );
-        apply_operational_pragmas(&connection, &options)?;
-        connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
-        let migration_started = std::time::Instant::now();
-        let migrations_applied = migrations::run_all_observed(&mut connection, observer)?;
-        let migration_duration = migration_started.elapsed();
-        let connection = SharedConnection::new(connection);
-        let openmls = SqliteOpenMlsStorage::new(connection.clone());
-        Ok(Self {
-            connection,
-            openmls,
-            draft_commit_observer: Default::default(),
-            migrations_applied,
-            migration_duration,
-        })
-    }
-
+impl SharedConnection {
     /// Set an aggregate-only observer shared by all clones. No identities or SQL
     /// are passed. Install once per runtime; `None` disables observation.
-    pub fn set_timing_observer(&self, observer: Option<SqliteTimingObserver>) {
-        let mut slot = self
-            .connection
-            .inner
-            .timing
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    pub(crate) fn set_timing_observer(&self, observer: Option<SqliteTimingObserver>) {
+        let mut slot = self.inner.timing.lock().unwrap_or_else(|e| e.into_inner());
         *slot = observer;
-        self.connection
-            .inner
+        self.inner
             .timing_enabled
             .store(slot.is_some(), Ordering::Release);
     }
 
-    pub(crate) fn lock(&self) -> StorageResult<ConnectionGuard<'_>> {
-        self.connection.lock()
-    }
-
-    /// Whether `other` is a clone of this same opened database handle, not
-    /// merely another connection to the same file.
-    pub fn shares_connection_with(&self, other: &SqliteAccountStorage) -> bool {
-        self.connection.same_as(&other.connection)
-    }
-
-    /// Checkpoint the WAL and close this account database, releasing every
-    /// file lock it holds on the main database and its `-wal`/`-shm` sidecars.
-    ///
-    /// **Closing is terminal.** Every clone of this handle — including the
-    /// OpenMLS adapter reached through
-    /// [`StorageProvider::mls_storage`][cgka_traits::storage::StorageProvider::mls_storage]
-    /// and any clone held elsewhere in the process — fails with
-    /// [`StorageError::Closed`] from here on. Nothing reopens implicitly; to
-    /// use the database again, construct a new [`SqliteAccountStorage`].
-    ///
-    /// Callers should quiesce their own work first. Closing is nonetheless
-    /// safe under concurrent use: it waits out the statement currently
-    /// executing, and SQLite rolls back any transaction still open on another
-    /// thread as part of closing, so a partially applied transaction is not a
-    /// reachable outcome. Idempotent — later calls return `Ok(())`.
-    ///
-    /// This exists because dropping handles is not a usable close: the
-    /// connection lives behind an `Arc` shared by the engine, the OpenMLS
-    /// adapter, and app projections, so a host has no way to observe or await
-    /// the last clone going away. Hosts that must be provably lock-free at a
-    /// known instant need this — on iOS, a WAL connection left open across app
-    /// suspension holds a lock in the shared App Group container and the
-    /// process is killed with `0xdead10cc`.
-    pub fn close(&self) -> StorageResult<()> {
-        self.connection.close()
-    }
-
-    /// Whether [`Self::close`] has run on this database.
-    #[must_use]
-    pub fn is_closed(&self) -> bool {
-        self.connection.is_closed()
-    }
-
     /// A [`DatabaseCloser`] for this connection, shared by every clone.
-    #[must_use]
-    pub fn closer(&self) -> DatabaseCloser {
+    pub(crate) fn closer(&self) -> DatabaseCloser {
         DatabaseCloser {
-            target: CloserTarget::Account(Arc::downgrade(&self.connection.inner)),
-            release: self.connection.inner.connection.released.clone(),
+            target: CloserTarget::Account(Arc::downgrade(&self.inner)),
+            release: self.inner.connection.released.clone(),
         }
     }
 }
@@ -1594,6 +1462,7 @@ pub fn open_hardened_sqlcipher(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SqliteAccountStorage;
     use cgka_traits::storage::StorageProvider;
     use cgka_traits::types::Backend;
     use rusqlite::trace::{TraceEvent, TraceEventCodes};

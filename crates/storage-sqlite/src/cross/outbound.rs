@@ -2,9 +2,7 @@
 //! draft a confirmed message came from, consumed in the engine's transaction,
 //! and the draft observer the app registers.
 
-use crate::app::message_drafts::revisioned::{
-    DraftAcceptance, MessageDraftCommitObserver, accept_submission_tx,
-};
+use crate::app::message_drafts::revisioned::{DraftAcceptance, accept_submission_tx};
 use crate::{SqliteAccountStorage, SqliteAppStorage};
 use cgka_traits::storage::StorageResult;
 
@@ -40,6 +38,13 @@ pub(crate) fn accept_confirmed_event(
     )?;
     accept_submission_tx(conn, group_hex, DraftAcceptance::Event(app_event_id))
 }
+
+/// Post-commit wakeup only; consumers reload the durable selected revision.
+pub type MessageDraftCommitObserver = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+/// The account handle's slot for the app's draft observer, shared by every clone.
+pub(crate) type DraftObserverSlot =
+    std::sync::Arc<std::sync::Mutex<Option<MessageDraftCommitObserver>>>;
 
 /// Wakes the app's draft observer after a confirm that changed a draft.
 pub(crate) fn notify_draft_committed(storage: &SqliteAccountStorage, group_hex: &str) {

@@ -3,13 +3,6 @@
 # fails on a crossing missing from this list and on a listed one that no longer occurs.
 # See docs/marmot-architecture/review/brief-storage-boundaries.md.
 
-# Module paths that name the other side (the base handle names both: it holds the OpenMLS store and the draft observer).
-path base/connection.rs crate::app::message_drafts
-path base/connection.rs crate::protocol::openmls_storage
-path base/connection.rs crate::protocol::storage::snapshots
-
-# Calls through self or Self to a method the other side defines.
-
 # SQL naming the other side's tables. base/migrations.rs: the legacy migration 9 reconcile adds a column to two app tables.
 sql base/migrations.rs app_events
 sql base/migrations.rs message_timeline

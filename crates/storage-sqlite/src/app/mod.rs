@@ -12,8 +12,6 @@ pub(crate) mod group_system;
 pub(crate) mod handle;
 pub(crate) mod local_submissions;
 pub(crate) mod media_catalog;
-#[cfg(feature = "media-store-benchmarks")]
-pub mod media_store_bench;
 pub(crate) mod message_drafts;
 pub(crate) mod pending_welcome_delivery;
 pub(crate) mod recovery_health;
