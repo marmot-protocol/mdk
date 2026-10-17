@@ -12,6 +12,7 @@ use cgka_conformance_simulator::{
     SubjectInviteMembers, SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication,
     SubjectUpdateGroupData,
 };
+use cgka_traits::engine::{SupersededIntentKind, SupersededIntentOutcome};
 use serde_json::json;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -504,11 +505,20 @@ fn settled_edits(
         .collect()
 }
 
+/// Whether the runtime reported `client`'s racing command as saved.
+fn accepted(report: &ConcurrentMutationReport, client: &str) -> bool {
+    report
+        .outcomes
+        .iter()
+        .any(|outcome| outcome.client == client && outcome.accepted)
+}
+
 /// Which racing profile edits the runtime reported as saved but the settled
 /// public state does not contain. Convergence keeps one branch and parks the
-/// other; the parked committer's intent is not re-issued today, so a losing
-/// admin edit is dropped after its caller was told it succeeded (#1734). The
-/// strict journeys fail on this; the default journeys record it as evidence.
+/// other; since #1734 the parked committer re-issues an edit the winner left
+/// untouched, so a missing edit here was dropped after its caller was told it
+/// succeeded. The strict journeys fail on this; the default journeys record it
+/// as evidence.
 fn dropped_accepted_edits(
     report: &ConcurrentMutationReport,
     observations: &[AppRuntimeObservationV1],
@@ -516,15 +526,58 @@ fn dropped_accepted_edits(
 ) -> Vec<String> {
     edits
         .iter()
-        .filter(|(client, _, _)| {
-            report
-                .outcomes
-                .iter()
-                .any(|outcome| outcome.client == *client && outcome.accepted)
-        })
+        .filter(|(client, _, _)| accepted(report, client))
         .filter(|(_, field, value)| !edit_applied(observations, field, value))
         .map(|(client, field, _)| format!("{client}:{field}"))
         .collect()
+}
+
+/// Whether `client`'s latest superseded profile edit was re-queued, so its
+/// runtime still owes the group a commit carrying it.
+fn profile_edit_requeued(subject: &AppRuntimeHarness, client: &str) -> TestResult<bool> {
+    Ok(subject
+        .superseded_group_changes(client)?
+        .iter()
+        .rev()
+        .find(|change| change.kind == SupersededIntentKind::GroupProfile)
+        .is_some_and(|change| change.outcome == SupersededIntentOutcome::Reissued))
+}
+
+/// Settle after a profile race. The losing author's runtime re-queues its edit
+/// and publishes it on its next scheduled convergence pass, about 1.1 s after
+/// the supersession, so every member can share the winner-only state for
+/// longer than the 1 s quiet window first. While an accepted edit is missing
+/// and its author's latest notice says it was re-queued, it is still in
+/// flight: settle again inside the same budget. Any other outcome ends the
+/// wait, and the strict oracle judges what settled. A re-issue that never
+/// lands leaves the last settled state, so the oracle names the lost edit.
+async fn settle_profile_race(
+    subject: &mut AppRuntimeHarness,
+    clients: &[String],
+    report: &ConcurrentMutationReport,
+    edits: &[(&str, &str, &str)],
+) -> TestResult<Vec<AppRuntimeObservationV1>> {
+    let deadline = tokio::time::Instant::now() + SETTLEMENT;
+    let mut settled = subject
+        .await_observable_settlement(clients, SETTLEMENT)
+        .await?;
+    loop {
+        let mut in_flight = false;
+        for (client, field, value) in edits {
+            in_flight |= accepted(report, client)
+                && !edit_applied(&settled, field, value)
+                && profile_edit_requeued(subject, client)?;
+        }
+        if !in_flight {
+            return Ok(settled);
+        }
+        let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match subject.await_observable_settlement(clients, wait).await {
+            Ok(observations) => settled = observations,
+            Err(error) if error.code == "app_runtime_settlement_timeout" => return Ok(settled),
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn require_edits_retained(dropped: &[String], strict: bool) -> TestResult {
@@ -580,21 +633,23 @@ async fn concurrent_profile_edits(
         .await?;
     save(out, "race-report.json", &report)?;
     subject.tick(&clients).await?;
-    let observations = subject
-        .await_observable_settlement(&clients, SETTLEMENT)
-        .await?;
     let edits = [
         ("alice", "name", "alice renamed it"),
         ("bob", "description", "bob described it"),
     ];
+    let observations = settle_profile_race(subject, &clients, &report, &edits).await?;
     let settled = settled_edits(&observations, &edits);
     let dropped = dropped_accepted_edits(&report, &observations, &edits);
+    let notices = clients
+        .iter()
+        .map(|client| Ok((client.clone(), subject.superseded_group_changes(client)?)))
+        .collect::<TestResult<BTreeMap<_, _>>>()?;
     save(
         out,
         "after-race.json",
         &json!({
             "settled_edits": settled, "dropped_accepted_edits": dropped,
-            "observations": observations,
+            "superseded_notices": notices, "observations": observations,
         }),
     )?;
     // Presence is measured on the settled projection itself, so a command the
