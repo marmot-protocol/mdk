@@ -82,7 +82,8 @@ class SelectCiTests(unittest.TestCase):
         self.assertTrue(select(["README.md"], full=True)["run_tests"])
 
     def test_docs_and_plugins_do_not_select_native_tests(self):
-        for path in ["README.md", "integrations/hermes/marmot/plugin.py"]:
+        for path in ["README.md", "integrations/hermes/marmot/plugin.py",
+                     ".agents/skills/land-change/SKILL.md", ".claude/skills"]:
             with self.subTest(path=path):
                 self.assertFalse(select([path])["run_tests"])
         self.assertTrue(select(["crates/marmot-markdown/tests/golden/new.md"])["run_tests"])
