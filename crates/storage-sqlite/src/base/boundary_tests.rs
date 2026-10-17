@@ -9,9 +9,10 @@
 //!
 //! The crossings that remain are listed in `src/cross/allow-list.txt`, one line
 //! per file and target. A crossing missing from the list fails, and so does a
-//! listed one that no longer occurs, so the list only shrinks. Test code
-//! (`#[cfg(test)]` items and the files they declare) and migration bodies are
-//! not scanned; the fresh-database checks cover the schema the migrations leave.
+//! listed one that no longer occurs, so the list only shrinks. Code compiled
+//! only in test builds (`#[test]`, and a `cfg` that is false without `test`, with
+//! the files such items declare) and migration bodies are not scanned; the
+//! fresh-database checks cover the schema the migrations leave.
 //!
 //! The scan is by name. It reads string literals for table names, `crate::`
 //! paths for modules, and calls through `self` or `Self` inside
@@ -199,39 +200,71 @@ fn walk_items(
     }
 }
 
-/// `#[test]`, or a `cfg` that mentions `test`.
+/// Whether these attributes compile the item only in test builds: `#[test]`,
+/// or a `cfg` that is false whenever `test` is. `not(test)` ships, and so does
+/// `any(target_os = "android", test)`; only a predicate that cannot hold without
+/// `test` makes an item test-only.
 fn is_test_only(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         attr.path().is_ident("test")
             || (attr.path().is_ident("cfg")
-                && matches!(&attr.meta, syn::Meta::List(list) if mentions_test(list.tokens.clone())))
+                && attr
+                    .parse_args::<syn::Meta>()
+                    .is_ok_and(|p| cfg_without_test(&p) == Some(false)))
     })
 }
 
-fn mentions_test(tokens: TokenStream) -> bool {
-    tokens.into_iter().any(|tree| match tree {
-        TokenTree::Ident(ident) => ident == "test",
-        TokenTree::Group(group) => mentions_test(group.stream()),
-        _ => false,
-    })
-}
-
-/// Whether a statement or expression starts with a test-only attribute.
-fn starts_test_only(tokens: TokenStream) -> bool {
-    let mut trees = tokens.into_iter();
-    while let (Some(TokenTree::Punct(p)), Some(TokenTree::Group(g))) = (trees.next(), trees.next())
-    {
-        if p.as_char() != '#' {
-            return false;
+/// A `cfg` predicate's value in a build without `test`: `Some` when that alone
+/// decides it, `None` when it depends on the target or features.
+fn cfg_without_test(predicate: &syn::Meta) -> Option<bool> {
+    match predicate {
+        syn::Meta::Path(path) if path.is_ident("test") => Some(false),
+        syn::Meta::List(list) => {
+            let args = list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .ok()?;
+            let values: Vec<Option<bool>> = args.iter().map(cfg_without_test).collect();
+            if list.path.is_ident("not") {
+                values.first().copied().flatten().map(|v| !v)
+            } else if list.path.is_ident("all") {
+                if values.contains(&Some(false)) {
+                    Some(false)
+                } else if values.iter().all(|v| *v == Some(true)) {
+                    Some(true)
+                } else {
+                    None
+                }
+            } else if list.path.is_ident("any") {
+                if values.contains(&Some(true)) {
+                    Some(true)
+                } else if values.iter().all(|v| *v == Some(false)) {
+                    Some(false)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         }
-        let mut inner = g.stream().into_iter();
-        if let Some(TokenTree::Ident(name)) = inner.next()
-            && (name == "test" || (name == "cfg" && mentions_test(inner.collect())))
-        {
-            return true;
-        }
+        _ => None,
     }
-    false
+}
+
+/// The outer attributes at the start of an item, statement or expression.
+fn leading_attrs(tokens: TokenStream) -> Vec<syn::Attribute> {
+    let parser = |input: syn::parse::ParseStream| {
+        let attrs = syn::Attribute::parse_outer(input)?;
+        input.parse::<TokenStream>()?;
+        Ok(attrs)
+    };
+    syn::parse::Parser::parse2(parser, tokens).unwrap_or_default()
+}
+
+/// Whether an item, statement or expression is compiled only in test builds.
+fn starts_test_only(tokens: TokenStream) -> bool {
+    is_test_only(&leading_attrs(tokens))
 }
 
 /// What one file names: string literals, `crate::` paths, and calls through
@@ -596,4 +629,37 @@ fn schema_crossings() -> BTreeSet<String> {
         }
     }
     found
+}
+
+#[test]
+fn cfg_predicates_skip_only_test_builds() {
+    let skipped = |cfg: &str| {
+        let item: syn::ItemFn = syn::parse_str(&format!("#[cfg({cfg})] fn f() {{}}")).unwrap();
+        is_test_only(&item.attrs)
+    };
+    for cfg in [
+        "test",
+        "all(test, feature = \"x\")",
+        "any(test)",
+        "not(not(test))",
+        "all(unix, test)",
+    ] {
+        assert!(skipped(cfg), "{cfg} compiles only in test builds");
+    }
+    for cfg in [
+        "not(test)",
+        "any(target_os = \"android\", test)",
+        "feature = \"x\"",
+        "all(not(test), unix)",
+        "any(test, feature = \"test-support\")",
+    ] {
+        assert!(!skipped(cfg), "{cfg} can ship, so it must be scanned");
+    }
+    let test_fn: syn::ItemFn = syn::parse_str("#[test] fn f() {}").unwrap();
+    assert!(is_test_only(&test_fn.attrs));
+    let stmt: syn::Stmt =
+        syn::parse_str("#[cfg(any(target_os = \"android\", test))] let x = 1;").unwrap();
+    assert!(!starts_test_only(stmt.to_token_stream()));
+    let stmt: syn::Stmt = syn::parse_str("#[cfg(test)] let x = 1;").unwrap();
+    assert!(starts_test_only(stmt.to_token_stream()));
 }
