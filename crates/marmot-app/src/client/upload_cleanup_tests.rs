@@ -84,7 +84,11 @@ async fn closed_storage_refuses_staging_but_not_a_completed_upload() {
         sent: None,
     };
     let completed = client
-        .finish_encrypted_media_upload(finish, result.clone(), Vec::new())
+        .finish_encrypted_media_upload(
+            finish,
+            result.clone(),
+            crate::media::outgoing::OutgoingUploads::new(client.app.clone(), "alice".into()),
+        )
         .await
         .unwrap();
     assert_eq!(completed, result);
@@ -438,9 +442,9 @@ async fn cancelled_finish_frees_staging() {
     };
     for should_send in [false, true] {
         let staging = crate::media::outgoing::SendStaging::open(&app, "alice", &group, 3).unwrap();
-        let mut tokens = Vec::new();
+        let mut uploads = crate::media::outgoing::OutgoingUploads::new(app.clone(), "alice".into());
         staging
-            .stage(&mut tokens, bytes.len() as u64, |media, target| {
+            .stage(uploads.tokens_mut(), bytes.len() as u64, |media, target| {
                 crate::media::outgoing::stage_body(
                     media,
                     target,
@@ -450,7 +454,7 @@ async fn cancelled_finish_frees_staging() {
                 )
             })
             .unwrap();
-        staging.bind(&tokens, &result).unwrap();
+        staging.bind(uploads.tokens(), &result).unwrap();
         assert_eq!(count(&connection, "outgoing_attachment_uploads"), 1);
         assert_eq!(media_files_on_disk(&app), 1);
         let control = Arc::new(crate::MediaFileTransferControl::default());
@@ -460,7 +464,7 @@ async fn cancelled_finish_frees_staging() {
         completion.should_send = should_send;
         completion.control = Some(control);
         let error = client
-            .finish_encrypted_media_upload(completion, result.clone(), tokens)
+            .finish_encrypted_media_upload(completion, result.clone(), uploads)
             .await
             .unwrap_err();
         assert!(matches!(error, AppError::InvalidEncryptedMedia(_)));
@@ -824,4 +828,61 @@ async fn a_send_dropped_during_staging_releases_its_upload() {
     .await
     .expect("the dropped send's upload and staged file are released");
     assert_eq!(count(&connection, "media_files"), 0);
+}
+
+/// A successful upload whose completion is dropped before any message admits
+/// it (a stopped worker discarding its queued completion) releases the upload
+/// and its staged file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completed_upload_dropped_before_admission_is_released() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::default().with_allow_loopback_blob_endpoints(true),
+    )
+    .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client
+        .create_group("generated dropped completion", &[])
+        .await
+        .unwrap();
+    let connection = fault_connection(&app);
+    let (url, puts, server) = upload_endpoint().await;
+    let request = crate::MediaUploadRequest {
+        attachments: vec![crate::MediaUploadAttachmentRequest {
+            file_name: "generated.bin".into(),
+            media_type: "application/octet-stream".into(),
+            plaintext: vec![42; 4096],
+            dim: None,
+            thumbhash: None,
+        }],
+        caption: None,
+        send: true,
+        blossom_server: Some(url),
+        message_tags: Vec::new(),
+    };
+    let (http, _finish) = client
+        .prepare_encrypted_media_upload(&group, request)
+        .await
+        .unwrap();
+    let (_result, uploads) = http.run().await.unwrap();
+    assert_eq!(puts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(count(&connection, "outgoing_attachment_uploads"), 1);
+    assert_eq!(media_files_on_disk(&app), 1);
+    drop(uploads);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while count(&connection, "outgoing_attachment_uploads") != 0
+            || media_files_on_disk(&app) != 0
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the unadmitted upload and its staged file are released");
+    server.abort();
+    let _ = server.await;
 }

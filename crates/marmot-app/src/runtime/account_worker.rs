@@ -3868,7 +3868,13 @@ enum MediaHttpCompletion {
     },
     Upload {
         finish: EncryptedMediaUploadFinish,
-        result: Result<(MediaUploadResult, Vec<Vec<u8>>), AppError>,
+        result: Result<
+            (
+                MediaUploadResult,
+                Box<crate::media::outgoing::OutgoingUploads>,
+            ),
+            AppError,
+        >,
         respond: oneshot::Sender<Result<MediaUploadResult, AppError>>,
         started_at: Instant,
     },
@@ -4164,9 +4170,9 @@ async fn complete_media_http(
             started_at,
         } => {
             let result = match result {
-                Ok((result, upload_tokens)) => {
+                Ok((result, uploads)) => {
                     client
-                        .finish_encrypted_media_upload(finish, result, upload_tokens)
+                        .finish_encrypted_media_upload(finish, result, *uploads)
                         .await
                 }
                 Err(err) => Err(err),
@@ -5760,7 +5766,7 @@ fn account_worker_command_future<'a>(
                     spawn_media_http(media_http, permit, http.run(), move |result| {
                         MediaHttpCompletion::Upload {
                             finish,
-                            result,
+                            result: result.map(|(result, uploads)| (result, Box::new(uploads))),
                             respond,
                             started_at,
                         }

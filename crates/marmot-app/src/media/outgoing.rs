@@ -631,6 +631,14 @@ impl OutgoingUploads {
     }
 }
 
+impl std::fmt::Debug for OutgoingUploads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutgoingUploads")
+            .field("uploads", &self.tokens.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Drop for OutgoingUploads {
     fn drop(&mut self) {
         if self.tokens.is_empty() {

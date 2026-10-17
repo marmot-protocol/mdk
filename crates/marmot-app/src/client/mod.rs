@@ -224,7 +224,11 @@ impl EncryptedMediaUploadHttp {
     /// Stages every body in the media store, uploads, then binds the uploads
     /// to their descriptors. A body the disk cannot hold refuses the send
     /// with the storage-full error; any failure releases what was staged.
-    pub(crate) async fn run(self) -> Result<(MediaUploadResult, Vec<Vec<u8>>), AppError> {
+    /// The returned guard still owns the uploads: the finish phase hands them
+    /// on, or dropping it unfinished releases them.
+    pub(crate) async fn run(
+        self,
+    ) -> Result<(MediaUploadResult, crate::media::outgoing::OutgoingUploads), AppError> {
         let mut uploads = crate::media::outgoing::OutgoingUploads::new(
             self.retention_app.clone(),
             self.retention_account.clone(),
@@ -258,7 +262,7 @@ impl EncryptedMediaUploadHttp {
                 return Err(error);
             }
         };
-        Ok((result, uploads.into_tokens()))
+        Ok((result, uploads))
     }
 
     async fn upload(
@@ -5186,8 +5190,8 @@ impl AppClient {
         let (http, finish) = self
             .prepare_encrypted_media_upload(group_id, request)
             .await?;
-        let (result, upload_tokens) = http.run().await?;
-        self.finish_encrypted_media_upload(finish, result, upload_tokens)
+        let (result, uploads) = http.run().await?;
+        self.finish_encrypted_media_upload(finish, result, uploads)
             .await
     }
 
@@ -5296,25 +5300,26 @@ impl AppClient {
         ))
     }
 
-    /// Complete successful HTTP independently of best-effort local retention.
+    /// Complete a successful upload. `uploads` keeps owning the staged
+    /// uploads until a message admits them (or an upload-only request hands
+    /// them back); a cancellation or a refused send releases them, and so
+    /// does dropping this future before admission.
     pub(crate) async fn finish_encrypted_media_upload(
         &mut self,
         finish: EncryptedMediaUploadFinish,
         mut result: MediaUploadResult,
-        upload_tokens: Vec<Vec<u8>>,
+        uploads: crate::media::outgoing::OutgoingUploads,
     ) -> Result<MediaUploadResult, AppError> {
         if let Some(control) = &finish.control
             && let Err(error) = control.check()
         {
-            crate::media::outgoing::release_outgoing_uploads(
-                self.app.clone(),
-                self.state.label.clone(),
-                upload_tokens,
-            )
-            .await;
+            uploads.release().await;
             return Err(error);
         }
         if !finish.should_send {
+            // Upload only: the host sends the references later, and admission
+            // then protects the bound uploads; unsent ones expire.
+            uploads.into_tokens();
             return Ok(result);
         }
         let attachments = result
@@ -5333,18 +5338,14 @@ impl AppClient {
         {
             Ok(summary) => summary,
             Err(error) => {
-                // Committed pending/canonical sources protect staging even if optional
-                // owner protection failed. The storage
-                // fence preserves accepted sends even if their host wait fails.
-                crate::media::outgoing::release_outgoing_uploads(
-                    self.app.clone(),
-                    self.state.label.clone(),
-                    upload_tokens,
-                )
-                .await;
+                // An admitted pending or canonical source keeps its uploads:
+                // the release leaves any upload a message still carries.
+                uploads.release().await;
                 return Err(error);
             }
         };
+        // Admitted: the message's descriptors own the uploads now.
+        uploads.into_tokens();
         // The post-publish projection now durably references this source
         // epoch. Persist again so a prior final-reference retirement cannot
         // suppress the secret needed by the newly retained message.
