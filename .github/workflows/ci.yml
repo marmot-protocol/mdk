@@ -1,10 +1,23 @@
 name: CI
 
+# The merge queue is the merge gate and runs the full matrix. Pull requests run
+# a fast pre-check (format, static gates, audit, clippy, WASM build) unless
+# labelled `ci:full`. The queue fast-forwards master to the commit it tested, so
+# master pushes only refresh the Rust caches pull requests and merge groups
+# restore: GitHub scopes a cache saved by a merge-group run to its temporary
+# branch. Those pushes run only when an input of the rust-cache key changes.
 on:
   pull_request:
   push:
     branches:
       - master
+    paths:
+      - Cargo.lock
+      - "**/Cargo.toml"
+      - "**/rust-toolchain"
+      - "**/rust-toolchain.toml"
+      - "**/.cargo/config.toml"
+      - .github/workflows/ci.yml
   merge_group:
   workflow_dispatch:
 
@@ -12,10 +25,11 @@ permissions:
   contents: read
 
 concurrency:
-  # A unique group also protects queued master runs: GitHub otherwise replaces
-  # older pending runs even when cancel-in-progress is false.
-  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Pull requests and cache-refresh pushes supersede their own older runs. A
+  # unique group protects merge-group and manual runs: GitHub otherwise
+  # replaces older pending runs even when cancel-in-progress is false.
+  group: ci-${{ github.workflow }}-${{ (github.event_name == 'pull_request' || github.event_name == 'push') && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,6 +44,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
+      ci_mode: ${{ steps.mode.outputs.ci_mode }}
       run_full: ${{ steps.classify.outputs.run_full }}
       run_c: ${{ steps.classify.outputs.run_c }}
       run_conformance: ${{ steps.classify.outputs.run_conformance }}
@@ -75,37 +90,49 @@ jobs:
           echo "full_ci=$(jq 'index("ci:full") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
           echo "apple_opt_in=$(jq 'index("ci:apple") != null or index("ci:full") != null' <<<"$labels")" >> "$GITHUB_OUTPUT"
 
+      # precheck: pull requests without `ci:full` run only the fast gates.
+      # full: merge groups, manual runs and `ci:full` run every job.
+      # warm: master pushes run only the jobs that save a Rust cache.
+      - name: Select CI mode
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FULL_CI: ${{ steps.labels.outputs.full_ci }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request) if [[ "$FULL_CI" == true ]]; then mode=full; else mode=precheck; fi ;;
+            push) mode=warm ;;
+            *) mode=full ;;
+          esac
+          echo "ci_mode=$mode" >> "$GITHUB_OUTPUT"
+
       - name: Classify changed paths
         id: classify
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-          EVENT_NAME: ${{ github.event_name }}
-          FULL_CI: ${{ steps.labels.outputs.full_ci }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_MODE: ${{ steps.mode.outputs.ci_mode }}
         run: |
           set -euo pipefail
           umask 077
           paths="$RUNNER_TEMP/ci-changes"
           : > "$paths"
           flags=()
-          if [[ "$EVENT_NAME" != "pull_request" || "$FULL_CI" == true \
-            || -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] \
+          if [[ "$CI_MODE" != precheck || -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] \
             || ! git cat-file -e "${BASE_SHA}^{commit}"; then
             flags=(--all)
           else
-            # Include removed paths and rename sources; test selection must
-            # also cover old dependents when a source becomes documentation.
+            # Include removed paths and rename sources.
             git diff --no-renames --name-only -z "$BASE_SHA" "$GITHUB_SHA" > "$paths"
           fi
           python3 scripts/classify_ci_changes.py "${flags[@]}" --github-output "$GITHUB_OUTPUT" < "$paths"
-          printf '%s\n' "${flags[@]}" > "$RUNNER_TEMP/ci-test-flags"
 
-      - name: Select affected crate tests
+      # Pre-checks run no tests: leaving these outputs unset skips every test
+      # build job and the test jobs that consume their archives.
+      - name: Select workspace tests
         id: tests
-        run: |
-          set -euo pipefail
-          flags=()
-          if grep -qx -- --all "$RUNNER_TEMP/ci-test-flags"; then flags=(--all); fi
-          python3 scripts/select_ci_tests.py "${flags[@]}" --github-output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY" < "$RUNNER_TEMP/ci-changes"
+        if: steps.mode.outputs.ci_mode != 'precheck'
+        run: python3 scripts/select_ci_tests.py --all --github-output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY" < /dev/null
 
   rust-format:
     name: Rust format
@@ -214,7 +241,7 @@ jobs:
   terminal-harness-installers:
     name: Terminal harness installer tests
     needs: changes
-    if: needs.changes.outputs.run_installers == 'true'
+    if: needs.changes.outputs.ci_mode == 'full' && needs.changes.outputs.run_installers == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -314,7 +341,7 @@ jobs:
   c-smoke:
     name: C bindings smoke
     needs: changes
-    if: needs.changes.outputs.run_c == 'true'
+    if: needs.changes.outputs.ci_mode != 'precheck' && needs.changes.outputs.run_c == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -358,19 +385,16 @@ jobs:
       - name: Compile and run debug C smoke test (gcc)
         run: ./crates/marmot-c/c-smoke.sh --debug gcc
 
-  # Pull requests run this only with the `ci:apple` label; master pushes and
-  # merge groups always run it, and a master failure opens an issue.
+  # Pull requests run this only with the `ci:apple` or `ci:full` label; merge
+  # groups always run it, so it gates merging.
   ios-account-clippy:
     name: iOS account keychain clippy
     needs: changes
     if: >-
       needs.changes.outputs.run_ios == 'true'
-      && (github.event_name != 'pull_request' || needs.changes.outputs.apple_opt_in == 'true')
+      && (needs.changes.outputs.ci_mode != 'precheck' || needs.changes.outputs.apple_opt_in == 'true')
     runs-on: macos-latest
     timeout-minutes: 30
-    permissions:
-      contents: read
-      issues: write
 
     steps:
       - name: Check out repository
@@ -397,31 +421,13 @@ jobs:
       - name: Check iOS account keychain code
         run: cargo clippy -p marmot-account --target aarch64-apple-ios --locked -- -D warnings
 
-      - name: Report master failure
-        if: failure() && github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          SOURCE_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          title="iOS account keychain clippy failed on master"
-          body="iOS account keychain clippy failed for ${SOURCE_SHA}. Run: ${RUN_URL}"
-          existing="$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')"
-          if [[ -n "$existing" ]]; then
-            gh issue comment "$existing" --repo "$REPO" --body "$body"
-          else
-            gh issue create --repo "$REPO" --title "$title" --body "$body"
-          fi
-
   # The broader integration matrix explicitly enables test-policy-overrides.
   # This focused default-feature job proves ordinary debug/release consumers
   # reject every non-v1 convergence policy (mdk#970).
   convergence-policy-pin:
     name: Convergence policy pin (release assertions)
     needs: changes
-    if: needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.ci_mode != 'precheck' && needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -515,6 +521,7 @@ jobs:
           cargo nextest run --archive-file "$archive" --workspace-remap "$GITHUB_WORKSPACE" --profile ci-pr -E 'none()' --no-tests=pass
 
       - name: Upload test archive
+        if: needs.changes.outputs.ci_mode == 'full'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rust-test
@@ -527,6 +534,7 @@ jobs:
   rust-test:
     name: Rust tests (${{ matrix.partition }}/5)
     needs: [changes, rust-test-build]
+    if: needs.changes.outputs.ci_mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -571,7 +579,7 @@ jobs:
   rust-test-extras:
     name: Doctests and diagnostic exporters
     needs: changes
-    if: needs.changes.outputs.run_full == 'true'
+    if: needs.changes.outputs.ci_mode != 'precheck' && needs.changes.outputs.run_full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -648,6 +656,7 @@ jobs:
         run: cargo nextest archive -p wn-cli --test cli --features test-policy-overrides --locked --profile "$NEXTEST_PROFILE" --archive-file tests.tar.zst
 
       - name: Upload test archive
+        if: needs.changes.outputs.ci_mode == 'full'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cli-e2e
@@ -660,6 +669,7 @@ jobs:
   cli-e2e:
     name: CLI e2e (mock relay, ${{ matrix.partition }}/2)
     needs: [changes, cli-e2e-build]
+    if: needs.changes.outputs.ci_mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -743,6 +753,7 @@ jobs:
         run: cargo nextest archive -p marmot-app --test relay_runtime --test startup_hydration --features test-policy-overrides --locked --profile "$NEXTEST_PROFILE" --archive-file tests.tar.zst
 
       - name: Upload test archive
+        if: needs.changes.outputs.ci_mode == 'full'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: relay-runtime
@@ -755,6 +766,7 @@ jobs:
   relay-runtime:
     name: Relay runtime tests (${{ matrix.partition }}/2)
     needs: [changes, relay-runtime-build]
+    if: needs.changes.outputs.ci_mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -801,7 +813,8 @@ jobs:
 
   relay-e2e:
     name: Relay CLI E2E
-    needs: cli-e2e-build
+    needs: [changes, cli-e2e-build]
+    if: needs.changes.outputs.ci_mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -898,6 +911,7 @@ jobs:
         run: cargo nextest archive -p cgka-conformance-simulator --locked --profile "$NEXTEST_PROFILE" --archive-file simulator.tar.zst
 
       - name: Upload simulator test archive
+        if: needs.changes.outputs.ci_mode == 'full'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: simulator-tests
@@ -910,6 +924,7 @@ jobs:
   conformance:
     name: Simulator and vectors (${{ matrix.lane }})
     needs: [changes, conformance-build]
+    if: needs.changes.outputs.ci_mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -1060,7 +1075,7 @@ jobs:
   formal:
     name: Tamarin proofs
     needs: changes
-    if: needs.changes.outputs.run_formal == 'true'
+    if: needs.changes.outputs.ci_mode == 'full' && needs.changes.outputs.run_formal == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -1113,7 +1128,7 @@ jobs:
   hermes-installer-auth:
     name: Hermes installer auth
     needs: changes
-    if: needs.changes.outputs.run_hermes == 'true'
+    if: needs.changes.outputs.ci_mode == 'full' && needs.changes.outputs.run_hermes == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -1212,6 +1227,47 @@ jobs:
           # adapter E2E. A missing Hermes venv is a hard failure, not a skip.
           ./scripts/hermes_marmot_deterministic_e2e.sh --root "$RUNNER_TEMP/hermes-installer-auth"
 
+  # Platform-neutral workspace dependencies reach this code too, so every full
+  # run includes it rather than a Windows path filter.
+  windows-filesystem:
+    name: Windows filesystem contracts
+    needs: changes
+    if: needs.changes.outputs.ci_mode != 'precheck'
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5 # nextest
+        with:
+          tool: cargo-nextest@0.9.132
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      # The Windows code lives in fs-private, account file replacement and
+      # local audit delivery, and is covered by those crates' unit tests,
+      # marmot-account's home tests and marmot-forensics' audit tests.
+      # marmot-account's runtime binary is excluded: its publish, fanout and
+      # maintenance scenarios are platform-neutral, run on Linux CI, and took
+      # over 30 minutes here.
+      - name: Test filesystem, account replacement, and audit delivery
+        run: >-
+          cargo nextest run --locked -p fs-private -p marmot-account -p marmot-forensics
+          -E 'not (package(marmot-account) & binary(runtime))'
+
+      - name: Test runtime root ownership
+        run: >-
+          cargo nextest run --locked -p marmot-app --lib
+          -E 'test(root_runtime_lease)'
+
   required-ci:
     name: Required CI
     if: always()
@@ -1238,12 +1294,25 @@ jobs:
       - conformance-extras
       - formal
       - hermes-installer-auth
+      - windows-filesystem
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
     steps:
+      # A full run selects every job, so a skip there means a broken condition
+      # rather than an unaffected lane. Merge groups must be full runs.
       - name: Require every selected core CI job to succeed
         env:
           NEEDS: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+          CI_MODE: ${{ needs.changes.outputs.ci_mode }}
         run: |
-          jq --exit-status 'all(.[]; .result == "success" or .result == "skipped")' <<<"$NEEDS"
+          set -euo pipefail
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          if [[ "$EVENT_NAME" == merge_group && "$CI_MODE" != full ]]; then
+            echo "error: merge group selected CI mode '$CI_MODE', not full" >&2
+            exit 1
+          fi
+          accepted='["success", "skipped"]'
+          if [[ "$CI_MODE" == full ]]; then accepted='["success"]'; fi
+          jq --exit-status --argjson accepted "$accepted" 'all(.[]; .result | IN($accepted[]))' <<<"$NEEDS"

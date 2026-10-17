@@ -109,8 +109,11 @@ before adding behavior or bindings.
 
 GitHub CI is the full gate. Local verification proves your change and stays scoped to it: several agents usually
 build on the same machine, so workspace-wide builds and suites run locally only when a rule below calls for one. On
-every PR, CI runs fmt, the static gates, clippy (default and `--all-features`), and the tests of each changed crate plus
-its transitive dependents (`scripts/select_ci_tests.py`); the `ci:full` label runs the whole matrix.
+every PR, CI runs a pre-check of a few minutes: fmt, the static gates, `cargo audit`, clippy (default and
+`--all-features`) and the WASM build. It runs no tests, so your local tests are the only test signal before the merge
+queue. The merge queue runs the whole matrix (every crate's tests, the simulator, and the C, iOS and Windows lanes)
+and is the merge gate; the `ci:full` label runs that matrix on a PR, `ci:apple` adds only the iOS lane. Master pushes
+only refresh CI's Rust caches, and only when a dependency or toolchain input changes.
 
 While iterating, run only the test you are working on. Before each push, run once:
 
@@ -137,7 +140,8 @@ Widen only for these changes:
   dependents whose behavior you changed.
 - Shared build inputs (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `Justfile`, `vendor/`) or
   `.github/workflows/`: `just fast-ci` once.
-- Convergence, delivery, branch-selection, or multi-client behavior: `just simulator-smoke` (the PR-lane selection).
+- Convergence, delivery, branch-selection, or multi-client behavior: `just simulator-smoke` (the merge-queue lane
+  selection).
 - Formal model: `just tamarin`.
 
 Do not run `just ci`, `just test`, `cargo test --workspace`, `--features conformance-slow`, benchmarks, or the
