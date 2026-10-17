@@ -1,4 +1,3 @@
-use crate::app::message_drafts::revisioned::{DraftAcceptance, accept_submission_tx};
 use crate::base::connection::CachedSql;
 use crate::base::connection::retry_on_busy;
 use crate::{SqliteAccountStorage, SqliteResultExt, created_at_to_i64, deserialize, serialize};
@@ -37,17 +36,10 @@ impl OutboundIntentStorage for SqliteAccountStorage {
             .storage()?;
             let changed =
                 if let cgka_traits::SendIntent::AppMessage { payload, .. } = &record.intent {
-                    use sha2::{Digest, Sha256};
-                    Self::accept_local_submission_tx(
+                    crate::cross::outbound::accept_confirmed_payload(
                         &conn,
                         &hex::encode(record.group_id.as_slice()),
-                        "payload_hash",
-                        &rusqlite::types::Value::Blob(Sha256::digest(payload).to_vec()),
-                    )?;
-                    accept_submission_tx(
-                        &conn,
-                        &hex::encode(record.group_id.as_slice()),
-                        DraftAcceptance::Payload(payload),
+                        payload,
                     )
                 } else {
                     Ok(false)
@@ -57,7 +49,10 @@ impl OutboundIntentStorage for SqliteAccountStorage {
         };
         let changed = self.connection.with_transaction(write)?;
         if changed {
-            self.notify_message_draft_committed(&hex::encode(record.group_id.as_slice()));
+            crate::cross::outbound::notify_draft_committed(
+                self,
+                &hex::encode(record.group_id.as_slice()),
+            );
         }
         Ok(())
     }
@@ -241,16 +236,10 @@ impl OutboundFanoutStorage for SqliteAccountStorage {
             )
             .storage()?;
             let changed = if let Some(message) = fanout.application_message() {
-                Self::accept_local_submission_tx(
+                crate::cross::outbound::accept_confirmed_event(
                     &conn,
                     &hex::encode(message.group_id.as_slice()),
-                    "app_event_id",
-                    &rusqlite::types::Value::Text(message.app_event_id.clone()),
-                )?;
-                accept_submission_tx(
-                    &conn,
-                    &hex::encode(message.group_id.as_slice()),
-                    DraftAcceptance::Event(&message.app_event_id),
+                    &message.app_event_id,
                 )
             } else {
                 Ok(false)
@@ -260,7 +249,10 @@ impl OutboundFanoutStorage for SqliteAccountStorage {
         };
         let changed = self.connection.with_transaction(write)?;
         if changed && let Some(message) = fanout.application_message() {
-            self.notify_message_draft_committed(&hex::encode(message.group_id.as_slice()));
+            crate::cross::outbound::notify_draft_committed(
+                self,
+                &hex::encode(message.group_id.as_slice()),
+            );
         }
         Ok(())
     }

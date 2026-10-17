@@ -612,11 +612,7 @@ fn backfill_authority_request(conn: &Connection, event: &RawAppEvent) -> Storage
         }),
     };
     let record = crate::serialize(&request)?;
-    conn.execute_cached(
-        "INSERT OR IGNORE INTO pending_application_authority SELECT ?1,?2,?3 WHERE EXISTS(SELECT 1 FROM cgka_messages WHERE id=?1 AND group_id=?2)",
-        params![source,group,record],
-    ).storage()?;
-    Ok(())
+    crate::cross::authority::request_authority_backfill(conn, &source, &group, &record)
 }
 #[cfg(test)]
 mod tests {

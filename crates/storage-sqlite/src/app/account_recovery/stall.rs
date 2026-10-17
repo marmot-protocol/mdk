@@ -2,7 +2,6 @@
 //! relay EOSE never create a certificate. The account worker supplies the epoch
 //! actually observed after evaluating eligible local convergence work.
 use super::*;
-use cgka_traits::storage::StorageProvider;
 use rusqlite::OptionalExtension;
 
 pub struct QualifiedRecoveryStallSample {
@@ -18,7 +17,8 @@ impl SqliteAccountStorage {
         &self,
         group: &cgka_traits::GroupId,
     ) -> StorageResult<bool> {
-        self.with_transaction(|storage| {
+        self.connection.with_transaction(|| {
+            let storage = self;
             storage.lock()?.execute_cached(
                 "DELETE FROM account_recovery_obligations WHERE group_id=?1 AND cause IN (1,2,4)",
                 [group.as_slice()],
