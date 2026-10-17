@@ -112,9 +112,10 @@ Each PR is green on its own and changes no behaviour.
      `notification_lag_with_a_legacy_retained_route_stays_bounded` read
      `app.relay_plane.inner.transport.sdk_relay_client` (`relay_plane/tests.rs:5500-5506`); it now calls
      `sdk_relay_client_for_test`.
-   - Adapt `relay_label_resolution_is_gated_behind_opt_in` to the new export-gate trait. Today it builds the app's
-     `RelayTelemetryRuntimeConfig` from `crate::config` (`relay_plane/tests.rs:33-51`) and the
-     `RelayTelemetryExportConfig` values the gate replaces (`:2352-2360`).
+   - Adapt `relay_label_resolution_is_gated_behind_opt_in` to the new export-gate trait. It built the app's
+     `RelayTelemetryRuntimeConfig` and `RelayTelemetryExportConfig` from `crate::config`; it now uses a stand-in
+     `TestExportGate`, and a `config.rs` test pins that the export config's gate implementation matches
+     `export_allowed`.
    - Proof: `relay_plane/` has no production `crate::` or `storage_sqlite::` imports.
 2. **Move the eight tests that build a whole `MarmotApp` or runtime** out of `relay_plane/tests.rs` into the app's
    tests, using the accessors from PR 1. Tests only.
