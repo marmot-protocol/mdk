@@ -2475,9 +2475,7 @@ mod otlp {
             use std::time::UNIX_EPOCH;
 
             use crate::config::{RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig};
-            use crate::relay_plane::publish_accounting_tests::{
-                AccountPublishFixture, PublishScript,
-            };
+            use crate::relay_plane::test_support::{AccountPublishFixture, PublishScript};
 
             let fixture = AccountPublishFixture::activate().await;
             let exporter = crate::RelayTelemetryExporter::new(

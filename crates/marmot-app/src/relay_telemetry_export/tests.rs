@@ -899,7 +899,7 @@ fn runtime_metrics_keep_first_observation_and_export_live_gauges_without_labels(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_publish_counters_are_unlabeled_population_points() {
-    use crate::relay_plane::publish_accounting_tests::{AccountPublishFixture, PublishScript};
+    use crate::relay_plane::test_support::{AccountPublishFixture, PublishScript};
 
     let fixture = AccountPublishFixture::activate().await;
     let exporter = RelayTelemetryExporter::new(
