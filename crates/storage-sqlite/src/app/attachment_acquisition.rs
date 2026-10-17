@@ -1,0 +1,1151 @@
+//! C8-C storage foundation. No network, parser, secret warming or scheduler.
+//! Callers request only shared-parser accepted references, reserve media capacity
+//! before claiming, and authenticate/decrypt the complete body before publishing.
+//! Bytes stay in the account's SQLCipher store; there is no attachment LRU.
+use crate::app::chat_presentation::nonnegative;
+use crate::base::connection::CachedSql;
+use crate::{SqliteAccountStorage, SqliteResultExt, u64_to_i64};
+use cgka_traits::storage::{StorageError, StorageResult};
+use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
+
+/// Storage plaintext safety ceiling, independent of transport admission. The
+/// current transport also caps ciphertext at 512 MiB, including its AEAD overhead;
+/// transport-valid plaintext is therefore smaller. This is not a size negotiation.
+pub const MAX_RETAINED_ATTACHMENT_BYTES: usize = 512 * 1024 * 1024;
+/// File/reader paths remain below SQLite's row bound; legacy arrays stay512MiB.
+pub const MAX_RETAINED_FILE_ATTACHMENT_BYTES: u64 = 900 * 1024 * 1024;
+pub const MAX_ATTACHMENT_LOCAL_READ_BYTES: usize = 1024 * 1024;
+pub const ATTACHMENT_ACQUISITION_BATCH_LIMIT: usize = 64;
+const MAX_DESCRIPTOR_BYTES: usize = 16384;
+/// Consecutive local-readiness deferrals before a job fails. With 15-second
+/// doubling this spans about eight minutes: far beyond the normal readiness lag
+/// (source-epoch media material lands during projection or the post-sync warm
+/// pass), yet material that never arrives cannot keep a job scheduled forever.
+const MAX_PREPARATION_DEFERRALS: u64 = 6;
+
+/// Shared permission buckets. Discriminants are persisted by migration 0087.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AttachmentPermissionCategory {
+    Image = 0,
+    Video = 1,
+    Audio = 2,
+    File = 3,
+}
+impl AttachmentPermissionCategory {
+    /// Classify the verbatim `m ` field preserved by the media parser. Unknown
+    /// families are files; parser rejection remains a separate admission gate.
+    pub fn from_media_type(media_type: &str) -> Self {
+        match media_type
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "image" => Self::Image,
+            "video" => Self::Video,
+            "audio" => Self::Audio,
+            _ => Self::File,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AttachmentAssetRef {
+    store_epoch: Vec<u8>,
+    token: Vec<u8>,
+}
+impl std::fmt::Debug for AttachmentAssetRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachmentAssetRef").finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentAcquisitionState {
+    Queued,
+    Fetching,
+    RetryScheduled,
+    Ready,
+    /// Failed until explicit retry; ordinary demand preserves this state.
+    Blocked,
+    /// Temporarily ineligible at claim time; eligible demand requeues it.
+    Parked,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttachmentDemand {
+    /// Existing or newly admitted demand. Inspect status for ready/failed work;
+    /// this does not imply that a download is currently queued.
+    Requested(AttachmentAssetRef),
+    Suppressed,
+    Unavailable,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentAcquisitionStatus {
+    pub state: AttachmentAcquisitionState,
+    /// Claims since the last durable forward checkpoint (the retry failure streak).
+    pub attempts: u64,
+    pub due: Option<u64>,
+    pub byte_count: u64,
+}
+/// Opaque completion fence, scoped to the store and a single attempt. Source
+/// locators remain protected in SQLite; Debug never exposes their contents.
+#[derive(Clone)]
+pub struct AttachmentAcquisition {
+    pub reference: AttachmentAssetRef,
+    pub group_id_hex: String,
+    pub message_id_hex: String,
+    pub attachment_index: u32,
+    pub source_message_id_hex: String,
+    pub source_epoch: u64,
+    pub slot: serde_json::Value,
+    attempt: Vec<u8>,
+    digest: Vec<u8>,
+}
+impl std::fmt::Debug for AttachmentAcquisition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachmentAcquisition")
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentPublishResult {
+    Published,
+    Superseded,
+    /// No bytes were committed or evicted. The caller must persist a retry or
+    /// blocked outcome and pause admission until capacity is available.
+    CapacityBlocked,
+}
+fn invalid(message: &str) -> StorageError {
+    StorageError::Backend(message.into())
+}
+fn epoch(conn: &Connection) -> StorageResult<Vec<u8>> {
+    conn.query_row(
+        "SELECT store_epoch FROM chat_presentation_meta WHERE id=1",
+        [],
+        |r| r.get(0),
+    )
+    .storage()
+}
+fn matches_store(conn: &Connection, reference: &AttachmentAssetRef) -> StorageResult<bool> {
+    Ok(epoch(conn)? == reference.store_epoch)
+}
+
+// Deliberately independent of timeline row identity and sort/received timestamps.
+// Repairs may recreate rows; only changed attachment source material invalidates.
+/// A completed body exists for `q.token`: a legacy SQLCipher row or a ready
+/// media file (mdk#2314). Every "is the body retained" check uses this.
+pub(crate) const RETAINED_BODY: &str = "(EXISTS(SELECT 1 FROM retained_attachment_bytes rb WHERE rb.token=q.token) OR EXISTS(SELECT 1 FROM media_file_refs mr JOIN media_files mf ON mf.id=mr.file_id WHERE mr.token=q.token AND mf.state=1))";
+/// Plaintext length of `q.token`'s retained body, preferring a ready media
+/// file over legacy chunked and single-row bodies.
+pub(crate) const RETAINED_BYTE_LEN: &str = "coalesce((SELECT mf.byte_len FROM media_file_refs mr JOIN media_files mf ON mf.id=mr.file_id WHERE mr.token=q.token AND mf.state=1),(SELECT byte_len FROM retained_attachment_files f WHERE f.token=q.token AND f.completed=1),(SELECT length(bytes) FROM retained_attachment_bytes b WHERE b.token=q.token),0)";
+const SOURCE_MATCH: &str = "EXISTS(SELECT 1 FROM attachment_history h
+ WHERE h.group_id_hex=q.group_id_hex AND h.message_id_hex=q.message_id_hex
+ AND h.attachment_index=q.attachment_index AND h.source_message_id_hex=q.source_message_id_hex
+ AND h.source_epoch=q.source_epoch AND h.slot_json=q.slot_json AND h.visible=1)";
+const ACCEPTED: &str = "EXISTS(SELECT 1 FROM account_groups g
+ WHERE g.group_id_hex=q.group_id_hex AND g.pending_confirmation=0)";
+
+/// Called after whole-group rebuild (never during its DELETE/INSERT interval).
+pub(crate) fn reconcile_attachment_acquisition_tx(
+    conn: &Connection,
+    group: &str,
+    message: Option<&str>,
+) -> StorageResult<()> {
+    // Historical migrations invoke timeline rebuild before migration 83 exists.
+    let present: bool = conn
+        .query_row_cached(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+         WHERE type='table' AND name='attachment_acquisition')",
+            [],
+            |r| r.get(0),
+        )
+        .storage()?;
+    if !present {
+        return Ok(());
+    }
+    let message_filter = if message.is_some() {
+        "AND message_id_hex=?2"
+    } else {
+        ""
+    };
+    let query = format!(
+        "DELETE FROM attachment_acquisition WHERE group_id_hex=?1 {message_filter} AND NOT EXISTS(
+        SELECT 1 FROM attachment_history h WHERE h.group_id_hex=attachment_acquisition.group_id_hex
+        AND h.message_id_hex=attachment_acquisition.message_id_hex
+        AND h.attachment_index=attachment_acquisition.attachment_index
+        AND h.source_message_id_hex=attachment_acquisition.source_message_id_hex
+        AND h.source_epoch=attachment_acquisition.source_epoch
+        AND h.slot_json=attachment_acquisition.slot_json)"
+    );
+    let mut args = vec![rusqlite::types::Value::Text(group.to_owned())];
+    if let Some(message) = message {
+        args.push(rusqlite::types::Value::Text(message.to_owned()));
+    }
+    conn.execute(&query, rusqlite::params_from_iter(args))
+        .storage()?;
+    Ok(())
+}
+
+/// A bounded parser work item. Its generation fences acknowledgement against
+/// a source update or rebuild that arrives while the caller is parsing it.
+pub struct AttachmentWorkerDemand {
+    pub group_id_hex: String,
+    pub entry: crate::AttachmentHistoryEntry,
+    generation: Vec<u8>,
+}
+
+/// Source material for local preparation. This is not a lease or permission to
+/// fetch; claim must still succeed for this exact asset before network work.
+pub struct AttachmentAcquisitionSource {
+    pub group_id_hex: String,
+    pub source_epoch: u64,
+    pub slot: serde_json::Value,
+}
+
+impl AttachmentAcquisition {
+    /// Deterministic publication validation, distinct from transient DB errors.
+    pub fn verify_plaintext(&self, plaintext: &[u8]) -> StorageResult<()> {
+        if plaintext.len() > MAX_RETAINED_ATTACHMENT_BYTES {
+            return Err(invalid("retained attachment exceeds storage bound"));
+        }
+        if Sha256::digest(plaintext).as_slice() != self.digest {
+            return Err(invalid("attachment plaintext digest mismatch"));
+        }
+        Ok(())
+    }
+}
+
+impl SqliteAccountStorage {
+    /// Read source changes without a history scan. Oversized descriptors are
+    /// represented as null so the shared parser rejects them without allocation.
+    pub fn attachment_worker_demands(
+        &self,
+        limit: usize,
+    ) -> StorageResult<Vec<AttachmentWorkerDemand>> {
+        if limit == 0 || limit > ATTACHMENT_ACQUISITION_BATCH_LIMIT {
+            return Err(invalid("invalid attachment demand limit"));
+        }
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT d.group_id_hex,d.generation,h.message_id_hex,
+            h.attachment_index,h.source_message_id_hex,h.source_epoch,h.sender,h.timeline_at,h.received_at,
+            CASE WHEN length(CAST(h.slot_json AS BLOB))<=16384 THEN h.slot_json ELSE 'null' END
+            FROM attachment_worker_demand d JOIN attachment_history h
+            USING(group_id_hex,message_id_hex,attachment_index)
+            ORDER BY h.received_at DESC,d.group_id_hex,d.message_id_hex,d.attachment_index LIMIT ?1").storage()?;
+        stmt.query_map([limit as i64], |r| {
+            let slot: String = r.get(9)?;
+            Ok(AttachmentWorkerDemand {
+                group_id_hex: r.get(0)?,
+                generation: r.get(1)?,
+                entry: crate::AttachmentHistoryEntry {
+                    emoji_tags: Vec::new(),
+                    message_id_hex: r.get(2)?,
+                    attachment_index: r.get::<_, u32>(3)? as usize,
+                    source_message_id_hex: r.get(4)?,
+                    source_epoch: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                    sender: r.get(6)?,
+                    timeline_at: nonnegative(r, 7)?,
+                    received_at: nonnegative(r, 8)?,
+                    slot: serde_json::from_str(&slot).unwrap_or(serde_json::Value::Null),
+                },
+            })
+        })
+        .storage()?
+        .collect::<Result<Vec<_>, _>>()
+        .storage()
+    }
+
+    pub fn acknowledge_attachment_worker_demand(
+        &self,
+        demand: &AttachmentWorkerDemand,
+    ) -> StorageResult<()> {
+        self.lock()?
+            .execute(
+                "DELETE FROM attachment_worker_demand
+            WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3 AND generation=?4",
+                params![
+                    demand.group_id_hex,
+                    demand.entry.message_id_hex,
+                    demand.entry.attachment_index as i64,
+                    demand.generation
+                ],
+            )
+            .storage()?;
+        Ok(())
+    }
+
+    /// Persist source-bound demand after the app has validated this exact slot
+    /// and its plaintext digest with the shared parser. Pending invitations,
+    /// hidden/expired/missing sources and legacy unknown epochs are not admitted.
+    /// Repeated demand preserves ready assets, active attempts, retry deadlines
+    /// and explicit-retry failures; it resumes a temporarily parked job.
+    ///
+    /// The digest MUST be the shared parser's plaintext hash for `selected.slot`.
+    /// Storage verifies source identity, not imeta semantics. A mismatched digest
+    /// is an unrecoverable caller bug, not a transport failure to retry; the caller
+    /// must re-parse that same authoritative slot and submit corrected demand.
+    pub fn request_attachment_acquisition(
+        &self,
+        group: &str,
+        selected: &crate::AttachmentHistoryEntry,
+        plaintext_digest: [u8; 32],
+        now: u64,
+    ) -> StorageResult<AttachmentDemand> {
+        let message = selected.message_id_hex.as_str();
+        let index = u32::try_from(selected.attachment_index)
+            .map_err(|_| invalid("invalid attachment index"))?;
+        let now = u64_to_i64(now)?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let suppressed: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM attachment_removal_suppression
+                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)",
+                    params![group, message, index],
+                    |r| r.get(0),
+                )
+                .storage()?;
+            if suppressed {
+                return Ok(AttachmentDemand::Suppressed);
+            }
+            let source = conn.query_row(
+                "SELECT h.source_message_id_hex,h.source_epoch,h.slot_json,a.retention_expires_at
+                 FROM attachment_history h JOIN app_events a USING(group_id_hex,message_id_hex)
+                 JOIN account_groups g USING(group_id_hex)
+                 WHERE h.group_id_hex=?1 AND h.message_id_hex=?2 AND h.attachment_index=?3
+                   AND h.visible=1 AND h.source_epoch IS NOT NULL AND g.pending_confirmation=0
+                   AND (a.retention_expires_at IS NULL OR a.retention_expires_at>?4)",
+                params![group, message, index, now],
+                |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                )),
+            ).optional().storage()?;
+            let Some((source, source_epoch, slot, expires)) = source else {
+                return Ok(AttachmentDemand::Unavailable);
+            };
+            if slot.len() > MAX_DESCRIPTOR_BYTES || source_epoch < 0 {
+                return Err(invalid("attachment descriptor exceeds storage bounds"));
+            }
+            let current_slot: serde_json::Value = serde_json::from_str(&slot)
+                .map_err(|_| invalid("invalid stored attachment slot"))?;
+            if selected.source_message_id_hex != source
+                || selected.source_epoch != Some(source_epoch as u64)
+                || selected.slot != current_slot
+            {
+                return Ok(AttachmentDemand::Unavailable);
+            }
+            conn.execute(
+                "DELETE FROM attachment_acquisition
+                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3
+                   AND (source_message_id_hex<>?4 OR source_epoch<>?5
+                        OR slot_json<>?6 OR plaintext_digest<>?7)",
+                params![
+                    group,
+                    message,
+                    index,
+                    source,
+                    source_epoch,
+                    slot,
+                    &plaintext_digest[..]
+                ],
+            )
+            .storage()?;
+            // Only policy parking is resumable through ordinary demand. Failed
+            // jobs still require explicit retry; backoff and leases stay intact.
+            conn.execute(
+                "INSERT INTO attachment_acquisition(
+                    token,group_id_hex,message_id_hex,attachment_index,
+                    source_message_id_hex,source_epoch,slot_json,plaintext_digest,expires_at,due,permission_category)
+                 VALUES(randomblob(16),?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                 ON CONFLICT(group_id_hex,message_id_hex,attachment_index)
+                 DO UPDATE SET state=0,due=excluded.due,permission_category=excluded.permission_category
+                 WHERE attachment_acquisition.state=5 AND attachment_acquisition.cancelled=0 AND (attachment_acquisition.automatic_history=0 OR (attachment_acquisition.body_completed=0 AND attachment_acquisition.network_attempts<64 AND attachment_acquisition.acquisition_attempts<4)) AND attachment_acquisition.permission_paused=0",
+                params![
+                    group,
+                    message,
+                    index,
+                    source,
+                    source_epoch,
+                    slot,
+                    &plaintext_digest[..],
+                    expires,
+                    now,
+                    AttachmentPermissionCategory::from_media_type(&controls::slot_media_type(&slot)) as u8
+                ],
+            )
+            .storage()?;
+            let token = conn
+                .query_row(
+                    "SELECT token FROM attachment_acquisition
+                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3",
+                    params![group, message, index],
+                    |r| r.get(0),
+                )
+                .storage()?;
+            Ok(AttachmentDemand::Requested(AttachmentAssetRef {
+                store_epoch: epoch(&conn)?,
+                token,
+            }))
+        })
+    }
+
+    /// Bounded candidates, including expired leases. Reserve worker/media capacity
+    /// before claim. A candidate is not a permission to fetch; claim rechecks it.
+    pub fn due_attachment_acquisitions(
+        &self,
+        now: u64,
+        limit: usize,
+    ) -> StorageResult<Vec<AttachmentAssetRef>> {
+        if limit == 0 || limit > ATTACHMENT_ACQUISITION_BATCH_LIMIT {
+            return Err(invalid("invalid attachment job page limit"));
+        }
+        let conn = self.lock()?;
+        let store_epoch = epoch(&conn)?;
+        let mut statement = conn.prepare(
+            "SELECT token FROM attachment_acquisition WHERE due<=?1 ORDER BY due,token LIMIT ?2",
+        ).storage()?;
+        let tokens = statement
+            .query_map(params![u64_to_i64(now)?, limit as i64], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()?;
+        Ok(tokens
+            .into_iter()
+            .map(|token| AttachmentAssetRef {
+                store_epoch: store_epoch.clone(),
+                token,
+            })
+            .collect())
+    }
+
+    /// Reclaim abandoned attempts once, under the new account worker's exclusive
+    /// ownership, before it starts any transfers. Bounded and attempt-fenced;
+    /// scheduled retries, terminal failures and ready bytes are unchanged.
+    pub fn resume_attachment_acquisitions(&self, now: u64, limit: usize) -> StorageResult<usize> {
+        if limit == 0 || limit > ATTACHMENT_ACQUISITION_BATCH_LIMIT {
+            return Err(invalid("invalid attachment resume limit"));
+        }
+        self.lock()?.execute("UPDATE attachment_acquisition SET acquisition_attempts=max(0,acquisition_attempts-CASE WHEN permission_paused=1 AND body_completed=0 THEN 1 ELSE 0 END),state=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts-CASE WHEN permission_paused=1 AND body_completed=0 THEN 1 ELSE 0 END>=4) THEN 4 WHEN permission_paused=1 THEN 5 ELSE 0 END,due=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts-CASE WHEN permission_paused=1 AND body_completed=0 THEN 1 ELSE 0 END>=4) THEN NULL WHEN permission_paused=1 THEN NULL ELSE ?1 END,attempt=NULL
+            WHERE token IN (SELECT token FROM attachment_acquisition WHERE state=1 ORDER BY token LIMIT ?2)",
+            params![u64_to_i64(now)?,limit as i64]).storage()
+    }
+
+    /// Select a due source without incrementing attempts. Ineligible sources are
+    /// parked just as at claim time, so stale rows cannot obstruct the due page.
+    pub fn prepare_attachment_acquisition(
+        &self,
+        reference: &AttachmentAssetRef,
+        now: u64,
+    ) -> StorageResult<Option<AttachmentAcquisitionSource>> {
+        let now = u64_to_i64(now)?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !matches_store(&conn, reference)? { return Ok(None); }
+            let row = conn.query_row(&format!("SELECT group_id_hex,source_epoch,slot_json
+                FROM attachment_acquisition q WHERE token=?1 AND due<=?2 AND cancelled=0 AND permission_paused=0 AND {SOURCE_MATCH} AND {ACCEPTED}
+                AND (expires_at IS NULL OR expires_at>?2)"), params![reference.token,now], |r|
+                Ok((r.get::<_,String>(0)?,nonnegative(r,1)?,r.get::<_,String>(2)?))).optional().storage()?;
+            let Some((group_id_hex,source_epoch,slot)) = row else {
+                conn.execute("UPDATE attachment_acquisition SET state=5,due=NULL,attempt=NULL
+                    WHERE token=?1 AND due<=?2",params![reference.token,now]).storage()?;
+                return Ok(None);
+            };
+            Ok(Some(AttachmentAcquisitionSource { group_id_hex,source_epoch,
+                slot: serde_json::from_str(&slot).map_err(|_| invalid("invalid stored attachment slot"))? }))
+        })
+    }
+
+    /// Defer resource admission without recording a transfer attempt, or block a
+    /// structurally invalid source. Never replace an active lease or newer job.
+    pub fn finish_attachment_preparation(
+        &self,
+        reference: &AttachmentAssetRef,
+        now: u64,
+        retry_at: Option<u64>,
+    ) -> StorageResult<()> {
+        let due = retry_at.map(u64_to_i64).transpose()?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !matches_store(&conn, reference)? {
+                return Ok(());
+            }
+            conn.execute(
+                "UPDATE attachment_acquisition SET state=?3,due=?4
+                WHERE token=?1 AND due<=?2 AND state IN (0,2)",
+                params![
+                    reference.token,
+                    u64_to_i64(now)?,
+                    if due.is_some() { 2 } else { 4 },
+                    due
+                ],
+            )
+            .storage()?;
+            Ok(())
+        })
+    }
+
+    /// Defer a due job whose local decryption material is not ready, without
+    /// claiming it or spending a transfer attempt. Consecutive deferrals back off
+    /// from 15 seconds, doubling; reaching `MAX_PREPARATION_DEFERRALS` blocks the
+    /// job until explicit retry. Claim and explicit retry reset the streak.
+    /// Returns true when this deferral made the job terminal.
+    pub fn defer_attachment_preparation(
+        &self,
+        reference: &AttachmentAssetRef,
+        now: u64,
+    ) -> StorageResult<bool> {
+        let now_sql = u64_to_i64(now)?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !matches_store(&conn, reference)? {
+                return Ok(false);
+            }
+            let deferrals = conn
+                .query_row(
+                    "SELECT preparation_deferrals FROM attachment_acquisition
+                     WHERE token=?1 AND due<=?2 AND state IN (0,2)",
+                    params![reference.token, now_sql],
+                    |r| nonnegative(r, 0),
+                )
+                .optional()
+                .storage()?;
+            let Some(deferrals) = deferrals.map(|n| n.saturating_add(1)) else {
+                return Ok(false);
+            };
+            let exhausted = deferrals >= MAX_PREPARATION_DEFERRALS;
+            let due = (!exhausted)
+                .then(|| now.saturating_add(15_u64 << (deferrals - 1).min(8)))
+                .map(u64_to_i64)
+                .transpose()?;
+            conn.execute(
+                "UPDATE attachment_acquisition SET state=?3,due=?4,preparation_deferrals=?5
+                 WHERE token=?1 AND due<=?2 AND state IN (0,2)",
+                params![
+                    reference.token,
+                    now_sql,
+                    if exhausted { 4 } else { 2 },
+                    due,
+                    u64_to_i64(deferrals)?
+                ],
+            )
+            .storage()?;
+            Ok(exhausted)
+        })
+    }
+
+    /// Lease deadlines are chosen by the runtime transfer policy. Expired leases
+    /// can be reclaimed after process death; the new attempt fences late results.
+    pub fn claim_attachment_acquisition(
+        &self,
+        reference: &AttachmentAssetRef,
+        now: u64,
+        lease_until: u64,
+    ) -> StorageResult<Option<AttachmentAcquisition>> {
+        if lease_until <= now {
+            return Err(invalid("attachment lease must end after now"));
+        }
+        let now = u64_to_i64(now)?;
+        let deadline = u64_to_i64(lease_until)?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !matches_store(&conn, reference)? {
+                return Ok(None);
+            }
+            // A completed body or exhausted budget must survive lease recovery.
+            conn.execute("UPDATE attachment_acquisition SET state=4,due=NULL,attempt=NULL WHERE token=?1 AND due<=?2 AND state<>3 AND (automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts>=4))", params![reference.token, now]).storage()?;
+            let claimable: bool = conn
+                .query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM attachment_acquisition q
+                    WHERE token=?1 AND due<=?2 AND cancelled=0 AND permission_paused=0 AND {SOURCE_MATCH} AND {ACCEPTED}
+                    AND (expires_at IS NULL OR expires_at>?2))"
+                    ),
+                    params![reference.token, now],
+                    |r| r.get(0),
+                )
+                .storage()?;
+            if !claimable {
+                // Keep ineligible work off the due page without conflating it
+                // with terminal failure. Re-admission after policy change
+                // requeues a parked job while preserving explicit removal.
+                conn.execute(
+                    "UPDATE attachment_acquisition SET state=5,due=NULL,attempt=NULL
+                     WHERE token=?1 AND due<=?2",
+                    params![reference.token, now],
+                )
+                .storage()?;
+                return Ok(None);
+            }
+            // A new admitted attempt discards a crash-interrupted import, never
+            // another active lease or a verified retained body.
+            conn.execute(
+                "DELETE FROM retained_attachment_bytes WHERE token=?1 AND EXISTS(SELECT 1 FROM retained_attachment_files f WHERE f.token=?1 AND f.completed=0)",
+                [&reference.token],
+            ).storage()?;
+            conn.execute(
+                "UPDATE attachment_acquisition SET state=1,due=?2,attempt=randomblob(16),progress_phase=0,body_completed=CASE WHEN automatic_history=0 THEN 0 ELSE body_completed END,
+                    progress_epoch=progress_epoch+1,progress_received=0,progress_total=NULL,
+                    attempts=min(attempts+1,2147483647),acquisition_attempts=min(acquisition_attempts+automatic_history,2147483647),preparation_deferrals=0 WHERE token=?1",
+                params![reference.token, deadline],
+            )
+            .storage()?;
+            let job = conn
+                .query_row(
+                    "SELECT group_id_hex,message_id_hex,attachment_index,source_message_id_hex,
+                    source_epoch,slot_json,attempt,plaintext_digest
+                 FROM attachment_acquisition WHERE token=?1",
+                    [&reference.token],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, u32>(2)?,
+                            r.get::<_, String>(3)?,
+                            nonnegative(r, 4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, Vec<u8>>(6)?,
+                            r.get::<_, Vec<u8>>(7)?,
+                        ))
+                    },
+                )
+                .storage()?;
+            Ok(Some(AttachmentAcquisition {
+                reference: reference.clone(),
+                group_id_hex: job.0,
+                message_id_hex: job.1,
+                attachment_index: job.2,
+                source_message_id_hex: job.3,
+                source_epoch: job.4,
+                slot: serde_json::from_str(&job.5)
+                    .map_err(|_| invalid("invalid stored attachment slot"))?,
+                attempt: job.6,
+                digest: job.7,
+            }))
+        })
+    }
+
+    /// Commit only fully authenticated/decrypted plaintext. Storage additionally
+    /// verifies the parser-supplied plaintext hash, but cannot authenticate AEAD.
+    /// Quota counts retained plaintext bytes, not SQLite/WAL filesystem overhead;
+    /// runtime disk-pressure admission must reserve that overhead separately.
+    /// A body larger than one `ATTACHMENT_STAGING_CHUNK_BYTES` chunk publishes
+    /// as a completed chunked file, the layout the file sink's import produces,
+    /// so no SQLite value holds more than one chunk of it; a body of at most one
+    /// chunk stays one array row. Either way publication is one transaction.
+    pub fn complete_attachment_acquisition(
+        &self,
+        job: &AttachmentAcquisition,
+        plaintext: &[u8],
+        now: u64,
+        byte_budget: u64,
+    ) -> StorageResult<AttachmentPublishResult> {
+        job.verify_plaintext(plaintext)?;
+        let now = u64_to_i64(now)?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if let Some(refused) =
+                publication_refusal(&conn, job, now, plaintext.len() as u64, byte_budget)?
+            {
+                return Ok(refused);
+            }
+            if plaintext.len() > ATTACHMENT_STAGING_CHUNK_BYTES {
+                let len = plaintext.len() as u64;
+                let nonce = file_import::reserve_chunked_file(&conn, job, len)?;
+                file_import::insert_chunks(&conn, &nonce, 0, plaintext)?;
+                file_import::seal_chunked_file(&conn, &job.reference.token, &nonce)?;
+            } else {
+                // Declaring `byte_len` keeps the insert trigger from rewriting the row.
+                conn.execute(
+                    "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,?2,?3)",
+                    params![
+                        job.reference.token,
+                        u64_to_i64(plaintext.len() as u64)?,
+                        plaintext
+                    ],
+                )
+                .storage()?;
+            }
+            conn.execute(
+                "UPDATE attachment_acquisition SET state=3,due=NULL,attempt=NULL,storage_blocked_headroom=NULL,storage_park_count=0 WHERE token=?1",
+                [&job.reference.token],
+            )
+            .storage()?;
+            Ok(AttachmentPublishResult::Published)
+        })
+    }
+
+    /// Import authenticated plaintext in bounded, separately committed chunks.
+    /// The full quota is reserved first, but bytes remain unreadable until EOF
+    /// and the digest verify. Every chunk and final publication recheck the
+    /// source/attempt fence; failed imports release only their own reservation.
+    /// An enclosing caller transaction still owns atomic commit/rollback.
+    pub fn complete_attachment_acquisition_from_reader(
+        &self,
+        job: &AttachmentAcquisition,
+        reader: &mut dyn std::io::Read,
+        len: u64,
+        now: u64,
+        byte_budget: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> StorageResult<AttachmentPublishResult> {
+        let started = std::time::Instant::now();
+        self.complete_attachment_acquisition_from_reader_with_clock(
+            job,
+            reader,
+            len,
+            &|| now.saturating_add(started.elapsed().as_secs()),
+            byte_budget,
+            cancelled,
+        )
+    }
+
+    /// Import using a fresh Unix-seconds clock at every chunk and publication
+    /// gate, after acquiring storage. The clock must be non-blocking. Runtime
+    /// callers use their wall clock; deterministic tests can advance it during I/O.
+    pub fn complete_attachment_acquisition_from_reader_with_clock(
+        &self,
+        job: &AttachmentAcquisition,
+        reader: &mut dyn std::io::Read,
+        len: u64,
+        clock: &dyn Fn() -> u64,
+        byte_budget: u64,
+        cancelled: &dyn Fn() -> bool,
+    ) -> StorageResult<AttachmentPublishResult> {
+        file_import::complete(self, job, reader, len, clock, byte_budget, cancelled)
+    }
+
+    /// None blocks until an explicit retry; Some schedules a later attempt. Never
+    /// persist an error string, URL, secret or decrypted content as job metadata.
+    pub fn fail_attachment_acquisition(
+        &self,
+        job: &AttachmentAcquisition,
+        retry_at: Option<u64>,
+    ) -> StorageResult<bool> {
+        let due = retry_at.map(u64_to_i64).transpose()?;
+        let conn = self.lock()?;
+        if !matches_store(&conn, &job.reference)? {
+            return Ok(false);
+        }
+        Ok(conn
+            .execute(
+                "UPDATE attachment_acquisition SET acquisition_attempts=max(0,acquisition_attempts-CASE WHEN permission_paused=1 AND body_completed=0 AND ?4 IS NOT NULL THEN 1 ELSE 0 END),state=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts-CASE WHEN permission_paused=1 AND body_completed=0 AND ?4 IS NOT NULL THEN 1 ELSE 0 END>=4) THEN 4 WHEN permission_paused=1 AND ?4 IS NOT NULL THEN 5 ELSE ?3 END,due=CASE WHEN automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts-CASE WHEN permission_paused=1 AND body_completed=0 AND ?4 IS NOT NULL THEN 1 ELSE 0 END>=4) THEN NULL WHEN permission_paused=1 THEN NULL ELSE ?4 END,retry_not_before=CASE WHEN permission_paused=1 THEN COALESCE(?4,retry_not_before) ELSE retry_not_before END,permission_paused=CASE WHEN ?4 IS NULL OR (automatic_history=1 AND (body_completed=1 OR network_attempts>=64 OR acquisition_attempts-CASE WHEN permission_paused=1 AND body_completed=0 AND ?4 IS NOT NULL THEN 1 ELSE 0 END>=4)) THEN 0 ELSE permission_paused END,attempt=NULL
+             WHERE token=?1 AND state=1 AND attempt=?2",
+                params![
+                    job.reference.token,
+                    job.attempt,
+                    if due.is_some() { 2 } else { 4 },
+                    due
+                ],
+            )
+            .storage()?
+            == 1)
+    }
+    /// Explicit retry of an existing failed/parked/delayed job. Ready bytes and active
+    /// attempts are not changed; this never clears explicit-removal suppression.
+    /// Retrying a storage-parked job refreshes its prefix's idle expiry, so a
+    /// park longer than a day still resumes from the kept checkpoint.
+    pub fn retry_attachment_acquisition(
+        &self,
+        reference: &AttachmentAssetRef,
+        now: u64,
+    ) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !matches_store(&conn, reference)? {
+                return Ok(false);
+            }
+            let parked = partial::storage_parked(&conn, &reference.token)?;
+            let retried = conn
+                .execute(
+                    "UPDATE attachment_acquisition SET state=0,due=?2,attempt=NULL,cancelled=0,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,permission_paused=0,retry_not_before=0,network_attempts=0,acquisition_attempts=0,body_completed=0,preparation_deferrals=0
+                 WHERE token=?1 AND state IN (2,4,5)",
+                    params![reference.token, u64_to_i64(now)?],
+                )
+                .storage()?
+                == 1;
+            if retried && parked {
+                partial::refresh_partial_expiry(&conn, &reference.token, now)?;
+            }
+            Ok(retried)
+        })
+    }
+
+    /// Suppress this original message slot durably even when it has no bytes yet.
+    /// Raw-source retention/deletion owns tombstone cleanup; timeline rebuild,
+    /// revalidation and ordinary demand cannot clear the user's intent.
+    pub fn remove_local_attachment(
+        &self,
+        group: &str,
+        message: &str,
+        index: u32,
+    ) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attachment_history
+                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)
+                 OR EXISTS(SELECT 1 FROM attachment_acquisition
+                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)
+                 OR EXISTS(SELECT 1 FROM attachment_removal_suppression
+                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)",
+                params![group, message, index],
+                |r| r.get(0),
+            ).storage()?;
+            if !exists {
+                return Ok(false);
+            }
+            conn.execute(
+                "INSERT INTO attachment_removal_suppression VALUES(?1,?2,?3) ON CONFLICT DO NOTHING",
+                params![group, message, index],
+            ).storage()?;
+            // A media-backed body's reference cascades away with the job; the
+            // last reference deletes the file's key, and the media store's
+            // sweep unlinks the file.
+            conn.execute(
+                "DELETE FROM attachment_acquisition
+                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3",
+                params![group, message, index],
+            ).storage()?;
+            Ok(true)
+        })
+    }
+    /// User-authorized download-again only. Clearing suppression and requesting
+    /// the currently authoritative source share one transaction.
+    pub fn request_attachment_download_again(
+        &self,
+        group: &str,
+        selected: &crate::AttachmentHistoryEntry,
+        digest: [u8; 32],
+        now: u64,
+    ) -> StorageResult<AttachmentDemand> {
+        let index = u32::try_from(selected.attachment_index)
+            .map_err(|_| invalid("invalid attachment index"))?;
+        self.connection.with_transaction(|| {
+            let current = self.attachment_control_entry(
+                group,
+                &selected.message_id_hex,
+                &selected.source_message_id_hex,
+                index,
+                now,
+            )?;
+            if !current.is_some_and(|entry| {
+                entry.slot == selected.slot && entry.source_epoch == selected.source_epoch
+            }) {
+                return Ok(AttachmentDemand::Unavailable);
+            }
+            self.lock()?
+                .execute(
+                    "DELETE FROM attachment_removal_suppression
+                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3",
+                    params![group, selected.message_id_hex, index],
+                )
+                .storage()?;
+            let demand = self.request_attachment_acquisition(group, selected, digest, now)?;
+            if let AttachmentDemand::Requested(reference) = &demand {
+                self.explicitly_retry_attachment(reference, now)?;
+            }
+            Ok(demand)
+        })
+    }
+
+    /// Persisted progress metadata only. Visibility/expiry may make ready bytes
+    /// unreadable until maintenance updates this state; use the local-read gate.
+    pub fn attachment_acquisition_status(
+        &self,
+        reference: &AttachmentAssetRef,
+    ) -> StorageResult<Option<AttachmentAcquisitionStatus>> {
+        let conn = self.lock()?;
+        if !matches_store(&conn, reference)? {
+            return Ok(None);
+        }
+        let row = conn
+            .query_row(
+                &format!(
+                    "SELECT state,attempts,due,
+                CASE WHEN q.state=3 THEN {RETAINED_BYTE_LEN} ELSE 0 END
+             FROM attachment_acquisition q WHERE token=?1"
+                ),
+                [&reference.token],
+                |r| {
+                    Ok((
+                        r.get::<_, u8>(0)?,
+                        nonnegative(r, 1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        nonnegative(r, 3)?,
+                    ))
+                },
+            )
+            .optional()
+            .storage()?;
+        row.map(|(state, attempts, due, byte_count)| {
+            Ok(AttachmentAcquisitionStatus {
+                state: match state {
+                    0 => AttachmentAcquisitionState::Queued,
+                    1 => AttachmentAcquisitionState::Fetching,
+                    2 => AttachmentAcquisitionState::RetryScheduled,
+                    3 => AttachmentAcquisitionState::Ready,
+                    4 => AttachmentAcquisitionState::Blocked,
+                    5 => AttachmentAcquisitionState::Parked,
+                    _ => return Err(invalid("invalid attachment state")),
+                },
+                attempts,
+                due: due
+                    .map(|value| {
+                        u64::try_from(value).map_err(|_| invalid("invalid attachment due time"))
+                    })
+                    .transpose()?,
+                byte_count,
+            })
+        })
+        .transpose()
+    }
+    /// Bounded local read of a database-backed body after source visibility
+    /// and expiry checks. Use `retained_attachment_read`, which also locates
+    /// media-file bodies; this returns an error for one.
+    pub fn read_retained_attachment(
+        &self,
+        reference: &AttachmentAssetRef,
+        now: u64,
+        offset: u64,
+        limit: usize,
+    ) -> StorageResult<Option<Zeroizing<Vec<u8>>>> {
+        match self.retained_attachment_read(reference, now, offset, limit)? {
+            None => Ok(None),
+            Some(RetainedAttachmentRead::Bytes(bytes)) => Ok(Some(bytes)),
+            Some(RetainedAttachmentRead::MediaFile(_)) => Err(invalid(
+                "retained attachment is a media file; read it through the media store",
+            )),
+        }
+    }
+
+    /// Bounded local read after source visibility/expiry checks. No download is
+    /// started; None means unavailable or obsolete. A legacy database body is
+    /// read here (wiped on drop); a media-file body is returned as its file id
+    /// for the caller to read through the media store, off any async thread.
+    /// Hosts must not interpret a handle as a permanent authorization.
+    pub fn retained_attachment_read(
+        &self,
+        reference: &AttachmentAssetRef,
+        now: u64,
+        offset: u64,
+        limit: usize,
+    ) -> StorageResult<Option<RetainedAttachmentRead>> {
+        if limit == 0 || limit > MAX_ATTACHMENT_LOCAL_READ_BYTES {
+            return Err(invalid("invalid attachment local read limit"));
+        }
+        let offset = usize::try_from(u64_to_i64(offset)?)
+            .map_err(|_| invalid("invalid attachment offset"))?;
+        let now = u64_to_i64(now)?;
+        self.connection.with_deferred_read(|conn| {
+            if !matches_store(conn, reference)? {
+                return Ok(None);
+            }
+            // Select only the body identities. SQL substr(bytes, ...)
+            // materializes the whole value inside SQLite before slicing it.
+            let row: Option<(Option<Vec<u8>>, Option<i64>)> = conn
+                .query_row(
+                    &format!(
+                        "SELECT (SELECT mr.file_id FROM media_file_refs mr JOIN media_files mf ON mf.id=mr.file_id
+                            WHERE mr.token=q.token AND mf.state=1),
+                        (SELECT b.rowid FROM retained_attachment_bytes b WHERE b.token=q.token)
+                    FROM attachment_acquisition q
+                    WHERE token=?1 AND state=3 AND {SOURCE_MATCH}
+                    AND (expires_at IS NULL OR expires_at>?2)"
+                    ),
+                    params![reference.token, now],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .storage()?;
+            let Some((media, row_id)) = row else {
+                return Ok(None);
+            };
+            if let Some(id) = media {
+                let id = media_store::FileId::from_slice(&id)
+                    .ok_or_else(|| StorageError::Corruption("invalid media file id".into()))?;
+                return Ok(Some(RetainedAttachmentRead::MediaFile(id)));
+            }
+            let Some(row_id) = row_id else {
+                return Ok(None);
+            };
+            if let Some(bytes) = file_import::read(conn, &reference.token, offset, limit)? {
+                return Ok(Some(RetainedAttachmentRead::Bytes(bytes)));
+            }
+            let blob = conn
+                .blob_open("main", "retained_attachment_bytes", "bytes", row_id, true)
+                .storage()?;
+            let count = blob.len().saturating_sub(offset).min(limit);
+            let mut bytes = Zeroizing::new(vec![0; count]);
+            if count != 0 {
+                blob.read_at_exact(&mut bytes, offset).storage()?;
+            }
+            blob.close().storage()?;
+            Ok(Some(RetainedAttachmentRead::Bytes(bytes)))
+        })
+    }
+    /// One bounded maintenance pass. Source pruning separately cascades deletion;
+    /// this releases bytes at the deadline even before the normal source sweep.
+    pub fn prune_expired_attachment_acquisitions(
+        &self,
+        now: u64,
+        limit: usize,
+    ) -> StorageResult<usize> {
+        if limit == 0 || limit > ATTACHMENT_ACQUISITION_BATCH_LIMIT {
+            return Err(invalid("invalid attachment cleanup limit"));
+        }
+        self.lock()?
+            .execute(
+                "DELETE FROM attachment_acquisition WHERE token IN (
+                SELECT token FROM attachment_acquisition WHERE expires_at<=?1
+                ORDER BY expires_at,token LIMIT ?2)",
+                params![u64_to_i64(now)?, limit as i64],
+            )
+            .storage()
+    }
+    /// Cap the account database at its current size plus `slack_pages`, so a
+    /// publication that needs more fails with the backend's capacity error
+    /// while small bookkeeping updates still fit. Test support only; a large
+    /// slack lifts the cap again.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn limit_database_pages_for_test(&self, slack_pages: u64) -> StorageResult<()> {
+        let conn = self.lock()?;
+        let pages: u64 = conn
+            .query_row("PRAGMA page_count", [], |row| nonnegative(row, 0))
+            .storage()?;
+        conn.execute_batch(&format!(
+            "PRAGMA max_page_count={}",
+            pages.saturating_add(slack_pages)
+        ))
+        .storage()
+    }
+
+    pub fn retained_attachment_byte_count(&self) -> StorageResult<u64> {
+        self.lock()?
+            .query_row(
+                "SELECT byte_count FROM attachment_retention_usage WHERE id=1",
+                [],
+                |r| nonnegative(r, 0),
+            )
+            .storage()
+    }
+}
+
+/// Store, attempt, lease, source, acceptance and expiry fences shared by every
+/// publication path. `true` means this attempt no longer owns the job.
+pub(crate) fn publication_superseded(
+    conn: &Connection,
+    job: &AttachmentAcquisition,
+    now: i64,
+) -> StorageResult<bool> {
+    if !matches_store(conn, &job.reference)? {
+        return Ok(true);
+    }
+    let valid: bool = conn
+        .query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM attachment_acquisition q
+            WHERE token=?1 AND state=1 AND attempt=?2 AND due>?3 AND (permission_paused=0 OR body_completed=1)
+            AND {SOURCE_MATCH} AND {ACCEPTED}
+            AND (expires_at IS NULL OR expires_at>?3))"
+            ),
+            params![job.reference.token, job.attempt, now],
+            |r| r.get(0),
+        )
+        .storage()?;
+    Ok(!valid)
+}
+
+/// Shared SQLCipher publication admission: the fences, then the
+/// retained+partial quota (excluding this job's own partial reservation).
+/// `Some` is the refusal to return without inserting. Media-file publication
+/// applies the fences only: free disk is its limit.
+fn publication_refusal(
+    conn: &Connection,
+    job: &AttachmentAcquisition,
+    now: i64,
+    len: u64,
+    byte_budget: u64,
+) -> StorageResult<Option<AttachmentPublishResult>> {
+    if publication_superseded(conn, job, now)? {
+        return Ok(Some(AttachmentPublishResult::Superseded));
+    }
+    let used: u64 = conn
+        .query_row(
+            "SELECT byte_count FROM attachment_retention_usage WHERE id=1",
+            [],
+            |r| nonnegative(r, 0),
+        )
+        .storage()?;
+    let partial_used: u64 = conn
+        .query_row(
+            "SELECT reserved_bytes FROM attachment_partial_usage WHERE id=1",
+            [],
+            |r| nonnegative(r, 0),
+        )
+        .storage()?;
+    let own_partial: u64 = conn
+        .query_row(
+            "SELECT coalesce((SELECT total FROM attachment_partial WHERE token=?1),0)",
+            [&job.reference.token],
+            |r| nonnegative(r, 0),
+        )
+        .storage()?;
+    if used
+        .saturating_add(partial_used.saturating_sub(own_partial))
+        .saturating_add(len)
+        > byte_budget
+    {
+        conn.execute("UPDATE attachment_acquisition SET body_completed=1,state=4,due=NULL,attempt=NULL WHERE token=?1 AND automatic_history=1", [&job.reference.token]).storage()?;
+        return Ok(Some(AttachmentPublishResult::CapacityBlocked));
+    }
+    Ok(None)
+}
+/// Where a retained body's bytes are.
+pub enum RetainedAttachmentRead {
+    /// A legacy body read from the account database.
+    Bytes(Zeroizing<Vec<u8>>),
+    /// A body in the encrypted media store: read it there.
+    MediaFile(media_store::FileId),
+}
+
+#[cfg(test)]
+mod tests;
+
+mod partial;
+pub use partial::{
+    ATTACHMENT_CHECKPOINT_BYTES, AttachmentPartial, AttachmentPartialIdentity,
+    STORAGE_PARKED_PREFIX_MAX_AGE_SECONDS,
+};
+
+mod checkpoint;
+pub use checkpoint::AttachmentCheckpoint;
+mod file_import;
+mod file_staging;
+mod media;
+pub use media::AttachmentPublication;
+
+mod access;
+pub use access::RetainedAttachmentAsset;
+
+mod controls;
+pub use controls::{
+    AttachmentDownloadPolicy, AttachmentTransferFrame, AttachmentTransferState,
+    AttachmentTransferStatus, ReadmitAdmission, STORAGE_READMIT_MARGIN_BYTES,
+};
+
+mod outgoing;
+mod outgoing_media;
+#[cfg(test)]
+pub(crate) use outgoing::copy_staged_body_for_test;
+pub use outgoing::{ATTACHMENT_STAGING_CHUNK_BYTES, AttachmentUploadSource};
+pub use outgoing_media::{AttachmentUploadPromotion, AttachmentUploadStage};

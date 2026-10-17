@@ -94,8 +94,8 @@ while resolving complete intent instead of deriving it from visible rows.
 
 ## Migrations
 
-Account/session schema changes are Rust migrations: the ordered registry lives in `src/migrations.rs` and bodies in
-numbered files like `src/migrations/0001_initial_schema.rs`. Each has a monotonically increasing version, a matching
+Account/session schema changes are Rust migrations: the ordered registry lives in `src/base/migrations.rs` and bodies in
+numbered files like `src/base/migrations/0001_initial_schema.rs`. Each has a monotonically increasing version, a matching
 padded name, and an `apply` function run inside a SQLite transaction, which can execute DDL, rewrite rows, or perform
 larger data-shape changes. Applied migrations are recorded in `cgka_schema_migrations`; opening an encrypted database
 applies missing migrations after SQLCipher keying and before storage handles are exposed. Message rows follow

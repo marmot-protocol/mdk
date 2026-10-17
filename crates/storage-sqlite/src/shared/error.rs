@@ -18,7 +18,7 @@ pub(super) fn sqlite_error(error: rusqlite::Error) -> StorageError {
     use rusqlite::Error;
     let detail = match error {
         Error::SqliteFailure(code, _) => {
-            return crate::codec::map_sqlite_error(Error::SqliteFailure(code, None));
+            return crate::base::codec::map_sqlite_error(Error::SqliteFailure(code, None));
         }
         Error::InvalidColumnType(index, _, kind) => {
             format!("shared store invalid column type at index {index}: {kind:?}")

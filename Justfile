@@ -88,7 +88,7 @@ bench-group-image-create:
 # and explicit VACUUM, then prints one stable `MDK_BENCH ...` line. Override
 # the default 512 rows with `MDK_STORAGE_OPS_ROWS=<count>`.
 bench-storage-upgrade:
-    cargo test --release -p storage-sqlite migrations::tests::storage_format_upgrade_benchmark -- --ignored --exact --nocapture --test-threads=1
+    cargo test --release -p storage-sqlite base::migrations::tests::storage_format_upgrade_benchmark -- --ignored --exact --nocapture --test-threads=1
 
 # Media file store benchmark (mdk#2314 step 0). Times the encrypted media
 # file format against today's SQLCipher retained

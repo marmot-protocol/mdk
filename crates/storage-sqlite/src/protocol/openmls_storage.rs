@@ -1,0 +1,120 @@
+mod labels;
+mod provider;
+mod value_store;
+
+use crate::base::connection::CachedSql;
+use crate::base::connection::SharedConnection;
+use cgka_traits::storage::{StorageError, StorageResult, StoredKeyPackageBundle};
+use cgka_traits::types::GroupId as MarmotGroupId;
+use serde::Serialize;
+use zeroize::Zeroizing;
+
+#[derive(Clone, Debug)]
+pub struct SqliteOpenMlsStorage {
+    pub(crate) connection: SharedConnection,
+}
+
+impl SqliteOpenMlsStorage {
+    pub(crate) fn new(connection: SharedConnection) -> Self {
+        Self { connection }
+    }
+
+    pub(crate) fn group_key<GroupId: Serialize>(
+        group_id: &GroupId,
+    ) -> Result<Vec<u8>, SqliteOpenMlsStorageError> {
+        Ok(serde_json::to_vec(group_id)?)
+    }
+
+    /// Borrow the shared connection, preserving the [`StorageError`] variant.
+    ///
+    /// Flattening it to a stringly-typed lock error would erase the
+    /// distinction the variants exist for — most importantly
+    /// [`StorageError::Closed`], which every OpenMLS value-store path can now
+    /// see when a host closes the store to release its file locks before
+    /// suspension. That has to stay reportable as orderly shutdown rather than
+    /// as an opaque lock fault.
+    fn lock(
+        &self,
+    ) -> Result<crate::base::connection::ConnectionGuard<'_>, SqliteOpenMlsStorageError> {
+        Ok(self.connection.lock()?)
+    }
+
+    pub(crate) fn stored_key_package_bundles(&self) -> StorageResult<Vec<StoredKeyPackageBundle>> {
+        use openmls_traits::storage::CURRENT_VERSION;
+        use rusqlite::params;
+
+        let connection = self.connection.lock()?;
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT storage_key, value
+                 FROM openmls_values
+                 WHERE provider_version = ?1 AND label = ?2
+                 ORDER BY storage_key",
+            )
+            .map_err(crate::base::codec::map_sqlite_error)?;
+        let rows = statement
+            .query_map(
+                params![CURRENT_VERSION, labels::KEY_PACKAGE_LABEL.as_bytes()],
+                |row| {
+                    Ok(StoredKeyPackageBundle {
+                        storage_key: row.get(0)?,
+                        value: Zeroizing::new(row.get(1)?),
+                    })
+                },
+            )
+            .map_err(crate::base::codec::map_sqlite_error)?;
+        rows.collect::<Result<Vec<StoredKeyPackageBundle>, _>>()
+            .map_err(crate::base::codec::map_sqlite_error)
+    }
+
+    pub(crate) fn delete_stored_key_package_bundle(&self, storage_key: &[u8]) -> StorageResult<()> {
+        self.connection.note_openmls_write();
+        use openmls_traits::storage::CURRENT_VERSION;
+        use rusqlite::params;
+
+        let connection = self.connection.lock()?;
+        connection
+            .execute_cached(
+                "DELETE FROM openmls_values
+                 WHERE provider_version = ?1 AND label = ?2 AND storage_key = ?3",
+                params![
+                    CURRENT_VERSION,
+                    labels::KEY_PACKAGE_LABEL.as_bytes(),
+                    storage_key
+                ],
+            )
+            .map_err(crate::base::codec::map_sqlite_error)?;
+        Ok(())
+    }
+}
+
+pub(crate) fn mls_group_key(group_id: &MarmotGroupId) -> StorageResult<Vec<u8>> {
+    let mls_group_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+    SqliteOpenMlsStorage::group_key(&mls_group_id)
+        .map_err(|e| StorageError::Serialization(e.to_string()))
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum SqliteOpenMlsStorageError {
+    #[error("storage failure: {0}")]
+    Storage(#[from] StorageError),
+    #[error("sqlite failure: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("serialization failure: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("encoding failure: {0}")]
+    Encode(#[from] rmp_serde::encode::Error),
+    #[error("decoding failure: {0}")]
+    Decode(#[from] rmp_serde::decode::Error),
+    #[error("queued proposal reference was present without a queued proposal")]
+    MissingQueuedProposal,
+}
+
+impl crate::base::connection::TransientError for SqliteOpenMlsStorageError {
+    fn is_busy(&self) -> bool {
+        match self {
+            SqliteOpenMlsStorageError::Sqlite(error) => crate::base::codec::is_busy_error(error),
+            _ => false,
+        }
+    }
+}

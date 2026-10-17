@@ -10,44 +10,60 @@ encrypted SQLite database. One database file belongs to one Marmot account-devic
 `SqliteSharedStorage` is a deliberate exception: a separate, non-account-scoped database for cross-identity state — do
 not "fix" it into the per-account database.
 
+## Layout
+
+The crate is split by which side owns each table; see the
+[step 4 brief](../../docs/marmot-architecture/review/brief-storage-boundaries.md).
+
+| Folder | Holds |
+| --- | --- |
+| `src/base/` | Connection, codec, migration runner and bodies, open progress, test support. Both sides build on it. |
+| `src/protocol/` | The engine's storage: the `StorageProvider` impls (`provider.rs`), `storage/` and `openmls_storage/`. |
+| `src/app/` | App storage: projections, timeline, chat list, recovery ledger, drafts, attachments, avatars, media catalog. |
+| `src/app/transport/` | App storage specific to one transport (NIP-77, NIP-51, relay-plane spill, NIP-59 outbox, QUIC sequences, prepared Blossom uploads), kept together for a later move. |
+| `src/shared.rs`, `src/shared/` | The separate shared database. |
+
+Put new code on the side that owns its tables. Code that must touch both sides goes in `cross/` once step 4 PR 3 adds
+it; until then, name any new crossing in the PR description.
+
 ## Key files
 
 | Path | Owns |
 | --- | --- |
-| `src/connection.rs` | SQLCipher key application, operational PRAGMAs, options, aggregate handle. |
-| `src/codec.rs` | JSON serialization helpers and SQLite error mapping. |
-| `src/migrations.rs` | Rust migration runner and migration tests. |
-| `src/migrations/` | Numbered Rust migration bodies plus upgrade/query-work tests; see its local `AGENTS.md`. |
-| `src/storage/` | Marmot engine storage tables by concern; see its local `AGENTS.md`. |
-| `src/storage/snapshots/` | Snapshot/checkpoint capture, restoration and the consistent replay-state fingerprint; see its local `AGENTS.md`. |
-| `src/openmls_storage/` | Custom OpenMLS storage adapter; see its local `AGENTS.md`. |
-| `src/account_recovery.rs` | Account-private recovery ledger, evidence import and durable retry reservations; `account_recovery/` holds typed joins, frozen scope checkpoints, loss acknowledgment and (`notice.rs`) parked "history may be incomplete" occurrences with their explicit retirement (`state = 2`, never coverage), (`stall.rs`) qualified stall observations, (`comparison.rs`) bounded operational comparison (never a coverage predicate), (`demand.rs`) typed joins for non-legacy callers, and (`observe.rs`) read-only transition facts for the owner's audit rows: a demand write's `RecoveryDemandTransition` read before and after it in the same transaction, and `recovery_obligation_status`. Transition reporting never changes demand. The app owner supplies validated facts and owns execution policy. |
-| `src/delivery_spill.rs` | Durable overflow tail of the in-memory account delivery queue: bounded spill, seen/released dedup, oldest-first reads and per-row removal after ingest. |
-| `src/recovery_health.rs` | Durable reports of unsuccessful automatic synchronization recovery. |
-| `src/transport_reconciliation.rs` | Account-private NIP-77 set-reconciliation inventory. |
-| `src/pending_welcome_delivery.rs` | Durable pointer to a confirmed create/invite whose Welcome publish failed, for re-delivery (mdk#352). |
-| `src/local_submissions.rs` | Device-local submission identity and durable admission before engine work. |
-| `src/agent_stream_sequences.rs` | Durable, fail-closed publisher sequence reservations for QUIC previews. |
-| `src/account_projection.rs` | Account-level event projection. |
-| `src/chat_list.rs` | Chat-list projection, including avatar URLs; `chat_list/` holds attention, pages, and windows. |
-| `src/chat_presentation.rs` | Durable selected-presentation foundation (runtime orchestration owns hydration). |
-| `src/group_system.rs` | Local presentation of kind-1210 content (not a wire-format change). |
-| `src/user_blocks.rs` | Account-private NIP-51 block state; never stored in the shared database. |
-| `src/moderation_reports.rs` | Account-private outbox of signed NIP-59 moderation-report wraps: idempotency and rate-limit metadata, retry state, purge. Never stores the reported key or explanation in the clear. |
-| `src/message_drafts.rs` | Revisioned encrypted composer drafts (`message_drafts/revisioned.rs`). |
-| `src/prepared_group_image_upload.rs` | Staged founding-image upload (component data + Blossom upload secret; keep both out of diagnostics). |
-| `src/attachment_acquisition.rs` | Source-bound durable acquisition jobs, leased attempts, protected retained bytes, bounded worker demand and explicit-removal suppression. Network orchestration stays in marmot-app. |
-| `src/attachment_acquisition/access.rs` | Read-only source-bound retained-asset lookup and opaque reference encoding; no demand registration. |
-| `src/attachment_acquisition/controls.rs` | Durable user intent and coalesced transfer metadata in the job store. |
-| `src/attachment_acquisition/partial.rs` | Attempt-fenced checkpoint rows: identity, recorded length, progress floor and the media store `.wire` file id (the ciphertext lives in that file, mdk#2314). Row operations only; abandoned-partial cleanup. |
-| `src/attachment_acquisition/outgoing_media.rs` | File-backed outgoing uploads on the media store (mdk#2314 step 3): `reserve_attachment_upload`, `AttachmentUploadStage` (the upload row as the staged file's owner) and `AttachmentUploadPromotion` (the message's slot fences, attaching the file instead of copying bytes). Rows with `file_id` carry no bytes; legacy rows keep `outgoing.rs`'s promotion until they expire. No retained-byte budget. |
-| `src/attachment_acquisition/checkpoint.rs` | `AttachmentCheckpoint`: a claimed job's checkpoint as the media store's `CheckpointTarget`. The store drives the file and the order of steps; each target call is one transaction under the job's fences. |
-| `src/media_catalog.rs` | The account database's side of the [`media-store`](../media-store/AGENTS.md) crate: `media_files`/`media_file_refs` rows (migration 0110), the `MediaCatalog` impl, per-use `PublishTarget`s and their one-transaction ready commits, reference release. Runs the crate's catalog conformance suite. No media file I/O here. |
-| `src/media_store_bench.rs`, `examples/media_store_bench.rs` | `media-store-benchmarks` feature: the `media-store` file format against the SQLCipher retained path, runnable on devices (mdk#2314 step 0). |
-| `src/attachment_history.rs` | Bounded canonical attachment-slot discovery and per-group revision-fenced cursors; source/visibility triggers maintain the derived index. |
-| `src/timeline.rs` | Materialized message-timeline aggregation; `timeline/` holds capture, edits, opening (`conversation_open` / `conversation_window`), presentation, and reports. |
-| `src/avatar_cache.rs` | Account-scoped encoded avatar storage, source generations, local reads and eviction; `avatar_cache/acquisition.rs` owns durable demand/retry state and `avatar_cache/access.rs` owns opaque screen targets/local metadata. |
-| `src/encrypted_media_secrets.rs` | Per-group encrypted-media secret storage. |
+| `src/base/connection.rs` | SQLCipher key application, operational PRAGMAs, options, aggregate handle. |
+| `src/base/codec.rs` | JSON serialization helpers and SQLite error mapping. |
+| `src/base/migrations.rs` | Rust migration runner and migration tests. |
+| `src/base/migrations/` | Numbered Rust migration bodies plus upgrade/query-work tests; see its local `AGENTS.md`. |
+| `src/protocol/storage/` | Marmot engine storage tables by concern; see its local `AGENTS.md`. |
+| `src/protocol/storage/snapshots/` | Snapshot/checkpoint capture, restoration and the consistent replay-state fingerprint; see its local `AGENTS.md`. |
+| `src/protocol/openmls_storage/` | Custom OpenMLS storage adapter; see its local `AGENTS.md`. |
+| `src/app/account_recovery.rs` | Account-private recovery ledger, evidence import and durable retry reservations; `account_recovery/` holds typed joins, frozen scope checkpoints, loss acknowledgment and (`notice.rs`) parked "history may be incomplete" occurrences with their explicit retirement (`state = 2`, never coverage), (`stall.rs`) qualified stall observations, (`comparison.rs`) bounded operational comparison (never a coverage predicate), (`demand.rs`) typed joins for non-legacy callers, and (`observe.rs`) read-only transition facts for the owner's audit rows: a demand write's `RecoveryDemandTransition` read before and after it in the same transaction, and `recovery_obligation_status`. Transition reporting never changes demand. The app owner supplies validated facts and owns execution policy. |
+| `src/app/transport/delivery_spill.rs` | Durable overflow tail of the in-memory account delivery queue: bounded spill, seen/released dedup, oldest-first reads and per-row removal after ingest. |
+| `src/app/recovery_health.rs` | Durable reports of unsuccessful automatic synchronization recovery. |
+| `src/app/transport/transport_reconciliation.rs` | Account-private NIP-77 set-reconciliation inventory. |
+| `src/app/pending_welcome_delivery.rs` | Durable pointer to a confirmed create/invite whose Welcome publish failed, for re-delivery (mdk#352). |
+| `src/app/local_submissions.rs` | Device-local submission identity and durable admission before engine work. |
+| `src/app/transport/agent_stream_sequences.rs` | Durable, fail-closed publisher sequence reservations for QUIC previews. |
+| `src/app/account_projection.rs` | Account-level event projection. |
+| `src/app/chat_list.rs` | Chat-list projection, including avatar URLs; `chat_list/` holds attention, pages, and windows. |
+| `src/app/chat_presentation.rs` | Durable selected-presentation foundation (runtime orchestration owns hydration). |
+| `src/app/group_system.rs` | Local presentation of kind-1210 content (not a wire-format change). |
+| `src/app/transport/user_blocks.rs` | Account-private NIP-51 block state; never stored in the shared database. |
+| `src/app/transport/moderation_reports.rs` | Account-private outbox of signed NIP-59 moderation-report wraps: idempotency and rate-limit metadata, retry state, purge. Never stores the reported key or explanation in the clear. |
+| `src/app/message_drafts.rs` | Revisioned encrypted composer drafts (`message_drafts/revisioned.rs`). |
+| `src/app/transport/prepared_group_image_upload.rs` | Staged founding-image upload (component data + Blossom upload secret; keep both out of diagnostics). |
+| `src/app/attachment_acquisition.rs` | Source-bound durable acquisition jobs, leased attempts, protected retained bytes, bounded worker demand and explicit-removal suppression. Network orchestration stays in marmot-app. |
+| `src/app/attachment_acquisition/access.rs` | Read-only source-bound retained-asset lookup and opaque reference encoding; no demand registration. |
+| `src/app/attachment_acquisition/controls.rs` | Durable user intent and coalesced transfer metadata in the job store. |
+| `src/app/attachment_acquisition/partial.rs` | Attempt-fenced checkpoint rows: identity, recorded length, progress floor and the media store `.wire` file id (the ciphertext lives in that file, mdk#2314). Row operations only; abandoned-partial cleanup. |
+| `src/app/attachment_acquisition/outgoing_media.rs` | File-backed outgoing uploads on the media store (mdk#2314 step 3): `reserve_attachment_upload`, `AttachmentUploadStage` (the upload row as the staged file's owner) and `AttachmentUploadPromotion` (the message's slot fences, attaching the file instead of copying bytes). Rows with `file_id` carry no bytes; legacy rows keep `outgoing.rs`'s promotion until they expire. No retained-byte budget. |
+| `src/app/attachment_acquisition/checkpoint.rs` | `AttachmentCheckpoint`: a claimed job's checkpoint as the media store's `CheckpointTarget`. The store drives the file and the order of steps; each target call is one transaction under the job's fences. |
+| `src/app/media_catalog.rs` | The account database's side of the [`media-store`](../media-store/AGENTS.md) crate: `media_files`/`media_file_refs` rows (migration 0110), the `MediaCatalog` impl, per-use `PublishTarget`s and their one-transaction ready commits, reference release. Runs the crate's catalog conformance suite. No media file I/O here. |
+| `src/app/media_store_bench.rs`, `examples/media_store_bench.rs` | `media-store-benchmarks` feature: the `media-store` file format against the SQLCipher retained path, runnable on devices (mdk#2314 step 0). |
+| `src/app/attachment_history.rs` | Bounded canonical attachment-slot discovery and per-group revision-fenced cursors; source/visibility triggers maintain the derived index. |
+| `src/app/timeline.rs` | Materialized message-timeline aggregation; `timeline/` holds capture, edits, opening (`conversation_open` / `conversation_window`), presentation, and reports. |
+| `src/app/avatar_cache.rs` | Account-scoped encoded avatar storage, source generations, local reads and eviction; `avatar_cache/acquisition.rs` owns durable demand/retry state and `avatar_cache/access.rs` owns opaque screen targets/local metadata. |
+| `src/app/encrypted_media_secrets.rs` | Per-group encrypted-media secret storage. |
 | `src/shared/error.rs` | Shared-store redacting SQLite error mapper and result extension. |
 | `src/shared/migrations.rs`, `src/shared/v*.sql`, `src/shared/legacy.sql` | Independent `shared_schema_migrations` runner, frozen per-version schemas, and recognized retired columns. |
 | `src/shared/presentation.rs` | Accepted directory profile bytes and local revision under one shared-store transaction. |

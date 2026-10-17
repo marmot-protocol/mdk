@@ -1,0 +1,3403 @@
+use crate::protocol::openmls_storage::SqliteOpenMlsStorage;
+use crate::{SqliteResultExt, base::migrations};
+use cgka_traits::storage::{StorageError, StorageResult};
+use std::fmt;
+use std::ops::{Deref, DerefMut};
+use std::path::Path;
+#[cfg(any(target_os = "android", test))]
+use std::sync::Once;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::ThreadId;
+use std::time::Duration;
+use zeroize::Zeroizing;
+
+/// Closed storage boundaries. Observers must only aggregate timings; they must
+/// not access storage or block on I/O, since a connection may still be held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqliteTimingOperation {
+    ConnectionWait,
+    Transaction,
+    WriteBegin,
+}
+pub type SqliteTimingObserver = Arc<dyn Fn(SqliteTimingOperation, Duration, bool) + Send + Sync>;
+
+/// Maximum number of attempts a write operation makes before giving up and
+/// surfacing the transient `Busy` error. The connection already sets
+/// `PRAGMA busy_timeout`, so each attempt blocks for that long inside SQLite
+/// before returning `SQLITE_BUSY`; this retry loop adds a second, coarser layer
+/// so brief contention from a concurrent writer (a background sync, projection
+/// rebuild, retention prune, or a WAL checkpoint racing the send path)
+/// self-resolves instead of bubbling to the user as "Send failed". See issue
+/// #484.
+const BUSY_MAX_ATTEMPTS: u32 = 6;
+
+/// Base backoff between busy retries. Backoff grows exponentially per attempt
+/// (capped at [`BUSY_BACKOFF_CAP`]) with no jitter — the in-process write mutex
+/// already serialises this connection's writers, so contention here is with a
+/// *separate* connection/process and a deterministic backoff is sufficient.
+const BUSY_BACKOFF_BASE: Duration = Duration::from_millis(20);
+
+/// Upper bound on a single busy-retry backoff sleep.
+const BUSY_BACKOFF_CAP: Duration = Duration::from_millis(250);
+
+/// Android imposes a finite process-wide `mlock` budget (64 KiB on API 34+),
+/// so SQLCipher's enhanced whole-library memory locking is necessarily best
+/// effort there. SQLCipher 4.17 keeps allocation failures below its default
+/// log level; retain one bounded MDK-owned diagnostic instead.
+#[cfg(target_os = "android")]
+static SQLCIPHER_PLATFORM_LIMIT_REPORTED: Once = Once::new();
+
+#[cfg(any(target_os = "android", test))]
+fn report_sqlcipher_platform_limit_once(report_once: &Once) {
+    report_once.call_once(|| {
+        tracing::warn!(
+            target: "storage_sqlite::connection",
+            method = "configure_cipher_memory_security",
+            configured = true,
+            lock_posture = "platform_limited",
+            "SQLCipher memory locking is best effort on Android"
+        );
+    });
+}
+
+/// An error that may represent transient SQLite lock contention worth retrying.
+/// Implemented for the two storage error types so [`retry_on_busy`] can drive a
+/// retry loop without knowing which one a call site uses.
+pub(crate) trait TransientError {
+    /// Whether this error is transient lock contention (`SQLITE_BUSY` /
+    /// `SQLITE_LOCKED`) rather than a durable failure.
+    fn is_busy(&self) -> bool;
+}
+
+impl TransientError for StorageError {
+    fn is_busy(&self) -> bool {
+        matches!(self, StorageError::Busy(_))
+    }
+}
+
+/// Retry an operation with capped exponential backoff while it fails with
+/// transient lock contention. `op` MUST be safe to invoke again. Most callers
+/// pass a complete, idempotent storage operation (a single autocommit statement
+/// or an entire transaction), never one statement from the middle of a larger
+/// transaction. Transaction-boundary callers are the deliberate exception:
+/// they retry only `COMMIT` or `ROLLBACK` in place while retaining transaction
+/// ownership, without re-running the transaction closure. After
+/// [`BUSY_MAX_ATTEMPTS`] the last transient error is returned unchanged so
+/// callers still see a `Busy` (transient) classification.
+pub(crate) fn retry_on_busy<T, E, F>(mut op: F) -> Result<T, E>
+where
+    E: TransientError,
+    F: FnMut() -> Result<T, E>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) if err.is_busy() && attempt + 1 < BUSY_MAX_ATTEMPTS => {
+                let backoff = busy_backoff(attempt);
+                attempt += 1;
+                std::thread::sleep(backoff);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Exponential backoff for busy retry `attempt` (0-indexed), capped at
+/// [`BUSY_BACKOFF_CAP`].
+fn busy_backoff(attempt: u32) -> Duration {
+    let scaled = BUSY_BACKOFF_BASE
+        .checked_mul(1u32 << attempt.min(8))
+        .unwrap_or(BUSY_BACKOFF_CAP);
+    scaled.min(BUSY_BACKOFF_CAP)
+}
+
+/// Message carried by every [`StorageError::Closed`] this module raises.
+const CLOSED_DETAIL: &str = "sqlite account storage is closed";
+
+/// Coarse, privacy-safe label for a `rusqlite::Error`, for `tracing` fields.
+/// The full error text can carry SQL, so only the classification is logged.
+fn sqlite_error_kind(error: &rusqlite::Error) -> &'static str {
+    match error.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DatabaseBusy) => "busy",
+        Some(rusqlite::ErrorCode::DatabaseLocked) => "locked",
+        Some(_) => "sqlite",
+        None => "rusqlite",
+    }
+}
+
+/// Borrowed access to the live `rusqlite::Connection` behind a
+/// [`CloseableConnection`].
+///
+/// The connection lives in an `Option` so a close can take it out and close it
+/// for real while other handles are still alive. Every path that hands out a
+/// guard has already checked, *while holding the same mutex the guard holds*,
+/// that the slot is occupied, so the deref is infallible for the guard's
+/// lifetime.
+pub struct ConnectionGuard<'a> {
+    guard: MutexGuard<'a, Option<rusqlite::Connection>>,
+}
+
+impl Deref for ConnectionGuard<'_> {
+    type Target = rusqlite::Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .as_ref()
+            .expect("connection guard outlived its checked slot")
+    }
+}
+
+impl DerefMut for ConnectionGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .as_mut()
+            .expect("connection guard outlived its checked slot")
+    }
+}
+
+/// A `rusqlite::Connection` that can be closed on demand, even while other
+/// handles to it survive.
+///
+/// Dropping handles is not a usable close for a shared connection: it lives
+/// behind an `Arc` reachable from the engine, the OpenMLS adapter, and app
+/// projections at once, so a host has no way to observe or await the last clone
+/// going away. And in WAL mode an open connection holds a persistent lock on
+/// its `-shm` sidecar for its whole lifetime — on iOS a process suspended while
+/// holding a lock in a shared App Group container is killed with `0xdead10cc`.
+/// Hosts therefore need an operation that ends the connection at a known
+/// instant and can be awaited.
+///
+/// This type is that operation. It is the shared building block for every
+/// closeable SQLite handle in the workspace, including databases opened outside
+/// the [`SqliteAccountStorage`] aggregate (the app's shared cache and directory
+/// caches), so the checkpoint-then-close ordering and the closed-state contract
+/// live in one place.
+#[derive(Debug)]
+pub struct CloseableConnection {
+    slot: Mutex<Option<rusqlite::Connection>>,
+    /// Published before [`Self::close`] waits for the connection mutex. New
+    /// operations must stop being admitted as soon as closing begins; otherwise
+    /// racing callers could repeatedly acquire `slot` ahead of the closer and
+    /// extend the host's suspension-critical teardown indefinitely.
+    closed: AtomicBool,
+    /// Marked once the connection itself is gone, closed by [`Self::close`] or
+    /// by dropping the last handle, so a [`DatabaseCloser`] can wait out a
+    /// drop that is still closing it on another thread.
+    released: Arc<ConnectionRelease>,
+    /// Detail carried by the [`StorageError::Closed`] this connection raises,
+    /// naming which database is closed.
+    closed_detail: &'static str,
+}
+
+#[derive(Debug, Default)]
+struct ConnectionRelease {
+    released: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl ConnectionRelease {
+    fn mark(&self) {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.changed.notify_all();
+    }
+
+    fn is_marked(&self) -> bool {
+        *self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn wait(&self) {
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*released {
+            released = self
+                .changed
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+impl CloseableConnection {
+    /// Take ownership of `connection`. `closed_detail` names this database in
+    /// the [`StorageError::Closed`] raised after a close.
+    #[must_use]
+    pub fn new(connection: rusqlite::Connection, closed_detail: &'static str) -> Self {
+        Self {
+            slot: Mutex::new(Some(connection)),
+            closed: AtomicBool::new(false),
+            released: Arc::default(),
+            closed_detail,
+        }
+    }
+
+    /// Borrow the connection, or fail with [`StorageError::Closed`] if it has
+    /// been closed or is currently closing.
+    pub fn lock(&self) -> StorageResult<ConnectionGuard<'_>> {
+        if self.is_closed() {
+            return Err(StorageError::Closed(self.closed_detail.to_string()));
+        }
+        let guard = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // `close` may have published after the optimistic check but before this
+        // mutex acquisition. Recheck under the mutex so a caller that queued
+        // behind the closer cannot start fresh work during teardown.
+        if self.is_closed() || guard.is_none() {
+            return Err(StorageError::Closed(self.closed_detail.to_string()));
+        }
+        Ok(ConnectionGuard { guard })
+    }
+
+    /// Whether [`Self::close`] has started. Nonblocking.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Checkpoint the WAL and close the connection, releasing every file lock
+    /// it holds on the database and its `-wal`/`-shm` sidecars.
+    ///
+    /// Idempotent: a second call finds an empty slot and returns `Ok(())`.
+    /// Blocking only for as long as the statement currently executing on
+    /// another thread; SQLite rolls back any transaction still open on that
+    /// connection as part of closing, so a half-applied transaction is not a
+    /// reachable outcome.
+    ///
+    /// A failed checkpoint is logged and does not block the close: leaving a
+    /// larger `-wal` behind costs the next open a replay, whereas leaving the
+    /// connection open costs the host its process.
+    pub fn close(&self) -> StorageResult<()> {
+        // Close admission before waiting for the currently executing operation.
+        // Do not return early when this was already set: concurrent close
+        // callers still have to serialize on `slot` so every return truthfully
+        // means the connection has been taken and closed.
+        self.closed.store(true, Ordering::Release);
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(connection) = slot.take() else {
+            return Ok(());
+        };
+        let result = Self::close_taken(connection);
+        self.released.mark();
+        result
+    }
+
+    fn close_taken(connection: rusqlite::Connection) -> StorageResult<()> {
+        // TRUNCATE folds the WAL back into the main database and resets the
+        // file to zero length, so the next open starts from a clean sidecar
+        // rather than replaying this session's log. It is a no-op error on
+        // rollback-journal databases, which is why the failure is not fatal.
+        if let Err(error) = connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+            tracing::debug!(
+                target: "storage_sqlite::connection",
+                method = "close",
+                error_kind = sqlite_error_kind(&error),
+                "wal checkpoint before close failed; closing anyway",
+            );
+        }
+
+        match connection.close() {
+            Ok(()) => Ok(()),
+            Err((connection, error)) => {
+                // `close` handing the connection back means SQLite still had
+                // work attached to it. Drop it regardless: rusqlite's `Drop`
+                // uses `sqlite3_close_v2`, which detaches the handle and frees
+                // it once that work finishes, so the file locks still go away.
+                drop(connection);
+                Err(StorageError::Backend(format!(
+                    "closing sqlite connection: {error}"
+                )))
+            }
+        }
+    }
+}
+
+/// rusqlite's default statement cache holds 16 entries; this crate issues
+/// well over a hundred distinct statement texts on the engine paths alone.
+pub(crate) const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 256;
+
+/// `Connection::execute` / `Connection::query_row` compile the SQL text on
+/// every call. Every statement this crate issues has a fixed text, so route
+/// the hot paths through the connection's prepared-statement cache instead.
+pub(crate) trait CachedSql {
+    fn execute_cached<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize>;
+
+    fn query_row_cached<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>;
+}
+
+impl CachedSql for rusqlite::Connection {
+    fn execute_cached<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize> {
+        self.prepare_cached(sql)?.execute(params)
+    }
+
+    fn query_row_cached<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.prepare_cached(sql)?.query_row(params, f)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedConnection {
+    inner: Arc<SharedConnectionInner>,
+}
+
+impl SharedConnection {
+    /// Whether both handles are clones of one opened connection.
+    pub(crate) fn same_as(&self, other: &SharedConnection) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+/// Transient identity without retaining the connection or its database locks.
+#[derive(Clone)]
+pub(crate) struct ConnectionLifetime(std::sync::Weak<SharedConnectionInner>);
+
+impl ConnectionLifetime {
+    pub(crate) fn matches(&self, connection: &SharedConnection) -> bool {
+        self.0.ptr_eq(&Arc::downgrade(&connection.inner))
+    }
+}
+
+struct SharedConnectionInner {
+    timing: Mutex<Option<SqliteTimingObserver>>,
+    timing_enabled: AtomicBool,
+    connection: CloseableConnection,
+    /// Set before the connection is taken so threads parked on
+    /// [`SharedConnectionInner::transaction_released`] wake up and bail out
+    /// rather than waiting for a transaction owner that will never run again.
+    closed: AtomicBool,
+    transaction_owner: Mutex<Option<ThreadId>>,
+    transaction_unusable: Mutex<Option<String>>,
+    transaction_released: Condvar,
+    post_commit: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+    /// Bumped before every write to `openmls_values` and on every rollback;
+    /// see `StorageProvider::mls_write_generation`.
+    openmls_writes: AtomicU64,
+}
+
+impl fmt::Debug for SharedConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedConnection").finish_non_exhaustive()
+    }
+}
+
+impl SharedConnection {
+    pub(crate) fn lifetime(&self) -> ConnectionLifetime {
+        ConnectionLifetime(Arc::downgrade(&self.inner))
+    }
+
+    fn new(connection: rusqlite::Connection) -> Self {
+        Self {
+            inner: Arc::new(SharedConnectionInner {
+                timing: Mutex::new(None),
+                timing_enabled: AtomicBool::new(false),
+                connection: CloseableConnection::new(connection, CLOSED_DETAIL),
+                closed: AtomicBool::new(false),
+                transaction_owner: Mutex::new(None),
+                transaction_unusable: Mutex::new(None),
+                transaction_released: Condvar::new(),
+                post_commit: Mutex::new(Vec::new()),
+                openmls_writes: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    fn start_timing(&self) -> Option<(SqliteTimingObserver, std::time::Instant)> {
+        if !self.inner.timing_enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        self.inner
+            .timing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .map(|observer| (observer, std::time::Instant::now()))
+    }
+
+    pub(crate) fn lock(&self) -> StorageResult<ConnectionGuard<'_>> {
+        let timing = self.start_timing();
+        let result = (|| {
+            let current = std::thread::current().id();
+            loop {
+                self.wait_for_transaction_slot(current)?;
+                let connection = self.inner.connection.lock()?;
+                let owner = self
+                    .inner
+                    .transaction_owner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(err) = self.unusable_error() {
+                    return Err(err);
+                }
+                if !owner.as_ref().is_some_and(|owner| owner != &current) {
+                    drop(owner);
+                    return Ok(connection);
+                }
+                drop(owner);
+                drop(connection);
+            }
+        })();
+        if let Some((observer, started)) = timing {
+            observer(
+                SqliteTimingOperation::ConnectionWait,
+                started.elapsed(),
+                result.is_ok(),
+            );
+        }
+        result
+    }
+
+    /// Whether [`Self::close`] has run (or is running) on this connection.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
+    }
+
+    /// Checkpoint the WAL and close the underlying `rusqlite::Connection`,
+    /// releasing every database file lock it holds.
+    ///
+    /// This is the only way to guarantee the `-wal`/`-shm` sidecars are
+    /// unlocked: in WAL mode an open connection holds a persistent shared lock
+    /// on `-shm` for its entire lifetime, and dropping one `SharedConnection`
+    /// clone does nothing while other clones survive somewhere in the process.
+    /// Hosts that must be lock-free at a known instant — notably iOS apps
+    /// facing the `0xdead10cc` suspension kill for holding a lock in a shared
+    /// App Group container — call this and await it.
+    ///
+    /// Behavior:
+    /// - Idempotent. The second and later calls see an empty slot and return
+    ///   `Ok(())`.
+    /// - Terminal. Surviving clones (including the OpenMLS adapter's) fail with
+    ///   [`StorageError::Closed`]; nothing reopens. Callers construct a fresh
+    ///   [`SqliteAccountStorage`] to use the database again.
+    /// - Safe under concurrent work. Acquiring the connection mutex waits out
+    ///   whatever statement is executing; an open transaction owned by another
+    ///   thread is rolled back by SQLite as part of closing, and that thread's
+    ///   next call fails with [`StorageError::Closed`]. Partial application is
+    ///   therefore impossible — a transaction either committed before the close
+    ///   or was discarded whole.
+    ///
+    /// A failed checkpoint is logged and does not prevent the close: leaving a
+    /// larger `-wal` behind costs the next open a replay, whereas leaving the
+    /// connection open costs the host its process.
+    pub(crate) fn close(&self) -> StorageResult<()> {
+        // Publish "closed" before taking the connection so anyone parked in
+        // `wait_for_transaction_slot` wakes to an error rather than a deadlock.
+        self.inner.closed.store(true, Ordering::Release);
+        self.wake_transaction_waiters();
+        self.inner.connection.close()
+    }
+
+    fn wake_transaction_waiters(&self) {
+        let _owner = self
+            .inner
+            .transaction_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.inner.transaction_released.notify_all();
+    }
+
+    /// Record a write to the OpenMLS store. Called before the write so a
+    /// partial failure invalidates cached objects too.
+    pub(crate) fn note_openmls_write(&self) {
+        self.inner.openmls_writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn openmls_write_generation(&self) -> u64 {
+        self.inner.openmls_writes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn is_current_thread_transaction_owner(&self) -> bool {
+        let current = std::thread::current().id();
+        let owner = self
+            .inner
+            .transaction_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        owner.as_ref().is_some_and(|owner| owner == &current)
+    }
+
+    /// Run a wakeup after the owning transaction commits, or immediately when
+    /// called outside a transaction. Callers register only after their local
+    /// savepoint succeeds. Rollback, panic, and failed commits discard wakeups.
+    pub(crate) fn after_commit(&self, callback: impl FnOnce() + Send + 'static) {
+        let owner = self
+            .inner
+            .transaction_owner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if owner.as_ref() == Some(&std::thread::current().id()) {
+            self.inner
+                .post_commit
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(Box::new(callback));
+            return;
+        }
+        drop(owner);
+        callback();
+    }
+
+    fn take_post_commit(&self) -> Vec<Box<dyn FnOnce() + Send>> {
+        std::mem::take(
+            &mut *self
+                .inner
+                .post_commit
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        )
+    }
+
+    /// Compose reads on one locked connection and one deferred snapshot. `lock`
+    /// waits for any other thread's transaction owner, so an existing transaction
+    /// here belongs to this thread and stays caller-owned, including on error.
+    /// The callback must use the supplied connection, not re-enter storage APIs.
+    pub(crate) fn with_deferred_read<T, E>(
+        &self,
+        read: impl FnOnce(&rusqlite::Connection) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<StorageError>,
+    {
+        let conn = self.lock()?;
+        let owned = if conn.is_autocommit() {
+            Some(conn.unchecked_transaction().storage()?)
+        } else {
+            None
+        };
+        let value = read(&conn)?;
+        if let Some(tx) = owned {
+            tx.commit().storage()?;
+        }
+        Ok(value)
+    }
+
+    pub(crate) fn with_transaction<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        E: From<StorageError>,
+        F: FnOnce() -> Result<T, E>,
+    {
+        self.with_transaction_mode(false, f)
+    }
+
+    pub(crate) fn with_transaction_mode<T, E, F>(&self, deferred: bool, f: F) -> Result<T, E>
+    where
+        E: From<StorageError>,
+        F: FnOnce() -> Result<T, E>,
+    {
+        let timing = self.start_timing();
+        let result = (|| {
+            let current = std::thread::current().id();
+            let mut owner = self
+                .inner
+                .transaction_owner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while owner.as_ref().is_some_and(|owner| owner != &current) {
+                if let Some(err) = self.unusable_error() {
+                    return Err(E::from(err));
+                }
+                owner = self
+                    .inner
+                    .transaction_released
+                    .wait(owner)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            if let Some(err) = self.unusable_error() {
+                return Err(E::from(err));
+            }
+
+            // Nested transaction on the same thread: the outer SQL transaction is
+            // already active and owns rollback/commit.
+            if owner.as_ref().is_some_and(|owner| owner == &current) {
+                drop(owner);
+                return f();
+            }
+
+            *owner = Some(current);
+            drop(owner);
+
+            let begin = if deferred {
+                self.begin_deferred_with_retry()
+            } else {
+                self.begin_immediate_with_retry()
+            };
+            if let Err(err) = begin {
+                self.clear_transaction_owner();
+                return Err(E::from(err));
+            }
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            // A nested savepoint whose rollback failed latched the connection
+            // unusable mid-transaction. The callback may have caught that
+            // error, but its abandoned writes are still open: never commit.
+            let result = match (result, self.transaction_unusable_error()) {
+                (Ok(Ok(_)), Some(err)) => {
+                    let _ = self.rollback_boundary_with_retry();
+                    return Err(E::from(err));
+                }
+                (result, _) => result,
+            };
+            match result {
+            Ok(Ok(value)) => match self.execute_transaction_boundary_with_retry("COMMIT") {
+                Ok(()) => {
+                    let callbacks = self.take_post_commit();
+                    self.clear_transaction_owner();
+                    for callback in callbacks {
+                        callback();
+                    }
+                    Ok(value)
+                }
+                Err(commit_err) => match self.rollback_boundary_with_retry() {
+                    Ok(()) => {
+                        self.clear_transaction_owner();
+                        Err(E::from(commit_err))
+                    }
+                    Err(rollback_err) => Err(E::from(self.mark_transaction_unusable(format!(
+                        "sqlite transaction COMMIT failed ({commit_err}); ROLLBACK after failed COMMIT also failed ({rollback_err}); connection marked unusable",
+                    )))),
+                },
+            },
+            Ok(Err(err)) => match self.rollback_boundary_with_retry() {
+                Ok(()) => {
+                    self.clear_transaction_owner();
+                    Err(err)
+                }
+                Err(rollback_err) => Err(E::from(self.mark_transaction_unusable(format!(
+                    "sqlite transaction ROLLBACK failed after callback error ({rollback_err}); connection marked unusable",
+                )))),
+            },
+            Err(payload) => match self.rollback_boundary_with_retry() {
+                Ok(()) => {
+                    self.clear_transaction_owner();
+                    std::panic::resume_unwind(payload);
+                }
+                Err(rollback_err) => {
+                    let _ = self.mark_transaction_unusable(format!(
+                        "sqlite transaction ROLLBACK failed during panic cleanup ({rollback_err}); connection marked unusable",
+                    ));
+                    std::panic::resume_unwind(payload);
+                }
+            },
+        }
+        })();
+        if let Some((observer, started)) = timing {
+            observer(
+                SqliteTimingOperation::Transaction,
+                started.elapsed(),
+                result.is_ok(),
+            );
+        }
+        result
+    }
+
+    /// Run `f` as a nested unit of the current transaction, or of a new one
+    /// when none is open. Nested [`Self::with_transaction`] calls flatten, so
+    /// their errors roll back only at the outermost boundary; this rolls `f`
+    /// back on its own. On `Err` or panic, `ROLLBACK TO` undoes every write
+    /// `f` made, drops the wakeups it registered and invalidates cached
+    /// OpenMLS objects, and the caller's transaction stays open and usable.
+    pub(crate) fn with_savepoint<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        E: From<StorageError>,
+        F: FnOnce() -> Result<T, E>,
+    {
+        self.with_transaction(|| {
+            self.execute_transaction_boundary_with_retry("SAVEPOINT mdk_savepoint")?;
+            let wakeups = self
+                .inner
+                .post_commit
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+                Ok(Ok(value)) => {
+                    match self.execute_transaction_boundary_with_retry("RELEASE mdk_savepoint") {
+                        Ok(()) => Ok(value),
+                        Err(release_err) => {
+                            self.rollback_to_savepoint(wakeups)?;
+                            Err(E::from(release_err))
+                        }
+                    }
+                }
+                Ok(Err(err)) => {
+                    self.rollback_to_savepoint(wakeups)?;
+                    Err(err)
+                }
+                Err(payload) => {
+                    let _ = self.rollback_to_savepoint(wakeups);
+                    std::panic::resume_unwind(payload);
+                }
+            }
+        })
+    }
+
+    /// Undo and close the innermost `mdk_savepoint`. A failure leaves the
+    /// unit's writes open in a transaction a caller catching the error could
+    /// otherwise commit, so it marks the connection unusable, as a failed
+    /// `ROLLBACK` does, and the outermost transaction then rolls back instead
+    /// of committing. A closed connection already rolled everything back.
+    fn rollback_to_savepoint(&self, wakeups: usize) -> StorageResult<()> {
+        // `ROLLBACK TO` discards OpenMLS writes, like `ROLLBACK`.
+        self.note_openmls_write();
+        self.inner
+            .post_commit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .truncate(wakeups);
+        match self
+            .execute_transaction_boundary_with_retry("ROLLBACK TO mdk_savepoint")
+            .and_then(|()| self.execute_transaction_boundary_with_retry("RELEASE mdk_savepoint"))
+        {
+            Ok(()) => Ok(()),
+            Err(err @ StorageError::Closed(_)) => Err(err),
+            Err(err) => Err(self.mark_transaction_unusable(format!(
+                "sqlite ROLLBACK TO SAVEPOINT failed ({err}); connection marked unusable",
+            ))),
+        }
+    }
+
+    fn wait_for_transaction_slot(&self, current: ThreadId) -> StorageResult<()> {
+        let mut owner = self
+            .inner
+            .transaction_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(err) = self.unusable_error() {
+                return Err(err);
+            }
+            if !owner.as_ref().is_some_and(|owner| owner != &current) {
+                return Ok(());
+            }
+            owner = self
+                .inner
+                .transaction_released
+                .wait(owner)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Finish the active transaction without releasing its in-process owner.
+    ///
+    /// SQLite leaves a transaction active when `COMMIT` returns
+    /// `SQLITE_BUSY`, so retrying that boundary in place is safe and avoids
+    /// re-running the arbitrary transaction closure. `ROLLBACK` uses the same
+    /// bounded policy so a transient boundary failure cannot strand a usable
+    /// connection. Ownership is cleared only by the caller after a boundary
+    /// succeeds; an exhausted rollback instead marks the connection unusable.
+    ///
+    /// A boundary that lands after [`Self::close`] took the connection is not
+    /// a fault: closing rolls the open transaction back inside SQLite. So a
+    /// `ROLLBACK` against a closed connection reports success — the rollback it
+    /// asked for has already happened — while a `COMMIT` reports
+    /// [`StorageError::Closed`], because that work was discarded. Reporting the
+    /// rollback as a failure instead would latch the connection "unusable" and
+    /// turn an orderly host suspension into a corruption-shaped error.
+    /// `ROLLBACK` discards OpenMLS writes the transaction made, so it counts
+    /// as a write for cache-validation purposes.
+    fn rollback_boundary_with_retry(&self) -> StorageResult<()> {
+        self.note_openmls_write();
+        self.execute_transaction_boundary_with_retry("ROLLBACK")
+    }
+
+    fn execute_transaction_boundary_with_retry(&self, sql: &str) -> StorageResult<()> {
+        retry_transaction_boundary(sql, || {
+            let Ok(conn) = self.inner.connection.lock() else {
+                return Err(BoundaryOutcome::Closed);
+            };
+            conn.execute_cached(sql, [])
+                .map(|_| ())
+                .map_err(BoundaryOutcome::Sqlite)
+        })
+    }
+
+    /// Run `BEGIN IMMEDIATE`, retrying with capped exponential backoff on
+    /// transient lock contention. `BEGIN IMMEDIATE` eagerly acquires the SQLite
+    /// write lock, so it is the dominant `SQLITE_BUSY` surface when a separate
+    /// connection/process is mid-write (background sync, projection rebuild,
+    /// retention prune, or WAL checkpoint). No transaction work has run yet at
+    /// this point, so retrying the BEGIN has no side effects. A busy failure
+    /// that survives all attempts is surfaced as the transient
+    /// [`StorageError::Busy`] so callers can tell it apart from a fatal backend
+    /// fault (issue #484).
+    fn begin_immediate_with_retry(&self) -> StorageResult<()> {
+        let timing = self.start_timing();
+        let result = retry_on_busy(|| {
+            self.inner
+                .connection
+                .lock()?
+                .execute_cached("BEGIN IMMEDIATE", [])
+                .map(|_| ())
+                .map_err(crate::base::codec::map_sqlite_error)
+        });
+        if let Some((observer, started)) = timing {
+            observer(
+                SqliteTimingOperation::WriteBegin,
+                started.elapsed(),
+                result.is_ok(),
+            );
+        }
+        result
+    }
+
+    fn begin_deferred_with_retry(&self) -> StorageResult<()> {
+        retry_on_busy(|| {
+            self.inner
+                .connection
+                .lock()?
+                .execute_cached("BEGIN DEFERRED", [])
+                .map(|_| ())
+                .map_err(crate::base::codec::map_sqlite_error)
+        })
+    }
+
+    /// Called only while this thread owns the transaction, including nested
+    /// reads inside a write transaction. Restore the caller's connection mode
+    /// before returning or unwinding, without committing its transaction.
+    pub(crate) fn with_query_only<T, E>(&self, read: impl FnOnce() -> Result<T, E>) -> Result<T, E>
+    where
+        E: From<StorageError>,
+    {
+        let previous: bool = {
+            let conn = self.lock()?;
+            let previous = conn
+                .pragma_query_value(None, "query_only", |row| row.get(0))
+                .storage()?;
+            conn.pragma_update(None, "query_only", true).storage()?;
+            previous
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(read));
+        let restored = self
+            .lock()
+            .and_then(|conn| conn.pragma_update(None, "query_only", previous).storage());
+        // A mode-restore failure must never leave a surviving connection with
+        // an unexpected access mode. Closed handles are already terminal.
+        if restored.is_err() {
+            let _ = self.close();
+        }
+        match result {
+            Ok(result) => {
+                restored?;
+                result
+            }
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// The reason this connection can no longer serve work, if any. Closing
+    /// takes precedence over a latched transaction fault: once the host has
+    /// closed the store, "closed" is the accurate and more actionable answer.
+    fn unusable_error(&self) -> Option<StorageError> {
+        if self.is_closed() {
+            return Some(StorageError::Closed(CLOSED_DETAIL.to_string()));
+        }
+        self.transaction_unusable_error()
+    }
+
+    fn transaction_unusable_error(&self) -> Option<StorageError> {
+        let unusable = self
+            .inner
+            .transaction_unusable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unusable
+            .as_ref()
+            .map(|reason| StorageError::Backend(reason.clone()))
+    }
+
+    fn clear_transaction_owner(&self) {
+        let mut owner = self
+            .inner
+            .transaction_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.take_post_commit();
+        *owner = None;
+        self.inner.transaction_released.notify_all();
+    }
+
+    fn mark_transaction_unusable(&self, reason: String) -> StorageError {
+        let mut owner = self
+            .inner
+            .transaction_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut unusable = self
+            .inner
+            .transaction_unusable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if unusable.is_none() {
+            *unusable = Some(reason.clone());
+        }
+        self.take_post_commit();
+        *owner = None;
+        drop(unusable);
+        drop(owner);
+        self.inner.transaction_released.notify_all();
+        StorageError::Backend(reason)
+    }
+}
+
+/// Why a transaction-boundary statement did not execute.
+enum BoundaryOutcome {
+    /// SQLite ran the statement and rejected it.
+    Sqlite(rusqlite::Error),
+    /// The connection was closed before the statement could run.
+    Closed,
+}
+
+fn retry_transaction_boundary<F>(sql: &str, mut execute: F) -> StorageResult<()>
+where
+    F: FnMut() -> Result<(), BoundaryOutcome>,
+{
+    retry_on_busy(|| {
+        execute().map_err(|outcome| match outcome {
+            // Closing the connection rolled the transaction back inside
+            // SQLite, so the rollback this boundary wanted is already done.
+            // A commit, by contrast, genuinely did not happen.
+            BoundaryOutcome::Closed if sql == "ROLLBACK" => {
+                BoundaryClosedOrError::RolledBackByClose
+            }
+            BoundaryOutcome::Closed => BoundaryClosedOrError::Error(StorageError::Closed(format!(
+                "sqlite transaction {sql}: {CLOSED_DETAIL}"
+            ))),
+            BoundaryOutcome::Sqlite(error) => {
+                BoundaryClosedOrError::Error(match crate::base::codec::map_sqlite_error(error) {
+                    StorageError::Busy(detail) => {
+                        StorageError::Busy(format!("sqlite transaction {sql}: {detail}"))
+                    }
+                    StorageError::Backend(detail) => {
+                        StorageError::Backend(format!("sqlite transaction {sql}: {detail}"))
+                    }
+                    StorageError::Corruption(detail) => {
+                        StorageError::Corruption(format!("sqlite transaction {sql}: {detail}"))
+                    }
+                    StorageError::Capacity(detail) => {
+                        StorageError::Capacity(format!("sqlite transaction {sql}: {detail}"))
+                    }
+                    other => StorageError::Backend(format!("sqlite transaction {sql}: {other}")),
+                })
+            }
+        })
+    })
+    .or_else(|outcome| match outcome {
+        BoundaryClosedOrError::RolledBackByClose => Ok(()),
+        BoundaryClosedOrError::Error(error) => Err(error),
+    })
+}
+
+/// [`retry_transaction_boundary`]'s internal error, distinguishing the
+/// "already rolled back by close" success-in-disguise from a real failure.
+enum BoundaryClosedOrError {
+    RolledBackByClose,
+    Error(StorageError),
+}
+
+impl TransientError for BoundaryClosedOrError {
+    fn is_busy(&self) -> bool {
+        matches!(self, Self::Error(error) if error.is_busy())
+    }
+}
+
+pub struct SqlCipherKey(Zeroizing<String>);
+
+impl SqlCipherKey {
+    pub fn new(key: impl Into<String>) -> StorageResult<Self> {
+        let key = Zeroizing::new(key.into());
+        if key.is_empty() {
+            return Err(StorageError::Backend(
+                "SQLCipher key must not be empty".to_string(),
+            ));
+        }
+        Ok(Self(key))
+    }
+
+    pub fn as_secret_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SqlCipherKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SqlCipherKey").field(&"<redacted>").finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct SqliteAccountStorage {
+    pub(crate) draft_commit_observer:
+        Arc<Mutex<Option<crate::app::message_drafts::revisioned::MessageDraftCommitObserver>>>,
+    migrations_applied: usize,
+    migration_duration: Duration,
+    pub(crate) connection: SharedConnection,
+    pub(crate) openmls: SqliteOpenMlsStorage,
+}
+
+#[deprecated(
+    note = "renamed to SqliteAccountStorage; SqliteStorage will be removed once downstream crates have migrated"
+)]
+pub type SqliteStorage = SqliteAccountStorage;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqliteStorageOptions {
+    pub busy_timeout_ms: u64,
+    pub journal_mode: SqliteJournalMode,
+    pub synchronous: SqliteSynchronous,
+    pub secure_delete: bool,
+    pub temp_store_memory: bool,
+    pub trusted_schema: bool,
+    /// Enable SQLCipher's process-global enhanced memory allocator. Once any
+    /// connection enables it, it remains enabled for every SQLite connection
+    /// in the process. Android receives a once-per-process diagnostic because
+    /// its finite `mlock` budget makes page locking best effort.
+    pub cipher_memory_security: bool,
+    pub cipher_compatibility: u8,
+}
+
+impl Default for SqliteStorageOptions {
+    fn default() -> Self {
+        Self {
+            busy_timeout_ms: 5_000,
+            journal_mode: SqliteJournalMode::Wal,
+            synchronous: SqliteSynchronous::Full,
+            secure_delete: true,
+            temp_store_memory: true,
+            trusted_schema: false,
+            cipher_memory_security: true,
+            cipher_compatibility: 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqliteJournalMode {
+    Wal,
+    Delete,
+}
+
+impl SqliteJournalMode {
+    fn as_pragma(self) -> &'static str {
+        match self {
+            Self::Wal => "WAL",
+            Self::Delete => "DELETE",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqliteSynchronous {
+    Full,
+    Normal,
+}
+
+impl SqliteSynchronous {
+    fn as_pragma(self) -> &'static str {
+        match self {
+            Self::Full => "FULL",
+            Self::Normal => "NORMAL",
+        }
+    }
+}
+
+impl SqliteAccountStorage {
+    /// Neutral open-time result. Existing ledger entries are not new migrations.
+    pub fn migration_summary(&self) -> (usize, Duration) {
+        (self.migrations_applied, self.migration_duration)
+    }
+
+    /// Export one group's convergence/OpenMLS state, including any durable
+    /// convergence pass, for a sensitive test-only replay capsule.
+    #[cfg(feature = "test-conformance-replay")]
+    pub fn export_conformance_replay_snapshot(
+        &self,
+        group_id: &cgka_traits::types::GroupId,
+    ) -> StorageResult<Vec<u8>> {
+        crate::protocol::storage::snapshots::export_replay(self, group_id)
+    }
+
+    /// Restore a sensitive test-only conformance replay snapshot into this
+    /// account-device database.
+    #[cfg(feature = "test-conformance-replay")]
+    pub fn import_conformance_replay_snapshot(
+        &self,
+        group_id: &cgka_traits::types::GroupId,
+        snapshot: &[u8],
+    ) -> StorageResult<()> {
+        crate::protocol::storage::snapshots::import_replay(self, group_id, snapshot)
+    }
+
+    pub fn in_memory() -> StorageResult<Self> {
+        Self::in_memory_with_options(SqliteStorageOptions::default())
+    }
+
+    pub fn in_memory_with_options(options: SqliteStorageOptions) -> StorageResult<Self> {
+        let connection = rusqlite::Connection::open_in_memory().storage()?;
+        apply_cipher_pragmas(&connection, &options)?;
+        Self::from_connection_with_options(connection, options)
+    }
+
+    /// Test-only in-memory storage copied from one migrated template per
+    /// process. Harnesses that open thousands of short-lived databases would
+    /// otherwise replay every migration for each. Opening the copy still runs
+    /// the migration ledger check, which finds nothing to apply.
+    #[cfg(feature = "test-migrated-template")]
+    pub fn in_memory_from_migrated_template(options: SqliteStorageOptions) -> StorageResult<Self> {
+        static TEMPLATE: std::sync::OnceLock<Mutex<rusqlite::Connection>> =
+            std::sync::OnceLock::new();
+        if TEMPLATE.get().is_none() {
+            let template_options = SqliteStorageOptions {
+                cipher_memory_security: false,
+                ..options.clone()
+            };
+            let mut template = rusqlite::Connection::open_in_memory().storage()?;
+            apply_cipher_pragmas(&template, &template_options)?;
+            apply_operational_pragmas(&template, &template_options)?;
+            migrations::run_all_observed(&mut template, None)?;
+            // A concurrent first caller may win; either template is complete.
+            let _ = TEMPLATE.set(Mutex::new(template));
+        }
+        let template = TEMPLATE
+            .get()
+            .expect("template was just initialized")
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut connection = rusqlite::Connection::open_in_memory().storage()?;
+        apply_cipher_pragmas(&connection, &options)?;
+        rusqlite::backup::Backup::new(&template, &mut connection)
+            .storage()?
+            .run_to_completion(std::ffi::c_int::MAX, Duration::ZERO, None)
+            .storage()?;
+        drop(template);
+        Self::from_connection_with_options(connection, options)
+    }
+
+    /// Open a private encrypted account store with the standard privacy and durability defaults.
+    pub fn open_encrypted(path: impl AsRef<Path>, key: &SqlCipherKey) -> StorageResult<Self> {
+        Self::open_encrypted_with_options(path, key, SqliteStorageOptions::default())
+    }
+
+    /// Apply the caller's cipher/operational options and pending migrations before publishing the store.
+    pub fn open_encrypted_with_options(
+        path: impl AsRef<Path>,
+        key: &SqlCipherKey,
+        options: SqliteStorageOptions,
+    ) -> StorageResult<Self> {
+        Self::open_encrypted_observed_options(path, key, options, None)
+    }
+
+    /// Observe fixed phases and migration numbers without exposing database paths, SQL or keys.
+    /// Callback faults are isolated; ordinary callers keep the same defaults and no callback.
+    pub fn open_encrypted_observed(
+        path: impl AsRef<Path>,
+        key: &SqlCipherKey,
+        observer: &dyn Fn(crate::StorageOpenProgress),
+    ) -> StorageResult<Self> {
+        Self::open_encrypted_observed_options(
+            path,
+            key,
+            SqliteStorageOptions::default(),
+            Some(observer),
+        )
+    }
+    /// Create private database files before opening and observing the unpublished connection.
+    fn open_encrypted_observed_options(
+        path: impl AsRef<Path>,
+        key: &SqlCipherKey,
+        options: SqliteStorageOptions,
+        observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
+    ) -> StorageResult<Self> {
+        let path = path.as_ref();
+        ensure_private_db_files(path)?;
+        let connection = rusqlite::Connection::open(path).storage()?;
+        Self::from_unkeyed_observed(connection, key, options, observer)
+    }
+    /// Exercise raw unkeyed connections with production keying defaults and no diagnostic callback.
+    #[cfg(test)]
+    fn from_unkeyed_encrypted_connection_with_options(
+        connection: rusqlite::Connection,
+        key: &SqlCipherKey,
+        options: SqliteStorageOptions,
+    ) -> StorageResult<Self> {
+        Self::from_unkeyed_observed(connection, key, options, None)
+    }
+    /// Pin cipher configuration before key application, reporting each boundary before it can block.
+    fn from_unkeyed_observed(
+        connection: rusqlite::Connection,
+        key: &SqlCipherKey,
+        options: SqliteStorageOptions,
+        observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
+    ) -> StorageResult<Self> {
+        crate::base::open_progress::observe(
+            observer,
+            crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::CipherConfiguration),
+        );
+        apply_cipher_pragmas(&connection, &options)?;
+        crate::base::open_progress::observe(
+            observer,
+            crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::CipherKeyApplication),
+        );
+        apply_sqlcipher_key(&connection, key)?;
+        Self::from_connection_observed(connection, options, observer)
+    }
+    /// Finish an existing connection without recording progress; options and migrations remain identical.
+    pub(crate) fn from_connection_with_options(
+        connection: rusqlite::Connection,
+        options: SqliteStorageOptions,
+    ) -> StorageResult<Self> {
+        Self::from_connection_observed(connection, options, None)
+    }
+    /// Apply operational settings and all pending migrations before sharing a closeable connection.
+    fn from_connection_observed(
+        mut connection: rusqlite::Connection,
+        options: SqliteStorageOptions,
+        observer: Option<&dyn Fn(crate::StorageOpenProgress)>,
+    ) -> StorageResult<Self> {
+        crate::base::open_progress::observe(
+            observer,
+            crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::OperationalPragmas),
+        );
+        apply_operational_pragmas(&connection, &options)?;
+        connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
+        let migration_started = std::time::Instant::now();
+        let migrations_applied = migrations::run_all_observed(&mut connection, observer)?;
+        let migration_duration = migration_started.elapsed();
+        let connection = SharedConnection::new(connection);
+        let openmls = SqliteOpenMlsStorage::new(connection.clone());
+        Ok(Self {
+            connection,
+            openmls,
+            draft_commit_observer: Default::default(),
+            migrations_applied,
+            migration_duration,
+        })
+    }
+
+    /// Set an aggregate-only observer shared by all clones. No identities or SQL
+    /// are passed. Install once per runtime; `None` disables observation.
+    pub fn set_timing_observer(&self, observer: Option<SqliteTimingObserver>) {
+        let mut slot = self
+            .connection
+            .inner
+            .timing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *slot = observer;
+        self.connection
+            .inner
+            .timing_enabled
+            .store(slot.is_some(), Ordering::Release);
+    }
+
+    pub(crate) fn lock(&self) -> StorageResult<ConnectionGuard<'_>> {
+        self.connection.lock()
+    }
+
+    /// Whether `other` is a clone of this same opened database handle, not
+    /// merely another connection to the same file.
+    pub fn shares_connection_with(&self, other: &SqliteAccountStorage) -> bool {
+        self.connection.same_as(&other.connection)
+    }
+
+    /// Checkpoint the WAL and close this account database, releasing every
+    /// file lock it holds on the main database and its `-wal`/`-shm` sidecars.
+    ///
+    /// **Closing is terminal.** Every clone of this handle — including the
+    /// OpenMLS adapter reached through
+    /// [`StorageProvider::mls_storage`][cgka_traits::storage::StorageProvider::mls_storage]
+    /// and any clone held elsewhere in the process — fails with
+    /// [`StorageError::Closed`] from here on. Nothing reopens implicitly; to
+    /// use the database again, construct a new [`SqliteAccountStorage`].
+    ///
+    /// Callers should quiesce their own work first. Closing is nonetheless
+    /// safe under concurrent use: it waits out the statement currently
+    /// executing, and SQLite rolls back any transaction still open on another
+    /// thread as part of closing, so a partially applied transaction is not a
+    /// reachable outcome. Idempotent — later calls return `Ok(())`.
+    ///
+    /// This exists because dropping handles is not a usable close: the
+    /// connection lives behind an `Arc` shared by the engine, the OpenMLS
+    /// adapter, and app projections, so a host has no way to observe or await
+    /// the last clone going away. Hosts that must be provably lock-free at a
+    /// known instant need this — on iOS, a WAL connection left open across app
+    /// suspension holds a lock in the shared App Group container and the
+    /// process is killed with `0xdead10cc`.
+    pub fn close(&self) -> StorageResult<()> {
+        self.connection.close()
+    }
+
+    /// Whether [`Self::close`] has run on this database.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.connection.is_closed()
+    }
+
+    /// A [`DatabaseCloser`] for this connection, shared by every clone.
+    #[must_use]
+    pub fn closer(&self) -> DatabaseCloser {
+        DatabaseCloser {
+            target: CloserTarget::Account(Arc::downgrade(&self.connection.inner)),
+            release: self.connection.inner.connection.released.clone(),
+        }
+    }
+}
+
+/// Closes a database without holding it open.
+///
+/// An owner that must close every live connection at a known instant (a host
+/// about to be suspended) keeps one of these per connection instead of a
+/// handle. It holds only a weak reference, so it never keeps a connection
+/// whose handles have all dropped alive, or its file locks held.
+#[derive(Clone, Debug)]
+pub struct DatabaseCloser {
+    target: CloserTarget,
+    release: Arc<ConnectionRelease>,
+}
+
+#[derive(Clone, Debug)]
+enum CloserTarget {
+    Account(std::sync::Weak<SharedConnectionInner>),
+    Connection(std::sync::Weak<CloseableConnection>),
+}
+
+impl DatabaseCloser {
+    /// Close the database if any handle to it is still alive, with the same
+    /// terminal contract as that handle's own `close`.
+    ///
+    /// When every handle has already dropped, dropping the last one closes
+    /// the connection, possibly still in progress on another thread. This
+    /// waits for that to finish, so a return always means the connection is
+    /// gone.
+    pub fn close(&self) -> StorageResult<()> {
+        let result = match &self.target {
+            CloserTarget::Account(inner) => inner
+                .upgrade()
+                .map_or(Ok(()), |inner| SharedConnection { inner }.close()),
+            CloserTarget::Connection(connection) => connection
+                .upgrade()
+                .map_or(Ok(()), |connection| connection.close()),
+        };
+        self.release.wait();
+        result
+    }
+
+    /// Whether the connection is gone, closed or dropped with its last
+    /// handle, leaving nothing to close. Nonblocking, and takes no reference,
+    /// so it cannot extend the connection's life.
+    #[must_use]
+    pub fn is_released(&self) -> bool {
+        self.release.is_marked()
+    }
+}
+
+impl CloseableConnection {
+    /// A [`DatabaseCloser`] for this shared connection.
+    #[must_use]
+    pub fn closer(self: &Arc<Self>) -> DatabaseCloser {
+        DatabaseCloser {
+            target: CloserTarget::Connection(Arc::downgrade(self)),
+            release: self.released.clone(),
+        }
+    }
+}
+
+impl Drop for CloseableConnection {
+    fn drop(&mut self) {
+        // Close before marking, so a closer that is waiting returns only once
+        // the database file is closed.
+        drop(
+            self.slot
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+        );
+        self.released.mark();
+    }
+}
+
+/// Make a database file owner-only before SQLite can create it at the process
+/// umask; see `fs_private::ensure_private_db_files` for the sidecar rules.
+pub(crate) fn ensure_private_db_files(path: &Path) -> StorageResult<()> {
+    fs_private::ensure_private_db_files(path).map_err(|err| StorageError::Backend(err.to_string()))
+}
+
+fn apply_sqlcipher_key(connection: &rusqlite::Connection, key: &SqlCipherKey) -> StorageResult<()> {
+    connection
+        .pragma_update(None, "key", key.as_secret_str())
+        .storage()?;
+    let _: i64 = connection
+        .query_row_cached("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .storage()?;
+    Ok(())
+}
+
+fn apply_cipher_pragmas(
+    connection: &rusqlite::Connection,
+    options: &SqliteStorageOptions,
+) -> StorageResult<()> {
+    connection
+        .pragma_update(
+            None,
+            "cipher_compatibility",
+            i64::from(options.cipher_compatibility),
+        )
+        .storage()?;
+    if options.cipher_memory_security {
+        connection
+            .execute_batch("PRAGMA cipher_memory_security = ON;")
+            .storage()?;
+        #[cfg(target_os = "android")]
+        report_sqlcipher_platform_limit_once(&SQLCIPHER_PLATFORM_LIMIT_REPORTED);
+    }
+    Ok(())
+}
+
+fn apply_operational_pragmas(
+    connection: &rusqlite::Connection,
+    options: &SqliteStorageOptions,
+) -> StorageResult<()> {
+    connection
+        .busy_timeout(Duration::from_millis(options.busy_timeout_ms))
+        .storage()?;
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .storage()?;
+    connection
+        .pragma_update(None, "secure_delete", options.secure_delete)
+        .storage()?;
+    connection
+        .pragma_update(None, "trusted_schema", options.trusted_schema)
+        .storage()?;
+    if options.temp_store_memory {
+        connection
+            .pragma_update(None, "temp_store", "MEMORY")
+            .storage()?;
+    }
+    connection
+        .pragma_update(None, "synchronous", options.synchronous.as_pragma())
+        .storage()?;
+    let journal_mode = format!("PRAGMA journal_mode = {}", options.journal_mode.as_pragma());
+    let _: String = connection
+        .query_row(&journal_mode, [], |row| row.get(0))
+        .storage()?;
+    Ok(())
+}
+
+/// SQLCipher hardening for connections opened *outside* the account-storage
+/// aggregate (the app's directory cache, legacy account-projection import, and
+/// key-rotation paths). It mirrors the hardening [`SqliteAccountStorage`]
+/// applies so every SQLCipher database the workspace opens pins
+/// `cipher_compatibility`, enables `cipher_memory_security` *before* keying,
+/// and optionally scrubs deleted rows and keeps temp state in memory.
+///
+/// The cipher fields default to the same values as [`SqliteStorageOptions`] so
+/// the two hardening paths cannot silently drift apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqlCipherHardening {
+    /// Pin `cipher_compatibility` so a future SQLCipher default-compat bump
+    /// cannot silently change the on-disk format these databases require.
+    pub cipher_compatibility: u8,
+    /// Enable `cipher_memory_security` so key/page material is wiped from the
+    /// SQLCipher heap.
+    pub cipher_memory_security: bool,
+    /// Scrub deleted rows on this connection (`secure_delete`).
+    pub secure_delete: bool,
+    /// Keep temporary tables/indexes in memory (`temp_store = MEMORY`).
+    pub temp_store_memory: bool,
+}
+
+impl SqlCipherHardening {
+    /// Cipher hardening only: pin `cipher_compatibility` and enable
+    /// `cipher_memory_security`, without row scrubbing or temp-store changes.
+    /// Suitable for short-lived migration/rekey opens.
+    pub fn cipher_only() -> Self {
+        let defaults = SqliteStorageOptions::default();
+        Self {
+            cipher_compatibility: defaults.cipher_compatibility,
+            cipher_memory_security: defaults.cipher_memory_security,
+            secure_delete: false,
+            temp_store_memory: false,
+        }
+    }
+
+    /// Full hardening for a long-lived encrypted cache: cipher hardening plus
+    /// `secure_delete` and `temp_store = MEMORY`.
+    pub fn live_cache() -> Self {
+        Self {
+            secure_delete: true,
+            temp_store_memory: true,
+            ..Self::cipher_only()
+        }
+    }
+}
+
+impl Default for SqlCipherHardening {
+    fn default() -> Self {
+        Self::cipher_only()
+    }
+}
+
+/// Apply SQLCipher hardening to `connection` and key it, in the order the
+/// PRAGMAs require to take effect: `cipher_compatibility` and
+/// `cipher_memory_security` are set **before** `PRAGMA key`, then the privacy
+/// PRAGMAs (`secure_delete`, `temp_store`) are applied after keying.
+///
+/// This is the shared entry point for SQLCipher databases opened outside
+/// [`SqliteAccountStorage`]. The cipher-pragma ordering invariant is exercised
+/// by `public_hardened_open_pins_cipher_pragmas_before_keying`.
+pub fn open_hardened_sqlcipher(
+    connection: &rusqlite::Connection,
+    key: &SqlCipherKey,
+    hardening: SqlCipherHardening,
+) -> StorageResult<()> {
+    // Reuse the account-storage cipher-pragma path so the "cipher pragmas
+    // before keying" ordering lives in exactly one place.
+    let cipher_options = SqliteStorageOptions {
+        cipher_compatibility: hardening.cipher_compatibility,
+        cipher_memory_security: hardening.cipher_memory_security,
+        ..SqliteStorageOptions::default()
+    };
+    apply_cipher_pragmas(connection, &cipher_options)?;
+    apply_sqlcipher_key(connection, key)?;
+    if hardening.secure_delete {
+        connection
+            .pragma_update(None, "secure_delete", true)
+            .storage()?;
+    }
+    if hardening.temp_store_memory {
+        connection
+            .pragma_update(None, "temp_store", "MEMORY")
+            .storage()?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cgka_traits::storage::StorageProvider;
+    use cgka_traits::types::Backend;
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+        mpsc,
+    };
+    use tracing::{Event, Subscriber, field::Visit};
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    #[cfg(feature = "test-migrated-template")]
+    #[test]
+    fn migrated_template_copies_match_a_migrated_database_and_stay_independent() {
+        fn schema(store: &SqliteAccountStorage) -> Vec<(String, String, Option<String>)> {
+            let conn = store.lock().unwrap();
+            let mut statement = conn
+                .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        }
+        fn ledger(store: &SqliteAccountStorage) -> Vec<i64> {
+            let conn = store.lock().unwrap();
+            let mut statement = conn
+                .prepare("SELECT version FROM cgka_schema_migrations ORDER BY version")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        }
+        let migrated = SqliteAccountStorage::in_memory().unwrap();
+        assert!(migrated.migration_summary().0 > 0);
+        let first =
+            SqliteAccountStorage::in_memory_from_migrated_template(Default::default()).unwrap();
+        let second =
+            SqliteAccountStorage::in_memory_from_migrated_template(Default::default()).unwrap();
+        assert_eq!(
+            first.migration_summary().0,
+            0,
+            "the copy needs no migration"
+        );
+        assert_eq!(schema(&first), schema(&migrated));
+        assert_eq!(ledger(&first), ledger(&migrated));
+        assert!(!ledger(&first).is_empty());
+
+        first
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TABLE template_copy_probe(value INTEGER)")
+            .unwrap();
+        let probe = "SELECT count(*) FROM sqlite_master WHERE name = 'template_copy_probe'";
+        let count = |store: &SqliteAccountStorage| -> i64 {
+            store
+                .lock()
+                .unwrap()
+                .query_row(probe, [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(&first), 1);
+        assert_eq!(count(&second), 0, "copies must not share pages");
+        let third =
+            SqliteAccountStorage::in_memory_from_migrated_template(Default::default()).unwrap();
+        assert_eq!(count(&third), 0, "writes must not reach the template");
+    }
+
+    #[test]
+    fn disabled_timing_skips_observer_lock_and_can_be_reenabled() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let events = Arc::new(AtomicU32::new(0));
+        let output = events.clone();
+        let observer: SqliteTimingObserver = Arc::new(move |_, _, _| {
+            output.fetch_add(1, Ordering::Relaxed);
+        });
+        for enabled in [false, true, false, true] {
+            store.set_timing_observer(enabled.then(|| observer.clone()));
+            if !enabled {
+                let _guard = store.connection.inner.timing.lock().unwrap();
+                assert!(store.connection.start_timing().is_none());
+            }
+            drop(store.lock().unwrap());
+        }
+        assert_eq!(events.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn timing_observer_preserves_transaction_rollback_and_closed_errors() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TABLE timing_test(value INTEGER)")
+            .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        store.set_timing_observer(Some(Arc::new(move |operation, _duration, success| {
+            output.lock().unwrap().push((operation, success));
+        })));
+        let result: StorageResult<()> = store.with_transaction(|s| {
+            s.lock()?
+                .execute("INSERT INTO timing_test VALUES(1)", [])
+                .storage()?;
+            Err(StorageError::Closed("deliberate rollback".into()))
+        });
+        assert!(result.is_err());
+        let count: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM timing_test", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        store.close().unwrap();
+        assert!(matches!(store.lock(), Err(StorageError::Closed(_))));
+        let events = events.lock().unwrap();
+        assert!(events.contains(&(SqliteTimingOperation::WriteBegin, true)));
+        assert!(events.contains(&(SqliteTimingOperation::Transaction, false)));
+        assert!(events.contains(&(SqliteTimingOperation::ConnectionWait, false)));
+    }
+
+    #[test]
+    fn read_snapshot_pins_foreign_writes_and_mls_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read-snapshot.db");
+        let key = SqlCipherKey::new("42".repeat(32)).unwrap();
+        let reader = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let writer = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        reader
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE capture_test(value INTEGER); INSERT INTO capture_test VALUES(1)",
+            )
+            .unwrap();
+        let value = |s: &SqliteAccountStorage| -> StorageResult<i64> {
+            s.lock()?
+                .query_row("SELECT value FROM capture_test", [], |r| r.get(0))
+                .storage()
+        };
+        let generation = reader.mls_write_generation().unwrap();
+        reader
+            .with_read_snapshot(|s| -> StorageResult<()> {
+                assert_eq!(value(s)?, 1);
+                writer
+                    .lock()?
+                    .execute("UPDATE capture_test SET value=2", [])
+                    .storage()?;
+                s.with_read_snapshot(|nested| -> StorageResult<()> {
+                    assert_eq!(value(nested)?, 1);
+                    assert_eq!(nested.mls_write_generation(), Some(generation));
+                    let error = nested
+                        .lock()?
+                        .execute("UPDATE capture_test SET value=3", [])
+                        .unwrap_err();
+                    assert_eq!(
+                        error.sqlite_error_code(),
+                        Some(rusqlite::ErrorCode::ReadOnly)
+                    );
+                    Ok(())
+                })
+            })
+            .unwrap();
+        assert_eq!(value(&reader).unwrap(), 2);
+        assert_ne!(reader.mls_write_generation(), Some(generation));
+    }
+
+    #[test]
+    fn read_snapshot_restores_mode_and_preserves_outer_transaction_on_all_exits() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TABLE capture_test(value INTEGER)")
+            .unwrap();
+        let assert_readonly = |s: &SqliteAccountStorage| -> StorageResult<()> {
+            // Even nested write transactions must not upgrade the read capture.
+            s.with_transaction(|nested| -> StorageResult<()> {
+                let error = nested
+                    .lock()?
+                    .execute("INSERT INTO capture_test VALUES(99)", [])
+                    .unwrap_err();
+                assert_eq!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::ReadOnly)
+                );
+                Ok(())
+            })
+        };
+        store.with_read_snapshot(assert_readonly).unwrap();
+        let result: StorageResult<()> = store.with_transaction(|outer| {
+            outer
+                .lock()?
+                .execute("INSERT INTO capture_test VALUES(1)", [])
+                .storage()?;
+            outer.with_read_snapshot(assert_readonly)?;
+            let failed: StorageResult<()> = outer.with_read_snapshot(|s| {
+                assert_readonly(s)?;
+                Err(StorageError::Backend("fixture error".into()))
+            });
+            assert!(failed.is_err());
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _: StorageResult<()> = outer.with_read_snapshot(|s| {
+                    assert_readonly(s)?;
+                    panic!("fixture panic")
+                });
+            }));
+            assert!(panicked.is_err());
+            outer
+                .lock()?
+                .execute("INSERT INTO capture_test VALUES(2)", [])
+                .storage()?;
+            Err(StorageError::Backend("rollback outer".into()))
+        });
+        assert!(result.is_err());
+        let count: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM capture_test", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "read capture must not commit the caller's writes");
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA query_only=ON")
+            .unwrap();
+        store.with_read_snapshot(assert_readonly).unwrap();
+        let query_only: bool = store
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "query_only", |r| r.get(0))
+            .unwrap();
+        assert!(query_only, "preserve the caller's already-read-only mode");
+        store.close().unwrap();
+        assert!(matches!(
+            store.with_read_snapshot(|_| Ok::<_, StorageError>(())),
+            Err(StorageError::Closed(_))
+        ));
+    }
+
+    static TRACE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static TRACED_SQLCIPHER_SETUP: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+    #[derive(Clone)]
+    struct PlatformLimitLayer {
+        events: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[derive(Default)]
+    struct PlatformLimitVisitor {
+        fields: Vec<String>,
+    }
+
+    impl Visit for PlatformLimitVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    impl<S> Layer<S> for PlatformLimitLayer
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            if event.metadata().target() == "storage_sqlite::connection"
+                && event.metadata().level() == &tracing::Level::WARN
+            {
+                let mut visitor = PlatformLimitVisitor::default();
+                event.record(&mut visitor);
+                self.events.lock().unwrap().push(visitor.fields);
+            }
+        }
+    }
+
+    fn delete_journal_options() -> SqliteStorageOptions {
+        SqliteStorageOptions {
+            busy_timeout_ms: 0,
+            journal_mode: SqliteJournalMode::Delete,
+            ..SqliteStorageOptions::default()
+        }
+    }
+
+    fn open_delete_journal_store(path: &Path) -> SqliteAccountStorage {
+        SqliteAccountStorage::open_encrypted_with_options(
+            path,
+            &SqlCipherKey::new("delete journal transaction boundary key").unwrap(),
+            delete_journal_options(),
+        )
+        .unwrap()
+    }
+
+    fn sqlite_failure(primary: std::os::raw::c_int) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(primary),
+            Some("database is locked".to_string()),
+        )
+    }
+
+    fn trace_sqlcipher_setup(sql: &str) {
+        let sql = sql.to_ascii_lowercase();
+        let setup_step = if sql.contains("cipher_compatibility") {
+            Some("cipher_compatibility")
+        } else if sql.contains("cipher_memory_security") {
+            Some("cipher_memory_security")
+        } else if sql.contains("pragma key") || sql.contains("pragma \"key\"") {
+            Some("key")
+        } else if sql.contains("sqlite_master") {
+            Some("key_probe")
+        } else {
+            None
+        };
+
+        if let Some(setup_step) = setup_step {
+            TRACED_SQLCIPHER_SETUP.lock().unwrap().push(setup_step);
+        }
+    }
+
+    fn trace_sqlcipher_setup_event(event: TraceEvent<'_>) {
+        if let TraceEvent::Stmt(_, sql) = event {
+            trace_sqlcipher_setup(sql);
+        }
+    }
+
+    #[test]
+    fn reports_sqlite_backend() {
+        assert_eq!(
+            SqliteAccountStorage::in_memory().unwrap().backend(),
+            Backend::Sqlite
+        );
+    }
+
+    #[test]
+    fn android_memory_lock_platform_limit_is_reported_once() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(PlatformLimitLayer {
+            events: Arc::clone(&events),
+        });
+        let report_once = Once::new();
+
+        tracing::subscriber::with_default(subscriber, || {
+            report_sqlcipher_platform_limit_once(&report_once);
+            report_sqlcipher_platform_limit_once(&report_once);
+        });
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0]
+                .iter()
+                .any(|field| field == "method=\"configure_cipher_memory_security\"")
+        );
+        assert!(events[0].iter().any(|field| field == "configured=true"));
+        assert!(
+            events[0]
+                .iter()
+                .any(|field| field == "lock_posture=\"platform_limited\"")
+        );
+    }
+
+    #[test]
+    fn bundled_sqlcipher_contains_android_mlock_warning_fix() {
+        fn version_tuple(value: &str) -> (u64, u64, u64) {
+            let numeric = value.split_ascii_whitespace().next().unwrap_or(value);
+            let mut components = numeric.split('.').map(|part| {
+                part.parse::<u64>()
+                    .unwrap_or_else(|_| panic!("invalid runtime version {value:?}"))
+            });
+            (
+                components.next().unwrap_or(0),
+                components.next().unwrap_or(0),
+                components.next().unwrap_or(0),
+            )
+        }
+
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let sqlite_version: String = connection
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+            .unwrap();
+        let sqlcipher_version: String = connection
+            .query_row("PRAGMA cipher_version", [], |row| row.get(0))
+            .unwrap();
+
+        assert!(
+            version_tuple(&sqlite_version) >= (3, 51, 3),
+            "SQLite {sqlite_version} predates the WAL-reset corruption fix"
+        );
+        assert!(
+            version_tuple(&sqlcipher_version) >= (4, 17, 0),
+            "SQLCipher {sqlcipher_version} predates the Android mlock warning fix"
+        );
+    }
+
+    #[test]
+    fn sqlcipher_key_debug_redacts_secret_material() {
+        let key = SqlCipherKey::new("debug-visible secret").unwrap();
+
+        let rendered = format!("{key:?}");
+
+        assert!(!rendered.contains("debug-visible secret"));
+        assert!(rendered.contains("redacted"));
+    }
+
+    #[test]
+    fn connection_lock_recovers_from_poisoned_guard() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.connection.lock().unwrap();
+            panic!("poison sqlite connection lock");
+        }));
+
+        let conn = store.lock().unwrap();
+
+        assert_eq!(pragma_i64(&conn, "foreign_keys"), 1);
+    }
+
+    #[test]
+    fn transaction_rolls_back_openmls_writes_on_error() {
+        use crate::base::test_support::TestGroupState;
+        use cgka_traits::storage::StorageError;
+        use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group_id = openmls::group::GroupId::from_slice(b"transaction-rollback");
+
+        let result: Result<(), StorageError> = store.with_transaction(|storage| {
+            storage
+                .mls_storage()
+                .write_group_state(&group_id, &TestGroupState(b"partial".to_vec()))
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
+            Err(StorageError::Backend("force rollback".to_string()))
+        });
+
+        assert!(result.is_err());
+        let persisted: Option<TestGroupState> = store.mls_storage().group_state(&group_id).unwrap();
+        assert_eq!(persisted, None);
+    }
+
+    #[test]
+    fn failed_group_savepoint_undoes_only_its_own_work_inside_a_committing_transaction() {
+        use crate::base::test_support::{TestGroupState, gid, mid, sample_group, sample_message};
+        use cgka_traits::storage::{GroupStorage, MessageStorage};
+        use cgka_traits::types::EpochId;
+        use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let mls_id = openmls::group::GroupId::from_slice(gid(1).as_slice());
+        let outer_wakeup = Arc::new(AtomicU32::new(0));
+        let savepoint_wakeup = Arc::new(AtomicU32::new(0));
+        let mut generation_inside = None;
+
+        store
+            .with_transaction(|outer| -> StorageResult<()> {
+                outer.put_group(&sample_group(gid(1), 1, 1))?;
+                let failed: StorageResult<()> =
+                    outer.with_group_savepoint(&gid(1), "unused-fallback", |inner| {
+                        inner.put_group(&sample_group(gid(1), 2, 2))?;
+                        inner.put_message(&sample_message(mid(1), gid(1), 2))?;
+                        inner
+                            .mls_storage()
+                            .write_group_state(&mls_id, &TestGroupState(b"partial".to_vec()))
+                            .map_err(|e| StorageError::Backend(e.to_string()))?;
+                        let wakeup = savepoint_wakeup.clone();
+                        inner.connection.after_commit(move || {
+                            wakeup.fetch_add(1, Ordering::SeqCst);
+                        });
+                        generation_inside = inner.mls_write_generation();
+                        Err(StorageError::Backend("abandon the unit".into()))
+                    });
+                assert!(failed.is_err());
+                assert_ne!(
+                    outer.mls_write_generation(),
+                    generation_inside,
+                    "a group cached inside the abandoned unit must not be reused"
+                );
+                assert_eq!(outer.get_group(&gid(1))?.epoch, EpochId(1));
+                let wakeup = outer_wakeup.clone();
+                outer.connection.after_commit(move || {
+                    wakeup.fetch_add(1, Ordering::SeqCst);
+                });
+                outer.put_group(&sample_group(gid(2), 1, 1))
+            })
+            .unwrap();
+
+        assert_eq!(store.get_group(&gid(1)).unwrap().epoch, EpochId(1));
+        assert!(store.get_group(&gid(2)).is_ok());
+        assert!(store.get_message(&mid(1)).is_err());
+        let partial: Option<TestGroupState> = store.mls_storage().group_state(&mls_id).unwrap();
+        assert_eq!(partial, None);
+        assert_eq!(outer_wakeup.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            savepoint_wakeup.load(Ordering::SeqCst),
+            0,
+            "a wakeup registered by the abandoned unit must not fire"
+        );
+    }
+
+    #[test]
+    fn group_savepoint_commits_alone_and_nests() {
+        use crate::base::test_support::{gid, sample_group};
+        use cgka_traits::storage::GroupStorage;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .with_group_savepoint(&gid(1), "unused-fallback", |outer| -> StorageResult<()> {
+                outer.put_group(&sample_group(gid(1), 1, 1))?;
+                let inner: StorageResult<()> =
+                    outer.with_group_savepoint(&gid(2), "unused-fallback", |inner| {
+                        inner.put_group(&sample_group(gid(2), 1, 1))?;
+                        Err(StorageError::Backend("abandon the inner unit".into()))
+                    });
+                assert!(inner.is_err());
+                outer.with_group_savepoint(&gid(3), "unused-fallback", |inner| {
+                    inner.put_group(&sample_group(gid(3), 1, 1))
+                })
+            })
+            .unwrap();
+        assert!(!store.connection.is_current_thread_transaction_owner());
+        assert!(store.get_group(&gid(1)).is_ok());
+        assert!(store.get_group(&gid(2)).is_err());
+        assert!(store.get_group(&gid(3)).is_ok());
+
+        let failed: StorageResult<()> =
+            store.with_group_savepoint(&gid(4), "unused-fallback", |storage| {
+                storage.put_group(&sample_group(gid(4), 1, 1))?;
+                Err(StorageError::Backend("abandon the unit".into()))
+            });
+        assert!(failed.is_err());
+        assert!(!store.connection.is_current_thread_transaction_owner());
+        assert!(store.get_group(&gid(4)).is_err());
+    }
+
+    #[test]
+    fn group_savepoint_undoes_a_panic_the_caller_catches_before_committing() {
+        use crate::base::test_support::{gid, sample_group};
+        use cgka_traits::storage::GroupStorage;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store
+            .with_transaction(|outer| -> StorageResult<()> {
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _: StorageResult<()> =
+                        outer.with_group_savepoint(&gid(1), "unused-fallback", |inner| {
+                            inner.put_group(&sample_group(gid(1), 1, 1))?;
+                            panic!("abandon the unit by panicking");
+                        });
+                }));
+                assert!(panic.is_err());
+                outer.put_group(&sample_group(gid(2), 1, 1))
+            })
+            .unwrap();
+        assert!(store.get_group(&gid(1)).is_err());
+        assert!(store.get_group(&gid(2)).is_ok());
+    }
+
+    #[test]
+    fn failed_savepoint_rollback_blocks_a_catching_caller_from_committing() {
+        use crate::base::test_support::{gid, sample_group};
+        use cgka_traits::storage::GroupStorage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("savepoint-rollback-failure.db");
+        let key = SqlCipherKey::new("42".repeat(32)).unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+
+        let committed = store.with_transaction(|outer| -> StorageResult<()> {
+            let failed: StorageResult<()> =
+                outer.with_group_savepoint(&gid(1), "unused-fallback", |inner| {
+                    inner.put_group(&sample_group(gid(1), 1, 1))?;
+                    // Releasing early makes `ROLLBACK TO` fail while the
+                    // transaction, and the write above, stay open.
+                    inner
+                        .lock()?
+                        .execute_batch("RELEASE mdk_savepoint")
+                        .storage()?;
+                    Err(StorageError::Backend("abandon the unit".into()))
+                });
+            assert!(failed.is_err());
+            Ok(())
+        });
+
+        assert!(
+            committed.is_err(),
+            "a failed savepoint rollback must fail the enclosing commit"
+        );
+        drop(store);
+        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert!(
+            reopened.get_group(&gid(1)).is_err(),
+            "the abandoned unit's write must not persist"
+        );
+    }
+
+    /// The trait default for backends without savepoints: the same contract
+    /// through a full group snapshot, released on both exits.
+    #[test]
+    fn group_snapshot_fallback_restores_the_group_inside_a_committing_transaction() {
+        use crate::base::test_support::{gid, mid, sample_group, sample_message};
+        use cgka_traits::storage::{GroupStorage, MessageStorage, with_group_snapshot_rollback};
+        use cgka_traits::types::EpochId;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        store.put_group(&sample_group(gid(1), 1, 1)).unwrap();
+        store
+            .with_transaction(|outer| -> StorageResult<()> {
+                let failed: StorageResult<()> =
+                    with_group_snapshot_rollback(outer, &gid(1), "fallback", |inner| {
+                        inner.put_group(&sample_group(gid(1), 2, 2))?;
+                        inner.put_message(&sample_message(mid(1), gid(1), 2))?;
+                        Err(StorageError::Backend("abandon the unit".into()))
+                    });
+                assert!(failed.is_err());
+                outer.put_group(&sample_group(gid(2), 1, 1))
+            })
+            .unwrap();
+        assert_eq!(store.get_group(&gid(1)).unwrap().epoch, EpochId(1));
+        assert!(store.get_message(&mid(1)).is_err());
+        assert!(store.get_group(&gid(2)).is_ok());
+        assert!(store.list_group_snapshots(&gid(1)).unwrap().is_empty());
+
+        with_group_snapshot_rollback(&store, &gid(1), "fallback", |storage| {
+            storage.put_group(&sample_group(gid(1), 3, 1))
+        })
+        .unwrap();
+        assert_eq!(store.get_group(&gid(1)).unwrap().epoch, EpochId(3));
+        assert!(store.list_group_snapshots(&gid(1)).unwrap().is_empty());
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct TestLeafNode(Vec<u8>);
+
+    impl openmls_traits::storage::Entity<{ openmls_traits::storage::CURRENT_VERSION }>
+        for TestLeafNode
+    {
+    }
+    impl openmls_traits::storage::traits::LeafNode<{ openmls_traits::storage::CURRENT_VERSION }>
+        for TestLeafNode
+    {
+    }
+
+    #[test]
+    fn transaction_allows_openmls_list_mutations_inside_outer_transaction() {
+        use cgka_traits::storage::StorageError;
+        use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
+
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let group_id = openmls::group::GroupId::from_slice(b"transaction-list-mutation");
+
+        store
+            .with_transaction(|storage| {
+                storage
+                    .mls_storage()
+                    .append_own_leaf_node(&group_id, &TestLeafNode(b"leaf".to_vec()))
+                    .map_err(|e| StorageError::Backend(e.to_string()))
+            })
+            .unwrap();
+
+        let leaves: Vec<TestLeafNode> = store.mls_storage().own_leaf_nodes(&group_id).unwrap();
+        assert_eq!(leaves, vec![TestLeafNode(b"leaf".to_vec())]);
+    }
+
+    #[test]
+    fn connection_lock_rechecks_transaction_owner_after_acquiring_connection() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let shared = store.connection.clone();
+        let connection_guard = shared.inner.connection.lock().unwrap();
+        let (lock_returned_tx, lock_returned_rx) = mpsc::channel();
+        let worker_connection = shared.clone();
+        let worker = std::thread::spawn(move || {
+            let _guard = worker_connection.lock().unwrap();
+            lock_returned_tx.send(()).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(100));
+        {
+            let mut owner = shared
+                .inner
+                .transaction_owner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *owner = Some(std::thread::current().id());
+        }
+        drop(connection_guard);
+
+        assert!(
+            lock_returned_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "non-owner connection lock entered another thread's transaction",
+        );
+
+        shared.clear_transaction_owner();
+        lock_returned_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("connection lock should proceed after the transaction owner clears");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn delete_journal_transient_commit_contention_retries_boundary_not_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transient-commit.sqlite");
+        let writer = open_delete_journal_store(&path);
+        {
+            let conn = writer.lock().unwrap();
+            conn.execute_batch("CREATE TABLE boundary_probe (value INTEGER NOT NULL)")
+                .unwrap();
+        }
+        let reader = open_delete_journal_store(&path);
+        let reader_conn = reader.lock().unwrap();
+        reader_conn.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader_conn
+            .query_row("SELECT COUNT(*) FROM boundary_probe", [], |row| row.get(0))
+            .unwrap();
+
+        let closure_calls = Arc::new(AtomicU32::new(0));
+        let worker_calls = closure_calls.clone();
+        let worker_store = writer.clone();
+        let (closure_done_tx, closure_done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_store.with_transaction(|storage| {
+                worker_calls.fetch_add(1, Ordering::SeqCst);
+                storage
+                    .lock()?
+                    .execute("INSERT INTO boundary_probe (value) VALUES (1)", [])
+                    .storage()?;
+                closure_done_tx.send(()).unwrap();
+                Ok::<_, StorageError>(())
+            })
+        });
+
+        closure_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer closure should reach the contended COMMIT");
+
+        let waiting_store = writer.clone();
+        let (lock_acquired_tx, lock_acquired_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _guard = waiting_store.lock().unwrap();
+            lock_acquired_tx.send(()).unwrap();
+        });
+        assert!(
+            lock_acquired_rx
+                .recv_timeout(Duration::from_millis(60))
+                .is_err(),
+            "transaction ownership must remain held while COMMIT is retrying",
+        );
+
+        reader_conn.execute_batch("COMMIT").unwrap();
+        drop(reader_conn);
+        worker
+            .join()
+            .unwrap()
+            .expect("COMMIT should succeed after reader contention clears");
+        lock_acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("connection waiter should proceed after COMMIT finishes");
+        waiter.join().unwrap();
+
+        assert_eq!(
+            closure_calls.load(Ordering::SeqCst),
+            1,
+            "busy COMMIT retries must not rerun the transaction closure",
+        );
+        let persisted: i64 = writer
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM boundary_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(persisted, 1);
+    }
+
+    #[test]
+    fn delete_journal_persistent_commit_contention_returns_busy_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("persistent-commit.sqlite");
+        let writer = open_delete_journal_store(&path);
+        {
+            let conn = writer.lock().unwrap();
+            conn.execute_batch("CREATE TABLE boundary_probe (value INTEGER NOT NULL)")
+                .unwrap();
+        }
+        let reader = open_delete_journal_store(&path);
+        let reader_conn = reader.lock().unwrap();
+        reader_conn.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader_conn
+            .query_row("SELECT COUNT(*) FROM boundary_probe", [], |row| row.get(0))
+            .unwrap();
+
+        let mut closure_calls = 0;
+        let result: StorageResult<()> = writer.with_transaction(|storage| {
+            closure_calls += 1;
+            storage
+                .lock()?
+                .execute("INSERT INTO boundary_probe (value) VALUES (1)", [])
+                .storage()?;
+            Ok(())
+        });
+
+        assert!(
+            matches!(result, Err(StorageError::Busy(_))),
+            "exhausted COMMIT contention must remain retryable Busy, got {result:?}",
+        );
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("sqlite transaction COMMIT"),
+            "busy classification should retain transaction-boundary context",
+        );
+        assert_eq!(
+            closure_calls, 1,
+            "persistent COMMIT contention must not rerun the closure",
+        );
+        assert!(
+            writer.lock().unwrap().is_autocommit(),
+            "failed COMMIT must be rolled back before ownership is released",
+        );
+
+        reader_conn.execute_batch("COMMIT").unwrap();
+        drop(reader_conn);
+        writer
+            .with_transaction(|storage| {
+                storage
+                    .lock()?
+                    .execute("INSERT INTO boundary_probe (value) VALUES (2)", [])
+                    .storage()?;
+                Ok::<_, StorageError>(())
+            })
+            .expect("connection must remain usable after contended COMMIT rollback");
+        let values: i64 = writer
+            .lock()
+            .unwrap()
+            .query_row("SELECT SUM(value) FROM boundary_probe", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(values, 2, "the rolled-back value must not persist");
+    }
+
+    #[test]
+    fn delete_journal_fatal_commit_failure_rolls_back_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fatal-commit.sqlite");
+        let store = open_delete_journal_store(&path);
+        {
+            let conn = store.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE deferred_parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE deferred_child (
+                     parent_id INTEGER NOT NULL REFERENCES deferred_parent(id) DEFERRABLE INITIALLY DEFERRED
+                 );",
+            )
+            .storage()
+            .unwrap();
+        }
+
+        let mut closure_calls = 0;
+        let result: StorageResult<()> = store.with_transaction(|storage| {
+            closure_calls += 1;
+            let conn = storage.lock()?;
+            conn.execute("INSERT INTO deferred_child (parent_id) VALUES (7)", [])
+                .storage()?;
+            Ok(())
+        });
+
+        assert!(
+            matches!(result, Err(StorageError::Backend(_))),
+            "deferred constraint failure must remain fatal Backend, got {result:?}",
+        );
+        assert_eq!(closure_calls, 1, "fatal COMMIT must not rerun the closure");
+        let conn = store.lock().unwrap();
+        assert!(
+            conn.is_autocommit(),
+            "failed COMMIT must not leave the connection inside a transaction",
+        );
+        let child_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM deferred_child", [], |row| row.get(0))
+            .storage()
+            .unwrap();
+        assert_eq!(child_count, 0);
+        drop(conn);
+        store
+            .with_transaction(|storage| {
+                storage
+                    .lock()?
+                    .execute("INSERT INTO deferred_parent (id) VALUES (7)", [])
+                    .storage()?;
+                Ok::<_, StorageError>(())
+            })
+            .expect("connection must remain usable after fatal COMMIT rollback");
+    }
+
+    #[test]
+    fn delete_journal_rollback_boundary_retries_busy_and_locked_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollback-classification.sqlite");
+        let store = open_delete_journal_store(&path);
+        assert_eq!(
+            pragma_string(&store.lock().unwrap(), "journal_mode"),
+            "delete"
+        );
+
+        let mut calls = 0;
+        retry_transaction_boundary("ROLLBACK", || {
+            calls += 1;
+            match calls {
+                1 => Err(BoundaryOutcome::Sqlite(sqlite_failure(
+                    rusqlite::ffi::SQLITE_BUSY,
+                ))),
+                2 => Err(BoundaryOutcome::Sqlite(sqlite_failure(
+                    rusqlite::ffi::SQLITE_LOCKED,
+                ))),
+                _ => Ok(()),
+            }
+        })
+        .expect("transient rollback boundary failures should be retried");
+        assert_eq!(calls, 3);
+
+        let mut persistent_calls = 0;
+        let result = retry_transaction_boundary("ROLLBACK", || {
+            persistent_calls += 1;
+            Err(BoundaryOutcome::Sqlite(sqlite_failure(
+                rusqlite::ffi::SQLITE_LOCKED,
+            )))
+        });
+        assert!(
+            matches!(result, Err(StorageError::Busy(_))),
+            "exhausted ROLLBACK lock contention must remain Busy, got {result:?}",
+        );
+        assert!(
+            result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("sqlite transaction ROLLBACK"),
+            "busy classification should retain transaction-boundary context",
+        );
+        assert_eq!(persistent_calls, BUSY_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn encrypted_connection_applies_operational_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let key = SqlCipherKey::new("operational defaults key").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let conn = store.lock().unwrap();
+
+        assert_eq!(pragma_i64(&conn, "busy_timeout"), 5_000);
+        assert_eq!(pragma_i64(&conn, "foreign_keys"), 1);
+        assert_eq!(pragma_i64(&conn, "secure_delete"), 1);
+        assert_eq!(pragma_i64(&conn, "temp_store"), 2);
+        assert_eq!(pragma_i64(&conn, "trusted_schema"), 0);
+        assert_eq!(pragma_i64(&conn, "synchronous"), 2);
+        assert_eq!(pragma_string(&conn, "journal_mode"), "wal");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn account_db_and_sidecars_are_owner_only_on_disk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let key = SqlCipherKey::new("on-disk mode key").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        // Force a WAL write so the -wal/-shm sidecars exist.
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE mode_probe (id INTEGER); INSERT INTO mode_probe VALUES (1);",
+            )
+            .unwrap();
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+            assert!(sidecar.exists(), "expected {suffix} sidecar to exist");
+            assert_eq!(mode(&sidecar), 0o600, "sidecar {suffix} should be 0600");
+        }
+    }
+
+    /// The load-bearing assertion for the iOS `0xdead10cc` fix: after `close`,
+    /// the WAL sidecars are gone and a *fresh* connection can take an exclusive
+    /// lock on the database. SQLite only unlinks `-wal`/`-shm` when the last
+    /// connection to a database closes, and `locking_mode = EXCLUSIVE` only
+    /// takes hold if nothing else holds a lock — together these are the same
+    /// property iOS checks when it decides whether to kill a suspended process.
+    #[test]
+    fn close_releases_wal_locks_and_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let key = SqlCipherKey::new("close releases locks key").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE close_probe (id INTEGER); INSERT INTO close_probe VALUES (1);",
+            )
+            .unwrap();
+
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        let shm = std::path::PathBuf::from(format!("{}-shm", path.display()));
+        assert!(
+            wal.exists() && shm.exists(),
+            "WAL sidecars should exist while open"
+        );
+
+        // A clone the host cannot reach — exactly the situation that makes
+        // dropping handles useless — must not keep the database locked.
+        let surviving_clone = store.clone();
+        store.close().expect("close should succeed");
+
+        assert!(
+            !wal.exists(),
+            "-wal must be gone once the last connection closes"
+        );
+        assert!(
+            !shm.exists(),
+            "-shm must be gone once the last connection closes"
+        );
+
+        let reopened = rusqlite::Connection::open(&path).unwrap();
+        apply_sqlcipher_key(&reopened, &key).unwrap();
+        reopened
+            .pragma_update(None, "locking_mode", "EXCLUSIVE")
+            .unwrap();
+        reopened
+            .execute_batch("INSERT INTO close_probe VALUES (2);")
+            .expect("an exclusive writer must be able to take the database");
+        let rows: i64 = reopened
+            .query_row("SELECT count(*) FROM close_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            rows, 2,
+            "the pre-close write must have been durably committed"
+        );
+
+        // The surviving clone is inert, not dangerous.
+        assert!(surviving_clone.is_closed());
+        assert!(matches!(
+            surviving_clone.lock().err(),
+            Some(StorageError::Closed(_))
+        ));
+    }
+
+    /// A closer reaches a connection its owner never held a handle to, and
+    /// closes it the same way the handle would.
+    #[test]
+    fn closer_closes_every_live_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let key = SqlCipherKey::new("closer closes live handles key").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TABLE closer_probe (id INTEGER);")
+            .unwrap();
+        let closer = store.closer();
+        let clone = store.clone();
+
+        assert!(!closer.is_released());
+        closer
+            .close()
+            .expect("closer should close the live connection");
+        assert!(closer.is_released());
+
+        assert!(store.is_closed() && clone.is_closed());
+        assert!(matches!(clone.lock().err(), Some(StorageError::Closed(_))));
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+            assert!(!sidecar.exists(), "{suffix} must be gone after close");
+        }
+        closer.close().expect("closing again is a no-op");
+    }
+
+    /// The closer must not be what keeps a connection, and its locks, alive.
+    #[test]
+    fn closer_does_not_keep_dropped_handles_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let key = SqlCipherKey::new("closer weak reference key").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TABLE closer_probe (id INTEGER);")
+            .unwrap();
+        let account_closer = store.closer();
+        let shared = crate::SqliteSharedStorage::open(dir.path().join("shared.sqlite")).unwrap();
+        let shared_closer = shared.closer();
+
+        drop(store);
+        drop(shared);
+
+        assert!(account_closer.is_released() && shared_closer.is_released());
+        account_closer.close().expect("nothing left to close");
+        shared_closer.close().expect("nothing left to close");
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        assert!(
+            !wal.exists(),
+            "dropping the last handle closes the database"
+        );
+    }
+
+    #[test]
+    fn close_is_idempotent_and_leaves_every_handle_reporting_closed() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        assert!(!store.is_closed());
+
+        store.close().expect("first close should succeed");
+        store.close().expect("second close should be a no-op");
+        assert!(store.is_closed());
+
+        assert!(matches!(store.lock().err(), Some(StorageError::Closed(_))));
+        // The OpenMLS adapter shares the same connection and must report the
+        // same terminal state rather than panicking on a missing connection.
+        assert!(matches!(
+            store.openmls.stored_key_package_bundles().err(),
+            Some(StorageError::Closed(_))
+        ));
+        // And a real storage operation, not just the raw lock.
+        assert!(matches!(
+            cgka_traits::storage::GroupStorage::list_groups(&store).err(),
+            Some(StorageError::Closed(_))
+        ));
+    }
+
+    /// Once closing starts, later callers must fail without queueing for the
+    /// connection mutex. Otherwise a stream of racing operations can repeatedly
+    /// get ahead of the closer and defeat the host's suspension deadline.
+    #[test]
+    fn close_rejects_new_admissions_while_waiting_for_the_active_operation() {
+        let connection = Arc::new(CloseableConnection::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+            "admission test connection is closed",
+        ));
+        let active_operation = connection.lock().unwrap();
+
+        let closing_connection = Arc::clone(&connection);
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            let result = closing_connection.close();
+            closed_tx.send(()).unwrap();
+            result
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !connection.is_closed() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            connection.is_closed(),
+            "the closer must publish terminal admission before waiting for slot",
+        );
+
+        let waiting_connection = Arc::clone(&connection);
+        let (admission_tx, admission_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            admission_tx
+                .send(waiting_connection.lock().map(|_| ()))
+                .unwrap();
+        });
+        assert!(matches!(
+            admission_rx
+                .recv_timeout(Duration::from_millis(250))
+                .expect("new admission must be rejected without waiting for slot"),
+            Err(StorageError::Closed(_)),
+        ));
+        assert!(
+            closed_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "close must still wait for the operation that was active before it began",
+        );
+
+        drop(active_operation);
+        closer.join().unwrap().unwrap();
+        waiter.join().unwrap();
+    }
+
+    /// A transaction that is open when the store closes must report the close,
+    /// not latch the connection "unusable" with a rollback-failed message. The
+    /// rollback it wanted did happen — SQLite performs it as part of closing.
+    #[test]
+    fn transaction_open_at_close_reports_closed_without_latching_unusable() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let closed_during_callback = store.connection.clone();
+
+        let result: Result<(), StorageError> = store.connection.with_transaction(|| {
+            closed_during_callback.close().unwrap();
+            Ok(())
+        });
+
+        assert!(
+            matches!(result, Err(StorageError::Closed(_))),
+            "COMMIT against a closed connection must report Closed, got {result:?}",
+        );
+        assert!(
+            store.connection.transaction_unusable_error().is_none(),
+            "closing must not latch the transaction-unusable flag",
+        );
+
+        // An error path through the same window rolls back and still reports
+        // the close rather than a doubled rollback failure.
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let closed_during_callback = store.connection.clone();
+        let result: Result<(), StorageError> = store.connection.with_transaction(|| {
+            closed_during_callback.close().unwrap();
+            Err(StorageError::Backend("callback failed".into()))
+        });
+        assert!(
+            matches!(result, Err(StorageError::Backend(detail)) if detail == "callback failed"),
+            "the callback's own error must survive the closed rollback",
+        );
+        assert!(store.connection.transaction_unusable_error().is_none());
+    }
+
+    /// Closing while another thread is parked waiting for the transaction slot
+    /// must wake it with an error rather than leave it blocked forever.
+    #[test]
+    fn close_wakes_threads_waiting_for_the_transaction_slot() {
+        let store = SqliteAccountStorage::in_memory().unwrap();
+        let shared = store.connection.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let holder_connection = shared.clone();
+        let holder = std::thread::spawn(move || {
+            holder_connection.with_transaction(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok::<_, StorageError>(())
+            })
+        });
+        entered_rx.recv().unwrap();
+
+        let waiter_connection = shared.clone();
+        let waiter = std::thread::spawn(move || waiter_connection.lock().map(|_| ()));
+
+        // Give the waiter time to park on the condvar, then close under it.
+        std::thread::sleep(Duration::from_millis(100));
+        shared.close().unwrap();
+        release_tx.send(()).unwrap();
+
+        assert!(
+            matches!(waiter.join().unwrap(), Err(StorageError::Closed(_))),
+            "a parked waiter must be woken with Closed",
+        );
+        let _ = holder.join().unwrap();
+    }
+
+    /// Closing under a live writer is the case that matters most: a host
+    /// suspending in a hurry will not always have quiesced cleanly. The close
+    /// must be prompt, and every transaction must be all-or-nothing across the
+    /// cut — a half-applied multi-table write would be worse than the crash
+    /// this whole change exists to avoid.
+    #[test]
+    fn close_under_a_live_writer_is_prompt_and_leaves_no_torn_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let key = SqlCipherKey::new("torn write probe key").unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE torn_left (id INTEGER); CREATE TABLE torn_right (id INTEGER);",
+            )
+            .unwrap();
+
+        let writer_store = store.clone();
+        let writer = std::thread::spawn(move || {
+            for id in 0..10_000i64 {
+                // Both inserts land, or neither does. Nothing else is allowed.
+                let result: Result<(), StorageError> =
+                    writer_store.connection.with_transaction(|| {
+                        let conn = writer_store.lock()?;
+                        conn.execute("INSERT INTO torn_left VALUES (?1)", [id])
+                            .storage()?;
+                        conn.execute("INSERT INTO torn_right VALUES (?1)", [id])
+                            .storage()?;
+                        Ok(())
+                    });
+                if let Err(error) = result {
+                    // The only acceptable way to stop is the close itself.
+                    assert!(
+                        error.is_closed(),
+                        "writer should only ever fail with Closed, got {error:?}",
+                    );
+                    return;
+                }
+            }
+        });
+
+        // Let the writer get going, then close out from under it.
+        std::thread::sleep(Duration::from_millis(50));
+        let started_at = std::time::Instant::now();
+        store.close().unwrap();
+        let close_elapsed = started_at.elapsed();
+        writer.join().unwrap();
+
+        assert!(
+            close_elapsed < Duration::from_secs(1),
+            "close should wait only for the executing statement, took {close_elapsed:?}",
+        );
+
+        let reopened = rusqlite::Connection::open(&path).unwrap();
+        apply_sqlcipher_key(&reopened, &key).unwrap();
+        let left: i64 = reopened
+            .query_row("SELECT count(*) FROM torn_left", [], |row| row.get(0))
+            .unwrap();
+        let right: i64 = reopened
+            .query_row("SELECT count(*) FROM torn_right", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            left, right,
+            "a transaction interrupted by close must be rolled back whole",
+        );
+        assert!(left > 0, "the writer should have committed something first");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pre_existing_db_and_sidecar_modes_are_tightened_on_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let key = SqlCipherKey::new("tighten mode key").unwrap();
+        drop(SqliteAccountStorage::open_encrypted(&path, &key).unwrap());
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        // Simulate files left behind by builds that created them at the umask.
+        for p in [&path, &wal] {
+            if !p.exists() {
+                std::fs::write(p, b"").unwrap();
+            }
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        // Assert while the store is open: the -wal sidecar is checkpointed
+        // away on clean close.
+        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&wal), 0o600);
+        drop(store);
+    }
+
+    #[cfg(unix)]
+    const TAKEOVER_PROBE_PATH: &str = "MDK_STORAGE_TEST_TAKEOVER_PROBE_PATH";
+    #[cfg(unix)]
+    const TAKEOVER_PROBE_KEY: &str = "posix lock retention key";
+
+    /// Child half of [`reopening_a_live_database_keeps_its_posix_locks`]: try
+    /// to take the database exclusively and write. Passes only when SQLite
+    /// refuses with `SQLITE_BUSY` because the parent still holds its locks.
+    #[test]
+    #[cfg(unix)]
+    fn exclusive_takeover_probe_child() {
+        let Some(path) = std::env::var_os(TAKEOVER_PROBE_PATH) else {
+            return;
+        };
+        let key = SqlCipherKey::new(TAKEOVER_PROBE_KEY.to_owned()).unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        apply_cipher_pragmas(&connection, &SqliteStorageOptions::default()).unwrap();
+        apply_sqlcipher_key(&connection, &key).unwrap();
+        connection.busy_timeout(Duration::ZERO).unwrap();
+        connection
+            .pragma_update(None, "locking_mode", "EXCLUSIVE")
+            .unwrap();
+        let error = connection
+            .execute_batch("CREATE TABLE takeover_probe (id INTEGER)")
+            .expect_err("a database another process holds open must refuse an exclusive writer");
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_exclusive_takeover_refused(path: &Path, stage: &str) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "base::connection::tests::exclusive_takeover_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(TAKEOVER_PROBE_PATH, path)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stage}: another process took the database exclusively while this process held \
+             it open:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("1 passed"), "{stage}: the probe must run");
+    }
+
+    /// On POSIX, closing any descriptor on a file drops every `fcntl` lock this
+    /// process holds on it, and SQLite never notices. Opening a database that
+    /// already has a live connection must therefore not open and close the
+    /// database or its sidecars outside SQLite, or another process (the iOS
+    /// Notification Service Extension) could take the database exclusively,
+    /// checkpoint the WAL or reinitialise `-shm` under the live connection.
+    #[test]
+    #[cfg(unix)]
+    fn reopening_a_live_database_keeps_its_posix_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let key = SqlCipherKey::new(TAKEOVER_PROBE_KEY.to_owned()).unwrap();
+        let live = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        // A WAL write so the -wal/-shm sidecars exist and the next open's file
+        // preparation reaches them too.
+        live.lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE lock_probe (id INTEGER); INSERT INTO lock_probe VALUES (1);",
+            )
+            .unwrap();
+        assert_exclusive_takeover_refused(&path, "one live connection");
+
+        let second = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_exclusive_takeover_refused(&path, "after a second open of the same database");
+
+        drop(second);
+        let rows: i64 = live
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM lock_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_exclusive_takeover_refused(&path, "after the second connection closed");
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+            assert!(
+                sidecar.exists(),
+                "{suffix} must survive while a connection is open"
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_connection_pins_cipher_pragmas_before_keying() {
+        let _guard = TRACE_TEST_LOCK.lock().unwrap();
+        TRACED_SQLCIPHER_SETUP.lock().unwrap().clear();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let key = SqlCipherKey::new("trace setup key").unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(trace_sqlcipher_setup_event),
+        );
+
+        let _store = SqliteAccountStorage::from_unkeyed_encrypted_connection_with_options(
+            connection,
+            &key,
+            SqliteStorageOptions::default(),
+        )
+        .unwrap();
+
+        let statements = TRACED_SQLCIPHER_SETUP.lock().unwrap().clone();
+        let cipher_compatibility = statements
+            .iter()
+            .position(|statement| *statement == "cipher_compatibility")
+            .expect("cipher_compatibility pragma was traced");
+        let cipher_memory_security = statements
+            .iter()
+            .position(|statement| *statement == "cipher_memory_security")
+            .expect("cipher_memory_security pragma was traced");
+        let key = statements
+            .iter()
+            .position(|statement| *statement == "key")
+            .expect("key pragma was traced");
+        let key_probe = statements
+            .iter()
+            .position(|statement| *statement == "key_probe")
+            .expect("keying probe was traced");
+
+        assert!(
+            cipher_compatibility < key,
+            "cipher_compatibility must be pinned before SQLCipher keying",
+        );
+        assert!(
+            cipher_compatibility < key_probe,
+            "cipher_compatibility must be pinned before the keying probe",
+        );
+        assert!(
+            cipher_memory_security < key,
+            "cipher_memory_security must be enabled before SQLCipher keying",
+        );
+        assert!(
+            cipher_memory_security < key_probe,
+            "cipher_memory_security must be enabled before the keying probe",
+        );
+    }
+
+    #[test]
+    fn public_hardened_open_pins_cipher_pragmas_before_keying() {
+        let _guard = TRACE_TEST_LOCK.lock().unwrap();
+        TRACED_SQLCIPHER_SETUP.lock().unwrap().clear();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hardened.sqlite");
+        let key = SqlCipherKey::new("public hardened key").unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(trace_sqlcipher_setup_event),
+        );
+
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+
+        let statements = TRACED_SQLCIPHER_SETUP.lock().unwrap().clone();
+        let cipher_compatibility = statements
+            .iter()
+            .position(|statement| *statement == "cipher_compatibility")
+            .expect("cipher_compatibility pragma was traced");
+        let cipher_memory_security = statements
+            .iter()
+            .position(|statement| *statement == "cipher_memory_security")
+            .expect("cipher_memory_security pragma was traced");
+        let key = statements
+            .iter()
+            .position(|statement| *statement == "key")
+            .expect("key pragma was traced");
+        let key_probe = statements
+            .iter()
+            .position(|statement| *statement == "key_probe")
+            .expect("keying probe was traced");
+
+        assert!(
+            cipher_compatibility < key,
+            "cipher_compatibility must be pinned before SQLCipher keying",
+        );
+        assert!(
+            cipher_compatibility < key_probe,
+            "cipher_compatibility must be pinned before the keying probe",
+        );
+        assert!(
+            cipher_memory_security < key,
+            "cipher_memory_security must be enabled before SQLCipher keying",
+        );
+        assert!(
+            cipher_memory_security < key_probe,
+            "cipher_memory_security must be enabled before the keying probe",
+        );
+    }
+
+    #[test]
+    fn public_hardened_open_applies_requested_privacy_pragmas() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hardened.sqlite");
+        let key = SqlCipherKey::new("hardened privacy key").unwrap();
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+        assert_eq!(pragma_i64(&connection, "secure_delete"), 1);
+        assert_eq!(pragma_i64(&connection, "temp_store"), 2);
+        drop(connection);
+
+        // cipher_only() must not switch temp_store to MEMORY. (secure_delete is
+        // left at the SQLCipher compile-time default, which is ON, so it is not
+        // asserted here — only the live-cache path opts into it explicitly.)
+        let path = dir.path().join("cipher-only.sqlite");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::cipher_only()).unwrap();
+        assert_ne!(pragma_i64(&connection, "temp_store"), 2);
+    }
+
+    #[test]
+    fn hardened_file_roundtrip_requires_the_correct_sqlcipher_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hardened-roundtrip.sqlite");
+        let key = SqlCipherKey::new("hardened correct key").unwrap();
+        let wrong_key = SqlCipherKey::new("hardened wrong key").unwrap();
+
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE marker (value TEXT NOT NULL);
+                     INSERT INTO marker (value) VALUES ('kept');",
+                )
+                .unwrap();
+        }
+
+        let file_bytes = std::fs::read(&path).unwrap();
+        assert!(!file_bytes.starts_with(b"SQLite format 3\0"));
+
+        // Wrong key cannot read the data.
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        assert!(
+            open_hardened_sqlcipher(&connection, &wrong_key, SqlCipherHardening::live_cache())
+                .is_err()
+        );
+        drop(connection);
+
+        // Correct key reopens and reads.
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+        let value: String = connection
+            .query_row("SELECT value FROM marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "kept");
+    }
+
+    #[test]
+    fn custom_options_can_relax_operational_defaults_for_tests() {
+        let store = SqliteAccountStorage::in_memory_with_options(SqliteStorageOptions {
+            busy_timeout_ms: 250,
+            journal_mode: SqliteJournalMode::Delete,
+            synchronous: SqliteSynchronous::Normal,
+            secure_delete: false,
+            temp_store_memory: false,
+            trusted_schema: true,
+            cipher_memory_security: false,
+            cipher_compatibility: 4,
+        })
+        .unwrap();
+        let conn = store.lock().unwrap();
+
+        assert_eq!(pragma_i64(&conn, "busy_timeout"), 250);
+        assert_eq!(pragma_i64(&conn, "secure_delete"), 0);
+        assert_eq!(pragma_i64(&conn, "trusted_schema"), 1);
+        assert_eq!(pragma_i64(&conn, "synchronous"), 1);
+    }
+
+    #[test]
+    fn migration_summary_does_not_count_existing_ledger_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("migration-summary.sqlite");
+        let key = SqlCipherKey::new("42".repeat(32)).unwrap();
+        let first = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert!(first.migration_summary().0 > 0);
+        first.close().unwrap();
+        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_eq!(reopened.migration_summary().0, 0);
+    }
+
+    #[test]
+    fn encrypted_file_roundtrip_requires_the_correct_sqlcipher_key() {
+        use crate::base::test_support::{gid, sample_group};
+        use cgka_traits::storage::GroupStorage;
+        use cgka_traits::types::EpochId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let key = SqlCipherKey::new("correct horse battery staple").unwrap();
+        let wrong_key = SqlCipherKey::new("wrong key").unwrap();
+
+        {
+            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+            store.put_group(&sample_group(gid(1), 3, 1)).unwrap();
+        }
+
+        let file_bytes = std::fs::read(&path).unwrap();
+        assert!(!file_bytes.starts_with(b"SQLite format 3\0"));
+
+        assert!(SqliteAccountStorage::open_encrypted(&path, &wrong_key).is_err());
+
+        let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        assert_eq!(reopened.get_group(&gid(1)).unwrap().epoch, EpochId(3));
+    }
+
+    #[test]
+    fn busy_backoff_grows_and_is_capped() {
+        assert_eq!(busy_backoff(0), BUSY_BACKOFF_BASE);
+        assert_eq!(busy_backoff(1), BUSY_BACKOFF_BASE * 2);
+        assert_eq!(busy_backoff(2), BUSY_BACKOFF_BASE * 4);
+        // Large attempt counts saturate at the cap rather than overflowing.
+        assert_eq!(busy_backoff(20), BUSY_BACKOFF_CAP);
+        assert!(busy_backoff(3) <= BUSY_BACKOFF_CAP);
+    }
+
+    #[test]
+    fn retry_on_busy_retries_transient_then_succeeds() {
+        let mut calls = 0u32;
+        let result: Result<u32, StorageError> = retry_on_busy(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(StorageError::Busy("locked".into()))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(result.unwrap(), 3, "should succeed once the busy clears");
+    }
+
+    #[test]
+    fn retry_on_busy_does_not_retry_fatal_errors() {
+        let mut calls = 0u32;
+        let result: Result<(), StorageError> = retry_on_busy(|| {
+            calls += 1;
+            Err(StorageError::Backend("fatal".into()))
+        });
+        assert!(matches!(result, Err(StorageError::Backend(_))));
+        assert_eq!(calls, 1, "fatal errors must not be retried");
+    }
+
+    #[test]
+    fn retry_on_busy_surfaces_busy_after_exhausting_attempts() {
+        let mut calls = 0u32;
+        let result: Result<(), StorageError> = retry_on_busy(|| {
+            calls += 1;
+            Err(StorageError::Busy("still locked".into()))
+        });
+        assert!(
+            matches!(result, Err(StorageError::Busy(_))),
+            "persistent busy must surface as a transient Busy error, not Backend"
+        );
+        assert_eq!(calls, BUSY_MAX_ATTEMPTS, "must use the full attempt budget");
+    }
+
+    // Regression for issue #484: a concurrent writer on a SECOND connection to
+    // the same database file briefly holds the SQLite write lock. With a busy
+    // timeout shorter than the hold, the first attempt sees SQLITE_BUSY; the
+    // storage layer's retry-with-backoff must wait it out so the send-path
+    // write succeeds instead of bubbling "database is locked" to the user.
+    #[test]
+    fn concurrent_writer_contention_is_retried_not_surfaced() {
+        use crate::base::test_support::{gid, mid, sample_group, sample_message};
+        use cgka_traits::storage::{GroupStorage, MessageStorage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contention.sqlite");
+        let key = SqlCipherKey::new("contention test key").unwrap();
+        // Short busy timeout so the *first* attempt fails fast and the win comes
+        // from the retry loop, not from SQLite's own busy_timeout wait.
+        let options = SqliteStorageOptions {
+            busy_timeout_ms: 50,
+            ..SqliteStorageOptions::default()
+        };
+
+        let writer =
+            SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
+                .unwrap();
+        writer.put_group(&sample_group(gid(1), 0, 0)).unwrap();
+
+        // A separate connection/handle to the same file holds an exclusive write
+        // transaction for longer than one busy-timeout window, then releases.
+        let hold = std::time::Duration::from_millis(200);
+        let blocker_options = options.clone();
+        let blocker_key = SqlCipherKey::new("contention test key").unwrap();
+        let blocker_path = path.clone();
+        let blocker = std::thread::spawn(move || {
+            let blocker = SqliteAccountStorage::open_encrypted_with_options(
+                &blocker_path,
+                &blocker_key,
+                blocker_options,
+            )
+            .unwrap();
+            let conn = blocker.lock().unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            conn.execute(
+                "INSERT INTO cgka_groups (id, record) VALUES (?1, ?2)",
+                rusqlite::params![gid(2).as_slice(), b"blocker".as_slice()],
+            )
+            .ok();
+            std::thread::sleep(hold);
+            conn.execute_batch("COMMIT").unwrap();
+        });
+
+        // Give the blocker time to take the write lock before we try to write.
+        std::thread::sleep(std::time::Duration::from_millis(40));
+
+        // This write contends with the blocker. Without retry it would return
+        // a "database is locked" error after the 50ms busy timeout; with retry
+        // it waits out the 200ms hold and succeeds.
+        writer
+            .put_message(&sample_message(mid(1), gid(1), 0))
+            .expect("contended write must succeed via busy retry, not surface as failure");
+
+        blocker.join().unwrap();
+        assert_eq!(
+            writer.get_message(&mid(1)).unwrap().id,
+            mid(1),
+            "the message persisted after contention cleared"
+        );
+    }
+
+    fn pragma_i64(connection: &rusqlite::Connection, name: &str) -> i64 {
+        connection
+            .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn pragma_string(connection: &rusqlite::Connection, name: &str) -> String {
+        connection
+            .query_row(&format!("PRAGMA {name}"), [], |row| row.get::<_, String>(0))
+            .unwrap()
+            .to_ascii_lowercase()
+    }
+}

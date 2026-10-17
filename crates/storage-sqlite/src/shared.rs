@@ -5,14 +5,15 @@ pub use presentation::{DirectoryPresentation, DirectoryPresentationChanges};
 
 use error::SharedSqliteResultExt;
 
-use crate::connection::CachedSql;
+use crate::base::connection::CachedSql;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::connection::{CloseableConnection, ConnectionGuard};
+use crate::base::connection::{CloseableConnection, ConnectionGuard};
 use crate::{
-    bool_i64, connection::retry_on_busy, optional_u64_to_i64, u64_to_i64, unix_now_ms, usize_to_i64,
+    base::connection::retry_on_busy, bool_i64, optional_u64_to_i64, u64_to_i64, unix_now_ms,
+    usize_to_i64,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, TransactionBehavior, params, params_from_iter};
@@ -153,7 +154,7 @@ impl SqliteSharedStorage {
         }
         // The shared cache is unencrypted, so file-level 0600 (including
         // sidecars) is the only thing keeping it from other local users.
-        crate::connection::ensure_private_db_files(path)?;
+        crate::base::connection::ensure_private_db_files(path)?;
         let conn = rusqlite::Connection::open(path).storage()?;
         Self::from_connection(conn)
     }
