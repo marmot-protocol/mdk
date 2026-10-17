@@ -157,7 +157,7 @@ impl SqliteAccountStorage {
     /// OpenMLS adapter reached through
     /// [`StorageProvider::mls_storage`][cgka_traits::storage::StorageProvider::mls_storage]
     /// and any clone held elsewhere in the process — fails with
-    /// [`StorageError::Closed`] from here on. Nothing reopens implicitly; to
+    /// [`StorageError::Closed`][cgka_traits::storage::StorageError::Closed] from here on. Nothing reopens implicitly; to
     /// use the database again, construct a new [`SqliteAccountStorage`].
     ///
     /// Callers should quiesce their own work first. Closing is nonetheless
