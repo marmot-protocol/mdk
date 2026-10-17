@@ -9,6 +9,7 @@ pub(crate) mod chat_list;
 pub(crate) mod chat_presentation;
 pub(crate) mod encrypted_media_secrets;
 pub(crate) mod group_system;
+pub(crate) mod handle;
 pub(crate) mod local_submissions;
 pub(crate) mod media_catalog;
 #[cfg(feature = "media-store-benchmarks")]

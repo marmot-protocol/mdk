@@ -20,21 +20,26 @@ group snapshots and rollback must be atomic across Marmot records and group-scop
 
 ## Layout
 
-- `connection.rs` — SQLCipher keying, connection setup, options, and the aggregate `SqliteAccountStorage` handle.
-- `storage/` — Marmot engine tables by concern (groups, messages, snapshots, outbound intents, Welcomes, capabilities,
-  convergence policy and passes, deferred-peel generations, maintenance, transport routes, and more).
-- `openmls_storage/` — the custom OpenMLS adapter (`provider.rs`, `value_store.rs`, `labels.rs`).
-- App-facing projections and account state: account event projection, chat list (including avatar URLs), the
-  materialized timeline and conversation opening, message drafts, attachments, avatar cache, encrypted-media secrets,
-  account recovery, delivery spill, transport reconciliation, user blocks, and more.
-- `media_catalog.rs` — metadata for the encrypted per-file media store in the [`media-store`](../media-store/README.md)
-  crate (mdk#2314): each file's random key and state in `media_files`, slot references in `media_file_refs`. The
-  bodies are files the crate owns; this crate never reads or writes them.
-- `shared.rs` — `SqliteSharedStorage`, a separate, non-account-scoped database for cross-identity state: the
-  public-directory user cache and presentation, relay-telemetry, usage-diagnostics and audit-log settings, and the
-  telemetry install id.
-- `migrations.rs` + `migrations/` — account/session migration runner and numbered bodies; `shared/migrations.rs` —
-  the independent shared-store runner.
+The crate is split by which side owns each table (see the
+[step 4 brief](../../docs/marmot-architecture/review/brief-storage-boundaries.md)):
+
+- `base/` — SQLCipher keying, connection setup and options, the aggregate `SqliteAccountStorage` handle, the codec,
+  and the account/session migration runner with its numbered bodies (`base/migrations/`).
+- `protocol/` — the engine's storage: the `StorageProvider` impls, `storage/` (Marmot engine tables by concern:
+  groups, messages, snapshots, outbound intents, Welcomes, capabilities, convergence, maintenance, transport routes and
+  more) and `openmls_storage/` (the custom OpenMLS adapter).
+- `app/` — app-facing projections and account state: account event projection, chat list, the materialized timeline
+  and conversation opening, message drafts, attachments, avatar cache, encrypted-media secrets, account recovery, and
+  `media_catalog.rs`, the metadata for the encrypted per-file media store in the
+  [`media-store`](../media-store/README.md) crate (the bodies are files that crate owns). `app/transport/` holds the
+  transport-specific app storage: delivery spill, NIP-77 reconciliation, user blocks, the moderation outbox, agent
+  stream sequences and prepared group-image uploads.
+- `SqliteAppStorage` (`app/handle.rs`) — the app side's handle, over the same connection; get it with
+  `storage.app_storage()`. App storage methods are moving onto it a folder at a time.
+- `cross/` — the code that must touch both sides in one transaction, one named function per crossing.
+- `shared.rs` + `shared/` — `SqliteSharedStorage`, a separate, non-account-scoped database for cross-identity state
+  (public-directory cache and presentation, relay-telemetry, usage-diagnostics and audit-log settings, the telemetry
+  install id), with its own migration runner.
 
 The complete module map is in [`AGENTS.md`](AGENTS.md).
 

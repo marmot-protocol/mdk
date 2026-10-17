@@ -618,7 +618,9 @@ impl AccountRecoveryOwner {
                     }
                 }
                 if let Some(route) = &grant.rotation_claim {
-                    storage.advance_transport_reconciliation_route_cursor(route)?;
+                    storage
+                        .app_storage()
+                        .advance_transport_reconciliation_route_cursor(route)?;
                 }
                 Ok(frozen)
             });
@@ -3742,9 +3744,11 @@ mod tests {
             created_at,
         };
         storage
+            .app_storage()
             .record_transport_reconciliation_item(&route, &item(1, now))
             .unwrap();
         storage
+            .app_storage()
             .record_transport_reconciliation_item(&route, &item(2, now + 1000))
             .unwrap();
         storage
@@ -3769,6 +3773,7 @@ mod tests {
         assert_eq!(frozen.items.len(), 1);
         assert_eq!(frozen.items[0].event_id, [1; 32]);
         storage
+            .app_storage()
             .record_transport_reconciliation_item(&route, &item(3, now))
             .unwrap();
         assert_eq!(

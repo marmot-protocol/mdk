@@ -1787,6 +1787,7 @@ fn notification_update_from_classified_group_state(
 ) -> Result<Option<NotificationUpdate>, AppError> {
     if app
         .account_storage(account_label)?
+        .app_storage()
         .suppress_blocked_notification(
             notice.actor_account_id_hex.unwrap_or(""),
             notice.group_id_hex,
@@ -1875,7 +1876,7 @@ fn notification_update_from_message(
     event: &RuntimeMessageReceived,
 ) -> Result<Option<NotificationUpdate>, AppError> {
     let storage = app.account_storage(&event.account_label)?;
-    if storage.suppress_blocked_notification(
+    if storage.app_storage().suppress_blocked_notification(
         &event.message.sender,
         &hex::encode(event.message.group_id.as_slice()),
         &event.message.message_id_hex,
@@ -1982,6 +1983,7 @@ fn notification_update_from_group_join(
         .unwrap_or_else(|| account_id_hex.to_owned());
     if app
         .account_storage(account_label)?
+        .app_storage()
         .suppress_blocked_notification(
             &sender_id,
             &group_id_hex,

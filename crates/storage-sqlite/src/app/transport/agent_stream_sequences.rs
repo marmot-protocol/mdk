@@ -1,7 +1,9 @@
 //! Durable, fail-closed publisher sequence reservations for QUIC previews.
 
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 use crate::base::connection::CachedSql;
-use crate::{SqliteAccountStorage, SqliteResultExt, base::connection::retry_on_busy, unix_now_ms};
+use crate::{SqliteAppStorage, SqliteResultExt, base::connection::retry_on_busy, unix_now_ms};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
@@ -35,7 +37,7 @@ pub struct AgentStreamPublisherState {
     pub ambiguous: bool,
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Atomically advance the next-unused sequence and transcript before any
     /// external record write. A surviving reservation token after a crash is
     /// intentionally ambiguous and permanently disables that preview.
@@ -262,6 +264,7 @@ mod tests {
         let token = [4_u8; 16];
 
         let reserved = storage
+            .app_storage()
             .reserve_agent_stream_publisher_records(AgentStreamPublisherReservationRequest {
                 context_id: &context,
                 initial_transcript_hash: &initial,
@@ -275,7 +278,10 @@ mod tests {
             .unwrap();
         assert_eq!(reserved.first_seq, 1);
         assert_eq!(
-            storage.agent_stream_publisher_state(&context).unwrap(),
+            storage
+                .app_storage()
+                .agent_stream_publisher_state(&context)
+                .unwrap(),
             Some(AgentStreamPublisherState {
                 next_seq: 3,
                 transcript_hash: after,
@@ -285,6 +291,7 @@ mod tests {
         );
         assert!(
             storage
+                .app_storage()
                 .reserve_agent_stream_publisher_records(AgentStreamPublisherReservationRequest {
                     context_id: &context,
                     initial_transcript_hash: &initial,
@@ -299,6 +306,7 @@ mod tests {
         );
         assert!(
             storage
+                .app_storage()
                 .confirm_agent_stream_publisher_reservation(&context, &token)
                 .is_err()
         );
@@ -311,6 +319,7 @@ mod tests {
         let initial = [2_u8; 32];
         let after_one = [3_u8; 32];
         let first = storage
+            .app_storage()
             .reserve_agent_stream_publisher_records(AgentStreamPublisherReservationRequest {
                 context_id: &context,
                 initial_transcript_hash: &initial,
@@ -323,9 +332,11 @@ mod tests {
             })
             .unwrap();
         storage
+            .app_storage()
             .confirm_agent_stream_publisher_reservation(&context, &first.token)
             .unwrap();
         let second = storage
+            .app_storage()
             .reserve_agent_stream_publisher_records(AgentStreamPublisherReservationRequest {
                 context_id: &context,
                 initial_transcript_hash: &initial,
@@ -364,6 +375,7 @@ mod tests {
 
         assert!(
             storage
+                .app_storage()
                 .reserve_agent_stream_publisher_records(AgentStreamPublisherReservationRequest {
                     context_id: &context,
                     initial_transcript_hash: &[3; 32],

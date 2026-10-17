@@ -143,6 +143,7 @@ impl<'a> SynchronizedTransportReceipts<'a> {
     ) -> Result<TransportReconciliationInventory, AppError> {
         Ok(self
             .storage
+            .app_storage()
             .transport_reconciliation_inventory(route, until)?)
     }
 
@@ -220,10 +221,12 @@ mod tests {
             // Simulate an intervening stale inventory checkpoint. Consuming the
             // durable journal must revoke it together with the active cache.
             storage
+                .app_storage()
                 .record_transport_reconciliation_item(&route, &item)
                 .unwrap();
             assert!(
                 storage
+                    .app_storage()
                     .transport_reconciliation_inventory(&route, item.created_at)
                     .unwrap()
                     .items

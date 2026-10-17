@@ -187,6 +187,7 @@ async fn run_held_comparison(
     *gate.target.lock().unwrap() = Some(event.id.to_hex());
     assert!(
         !storage
+            .app_storage()
             .retained_recovery_event(&recovery_route, &event_id, None, crate::unix_now_seconds())
             .unwrap()
     );
@@ -223,6 +224,7 @@ async fn run_held_comparison(
             gate.all_queries.load(Ordering::SeqCst),
             gate.id_queries.load(Ordering::SeqCst),
             storage
+                .app_storage()
                 .retained_recovery_event(
                     &recovery_route,
                     &event_id,
@@ -280,6 +282,7 @@ async fn run_held_comparison(
     assert!(storage.recovery_comparison().unwrap().pending());
     assert_eq!(
         storage
+            .app_storage()
             .transport_reconciliation_replay_cursor(&recovery_route)
             .unwrap(),
         None
@@ -481,6 +484,7 @@ async fn run_held_comparison(
                 .unwrap();
             assert!(
                 storage
+                    .app_storage()
                     .transport_reconciliation_replay_cursor(&recovery_route)
                     .unwrap()
                     .is_some(),
@@ -677,6 +681,7 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         .unwrap()
         .unwrap();
     let inventory = storage
+        .app_storage()
         .transport_reconciliation_inventory(&recovery_route, crate::unix_now_seconds())
         .unwrap();
     let before = inventory
@@ -696,6 +701,7 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
     drop(credit);
     assert!(matches!(result, EpochBackfillRunOutcome::Incomplete(_)));
     let after = storage
+        .app_storage()
         .transport_reconciliation_inventory(&recovery_route, crate::unix_now_seconds())
         .unwrap();
     assert!(

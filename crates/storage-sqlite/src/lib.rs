@@ -15,6 +15,7 @@ pub use app::media_store_bench;
 pub use app::group_system::{
     GroupSystemEventProjection, GroupSystemEventProvenance, group_system_event_from_message,
 };
+pub use app::handle::SqliteAppStorage;
 
 pub use app::account_recovery::{
     ParkedRecoveryObligation, QualifiedRecoveryStallSample, RECOVERY_PARK_AFTER_QUIET_PASSES,

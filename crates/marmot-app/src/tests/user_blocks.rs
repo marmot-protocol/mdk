@@ -44,6 +44,7 @@ async fn user_blocks_publication_failure_and_byte_identical_retry() {
     assert!(
         app.account_storage("alice")
             .unwrap()
+            .app_storage()
             .pending_block_publication()
             .unwrap()
             .is_none()
@@ -60,6 +61,7 @@ async fn user_blocks_publication_failure_and_byte_identical_retry() {
     let intent = app
         .account_storage("alice")
         .unwrap()
+        .app_storage()
         .pending_block_publication()
         .unwrap()
         .unwrap()
@@ -130,6 +132,7 @@ async fn user_blocks_remote_adoption_survives_failed_edit_and_supersedes_uncerta
     assert!(
         app.account_storage("alice")
             .unwrap()
+            .app_storage()
             .pending_block_publication()
             .unwrap()
             .is_none()
@@ -219,6 +222,7 @@ async fn user_blocks_restart_reconciles_each_publication_cut() {
         let pending = app
             .account_storage("alice")
             .unwrap()
+            .app_storage()
             .pending_block_publication()
             .unwrap()
             .unwrap();
@@ -232,6 +236,7 @@ async fn user_blocks_restart_reconciles_each_publication_cut() {
             app.ingest_block_list_event(event.clone()).await.unwrap();
             app.account_storage("alice")
                 .unwrap()
+                .app_storage()
                 .stage_block_publication(&pending)
                 .unwrap();
         }
@@ -253,6 +258,7 @@ async fn user_blocks_restart_reconciles_each_publication_cut() {
             reopened
                 .account_storage("alice")
                 .unwrap()
+                .app_storage()
                 .pending_block_publication()
                 .unwrap()
                 .is_none()

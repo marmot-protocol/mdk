@@ -847,6 +847,7 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     assert!(database.broad_queries.load(Ordering::SeqCst) > 0);
     assert!(
         !storage
+            .app_storage()
             .retained_recovery_event(
                 &route_key,
                 &missing.id.to_bytes(),
@@ -942,6 +943,7 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     .expect("no comparison job outlives recovery");
     assert!(
         storage
+            .app_storage()
             .retained_recovery_event(
                 &route_key,
                 &missing.id.to_bytes(),
@@ -980,6 +982,7 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
         final_app
             .account_storage(&alice.label)
             .unwrap()
+            .app_storage()
             .retained_recovery_event(
                 &route_key,
                 &missing.id.to_bytes(),

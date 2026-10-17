@@ -1011,6 +1011,7 @@ fn user_blocks_recompute_counts_clear_preview_and_restore_retained_messages() {
     assert!(before.last_message.is_some());
     let policy = |id: &str, at, entries: Vec<(String, bool)>| {
         store
+            .app_storage()
             .adopt_block_list(
                 &crate::StoredBlockList {
                     event_id: id.into(),

@@ -351,6 +351,7 @@ fn replay_query_work() {
 
         measured(&store, "duplicate reconciliation", 120, || {
             store
+                .app_storage()
                 .record_transport_reconciliation_item(
                     &crate::TransportReconciliationRoute::Inbox,
                     &crate::TransportReconciliationItem {

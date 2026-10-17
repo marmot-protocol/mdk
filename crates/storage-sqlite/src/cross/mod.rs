@@ -5,6 +5,7 @@
 
 pub(crate) mod authority;
 pub(crate) mod groups;
+mod handles;
 pub(crate) mod outbound;
 pub(crate) mod projection;
 pub(crate) mod release;

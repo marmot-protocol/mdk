@@ -317,6 +317,7 @@ mod tests {
             .as_secs();
         for route_id in [[0x01; 32], [0x02; 32], [0x03; 32], [0x04; 32]] {
             store
+                .app_storage()
                 .record_transport_reconciliation_item(
                     &TransportReconciliationRoute::Group(route_id),
                     &TransportReconciliationItem {
@@ -369,6 +370,7 @@ mod tests {
             .unwrap()
             .as_secs();
         store
+            .app_storage()
             .record_transport_reconciliation_item(
                 &TransportReconciliationRoute::Group([0xAA; 32]),
                 &TransportReconciliationItem {
@@ -401,6 +403,7 @@ mod tests {
             .unwrap()
             .as_secs();
         store
+            .app_storage()
             .record_transport_reconciliation_item(
                 &TransportReconciliationRoute::Group([0xCC; 32]),
                 &TransportReconciliationItem {

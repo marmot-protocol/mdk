@@ -315,6 +315,7 @@ fn poll_votes_list_each_effective_selection_and_match_the_tally() {
             .map(|key| ((*key).to_owned(), true))
             .collect::<Vec<_>>();
         store
+            .app_storage()
             .adopt_block_list(&list, &keys, at as i64, "local", &no_mentions)
             .unwrap();
     };
@@ -4001,6 +4002,7 @@ fn user_blocks_filter_before_pagination_and_restore_without_erasing_history() {
         ..Default::default()
     };
     store
+        .app_storage()
         .adopt_block_list(&list, &[("bob".into(), true)], 10, "local", &no_mentions)
         .unwrap();
     let page = store
@@ -4034,10 +4036,12 @@ fn user_blocks_filter_before_pagination_and_restore_without_erasing_history() {
         .unwrap();
     assert!(
         store
+            .app_storage()
             .blocked_notification_suppressed(&reply.group_id_hex, "during")
             .unwrap()
     );
     store
+        .app_storage()
         .adopt_block_list(
             &crate::StoredBlockList {
                 event_id: "unblock".into(),
@@ -4058,6 +4062,7 @@ fn user_blocks_filter_before_pagination_and_restore_without_erasing_history() {
     );
     assert!(
         store
+            .app_storage()
             .blocked_notification_suppressed(&reply.group_id_hex, "during")
             .unwrap()
     );
@@ -4075,6 +4080,7 @@ fn user_blocks_filter_before_pagination_and_restore_without_erasing_history() {
 fn user_blocks_notification_suppression_pruned_with_event_but_welcome_replay_fence_retained() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     store
+        .app_storage()
         .adopt_block_list(
             &crate::StoredBlockList {
                 event_id: "block".into(),
@@ -4089,9 +4095,13 @@ fn user_blocks_notification_suppression_pruned_with_event_but_welcome_replay_fen
         .unwrap();
     let event = chat("hidden", "bob", 2, "retained until prune");
     store.record_app_event(&event).unwrap();
-    store.dismiss_blocked_welcome("old-welcome").unwrap();
+    store
+        .app_storage()
+        .dismiss_blocked_welcome("old-welcome")
+        .unwrap();
     assert!(
         store
+            .app_storage()
             .blocked_notification_suppressed(&event.group_id_hex, "hidden")
             .unwrap()
     );
@@ -4105,10 +4115,16 @@ fn user_blocks_notification_suppression_pruned_with_event_but_welcome_replay_fen
         .unwrap();
     assert!(
         !store
+            .app_storage()
             .blocked_notification_suppressed(&event.group_id_hex, "hidden")
             .unwrap()
     );
-    assert!(store.is_blocked_welcome_dismissed("old-welcome").unwrap());
+    assert!(
+        store
+            .app_storage()
+            .is_blocked_welcome_dismissed("old-welcome")
+            .unwrap()
+    );
 }
 
 #[test]

@@ -1698,10 +1698,12 @@ mod tests {
                 created_at: crate::unix_now_seconds(),
             };
             store
+                .app_storage()
                 .record_transport_reconciliation_item(&TransportReconciliationRoute::Inbox, &item)
                 .unwrap();
             let (_, steps) = measure(&store, || {
                 store
+                    .app_storage()
                     .record_transport_reconciliation_item(
                         &TransportReconciliationRoute::Inbox,
                         &item,
@@ -1932,6 +1934,7 @@ mod tests {
                         .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
                         .unwrap();
                     store
+                        .app_storage()
                         .record_transport_reconciliation_item(
                             &route,
                             &TransportReconciliationItem {
@@ -2095,6 +2098,7 @@ mod tests {
             store.lock().unwrap().execute_batch("CREATE TRIGGER reject_scope_invalidation BEFORE UPDATE ON account_recovery_scopes BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
             assert!(
                 store
+                    .app_storage()
                     .record_transport_reconciliation_item(
                         &TransportReconciliationRoute::Inbox,
                         &TransportReconciliationItem {
@@ -2107,6 +2111,7 @@ mod tests {
             assert_eq!(store.recovery_revision_fence().unwrap(), before_failure);
             assert!(
                 store
+                    .app_storage()
                     .retained_recovery_event(
                         &TransportReconciliationRoute::Inbox,
                         &[0; 32],
@@ -2122,6 +2127,7 @@ mod tests {
                 .execute_batch("DROP TRIGGER reject_scope_invalidation")
                 .unwrap();
             store
+                .app_storage()
                 .record_transport_reconciliation_item(
                     &TransportReconciliationRoute::Inbox,
                     &TransportReconciliationItem {

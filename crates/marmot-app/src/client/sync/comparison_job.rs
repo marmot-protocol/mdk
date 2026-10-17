@@ -332,6 +332,7 @@ impl ComparisonNetworkJob {
                 Ok(FrozenRoute {
                     inventory: inventory.clone(),
                     initial_cursor: storage
+                        .app_storage()
                         .transport_reconciliation_replay_cursor(&inventory.route)?,
                     window: match inventory.route {
                         TransportReconciliationRoute::Group(id)
@@ -1078,6 +1079,7 @@ impl AppClient {
             // so the next pass fetches the unadmitted suffix again.
             if route.admitted && route.cursor != route.initial_cursor {
                 storage
+                    .app_storage()
                     .advance_transport_reconciliation_replay_cursor(&route.route, route.cursor)
                     .map_err(|error| failure(error.into()))?;
             }
@@ -1394,6 +1396,7 @@ mod tests {
         assert_eq!(
             fixture
                 .storage
+                .app_storage()
                 .transport_reconciliation_replay_cursor(&route)
                 .unwrap(),
             Some([8; 32])
@@ -1441,6 +1444,7 @@ mod tests {
         assert_eq!(
             fixture
                 .storage
+                .app_storage()
                 .transport_reconciliation_replay_cursor(&route)
                 .unwrap(),
             None
@@ -1482,6 +1486,7 @@ mod tests {
             .inventory_revision;
         fixture
             .storage
+            .app_storage()
             .record_transport_reconciliation_item(
                 &TransportReconciliationRoute::Group(route),
                 &TransportReconciliationItem {
@@ -1515,6 +1520,7 @@ mod tests {
         assert_eq!(
             fixture
                 .storage
+                .app_storage()
                 .transport_reconciliation_replay_cursor(&TransportReconciliationRoute::Inbox)
                 .unwrap(),
             None
@@ -1552,6 +1558,7 @@ mod tests {
         assert_eq!(
             fixture
                 .storage
+                .app_storage()
                 .transport_reconciliation_replay_cursor(&route)
                 .unwrap(),
             None
@@ -1578,6 +1585,7 @@ mod tests {
         assert_eq!(
             fixture
                 .storage
+                .app_storage()
                 .transport_reconciliation_replay_cursor(&route)
                 .unwrap(),
             Some([8; 32])
@@ -1649,6 +1657,7 @@ mod tests {
         assert_eq!(
             fixture
                 .storage
+                .app_storage()
                 .transport_reconciliation_replay_cursor(&route)
                 .unwrap(),
             None,
@@ -1673,6 +1682,7 @@ mod tests {
         assert_eq!(
             fixture
                 .storage
+                .app_storage()
                 .transport_reconciliation_replay_cursor(&route)
                 .unwrap(),
             Some([8; 32]),
@@ -1823,6 +1833,7 @@ mod tests {
         assert_eq!(
             fixture
                 .storage
+                .app_storage()
                 .transport_reconciliation_replay_cursor(&route)
                 .unwrap(),
             None,
@@ -1845,6 +1856,7 @@ mod tests {
         assert_eq!(
             fixture
                 .storage
+                .app_storage()
                 .transport_reconciliation_replay_cursor(&route)
                 .unwrap(),
             None,
@@ -1901,6 +1913,7 @@ mod tests {
         assert_eq!(
             fixture
                 .storage
+                .app_storage()
                 .transport_reconciliation_replay_cursor(&route)
                 .unwrap(),
             Some([8; 32])

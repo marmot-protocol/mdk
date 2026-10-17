@@ -322,7 +322,10 @@ impl MarmotApp {
                     AppError::GroupDisbanding(group_hex.clone())
                 });
             }
-            if storage.direct_conversation_has_blocked_user(&group_hex)? {
+            if storage
+                .app_storage()
+                .direct_conversation_has_blocked_user(&group_hex)?
+            {
                 return Err(AppError::UserBlocked);
             }
             let consuming_revision = match &draft {

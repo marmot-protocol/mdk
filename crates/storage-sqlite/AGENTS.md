@@ -6,7 +6,10 @@ recovery-ledger contracts: [`README.md`](README.md).
 ## Scope
 
 `SqliteAccountStorage` implements `cgka_traits::StorageProvider` with Marmot metadata and custom OpenMLS storage in one
-encrypted SQLite database. One database file belongs to one Marmot account-device identity. `shared.rs`'s
+encrypted SQLite database. One database file belongs to one Marmot account-device identity. App storage is moving
+onto its own handle, `SqliteAppStorage` (`src/app/handle.rs`), a folder at a time (step 4 PR 4 of the brief): it
+shares the account's connection, and `SqliteAccountStorage::app_storage()` (`src/cross/handles.rs`) is the only way
+to get one. Put new app methods on `SqliteAppStorage`, not on the account handle. `shared.rs`'s
 `SqliteSharedStorage` is a deliberate exception: a separate, non-account-scoped database for cross-identity state — do
 not "fix" it into the per-account database.
 

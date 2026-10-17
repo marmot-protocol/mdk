@@ -207,7 +207,10 @@ impl Fixture {
     }
 
     fn pending(&self) -> Vec<ModerationReportOutboxEntry> {
-        self.storage().pending_moderation_reports(100).unwrap()
+        self.storage()
+            .app_storage()
+            .pending_moderation_reports(100)
+            .unwrap()
     }
 }
 
@@ -549,6 +552,7 @@ async fn unconfigured_reporting_is_a_typed_error_and_publishes_nothing() {
     assert_eq!(
         fixture
             .storage()
+            .app_storage()
             .moderation_reports_created_since(0)
             .unwrap(),
         0
@@ -873,6 +877,7 @@ async fn purge_cancels_an_in_flight_publish_and_removes_queued_reports() {
     assert_eq!(
         fixture
             .storage()
+            .app_storage()
             .moderation_reports_created_since(0)
             .unwrap(),
         0
@@ -968,6 +973,7 @@ async fn a_teardown_fence_closes_admission_until_the_sign_out_commits() {
     assert_eq!(
         fixture
             .storage()
+            .app_storage()
             .moderation_reports_created_since(0)
             .unwrap(),
         0
@@ -976,6 +982,7 @@ async fn a_teardown_fence_closes_admission_until_the_sign_out_commits() {
     // A retry pass during teardown publishes nothing, even a row staged meanwhile.
     fixture
         .storage()
+        .app_storage()
         .stage_moderation_report(&ModerationReportOutboxEntry {
             report_id: "a".repeat(32),
             dedupe_key: "d".repeat(64),
@@ -1379,6 +1386,7 @@ mod runtime {
             self.app
                 .account_storage(&self.label)
                 .unwrap()
+                .app_storage()
                 .pending_moderation_reports(100)
                 .unwrap()
                 .len()
@@ -1423,6 +1431,7 @@ mod runtime {
                 .app
                 .account_storage(&fixture.label)
                 .unwrap()
+                .app_storage()
                 .moderation_reports_created_since(0)
                 .unwrap(),
             0

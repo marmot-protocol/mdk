@@ -67,7 +67,7 @@ impl MarmotApp {
             return Err(AppError::BlockListUnavailable);
         }
         let storage = self.account_storage(label)?;
-        let current = storage.stored_block_list()?;
+        let current = storage.app_storage().stored_block_list()?;
         if !event_is_newer(event, &current) {
             return Ok(());
         }
@@ -92,7 +92,9 @@ impl MarmotApp {
         let private_tags = match private_tags {
             Ok(tags) => tags,
             Err(error) => {
-                storage.record_unreadable_block_list(&event.id, event.created_at)?;
+                storage
+                    .app_storage()
+                    .record_unreadable_block_list(&event.id, event.created_at)?;
                 return Err(error);
             }
         };
@@ -109,7 +111,7 @@ impl MarmotApp {
         let app = self.clone();
         let label = label.to_owned();
         crate::blocking_app_task(move || {
-            if storage.adopt_block_list(
+            if storage.app_storage().adopt_block_list(
                 &list,
                 &entries,
                 crate::notifications::unix_now_ms(),
@@ -137,11 +139,11 @@ impl MarmotApp {
 
     fn reconcile_block_pending(&self, label: &str) -> Result<(), AppError> {
         let storage = self.account_storage(label)?;
-        if let Some(pending) = storage.pending_block_publication()? {
+        if let Some(pending) = storage.app_storage().pending_block_publication()? {
             let event: NostrTransportEvent = serde_json::from_str(&pending.event_json)
                 .map_err(|_| AppError::BlockListUnavailable)?;
-            if !event_is_newer(&event, &storage.stored_block_list()?) {
-                storage.clear_block_publication()?;
+            if !event_is_newer(&event, &storage.app_storage().stored_block_list()?) {
+                storage.app_storage().clear_block_publication()?;
             }
         }
         Ok(())
@@ -177,6 +179,7 @@ impl MarmotApp {
         }
         if self
             .account_storage(label)?
+            .app_storage()
             .block_list_has_unreadable_replacement()?
         {
             return Err(AppError::BlockListUnavailable);
@@ -198,14 +201,14 @@ impl MarmotApp {
         let lock = self.block_update_lock(label).await;
         let _guard = lock.lock().await;
         let storage = self.account_storage(label)?;
-        if storage.pending_block_publication()?.is_none()
-            && storage.is_user_blocked(&target)? == blocked
+        if storage.app_storage().pending_block_publication()?.is_none()
+            && storage.app_storage().is_user_blocked(&target)? == blocked
         {
             return Ok(());
         }
         self.fetch_block_list(label).await?;
-        let list = storage.stored_block_list()?;
-        let pending = storage.pending_block_publication()?;
+        let list = storage.app_storage().stored_block_list()?;
+        let pending = storage.app_storage().pending_block_publication()?;
         let retrying_uncertain = pending.is_some();
         let event = if let Some(pending) = pending {
             if pending.target != target || pending.blocked != blocked {
@@ -214,7 +217,7 @@ impl MarmotApp {
             serde_json::from_str::<NostrTransportEvent>(&pending.event_json)
                 .map_err(|_| AppError::BlockListUnavailable)?
         } else {
-            if storage.is_user_blocked(&target)? == blocked {
+            if storage.app_storage().is_user_blocked(&target)? == blocked {
                 return Ok(());
             }
             let mut public = list.public_tags;
@@ -260,11 +263,13 @@ impl MarmotApp {
                 .map_err(|_| AppError::BlockListUnavailable)?;
             let event = NostrTransportEvent::from_nostr_event(&signed)
                 .map_err(|_| AppError::BlockListUnavailable)?;
-            storage.stage_block_publication(&PendingBlockPublication {
-                target,
-                blocked,
-                event_json: serde_json::to_string(&event)?,
-            })?;
+            storage
+                .app_storage()
+                .stage_block_publication(&PendingBlockPublication {
+                    target,
+                    blocked,
+                    event_json: serde_json::to_string(&event)?,
+                })?;
             event
         };
         let signer = self.account_signer_for_summary(&account)?.as_nostr_signer();
@@ -282,6 +287,7 @@ impl MarmotApp {
                     .await
                     .map_err(|_| AppError::BlockPublicationUncertain)?;
                 storage
+                    .app_storage()
                     .clear_block_publication()
                     .map_err(|_| AppError::BlockPublicationUncertain)?;
                 Ok(())
@@ -296,7 +302,7 @@ impl MarmotApp {
                         .iter()
                         .all(|f| f.kind != TransportEndpointFailureKind::PossiblyExposed);
                 if definite && !retrying_uncertain {
-                    storage.clear_block_publication()?;
+                    storage.app_storage().clear_block_publication()?;
                     Err(AppError::BlockListUnavailable)
                 } else {
                     Err(AppError::BlockPublicationUncertain)
@@ -375,6 +381,7 @@ mod tests {
         let before = app
             .account_storage("alice")
             .unwrap()
+            .app_storage()
             .block_list_snapshot()
             .unwrap();
         let unreadable = EventBuilder::new(Kind::MuteList, "not ciphertext")
@@ -391,6 +398,7 @@ mod tests {
         assert_eq!(
             app.account_storage("alice")
                 .unwrap()
+                .app_storage()
                 .block_list_snapshot()
                 .unwrap(),
             before
@@ -398,6 +406,7 @@ mod tests {
         assert_eq!(
             app.account_storage("alice")
                 .unwrap()
+                .app_storage()
                 .stored_block_list()
                 .unwrap()
                 .private_tags[1],

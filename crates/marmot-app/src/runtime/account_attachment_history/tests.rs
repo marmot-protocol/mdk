@@ -113,14 +113,15 @@ async fn native_block_policy_fences_global_pages_and_never_returns_hidden_sender
         event_created_at: 1,
         ..Default::default()
     };
-    s.adopt_block_list(
-        &list,
-        &[("11".repeat(32), false)],
-        100,
-        &account.account_id_hex,
-        &|_, _| false,
-    )
-    .unwrap();
+    s.app_storage()
+        .adopt_block_list(
+            &list,
+            &[("11".repeat(32), false)],
+            100,
+            &account.account_id_hex,
+            &|_, _| false,
+        )
+        .unwrap();
     assert!(matches!(
         runtime
             .account_attachment_history_page(

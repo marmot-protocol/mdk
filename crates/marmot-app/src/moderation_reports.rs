@@ -458,11 +458,11 @@ impl MarmotApp {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
         }
         let storage = self.account_storage(label)?;
-        storage.prune_moderation_reports(
+        storage.app_storage().prune_moderation_reports(
             now_ms.saturating_sub(window_ms(MODERATION_REPORT_RATE_WINDOW)),
             now_ms.saturating_sub(window_ms(PENDING_MAX_AGE)),
         )?;
-        if let Some(existing) = storage.moderation_report_by_dedupe_key(
+        if let Some(existing) = storage.app_storage().moderation_report_by_dedupe_key(
             &dedupe_key,
             now_ms.saturating_sub(window_ms(MODERATION_REPORT_IDEMPOTENCY_WINDOW)),
         )? {
@@ -474,7 +474,7 @@ impl MarmotApp {
                 true,
             ));
         }
-        if storage.moderation_reports_created_since(
+        if storage.app_storage().moderation_reports_created_since(
             now_ms.saturating_sub(window_ms(MODERATION_REPORT_RATE_WINDOW)),
         )? >= MODERATION_REPORT_RATE_LIMIT
         {
@@ -496,21 +496,25 @@ impl MarmotApp {
             .map_err(|error| AppError::Publish(format!("moderation report event: {error}")))?;
         let report_id = hex::encode(rand::random::<[u8; 16]>());
         // Record intent before any relay can see the wrap.
-        storage.stage_moderation_report(&ModerationReportOutboxEntry {
-            report_id: report_id.clone(),
-            dedupe_key,
-            recipient_pubkey_hex: config.recipient.to_hex(),
-            outcome: ModerationReportOutboxOutcome::AcceptedPending,
-            event_json: Some(serde_json::to_string(&event)?),
-            created_at_ms: now_ms,
-            attempts: 0,
-        })?;
+        storage
+            .app_storage()
+            .stage_moderation_report(&ModerationReportOutboxEntry {
+                report_id: report_id.clone(),
+                dedupe_key,
+                recipient_pubkey_hex: config.recipient.to_hex(),
+                outcome: ModerationReportOutboxOutcome::AcceptedPending,
+                event_json: Some(serde_json::to_string(&event)?),
+                created_at_ms: now_ms,
+                attempts: 0,
+            })?;
         // Durably mark the attempt before relay I/O: if it is interrupted,
         // shutdown, cancellation or process death leave it `CompletionUnknown`.
         // The claim keeps a concurrent retry pass off this live attempt.
         let _claim = PublishClaim::try_claim(&slot, &report_id)
             .ok_or_else(|| AppError::Publish("moderation report already publishing".into()))?;
-        storage.begin_moderation_report_attempt(&report_id)?;
+        storage
+            .app_storage()
+            .begin_moderation_report_attempt(&report_id)?;
         // Publish without the account lock so a slow relay never blocks another
         // report, a retry selection or a purge. A purge that lands meanwhile
         // deletes the row, and the attempt record below then updates nothing.
@@ -534,7 +538,10 @@ impl MarmotApp {
                 ));
             }
         };
-        if let Err(error) = storage.record_moderation_report_attempt(&report_id, outcome, now_ms) {
+        if let Err(error) = storage
+            .app_storage()
+            .record_moderation_report_attempt(&report_id, outcome, now_ms)
+        {
             // The relay outcome stands; a stale row only causes one more idempotent retry.
             tracing::warn!(
                 target: "marmot_app::moderation_reports",
@@ -575,13 +582,15 @@ impl MarmotApp {
         let storage = self.account_storage(label)?;
         let now_ms = unix_now_ms();
         let mut summary = ModerationReportRetrySummary {
-            abandoned: storage.prune_moderation_reports(
+            abandoned: storage.app_storage().prune_moderation_reports(
                 now_ms.saturating_sub(window_ms(MODERATION_REPORT_RATE_WINDOW)),
                 now_ms.saturating_sub(window_ms(PENDING_MAX_AGE)),
             )? as usize,
             ..Default::default()
         };
-        let pending = storage.pending_moderation_reports(RETRY_BATCH_LIMIT)?;
+        let pending = storage
+            .app_storage()
+            .pending_moderation_reports(RETRY_BATCH_LIMIT)?;
         drop(work);
         let Some(config) = self.moderation_report_config() else {
             summary.pending = pending.len();
@@ -595,7 +604,9 @@ impl MarmotApp {
                 .filter(|_| entry.recipient_pubkey_hex == recipient_hex)
                 .and_then(|json| serde_json::from_str::<NostrTransportEvent>(json).ok());
             let Some(event) = event else {
-                storage.delete_moderation_report(&entry.report_id)?;
+                storage
+                    .app_storage()
+                    .delete_moderation_report(&entry.report_id)?;
                 summary.abandoned += 1;
                 continue;
             };
@@ -604,7 +615,10 @@ impl MarmotApp {
                 summary.pending += 1;
                 continue;
             };
-            if !storage.begin_moderation_report_attempt(&entry.report_id)? {
+            if !storage
+                .app_storage()
+                .begin_moderation_report_attempt(&entry.report_id)?
+            {
                 // Purged or published since selection.
                 continue;
             }
@@ -613,7 +627,11 @@ impl MarmotApp {
                 _ = generation_changed(&mut generation) => break,
                 _ = runtime_stopping(&mut stopping) => break,
             };
-            storage.record_moderation_report_attempt(&entry.report_id, outcome, unix_now_ms())?;
+            storage.app_storage().record_moderation_report_attempt(
+                &entry.report_id,
+                outcome,
+                unix_now_ms(),
+            )?;
             if outcome == ModerationReportOutboxOutcome::Published {
                 summary.published += 1;
             } else {
@@ -634,7 +652,7 @@ impl MarmotApp {
     /// Whether `label` has reports waiting for a relay. Cheap; used to skip retry passes.
     pub(crate) fn has_pending_moderation_reports(&self, label: &str) -> bool {
         self.account_storage(label)
-            .and_then(|storage| Ok(storage.has_pending_moderation_reports()?))
+            .and_then(|storage| Ok(storage.app_storage().has_pending_moderation_reports()?))
             .unwrap_or(false)
     }
 
@@ -682,7 +700,7 @@ impl MarmotApp {
             Ok(_) if !self.account_storage_path(label).exists() => Ok(0),
             _ => self
                 .account_storage(label)
-                .and_then(|storage| Ok(storage.purge_moderation_reports()?)),
+                .and_then(|storage| Ok(storage.app_storage().purge_moderation_reports()?)),
         };
         if let Err(error) = &purged {
             tracing::warn!(

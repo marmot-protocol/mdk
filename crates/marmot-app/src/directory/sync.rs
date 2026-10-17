@@ -755,7 +755,7 @@ mod tests {
             .unwrap();
         drop(guard);
         assert_eq!(
-            storage.block_list_revision().unwrap(),
+            storage.app_storage().block_list_revision().unwrap(),
             0,
             "queued adoption is cancelled at shutdown"
         );

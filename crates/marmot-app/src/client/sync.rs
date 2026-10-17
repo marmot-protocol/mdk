@@ -1369,7 +1369,9 @@ impl AppClient {
                 work.push(candidate);
             }
         }
-        let cursor = storage.transport_reconciliation_route_cursor()?;
+        let cursor = storage
+            .app_storage()
+            .transport_reconciliation_route_cursor()?;
         let rotation_claim = order_reconciliation_pass(
             &mut work,
             cursor.as_ref(),
@@ -3477,6 +3479,7 @@ impl AppClient {
             .account_storage(&self.state.label)
             .and_then(|storage| {
                 storage
+                    .app_storage()
                     .record_transport_reconciliation_item(route, item)
                     .map_err(AppError::from)
             });
@@ -3552,7 +3555,10 @@ impl AppClient {
         };
         if welcome {
             let storage = client.app.account_storage(&client.state.label)?;
-            if storage.is_blocked_welcome_dismissed(&source_message_id_hex)? {
+            if storage
+                .app_storage()
+                .is_blocked_welcome_dismissed(&source_message_id_hex)?
+            {
                 return Ok(DeliveryIngest {
                     routes_dirty: false,
                     must_stay_fetchable: false,
@@ -3561,7 +3567,7 @@ impl AppClient {
             }
             // Dismissals remain authoritative after unblock. With no current
             // blocks the normal ingress peeler is sufficient.
-            if storage.has_blocked_users()? {
+            if storage.app_storage().has_blocked_users()? {
                 let account = client.app.account_home().account(&client.state.label)?;
                 let peeler = transport_nostr_peeler::NostrMlsPeeler::new().with_welcome_signer_arc(
                     client
@@ -3575,9 +3581,13 @@ impl AppClient {
                     cgka_traits::peeler::TransportPeeler::peel_welcome(&peeler, &delivery.message)
                         .await
                     && let Some(sender) = peeled.sender
-                    && storage.is_user_blocked(&hex::encode(sender.as_slice()))?
+                    && storage
+                        .app_storage()
+                        .is_user_blocked(&hex::encode(sender.as_slice()))?
                 {
-                    storage.dismiss_blocked_welcome(&source_message_id_hex)?;
+                    storage
+                        .app_storage()
+                        .dismiss_blocked_welcome(&source_message_id_hex)?;
                     return Ok(DeliveryIngest {
                         routes_dirty: false,
                         must_stay_fetchable: false,
@@ -5184,12 +5194,14 @@ impl AppClient {
                         }
                     }
                     let retained_known_event = match (&route, scope.goal.known_event_id) {
-                        (Some(route), Some(event)) => storage.retained_recovery_event(
-                            route,
-                            &event,
-                            scope.goal.since_seconds,
-                            scope.goal.until_seconds,
-                        )?,
+                        (Some(route), Some(event)) => {
+                            storage.app_storage().retained_recovery_event(
+                                route,
+                                &event,
+                                scope.goal.since_seconds,
+                                scope.goal.until_seconds,
+                            )?
+                        }
                         _ => false,
                     };
                     let endpoints = scope

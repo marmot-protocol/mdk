@@ -5,7 +5,9 @@
 //! explanation in the clear; both exist only inside the signed NIP-59 wrap, which is dropped once
 //! a relay accepts it. Published rows stay as bare metadata until the app prunes them, so the
 //! idempotency window and the local rate limit survive a restart.
-use crate::{SqliteAccountStorage, SqliteResultExt};
+#[cfg(test)]
+use crate::SqliteAccountStorage;
+use crate::{SqliteAppStorage, SqliteResultExt};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, Row, params};
 
@@ -100,7 +102,7 @@ fn entry_from_raw(
     })
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// The newest report with `dedupe_key` created at or after `not_before_ms`.
     pub fn moderation_report_by_dedupe_key(
         &self,
@@ -321,13 +323,27 @@ mod tests {
     fn staged_report_publishes_once_and_drops_its_wrap() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
+            .app_storage()
             .stage_moderation_report(&entry('a', 'd', 1_000))
             .unwrap();
-        assert!(store.has_pending_moderation_reports().unwrap());
-        assert_eq!(store.pending_moderation_reports(10).unwrap().len(), 1);
+        assert!(
+            store
+                .app_storage()
+                .has_pending_moderation_reports()
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .app_storage()
+                .pending_moderation_reports(10)
+                .unwrap()
+                .len(),
+            1
+        );
 
         assert!(
             store
+                .app_storage()
                 .record_moderation_report_attempt(
                     &"a".repeat(32),
                     ModerationReportOutboxOutcome::CompletionUnknown,
@@ -335,7 +351,7 @@ mod tests {
                 )
                 .unwrap()
         );
-        let pending = store.pending_moderation_reports(10).unwrap();
+        let pending = store.app_storage().pending_moderation_reports(10).unwrap();
         assert_eq!(pending[0].attempts, 1);
         assert_eq!(
             pending[0].outcome,
@@ -344,6 +360,7 @@ mod tests {
 
         assert!(
             store
+                .app_storage()
                 .record_moderation_report_attempt(
                     &"a".repeat(32),
                     ModerationReportOutboxOutcome::Published,
@@ -351,8 +368,14 @@ mod tests {
                 )
                 .unwrap()
         );
-        assert!(!store.has_pending_moderation_reports().unwrap());
+        assert!(
+            !store
+                .app_storage()
+                .has_pending_moderation_reports()
+                .unwrap()
+        );
         let published = store
+            .app_storage()
             .moderation_report_by_dedupe_key(&"d".repeat(64), 0)
             .unwrap()
             .unwrap();
@@ -361,6 +384,7 @@ mod tests {
         // A published row accepts no further attempts.
         assert!(
             !store
+                .app_storage()
                 .record_moderation_report_attempt(
                     &"a".repeat(32),
                     ModerationReportOutboxOutcome::AcceptedPending,
@@ -374,17 +398,20 @@ mod tests {
     fn completion_unknown_survives_a_later_refused_attempt() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
+            .app_storage()
             .stage_moderation_report(&entry('a', 'd', 1_000))
             .unwrap();
         let id = "a".repeat(32);
         let outcome = |store: &SqliteAccountStorage| {
             store
+                .app_storage()
                 .moderation_report_by_dedupe_key(&"d".repeat(64), 0)
                 .unwrap()
                 .unwrap()
                 .outcome
         };
         store
+            .app_storage()
             .record_moderation_report_attempt(
                 &id,
                 ModerationReportOutboxOutcome::CompletionUnknown,
@@ -392,6 +419,7 @@ mod tests {
             )
             .unwrap();
         store
+            .app_storage()
             .record_moderation_report_attempt(
                 &id,
                 ModerationReportOutboxOutcome::AcceptedPending,
@@ -403,6 +431,7 @@ mod tests {
             ModerationReportOutboxOutcome::CompletionUnknown
         );
         store
+            .app_storage()
             .record_moderation_report_attempt(&id, ModerationReportOutboxOutcome::Published, 4_000)
             .unwrap();
         assert_eq!(outcome(&store), ModerationReportOutboxOutcome::Published);
@@ -412,11 +441,13 @@ mod tests {
     fn an_interrupted_attempt_reads_and_stays_completion_unknown() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
+            .app_storage()
             .stage_moderation_report(&entry('a', 'd', 1_000))
             .unwrap();
         let id = "a".repeat(32);
         let outcome = |store: &SqliteAccountStorage| {
             store
+                .app_storage()
                 .moderation_report_by_dedupe_key(&"d".repeat(64), 0)
                 .unwrap()
                 .unwrap()
@@ -427,14 +458,25 @@ mod tests {
             ModerationReportOutboxOutcome::AcceptedPending
         );
         // In flight: the wrap may be leaving the device.
-        assert!(store.begin_moderation_report_attempt(&id).unwrap());
+        assert!(
+            store
+                .app_storage()
+                .begin_moderation_report_attempt(&id)
+                .unwrap()
+        );
         assert_eq!(
             outcome(&store),
             ModerationReportOutboxOutcome::CompletionUnknown
         );
         // Interrupted (never recorded), then a later attempt is refused before sending.
-        assert!(store.begin_moderation_report_attempt(&id).unwrap());
+        assert!(
+            store
+                .app_storage()
+                .begin_moderation_report_attempt(&id)
+                .unwrap()
+        );
         store
+            .app_storage()
             .record_moderation_report_attempt(
                 &id,
                 ModerationReportOutboxOutcome::AcceptedPending,
@@ -451,11 +493,18 @@ mod tests {
     fn a_completed_attempt_without_prior_uncertainty_stays_pending() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
+            .app_storage()
             .stage_moderation_report(&entry('a', 'd', 1_000))
             .unwrap();
         let id = "a".repeat(32);
-        assert!(store.begin_moderation_report_attempt(&id).unwrap());
+        assert!(
+            store
+                .app_storage()
+                .begin_moderation_report_attempt(&id)
+                .unwrap()
+        );
         store
+            .app_storage()
             .record_moderation_report_attempt(
                 &id,
                 ModerationReportOutboxOutcome::AcceptedPending,
@@ -463,7 +512,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store.pending_moderation_reports(1).unwrap()[0].outcome,
+            store.app_storage().pending_moderation_reports(1).unwrap()[0].outcome,
             ModerationReportOutboxOutcome::AcceptedPending
         );
     }
@@ -472,16 +521,20 @@ mod tests {
     fn retry_selection_rotates_past_reports_that_keep_failing() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
+            .app_storage()
             .stage_moderation_report(&entry('a', 'd', 1_000))
             .unwrap();
         store
+            .app_storage()
             .stage_moderation_report(&entry('b', 'e', 2_000))
             .unwrap();
         store
+            .app_storage()
             .stage_moderation_report(&entry('f', 'f', 3_000))
             .unwrap();
         let ids = |store: &SqliteAccountStorage| {
             store
+                .app_storage()
                 .pending_moderation_reports(2)
                 .unwrap()
                 .into_iter()
@@ -491,6 +544,7 @@ mod tests {
         assert_eq!(ids(&store), "ab");
         for (id, at) in [('a', 5_000), ('b', 6_000)] {
             store
+                .app_storage()
                 .record_moderation_report_attempt(
                     &id.to_string().repeat(32),
                     ModerationReportOutboxOutcome::AcceptedPending,
@@ -506,43 +560,64 @@ mod tests {
     fn dedupe_lookup_and_rate_count_respect_their_windows() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
+            .app_storage()
             .stage_moderation_report(&entry('a', 'd', 1_000))
             .unwrap();
         store
+            .app_storage()
             .stage_moderation_report(&entry('b', 'd', 5_000))
             .unwrap();
         store
+            .app_storage()
             .stage_moderation_report(&entry('e', 'f', 9_000))
             .unwrap();
 
         let newest = store
+            .app_storage()
             .moderation_report_by_dedupe_key(&"d".repeat(64), 0)
             .unwrap()
             .unwrap();
         assert_eq!(newest.report_id, "b".repeat(32));
         assert!(
             store
+                .app_storage()
                 .moderation_report_by_dedupe_key(&"d".repeat(64), 6_000)
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(store.moderation_reports_created_since(0).unwrap(), 3);
-        assert_eq!(store.moderation_reports_created_since(5_000).unwrap(), 2);
+        assert_eq!(
+            store
+                .app_storage()
+                .moderation_reports_created_since(0)
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            store
+                .app_storage()
+                .moderation_reports_created_since(5_000)
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
     fn prune_and_purge_remove_the_right_rows() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
+            .app_storage()
             .stage_moderation_report(&entry('a', 'd', 1_000))
             .unwrap();
         store
+            .app_storage()
             .stage_moderation_report(&entry('b', 'e', 2_000))
             .unwrap();
         store
+            .app_storage()
             .stage_moderation_report(&entry('f', 'f', 9_000))
             .unwrap();
         store
+            .app_storage()
             .record_moderation_report_attempt(
                 &"b".repeat(32),
                 ModerationReportOutboxOutcome::Published,
@@ -551,11 +626,28 @@ mod tests {
             .unwrap();
 
         // Published metadata before 3s goes; pending before 1.5s is abandoned.
-        assert_eq!(store.prune_moderation_reports(3_000, 1_500).unwrap(), 1);
-        assert_eq!(store.moderation_reports_created_since(0).unwrap(), 1);
+        assert_eq!(
+            store
+                .app_storage()
+                .prune_moderation_reports(3_000, 1_500)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .app_storage()
+                .moderation_reports_created_since(0)
+                .unwrap(),
+            1
+        );
 
-        assert_eq!(store.purge_moderation_reports().unwrap(), 1);
-        assert!(!store.has_pending_moderation_reports().unwrap());
+        assert_eq!(store.app_storage().purge_moderation_reports().unwrap(), 1);
+        assert!(
+            !store
+                .app_storage()
+                .has_pending_moderation_reports()
+                .unwrap()
+        );
     }
 
     #[test]
@@ -563,6 +655,11 @@ mod tests {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let mut published = entry('a', 'd', 1_000);
         published.outcome = ModerationReportOutboxOutcome::Published;
-        assert!(store.stage_moderation_report(&published).is_err());
+        assert!(
+            store
+                .app_storage()
+                .stage_moderation_report(&published)
+                .is_err()
+        );
     }
 }

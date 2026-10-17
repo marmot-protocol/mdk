@@ -273,7 +273,10 @@ impl MarmotApp {
             };
         }
         if let Some(peer) = peer.as_deref()
-            && storage.is_user_blocked(peer).map_err(AppError::from)?
+            && storage
+                .app_storage()
+                .is_user_blocked(peer)
+                .map_err(AppError::from)?
         {
             capabilities.can_send = false;
         }

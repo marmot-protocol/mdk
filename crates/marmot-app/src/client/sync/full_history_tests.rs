@@ -960,6 +960,7 @@ async fn a_route_the_cutoff_timed_out_keeps_its_replay_cursor() {
     // A route never compared has no stored cursor yet.
     let cursor = || {
         storage
+            .app_storage()
             .transport_reconciliation_replay_cursor(&TransportReconciliationRoute::Inbox)
             .ok()
             .flatten()

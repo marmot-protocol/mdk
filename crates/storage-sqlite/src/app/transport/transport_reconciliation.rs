@@ -1,9 +1,11 @@
 //! Durable, account-private NIP-77 set-reconciliation inventory.
 
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 use crate::base::connection::CachedSql;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{SqliteAccountStorage, SqliteResultExt, base::connection::retry_on_busy};
+use crate::{SqliteAppStorage, SqliteResultExt, base::connection::retry_on_busy};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -118,7 +120,7 @@ fn compact_route_tx(tx: &Transaction<'_>, route_kind: i64, route_id: &[u8]) -> S
     Ok(())
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Remember one transport event in the exact set advertised during NIP-77
     /// reconciliation. The row is written only after the app confirms the
     /// delivery was durably retained; resource-refused input must remain absent
@@ -402,6 +404,7 @@ mod tests {
         let key = crate::SqlCipherKey::new("synthetic replay contention").unwrap();
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         store
+            .app_storage()
             .transport_reconciliation_inventory(&TransportReconciliationRoute::Inbox, 100)
             .unwrap();
         let blocker = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
@@ -428,10 +431,12 @@ mod tests {
                     false
                 }))
                 .unwrap();
-            writer.advance_transport_reconciliation_replay_cursor(
-                &TransportReconciliationRoute::Inbox,
-                Some([7; 32]),
-            )
+            writer
+                .app_storage()
+                .advance_transport_reconciliation_replay_cursor(
+                    &TransportReconciliationRoute::Inbox,
+                    Some([7; 32]),
+                )
         });
         // Release only after SQLite reports real contention, without a sleep.
         let observed = busy_rx.recv_timeout(Duration::from_secs(5));
@@ -442,6 +447,7 @@ mod tests {
         result.unwrap().unwrap();
         assert_eq!(
             store
+                .app_storage()
                 .transport_reconciliation_replay_cursor(&TransportReconciliationRoute::Inbox)
                 .unwrap(),
             Some([7; 32])
@@ -462,22 +468,30 @@ mod tests {
             .put_transport_group_route(&route_id, &gid(1), cgka_traits::EpochId(0))
             .unwrap();
         store
+            .app_storage()
             .transport_reconciliation_inventory(&route, unix_now_secs().unwrap())
             .unwrap();
         store
+            .app_storage()
             .advance_transport_reconciliation_replay_cursor(&route, Some([1; 32]))
             .unwrap();
         store.delete_transport_group_route(&route_id).unwrap();
         assert!(matches!(
-            store.transport_reconciliation_replay_cursor(&route),
+            store
+                .app_storage()
+                .transport_reconciliation_replay_cursor(&route),
             Err(StorageError::NotFound)
         ));
         assert!(matches!(
-            store.advance_transport_reconciliation_replay_cursor(&route, Some([2; 32])),
+            store
+                .app_storage()
+                .advance_transport_reconciliation_replay_cursor(&route, Some([2; 32])),
             Err(StorageError::NotFound)
         ));
         assert!(matches!(
-            store.transport_reconciliation_replay_cursor(&route),
+            store
+                .app_storage()
+                .transport_reconciliation_replay_cursor(&route),
             Err(StorageError::NotFound)
         ));
     }
@@ -498,9 +512,11 @@ mod tests {
             .collect::<Vec<_>>();
         for route in &routes {
             store
+                .app_storage()
                 .transport_reconciliation_inventory(route, now)
                 .unwrap();
             store
+                .app_storage()
                 .advance_transport_reconciliation_replay_cursor(route, Some([7; 32]))
                 .unwrap();
         }
@@ -508,11 +524,15 @@ mod tests {
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         for route in &routes {
             assert_eq!(
-                store.transport_reconciliation_replay_cursor(route).unwrap(),
+                store
+                    .app_storage()
+                    .transport_reconciliation_replay_cursor(route)
+                    .unwrap(),
                 Some([7; 32])
             );
             assert!(
                 store
+                    .app_storage()
                     .transport_reconciliation_inventory(route, now)
                     .unwrap()
                     .items
@@ -522,25 +542,30 @@ mod tests {
         }
         let other_account = SqliteAccountStorage::in_memory().unwrap();
         other_account
+            .app_storage()
             .transport_reconciliation_inventory(&routes[0], now)
             .unwrap();
         assert_eq!(
             other_account
+                .app_storage()
                 .transport_reconciliation_replay_cursor(&routes[0])
                 .unwrap(),
             None
         );
         store
+            .app_storage()
             .advance_transport_reconciliation_replay_cursor(&routes[0], None)
             .unwrap();
         assert_eq!(
             store
+                .app_storage()
                 .transport_reconciliation_replay_cursor(&routes[0])
                 .unwrap(),
             None
         );
         assert_eq!(
             store
+                .app_storage()
                 .transport_reconciliation_replay_cursor(&routes[1])
                 .unwrap(),
             Some([7; 32])
@@ -577,6 +602,7 @@ mod tests {
                 created_at: now,
             };
             store
+                .app_storage()
                 .record_transport_reconciliation_item(&route, &item)
                 .unwrap();
             let before = store.recovery_revision_fence().unwrap();
@@ -595,6 +621,7 @@ mod tests {
             assert_eq!(store.recovery_revision_fence().unwrap(), before);
             assert!(
                 store
+                    .app_storage()
                     .retained_recovery_event(&route, &item.event_id, None, now)
                     .unwrap()
             );
@@ -609,6 +636,7 @@ mod tests {
             retire().unwrap();
             assert!(
                 !store
+                    .app_storage()
                     .retained_recovery_event(&route, &item.event_id, None, now)
                     .unwrap()
             );
@@ -638,19 +666,23 @@ mod tests {
         };
         assert!(
             !store
+                .app_storage()
                 .retained_recovery_event(&route, &item.event_id, None, now)
                 .unwrap()
         );
         store
+            .app_storage()
             .record_transport_reconciliation_item(&route, &item)
             .unwrap();
         assert!(
             store
+                .app_storage()
                 .retained_recovery_event(&route, &item.event_id, Some(now), now)
                 .unwrap()
         );
         assert!(
             !store
+                .app_storage()
                 .retained_recovery_event(
                     &TransportReconciliationRoute::Inbox,
                     &item.event_id,
@@ -661,11 +693,13 @@ mod tests {
         );
         assert!(
             !store
+                .app_storage()
                 .retained_recovery_event(&route, &item.event_id, None, now - 1)
                 .unwrap()
         );
         assert!(
             !store
+                .app_storage()
                 .retained_recovery_event(&route, &item.event_id, Some(now + 1), now + 2)
                 .unwrap()
         );
@@ -676,6 +710,7 @@ mod tests {
             .unwrap();
         assert!(
             !store
+                .app_storage()
                 .retained_recovery_event(&route, &item.event_id, None, now)
                 .unwrap(),
             "released or evicted copy is not admission proof"
@@ -698,18 +733,23 @@ mod tests {
         };
 
         store
+            .app_storage()
             .record_transport_reconciliation_item(&group, &later)
             .unwrap();
         store
+            .app_storage()
             .record_transport_reconciliation_item(&group, &earlier)
             .unwrap();
         store
+            .app_storage()
             .record_transport_reconciliation_item(&group, &later)
             .unwrap();
         store
+            .app_storage()
             .record_transport_reconciliation_item(&inbox, &later)
             .unwrap();
         store
+            .app_storage()
             .record_transport_reconciliation_item(
                 &group,
                 &TransportReconciliationItem {
@@ -721,6 +761,7 @@ mod tests {
 
         assert_eq!(
             store
+                .app_storage()
                 .transport_reconciliation_inventory(&group, now)
                 .unwrap()
                 .items,
@@ -728,6 +769,7 @@ mod tests {
         );
         assert_eq!(
             store
+                .app_storage()
                 .transport_reconciliation_inventory(&inbox, now)
                 .unwrap()
                 .items,
@@ -739,10 +781,12 @@ mod tests {
             created_at: now - TRANSPORT_RECONCILIATION_RETENTION_SECS - 1,
         };
         store
+            .app_storage()
             .record_transport_reconciliation_item(&group, &stale)
             .unwrap();
         assert_eq!(
             store
+                .app_storage()
                 .transport_reconciliation_inventory(&group, now)
                 .unwrap()
                 .items,
@@ -787,6 +831,7 @@ mod tests {
 
         let before_revision = store.recovery_revision_fence().unwrap().inventory_revision;
         let inventory = store
+            .app_storage()
             .transport_reconciliation_inventory(&route, now)
             .unwrap();
         assert_eq!(
@@ -802,6 +847,7 @@ mod tests {
         );
 
         let reopened = store
+            .app_storage()
             .transport_reconciliation_inventory(&route, now)
             .unwrap();
         assert_eq!(reopened, inventory);
@@ -814,21 +860,35 @@ mod tests {
     #[test]
     fn reconciliation_route_cursor_is_durable_and_route_scoped() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        assert_eq!(store.transport_reconciliation_route_cursor().unwrap(), None);
+        assert_eq!(
+            store
+                .app_storage()
+                .transport_reconciliation_route_cursor()
+                .unwrap(),
+            None
+        );
 
         let group = TransportReconciliationRoute::Group([0x66; 32]);
         store
+            .app_storage()
             .advance_transport_reconciliation_route_cursor(&group)
             .unwrap();
         assert_eq!(
-            store.transport_reconciliation_route_cursor().unwrap(),
+            store
+                .app_storage()
+                .transport_reconciliation_route_cursor()
+                .unwrap(),
             Some(group)
         );
         store
+            .app_storage()
             .advance_transport_reconciliation_route_cursor(&TransportReconciliationRoute::Inbox)
             .unwrap();
         assert_eq!(
-            store.transport_reconciliation_route_cursor().unwrap(),
+            store
+                .app_storage()
+                .transport_reconciliation_route_cursor()
+                .unwrap(),
             Some(TransportReconciliationRoute::Inbox)
         );
     }
@@ -853,9 +913,11 @@ mod tests {
         };
         let before = store.recovery_revision_fence().unwrap();
         store
+            .app_storage()
             .record_transport_reconciliation_item(&route, &item)
             .unwrap();
         store
+            .app_storage()
             .record_transport_reconciliation_item(&route, &item)
             .unwrap();
         assert_eq!(store.recovery_revision_fence().unwrap(), before);
@@ -870,6 +932,7 @@ mod tests {
         let expired_at = now + TRANSPORT_RECONCILIATION_RETENTION_SECS + 1;
         assert!(
             store
+                .app_storage()
                 .transport_reconciliation_inventory(&route, expired_at)
                 .is_err()
         );
@@ -880,6 +943,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
+                .app_storage()
                 .transport_reconciliation_inventory(&route, now)
                 .unwrap()
                 .items
@@ -889,6 +953,7 @@ mod tests {
         assert_eq!(store.recovery_revision_fence().unwrap(), before);
         assert!(
             store
+                .app_storage()
                 .transport_reconciliation_inventory(&route, expired_at)
                 .unwrap()
                 .items

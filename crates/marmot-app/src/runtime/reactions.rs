@@ -200,6 +200,7 @@ mod tests {
             ..Default::default()
         };
         storage
+            .app_storage()
             .adopt_block_list(
                 &block_list,
                 &[(blocked_sender, true)],
@@ -218,6 +219,7 @@ mod tests {
         block_list.event_id = "02".repeat(32);
         block_list.event_created_at = 2;
         storage
+            .app_storage()
             .adopt_block_list(&block_list, &[], 2, &account.account_id_hex, &|_, _| false)
             .unwrap();
         assert_eq!(
