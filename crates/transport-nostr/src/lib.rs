@@ -3076,102 +3076,21 @@ async fn handle_relay_notification(
     account_id: Option<&MemberId>,
     classify_closed: &(dyn Fn(&str) -> transport_nostr_adapter::SubscriptionRefusal + Sync),
 ) -> bool {
-    match notification {
-        ClientNotification::Event {
-            relay_url,
-            subscription_id,
-            event,
-        } => {
-            if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
-                tracing::trace!(
-                    target: "marmot_app::relay_plane",
-                    method = "handle_relay_notification",
-                    "forwarding SDK relay event"
-                );
-                let endpoint = TransportEndpoint(relay_url.to_string());
-                let subscription_id = subscription_id.to_string();
-                let relay_event = transport_nostr_adapter::NostrRelayEvent {
-                    endpoint,
-                    subscription_id: Some(subscription_id),
-                    event,
-                };
-                // Account notifications feed only account/group delivery.
-                // Public directory interests use the anonymous receiver.
-                let _ = if let Some(account_id) = account_id {
-                    adapter
-                        .handle_reconciled_event(account_id, relay_event)
-                        .await
-                } else {
-                    adapter.handle_relay_event(relay_event).await
-                };
-            }
-            false
-        }
-        ClientNotification::Message { relay_url, message } => {
-            match *message {
-                RelayMessage::Event {
-                    subscription_id,
-                    event,
-                } => {
-                    // Raw per-relay copy feeds telemetry and replay-page
-                    // accounting, in order with this relay's EOSE. Delivery
-                    // uses the deduplicated Event notification above.
-                    match NostrTransportEvent::from_nostr_event(&event) {
-                        Ok(event) => {
-                            adapter
-                                .observe_relay_event(transport_nostr_adapter::NostrRelayEvent {
-                                    endpoint: TransportEndpoint(relay_url.to_string()),
-                                    subscription_id: Some(subscription_id.to_string()),
-                                    event,
-                                })
-                                .await;
-                        }
-                        Err(_) => {
-                            adapter
-                                .observe_unconvertible_relay_event(
-                                    TransportEndpoint(relay_url.to_string()),
-                                    subscription_id.to_string(),
-                                    event.created_at.as_secs(),
-                                )
-                                .await;
-                        }
-                    }
-                }
-                RelayMessage::EndOfStoredEvents(subscription_id) => {
-                    adapter
-                        .handle_relay_eose(
-                            TransportEndpoint(relay_url.to_string()),
-                            subscription_id.to_string(),
-                        )
-                        .await;
-                }
-                // Classified from this message's reason, not from the SDK's
-                // registry, which a later re-send may already have changed.
-                RelayMessage::Closed {
-                    subscription_id,
-                    message,
-                } => {
-                    adapter
-                        .handle_relay_closed(
-                            TransportEndpoint(relay_url.to_string()),
-                            subscription_id.to_string(),
-                            classify_closed(&message),
-                        )
-                        .await;
-                }
-                _ => {}
-            }
-            false
-        }
-        ClientNotification::Shutdown => {
-            tracing::debug!(
-                target: "marmot_app::relay_plane",
-                method = "handle_relay_notification",
-                "SDK relay pool shutdown observed"
-            );
-            true
-        }
+    let shutdown = transport_nostr_adapter::dispatch_sdk_notification(
+        notification,
+        adapter,
+        account_id,
+        classify_closed,
+    )
+    .await;
+    if shutdown {
+        tracing::debug!(
+            target: "marmot_app::relay_plane",
+            method = "handle_relay_notification",
+            "SDK relay pool shutdown observed"
+        );
     }
+    shutdown
 }
 
 fn recover_relay_notification_forwarder(

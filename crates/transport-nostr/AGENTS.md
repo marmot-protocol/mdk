@@ -29,6 +29,8 @@ not depend on `marmot-app` or `storage-sqlite`. The app supplies storage and pol
   `docs/marmot-architecture/overview/dial-safety.md`.
 - Keep logs privacy-safe: aggregate values only, no account ids, group ids, relay URLs, pubkeys or payloads. The
   tracing target stays `marmot_app::relay_plane` until the brief's later rename.
+- Handle a new kind of SDK notification in `transport_nostr_adapter::dispatch_sdk_notification`, which this crate's
+  consumer and the adapter's test forwarder share; the consumer adds only queueing, lag repair and loss accounting.
 - Test hooks and accessors (`*_for_test`, `test_support`) are `cfg(any(test, feature = "test-support"))`.
   `marmot-app` enables `test-support` only through its dev-dependency; never enable it in app artifacts.
 - Widen an item to `pub` only when another crate names it. `marmot-app` re-exports `MarmotRelayPlane` and

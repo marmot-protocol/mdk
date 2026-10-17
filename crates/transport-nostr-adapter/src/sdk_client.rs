@@ -989,6 +989,114 @@ struct PreparedPublish {
     required_acks: usize,
 }
 
+/// Routes one SDK client notification into `adapter`. The deduplicated event
+/// goes to delivery, or to `account_id`'s reconciled delivery when the receiver
+/// serves one account. Each relay copy of an event feeds telemetry and
+/// replay-page accounting, an end of stored events feeds subscription
+/// progress, and a `CLOSED` becomes a refusal classified by `classify_closed`
+/// from its own reason. Returns whether the notification was the pool's
+/// shutdown.
+///
+/// The relay plane's notification consumer and
+/// [`NostrSdkRelayClient::spawn_notification_forwarder`] both dispatch through
+/// this, so the two cannot handle a notification differently.
+pub async fn dispatch_sdk_notification(
+    notification: ClientNotification,
+    adapter: &NostrTransportAdapter,
+    account_id: Option<&MemberId>,
+    classify_closed: &(dyn Fn(&str) -> crate::SubscriptionRefusal + Sync),
+) -> bool {
+    match notification {
+        ClientNotification::Event {
+            relay_url,
+            subscription_id,
+            event,
+        } => {
+            if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
+                tracing::trace!(
+                    target: "transport_nostr_adapter::sdk_client",
+                    method = "dispatch_sdk_notification",
+                    "forwarding SDK relay event"
+                );
+                let endpoint = TransportEndpoint(relay_url.to_string());
+                let subscription_id = subscription_id.to_string();
+                let relay_event = NostrRelayEvent {
+                    endpoint,
+                    subscription_id: Some(subscription_id),
+                    event,
+                };
+                // Account notifications feed only account/group delivery.
+                // Public directory interests use the anonymous receiver.
+                let _ = if let Some(account_id) = account_id {
+                    adapter
+                        .handle_reconciled_event(account_id, relay_event)
+                        .await
+                } else {
+                    adapter.handle_relay_event(relay_event).await
+                };
+            }
+            false
+        }
+        ClientNotification::Message { relay_url, message } => {
+            match *message {
+                RelayMessage::Event {
+                    subscription_id,
+                    event,
+                } => {
+                    // Raw per-relay copy feeds telemetry and replay-page
+                    // accounting, in order with this relay's EOSE. Delivery
+                    // uses the deduplicated Event notification above.
+                    match NostrTransportEvent::from_nostr_event(&event) {
+                        Ok(event) => {
+                            adapter
+                                .observe_relay_event(NostrRelayEvent {
+                                    endpoint: TransportEndpoint(relay_url.to_string()),
+                                    subscription_id: Some(subscription_id.to_string()),
+                                    event,
+                                })
+                                .await;
+                        }
+                        Err(_) => {
+                            adapter
+                                .observe_unconvertible_relay_event(
+                                    TransportEndpoint(relay_url.to_string()),
+                                    subscription_id.to_string(),
+                                    event.created_at.as_secs(),
+                                )
+                                .await;
+                        }
+                    }
+                }
+                RelayMessage::EndOfStoredEvents(subscription_id) => {
+                    adapter
+                        .handle_relay_eose(
+                            TransportEndpoint(relay_url.to_string()),
+                            subscription_id.to_string(),
+                        )
+                        .await;
+                }
+                // Classified from this message's reason, not from the SDK's
+                // registry, which a later re-send may already have changed.
+                RelayMessage::Closed {
+                    subscription_id,
+                    message,
+                } => {
+                    adapter
+                        .handle_relay_closed(
+                            TransportEndpoint(relay_url.to_string()),
+                            subscription_id.to_string(),
+                            classify_closed(&message),
+                        )
+                        .await;
+                }
+                _ => {}
+            }
+            false
+        }
+        ClientNotification::Shutdown => true,
+    }
+}
+
 impl NostrSdkRelayClient {
     pub fn new(client: Client) -> Self {
         Self {
@@ -2528,85 +2636,15 @@ impl NostrSdkRelayClient {
                     if matches!(notification, ClientNotification::Event { .. }) {
                         forwarder_event_entered.store(true, Ordering::SeqCst);
                     }
-                    match notification {
-                        ClientNotification::Event {
-                            relay_url,
-                            subscription_id,
-                            event,
-                        } => {
-                            if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
-                                tracing::trace!(
-                                    target: "transport_nostr_adapter::sdk_client",
-                                    method = "spawn_notification_forwarder",
-                                    "forwarding SDK relay event"
-                                );
-                                let _ = adapter
-                                    .handle_relay_event(NostrRelayEvent {
-                                        endpoint: TransportEndpoint(relay_url.to_string()),
-                                        subscription_id: Some(subscription_id.to_string()),
-                                        event,
-                                    })
-                                    .await;
-                            }
-                        }
-                        ClientNotification::Message { relay_url, message } => match *message {
-                            RelayMessage::Event {
-                                subscription_id,
-                                event,
-                            } => {
-                                // Every relay copy feeds telemetry and replay-page
-                                // accounting, in order with that relay's EOSE;
-                                // delivery uses the SDK's deduplicated Event
-                                // notification above.
-                                match NostrTransportEvent::from_nostr_event(&event) {
-                                    Ok(event) => {
-                                        adapter
-                                            .observe_relay_event(NostrRelayEvent {
-                                                endpoint: TransportEndpoint(relay_url.to_string()),
-                                                subscription_id: Some(subscription_id.to_string()),
-                                                event,
-                                            })
-                                            .await;
-                                    }
-                                    Err(_) => {
-                                        adapter
-                                            .observe_unconvertible_relay_event(
-                                                TransportEndpoint(relay_url.to_string()),
-                                                subscription_id.to_string(),
-                                                event.created_at.as_secs(),
-                                            )
-                                            .await;
-                                    }
-                                }
-                            }
-                            RelayMessage::EndOfStoredEvents(subscription_id) => {
-                                adapter
-                                    .handle_relay_eose(
-                                        TransportEndpoint(relay_url.to_string()),
-                                        subscription_id.to_string(),
-                                    )
-                                    .await;
-                            }
-                            RelayMessage::Closed {
-                                subscription_id,
-                                message,
-                            } => {
-                                adapter
-                                    .handle_relay_closed(
-                                        TransportEndpoint(relay_url.to_string()),
-                                        subscription_id.to_string(),
-                                        classifier.subscription_refusal(&message),
-                                    )
-                                    .await;
-                            }
-                            _ => {}
-                        },
-                        ClientNotification::Shutdown => {
-                            worker_pending.fetch_sub(1, Ordering::SeqCst);
-                            break;
-                        }
-                    }
+                    let shutdown =
+                        dispatch_sdk_notification(notification, &adapter, None, &|reason: &str| {
+                            classifier.subscription_refusal(reason)
+                        })
+                        .await;
                     worker_pending.fetch_sub(1, Ordering::SeqCst);
+                    if shutdown {
+                        break;
+                    }
                 }
             });
             let mut worker_guard = ForwarderWorkerGuard {
