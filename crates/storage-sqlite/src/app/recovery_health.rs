@@ -2,7 +2,7 @@
 use crate::base::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, StoredEpochStallEvidence};
 use cgka_traits::GroupId;
-use cgka_traits::storage::{StorageProvider, StorageResult};
+use cgka_traits::storage::StorageResult;
 
 impl SqliteAccountStorage {
     /// Whether completed automatic recovery has failed to restore synchronization.
@@ -27,7 +27,8 @@ impl SqliteAccountStorage {
         if evidence.is_empty() {
             return Ok(Vec::new());
         }
-        self.with_transaction(|storage| {
+        self.connection.with_transaction(|| {
+            let storage = self;
             storage.record_epoch_stall_evidence(evidence)?;
             let conn = storage.lock()?;
             let mut changed = Vec::new();
@@ -68,7 +69,8 @@ impl SqliteAccountStorage {
         if !has_evidence {
             return Ok(false);
         }
-        self.with_transaction(|storage| {
+        self.connection.with_transaction(|| {
+            let storage = self;
             let conn = storage.lock()?;
             conn.execute_cached(
                 "DELETE FROM app_epoch_stall_evidence WHERE group_id = ?1",

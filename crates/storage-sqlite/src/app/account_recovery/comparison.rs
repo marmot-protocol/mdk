@@ -1,6 +1,5 @@
 //! Bounded operational comparison. This slot is never a coverage predicate.
 use super::*;
-use cgka_traits::StorageProvider;
 
 use serde::{Deserialize, Serialize};
 
@@ -146,7 +145,8 @@ impl SqliteAccountStorage {
         if goals.is_empty() {
             return Err(invalid());
         }
-        self.with_transaction(|storage| {
+        self.connection.with_transaction(|| {
+            let storage = self;
             {
                 let conn = storage.lock()?;
                 let duplicate: bool = conn.query_row_cached(

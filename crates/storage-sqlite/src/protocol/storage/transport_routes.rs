@@ -72,23 +72,7 @@ pub(super) fn delete_route(
 ) -> StorageResult<()> {
     store.connection.with_transaction(|| {
         let conn = store.lock()?;
-        crate::app::account_recovery::delete_inventory_tx(
-            &conn,
-            "route_kind = 1 AND route_id = ?1",
-            params![transport_group_id],
-        )?;
-        conn.execute_cached(
-            "DELETE FROM transport_reconciliation_route_state
-         WHERE route_kind = 1 AND route_id = ?1",
-            params![transport_group_id],
-        )
-        .storage()?;
-        conn.execute_cached(
-            "DELETE FROM transport_reconciliation_scheduler
-         WHERE singleton = 1 AND route_kind = 1 AND route_id = ?1",
-            params![transport_group_id],
-        )
-        .storage()?;
+        crate::cross::routes::delete_route_app_state(&conn, "= ?1", params![transport_group_id])?;
         conn.execute_cached(
             "DELETE FROM cgka_transport_group_routes WHERE transport_group_id = ?1",
             params![transport_group_id],
@@ -105,35 +89,7 @@ pub(super) fn delete_below_epoch(
 ) -> StorageResult<()> {
     store.connection.with_transaction(|| {
         let conn = store.lock()?;
-        crate::app::account_recovery::delete_inventory_tx(
-            &conn,
-            "route_kind = 1 AND route_id IN (
-             SELECT transport_group_id
-             FROM cgka_transport_group_routes
-             WHERE group_id = ?1 AND source_epoch < ?2
-         )",
-            params![group_id.as_slice(), epoch_to_i64(cutoff)?],
-        )?;
-        conn.execute_cached(
-            "DELETE FROM transport_reconciliation_route_state
-         WHERE route_kind = 1 AND route_id IN (
-             SELECT transport_group_id
-             FROM cgka_transport_group_routes
-             WHERE group_id = ?1 AND source_epoch < ?2
-         )",
-            params![group_id.as_slice(), epoch_to_i64(cutoff)?],
-        )
-        .storage()?;
-        conn.execute_cached(
-            "DELETE FROM transport_reconciliation_scheduler
-         WHERE singleton = 1 AND route_kind = 1 AND route_id IN (
-             SELECT transport_group_id
-             FROM cgka_transport_group_routes
-             WHERE group_id = ?1 AND source_epoch < ?2
-         )",
-            params![group_id.as_slice(), epoch_to_i64(cutoff)?],
-        )
-        .storage()?;
+        crate::cross::routes::delete_route_app_state(&conn, "IN (SELECT transport_group_id FROM cgka_transport_group_routes WHERE group_id = ?1 AND source_epoch < ?2)", params![group_id.as_slice(), epoch_to_i64(cutoff)?])?;
         conn.execute_cached(
             "DELETE FROM cgka_transport_group_routes
              WHERE group_id = ?1 AND source_epoch < ?2",
@@ -150,35 +106,11 @@ pub(super) fn delete_for_group(
 ) -> StorageResult<()> {
     store.connection.with_transaction(|| {
         let conn = store.lock()?;
-        crate::app::account_recovery::delete_inventory_tx(
+        crate::cross::routes::delete_route_app_state(
             &conn,
-            "route_kind = 1 AND route_id IN (
-             SELECT transport_group_id
-             FROM cgka_transport_group_routes
-             WHERE group_id = ?1
-         )",
+            "IN (SELECT transport_group_id FROM cgka_transport_group_routes WHERE group_id = ?1)",
             params![group_id.as_slice()],
         )?;
-        conn.execute_cached(
-            "DELETE FROM transport_reconciliation_route_state
-         WHERE route_kind = 1 AND route_id IN (
-             SELECT transport_group_id
-             FROM cgka_transport_group_routes
-             WHERE group_id = ?1
-         )",
-            params![group_id.as_slice()],
-        )
-        .storage()?;
-        conn.execute_cached(
-            "DELETE FROM transport_reconciliation_scheduler
-         WHERE singleton = 1 AND route_kind = 1 AND route_id IN (
-             SELECT transport_group_id
-             FROM cgka_transport_group_routes
-             WHERE group_id = ?1
-         )",
-            params![group_id.as_slice()],
-        )
-        .storage()?;
         conn.execute_cached(
             "DELETE FROM cgka_transport_group_routes WHERE group_id = ?1",
             params![group_id.as_slice()],

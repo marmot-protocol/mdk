@@ -10,19 +10,10 @@ path app/chat_list.rs crate::protocol::storage::leave_requests
 path base/connection.rs crate::app::message_drafts
 path base/connection.rs crate::protocol::openmls_storage
 path base/connection.rs crate::protocol::storage::snapshots
-path protocol/storage/groups.rs crate::app::account_recovery
-path protocol/storage/messages.rs crate::app::account_recovery
-path protocol/storage/outbound.rs crate::app::message_drafts
-path protocol/storage/transport_routes.rs crate::app::account_recovery
 
 # Calls through self or Self to a method the other side defines.
 method app/account_projection.rs is_group_forgotten
-method app/account_recovery/comparison.rs with_transaction
-method app/account_recovery/stall.rs with_transaction
-method app/recovery_health.rs with_transaction
 method protocol/storage/groups.rs forget_group_local_data
-method protocol/storage/outbound.rs accept_local_submission_tx
-method protocol/storage/outbound.rs notify_message_draft_committed
 
 # SQL naming the other side's tables. base/migrations.rs: the legacy migration 9 reconcile adds a column to two app tables.
 sql app/account_projection.rs cgka_disband_tombstones
@@ -44,13 +35,6 @@ sql app/timeline/reports.rs pending_application_authority
 sql app/transport/delivery_spill.rs cgka_released_transport_receipts
 sql base/migrations.rs app_events
 sql base/migrations.rs message_timeline
-sql protocol/storage/groups.rs encrypted_media_epoch_secret_retirement_watermarks
-sql protocol/storage/groups.rs transport_reconciliation_route_state
-sql protocol/storage/groups.rs transport_reconciliation_scheduler
-sql protocol/storage/messages.rs account_state
-sql protocol/storage/messages.rs seen_events
-sql protocol/storage/transport_routes.rs transport_reconciliation_route_state
-sql protocol/storage/transport_routes.rs transport_reconciliation_scheduler
 
 # Foreign keys from app tables to protocol tables (schema; stays).
 fk account_recovery_obligations cgka_groups
