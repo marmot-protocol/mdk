@@ -15,7 +15,7 @@ not depend on `marmot-app` or `storage-sqlite`. The app supplies storage and pol
 
 | Path | Owns |
 | --- | --- |
-| `src/lib.rs` | `MarmotRelayPlane`: relay sessions, per-account delivery queues, notification forwarding, lag repair, publish accounting, `nostr_builder()`. |
+| `src/lib.rs` | `MarmotRelayPlane`: relay sessions, per-account delivery queues and publish clients, notification forwarding, lag repair, publish accounting, `nostr_builder()`. |
 | `src/delivery_spill.rs` | The plane's side of the durable overflow tail: when a full queue spills and how it reports the disposition. |
 | `src/directory.rs`, `src/directory_wire.rs` | Directory fetches and subscriptions, and their relay wire handling. |
 | `src/safety.rs` | `RelaySafetyPolicy`: the host-safety chokepoint every relay endpoint passes before a connect. |
@@ -38,8 +38,9 @@ not depend on `marmot-app` or `storage-sqlite`. The app supplies storage and pol
 - Shutdown aborts the router and the notification forwarders, but does not join the spill writer (`delivery_spill.rs`
   spawns `write()`), the loss-marker task (`persist_marker_before_drop`) or the directory fetch tasks; the plane
   registers nothing in the app's close registry (#2341). Follow-up: join or register them.
-- Per-account SDK clients sit on both sides of the boundary until the brief's PR 5 moves the publish-client cache here.
-  Their order matters: the signer is installed before activation, and a client is retired before its account reopens.
+- The plane owns each account's signer-bound publish client (`account_publish_client`). Order matters: the signer is
+  installed before activation, and the client is evicted (`evict_account_publish_client`) before its account reopens
+  or its signer is replaced, because a cache hit ignores the signer passed in.
 
 ## Verification
 
