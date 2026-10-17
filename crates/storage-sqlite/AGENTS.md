@@ -33,6 +33,7 @@ it; until then, name any new crossing in the PR description.
 | `src/base/connection.rs` | SQLCipher key application, operational PRAGMAs, options, aggregate handle. |
 | `src/base/codec.rs` | JSON serialization helpers and SQLite error mapping. |
 | `src/base/migrations.rs` | Rust migration runner and migration tests. |
+| `src/base/test_support.rs` | Shared storage test fixtures for both sides' tests. |
 | `src/base/migrations/` | Numbered Rust migration bodies plus upgrade/query-work tests; see its local `AGENTS.md`. |
 | `src/protocol/storage/` | Marmot engine storage tables by concern; see its local `AGENTS.md`. |
 | `src/protocol/storage/snapshots/` | Snapshot/checkpoint capture, restoration and the consistent replay-state fingerprint; see its local `AGENTS.md`. |

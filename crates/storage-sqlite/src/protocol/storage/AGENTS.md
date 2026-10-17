@@ -22,7 +22,6 @@ Map for Marmot engine-side SQLite tables (the `cgka_traits` storage traits). App
 | `deferred_peel_generations.rs` | `DeferredPeelGenerationStorage`: deferred-peel generation barriers. |
 | `leave_requests.rs`, `disband_requests.rs` | Durable leave and disband requests (plus disband candidates/tombstones). |
 | `maintenance.rs` | `MaintenanceStorage`: maintenance and publication-recovery records. |
-| `test_support.rs` | Shared storage test fixtures. |
 
 ## Rules
 
