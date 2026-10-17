@@ -192,5 +192,7 @@ These build on the moved crate, each as its own design brief:
 
 ## Open questions
 
-1. Is the name `transport-nostr` confirmed? This is question 4 in [core-structure §6](core-structure.md#6-questions-for-the-product-owner).
-2. Keep the tracing target `marmot_app::relay_plane` through the move? The recommendation is yes.
+1. Keep the tracing target `marmot_app::relay_plane` through the move? The recommendation is yes.
+
+Answered: the name `transport-nostr` is confirmed (2026-10-17, decision 4 in
+[core-structure §6](core-structure.md#6-product-owner-decisions)).

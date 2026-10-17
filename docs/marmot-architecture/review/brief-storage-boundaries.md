@@ -49,8 +49,8 @@ sides' tables.
 
 Every module adds inherent methods to one type, `SqliteAccountStorage` (`connection.rs:1050`), whose
 `connection` and `openmls` fields are `pub(crate)` (`connection.rs:1050-1057`). It has 387 `pub` inherent methods,
-not counting six feature-gated ones: 17 in protocol or base modules and 370 app or transport. `marmot-app` calls about 318 of them (name-match count,
-hypothesis), through the concrete type: there is no app-side trait. So protocol code reaches app code by method
+not counting six feature-gated ones: 17 in protocol or base modules and 370 app or transport. `marmot-app` calls
+about 318 of them (name-match count, hypothesis), through the concrete type: there is no app-side trait. So protocol code reaches app code by method
 call, not by path. `forget_group_local_data`, `accept_local_submission_tx` and `notify_message_draft_committed` are
 examples. Moving files into `protocol/` and `app/` alone would not stop any of those calls (hypothesis, but it
 follows from Rust's visibility rules: an inherent `pub` method is callable from anywhere the type is).
@@ -72,7 +72,7 @@ where it can go away.
 | 4 | Group and route deletion clear NIP-77 reconciliation rows | The `transport_reconciliation_*` deletes: `storage/groups.rs:173-192`; `storage/transport_routes.rs:81,87,118,128,163,173` | `cross::clear_reconciliation_for_group` and `..._for_route` | When reconciliation moves to `transport-nostr` |
 | 5 | Local forget and delete span both sides in one wipe | `account_projection.rs:1427-1440` (`forget_group_local_data`, which calls `GroupStorage::is_group_forgotten` at `:1437`) and `:1442-1649` (`delete_local_group_data_inner`, the wipe, including `storage::groups::delete_group_tx` at `:1572`) | Both functions move to `cross/` whole; the public `delete_local_group_data` (`:1420-1425`) stays in `app/` and calls them | Keep: a local delete must be atomic |
 | 6 | App tables cascade from `cgka_groups` | Migrations 0055:10, 0067:9, 0092:26 | Listed in `cross/README.md` | Step 8 decides per table |
-| 7 | Engine-table triggers maintain the chat list | Migrations 0071:13-16 and 0072:70-178 (12 triggers) | Listed in `cross/README.md` | Step 8: replace with the outbox, or keep as schema |
+| 7 | Engine-table triggers maintain the chat list | 13 triggers on protocol tables: the twelve chat-list triggers in migration 0072:70-178 (insert, update and delete on `cgka_leave_requests`, `cgka_disband_requests`, `cgka_disband_candidates` and `cgka_disband_tombstones`) plus the `reject_forgotten_group_insert` guard on `cgka_groups` in 0071:13-16 | Listed in `cross/README.md` | Step 8: replace with the outbox, or keep as schema |
 | 8 | App reads join engine tables, and `chat_list.rs` imports protocol modules | `chat_list.rs:7-11` (imports of `storage::disband_requests` and `storage::leave_requests`), `chat_list.rs:2533`, `chat_list/pages.rs:357-362`, `timeline/capture.rs:65-66`, `timeline.rs:1296-1316`, `account_projection.rs:1511-1514,1752,1882,1908`, `delivery_spill.rs:88-91` | Read-only engine views in `cross/` | Step 8: published read views |
 | 9 | The app writes the engine's authority outbox | `timeline/reports.rs:555-620` | `cross::backfill_authority_request` | Step 8 |
 | 10 | App writes invalidate the engine's MLS cache | `connection.rs:1604-1621` (`PRAGMA data_version`) | Stays in `base/`, documented | Keep while both sides share a file |
@@ -80,7 +80,7 @@ where it can go away.
 | A | A `GroupStorage` method writes the app's media-secret barrier | `storage/groups.rs:40-58` | Into `cross/` | Step 8 |
 | B | Protocol code reads app state (`account_state`) | Inside #3 | Covered by #3 | With #3 |
 | C | App modules open transactions through `StorageProvider::with_transaction` (`connection.rs:1643`) | `recovery_health.rs:30,71`, `account_recovery/stall.rs:21`, `account_recovery/comparison.rs:149` | Switch to `SharedConnection::with_transaction` (`connection.rs:596`) in PR 3 | — |
-| D | `marmot-app` reads protocol state through the engine traits on its own connection | `marmot-app` `local_submissions.rs:317`, `client/projection.rs:380,1221`, `runtime/mod.rs:6700` | Recorded; no change here | Step 5 (`marmot-session` owns those reads) |
+| D | `marmot-app` reads protocol state through the engine traits on its own connection | `marmot-app` `local_submissions.rs:317`, `client/projection.rs:380,1221`, `runtime/mod.rs:6697-6698` | Recorded; no change here | Step 5 (`marmot-session` owns those reads) |
 
 ## Target layout inside the crate
 
@@ -110,9 +110,12 @@ are callable wherever the type is.
 
 **Decision:** step 4 gives the app side its own handle type, `SqliteAppStorage`, as PR 4, after the folders,
 `cross/` and the boundary test. The app and transport methods move onto it; `SqliteAccountStorage` keeps the
-protocol traits. `marmot-app` reaches app storage through the new handle, and only `cross/` holds both. The handle
-shares the account's existing connection and lifecycle, so it opens no second connection and closing the account
-storage closes it too. It is the type the app store crate gets in step 8, so the work is not thrown away. It is
+protocol traits. `marmot-app` reaches app storage through the new handle, and only `cross/` holds both.
+`marmot-app` builds the handle from the `SqliteAccountStorage` it already opens for the account (marmot-app
+`lib.rs:6636`) and keeps it beside that storage. It shares that connection, so it opens no second connection, and the
+closer already registered for that storage in `root_closers` (`lib.rs:4580`) closes both; after close, its calls fail
+the way the account storage's do. The engine's session keeps only its own storage handle and never receives
+`SqliteAppStorage`. It is the type the app store crate gets in step 8, so the work is not thrown away. It is
 mechanical but wide: every `marmot-app` call to the app methods it uses, about 318 of them by a name-match count,
 changes from `storage.x()` to `app_storage.x()`.
 
@@ -122,11 +125,11 @@ Declined: stopping at folders, visibility and `cross/`, which would leave the wa
 
 Each PR is green on its own and changes no behaviour or schema.
 
-1. **Create the folders and `git mv` the files.** Keep every crate-root re-export in `lib.rs` (257 names today),
-   so no other crate changes. Fix the internal paths that cross the new folders (about 70, hypothesis). Repoint the
-   117 `#[path]` attributes in `migrations.rs` and the 6 others, and the `include_str!`/`include_bytes!` fixtures.
-   Keep the 18 hard-coded tracing targets unchanged in this PR. Update the crate and nested `AGENTS.md` key-file
-   tables.
+1. **Create the folders and `git mv` the files.** Keep every crate-root re-export in `lib.rs` (257 names today), so no
+   other crate changes. Fix the internal paths that cross the new folders (about 70, hypothesis). Repoint the 117
+   `#[path]` attributes in `migrations.rs` and the 6 others, and the `include_str!`/`include_bytes!` fixtures. Keep the
+   hard-coded tracing targets (17 in non-test files, 3 in test files) unchanged in this PR. Update the crate and nested
+   `AGENTS.md` key-file tables.
 2. **Introduce `cross/`.** Move each coupling's code into its named function: the protocol modules' 8 reaches
    into `account_recovery` (including the 4 `delete_inventory_tx` calls) and 1 into `message_drafts`; the wipe
    (`forget_group_local_data` and `delete_local_group_data_inner`, coupling 5); the authority backfill from
@@ -147,13 +150,13 @@ Each PR is green on its own and changes no behaviour or schema.
    the app and transport methods to it a folder at a time, and repoint `marmot-app` and `cgka-session`'s draft
    observer. Extend the boundary test: protocol production code never names `SqliteAppStorage`, and app production
    code never calls the protocol traits on `SqliteAccountStorage` outside `cross/`; tests may hold both handles.
-5. **Tracing targets.** Rename the 18 targets to the new module paths in one PR, and update the docs and simulator
-   filters that match them.
+5. **Tracing targets.** Rename the 20 targets (17 in non-test files, 3 in test files) to the new module paths in one PR,
+   and update the docs and simulator filters that match them.
 
 ## Sequencing against step 2
 
 Step 4 starts after step 2, one extraction at a time. If parallel work is wanted: PRs 1–3 touch only
-`storage-sqlite` (and its `AGENTS.md` files), so they don't collide with the relay-plane move. PR 4 rewrites about
+`storage-sqlite` (and its `AGENTS.md` files), so they don't collide with the relay-plane move. PR 4 rewrites
 `marmot-app`'s calls to about 318 app methods (a name-match count) and must wait until step 2's crate move (its
 PR 3) and caller repoint (its PR 4) have landed.
 

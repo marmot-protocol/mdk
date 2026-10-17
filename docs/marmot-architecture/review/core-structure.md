@@ -140,7 +140,7 @@ The couplings a split has to carry, all with file:line in the source inventory:
 3. Message release writes app recovery tables.
 4. Group and route deletion clear reconciliation rows.
 5. Local forget and local delete span both sides.
-6. Foreign keys cascade from app tables to `cgka_groups`.
+6. App tables reference `cgka_groups` and are deleted in cascade with a group.
 7. The engine-table triggers above update the chat list.
 8. App reads join engine tables.
 9. The app writes the engine's authority outbox.
@@ -150,12 +150,12 @@ The couplings a split has to carry, all with file:line in the source inventory:
 Several bridges already half exist: the at-least-once outbox, the released-receipt journal, the secure-delete intents
 and the replay fingerprint.
 
-**Evidence (observed):**
+**Evidence (observed at `e9ecb12e0`):**
 - `SqliteAccountStorage`: `crates/storage-sqlite/src/connection.rs:1050`.
 - The release probe: `storage/messages.rs:319-326`. The forget wipe: `account_projection.rs:1427-1649`.
-- Draft and submission consumption: `storage/outbound.rs:20-62`, `:240-262`. The outbox acknowledgement:
+- Draft and submission consumption: `storage/outbound.rs:20-62`, `:240-263`. The outbox acknowledgement:
   `account_projection.rs:1313-1318`.
-- Engine-table triggers: `migrations/0072_chat_list_pages.rs:68-171`, and `reject_forgotten_group_insert` in
+- Engine-table triggers: `migrations/0072_chat_list_pages.rs:70-178`, and `reject_forgotten_group_insert` in
   migration 0071. The media reset: `migrations/0110_media_files.rs:51`.
 - The cache generation: `connection.rs:1604-1621`. The transport rule: the root `AGENTS.md` invariants.
 - Measured: method counts, the migration and trigger classification, and the commit history over non-test files.
