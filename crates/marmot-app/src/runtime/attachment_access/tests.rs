@@ -571,3 +571,51 @@ async fn handoff_refusals_leave_nothing() {
             .is_err()
     );
 }
+
+/// Abandoning an opening call mid-copy, without cancelling its control (a
+/// host coroutine cancelled), leaves neither a copy nor a live lease once
+/// the copy task finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abandoned_handoff_leaves_no_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    let body = vec![9u8; 64 * 1024 * 1024];
+    seed_file_backed(&app, &store, &body);
+    let runtime = app.runtime();
+    let control = std::sync::Arc::new(crate::MediaFileTransferControl::default());
+    let opening = {
+        let (runtime, control) = (runtime.clone(), control.clone());
+        tokio::spawn(async move {
+            runtime
+                .open_attachment_handoff("alice", &GroupId::new(vec![0xab; 16]), target(), control)
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while control.processed_bytes() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    opening.abort();
+    assert!(opening.await.unwrap_err().is_cancelled());
+    assert!(
+        control.processed_bytes() < body.len() as u64,
+        "abandoned while copying"
+    );
+    let handoffs = crate::media::handoff::handoff_directory(&app, "alice");
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while handoff_entries(&app) != 0 || crate::media::handoff::live_leases_under(&handoffs) != 0
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the abandoned copy and its lease are discarded");
+    runtime.shutdown_and_close().await.unwrap();
+}

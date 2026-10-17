@@ -24,8 +24,13 @@ fn copies_are_named_after_the_attachment_safely_with_an_extension() {
     assert!(named.ends_with(".apk"));
     let wide = "é".repeat(200);
     let named = handoff_name(&wide, "image/png");
-    assert!(named.len() <= MAX_NAME_BYTES + ".png".len());
+    assert!(
+        named.len() <= MAX_NAME_BYTES,
+        "the extension counts toward the cap"
+    );
     assert!(named.ends_with(".png"));
+    let bare = "y".repeat(300);
+    assert_eq!(handoff_name(&bare, "image/png").len(), MAX_NAME_BYTES);
 }
 
 #[test]
@@ -63,4 +68,70 @@ fn the_wipe_removes_what_no_live_lease_holds() {
     release(&live).unwrap();
     assert!(!live_directory.exists(), "release deletes the live copy");
     assert_eq!(wipe_stale(&directory.path().join("absent")), 0);
+}
+
+/// A copy that cannot be deleted fails its release and stays leased, so a
+/// retry after the fault clears deletes it.
+#[cfg(unix)]
+#[test]
+fn a_failed_release_stays_leased_for_a_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let lease = "33".repeat(16);
+    let copy = directory.path().join(&lease);
+    std::fs::create_dir_all(&copy).unwrap();
+    std::fs::write(copy.join("held.bin"), b"plaintext").unwrap();
+    lock_leases().insert(lease.clone(), copy.clone());
+    let set_mode = |mode| {
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    // A read-only lease directory cannot have its file removed (unless this
+    // test runs as root, which ignores permissions).
+    set_mode(0o500);
+    let enforced = std::fs::remove_file(copy.join("probe")).is_err()
+        && std::fs::File::create(copy.join("probe")).is_err();
+    if enforced {
+        assert!(release(&lease).is_err());
+        assert!(copy.join("held.bin").exists());
+        assert_eq!(live_leases_under(directory.path()), 1, "still leased");
+    }
+    set_mode(0o700);
+    release(&lease).unwrap();
+    assert!(!copy.exists());
+    assert_eq!(live_leases_under(directory.path()), 0);
+}
+
+/// A finished copy that never reached the host is discarded with its lease.
+#[test]
+fn an_undelivered_copy_is_discarded() {
+    let directory = tempfile::tempdir().unwrap();
+    let lease = "44".repeat(16);
+    let copy = directory.path().join(&lease);
+    std::fs::create_dir_all(&copy).unwrap();
+    std::fs::write(copy.join("left.bin"), b"plaintext").unwrap();
+    lock_leases().insert(lease.clone(), copy.clone());
+    let pending = PendingHandoff(Some(AttachmentHandoff {
+        lease: lease.clone(),
+        path: copy.join("left.bin"),
+        byte_count: 9,
+        media_type: "application/octet-stream".into(),
+        file_name: "left.bin".into(),
+    }));
+    drop(pending);
+    assert!(!copy.exists());
+    assert_eq!(live_leases_under(directory.path()), 0);
+}
+
+/// A write that fills the volume is the storage-full error, as a known
+/// shortfall is; other write failures are not.
+#[test]
+fn a_full_volume_during_the_copy_is_storage_full() {
+    assert!(matches!(
+        handoff_error(std::io::Error::from(std::io::ErrorKind::StorageFull)),
+        AppError::Storage(cgka_traits::StorageError::Capacity(_))
+    ));
+    assert!(matches!(
+        handoff_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        AppError::InvalidEncryptedMedia(_)
+    ));
 }

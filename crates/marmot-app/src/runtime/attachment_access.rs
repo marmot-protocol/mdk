@@ -129,6 +129,9 @@ impl MarmotAppRuntime {
             crate::media::handoff::open(app, label, &storage, source, &control)
         })
         .await
+        // Abandoning this call drops the pending copy where the blocking
+        // task finishes, which discards it; only a delivered one is leased.
+        .map(|pending| pending.map(crate::media::handoff::PendingHandoff::deliver))
     }
 
     /// Deletes a handoff copy. An unknown or already released lease is not

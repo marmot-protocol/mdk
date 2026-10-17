@@ -63,8 +63,19 @@ pub(crate) fn handoff_directory(app: &MarmotApp, account: &str) -> PathBuf {
     app.account_dir(account).join(HANDOFF_DIRECTORY)
 }
 
-fn handoff_error(_: std::io::Error) -> AppError {
+/// A full volume is the storage-full error, as admission reports a known
+/// shortfall; anything else is a failed copy.
+fn handoff_error(error: std::io::Error) -> AppError {
+    if error.kind() == std::io::ErrorKind::StorageFull {
+        return capacity_error();
+    }
     AppError::InvalidEncryptedMedia("attachment handoff I/O failed".into())
+}
+
+fn capacity_error() -> AppError {
+    AppError::from(cgka_traits::StorageError::Capacity(
+        "not enough free space for the attachment copy".into(),
+    ))
 }
 
 /// Where a retained attachment is, and what to call its copy.
@@ -128,33 +139,25 @@ pub(crate) fn handoff_name(file_name: &str, media_type: &str) -> String {
         .chars()
         .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | ':'))
         .collect::<String>();
-    let mut name = cleaned.trim().trim_matches('.').trim().to_owned();
-    if name.len() > MAX_NAME_BYTES {
-        // Keep the extension when shortening.
-        let extension = name
-            .rsplit_once('.')
-            .map(|(_, ext)| ext)
-            .filter(|ext| !ext.is_empty() && ext.len() <= 16)
-            .map(|ext| format!(".{ext}"))
-            .unwrap_or_default();
-        let mut cut = MAX_NAME_BYTES - extension.len();
-        while !name.is_char_boundary(cut) {
-            cut -= 1;
+    let name = cleaned.trim().trim_matches('.').trim();
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() && ext.len() <= 16 => {
+            (stem.trim_end_matches('.'), ext.to_owned())
         }
-        name.truncate(cut);
-        name.push_str(&extension);
+        _ => (name, extension_for(media_type).to_owned()),
+    };
+    let stem = if stem.is_empty() { FALLBACK_NAME } else { stem };
+    // The whole name, extension included, fits the cap.
+    let mut cut = stem.len().min(MAX_NAME_BYTES - extension.len() - 1);
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
     }
-    if name.is_empty() {
-        name = FALLBACK_NAME.to_owned();
-    }
-    let has_extension = name
-        .rsplit_once('.')
-        .is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty());
-    if !has_extension {
-        name.push('.');
-        name.push_str(extension_for(media_type));
-    }
-    name
+    let stem = if cut == 0 {
+        FALLBACK_NAME
+    } else {
+        &stem[..cut]
+    };
+    format!("{stem}.{extension}")
 }
 
 fn extension_for(media_type: &str) -> &'static str {
@@ -186,24 +189,68 @@ fn extension_for(media_type: &str) -> &'static str {
     }
 }
 
-/// Removes a lease's directory if it is still registered. Blocking.
-fn remove_lease(lease: &str) {
-    let directory = lock_leases().remove(lease);
-    if let Some(directory) = directory {
-        let _ = std::fs::remove_dir_all(directory);
+/// Deletes a registered lease's directory, then forgets the lease. A
+/// deletion that fails keeps the lease registered, so a later release can
+/// retry it. An unknown lease is already gone. Blocking.
+fn remove_lease(lease: &str) -> std::io::Result<()> {
+    let Some(directory) = lock_leases().get(lease).cloned() else {
+        return Ok(());
+    };
+    match std::fs::remove_dir_all(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    lock_leases().remove(lease);
+    Ok(())
+}
+
+/// Best-effort removal for a copy nobody will release: the lease is
+/// forgotten even if deletion fails, so the next wipe reclaims the files.
+fn discard_lease(lease: &str) {
+    if remove_lease(lease).is_err() {
+        lock_leases().remove(lease);
+    }
+}
+
+/// A finished copy that has not reached the host yet. Dropping it (the
+/// opening call was abandoned while the copy ran on the blocking pool)
+/// discards the copy; [`Self::deliver`] hands it over.
+pub(crate) struct PendingHandoff(Option<AttachmentHandoff>);
+
+impl PendingHandoff {
+    /// The host now holds the lease and must release it.
+    pub(crate) fn deliver(mut self) -> AttachmentHandoff {
+        self.0.take().expect("a pending handoff is delivered once")
+    }
+}
+
+impl Drop for PendingHandoff {
+    fn drop(&mut self) {
+        if let Some(handoff) = self.0.take() {
+            discard_lease(&handoff.lease);
+        }
     }
 }
 
 /// Writes a handoff copy of `source` and registers its lease. `None` means
 /// the body stopped being available while it was copied. A cancelled,
-/// failed or short copy leaves nothing. Blocking.
+/// failed or short copy leaves nothing, and so does a finished copy whose
+/// [`PendingHandoff`] is dropped undelivered. Blocking.
 pub(crate) fn open(
     app: &MarmotApp,
     account: &str,
     storage: &SqliteAccountStorage,
     source: HandoffSource,
     control: &MediaFileTransferControl,
-) -> Result<Option<AttachmentHandoff>, AppError> {
+) -> Result<Option<PendingHandoff>, AppError> {
+    // Plaintext must not depend on an inherited ACL: `fs-private` modes are
+    // no-ops on Windows, which is not a target platform.
+    if cfg!(windows) {
+        return Err(AppError::InvalidEncryptedMedia(
+            "attachment handoff is not supported on this platform".into(),
+        ));
+    }
     control.check()?;
     let policy = storage.attachment_download_policy(
         &crate::runtime::attachment_controls::default_policy(&app.config),
@@ -214,9 +261,7 @@ pub(crate) fn open(
         })
         .admit(free, DiskPolicy::handoff_need(source.byte_count))
     {
-        return Err(AppError::from(cgka_traits::StorageError::Capacity(
-            "not enough free space for the attachment copy".into(),
-        )));
+        return Err(capacity_error());
     }
     let lease = {
         use rand::RngCore;
@@ -229,19 +274,19 @@ pub(crate) fn open(
     lock_leases().insert(lease.clone(), directory.clone());
     let path = directory.join(&source.file_name);
     match write_copy(app, account, storage, &source, &directory, &path, control) {
-        Ok(true) => Ok(Some(AttachmentHandoff {
+        Ok(true) => Ok(Some(PendingHandoff(Some(AttachmentHandoff {
             lease,
             path,
             byte_count: source.byte_count,
             media_type: source.media_type,
             file_name: source.file_name,
-        })),
+        })))),
         Ok(false) => {
-            remove_lease(&lease);
+            discard_lease(&lease);
             Ok(None)
         }
         Err(error) => {
-            remove_lease(&lease);
+            discard_lease(&lease);
             Err(error)
         }
     }
@@ -316,15 +361,17 @@ fn write_copy(
 }
 
 /// Deletes a lease's copy. An unknown or already released lease is not an
-/// error. Blocking.
+/// error. A copy that cannot be deleted is an error and stays leased, so the
+/// host can retry. Blocking.
 pub(crate) fn release(lease: &str) -> Result<(), AppError> {
     if lease.len() != 32 || !lease.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(AppError::InvalidEncryptedMedia(
             "invalid attachment handoff lease".into(),
         ));
     }
-    remove_lease(&lease.to_ascii_lowercase());
-    Ok(())
+    remove_lease(&lease.to_ascii_lowercase()).map_err(|_| {
+        AppError::InvalidEncryptedMedia("attachment handoff copy could not be deleted".into())
+    })
 }
 
 /// Deletes every handoff copy under `directory` that no live lease of this
@@ -356,6 +403,15 @@ pub(crate) fn wipe_stale(directory: &Path) -> usize {
         }
     }
     removed
+}
+
+/// Live leases of this process whose copies are under `directory`.
+#[cfg(test)]
+pub(crate) fn live_leases_under(directory: &Path) -> usize {
+    lock_leases()
+        .values()
+        .filter(|path| path.starts_with(directory))
+        .count()
 }
 
 #[cfg(test)]
