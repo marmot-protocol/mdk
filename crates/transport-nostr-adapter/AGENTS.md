@@ -105,6 +105,8 @@ for reconnect/backoff and relay status mechanics.
   (superseded attempts, one-shot fetches). Keep only the reason's category, never its text, in state, logs,
   telemetry and the audit queue.
 - Keep real relay clients behind `NostrRelayClient`.
+- `dispatch_sdk_notification` is the one place an SDK notification is routed into the adapter. The relay plane's
+  consumer (`transport-nostr`) and `spawn_notification_forwarder`, which only tests use, both call it.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.
 - Relay endpoints are host-safety filtered before any connect at the `RelaySafetyPolicy` chokepoint in `transport-nostr`
   (`crates/transport-nostr/src/safety.rs`); relay hosts that are non-public IP literals are rejected, and literal

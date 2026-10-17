@@ -141,6 +141,11 @@ Each PR is green on its own and changes no behaviour.
 5. **Move the per-account publish clients onto the plane,** with the cache and eviction rules in the same PR.
 6. **Merge the duplicate notification consumer.** The adapter's test-only forwarder either delegates to the plane's
    handler or is removed.
+   Done as a shared dispatch (2026-10-17): the adapter cannot call the plane, which depends on it, and the forwarder
+   drives about 2,000 lines of adapter tests that removing it would orphan. Both consumers already called the same
+   adapter handlers, so the per-notification dispatch moves into the adapter as `dispatch_sdk_notification` and both
+   loops call it. New notification handling goes there once; the loops keep only their own queueing and loss
+   accounting.
 
 ## Proof that behaviour is unchanged
 
