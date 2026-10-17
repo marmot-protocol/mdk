@@ -763,7 +763,8 @@ Notable tracing targets currently present:
 | Target | Typical methods / fields |
 | --- | --- |
 | `transport_nostr_adapter::adapter` | `metrics`, `delivery_spread`, `relay_sync`, `handle_relay_event`, `activate_account`, `sync_account_groups`, `deactivate_account`, `publish`; fields are counts such as `delivered`, endpoint counts, subscription counts, required ack count. |
-| `marmot_app::relay_plane` | Relay notification forwarding, directory subscription/fetch lifecycle, router shutdown/drop warnings; fields are status/counts and bounded error categories. |
+| `transport_nostr_adapter::sdk_client` | SDK relay client paths, including the per-event forwarding trace in `dispatch_sdk_notification`, the notification dispatch the relay plane and the adapter's test forwarder share. |
+| `marmot_app::relay_plane` | Relay notification consumer and pool shutdown, directory subscription/fetch lifecycle, router shutdown/drop warnings; fields are status/counts and bounded error categories. |
 | `marmot_app::relay_telemetry_export` | Exporter construction, `export_once`, `run`; fields include `point_count` and safe warning categories. |
 | `marmot_app::audit_log` | Audit tracker scheduling/upload summaries; fields include `trigger`, `skipped_reason`, uploaded/failed counts, and file index. Audit content is not logged. |
 | `marmot_app::runtime` | Startup/shutdown and worker lifecycle; fields include elapsed times and active operation counts. |
