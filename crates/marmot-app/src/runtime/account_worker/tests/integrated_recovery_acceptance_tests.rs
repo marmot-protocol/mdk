@@ -957,6 +957,7 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     );
     reopened.shutdown_and_close().await.unwrap();
     drop(reopened);
+    drop(app);
     drop(storage);
     drop(reopened_app);
 

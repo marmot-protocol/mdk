@@ -900,6 +900,7 @@ mod tests {
         app.record_app_event(&media_event("old", 10, 7)).unwrap();
         app.secure_prune_app_events_before("aa", 11, "local", &no_mentions)
             .unwrap();
+        drop(app);
         drop(store);
 
         let reopened = SqliteAccountStorage::from_connection_with_options(
@@ -942,6 +943,7 @@ mod tests {
             None,
             "retirement must not depend on a key row existing at prune time"
         );
+        drop(app);
         drop(store);
 
         let reopened = SqliteAccountStorage::from_connection_with_options(

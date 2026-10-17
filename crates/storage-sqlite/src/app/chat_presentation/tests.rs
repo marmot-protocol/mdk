@@ -1003,6 +1003,7 @@ fn chat_list_draft_preview_reopens_from_encrypted_store_without_projection_write
     app.save_message_draft("11", "persisted draft", None, &[])
         .unwrap();
     store.close().unwrap();
+    drop(app);
     drop(store);
     let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let before: i64 = reopened

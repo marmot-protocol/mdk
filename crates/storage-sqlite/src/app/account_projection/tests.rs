@@ -1818,6 +1818,7 @@ fn secure_prune_checkpoint_removes_plaintext_from_database_and_wal_files() {
             .last_message
             .is_none()
     );
+    drop(app);
     drop(store);
 
     for path in [
@@ -1889,6 +1890,7 @@ fn secure_prune_removes_pruned_plaintext_from_search_index() {
         .unwrap();
 
     assert_eq!(outcome.pruned_messages, 1);
+    drop(app);
     drop(store);
     assert!(
         !file_contains(&db_path, old_secret.as_bytes()),
@@ -4642,6 +4644,7 @@ fn secure_prune_scrubs_retained_edit_copies_before_reprojection() {
                 .unwrap();
             assert_eq!(secure_delete, 0, "restore caller setting");
         }
+        drop(app);
         drop(store);
         for file in [path.clone(), path.with_extension("sqlite-wal")] {
             if file.exists() {

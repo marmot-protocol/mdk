@@ -435,6 +435,7 @@ fn accepted_and_unaccepted_draft_revisions_survive_encrypted_reopen() {
                 .unwrap();
         }
         store.close().unwrap();
+        drop(app);
         drop(store);
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         let now = reopened
