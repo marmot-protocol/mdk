@@ -216,6 +216,16 @@ enum MarmotStatus
    * account, deleted, or withdrawn by convergence; nothing was published.
    */
   MARMOT_STATUS_INVALID_EDIT_TARGET = 105,
+  /**
+   * An attachment was encrypted at an epoch the group has left, so it cannot
+   * be sent; upload the file again (mdk#2158).
+   */
+  MARMOT_STATUS_MEDIA_REFERENCE_STALE_EPOCH = 106,
+  /**
+   * The group's epoch is unsettled, so an attachment cannot be sent yet;
+   * sync and send again (mdk#2158).
+   */
+  MARMOT_STATUS_MEDIA_REFERENCE_EPOCH_UNSETTLED = 107,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

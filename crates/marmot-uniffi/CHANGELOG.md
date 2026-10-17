@@ -22,6 +22,13 @@
   [the attachment access contract](ATTACHMENT-ACCESS.md).
 - `MarmotKitError` adds `InvalidEditTarget`, returned by `edit_message` (see Fixed). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 - `MarmotKitError` adds `GroupCommitUndelivered`: a group change was refused because the group's last change has not reached every group relay yet (mdk#2255). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
+- `MarmotKitError` adds `MediaReferenceStaleEpoch { reference_epoch, group_epoch }`
+  and `MediaReferenceEpochUnsettled { reference_epoch }`. They replace the
+  generic `InvalidMediaReference` for these two cases: the first means the
+  group left the epoch the attachment was encrypted under, so upload the file
+  again; the second means the epoch is settling, so sync and send again. Update
+  exhaustive Swift/Kotlin handling and regenerate bindings with the matching
+  native library (#2158).
 
 ### Added
 

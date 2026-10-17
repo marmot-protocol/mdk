@@ -6653,7 +6653,7 @@ async fn held_group_defers_a_due_self_update_until_the_hold_lifts() {
     let (_dir, mut runtime, group_id, source_epoch) =
         manual_only_group_runtime(MaintenanceTiming::immediate()).await;
     let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
-    let held = [group_id.clone()];
+    let held = [(group_id.clone(), marmot_account::SelfUpdateHold::EpochGap)];
     for _ in 0..3 {
         runtime.run_due_maintenance_holding(&held).await.unwrap();
     }
@@ -6680,6 +6680,96 @@ async fn held_group_defers_a_due_self_update_until_the_hold_lifts() {
     assert_eq!(
         runtime.session().epoch(&group_id).unwrap().0,
         source_epoch.0 + 1
+    );
+}
+
+/// mdk#2158: a group with an attachment upload in flight keeps its due
+/// periodic self-update owed, recorded as an upload hold, until the upload
+/// ends. A self-update the user asked for and the post-join rotation are not
+/// held.
+#[tokio::test]
+async fn upload_hold_defers_only_periodic_self_updates() {
+    let (_dir, mut runtime, group_id, source_epoch) =
+        manual_only_group_runtime(MaintenanceTiming::immediate()).await;
+    let held = [(group_id.clone(), marmot_account::SelfUpdateHold::Upload)];
+    let confirmed = |effects: &marmot_account::AccountDeviceEffects| {
+        effects
+            .pending
+            .iter()
+            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. }))
+    };
+
+    // A manual self-update goes ahead during an upload.
+    runtime.schedule_manual_self_update(&group_id).unwrap();
+    let mut rotated = false;
+    for _ in 0..3 {
+        let effects = runtime.run_due_maintenance_holding(&held).await.unwrap();
+        rotated |= confirmed(&effects);
+    }
+    assert!(rotated, "a manual self-update is not held by an upload");
+    assert_eq!(
+        runtime.session().epoch(&group_id).unwrap().0,
+        source_epoch.0 + 1
+    );
+
+    // A periodic rotation that is due waits for the upload.
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    let mut obligation = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    obligation.trigger = cgka_traits::MaintenanceTrigger::Periodic;
+    obligation.phase = cgka_traits::MaintenancePhase::Retry;
+    runtime
+        .session()
+        .put_maintenance_obligation(&obligation)
+        .unwrap();
+    for _ in 0..3 {
+        runtime.run_due_maintenance_holding(&held).await.unwrap();
+    }
+    let obligation = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(obligation.phase, cgka_traits::MaintenancePhase::Retry);
+    assert_eq!(obligation.last_failure_code.as_deref(), Some("upload_hold"));
+    assert_eq!(
+        runtime.session().epoch(&group_id).unwrap().0,
+        source_epoch.0 + 1
+    );
+
+    // Once the upload ends, the rotation runs.
+    let effects = runtime.run_due_maintenance().await.unwrap();
+    assert!(confirmed(&effects), "{effects:?}");
+    assert_eq!(
+        runtime.session().epoch(&group_id).unwrap().0,
+        source_epoch.0 + 2
+    );
+
+    // A post-join rotation goes ahead during an upload.
+    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
+    let mut obligation = runtime
+        .session()
+        .maintenance_obligation(&obligation_id)
+        .unwrap()
+        .unwrap();
+    obligation.trigger = cgka_traits::MaintenanceTrigger::PostJoin;
+    obligation.phase = cgka_traits::MaintenancePhase::Retry;
+    runtime
+        .session()
+        .put_maintenance_obligation(&obligation)
+        .unwrap();
+    let mut rotated = false;
+    for _ in 0..3 {
+        let effects = runtime.run_due_maintenance_holding(&held).await.unwrap();
+        rotated |= confirmed(&effects);
+    }
+    assert!(rotated, "a post-join self-update is not held by an upload");
+    assert_eq!(
+        runtime.session().epoch(&group_id).unwrap().0,
+        source_epoch.0 + 3
     );
 }
 
