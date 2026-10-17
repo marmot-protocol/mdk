@@ -113,7 +113,8 @@ pub trait MediaCatalog: Send + Sync {
     fn abandon_pending(&self, id: FileId) -> CatalogResult<bool>;
     fn ready_file(&self, id: FileId) -> CatalogResult<Option<ReadyFile>>;
     fn file_state(&self, id: FileId) -> CatalogResult<Option<FileState>>;
-    /// Ready → lost, overwriting the key. Returns whether it changed.
+    /// Ready or staged → lost, overwriting the key: the file is gone or
+    /// failed verification. Returns whether it changed.
     fn mark_lost(&self, id: FileId) -> CatalogResult<bool>;
     /// Rows in id order after `after`, for the sweep.
     fn page(&self, after: Option<FileId>, limit: usize) -> CatalogResult<Vec<(FileId, FileState)>>;

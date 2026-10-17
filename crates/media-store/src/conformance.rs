@@ -183,6 +183,7 @@ pub fn run_all<H: Harness>(make: &dyn Fn() -> H) {
     releasing_a_staged_file_deletes_its_key_then_the_file(make());
     promotion_attaches_a_present_twin_instead(make());
     promotion_skips_a_twin_whose_file_is_gone(make());
+    a_missing_staged_file_is_lost_and_never_promoted(make());
 }
 
 pub fn publish_reads_back_and_reuses_identical_content<H: Harness>(harness: H) {
@@ -944,4 +945,25 @@ pub fn promotion_skips_a_twin_whose_file_is_gone<H: Harness>(harness: H) {
     );
     assert_eq!(store.file_state(&twin).unwrap(), Some(FileState::Lost));
     assert_eq!(read_all(&store, &id).unwrap(), content);
+}
+
+/// A staged file that vanished is marked lost (key zeroed), by a read or
+/// by the sweep, and can no longer be promoted.
+pub fn a_missing_staged_file_is_lost_and_never_promoted<H: Harness>(harness: H) {
+    let store = store(&harness);
+    let read = staged(&harness, &store, 0, &body(20_000, 18));
+    std::fs::remove_file(store.path(&read)).unwrap();
+    assert!(store.open_staged_reader(&read).unwrap().is_none());
+    assert_eq!(store.file_state(&read).unwrap(), Some(FileState::Lost));
+    assert_eq!(
+        store
+            .promote(harness.promote_target(0).as_ref(), read)
+            .unwrap(),
+        PromoteOutcome::Superseded
+    );
+
+    let swept = staged(&harness, &store, 2, &body(20_000, 19));
+    std::fs::remove_file(store.path(&swept)).unwrap();
+    sweep_all(&store);
+    assert_eq!(store.file_state(&swept).unwrap(), Some(FileState::Lost));
 }
