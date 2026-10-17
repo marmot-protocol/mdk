@@ -99,7 +99,10 @@ impl SqliteAccountStorage {
             let mut unknown_bounds = false;
             for id in &ids {
                 let invalidated:bool=conn.query_row_cached("SELECT inventory_invalidated FROM cgka_released_transport_receipts WHERE id=?1",[id],|r|r.get(0)).storage()?;
-                let removed = retire_transport_receipts(&conn, &MessageId::new(id.clone()))?;
+                let removed = crate::cross::release::retire_transport_receipts(
+                    &conn,
+                    &MessageId::new(id.clone()),
+                )?;
                 unknown_bounds |= removed == 0 && !invalidated;
             }
             let groups = conn.prepare_cached(
@@ -107,7 +110,7 @@ impl SqliteAccountStorage {
             ).storage()?.query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)))
                 .storage()?.collect::<Result<Vec<_>, _>>().storage()?;
             for (group_id, epoch) in groups {
-                crate::app::account_recovery::arm_released_epoch_tx(
+                crate::cross::release::arm_released_epoch(
                     &conn,
                     &group_id,
                     epoch,
@@ -115,7 +118,7 @@ impl SqliteAccountStorage {
                 )?;
             }
             if unknown_bounds {
-                crate::app::account_recovery::invalidate_inventory_tx(&conn)?;
+                crate::cross::release::invalidate_recovery_inventory(&conn)?;
             }
             conn.execute_cached("DELETE FROM cgka_released_transport_receipts", [])
                 .storage()?;
@@ -316,12 +319,7 @@ impl MessageStorage for SqliteAccountStorage {
             // depend on individual receipts: the app's active seen ring may
             // not have checkpointed yet, and inventory writes are best-effort.
             // A standalone engine has no app consumer and needs only deletion.
-            if !conn
-                .query_row_cached("SELECT EXISTS(SELECT 1 FROM account_state)", [], |row| {
-                    row.get::<_, bool>(0)
-                })
-                .storage()?
-            {
+            if !crate::cross::release::app_owns_released_messages(&conn)? {
                 return delete_message_on_connection(&conn, &record.id);
             }
             // Bound journal metadata even if a host never consumes it. At the
@@ -350,8 +348,10 @@ impl MessageStorage for SqliteAccountStorage {
                 "SELECT inventory_invalidated FROM cgka_released_transport_receipts WHERE id=?1",
                 [record.id.as_slice()], |row| row.get(0),
             ).storage()?;
-            if retire_transport_receipts(&conn, &record.id)? == 0 && !invalidated {
-                crate::app::account_recovery::invalidate_inventory_tx(&conn)?;
+            if crate::cross::release::retire_transport_receipts(&conn, &record.id)? == 0
+                && !invalidated
+            {
+                crate::cross::release::invalidate_recovery_inventory(&conn)?;
             }
             conn.execute_cached(
                 "UPDATE cgka_released_transport_receipts SET inventory_invalidated=1 WHERE id=?1",
@@ -1293,15 +1293,6 @@ fn update_message_state_on_connection(
         return Err(StorageError::NotFound);
     }
     Ok(())
-}
-
-fn retire_transport_receipts(conn: &rusqlite::Connection, id: &MessageId) -> StorageResult<usize> {
-    conn.execute_cached(
-        "DELETE FROM seen_events WHERE event_id = ?1",
-        params![hex::encode(id.as_slice())],
-    )
-    .storage()?;
-    crate::app::account_recovery::delete_inventory_tx(conn, "event_id = ?1", params![id.as_slice()])
 }
 
 /// Delete a protocol message and its not-yet-acknowledged application event on

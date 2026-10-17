@@ -3,7 +3,7 @@ title: "Extraction Brief — Internal Boundaries in storage-sqlite"
 created: 2026-10-17
 updated: 2026-10-17
 tags: [marmot, architecture, review, extraction-brief, storage, sqlite]
-status: proposed, needs approval before implementation
+status: approved 2026-10-17, in implementation
 ---
 
 # Extraction Brief — Internal Boundaries in `storage-sqlite`
@@ -157,14 +157,19 @@ Each PR is green on its own and changes no behaviour or schema.
 3. **Introduce `cross/`.** Move each crossing into a named `cross/` function, one kind at a time (several PRs if the
    diff is large), deleting its allow-list lines as it goes. Switch the plain transactions to
    `SharedConnection::with_transaction`. Write `cross/README.md` for the schema-level kinds. When this is done, the
-   allow-list holds only the schema links and the migration 9 reconcile.
+   allow-list holds only the schema links, the migration 9 reconcile, and the three lines from the account handle in
+   `base/connection.rs`, which holds the OpenMLS store and the draft observer and delegates replay snapshots to
+   protocol code (PR 2's generated list found them; this brief's preview counted one). PR 4 removes those.
 4. **The app handle type**, in mechanical slices: introduce `SqliteAppStorage` over the account's connection, move the
    app and transport methods to it a folder at a time, and repoint the callers the compiler finds, `marmot-app` above
    all. The draft-commit observer is the exception: `cgka-session` installs it on the engine's storage (`cgka-session`
    `lib.rs:490-495`) and the confirm path fires it on that same value (`storage/outbound.rs:60`), so its slot and setter
    stay on `SqliteAccountStorage`, in `cross/`. It is `cgka-session`'s only app-side call on that storage. The names
    test adds two checks: protocol production code never names `SqliteAppStorage`, and app production code outside
-   `cross/` never calls the protocol traits; tests may hold both handles.
+   `cross/` never calls the protocol traits; tests may hold both handles. When the app methods have moved,
+   `SqliteAccountStorage` is the engine's handle and moves to `protocol/`, `SqliteAppStorage` lives in `app/`, both
+   over `base`'s connection, and the draft observer's type and slot go to `cross/`, which ends the handle's three
+   allow-list lines.
 5. **Tracing targets.** Rename the hard-coded targets (20 today, 3 of them in test files) to the new module paths in
    one PR, and update the docs and simulator filters that match them.
 
@@ -214,6 +219,6 @@ PR 4) have landed.
 ## Done when
 
 - The crate has `base/`, `protocol/`, `app/` and `cross/`, and both tests pass.
-- The allow-list holds only schema links and the migration 9 reconcile, and `cross/README.md` explains each
+- After PR 4, the allow-list holds only schema links and the migration 9 reconcile, and `cross/README.md` explains each
   kind.
 - `marmot-app` reaches app storage only through `SqliteAppStorage`, and the names test covers the handle.

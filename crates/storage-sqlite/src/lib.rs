@@ -7,6 +7,7 @@
 
 mod app;
 mod base;
+mod cross;
 mod protocol;
 #[cfg(feature = "media-store-benchmarks")]
 pub use app::media_store_bench;

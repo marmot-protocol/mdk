@@ -1,0 +1,35 @@
+# cross
+
+The protocol side and the app side of `storage-sqlite` share one database file, so some operations must change both
+sides' tables in one transaction. That code lives here, one named function per crossing, and this is the only folder
+`base::boundary_tests` lets name both sides. What still crosses elsewhere is listed in [`allow-list.txt`](allow-list.txt);
+the list only shrinks. The plan is the
+[step 4 storage brief](../../../../docs/marmot-architecture/review/brief-storage-boundaries.md).
+
+## What is here
+
+| Module | The crossing | Called from |
+| --- | --- | --- |
+| `routes.rs` | Deleting a route's recovery inventory and NIP-77 reconciliation state when the engine deletes the route or the group | `protocol/storage/transport_routes.rs`, `protocol/storage/groups.rs` |
+| `groups.rs` | Lifting the media-secret retirement barrier when a forgotten group rejoins | `protocol/storage/groups.rs` |
+| `release.rs` | Message release for replay: whether an app owns the messages, retiring seen-ring and inventory entries, arming or invalidating the recovery ledger | `protocol/storage/messages.rs` |
+| `outbound.rs` | The confirm path consuming the local submission and the draft a message came from, and waking the app's draft observer | `protocol/storage/outbound.rs` |
+
+Later step 4 PRs move the app-side crossings in: the projection checkpoint acknowledging the engine outbox, the
+authority backfill, the local-forget wipe, and app reads of engine tables.
+
+## Schema links that stay
+
+These are schema, which step 4 does not change. The foreign keys and triggers stay on `allow-list.txt`; the others are
+not table references the test can see.
+
+- **Foreign keys:** `account_recovery_obligations`, `app_epoch_stall_evidence` and `app_group_recovery_failures`
+  reference `cgka_groups` and are deleted in cascade with a group (migrations 0092, 0055 and 0067).
+- **Triggers:** migration 0072 creates the 17 chat-list key triggers. Twelve on the engine's leave and disband tables
+  rewrite `chat_list_rows`; five on `account_groups` and `chat_list_rows` read those engine tables.
+- **One migration ledger:** both sides' migrations run in one strictly ordered registry (`base/migrations.rs`), and the
+  legacy migration 9 reconcile adds a column to two app tables.
+- **One MLS cache generation:** every commit to the file, app writes included, changes `PRAGMA data_version`, which
+  invalidates the engine's cached MLS groups (`protocol/provider.rs`, `mls_write_generation`).
+
+Step 8 decides per table which store each lands in.

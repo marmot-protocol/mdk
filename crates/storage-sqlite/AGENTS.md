@@ -21,13 +21,14 @@ The crate is split by which side owns each table; see the
 | `src/protocol/` | The engine's storage: the `StorageProvider` impls (`provider.rs`), `storage/` and `openmls_storage/`. |
 | `src/app/` | App storage: projections, timeline, chat list, recovery ledger, drafts, attachments, avatars, media catalog. |
 | `src/app/transport/` | App storage specific to one transport (NIP-77, NIP-51, relay-plane spill, NIP-59 outbox, QUIC sequences, prepared Blossom uploads), kept together for a later move. |
+| `src/cross/` | Code that must touch both sides in one transaction, one named function per crossing; its `README.md` lists them. |
 | `src/shared.rs`, `src/shared/` | The separate shared database. |
 
 Put new code on the side that owns its tables. `src/base/boundary_tests.rs` fails on any crossing between the sides
 (SQL naming the other side's tables, a `crate::` path or a `self` call into the other side, or a cross-side foreign key
 or trigger) that is missing from `src/cross/allow-list.txt`, and on a listed one that no longer occurs. Do not add a
-line to make a change pass: code that must touch both sides goes in `cross/` once step 4 PR 3 adds it, and until then
-a new line needs its reason in the PR description. A new table needs an owner in `src/base/table_owners.rs`.
+line to make a change pass: code that must touch both sides goes in a named `cross/` function, and a new line needs its
+reason in the PR description. A new table needs an owner in `src/base/table_owners.rs`.
 
 ## Key files
 
