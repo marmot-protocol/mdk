@@ -67,6 +67,10 @@ impl Marmot {
     /// does not revoke it. `control` reports copied bytes and cancels the
     /// copy. `StorageFull` when the disk cannot hold the copy beyond the
     /// reserve. No network or download is started.
+    // Polled on the caller, never spawned: a spawned export could finish and
+    // drop the lease while a cancelled host never collects it. Dropped on
+    // the caller, the pending copy is discarded instead.
+    #[marmot_uniffi_macros::receive]
     pub async fn open_attachment_handoff(
         &self,
         account_ref: String,
