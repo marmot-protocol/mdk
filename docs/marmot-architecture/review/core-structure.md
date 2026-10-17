@@ -31,7 +31,7 @@ the citations behind it. §4 and §5 are proposals, not findings.
    `MarmotAccountSession` and `SharedServices` that don't exist. The public runtime mostly forwards calls: 179 of its
    250 public methods are thin delegations, and a feature crosses four hand-written layers.
 3. **`storage-sqlite` is the app's whole data model with a protocol store inside it.** (Observed; §2.2.) Protocol
-   persistence is 16% of its production code. It exposes 366 public app and transport methods next to 122
+   persistence is 16% of its production code. It exposes 370 public app and transport methods next to 122
    storage-trait methods, about 82% of its public methods are used by `marmot-app`, and its protocol code behaves
    differently depending on app tables.
 4. **The lower stack has three identical wrappers and no layer narrows the surface.** (Observed; §2.3 and §2.4.) The
@@ -113,8 +113,8 @@ references 48 recovery symbols.
 
 ### 2.2 `storage-sqlite`: two stores in one type
 
-- **The callers are the app.** One concrete type, `SqliteAccountStorage`, carries 387 public inherent methods, 366
-  of them app or transport, and 122 storage-trait methods. `marmot-app` calls about 318 of the public methods (a
+- **The callers are the app.** One concrete type, `SqliteAccountStorage`, carries 387 public inherent methods (not
+  counting six feature-gated ones), 370 of them app or transport, and 122 storage-trait methods. `marmot-app` calls about 318 of the public methods (a
   name-match count). 239 of its 257 re-exports are app DTOs. These counts are at `e9ecb12e0`, from the
   [step 4 brief](brief-storage-boundaries.md).
 - **It breaks a stated rule.** The root `AGENTS.md` says to keep transport-specific code out of storage crates. This
@@ -152,7 +152,7 @@ and the replay fingerprint.
 
 **Evidence (observed):**
 - `SqliteAccountStorage`: `crates/storage-sqlite/src/connection.rs:1050`.
-- The release probe: `storage/messages.rs:283-290`. The forget wipe: `account_projection.rs:1427-1600`.
+- The release probe: `storage/messages.rs:319-326`. The forget wipe: `account_projection.rs:1427-1649`.
 - Draft and submission consumption: `storage/outbound.rs:20-62`, `:240-262`. The outbox acknowledgement:
   `account_projection.rs:1313-1318`.
 - Engine-table triggers: `migrations/0072_chat_list_pages.rs:68-171`, and `reject_forgotten_group_insert` in
