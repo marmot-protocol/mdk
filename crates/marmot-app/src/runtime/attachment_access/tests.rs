@@ -783,3 +783,161 @@ async fn a_handoff_on_an_evicted_handle_writes_nothing() {
         0
     );
 }
+
+/// Files under the account's media store directory.
+fn media_files_on_disk(app: &MarmotApp) -> usize {
+    fn walk(path: &std::path::Path) -> usize {
+        std::fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| {
+                        if entry.file_type().unwrap().is_dir() {
+                            walk(&entry.path())
+                        } else {
+                            1
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+    walk(&app.account_dir("alice").join(media_store::MEDIA_DIRECTORY))
+}
+
+/// Manage storage reports a file-backed attachment, and removing its chat
+/// frees the file at once, without waiting for the sweep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manage_storage_reports_and_frees_a_chat_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    let body = vec![8u8; 96 * 1024];
+    seed_file_backed(&app, &store, &body);
+    let runtime = app.runtime();
+    let group = GroupId::new(vec![0xab; 16]);
+
+    let usage = runtime.attachment_storage_usage("alice").await.unwrap();
+    assert_eq!(usage.media_bytes, body.len() as u64);
+    assert_eq!(usage.attachment_count, 1);
+    let chats = runtime
+        .attachment_storage_by_chat("alice", None, 8)
+        .await
+        .unwrap();
+    assert_eq!(
+        chats
+            .iter()
+            .map(|chat| (chat.group_id_hex.as_str(), chat.bytes))
+            .collect::<Vec<_>>(),
+        vec![(GROUP, body.len() as u64)]
+    );
+    let largest = runtime
+        .largest_retained_attachments("alice", Some(&group), None, 8)
+        .await
+        .unwrap();
+    assert_eq!(largest.len(), 1);
+    assert_eq!(largest[0].byte_count, body.len() as u64);
+    assert_eq!(largest[0].target.message_id_hex, target().message_id_hex);
+    assert_eq!(largest[0].group_id_hex, GROUP);
+
+    assert_eq!(media_files_on_disk(&app), 1);
+    assert_eq!(
+        runtime
+            .remove_chat_attachments("alice", &group)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        media_files_on_disk(&app),
+        0,
+        "freed before the call returns"
+    );
+    assert_eq!(
+        runtime
+            .attachment_storage_usage("alice")
+            .await
+            .unwrap()
+            .attachment_count,
+        0
+    );
+    assert!(
+        runtime
+            .attachment_local_assets("alice", &group, vec![target()])
+            .await
+            .unwrap()[0]
+            .is_none()
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// The single explicit Remove also unlinks a released file at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_remove_unlinks_a_released_file_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    seed_file_backed(&app, &store, &[9u8; 4096]);
+    let runtime = app.runtime();
+    let group = GroupId::new(vec![0xab; 16]);
+    let asset = runtime
+        .attachment_local_assets("alice", &group, vec![target()])
+        .await
+        .unwrap()
+        .remove(0)
+        .unwrap();
+    assert_eq!(media_files_on_disk(&app), 1);
+    assert!(
+        runtime
+            .control_attachment("alice", asset.reference, crate::AttachmentControl::Remove)
+            .await
+            .unwrap()
+    );
+    assert_eq!(media_files_on_disk(&app), 0);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Removal by age uses the message's received time and works on legacy
+/// database bodies too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removal_by_age_covers_legacy_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    let body = vec![5u8; 3000];
+    // The fixture message was received at 10.
+    seed(&store.app_storage(), &body);
+    let runtime = app.runtime();
+    let usage = runtime.attachment_storage_usage("alice").await.unwrap();
+    assert_eq!(
+        (usage.legacy_bytes, usage.attachment_count),
+        (body.len() as u64, 1)
+    );
+    assert_eq!(
+        runtime
+            .remove_attachments_older_than("alice", 10, None)
+            .await
+            .unwrap(),
+        0,
+        "received at 10 is not before 10"
+    );
+    assert_eq!(
+        runtime
+            .remove_attachments_older_than("alice", 11, None)
+            .await
+            .unwrap(),
+        1
+    );
+    let usage = runtime.attachment_storage_usage("alice").await.unwrap();
+    assert_eq!((usage.legacy_bytes, usage.attachment_count), (0, 0));
+    runtime.shutdown_and_close().await.unwrap();
+}

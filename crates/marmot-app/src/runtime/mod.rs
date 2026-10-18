@@ -98,9 +98,14 @@ pub use attachment_controls::{
 pub use attachment_permission::{AttachmentAutomaticPermission, AutomaticAttachmentRequest};
 mod attachment_access;
 mod attachment_history;
+mod attachment_storage;
 pub use attachment_access::{
     AttachmentAssetRef, AttachmentLocalTarget, MAX_ATTACHMENT_ASSET_LOOKUPS,
     MAX_ATTACHMENT_LOCAL_READ_BYTES, RetainedAttachmentAsset,
+};
+pub use attachment_storage::{
+    AttachmentStorageUsage, ChatAttachmentUsage, ChatUsageCursor, RetainedAttachmentSummary,
+    RetainedSizeCursor,
 };
 mod avatar;
 pub use attachment_history::{

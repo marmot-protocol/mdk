@@ -84,6 +84,15 @@
 
 ### Added
 
+- Manage storage (mdk#2314 step 5): `attachment_storage_usage`,
+  `attachment_storage_by_chat`, `largest_retained_attachments`,
+  `remove_chat_attachments` and `remove_attachments_older_than` on
+  `MarmotAppRuntime`, across both body layouts. Removal is explicit `Remove`
+  (shown as removed, download-again allowed), and the media files it
+  releases are unlinked before the call returns, so file-backed space frees
+  at once. Explicit `Remove` through `control_attachment` now unlinks its
+  released file at once too, instead of at the next media sweep.
+
 - `MarmotAppRuntime::open_attachment_handoff` and `release_attachment_handoff`
   (mdk#2314 step 4): a private plaintext copy of a retained attachment, under
   `<account>/handoff/<lease>/<name>`, lent to an OS surface that needs a real

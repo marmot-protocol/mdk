@@ -50,15 +50,16 @@ pub use app::account_projection::{
     StoredEpochStallEvidence, StoredNostrRoute, clamp_to_max_future_skew,
 };
 pub use app::attachment_acquisition::{
-    ATTACHMENT_ACQUISITION_BATCH_LIMIT, ATTACHMENT_CHECKPOINT_BYTES,
+    ATTACHMENT_ACQUISITION_BATCH_LIMIT, ATTACHMENT_CHECKPOINT_BYTES, ATTACHMENT_REMOVAL_BATCH,
     ATTACHMENT_STAGING_CHUNK_BYTES, AttachmentAcquisition, AttachmentAcquisitionSource,
     AttachmentAcquisitionState, AttachmentAcquisitionStatus, AttachmentAssetRef,
     AttachmentCheckpoint, AttachmentDemand, AttachmentPartial, AttachmentPartialIdentity,
     AttachmentPermissionCategory, AttachmentPublication, AttachmentPublishResult,
-    AttachmentUploadOwner, AttachmentUploadPromotion, AttachmentUploadSource,
-    AttachmentUploadStage, AttachmentWorkerDemand, MAX_ATTACHMENT_LOCAL_READ_BYTES,
-    MAX_RETAINED_ATTACHMENT_BYTES, MAX_RETAINED_FILE_ATTACHMENT_BYTES, RetainedAttachmentAsset,
-    RetainedAttachmentRead,
+    AttachmentRemoval, AttachmentStorageUsage, AttachmentUploadOwner, AttachmentUploadPromotion,
+    AttachmentUploadSource, AttachmentUploadStage, AttachmentWorkerDemand, ChatAttachmentUsage,
+    ChatUsageCursor, MAX_ATTACHMENT_LOCAL_READ_BYTES, MAX_RETAINED_ATTACHMENT_BYTES,
+    MAX_RETAINED_FILE_ATTACHMENT_BYTES, RetainedAttachmentAsset, RetainedAttachmentEntry,
+    RetainedAttachmentRead, RetainedSizeCursor,
 };
 pub use app::attachment_history::{
     AccountAttachmentCursor, AccountAttachmentEntry, AccountAttachmentHistoryError,

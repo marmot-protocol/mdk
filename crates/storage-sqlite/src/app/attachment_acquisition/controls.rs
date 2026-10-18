@@ -531,12 +531,27 @@ impl SqliteAppStorage {
         &self,
         reference: &AttachmentAssetRef,
     ) -> StorageResult<bool> {
+        Ok(self
+            .remove_attachment_reference_releasing(reference)?
+            .is_some())
+    }
+
+    /// [`Self::remove_attachment_reference`], also returning the media files
+    /// the removal released (their keys are gone), so the caller can unlink
+    /// them at once instead of waiting for the sweep. `None` when nothing was
+    /// removed.
+    pub fn remove_attachment_reference_releasing(
+        &self,
+        reference: &AttachmentAssetRef,
+    ) -> StorageResult<Option<Vec<media_store::FileId>>> {
         self.connection.with_transaction(|| {
             let conn=self.lock()?;
-            if !matches_store(&conn,reference)? {return Ok(false);}
+            if !matches_store(&conn,reference)? {return Ok(None);}
             let source=conn.query_row("SELECT group_id_hex,message_id_hex,attachment_index FROM attachment_acquisition WHERE token=?1",[&reference.token],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?))).optional().storage()?;
-            drop(conn); // Nested storage calls must acquire their own connection guard.
-            match source { Some((g,m,i))=>self.remove_local_attachment(&g,&m,i),None=>Ok(false) }
+            match source {
+                Some((g,m,i)) => super::storage_usage::remove_slot(&conn,&g,&m,i),
+                None => Ok(None),
+            }
         })
     }
 
