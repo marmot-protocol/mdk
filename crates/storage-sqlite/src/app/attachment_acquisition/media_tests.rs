@@ -413,3 +413,313 @@ fn legacy_database_bodies_stay_readable_beside_media_files() {
     assert_eq!(fixture.read(&legacy).unwrap(), content);
     assert_eq!(fixture.read(&media).unwrap(), other);
 }
+
+// Manage storage (mdk#2314 step 5) across both layouts.
+
+const OTHER_GROUP: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+
+impl Fixture {
+    /// A claimed download for `message` in `group`, received at `received`.
+    fn claimed_in(
+        &self,
+        group: &str,
+        message: &str,
+        plaintext: &[u8],
+        received: u64,
+    ) -> AttachmentAcquisition {
+        self.store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO account_groups(group_id_hex,endpoint,updated_at) VALUES(?1,'',0)
+                 ON CONFLICT DO NOTHING",
+                [group],
+            )
+            .unwrap();
+        let (mut event, mut entry) = Self::entry(message, plaintext);
+        event.group_id_hex = group.into();
+        event.received_at = received;
+        entry.received_at = received;
+        self.store.app_storage().record_app_event(&event).unwrap();
+        let AttachmentDemand::Requested(reference) = self
+            .store
+            .app_storage()
+            .request_attachment_acquisition(group, &entry, digest(plaintext), NOW)
+            .unwrap()
+        else {
+            panic!("attachment was not requested");
+        };
+        self.store
+            .app_storage()
+            .claim_attachment_acquisition(&reference, NOW, LEASE)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Retains `plaintext` in the legacy database layout.
+    fn legacy(&self, job: &AttachmentAcquisition, plaintext: &[u8]) {
+        assert_eq!(
+            self.store
+                .app_storage()
+                .complete_attachment_acquisition(job, plaintext, NOW, u64::MAX / 2)
+                .unwrap(),
+            AttachmentPublishResult::Published
+        );
+    }
+}
+
+fn sized(len: usize, seed: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(31) ^ seed)
+        .collect()
+}
+
+/// Usage counts media-store files once and legacy bodies by the database
+/// counter; listings order chats and attachments by bytes and page.
+#[test]
+fn storage_usage_and_listings_cover_both_layouts() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let big = sized(90_000, 1);
+    let mid = sized(40_000, 2);
+    let small = sized(5_000, 3);
+    let first = fixture.claimed_in(GROUP, &"a".repeat(64), &big, NOW);
+    assert!(matches!(
+        fixture.publish(&first, &big),
+        PublishOutcome::Published(_)
+    ));
+    let twin = fixture.claimed_in(OTHER_GROUP, &"b".repeat(64), &big, NOW);
+    assert!(matches!(
+        fixture.publish(&twin, &big),
+        PublishOutcome::Existing(_)
+    ));
+    let legacy = fixture.claimed_in(OTHER_GROUP, &"c".repeat(64), &mid, NOW);
+    fixture.legacy(&legacy, &mid);
+    let tiny = fixture.claimed_in(GROUP, &"d".repeat(64), &small, NOW);
+    assert!(matches!(
+        fixture.publish(&tiny, &small),
+        PublishOutcome::Published(_)
+    ));
+
+    let usage = app.attachment_storage_usage(NOW).unwrap();
+    assert_eq!(
+        usage.media_bytes,
+        (big.len() + small.len()) as u64,
+        "shared content counted once"
+    );
+    assert_eq!(usage.legacy_bytes, mid.len() as u64);
+    assert_eq!(usage.attachment_count, 4);
+    assert!(usage.database_bytes > 0);
+
+    // Shared content counts in each chat that holds it.
+    let chats = app.attachment_storage_by_chat(NOW, None, 8).unwrap();
+    assert_eq!(
+        chats
+            .iter()
+            .map(|chat| (
+                chat.group_id_hex.as_str(),
+                chat.bytes,
+                chat.attachment_count
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (OTHER_GROUP, (big.len() + mid.len()) as u64, 2),
+            (GROUP, (big.len() + small.len()) as u64, 2),
+        ]
+    );
+    let first_page = app.attachment_storage_by_chat(NOW, None, 1).unwrap();
+    let rest = app
+        .attachment_storage_by_chat(NOW, Some(&first_page[0].cursor()), 8)
+        .unwrap();
+    assert_eq!([first_page, rest].concat(), chats);
+
+    let largest = app
+        .largest_retained_attachments(NOW, None, None, 8)
+        .unwrap();
+    assert_eq!(
+        largest
+            .iter()
+            .map(|entry| entry.byte_count)
+            .collect::<Vec<_>>(),
+        vec![
+            big.len() as u64,
+            big.len() as u64,
+            mid.len() as u64,
+            small.len() as u64
+        ]
+    );
+    let mut paged = Vec::new();
+    let mut after = None;
+    loop {
+        let page = app
+            .largest_retained_attachments(NOW, None, after.as_ref(), 1)
+            .unwrap();
+        let Some(last) = page.last() else { break };
+        after = Some(last.cursor());
+        paged.extend(page);
+    }
+    assert_eq!(paged, largest);
+    let in_group = app
+        .largest_retained_attachments(NOW, Some(GROUP), None, 8)
+        .unwrap();
+    assert_eq!(in_group.len(), 2);
+    assert!(in_group.iter().all(|entry| entry.group_id_hex == GROUP));
+    assert!(
+        app.largest_retained_attachments(NOW, None, None, 0)
+            .is_err()
+    );
+    assert!(app.attachment_storage_by_chat(NOW, None, 257).is_err());
+}
+
+/// Bulk removal is explicit Remove: suppression recorded, bodies of both
+/// layouts gone, released media files reported for an immediate unlink, and
+/// a file another attachment still shares kept.
+#[test]
+fn bulk_removal_releases_files_and_respects_its_filters() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let shared = sized(60_000, 4);
+    let old_media = fixture.claimed_in(GROUP, &"e".repeat(64), &shared, 100);
+    let PublishOutcome::Published(shared_id) = fixture.publish(&old_media, &shared) else {
+        panic!("published");
+    };
+    let new_twin = fixture.claimed_in(OTHER_GROUP, &"f".repeat(64), &shared, 5_000);
+    assert!(matches!(
+        fixture.publish(&new_twin, &shared),
+        PublishOutcome::Existing(_)
+    ));
+    let own = sized(20_000, 5);
+    let old_own = fixture.claimed_in(GROUP, &"1".repeat(64), &own, 200);
+    let PublishOutcome::Published(own_id) = fixture.publish(&old_own, &own) else {
+        panic!("published");
+    };
+    let legacy_body = sized(10_000, 6);
+    let old_legacy = fixture.claimed_in(GROUP, &"2".repeat(64), &legacy_body, 300);
+    fixture.legacy(&old_legacy, &legacy_body);
+    let recent = sized(7_000, 7);
+    let recent_job = fixture.claimed_in(GROUP, &"3".repeat(64), &recent, 9_000);
+    assert!(matches!(
+        fixture.publish(&recent_job, &recent),
+        PublishOutcome::Published(_)
+    ));
+
+    // Received before 1,000 across the account: the three old attachments.
+    let removal = app
+        .remove_retained_attachments(NOW, None, Some(1_000))
+        .unwrap();
+    assert_eq!(removal.removed, 3);
+    assert!(!removal.more);
+    assert_eq!(
+        removal.released_files,
+        vec![own_id],
+        "the shared file is still held"
+    );
+    assert_eq!(app.attachment_storage_usage(NOW).unwrap().legacy_bytes, 0);
+    for job in [&old_media, &old_own, &old_legacy] {
+        assert!(fixture.read(job).is_none());
+    }
+    assert_eq!(fixture.read(&new_twin).unwrap(), shared);
+    assert_eq!(fixture.read(&recent_job).unwrap(), recent);
+    let suppressed: i64 = fixture
+        .store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM attachment_removal_suppression",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(suppressed, 3, "removed attachments show as removed by you");
+    fixture.media.unlink_released(&removal.released_files);
+    assert!(
+        !fixture.media.path(&own_id).exists(),
+        "unlinked at once, not at the sweep"
+    );
+    assert!(fixture.media.path(&shared_id).exists());
+
+    // One chat: its last holder releases the shared file.
+    let chat = app
+        .remove_retained_attachments(NOW, Some(OTHER_GROUP), None)
+        .unwrap();
+    assert_eq!(
+        (chat.removed, chat.released_files.clone()),
+        (1, vec![shared_id])
+    );
+    assert_eq!(
+        fixture.read(&recent_job).unwrap(),
+        recent,
+        "other chats untouched"
+    );
+    assert_eq!(
+        app.remove_retained_attachments(NOW, Some(OTHER_GROUP), None)
+            .unwrap(),
+        AttachmentRemoval::default()
+    );
+}
+
+/// The single explicit Remove reports the media file it released.
+#[test]
+fn explicit_remove_reports_its_released_file() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let content = sized(30_000, 8);
+    let job = fixture.claimed_in(GROUP, &"4".repeat(64), &content, NOW);
+    let PublishOutcome::Published(id) = fixture.publish(&job, &content) else {
+        panic!("published");
+    };
+    assert_eq!(
+        app.remove_attachment_reference_releasing(&job.reference)
+            .unwrap(),
+        Some(vec![id])
+    );
+    assert_eq!(
+        app.remove_attachment_reference_releasing(&job.reference)
+            .unwrap(),
+        None,
+        "nothing left to remove"
+    );
+}
+
+/// A file two attachments of one chat share counts once in that chat, while
+/// two distinct files of equal length both count.
+#[test]
+fn a_chat_counts_each_stored_file_once() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let shared = sized(50_000, 10);
+    let first = fixture.claimed_in(GROUP, &"5".repeat(64), &shared, NOW);
+    assert!(matches!(
+        fixture.publish(&first, &shared),
+        PublishOutcome::Published(_)
+    ));
+    let second = fixture.claimed_in(GROUP, &"6".repeat(64), &shared, NOW);
+    assert!(matches!(
+        fixture.publish(&second, &shared),
+        PublishOutcome::Existing(_)
+    ));
+    let same_len_a = sized(30_000, 11);
+    let same_len_b = sized(30_000, 12);
+    let a = fixture.claimed_in(GROUP, &"7".repeat(64), &same_len_a, NOW);
+    assert!(matches!(
+        fixture.publish(&a, &same_len_a),
+        PublishOutcome::Published(_)
+    ));
+    let b = fixture.claimed_in(GROUP, &"8".repeat(64), &same_len_b, NOW);
+    assert!(matches!(
+        fixture.publish(&b, &same_len_b),
+        PublishOutcome::Published(_)
+    ));
+    let chats = app.attachment_storage_by_chat(NOW, None, 8).unwrap();
+    assert_eq!(chats.len(), 1);
+    assert_eq!(
+        chats[0].bytes,
+        (shared.len() + same_len_a.len() + same_len_b.len()) as u64,
+        "the shared file once, both equal-length files"
+    );
+    assert_eq!(chats[0].attachment_count, 4);
+    assert_eq!(
+        app.attachment_storage_usage(NOW).unwrap().media_bytes,
+        chats[0].bytes
+    );
+}

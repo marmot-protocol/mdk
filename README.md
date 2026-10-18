@@ -176,7 +176,7 @@ just ci                      # full local parity with GitHub CI (slow)
 Pull requests run a pre-check of a few minutes: formatting, the static and
 contract gates, dependency audit, workspace clippy and the WASM build. They run
 no tests. The merge queue runs the full matrix on the exact commit it merges:
-workspace tests with the `ci-full` nextest profile, the CLI and relay end-to-end
+every workspace test with the `ci` nextest profile, the CLI and relay end-to-end
 suites, simulator lanes, C bindings, iOS clippy, Windows filesystem contracts,
 Tamarin, Hermes and installer checks. `Required CI` must pass there before a
 change lands. Master pushes run CI only to refresh the Rust dependency caches
@@ -190,8 +190,7 @@ packaging, re-run all candidate-workflow jobs or push a new commit. Ordinary PRs
 skip complete native candidate packaging, including Android target compilation
 and linking; use the opt-in when a change needs that signal before merging.
 Candidate packaging also runs on master when its inputs change, and weekly.
-Existing nightly and weekly campaigns retain their wider coverage. These
-profiles do not change local `just test` or `just ci` selection. Broker image
+Existing nightly and weekly campaigns retain their wider coverage. Broker image
 publishing stays serialized per ref so an older build cannot overwrite a newer
 `latest` image.
 

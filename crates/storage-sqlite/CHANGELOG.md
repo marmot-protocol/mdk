@@ -78,6 +78,16 @@
 
 ### Added
 
+- Manage storage queries (mdk#2314 step 5) on `SqliteAppStorage`:
+  `attachment_storage_usage` (media-store bytes counted once, legacy database
+  bytes, retained attachment count, database size and free pages),
+  `attachment_storage_by_chat` and `largest_retained_attachments` (paged,
+  largest first, with `ChatUsageCursor` / `RetainedSizeCursor`), and
+  `remove_retained_attachments`, a bounded batch of explicit `Remove` by chat
+  and/or received time that reports released media files.
+  `remove_attachment_reference_releasing` is `remove_attachment_reference`
+  returning the media files it released, for an immediate unlink.
+
 - `retained_attachment_descriptor` returns a source slot's `imeta` tag and
   source epoch, for naming a local copy of a retained body (mdk#2314 step 4).
 

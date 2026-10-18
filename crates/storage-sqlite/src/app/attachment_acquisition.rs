@@ -791,32 +791,7 @@ impl SqliteAppStorage {
     ) -> StorageResult<bool> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let exists: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM attachment_history
-                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)
-                 OR EXISTS(SELECT 1 FROM attachment_acquisition
-                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)
-                 OR EXISTS(SELECT 1 FROM attachment_removal_suppression
-                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)",
-                params![group, message, index],
-                |r| r.get(0),
-            ).storage()?;
-            if !exists {
-                return Ok(false);
-            }
-            conn.execute(
-                "INSERT INTO attachment_removal_suppression VALUES(?1,?2,?3) ON CONFLICT DO NOTHING",
-                params![group, message, index],
-            ).storage()?;
-            // A media-backed body's reference cascades away with the job; the
-            // last reference deletes the file's key, and the media store's
-            // sweep unlinks the file.
-            conn.execute(
-                "DELETE FROM attachment_acquisition
-                 WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3",
-                params![group, message, index],
-            ).storage()?;
-            Ok(true)
+            Ok(storage_usage::remove_slot(&conn, group, message, index)?.is_some())
         })
     }
     /// User-authorized download-again only. Clearing suppression and requesting
@@ -1136,6 +1111,11 @@ pub use media::AttachmentPublication;
 
 mod access;
 pub use access::RetainedAttachmentAsset;
+mod storage_usage;
+pub use storage_usage::{
+    ATTACHMENT_REMOVAL_BATCH, AttachmentRemoval, AttachmentStorageUsage, ChatAttachmentUsage,
+    ChatUsageCursor, RetainedAttachmentEntry, RetainedSizeCursor,
+};
 
 mod controls;
 pub use controls::{

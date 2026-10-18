@@ -119,12 +119,13 @@ the pre-check passes, and own the queue result until the change merges.
 ## Verification
 
 GitHub CI is the full gate. Local verification proves your change and stays scoped to it: several agents usually
-build on the same machine, so workspace-wide builds and suites run locally only when a rule below calls for one. On
-every PR, CI runs a pre-check of a few minutes: fmt, the static gates, `cargo audit`, clippy (default and
-`--all-features`) and the WASM build. It runs no tests, so your local tests are the only test signal before the merge
-queue. The merge queue runs the whole matrix (every crate's tests, the simulator, and the C, iOS and Windows lanes)
-and is the merge gate; the `ci:full` label runs that matrix on a PR, `ci:apple` adds only the iOS lane. Master pushes
-only refresh CI's Rust caches, and only when a dependency or toolchain input changes.
+build on the same machine, so workspace-wide builds and suites run locally only when a rule below calls for one. By
+default, CI runs a pre-check of a few minutes on a PR: fmt, the static gates, `cargo audit`, clippy (default and
+`--all-features`) and the WASM build. It runs no tests, so unless the PR carries `ci:full`, your local tests are the
+only test signal before the merge queue. The merge queue runs the whole matrix (every crate's tests, the simulator,
+and the C, iOS and Windows lanes) and is the merge gate; the `ci:full` label runs that matrix on a PR, `ci:apple`
+adds only the iOS lane. Master pushes only refresh CI's Rust caches, and only when a dependency or toolchain input
+changes.
 
 While iterating, run only the test you are working on. Before each push, run once:
 

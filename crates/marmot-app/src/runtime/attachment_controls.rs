@@ -75,7 +75,7 @@ impl MarmotAppRuntime {
         control: AttachmentControl,
     ) -> Result<bool, AppError> {
         let changed = self
-            .attachment_read(account_ref, move |s, _| {
+            .attachment_read_with(account_ref, move |app, label, s, _| {
                 Ok(match control {
                     AttachmentControl::Cancel => {
                         s.app_storage().cancel_attachment_acquisition(&reference)?
@@ -83,8 +83,22 @@ impl MarmotAppRuntime {
                     AttachmentControl::Retry => s
                         .app_storage()
                         .explicitly_retry_attachment(&reference, crate::unix_now_seconds())?,
+                    // The released media files are unlinked now, not at the
+                    // next sweep, so removal frees file-backed space at once.
                     AttachmentControl::Remove => {
-                        s.app_storage().remove_attachment_reference(&reference)?
+                        match s
+                            .app_storage()
+                            .remove_attachment_reference_releasing(&reference)?
+                        {
+                            Some(released) => {
+                                if !released.is_empty() {
+                                    app.account_media_store(label, &s)?
+                                        .unlink_released(&released);
+                                }
+                                true
+                            }
+                            None => false,
+                        }
                     }
                 })
             })

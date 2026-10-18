@@ -8359,6 +8359,10 @@ pub use runtime::{
     MAX_ATTACHMENT_ASSET_LOOKUPS, MAX_ATTACHMENT_HISTORY_PAGE, MAX_ATTACHMENT_LOCAL_READ_BYTES,
     RetainedAttachmentAsset, RuntimeAttachmentTransferSubscription,
 };
+pub use runtime::{
+    AttachmentStorageUsage, ChatAttachmentUsage, ChatUsageCursor, RetainedAttachmentSummary,
+    RetainedSizeCursor,
+};
 
 pub use runtime::{
     AccountAttachmentCursor, AccountAttachmentEntry, AccountAttachmentPage,
