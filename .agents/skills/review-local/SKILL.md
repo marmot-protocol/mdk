@@ -72,24 +72,34 @@ job, and keep each PID. Each seat writes its review to `$REVIEW_DIR/<seat>.md`:
 ```sh
 T="$REVIEW_DIR/tree"
 
-# Codex: the read-only sandbox blocks writes.
-codex exec -s read-only -m gpt-6.1-sol -C "$T" \
+# Codex: the read-only sandbox blocks writes; --ignore-user-config drops the
+# MCP servers in ~/.codex/config.toml, which run outside the sandbox.
+codex exec --ignore-user-config -s read-only -m gpt-6.1-sol -C "$T" \
   -o "$REVIEW_DIR/codex.md" - < "$REVIEW_DIR/prompt.md" > "$REVIEW_DIR/codex.log" 2>&1
 
-# Claude: --restricted ignores personal settings; --tools leaves only read tools.
-(cd "$T" && claude -p --restricted --tools Read Grep Glob --add-dir "$REVIEW_DIR" \
-  --model claude-opus-5-5 < "$REVIEW_DIR/prompt.md") \
+# Claude: --restricted ignores personal settings, --tools leaves only read
+# tools, and --strict-mcp-config drops every MCP server and claude.ai connector.
+(cd "$T" && claude -p --restricted --tools Read Grep Glob --strict-mcp-config \
+  --add-dir "$REVIEW_DIR" --model claude-opus-5-5 < "$REVIEW_DIR/prompt.md") \
   > "$REVIEW_DIR/claude.md" 2> "$REVIEW_DIR/claude.log"
 
-# Cursor: ask mode inside the sandbox. Take the model id from `agent --list-models`.
+# Cursor: ask mode inside the sandbox; ask mode also refuses MCP tools that
+# write. Take the model id from `agent --list-models`.
 agent -p --mode ask --sandbox enabled --trust --workspace "$T" --add-dir "$REVIEW_DIR" \
   --model <grok-*-high-fast> --output-format text "$(cat "$REVIEW_DIR/prompt.md")" \
   > "$REVIEW_DIR/cursor.md" 2> "$REVIEW_DIR/cursor.log"
 ```
 
-Keep the restriction flags. Without `--restricted --tools` and
-`--sandbox enabled`, the Claude and Cursor reviewers could write files into
-the checkout they were reviewing (checked 2026-10-17).
+Keep every restriction flag. Checked on 2026-10-17 and 2026-10-18:
+
+- Without `--restricted --tools`, the Claude reviewer could write into the
+  checkout. Without `--strict-mcp-config`, it still had the user's MCP servers
+  and claude.ai connectors (Drive, Docs, Sheets, Gmail), which edit or share
+  outside the checkout.
+- Without `--sandbox enabled`, the Cursor reviewer could write into the
+  checkout. In ask mode it refused a writing MCP tool call.
+- Without `--ignore-user-config`, the Codex reviewer had a JavaScript REPL
+  MCP server that is not covered by its read-only sandbox.
 
 ## Collect
 

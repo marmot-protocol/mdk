@@ -34,15 +34,13 @@ class ClassifyCiChangesTests(unittest.TestCase):
             },
         )
 
-    def test_shared_agent_skills_use_short_lane(self) -> None:
-        result = classify(
-            [
-                ".agents/skills/land-change/SKILL.md",
-                ".agents/skills/review-local/scripts/launch.sh",
-                ".claude/skills",
-            ]
-        )
+    def test_shared_agent_skill_markdown_uses_short_lane(self) -> None:
+        result = classify([".agents/skills/land-change/SKILL.md", ".claude/skills"])
         self.assertFalse(any(result.values()))
+
+    def test_non_markdown_agent_skill_file_fails_open_to_every_lane(self) -> None:
+        result = classify([".agents/skills/review-local/scripts/launch.sh"])
+        self.assertTrue(all(result.values()))
 
     def test_unknown_non_documentation_change_fails_open_to_every_lane(self) -> None:
         result = classify(["integrations/codex/marmot/src/main.rs"])

@@ -67,9 +67,9 @@ the pre-check passes, and own the queue result until the change merges.
   out of `AGENTS.md`; link instead of duplicating.
 - When you add, rename, or remove a crate, binary, `just` recipe, or user-facing command, update the root `README.md`
   crate map and the affected crate README in the same change.
-- Do not add `CLAUDE.md` files or symlinks; `AGENTS.md` is the single agent-instruction file.
+- Do not add `CLAUDE.md` files or `CLAUDE.md` symlinks; `AGENTS.md` is the single agent-instruction file.
 - Shared agent skills live in `.agents/skills/<name>/SKILL.md`, which Codex and Cursor read. Claude Code reads only
-  `.claude/skills`, so that path is a symlink to `.agents/skills`; add skills to `.agents/skills` only.
+  `.claude/skills`, so that path is a symlink to `../.agents/skills`; keep it, and add skills to `.agents/skills` only.
 
 ## Invariants
 

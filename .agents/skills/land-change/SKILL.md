@@ -44,11 +44,15 @@ cargo nextest run -p wn-cli --locked --test cli --features test-policy-overrides
 ```
 
 Keep them as two commands: one invocation would unify features and turn
-`test-policy-overrides` on for the simulator. Both run offline, and together
-they take about two minutes on a warm build. The first simulator build is the
-heaviest compile in the workspace. They use real sockets and settlement
-windows, so a heavily loaded machine can stretch them. If one fails, rerun it
-alone before treating the failure as yours.
+`test-policy-overrides` on for the simulator. Both run offline. The four tests
+take under a minute; the two builds take a few minutes on a warm cache, and the
+first simulator build is the heaviest compile in the workspace. The tests use
+real sockets and settlement windows, so a heavily loaded machine can stretch
+them. If one fails, rerun it alone before treating the failure as yours.
+
+An initial cohort-release PR follows the release exception in the root
+`AGENTS.md` Verification section instead of this step: run only
+`just release-pr-preflight <version>`.
 
 A test that fails locally is yours until shown otherwise. Before calling it
 unrelated, run it on the merge-base (`git merge-base HEAD origin/master`). If it
@@ -141,17 +145,21 @@ Wait for the PR's required pre-check, then enqueue the head you verified and
 had reviewed:
 
 ```sh
-gh pr checks <pr> --required --watch --fail-fast
-gh api graphql \
-  -f query='mutation($id: ID!, $oid: GitObjectID!) { enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid}) { mergeQueueEntry { position } } }' \
-  -f id="$(gh pr view <pr> --json id -q .id)" \
-  -f oid="$(git rev-parse HEAD)"
+gh pr checks <pr> --required --watch --fail-fast &&
+  gh api graphql \
+    -f query='mutation($id: ID!, $oid: GitObjectID!) { enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid}) { mergeQueueEntry { position } } }' \
+    -f id="$(gh pr view <pr> --json id -q .id)" \
+    -f oid="$(git rev-parse HEAD)"
 ```
 
-`expectedHeadOid` makes the enqueue fail if the PR head is not the commit you
-verified. Do not use `gh pr merge`; repository auto-merge is off, so it fails.
+The `&&` keeps a failed pre-check from enqueueing. `expectedHeadOid` makes the
+enqueue fail if the PR head is not the commit you verified. Do not use
+`gh pr merge`; repository auto-merge is off, so it fails.
 
-A failed pre-check is handled like a queue ejection (step 5).
+If the pre-check fails, open this head's pull-request run
+(`gh run list --workflow ci.yml --commit "$(git rev-parse HEAD)"`, then
+`gh run view <id> --log-failed`) and classify the failure with the table in
+step 5.
 
 ## 5. Own the queue result
 
@@ -163,25 +171,43 @@ gh api graphql -F owner='{owner}' -F repo='{repo}' -F n=<pr> -f query='
 query($owner: String!, $repo: String!, $n: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $n) {
-      state isInMergeQueue mergeQueueEntry { state position }
-      timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
-        nodes { ... on RemovedFromMergeQueueEvent { createdAt reason } }
+      state isInMergeQueue
+      timelineItems(last: 1, itemTypes: [ADDED_TO_MERGE_QUEUE_EVENT, REMOVED_FROM_MERGE_QUEUE_EVENT]) {
+        nodes {
+          __typename
+          ... on AddedToMergeQueueEvent { createdAt }
+          ... on RemovedFromMergeQueueEvent { createdAt reason }
+        }
       }
     }
   }
 }'
 ```
 
-- `state: MERGED`: done, go to step 6.
-- `isInMergeQueue: true`: keep waiting. A rebuild because a PR ahead of yours
-  failed is not your failure.
-- `state: OPEN` and `isInMergeQueue: false`: the queue ejected your PR. Fixing
-  that is now your job.
+The node is the PR's latest queue event. Removal events stay in the timeline, so
+judge only the latest one:
 
-On an ejection, find the failing job (`gh run list --workflow ci.yml --event
-merge_group`, then `gh run view <id> --log-failed`) and reproduce the failing
-test by name (`cargo nextest run -p <crate> -E 'test(=<name>)'`). Then decide
-which case it is:
+- `state: MERGED`: done, go to step 6.
+- Latest is `AddedToMergeQueueEvent`: queued, keep waiting. A rebuild because
+  a PR ahead of yours failed is not your failure.
+- Latest is `RemovedFromMergeQueueEvent` after your enqueue, with the PR still
+  `OPEN`: the queue ejected it, and `reason` says why (for example
+  `failed_checks`). Fixing that is now your job.
+- No queue event since your enqueue: it has not been recorded yet, so check
+  again.
+
+On an ejection, find your PR's queue run. Its branch is named
+`gh-readonly-queue/master/pr-<pr>-<sha>`, and other PRs' runs share the list:
+
+```sh
+gh run list --workflow ci.yml --event merge_group --limit 50 \
+  --json databaseId,headBranch,conclusion,createdAt \
+  --jq '.[] | select(.headBranch | startswith("gh-readonly-queue/master/pr-<pr>-"))'
+```
+
+Read the newest one with `gh run view <id> --log-failed`, and reproduce the
+failing test by name (`cargo nextest run -p <crate> -E 'test(=<name>)'`). Then
+decide which case it is:
 
 | Case | How you know | What to do |
 | --- | --- | --- |
