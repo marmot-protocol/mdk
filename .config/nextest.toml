@@ -124,7 +124,7 @@ filter = 'package(wn-cli) & binary(cli)'
 retries = 2
 slow-timeout = { period = "60s", terminate-after = 4 }
 
-# Explicit all-test profile for master, merge groups, manual runs and ci:full.
+# Explicit all-test profile for merge groups, manual runs and ci:full.
 # Ignored tests remain opt-in, just as in the existing ci profile.
 [profile.ci-full]
 retries = 1

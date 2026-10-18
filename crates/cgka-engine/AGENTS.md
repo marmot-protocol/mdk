@@ -473,8 +473,8 @@ cargo test -p cgka-engine --features test-policy-overrides   # suites that insta
 just test-convergence-policy-pin                            # default-build v1 policy pin; never with overrides
 ```
 
-For convergence, delivery, branch-selection, group-data, or multi-client changes, also run the simulator's PR-lane
-selection, or the narrowest simulator gate `crates/cgka-conformance-simulator/AGENTS.md` names:
+For convergence, delivery, branch-selection, group-data, or multi-client changes, also run the simulator's merge-queue
+lane selection, or the narrowest simulator gate `crates/cgka-conformance-simulator/AGENTS.md` names:
 
 ```sh
 just simulator-smoke

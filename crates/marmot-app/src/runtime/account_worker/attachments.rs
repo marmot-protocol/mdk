@@ -310,6 +310,10 @@ pub(super) fn schedule(
         crate::media::file_transfer::sweep_stale_media_staging(
             &crate::media::file_transfer::media_staging_directory(&client.app, &client.state.label),
         );
+        // Handoff copies an earlier process lent out cannot be released any
+        // more; this process's live leases are spared.
+        let handoffs = crate::media::handoff::handoff_directory(&client.app, &client.state.label);
+        tokio::task::spawn_blocking(move || crate::media::handoff::wipe_stale(&handoffs));
         // Reclaim whatever a crash left in the media store before new work.
         spawn_media_sweep(
             admission,

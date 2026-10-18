@@ -110,7 +110,7 @@ Use fresh evidence roots and the saved generated input for reproduction.
 
 ## CI placement
 
-PR CI runs `just simulator-smoke` (ordinary simulator tests and four selected process regressions)
+The merge queue runs `just simulator-smoke` (ordinary simulator tests and four selected process regressions)
 and the Python campaign-contract tests. It does **not** execute the full 72-case app catalog.
 The nightly workflow runs the broader simulator lane and two separate production-policy
 1,024-message app recovery journeys. The weekly hardening lane runs broader engine/container

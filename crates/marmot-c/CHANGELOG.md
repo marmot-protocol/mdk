@@ -10,6 +10,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 ### Added
 
 - Add `marmot_client_new_with_deployment` and the opaque `MarmotDeployment` (`marmot_deployment_white_noise`, `marmot_deployment_neutral`, the `marmot_deployment_set_*` setters, `marmot_deployment_free`): a host passes its recovery relays, discovery indexers, media and image servers, Open Ranking, KeyPackage client preference, moderation label namespace and keychain service at construction. A NULL deployment, and every other constructor, still uses White Noise's until the neutral default lands (host-configuration brief, PR 2). `MarmotClientOptions` is unchanged. Use matching regenerated headers and libraries.
+- Add `marmot_open_attachment_handoff` and `marmot_release_attachment_handoff`
+  (record `MarmotAttachmentHandoff`, freed with `marmot_attachment_handoff_free`,
+  which does not release the lease) for handoff copies of retained attachments
+  (mdk#2314 step 4). Use matching regenerated headers and libraries.
+
 - Add `marmot_cached_public_event_previews` and `marmot_resolve_public_event_preview` (record `MarmotPublicEventPreview`, enum `MarmotPublicEventPreviewState`, freed with `marmot_public_event_preview_free` / `marmot_public_event_preview_list_free`) for cached public Nostr event previews (mdk#1547), and `MARMOT_STATUS_INVALID_PUBLIC_EVENT_REFERENCES` (103) for a read of more than 16 references. Use matching regenerated headers and libraries.
 
 - Add `MARMOT_STATUS_STORAGE_FULL` (106): the device has no room for the operation (mdk#2314).

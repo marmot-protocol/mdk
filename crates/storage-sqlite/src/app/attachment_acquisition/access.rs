@@ -46,6 +46,42 @@ impl SqliteAppStorage {
     }
 }
 
+impl SqliteAppStorage {
+    /// The published descriptor of one original source slot: its `imeta`
+    /// tag (as stored JSON) and source epoch, for naming a local copy of a
+    /// retained body. `None` unless the slot is a currently readable retained
+    /// asset, under exactly the conditions of
+    /// [`Self::retained_attachment_asset`]. Reads no bytes and grants
+    /// nothing: callers still read the body through
+    /// [`Self::retained_attachment_read`].
+    pub fn retained_attachment_descriptor(
+        &self,
+        group: &str,
+        message: &str,
+        source: &str,
+        index: u32,
+        now: u64,
+    ) -> StorageResult<Option<(String, Option<u64>)>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            &format!(
+                "SELECT q.slot_json,q.source_epoch FROM attachment_acquisition q
+                 WHERE q.group_id_hex=?1 AND q.message_id_hex=?2
+                   AND q.source_message_id_hex=?3 AND q.attachment_index=?4
+                   AND q.state=3 AND {RETAINED_BODY} AND {SOURCE_MATCH}
+                   AND (q.expires_at IS NULL OR q.expires_at>?5)"
+            ),
+            params![group, message, source, index, u64_to_i64(now)?],
+            |r| {
+                let epoch: Option<i64> = r.get(1)?;
+                Ok((r.get(0)?, epoch.and_then(|e| u64::try_from(e).ok())))
+            },
+        )
+        .optional()
+        .storage()
+    }
+}
+
 impl AttachmentAssetRef {
     /// Opaque locator, not an authorization grant. Contains no URL/key material.
     pub fn to_opaque(&self) -> String {

@@ -26,6 +26,7 @@ pub(crate) use blossom::fetch_blossom_file_with_transport;
 #[cfg(test)]
 pub(crate) use crypto::{derive_media_file_key, media_aad};
 pub(crate) mod file_transfer;
+pub(crate) mod handoff;
 pub(crate) mod outgoing;
 pub(crate) use crypto::media_hash_from_reference;
 mod group_image;

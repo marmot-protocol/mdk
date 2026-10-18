@@ -51,6 +51,15 @@ before adding behavior or bindings.
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
 | Formal model | `formal/tamarin/AGENTS.md` |
 | Releases | `release.md` |
+| Landing a change (verify, review, PR, merge queue) | `.agents/skills/land-change/SKILL.md` |
+
+## Landing changes
+
+Every change reaches master through the merge queue; nobody pushes to master or bypasses the queue. Verification and
+review happen locally, the PR carries the change, and the queue runs the full CI matrix on the exact commit that
+lands. Follow `.agents/skills/land-change`: targeted tests plus the end-to-end smoke, two independent cross-model
+reviews of the local diff (`.agents/skills/review-local`) until both recommend merge, a short PR, enqueue as soon as
+the pre-check passes, and own the queue result until the change merges.
 
 ## Documentation
 
@@ -59,7 +68,9 @@ before adding behavior or bindings.
   out of `AGENTS.md`; link instead of duplicating.
 - When you add, rename, or remove a crate, binary, `just` recipe, or user-facing command, update the root `README.md`
   crate map and the affected crate README in the same change.
-- Do not add `CLAUDE.md` files or symlinks; `AGENTS.md` is the single agent-instruction file.
+- Do not add `CLAUDE.md` files or `CLAUDE.md` symlinks; `AGENTS.md` is the single agent-instruction file.
+- Shared agent skills live in `.agents/skills/<name>/SKILL.md`, which Codex and Cursor read. Claude Code reads only
+  `.claude/skills`, so that path is a symlink to `../.agents/skills`; keep it, and add skills to `.agents/skills` only.
 
 ## Invariants
 
@@ -109,8 +120,11 @@ before adding behavior or bindings.
 
 GitHub CI is the full gate. Local verification proves your change and stays scoped to it: several agents usually
 build on the same machine, so workspace-wide builds and suites run locally only when a rule below calls for one. On
-every PR, CI runs fmt, the static gates, clippy (default and `--all-features`), and the tests of each changed crate plus
-its transitive dependents (`scripts/select_ci_tests.py`); the `ci:full` label runs the whole matrix.
+every PR, CI runs a pre-check of a few minutes: fmt, the static gates, `cargo audit`, clippy (default and
+`--all-features`) and the WASM build. It runs no tests, so your local tests are the only test signal before the merge
+queue. The merge queue runs the whole matrix (every crate's tests, the simulator, and the C, iOS and Windows lanes)
+and is the merge gate; the `ci:full` label runs that matrix on a PR, `ci:apple` adds only the iOS lane. Master pushes
+only refresh CI's Rust caches, and only when a dependency or toolchain input changes.
 
 While iterating, run only the test you are working on. Before each push, run once:
 
@@ -137,7 +151,8 @@ Widen only for these changes:
   dependents whose behavior you changed.
 - Shared build inputs (`Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `Justfile`, `vendor/`) or
   `.github/workflows/`: `just fast-ci` once.
-- Convergence, delivery, branch-selection, or multi-client behavior: `just simulator-smoke` (the PR-lane selection).
+- Convergence, delivery, branch-selection, or multi-client behavior: `just simulator-smoke` (the merge-queue lane
+  selection).
 - Formal model: `just tamarin`.
 
 Do not run `just ci`, `just test`, `cargo test --workspace`, `--features conformance-slow`, benchmarks, or the

@@ -72,7 +72,7 @@ impl MarmotMediaFileUploadRequest {
 
 /// One operation's control. Query/cancel concurrently; never free during any call on the handle.
 pub struct MarmotMediaFileTransferControl {
-    inner: Arc<MediaFileTransferControlFfi>,
+    pub(crate) inner: Arc<MediaFileTransferControlFfi>,
 }
 impl CFree for MarmotMediaFileTransferControl {
     unsafe fn free_in_place(&mut self) {}
@@ -96,6 +96,7 @@ pub unsafe extern "C" fn marmot_media_file_transfer_control_new(
     })
 }
 /// Cancel before admission starts; once admission starts, delivery belongs to the local-send queue.
+/// For an attachment handoff it stops the copy, and a cancelled copy leaves no file and no lease.
 /// # Safety
 /// control must be live; no concurrent free.
 #[unsafe(no_mangle)]

@@ -78,6 +78,9 @@
 
 ### Added
 
+- `retained_attachment_descriptor` returns a source slot's `imeta` tag and
+  source epoch, for naming a local copy of a retained body (mdk#2314 step 4).
+
 - File-backed outgoing uploads on the media store (mdk#2314 step 3):
   `reserve_attachment_upload` reserves an upload row before its body is staged,
   `attachment_upload_stage` returns its `AttachmentUploadStage`
