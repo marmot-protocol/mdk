@@ -132,7 +132,11 @@ class MergeGatePolicyTests(unittest.TestCase):
         self.assertEqual(used, {"ci", "default"})
         for profile in used:
             with self.subTest(profile=profile):
-                self.assertNotIn("default-filter", profiles.get(profile, {}))
+                config = profiles.get(profile, {})
+                self.assertNotIn("default-filter", config)
+                # Platform overrides can set their own default-filter.
+                for override in config.get("overrides", []):
+                    self.assertNotIn("default-filter", override)
 
     def test_required_ci_aggregates_every_job(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
