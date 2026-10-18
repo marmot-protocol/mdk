@@ -17,7 +17,8 @@ per feature.
 - [Onboarding relay repair](#onboarding-relay-repair)
 - [NIP-46 accounts](#nip-46-accounts)
 - Feature notes: [runtime construction](#runtime-construction), [local sends](#local-sends),
-  [file-backed media upload](#file-backed-media-upload), [account attachment history](#account-attachment-history),
+  [attachment handoff leases](#attachment-handoff-leases), [file-backed media upload](#file-backed-media-upload),
+  [account attachment history](#account-attachment-history),
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
   [Markdown rendering](#markdown-rendering), [identity references and pseudonyms](#identity-references-and-pseudonyms),
   [KeyPackage inventory](#keypackage-inventory), [invitation lookup outcomes](#invitation-lookup-outcomes), [selected chat-list presentation](#selected-chat-list-presentation),
@@ -182,6 +183,21 @@ an explicit loopback relay policy and an optional host secret-store vtable.
 Existing constructors keep their public-only policy. Loopback broker access
 requires a separate publisher trust opt-in; neither permits private or
 link-local endpoints. Local insecure trust is intended only for tests.
+
+## Attachment handoff leases
+
+`marmot_open_attachment_handoff` writes a private plaintext copy of a retained
+attachment for an OS surface that needs a real file and returns its path under a
+lease (NULL with `MARMOT_STATUS_OK` when the attachment is not held locally).
+A copy the disk cannot hold beyond the reserve returns
+`MARMOT_STATUS_STORAGE_FULL`. Call `marmot_release_attachment_handoff` when the
+surface is done: it returns `MARMOT_STATUS_OK` for an unknown or already released
+lease, `MARMOT_STATUS_INVALID_MEDIA_REFERENCE` for a malformed one, and
+`MARMOT_STATUS_IO` when the copy could not be deleted (the lease is kept; retry).
+Freeing the record with `marmot_attachment_handoff_free` does not release the
+lease. Both calls block, and the open holds the calling thread for the whole copy:
+run them off the UI thread. See the
+[shared contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#handoff-leases).
 
 ## File-backed media upload
 

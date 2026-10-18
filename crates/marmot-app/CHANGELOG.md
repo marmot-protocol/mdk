@@ -63,6 +63,14 @@
 
 ### Added
 
+- `MarmotAppRuntime::open_attachment_handoff` and `release_attachment_handoff`
+  (mdk#2314 step 4): a private plaintext copy of a retained attachment, under
+  `<account>/handoff/<lease>/<name>`, lent to an OS surface that needs a real
+  file (package installer, share sheet, "open with", Quick Look). The copy is
+  named after the attachment, deleted on release, with the account, or when
+  the account worker next starts in a new process, and refused with the
+  storage-full error when the disk cannot hold it.
+
 - `MarmotAppRuntime::cached_public_event_previews` and `resolve_public_event_preview` keep verified public Nostr events referenced from message content in the account's directory cache (mdk#1547). The cache adds directory-cache migration 2; an older build refuses the upgraded cache. `AppError` adds `InvalidPublicEventReferences` for batches over 16 references.
 
 - Account-wide local attachment pages expose bounded typed metadata, group/sender/date selection, continuation cursors and retention deadlines. Reads start no acquisition or relay activity.

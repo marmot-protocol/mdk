@@ -9,6 +9,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Add `marmot_open_attachment_handoff` and `marmot_release_attachment_handoff`
+  (record `MarmotAttachmentHandoff`, freed with `marmot_attachment_handoff_free`,
+  which does not release the lease) for handoff copies of retained attachments
+  (mdk#2314 step 4). Use matching regenerated headers and libraries.
+
 - Add `marmot_cached_public_event_previews` and `marmot_resolve_public_event_preview` (record `MarmotPublicEventPreview`, enum `MarmotPublicEventPreviewState`, freed with `marmot_public_event_preview_free` / `marmot_public_event_preview_list_free`) for cached public Nostr event previews (mdk#1547), and `MARMOT_STATUS_INVALID_PUBLIC_EVENT_REFERENCES` (103) for a read of more than 16 references. Use matching regenerated headers and libraries.
 
 - Add `MARMOT_STATUS_STORAGE_FULL` (106): the device has no room for the operation (mdk#2314).

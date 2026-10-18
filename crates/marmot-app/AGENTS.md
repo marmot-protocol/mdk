@@ -66,6 +66,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   held open by the store's `CheckpointReader`, or one `media-staging/` file without a validator; authenticated into a
   discard sink before the receipt and decrypted by `DecryptingReader` straight into the store publish; never write a
   plaintext file for a download) and the `MediaFileTransferControl` cancellation/progress handle.
+- `media/handoff.rs` owns handoff leases (mdk#2314 step 4): the only plaintext attachment files MDK writes, decrypted from a
+  retained body (either layout) into `<account>/handoff/<lease>/<name>` for an OS surface that needs a real file.
+  Register a lease before its directory exists, delete only on explicit release or by `wipe_stale` (worker start,
+  sparing this process's live leases and never following a symlink), and never sync, rename or lock these files.
 - `media/outgoing.rs` owns the send path on the media store (mdk#2314 step 3): `SendStaging` admits each body with
   `DiskPolicy::send_need` (a shortfall is `StorageError::Capacity`, which bindings surface as `StorageFull`), reserves
   an `outgoing_attachment_uploads` row and stages the body as that row's file before the first PUT; `upload_staged`

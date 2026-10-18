@@ -1019,7 +1019,10 @@ removal and cursor ownership. `list_media` remains a compatibility API.
 Use `attachmentLocalAssets` to locate verified retained bytes for visible source
 slots, then `readAttachmentAsset` for bounded local chunks without network work.
 See [the native attachment handoff](ATTACHMENT-ACCESS.md) for unavailable/EOF semantics,
-source revalidation, host buffer ownership and integration guidance. Acquisition
+source revalidation, host buffer ownership and integration guidance. For an OS surface
+that needs a real file (package installer, share sheet, "open with", Quick Look), use
+`openAttachmentHandoff` and release its lease when done; see
+[handoff leases](ATTACHMENT-ACCESS.md#handoff-leases). Acquisition
 defaults on with bounded per-account policy. Native progress snapshots/subscriptions
 and durable cancellation, retry, remove and download-again controls use the same source slots.
 

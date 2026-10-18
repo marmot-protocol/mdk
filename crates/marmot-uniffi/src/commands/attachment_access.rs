@@ -1,8 +1,10 @@
 use crate::conversions::{
-    AttachmentLocalAssetFfi, AttachmentLocalBytesFfi, AttachmentLocalTargetFfi, group_id_from_hex,
+    AttachmentHandoffFfi, AttachmentLocalAssetFfi, AttachmentLocalBytesFfi,
+    AttachmentLocalTargetFfi, MediaFileTransferControlFfi, group_id_from_hex,
 };
 use crate::{Marmot, MarmotKitError};
 use marmot_app::{AppError, AttachmentAssetRef, MAX_ATTACHMENT_ASSET_LOOKUPS};
+use std::sync::Arc;
 
 #[marmot_uniffi_macros::on_tokio_runtime]
 #[uniffi::export]
@@ -55,6 +57,50 @@ impl Marmot {
             .await?
             .into())
     }
+
+    /// Write a plaintext copy of one retained attachment for an OS surface
+    /// that needs a real file (package installer, share sheet, "open with",
+    /// Quick Look) and lend it under a lease. `None` means the attachment is
+    /// not held locally, as `attachment_local_assets` reports it. The copy
+    /// stays until `release_attachment_handoff`, account removal, or the
+    /// account worker's next start in a new process; removing the attachment
+    /// does not revoke it. `control` reports copied bytes and cancels the
+    /// copy. `StorageFull` when the disk cannot hold the copy beyond the
+    /// reserve. No network or download is started.
+    ///
+    /// Cancel a handoff only through `control`, which always leaves no copy
+    /// and no lease. Do not cancel the awaiting coroutine or task: if that
+    /// happens just as the call completes, the result can be dropped before
+    /// the host sees the lease, and the copy then stays until the account
+    /// worker's next start in a new process, which deletes it.
+    // Polled on the caller, never spawned: a spawned export could finish and
+    // drop the lease while a cancelled host never collects it. Dropped on
+    // the caller, the pending copy is discarded instead.
+    #[marmot_uniffi_macros::receive]
+    pub async fn open_attachment_handoff(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+        target: AttachmentLocalTargetFfi,
+        control: Arc<MediaFileTransferControlFfi>,
+    ) -> Result<Option<AttachmentHandoffFfi>, MarmotKitError> {
+        let group = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .open_attachment_handoff(&account_ref, &group, target.into(), control.inner.clone())
+            .await?
+            .map(Into::into))
+    }
+
+    /// Delete a handoff copy once the OS surface is done with it. An unknown
+    /// or already released lease is not an error. A malformed lease returns
+    /// `InvalidMediaReference`, which no retry fixes. A copy that cannot be
+    /// deleted returns `Io` and stays leased: retry the release. A release
+    /// the host stops waiting for still runs to completion.
+    #[marmot_uniffi_macros::survives_cancellation]
+    pub async fn release_attachment_handoff(&self, lease: String) -> Result<(), MarmotKitError> {
+        Ok(self.runtime.release_attachment_handoff(&lease).await?)
+    }
 }
 
 #[cfg(test)]
@@ -92,6 +138,26 @@ mod tests {
             .unwrap();
         assert!(!bytes.available);
         assert!(bytes.bytes.is_empty());
+        let control = MediaFileTransferControlFfi::new();
+        assert!(
+            kit.open_attachment_handoff(
+                "alice".into(),
+                "ab".repeat(16),
+                target.clone(),
+                control.clone()
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "an attachment not held locally has no handoff"
+        );
+        kit.release_attachment_handoff("cd".repeat(16))
+            .await
+            .unwrap();
+        assert!(matches!(
+            kit.release_attachment_handoff("not-a-lease".into()).await,
+            Err(MarmotKitError::InvalidMediaReference { .. })
+        ));
         assert!(
             kit.read_attachment_asset("alice".into(), "bad".into(), 0, 1)
                 .await
@@ -129,6 +195,21 @@ mod tests {
             kit.read_attachment_asset("alice".into(), absent, 0, 1)
                 .await
                 .is_err()
+        );
+        assert!(
+            kit.open_attachment_handoff(
+                "alice".into(),
+                "ab".repeat(16),
+                AttachmentLocalTargetFfi {
+                    message_id_hex: "aa".repeat(32),
+                    source_message_id_hex: "bb".repeat(32),
+                    attachment_index: 0,
+                },
+                MediaFileTransferControlFfi::new(),
+            )
+            .await
+            .is_err(),
+            "a closed runtime refuses new handoffs"
         );
     }
 }

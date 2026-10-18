@@ -20,7 +20,8 @@ Proc macros used only by `crates/marmot-uniffi`. What the macro does and why: [`
 - The expansion names `crate::tokio_runtime`; it is only meaningful inside `marmot-uniffi`.
 - A spawned export is not cancel-safe for a receive: it can consume an update the cancelled caller never collects.
   Keep every subscription receive on `receive`; `subscription_receives_poll_on_the_caller` enforces it for `next` and
-  `next_update`.
+  `next_update`. An export whose result owns something the host must release (`open_attachment_handoff`'s lease) is
+  `receive` too, so a cancelled host drops the pending result and its cleanup runs; the same test enforces it.
 - `marmot-uniffi`'s `tokio_runtime::tests::every_async_export_block_runs_on_the_tokio_runtime` fails if an async
   export block lacks this attribute. Keep it in step with the attribute's spelling.
 

@@ -124,6 +124,13 @@ account database stays the authority: each file's random key and state live in i
   is gone. A finished download is authenticated in place and decrypted straight into the store's encrypted pending
   file, so a downloaded body never exists as a plaintext file. A body served without a strong validator cannot
   checkpoint and stages its ciphertext in one private `media-staging/` file instead.
+- **Handoff copies are the only plaintext attachment files.** A handoff lease (`marmot-app` `media/handoff.rs`) decrypts one
+  retained attachment into `<account>/handoff/<lease>/<name>` (directory 0700, file 0600, created through
+  `fs-private`) for an OS surface that needs a real file. It is written without sync or rename and never needs to
+  survive a crash. It is deleted on explicit release, with the account directory, and by the wipe when an account
+  worker starts, which spares this process's live leases so a runtime rebuilt after `shutdown_and_close` keeps a copy
+  a share sheet is still reading. Closing refuses new handoffs but does not delete existing copies. Handoff files
+  take no locks.
 - **Terminal close covers media.** Once the account database closes, or the store's own close latch is tripped, media
   reads (including open readers), writes and sweeps fail with `Closed`. The store joins the runtime's close path; it
   never adds a second one.

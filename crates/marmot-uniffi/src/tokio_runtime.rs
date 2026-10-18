@@ -266,7 +266,8 @@ mod tests {
     }
 
     /// A spawned receive could consume an update its cancelled caller never
-    /// collects, so subscription receives stay on the caller's thread.
+    /// collects, and a spawned export could drop a lease its cancelled caller
+    /// never learns of, so both stay on the caller's thread.
     #[test]
     fn subscription_receives_poll_on_the_caller() {
         fn visit(dir: &Path, unmarked: &mut Vec<String>) {
@@ -283,8 +284,11 @@ mod tests {
                 let lines: Vec<&str> = source.lines().collect();
                 for (index, line) in lines.iter().enumerate() {
                     let line = line.trim();
+                    // Subscription receives, and exports whose result owns
+                    // something the host must release (a handoff lease).
                     let receive = line.starts_with("pub async fn next(")
-                        || line.starts_with("pub async fn next_update(");
+                        || line.starts_with("pub async fn next_update(")
+                        || line.starts_with("pub async fn open_attachment_handoff(");
                     if receive
                         && (index == 0
                             || lines[index - 1].trim() != "#[marmot_uniffi_macros::receive]")
@@ -302,7 +306,7 @@ mod tests {
         );
         assert!(
             unmarked.is_empty(),
-            "subscription receives without #[receive]: {unmarked:#?}"
+            "receives and lease-returning exports without #[receive]: {unmarked:#?}"
         );
     }
 

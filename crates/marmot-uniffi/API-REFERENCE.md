@@ -550,7 +550,7 @@ pub async fn attachment_local_assets( &self, account_ref: String, group_id_hex: 
 
 Local-only metadata for up to 64 original source slots in one group. Results preserve input order/duplicates. No bytes are loaded, jobs queued, downloads started or engine state hydrated. Requires no runtime start.
 
-[Source](src/commands/attachment_access.rs#L13)
+[Source](src/commands/attachment_access.rs#L15)
 
 ### `Marmot::read_attachment_asset`
 
@@ -562,7 +562,31 @@ pub async fn read_attachment_asset( &self, account_ref: String, reference: Strin
 
 Read 1..=1048576 bytes at an offset from an opaque local asset reference. Unavailable is distinct from available/empty EOF. Every call rechecks source visibility, expiry and account/store identity. No network fallback. Hosts own decoding and must discard assembled bytes if a chunk is unavailable.
 
-[Source](src/commands/attachment_access.rs#L44)
+[Source](src/commands/attachment_access.rs#L46)
+
+### `Marmot::open_attachment_handoff`
+
+**Current.**
+
+```rust
+pub async fn open_attachment_handoff( &self, account_ref: String, group_id_hex: String, target: AttachmentLocalTargetFfi, control: Arc<MediaFileTransferControlFfi>, ) -> Result<Option<AttachmentHandoffFfi>, MarmotKitError>
+```
+
+Write a plaintext copy of one retained attachment for an OS surface that needs a real file (the Android package installer, the share sheet, "open with", Quick Look) and lend it under a lease. Use it only for those surfaces; in-app display and playback keep using `read_attachment_asset`. `None` means the attachment is not held locally, exactly as `attachment_local_assets` reports it; no download is started. The copy is `<account>/handoff/<lease>/<file_name>`, created owner-only, where `file_name` is the attachment's own name made safe (basename only, no separators, control characters or edge dots, at most 128 bytes) with an extension from the media type when it had none. It stays until `release_attachment_handoff`, account removal, or the account worker's next start in a new process; `shutdown_and_close` refuses new handoffs but keeps existing copies, and removing the attachment does not revoke a lease. Each call makes a separate copy. `control` reports copied bytes and cancels the copy, which then leaves nothing. Cancel only through `control`, never by cancelling the awaiting coroutine or task: a call cancelled just as it completes can drop the lease before the host sees it, leaving the copy until the account worker's next start in a new process deletes it. A copy the disk cannot hold beyond the attachment policy's `disk_reserve` fails with `StorageFull`. Works for bodies in the media store and in the legacy database layout. See [the handoff contract](ATTACHMENT-ACCESS.md#handoff-leases).
+
+[Source](src/commands/attachment_access.rs#L80)
+
+### `Marmot::release_attachment_handoff`
+
+**Current.**
+
+```rust
+pub async fn release_attachment_handoff(&self, lease: String) -> Result<(), MarmotKitError>
+```
+
+Delete a handoff copy once the OS surface is done with it (the installer or share activity returned, the controller was dismissed). Idempotent: an unknown or already released lease succeeds; a malformed one is rejected with `InvalidMediaReference`, which no retry fixes. A copy that cannot be deleted returns `Io` and stays leased, so retry the release. Do not use the path afterwards.
+
+[Source](src/commands/attachment_access.rs#L101)
 
 </details>
 
@@ -2444,7 +2468,6 @@ pub fn message_reactions( &self, account_ref: String, group_id_hex: String, mess
 Read every effective user/emoji pair for an exact account/group/message. Use for reaction details, because conversation references contain only a bounded preview. Returns one local snapshot, ordered by timestamp/sender/emoji, with duplicate events collapsed to the latest pair. Blocked reactors and hidden, deleted, invalidated or retention-pruned targets are excluded. Run off the UI thread, refresh on installed conversation revisions, and discard results when the owning screen closes. No network work, localization or durable client cache is involved; records are caller-owned. See [conversation details](CONVERSATION-WINDOW.md#complete-reaction-details).
 
 [Source](src/commands/timeline.rs#L19)
-
 
 ### `Marmot::poll_votes`
 
@@ -4615,3 +4638,4 @@ Fetch one referenced event from at most two safe relay hints plus the configured
 [Source](src/commands/public_event_preview.rs#L83)
 
 </details>
+

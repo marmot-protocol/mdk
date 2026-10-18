@@ -51,6 +51,15 @@ before adding behavior or bindings.
 | Architecture docs | `docs/AGENTS.md` and `docs/marmot-architecture/AGENTS.md` |
 | Formal model | `formal/tamarin/AGENTS.md` |
 | Releases | `release.md` |
+| Landing a change (verify, review, PR, merge queue) | `.agents/skills/land-change/SKILL.md` |
+
+## Landing changes
+
+Every change reaches master through the merge queue; nobody pushes to master or bypasses the queue. Verification and
+review happen locally, the PR carries the change, and the queue runs the full CI matrix on the exact commit that
+lands. Follow `.agents/skills/land-change`: targeted tests plus the end-to-end smoke, two independent cross-model
+reviews of the local diff (`.agents/skills/review-local`) until both recommend merge, a short PR, enqueue as soon as
+the pre-check passes, and own the queue result until the change merges.
 
 ## Documentation
 
@@ -59,7 +68,9 @@ before adding behavior or bindings.
   out of `AGENTS.md`; link instead of duplicating.
 - When you add, rename, or remove a crate, binary, `just` recipe, or user-facing command, update the root `README.md`
   crate map and the affected crate README in the same change.
-- Do not add `CLAUDE.md` files or symlinks; `AGENTS.md` is the single agent-instruction file.
+- Do not add `CLAUDE.md` files or `CLAUDE.md` symlinks; `AGENTS.md` is the single agent-instruction file.
+- Shared agent skills live in `.agents/skills/<name>/SKILL.md`, which Codex and Cursor read. Claude Code reads only
+  `.claude/skills`, so that path is a symlink to `../.agents/skills`; keep it, and add skills to `.agents/skills` only.
 
 ## Invariants
 

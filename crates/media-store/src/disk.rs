@@ -50,6 +50,12 @@ impl DiskPolicy {
         body
     }
 
+    /// Bytes a handoff copy of a `body`-byte attachment writes: the plaintext
+    /// file the host borrows.
+    pub fn handoff_need(body: u64) -> u64 {
+        body
+    }
+
     /// The inverse of [`Self::download_need`]: the fewest checkpointed bytes
     /// with which a download of `body` bytes still writes at most
     /// `available`, or `None` when even a complete checkpoint leaves too
@@ -96,6 +102,14 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn sends_and_handoffs_need_exactly_the_body() {
+        for body in [0, 1, 50, 1 << 40] {
+            assert_eq!(DiskPolicy::send_need(body), body);
+            assert_eq!(DiskPolicy::handoff_need(body), body);
         }
     }
 

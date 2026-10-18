@@ -1658,6 +1658,18 @@ typedef struct MarmotAttachmentLocalBytes {
 } MarmotAttachmentLocalBytes;
 
 /**
+ * A plaintext copy of a retained attachment lent to the host. Pass path
+ * to the OS surface that needs a file, then release lease when it is done.
+ */
+typedef struct MarmotAttachmentHandoff {
+  char *lease;
+  char *path;
+  uint64_t byte_count;
+  char *media_type;
+  char *file_name;
+} MarmotAttachmentHandoff;
+
+/**
  * Borrowed original source slot from a timeline/history entry. Strings must be
  * NUL-terminated; caller retains ownership throughout the call.
  */
@@ -6050,6 +6062,48 @@ void marmot_attachment_local_asset_list_free(struct MarmotAttachmentLocalAssetLi
 void marmot_attachment_local_bytes_free(struct MarmotAttachmentLocalBytes *ptr);
 
 /**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_attachment_handoff_free(struct MarmotAttachmentHandoff *ptr);
+
+/**
+ * Write a plaintext copy of one retained attachment for an OS surface that
+ * needs a real file, lent under a lease. Writes NULL with MARMOT_STATUS_OK when
+ * the attachment is not held locally. MARMOT_STATUS_STORAGE_FULL when the disk
+ * cannot hold the copy beyond the reserve. The control reports copied bytes and
+ * cancels. Free the record with marmot_attachment_handoff_free; that does not
+ * release the lease. Blocking for the whole copy: call off the UI thread.
+ * Cancel the copy with marmot_media_file_transfer_control_cancel from
+ * another thread; a cancelled copy leaves no file and no lease.
+ * # Safety
+ * Client, control and strings must be live; target must point to a valid
+ * target whose strings stay valid until return; out must be writable.
+ */
+MarmotStatus marmot_open_attachment_handoff(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            const char *group_id_hex,
+                                            const struct MarmotAttachmentLocalTarget *target,
+                                            const struct MarmotMediaFileTransferControl *control,
+                                            struct MarmotAttachmentHandoff **out);
+
+/**
+ * Delete a handoff copy once the OS surface is done with it. An unknown or
+ * already released lease returns MARMOT_STATUS_OK; a malformed lease returns
+ * MARMOT_STATUS_INVALID_MEDIA_REFERENCE. A copy that cannot be deleted
+ * returns MARMOT_STATUS_IO and stays leased, so the call can be retried.
+ * Blocking: call off the UI thread.
+ * # Safety
+ * Client and lease must be live NUL-terminated inputs.
+ */
+MarmotStatus marmot_release_attachment_handoff(const struct MarmotClient *client,
+                                               const char *lease);
+
+/**
  * Look up up to 64 original slots in one group, preserving input order/duplicates.
  * Does not load bytes, enqueue demand, start a worker or perform network work.
  * # Safety
@@ -9860,6 +9914,7 @@ MarmotStatus marmot_media_file_transfer_control_new(struct MarmotMediaFileTransf
 
 /**
  * Cancel before admission starts; once admission starts, delivery belongs to the local-send queue.
+ * For an attachment handoff it stops the copy, and a cancelled copy leaves no file and no lease.
  * # Safety
  * control must be live; no concurrent free.
  */

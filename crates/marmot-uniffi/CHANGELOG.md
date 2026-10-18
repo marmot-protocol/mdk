@@ -31,6 +31,13 @@
 
 ### Added
 
+- `open_attachment_handoff` and `release_attachment_handoff`, with record
+  `AttachmentHandoffFfi` (mdk#2314 step 4): a private plaintext copy of a
+  retained attachment, lent under a lease to an OS surface that needs a real
+  file (package installer, share sheet, "open with", Quick Look). Release it
+  when the surface is done, and cancel a copy only through its control, not by
+  cancelling the awaiting coroutine. See [handoff leases](ATTACHMENT-ACCESS.md#handoff-leases).
+
 - `Marmot::cached_public_event_previews` and `Marmot::resolve_public_event_preview` cache verified public Nostr events referenced from message content (mdk#1547). Cached reads are network-free and survive restarts; resolve fetches missing or stale previews. See [public event previews](README.md#public-event-previews).
 
 - Account-wide attachment candidate pages, group/sender/date queries and opaque account/query-bound cursor/version handles. Filtered empty pages can continue; source changes require restart. Existing group history and acquisition primitives are unchanged.
