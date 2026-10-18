@@ -680,3 +680,46 @@ fn explicit_remove_reports_its_released_file() {
         "nothing left to remove"
     );
 }
+
+/// A file two attachments of one chat share counts once in that chat, while
+/// two distinct files of equal length both count.
+#[test]
+fn a_chat_counts_each_stored_file_once() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let shared = sized(50_000, 10);
+    let first = fixture.claimed_in(GROUP, &"5".repeat(64), &shared, NOW);
+    assert!(matches!(
+        fixture.publish(&first, &shared),
+        PublishOutcome::Published(_)
+    ));
+    let second = fixture.claimed_in(GROUP, &"6".repeat(64), &shared, NOW);
+    assert!(matches!(
+        fixture.publish(&second, &shared),
+        PublishOutcome::Existing(_)
+    ));
+    let same_len_a = sized(30_000, 11);
+    let same_len_b = sized(30_000, 12);
+    let a = fixture.claimed_in(GROUP, &"7".repeat(64), &same_len_a, NOW);
+    assert!(matches!(
+        fixture.publish(&a, &same_len_a),
+        PublishOutcome::Published(_)
+    ));
+    let b = fixture.claimed_in(GROUP, &"8".repeat(64), &same_len_b, NOW);
+    assert!(matches!(
+        fixture.publish(&b, &same_len_b),
+        PublishOutcome::Published(_)
+    ));
+    let chats = app.attachment_storage_by_chat(NOW, None, 8).unwrap();
+    assert_eq!(chats.len(), 1);
+    assert_eq!(
+        chats[0].bytes,
+        (shared.len() + same_len_a.len() + same_len_b.len()) as u64,
+        "the shared file once, both equal-length files"
+    );
+    assert_eq!(chats[0].attachment_count, 4);
+    assert_eq!(
+        app.attachment_storage_usage(NOW).unwrap().media_bytes,
+        chats[0].bytes
+    );
+}

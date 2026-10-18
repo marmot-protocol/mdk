@@ -27,8 +27,9 @@ pub struct AttachmentStorageUsage {
     pub database_free_bytes: u64,
 }
 
-/// Retained attachment bytes in one chat. Content shared with other chats
-/// counts in each of them.
+/// Retained attachment bytes in one chat: each stored body once, however
+/// many of the chat's attachments share it. Content shared with other chats
+/// counts in each of them. `attachment_count` counts attachments.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatAttachmentUsage {
     pub group_id_hex: String,
@@ -262,11 +263,20 @@ impl SqliteAppStorage {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(&format!(
+                // One row per stored body within a chat: a media file is
+                // counted once however many of the chat's attachments share
+                // it, while each legacy body is its own stored copy.
                 "SELECT group_id_hex,bytes,attachments FROM (
-                   SELECT q.group_id_hex AS group_id_hex,sum({RETAINED_BYTE_LEN}) AS bytes,
-                          count(*) AS attachments
-                   FROM attachment_acquisition q WHERE {}
-                   GROUP BY q.group_id_hex)
+                   SELECT group_id_hex,sum(len) AS bytes,sum(slots) AS attachments FROM (
+                     SELECT q.group_id_hex AS group_id_hex,max({RETAINED_BYTE_LEN}) AS len,
+                            count(*) AS slots
+                     FROM attachment_acquisition q WHERE {}
+                     GROUP BY q.group_id_hex,coalesce(
+                       'f'||(SELECT hex(mr.file_id) FROM media_file_refs mr
+                             JOIN media_files mf ON mf.id=mr.file_id
+                             WHERE mr.token=q.token AND mf.state=1),
+                       't'||hex(q.token)))
+                   GROUP BY group_id_hex)
                  WHERE bytes<?2 OR (bytes=?2 AND group_id_hex>?3)
                  ORDER BY bytes DESC,group_id_hex LIMIT ?4",
                 retained("?1")
