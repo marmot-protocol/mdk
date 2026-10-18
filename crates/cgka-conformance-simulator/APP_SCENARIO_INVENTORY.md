@@ -119,7 +119,7 @@ seed-7 catalog cases with eight-way participant catch-up, one family at a time, 
 It uses `--generated-only` to exclude fixed journeys and the separately classified invite/rename
 diagnostic. It runs weekly or by manual workflow dispatch, never on PR events.
 
-Focused saved-input regressions and harness tests remain the PR gate for timing fixes. Weekly
+Focused saved-input regressions and harness tests remain the merge-queue gate for timing fixes. Weekly
 workflow execution is a separate result from the verified local catalog run.
 
 ## Recorded validation and remaining gates
