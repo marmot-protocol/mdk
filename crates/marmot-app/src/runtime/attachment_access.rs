@@ -136,7 +136,10 @@ impl MarmotAppRuntime {
     }
 
     /// Deletes a handoff copy. An unknown or already released lease is not
-    /// an error; a malformed one is.
+    /// an error. A malformed lease is `InvalidEncryptedMedia`, which no retry
+    /// fixes. A copy that cannot be deleted is `AppError::Io` (its original
+    /// `ErrorKind`, fixed text): the lease stays registered and the host
+    /// should retry, since the file holds plaintext.
     pub async fn release_attachment_handoff(&self, lease: &str) -> Result<(), AppError> {
         let lease = lease.to_owned();
         tokio::task::spawn_blocking(move || crate::media::handoff::release(&lease))

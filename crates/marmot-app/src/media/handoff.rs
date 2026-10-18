@@ -112,6 +112,7 @@ impl HandoffSource {
                 &target.message_id_hex,
                 &target.source_message_id_hex,
                 target.attachment_index,
+                crate::unix_now_seconds(),
             )?
             .and_then(|(slot, epoch)| {
                 let tag = serde_json::from_str::<Vec<String>>(&slot).ok()?;
@@ -138,7 +139,7 @@ pub(crate) fn handoff_name(file_name: &str, media_type: &str) -> String {
     let base = file_name.rsplit(['/', '\\']).next().unwrap_or_default();
     let cleaned = base
         .chars()
-        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | ':'))
+        .filter(|c| !c.is_control() && !is_bidi_format(*c) && !matches!(c, '/' | '\\' | ':'))
         .collect::<String>();
     let name = cleaned.trim().trim_matches('.').trim();
     let (stem, extension) = match name.rsplit_once('.') {
@@ -159,6 +160,15 @@ pub(crate) fn handoff_name(file_name: &str, media_type: &str) -> String {
         &stem[..cut]
     };
     format!("{stem}.{extension}")
+}
+
+/// Unicode bidirectional formatting characters, which could make a name
+/// display with a different extension than it has (`safe\u{202E}txt.apk`).
+fn is_bidi_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 fn extension_for(media_type: &str) -> &'static str {

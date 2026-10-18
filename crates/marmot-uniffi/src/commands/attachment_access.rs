@@ -87,8 +87,9 @@ impl Marmot {
     }
 
     /// Delete a handoff copy once the OS surface is done with it. An unknown
-    /// or already released lease is not an error. A copy that cannot be
-    /// deleted returns `Io` and stays leased, so release can be retried.
+    /// or already released lease is not an error. A malformed lease returns
+    /// `InvalidMediaReference`, which no retry fixes. A copy that cannot be
+    /// deleted returns `Io` and stays leased: retry the release.
     pub async fn release_attachment_handoff(&self, lease: String) -> Result<(), MarmotKitError> {
         Ok(self.runtime.release_attachment_handoff(&lease).await?)
     }
@@ -145,11 +146,10 @@ mod tests {
         kit.release_attachment_handoff("cd".repeat(16))
             .await
             .unwrap();
-        assert!(
-            kit.release_attachment_handoff("not-a-lease".into())
-                .await
-                .is_err()
-        );
+        assert!(matches!(
+            kit.release_attachment_handoff("not-a-lease".into()).await,
+            Err(MarmotKitError::InvalidMediaReference { .. })
+        ));
         assert!(
             kit.read_attachment_asset("alice".into(), "bad".into(), 0, 1)
                 .await
@@ -187,6 +187,21 @@ mod tests {
             kit.read_attachment_asset("alice".into(), absent, 0, 1)
                 .await
                 .is_err()
+        );
+        assert!(
+            kit.open_attachment_handoff(
+                "alice".into(),
+                "ab".repeat(16),
+                AttachmentLocalTargetFfi {
+                    message_id_hex: "aa".repeat(32),
+                    source_message_id_hex: "bb".repeat(32),
+                    attachment_index: 0,
+                },
+                MediaFileTransferControlFfi::new(),
+            )
+            .await
+            .is_err(),
+            "a closed runtime refuses new handoffs"
         );
     }
 }

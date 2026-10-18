@@ -566,6 +566,8 @@ Read 1..=1048576 bytes at an offset from an opaque local asset reference. Unavai
 
 ### `Marmot::open_attachment_handoff`
 
+**Current.**
+
 ```rust
 pub async fn open_attachment_handoff( &self, account_ref: String, group_id_hex: String, target: AttachmentLocalTargetFfi, control: Arc<MediaFileTransferControlFfi>, ) -> Result<Option<AttachmentHandoffFfi>, MarmotKitError>
 ```
@@ -576,13 +578,15 @@ Write a plaintext copy of one retained attachment for an OS surface that needs a
 
 ### `Marmot::release_attachment_handoff`
 
+**Current.**
+
 ```rust
 pub async fn release_attachment_handoff(&self, lease: String) -> Result<(), MarmotKitError>
 ```
 
-Delete a handoff copy once the OS surface is done with it (the installer or share activity returned, the controller was dismissed). Idempotent: an unknown or already released lease succeeds; a malformed one is rejected with `InvalidMediaReference`. A copy that cannot be deleted returns `Io` and stays leased, so retry the release. Do not use the path afterwards.
+Delete a handoff copy once the OS surface is done with it (the installer or share activity returned, the controller was dismissed). Idempotent: an unknown or already released lease succeeds; a malformed one is rejected with `InvalidMediaReference`, which no retry fixes. A copy that cannot be deleted returns `Io` and stays leased, so retry the release. Do not use the path afterwards.
 
-[Source](src/commands/attachment_access.rs#L92)
+[Source](src/commands/attachment_access.rs#L93)
 
 </details>
 

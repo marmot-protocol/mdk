@@ -166,6 +166,7 @@ mod tests {
     use super::*;
     use crate::commands::marmot_read_attachment_asset;
     use crate::memory::{audit, boxed};
+    use marmot_uniffi::MarmotKitError;
     use std::ptr;
     /// With a real client: NULL inputs are refused before any work, an
     /// unknown account is an error rather than a lease, and release is
@@ -261,6 +262,34 @@ mod tests {
             assert_eq!(crate::marmot_client_shutdown(client), MarmotStatus::Ok);
             crate::marmot_client_free(client);
         }
+    }
+
+    /// The two failures a handoff can report besides bad input reach C as
+    /// distinct statuses: a full disk (retry once space frees) and a failed
+    /// deletion (retry the release), never the malformed-lease status.
+    #[test]
+    fn handoff_failures_map_to_distinct_c_statuses() {
+        // The runtime reports a full disk as StorageFull and a failed
+        // deletion as Io (marmot-uniffi tests the AppError mapping).
+        let status = |error: MarmotKitError| crate::status::status_from_error(&error);
+        assert_eq!(
+            status(MarmotKitError::StorageFull {
+                details: "d".into()
+            }),
+            MarmotStatus::StorageFull
+        );
+        assert_eq!(
+            status(MarmotKitError::Io {
+                details: "d".into()
+            }),
+            MarmotStatus::Io
+        );
+        assert_eq!(
+            status(MarmotKitError::InvalidMediaReference {
+                details: "d".into()
+            }),
+            MarmotStatus::InvalidMediaReference
+        );
     }
 
     #[test]

@@ -189,9 +189,15 @@ link-local endpoints. Local insecure trust is intended only for tests.
 `marmot_open_attachment_handoff` writes a private plaintext copy of a retained
 attachment for an OS surface that needs a real file and returns its path under a
 lease (NULL with `MARMOT_STATUS_OK` when the attachment is not held locally).
-Call `marmot_release_attachment_handoff` when the surface is done; freeing the
-record with `marmot_attachment_handoff_free` does not release the lease. Calls
-block. See the [shared contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#handoff-leases).
+A copy the disk cannot hold beyond the reserve returns
+`MARMOT_STATUS_STORAGE_FULL`. Call `marmot_release_attachment_handoff` when the
+surface is done: it returns `MARMOT_STATUS_OK` for an unknown or already released
+lease, `MARMOT_STATUS_INVALID_MEDIA_REFERENCE` for a malformed one, and
+`MARMOT_STATUS_IO` when the copy could not be deleted (the lease is kept; retry).
+Freeing the record with `marmot_attachment_handoff_free` does not release the
+lease. Both calls block, and the open holds the calling thread for the whole copy:
+run them off the UI thread. See the
+[shared contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#handoff-leases).
 
 ## File-backed media upload
 

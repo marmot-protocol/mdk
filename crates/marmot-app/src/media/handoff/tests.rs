@@ -15,6 +15,16 @@ fn copies_are_named_after_the_attachment_safely_with_an_extension() {
         ("a:b.mp4", "video/mp4", "ab.mp4"),
         ("voice", "audio/mp4; codecs=mp4a", "voice.m4a"),
         ("notes.", "text/plain", "notes.txt"),
+        (
+            "safe\u{202E}txt.apk",
+            "application/vnd.android.package-archive",
+            "safetxt.apk",
+        ),
+        (
+            "\u{2067}invoice\u{2069}.pdf",
+            "application/pdf",
+            "invoice.pdf",
+        ),
     ] {
         assert_eq!(handoff_name(name, media_type), expected, "{name:?}");
     }
@@ -119,7 +129,8 @@ pub(super) fn record_discard_thread() {
 #[test]
 fn an_undelivered_copy_is_discarded_on_the_blocking_pool() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
         .build()
         .unwrap();
     let directory = tempfile::tempdir().unwrap();
@@ -181,7 +192,8 @@ fn a_discard_lost_with_its_runtime_leaves_the_copy_to_the_wipe() {
     std::fs::write(copy.join("left.bin"), b"plaintext").unwrap();
     lock_leases().insert(lease.clone(), copy.clone());
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
         .build()
         .unwrap();
     let handoff = AttachmentHandoff {
