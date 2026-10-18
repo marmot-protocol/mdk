@@ -1506,7 +1506,7 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(
             root.path(),
             url.clone(),
-            marmot_app::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+            marmot_app::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
         );
         let kit = Marmot {
             runtime: app.runtime(),

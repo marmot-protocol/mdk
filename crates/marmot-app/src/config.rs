@@ -293,6 +293,18 @@ impl Default for MarmotAppConfig {
 }
 
 impl MarmotAppConfig {
+    /// Today's defaults with White Noise's deployment as this build compiled
+    /// it ([`MarmotDeployment::white_noise`], with a build-time
+    /// `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` list over its new-group media
+    /// servers). White Noise hosts, and tests of White Noise behaviour, name
+    /// it explicitly so they keep it when [`Default`] turns neutral.
+    pub fn white_noise() -> Self {
+        Self {
+            deployment: compiled_deployment(),
+            ..Self::default()
+        }
+    }
+
     /// Select native or host-managed demand before constructing a runtime.
     pub fn with_attachment_acquisition_mode(mut self, mode: AttachmentAcquisitionMode) -> Self {
         self.attachment_acquisition_mode = mode;
@@ -996,6 +1008,11 @@ mod tests {
             expected.new_group_media_endpoints = compiled;
         }
         assert_eq!(MarmotAppConfig::default().deployment, expected);
+        assert_eq!(
+            MarmotAppConfig::white_noise(),
+            MarmotAppConfig::default(),
+            "until the neutral default lands, the default is White Noise's"
+        );
     }
 
     fn runtime_config() -> RelayTelemetryRuntimeConfig {

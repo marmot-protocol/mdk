@@ -11,7 +11,7 @@ use cgka_traits::app_event::{
     STREAM_TAG,
 };
 use clap::Parser;
-use marmot_account::{AccountHome, DEFAULT_KEYCHAIN_SERVICE_NAME};
+use marmot_account::AccountHome;
 pub(crate) use marmot_app::is_nostr_secret;
 use marmot_app::{
     AccountRelayListStatus, AppError, AppGroupRecord, ChatListRow, MarmotApp, MarmotAppConfig,
@@ -1293,7 +1293,7 @@ fn app_for_role(
     // dev/test (see MarmotAppConfig::allow_loopback_blob_endpoints). Opt in via
     // WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS=1 for local Blossom servers; production
     // installs leave it unset.
-    let mut config = MarmotAppConfig::default()
+    let mut config = MarmotAppConfig::white_noise()
         .with_allow_loopback_blob_endpoints(wn_allow_loopback_blob_endpoints())
         .with_allow_loopback_relay_endpoints(wn_allow_loopback_relays())
         .with_directory_relay_urls(directory_relays);
@@ -1359,7 +1359,7 @@ fn open_account_home(
 fn resolve_keychain_service(keychain_service: Option<String>) -> String {
     keychain_service
         .or_else(|| std::env::var("WN_KEYCHAIN_SERVICE").ok())
-        .unwrap_or_else(|| DEFAULT_KEYCHAIN_SERVICE_NAME.to_owned())
+        .unwrap_or_else(|| marmot_app::MarmotDeployment::white_noise().keychain_service)
 }
 
 fn resolve_secret_store(secret_store: Option<SecretStoreKind>) -> Result<SecretStoreKind, WnError> {

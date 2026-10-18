@@ -382,7 +382,7 @@ async fn cold_open_before_hydration_and_after_runtime_restart_keeps_history_loca
         let app = MarmotApp::with_relay_and_config(
             h._dir.path(),
             "wss://relay.example",
-            crate::MarmotAppConfig::default().with_dev_startup_hydration_batch_delay_ms(60_000),
+            crate::MarmotAppConfig::white_noise().with_dev_startup_hydration_batch_delay_ms(60_000),
         )
         .with_test_relay_client(h.relay.clone());
         let runtime = MarmotAppRuntime::new(app);

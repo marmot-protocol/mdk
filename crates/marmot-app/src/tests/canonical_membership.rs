@@ -8,7 +8,7 @@ fn app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> Marmo
     MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://relay.example",
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_dev_settlement_quiescence_ms(0)
             .with_dev_scheduled_convergence_delay_ms(0),
     )

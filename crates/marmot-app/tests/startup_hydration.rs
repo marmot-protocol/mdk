@@ -27,7 +27,7 @@ const GROUP_COUNT: usize = 6;
 const BATCH_HOLD_MS: u64 = 30_000;
 
 fn open_store(dir: &tempfile::TempDir, relay_url: &str, hold_ms: Option<u64>) -> MarmotApp {
-    let mut config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let mut config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     if let Some(ms) = hold_ms {
         config = config.with_dev_startup_hydration_batch_delay_ms(ms);
     }

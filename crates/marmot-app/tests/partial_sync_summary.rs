@@ -23,7 +23,7 @@ fn open_store(
     relay_url: &str,
     fail_sync_before_delivery: Option<u64>,
 ) -> MarmotApp {
-    let mut config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let mut config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     if let Some(deliveries) = fail_sync_before_delivery {
         config = config.with_dev_fail_sync_before_delivery(deliveries);
     }
@@ -35,14 +35,14 @@ fn open_store_with_boundary_failure(
     relay_url: &str,
     completed_deliveries: u64,
 ) -> MarmotApp {
-    let config = MarmotAppConfig::default()
+    let config = MarmotAppConfig::white_noise()
         .with_allow_loopback_relay_endpoints(true)
         .with_dev_fail_sync_before_boundary_save(completed_deliveries);
     MarmotApp::with_relay_and_config(dir.path(), relay_url.to_owned(), config)
 }
 
 fn open_store_with_post_ack_failure(dir: &tempfile::TempDir, relay_url: &str) -> MarmotApp {
-    let config = MarmotAppConfig::default()
+    let config = MarmotAppConfig::white_noise()
         .with_allow_loopback_relay_endpoints(true)
         .with_dev_fail_ingest_after_application_event_ack();
     MarmotApp::with_relay_and_config(dir.path(), relay_url.to_owned(), config)
@@ -468,7 +468,7 @@ async fn catch_up_failure_emits_summary_for_earlier_committed_delivery() {
         batch.bob_dir.path(),
         vec![batch.relay_url.clone()],
         AccountHome::open(batch.bob_dir.path()),
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_relay_endpoints(true)
             .with_dev_fail_sync_before_delivery(1),
     )

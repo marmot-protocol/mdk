@@ -144,7 +144,7 @@ async fn run_receive_selected_comparison(shutdown_while_held: bool) {
     let home = AccountHome::open(dir.path());
     let alice = home.create_account("receive_target").unwrap();
     let bob = home.create_account("receive_sender").unwrap();
-    let config = crate::MarmotAppConfig::default()
+    let config = crate::MarmotAppConfig::white_noise()
         .with_allow_loopback_relay_endpoints(true)
         .with_dev_settlement_quiescence_ms(100)
         .with_dev_epoch_backfill_retry_backoff_ms(100);

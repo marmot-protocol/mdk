@@ -60,7 +60,7 @@ fn open_store(
     MarmotApp::with_relay_and_config(
         dir.path(),
         relay_url.to_owned(),
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_relay_endpoints(true)
             .with_cursor_persistence(cursor_persistence),
     )

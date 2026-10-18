@@ -9942,7 +9942,9 @@ MarmotStatus marmot_deployment_white_noise(struct MarmotDeployment **out);
 
 /**
  * No deployment services: every list empty, every option unset, and the
- * neutral keychain service org.marmot-protocol.mdk. Free with
+ * neutral keychain service org.marmot-protocol.mdk. Until the neutral
+ * default lands, an empty new-group media list or an unset group-image or
+ * profile-image server still falls back to White Noise's. Free with
  * marmot_deployment_free.
  * # Safety
  * out must be writable.

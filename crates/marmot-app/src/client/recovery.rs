@@ -2888,7 +2888,7 @@ mod tests {
         let app = crate::MarmotApp::with_relay_and_config(
             directory.path(),
             "wss://relay.example",
-            crate::MarmotAppConfig::default()
+            crate::MarmotAppConfig::white_noise()
                 .with_cursor_persistence(crate::CursorPersistence::Frozen),
         )
         .with_test_relay_client(relay.clone());
@@ -4146,7 +4146,7 @@ mod tests {
         let app = crate::MarmotApp::with_relays_and_config(
             dir.path(),
             endpoints,
-            crate::MarmotAppConfig::default(),
+            crate::MarmotAppConfig::white_noise(),
         )
         .with_test_relay_client(relay.clone());
         let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
@@ -4974,7 +4974,7 @@ mod tests {
         let app = crate::MarmotApp::with_relays_and_config(
             dir.path(),
             vec!["wss://relay.example".into()],
-            crate::MarmotAppConfig::default()
+            crate::MarmotAppConfig::white_noise()
                 .with_allow_loopback_relay_endpoints(true)
                 .with_open_ranking_provider(None, Vec::new())
                 .with_recovery_operated_relays(vec![OPERATED.into()]),

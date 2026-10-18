@@ -204,7 +204,7 @@ mod tests {
             root.path(),
             Vec::new(),
             AccountHome::open(root.path()),
-            MarmotAppConfig::default(),
+            MarmotAppConfig::white_noise(),
         )
         .unwrap();
         let clone = app.clone();

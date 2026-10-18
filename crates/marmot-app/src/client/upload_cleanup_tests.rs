@@ -208,7 +208,7 @@ async fn file_backed_sends_retain_bounded_bodies_and_publish_once() {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://relay.example",
-            crate::MarmotAppConfig::default().with_allow_loopback_blob_endpoints(true),
+            crate::MarmotAppConfig::white_noise().with_allow_loopback_blob_endpoints(true),
         )
         .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
@@ -357,7 +357,7 @@ async fn cancelled_file_upload_is_refused_without_upload_or_admission() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://relay.example",
-        crate::MarmotAppConfig::default().with_allow_loopback_blob_endpoints(true),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_blob_endpoints(true),
     )
     .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
@@ -492,7 +492,7 @@ async fn outgoing_sends_ignore_the_budget_and_refuse_what_they_cannot_stage() {
             let app = MarmotApp::with_relay_and_config(
                 dir.path(),
                 "wss://relay.example",
-                crate::MarmotAppConfig::default().with_allow_loopback_blob_endpoints(true),
+                crate::MarmotAppConfig::white_noise().with_allow_loopback_blob_endpoints(true),
             )
             .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
             let mut client = app.client("alice").await.unwrap();
@@ -739,7 +739,7 @@ async fn staging_does_not_hold_an_account_transaction() {
         cgka_traits::StorageProvider::with_transaction(&probe_storage, |storage| {
             storage.app_storage().attachment_download_policy(
                 &crate::runtime::attachment_controls::default_policy(
-                    &crate::MarmotAppConfig::default(),
+                    &crate::MarmotAppConfig::white_noise(),
                 ),
             )
         })
@@ -769,7 +769,7 @@ async fn a_send_dropped_during_staging_releases_its_upload() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://relay.example",
-        crate::MarmotAppConfig::default().with_allow_loopback_blob_endpoints(true),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_blob_endpoints(true),
     )
     .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
@@ -843,7 +843,7 @@ async fn a_completed_upload_dropped_before_admission_is_released() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://relay.example",
-        crate::MarmotAppConfig::default().with_allow_loopback_blob_endpoints(true),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_blob_endpoints(true),
     )
     .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();

@@ -54,7 +54,7 @@ fn app(path: &Path, relay: &str) -> MarmotApp {
     let app = MarmotApp::with_relay_and_config(
         path,
         relay.to_owned(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     // Enable the same v5 recorder used by the live app path.
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
