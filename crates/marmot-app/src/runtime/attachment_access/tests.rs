@@ -675,3 +675,75 @@ async fn a_finished_but_uncollected_handoff_is_discarded() {
     .expect("the uncollected copy and its lease are discarded");
     runtime.shutdown_and_close().await.unwrap();
 }
+
+/// A symlinked handoff directory is refused, never followed: no plaintext
+/// lands outside the account directory.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_symlinked_handoff_directory_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    seed(&store.app_storage(), &[3; 2048]);
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(
+        &elsewhere,
+        crate::media::handoff::handoff_directory(&app, "alice"),
+    )
+    .unwrap();
+    let runtime = app.runtime();
+    assert!(
+        runtime
+            .open_attachment_handoff(
+                "alice",
+                &GroupId::new(vec![0xab; 16]),
+                target(),
+                Default::default()
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read_dir(&elsewhere).unwrap().count(),
+        0,
+        "nothing written through the link"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A copy admitted just before its account was removed (the account
+/// directory already renamed away) fails instead of recreating the account
+/// directory, and leaves no lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handoff_never_recreates_a_removed_account_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    seed(&store.app_storage(), &[4; 2048]);
+    let source = crate::media::handoff::HandoffSource::find(&store, GROUP, &target(), false)
+        .unwrap()
+        .expect("admitted");
+    let account_dir = app.account_dir("alice");
+    let tombstone = dir.path().join("removed-alice");
+    // What account removal does after admission: the directory moves away.
+    std::fs::rename(&account_dir, &tombstone).unwrap();
+    let control = crate::MediaFileTransferControl::default();
+    assert!(crate::media::handoff::open(&app, "alice", &store, source, &control).is_err());
+    assert!(
+        !account_dir.exists(),
+        "the removed account directory is not recreated"
+    );
+    assert_eq!(
+        crate::media::handoff::live_leases_under(&account_dir),
+        0,
+        "no lease survives"
+    );
+    std::fs::rename(&tombstone, &account_dir).unwrap();
+}

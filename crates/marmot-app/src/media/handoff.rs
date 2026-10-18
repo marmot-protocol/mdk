@@ -366,7 +366,14 @@ fn write_copy(
     path: &Path,
     control: &MediaFileTransferControl,
 ) -> Result<bool, AppError> {
-    fs_private::create_dir_all_private(directory).map_err(handoff_error)?;
+    // One level at a time and never the account directory itself: a
+    // removed account's directory is not recreated, and a symlinked
+    // `handoff` is refused rather than followed out of the account.
+    let root = directory
+        .parent()
+        .ok_or_else(|| AppError::InvalidEncryptedMedia("invalid handoff directory".into()))?;
+    create_private_dir_level(root, true).map_err(handoff_error)?;
+    create_private_dir_level(directory, false).map_err(handoff_error)?;
     // Unbuffered: chunks are already 64 KiB to 1 MiB, and no plaintext is
     // left behind in a writer buffer.
     let mut file = fs_private::create_new_private(path).map_err(handoff_error)?;
@@ -428,6 +435,30 @@ fn write_copy(
     }
     control.check()?;
     Ok(true)
+}
+
+/// Creates one directory level owner-only, without creating parents and
+/// without following a symlink: an existing entry is accepted only when
+/// `existing` allows it and it is a real directory.
+fn create_private_dir_level(path: &Path, existing: bool) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if existing && error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    if !std::fs::symlink_metadata(path)?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "handoff directory must be a real directory",
+        ));
+    }
+    Ok(())
 }
 
 /// Deletes a lease's copy. An unknown or already released lease is not an
