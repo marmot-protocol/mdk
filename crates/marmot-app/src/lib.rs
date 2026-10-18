@@ -7322,16 +7322,6 @@ impl MarmotApp {
         self.root.clone()
     }
 
-    /// Evict every in-memory handle and warm flag bound to `label`.
-    ///
-    /// Must be called before the account directory is deleted on removal or
-    /// setup-failure rollback. Without this, the cached `SqliteAccountStorage`
-    /// connection in `account_storages` (and the `directory_caches` handle)
-    /// keeps pointing at the now-unlinked inode: after the user re-imports the
-    /// same account, the session DB is rebuilt fresh while projection paths
-    /// keep writing through the stale handle, silently losing data. Clearing
-    /// the warm/stale/ready flags forces the rebuilt account to re-warm its
-    /// projections from the fresh database.
     /// Whether `storage` is still the account's current cached handle:
     /// account removal evicts it, so a handle held across a removal (and any
     /// re-import at the same path) is no longer current.
@@ -7347,6 +7337,16 @@ impl MarmotApp {
             .is_some_and(|cached| cached.shares_connection_with(storage))
     }
 
+    /// Evict every in-memory handle and warm flag bound to `label`.
+    ///
+    /// Must be called before the account directory is deleted on removal or
+    /// setup-failure rollback. Without this, the cached `SqliteAccountStorage`
+    /// connection in `account_storages` (and the `directory_caches` handle)
+    /// keeps pointing at the now-unlinked inode: after the user re-imports the
+    /// same account, the session DB is rebuilt fresh while projection paths
+    /// keep writing through the stale handle, silently losing data. Clearing
+    /// the warm/stale/ready flags forces the rebuilt account to re-warm its
+    /// projections from the fresh database.
     fn drop_account_caches(&self, label: &str) {
         // Close live bounded windows before a label can bind to another store.
         let _ = self
