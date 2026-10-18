@@ -30,7 +30,12 @@ use marmot_app::{
 pub use marmot_app::MAX_ATTACHMENT_ASSET_LOOKUPS;
 
 mod commands;
+mod deployment;
 pub use commands::user_blocks::{BlockListSnapshotFfi, BlockListSubscription, BlockedUserFfi};
+pub use deployment::{
+    MarmotDeploymentFfi, OpenRankingProviderFfi, marmot_deployment_neutral,
+    marmot_deployment_white_noise,
+};
 // Public: `marmot-c` builds its `#[repr(C)]` mirrors from these modules so
 // the C ABI can never drift from the Swift/Kotlin surface.
 pub mod conversions;
@@ -196,7 +201,9 @@ pub(crate) fn timeline_query_from_ffi(
 
 /// Composable runtime construction options. Omitted policies use public-only
 /// endpoints and an advancing cursor. Omitted labels stay untagged; omitted
-/// secret storage uses the platform keychain.
+/// secret storage uses the platform keychain under the deployment's
+/// keychain service. An omitted deployment is
+/// [`marmot_deployment_white_noise`] until the neutral default lands.
 #[derive(Clone, Default, uniffi::Record)]
 pub struct MarmotOptions {
     #[uniffi(default = None)]
@@ -214,12 +221,18 @@ pub struct MarmotOptions {
     /// reports why.
     #[uniffi(default = None)]
     pub moderation_report_config: Option<ModerationReportConfigFfi>,
+    /// Deployment services: recovery relays, discovery indexers, media and
+    /// image servers, Open Ranking, KeyPackage client preference, moderation
+    /// label namespace and keychain service. Omitted is
+    /// `marmot_deployment_white_noise()` for now.
+    #[uniffi(default = None)]
+    pub deployment: Option<MarmotDeploymentFfi>,
 }
 
 impl MarmotOptions {
     fn app_config(&self) -> MarmotAppConfig {
         let relay_policy = self.relay_policy.unwrap_or(RelayPolicyFfi::PublicOnly);
-        MarmotAppConfig::default()
+        let config = MarmotAppConfig::default()
             .with_attachment_acquisition_mode(
                 self.attachment_acquisition_mode.unwrap_or_default().into(),
             )
@@ -237,7 +250,11 @@ impl MarmotOptions {
                     .into(),
             )
             .with_key_package_client_name(self.client_name.clone())
-            .with_moderation_report_config(self.moderation_report_config.clone().map(Into::into))
+            .with_moderation_report_config(self.moderation_report_config.clone().map(Into::into));
+        match &self.deployment {
+            Some(deployment) => config.with_deployment(deployment.clone().into()),
+            None => config,
+        }
     }
 }
 
@@ -471,8 +488,9 @@ impl Marmot {
 
 impl Marmot {
     /// Shared open path behind the exported constructors: account home backed
-    /// by `secret_store` (the platform keychain when `None`), app configured
-    /// by `config`, runtime pair.
+    /// by `secret_store` (the platform keychain under the deployment's
+    /// keychain service when `None`), app configured by `config`, runtime
+    /// pair.
     fn open(
         root_path: String,
         relay_urls: Vec<String>,
@@ -485,8 +503,11 @@ impl Marmot {
         let _entered = tokio_handle.enter();
         let account_home = match secret_store {
             Some(store) => marmot_account::AccountHome::open_with_secret_store(&root_path, store),
-            None => marmot_account::AccountHome::open_with_default_keychain(&root_path)
-                .map_err(marmot_app::AppError::from)?,
+            None => marmot_account::AccountHome::open_with_keychain(
+                &root_path,
+                config.deployment.keychain_service.clone(),
+            )
+            .map_err(marmot_app::AppError::from)?,
         };
         let app = MarmotApp::try_with_relays_and_account_home_and_config(
             &root_path,
@@ -562,6 +583,30 @@ mod tests {
                 Some(" whitenoise ")
             );
         }
+    }
+
+    #[test]
+    fn runtime_options_carry_the_deployment() {
+        assert_eq!(
+            MarmotOptions::default().app_config().deployment,
+            marmot_app::MarmotAppConfig::default().deployment,
+            "an omitted deployment is White Noise's as compiled, for now"
+        );
+        let neutral = MarmotOptions {
+            deployment: Some(MarmotDeploymentFfi {
+                keychain_service: " org.example.app ".into(),
+                ..marmot_deployment_neutral()
+            }),
+            ..Default::default()
+        }
+        .app_config();
+        assert_eq!(
+            neutral.deployment,
+            marmot_app::MarmotDeployment {
+                keychain_service: "org.example.app".into(),
+                ..marmot_app::MarmotDeployment::neutral()
+            }
+        );
     }
 
     #[test]

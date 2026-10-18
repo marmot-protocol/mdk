@@ -177,6 +177,13 @@ the same defaults as the Swift/Kotlin `MarmotOptions` (see the
 [shared contract](../marmot-uniffi/README.md#runtime-options-and-client-label)). Use the matching header and library
 for that struct's layout. `marmot_client_new_with_client_name` is the older label-only constructor.
 
+`marmot_client_new_with_deployment` takes the same options plus a `MarmotDeployment`: the deployment's recovery
+relays, discovery indexers, media and image servers, Open Ranking, KeyPackage client preference, moderation label
+namespace and keychain service. Create one with `marmot_deployment_white_noise` or `marmot_deployment_neutral`,
+adjust it with the `marmot_deployment_set_*` functions, construct, then free it with `marmot_deployment_free`; the
+client keeps its own copy. A NULL deployment, like every other constructor, uses White Noise's until the default
+turns neutral. The [shared contract](../marmot-uniffi/README.md#deployment) covers the keychain caveat.
+
 For private integration fixtures, `marmot_client_new_with_options` accepts
 an explicit loopback relay policy and an optional host secret-store vtable.
 Existing constructors keep their public-only policy. Loopback broker access

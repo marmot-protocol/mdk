@@ -26,6 +26,7 @@ pub mod account_attachment_history;
 pub mod attachment_access;
 pub mod attachment_history;
 pub mod commands;
+pub mod deployment;
 pub mod file_media;
 pub(crate) mod macros;
 pub mod memory;
@@ -420,6 +421,61 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
     options: *const MarmotClientOptions,
     out_client: *mut *mut MarmotClient,
 ) -> MarmotStatus {
+    unsafe {
+        new_client_with_deployment(
+            root_path,
+            relay_urls,
+            relay_urls_len,
+            options,
+            std::ptr::null(),
+            out_client,
+        )
+    }
+}
+
+/// Create a client with `marmot_client_new_with_configuration`'s options and
+/// a deployment, copied during the call. NULL options uses defaults; a NULL
+/// deployment selects marmot_deployment_white_noise() until the neutral
+/// default lands. With no secret store, the deployment's keychain service
+/// names the platform keychain.
+///
+/// # Safety
+/// Same contract as marmot_client_new_with_configuration; deployment must be
+/// NULL or a live handle from marmot_deployment_white_noise or
+/// marmot_deployment_neutral.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_client_new_with_deployment(
+    root_path: *const c_char,
+    relay_urls: *const *const c_char,
+    relay_urls_len: usize,
+    options: *const MarmotClientOptions,
+    deployment: *const deployment::MarmotDeployment,
+    out_client: *mut *mut MarmotClient,
+) -> MarmotStatus {
+    unsafe {
+        new_client_with_deployment(
+            root_path,
+            relay_urls,
+            relay_urls_len,
+            options,
+            deployment,
+            out_client,
+        )
+    }
+}
+
+/// Shared body of the configuration constructors.
+///
+/// # Safety
+/// As marmot_client_new_with_deployment.
+unsafe fn new_client_with_deployment(
+    root_path: *const c_char,
+    relay_urls: *const *const c_char,
+    relay_urls_len: usize,
+    options: *const MarmotClientOptions,
+    deployment: *const deployment::MarmotDeployment,
+    out_client: *mut *mut MarmotClient,
+) -> MarmotStatus {
     ffi_guard(|| {
         if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
             return status;
@@ -456,6 +512,7 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
             Ok(name) => name,
             Err(status) => return status,
         };
+        let deployment = unsafe { deployment.as_ref() }.map(|deployment| deployment.inner.clone());
         let store = if store.is_null() {
             None
         } else {
@@ -480,6 +537,7 @@ pub unsafe extern "C" fn marmot_client_new_with_configuration(
                             client_name: name,
                             secret_store: store,
                             moderation_report_config: None,
+                            deployment,
                         },
                     )
                 }

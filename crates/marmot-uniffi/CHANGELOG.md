@@ -31,6 +31,7 @@
 
 ### Added
 
+- `MarmotOptions.deployment` takes a `MarmotDeploymentFfi` (with `OpenRankingProviderFfi`) for the deployment's recovery relays, discovery indexers, media and image servers, Open Ranking, KeyPackage client preference, moderation label namespace and keychain service; `marmot_deployment_white_noise()` and `marmot_deployment_neutral()` build one. Without a `SecretStore`, the platform keychain now opens under the deployment's `keychain_service`. An omitted deployment is White Noise's, unchanged, until the neutral default lands, when every constructor will require one (host-configuration brief, PR 2).
 - `Marmot::cached_public_event_previews` and `Marmot::resolve_public_event_preview` cache verified public Nostr events referenced from message content (mdk#1547). Cached reads are network-free and survive restarts; resolve fetches missing or stale previews. See [public event previews](README.md#public-event-previews).
 
 - Account-wide attachment candidate pages, group/sender/date queries and opaque account/query-bound cursor/version handles. Filtered empty pages can continue; source changes require restart. Existing group history and acquisition primitives are unchanged.

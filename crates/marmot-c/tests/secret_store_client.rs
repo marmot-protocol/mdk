@@ -286,3 +286,53 @@ fn combined_options_validate_before_transferring_store_ownership() {
     unsafe { marmot_client_free(client) };
     assert!(destroyed.load(Ordering::SeqCst));
 }
+
+#[test]
+fn a_deployment_constructor_opens_with_a_host_store() {
+    unsafe extern "C" fn mark_destroyed(data: *mut c_void) {
+        unsafe { &*(data as *const AtomicBool) }.store(true, Ordering::SeqCst);
+    }
+    let destroyed = AtomicBool::new(false);
+    let store = MarmotSecretStore {
+        user_data: (&destroyed as *const AtomicBool).cast_mut().cast(),
+        has_secret_for_label: Some(has),
+        has_secret_for_account_id: Some(has),
+        write_secret: Some(write_secret),
+        load_secret: Some(load_secret),
+        remove_secret: Some(remove_secret),
+        free_secret: Some(free_secret),
+        destroy: Some(mark_destroyed),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let path = CString::new(root.path().to_str().unwrap()).unwrap();
+    let relay = CString::new("ws://127.0.0.1:1").unwrap();
+    let relays = [relay.as_ptr()];
+    let options = marmot_c::MarmotClientOptions {
+        attachment_acquisition_mode: 0,
+        relay_policy: 2,
+        cursor_persistence: 0,
+        client_name: std::ptr::null(),
+        store: &store,
+    };
+    let mut deployment = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { marmot_c::deployment::marmot_deployment_neutral(&raw mut deployment) },
+        MarmotStatus::Ok
+    );
+    let mut client = std::ptr::null_mut();
+    let status = unsafe {
+        marmot_c::marmot_client_new_with_deployment(
+            path.as_ptr(),
+            relays.as_ptr(),
+            1,
+            &options,
+            deployment,
+            &raw mut client,
+        )
+    };
+    // The client copied the deployment, so the host may free it at once.
+    unsafe { marmot_c::deployment::marmot_deployment_free(deployment) };
+    assert_eq!(status, MarmotStatus::Ok);
+    unsafe { marmot_client_free(client) };
+    assert!(destroyed.load(Ordering::SeqCst));
+}

@@ -3660,7 +3660,7 @@ pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, optio
 
 Open with any combination of runtime options. Existing constructors are compatibility wrappers around this entry point.
 
-[Source](src/lib.rs#L256)
+[Source](src/lib.rs#L273)
 
 ### `Marmot::new_with_options`
 
@@ -3672,7 +3672,7 @@ pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_polic
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L272)
+[Source](src/lib.rs#L289)
 
 ### `Marmot::new`
 
@@ -3684,7 +3684,7 @@ pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, Marm
 
 Open the Marmot app at `root_path`, configured with the given default relay URLs. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) via the default keychain-backed account home — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L300)
+[Source](src/lib.rs#L317)
 
 ### `Marmot::new_with_secret_store`
 
@@ -3696,7 +3696,7 @@ pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L318)
+[Source](src/lib.rs#L335)
 
 ### `Marmot::new_with_cursor_persistence`
 
@@ -3708,7 +3708,7 @@ pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, 
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L348)
+[Source](src/lib.rs#L365)
 
 ### `Marmot::new_with_client_name`
 
@@ -3720,7 +3720,7 @@ pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels are omitted. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L367)
+[Source](src/lib.rs#L384)
 
 ### `Marmot::start`
 
@@ -3732,7 +3732,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L404)
+[Source](src/lib.rs#L421)
 
 ### `Marmot::shutdown`
 
@@ -3744,7 +3744,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L416)
+[Source](src/lib.rs#L433)
 
 ### `Marmot::shutdown_and_close`
 
@@ -3756,7 +3756,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L452)
+[Source](src/lib.rs#L469)
 
 ### `Marmot::storage_is_closed`
 
@@ -3768,7 +3768,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L460)
+[Source](src/lib.rs#L477)
 
 ### `Marmot::is_stopping`
 
@@ -3780,7 +3780,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L467)
+[Source](src/lib.rs#L484)
 
 </details>
 
@@ -4613,5 +4613,34 @@ pub async fn resolve_public_event_preview( &self, account_ref: String, reference
 Fetch one referenced event from at most two safe relay hints plus the configured directory relays when it is missing or stale, store it if it verifies and matches, and return the resulting local state. An event-ID preview never refetches once every relay answered the fetch that cached it; otherwise, and for `naddr` previews, it refetches after 30 minutes. `naddr` keeps the newest version. Author-signed NIP-09 deletions apply in either tag form: an `e` tag removes that event (an `naddr` falls back to the previous version), an `a` tag removes every version up to its timestamp. Calls within 30 seconds of a finished fetch for the same reference return local state without network I/O, as does any call while the row is fresh, so call it for every reference a screen shows. A failed or empty fetch keeps prior content and stores no miss.
 
 [Source](src/commands/public_event_preview.rs#L83)
+
+</details>
+
+<details>
+<summary>deployment.rs</summary>
+
+### `marmot_deployment_neutral`
+
+```rust
+pub fn marmot_deployment_neutral() -> MarmotDeploymentFfi
+```
+
+**Current free function.** Generated Swift/Kotlin name: `marmotDeploymentNeutral`. **C:** `marmot_deployment_neutral`.
+
+A deployment with no services: recovery requires every relay on a route, onboarding searches only the host's discovery relays, there is no Open Ranking tier or KeyPackage client preference, moderation reporting refuses a destination, and the keychain service is `org.marmot-protocol.mdk`. Start here and fill in the services your deployment operates. Until the neutral default lands, an empty media list or unset image server still falls back to White Noise's servers.
+
+[Source](src/deployment.rs#L108)
+
+### `marmot_deployment_white_noise`
+
+```rust
+pub fn marmot_deployment_white_noise() -> MarmotDeploymentFfi
+```
+
+**Current free function.** Generated Swift/Kotlin name: `marmotDeploymentWhiteNoise`. **C:** `marmot_deployment_white_noise`.
+
+White Noise's deployment as this build compiled it: its recovery relays, discovery indexers, media and image servers, Vertex Open Ranking, KeyPackage client preference, moderation label namespace and keychain service, with a build-time `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` list over the new-group media servers. A `MarmotOptions` without a deployment uses these values until the neutral default lands; White Noise apps should pass this record explicitly before then. Keep `keychain_service` unchanged for an existing install, or its account secrets are stranded.
+
+[Source](src/deployment.rs#L101)
 
 </details>

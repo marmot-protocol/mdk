@@ -1325,6 +1325,13 @@ typedef struct MarmotClient MarmotClient;
 typedef struct MarmotConversationWindowSubscription MarmotConversationWindowSubscription;
 
 /**
+ * One deployment's services and identifiers. Create it with
+ * `marmot_deployment_white_noise` or `marmot_deployment_neutral` and free it
+ * with `marmot_deployment_free`. Blank values count as unset.
+ */
+typedef struct MarmotDeployment MarmotDeployment;
+
+/**
  * Opaque handle to the top-level event firehose: one subscription,
  * every account, every event type. Broadcast lag is skipped
  * silently — catch back up via the per-account subscriptions.
@@ -5913,6 +5920,25 @@ MarmotStatus marmot_client_new_with_configuration(const char *root_path,
                                                   struct MarmotClient **out_client);
 
 /**
+ * Create a client with `marmot_client_new_with_configuration`'s options and
+ * a deployment, copied during the call. NULL options uses defaults; a NULL
+ * deployment selects marmot_deployment_white_noise() until the neutral
+ * default lands. With no secret store, the deployment's keychain service
+ * names the platform keychain.
+ *
+ * # Safety
+ * Same contract as marmot_client_new_with_configuration; deployment must be
+ * NULL or a live handle from marmot_deployment_white_noise or
+ * marmot_deployment_neutral.
+ */
+MarmotStatus marmot_client_new_with_deployment(const char *root_path,
+                                               const char *const *relay_urls,
+                                               uintptr_t relay_urls_len,
+                                               const struct MarmotClientOptions *options,
+                                               const struct MarmotDeployment *deployment,
+                                               struct MarmotClient **out_client);
+
+/**
  * Start the runtime (reconcile accounts, start workers, subscribe
  * transport). Must be called before subscribing.
  *
@@ -9850,6 +9876,117 @@ MarmotStatus marmot_set_startup_diagnostics_enabled(const struct MarmotClient *c
  */
 MarmotStatus marmot_startup_diagnostics_snapshot(const struct MarmotClient *client,
                                                  struct MarmotNativeStartupSnapshot **out);
+
+/**
+ * White Noise's deployment as this build compiled it, the values every
+ * constructor uses without a deployment until the neutral default lands.
+ * Free with marmot_deployment_free.
+ * # Safety
+ * out must be writable.
+ */
+MarmotStatus marmot_deployment_white_noise(struct MarmotDeployment **out);
+
+/**
+ * No deployment services: every list empty, every option unset, and the
+ * neutral keychain service org.marmot-protocol.mdk. Free with
+ * marmot_deployment_free.
+ * # Safety
+ * out must be writable.
+ */
+MarmotStatus marmot_deployment_neutral(struct MarmotDeployment **out);
+
+/**
+ * Free a deployment; NULL is accepted. A client constructed with it keeps
+ * its own copy.
+ * # Safety
+ * deployment must be NULL or live, with no call on it in progress.
+ */
+void marmot_deployment_free(struct MarmotDeployment *deployment);
+
+/**
+ * Replace the relays this deployment operates, which certify recovery.
+ * # Safety
+ * deployment must be live; relays must point to relays_len valid strings (or be NULL with 0).
+ */
+MarmotStatus marmot_deployment_set_recovery_operated_relays(struct MarmotDeployment *deployment,
+                                                            const char *const *relays,
+                                                            uintptr_t relays_len);
+
+/**
+ * Replace the public indexers onboarding and account setup also search.
+ * # Safety
+ * deployment must be live; relays must point to relays_len valid strings (or be NULL with 0).
+ */
+MarmotStatus marmot_deployment_set_discovery_indexer_relays(struct MarmotDeployment *deployment,
+                                                            const char *const *relays,
+                                                            uintptr_t relays_len);
+
+/**
+ * Replace the Blossom servers signed into a new group's encrypted-media component.
+ * # Safety
+ * deployment must be live; endpoints must point to endpoints_len valid strings (or be NULL with 0).
+ */
+MarmotStatus marmot_deployment_set_new_group_media_endpoints(struct MarmotDeployment *deployment,
+                                                             const char *const *endpoints,
+                                                             uintptr_t endpoints_len);
+
+/**
+ * Set the encrypted group-image server; NULL unsets it.
+ * # Safety
+ * deployment must be live; endpoint must be NULL or a valid string.
+ */
+MarmotStatus marmot_deployment_set_group_image_endpoint(struct MarmotDeployment *deployment,
+                                                        const char *endpoint);
+
+/**
+ * Set the public profile-image upload server; NULL unsets it.
+ * # Safety
+ * deployment must be live; endpoint must be NULL or a valid string.
+ */
+MarmotStatus marmot_deployment_set_profile_image_endpoint(struct MarmotDeployment *deployment,
+                                                          const char *endpoint);
+
+/**
+ * Set the Open Ranking search endpoint and its profile relays; a NULL
+ * endpoint, or no profile relay, turns the tier off.
+ * # Safety
+ * deployment must be live; search_endpoint must be NULL or a valid string;
+ * profile_relays must point to profile_relays_len valid strings (or be NULL with 0).
+ */
+MarmotStatus marmot_deployment_set_open_ranking(struct MarmotDeployment *deployment,
+                                                const char *search_endpoint,
+                                                const char *const *profile_relays,
+                                                uintptr_t profile_relays_len);
+
+/**
+ * Replace the KeyPackage `client` tags ranked first and ranked last.
+ * # Safety
+ * deployment must be live; each list must point to its length of valid strings (or be NULL with 0).
+ */
+MarmotStatus marmot_deployment_set_key_package_client_preference(struct MarmotDeployment *deployment,
+                                                                 const char *const *preferred,
+                                                                 uintptr_t preferred_len,
+                                                                 const char *const *last,
+                                                                 uintptr_t last_len);
+
+/**
+ * Set the NIP-32 namespace on moderation report labels; NULL unsets it, and
+ * reporting then refuses a destination.
+ * # Safety
+ * deployment must be live; namespace must be NULL or a valid string.
+ */
+MarmotStatus marmot_deployment_set_moderation_label_namespace(struct MarmotDeployment *deployment,
+                                                              const char *namespace_);
+
+/**
+ * Set the platform keychain service for account secrets when no secret
+ * store is supplied. Changing it for an existing install strands the secrets
+ * stored under the old name.
+ * # Safety
+ * deployment must be live; name must be a valid string.
+ */
+MarmotStatus marmot_deployment_set_keychain_service(struct MarmotDeployment *deployment,
+                                                    const char *name);
 
 /**
  * Create a control; free it with marmot_media_file_transfer_control_free after upload returns.

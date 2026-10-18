@@ -286,6 +286,25 @@ Native construction/default checks: `./crates/marmot-uniffi/options-smoke.sh swi
 and `MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars>
 ./crates/marmot-uniffi/options-smoke.sh kotlin`.
 
+### Deployment
+
+`MarmotOptions.deployment` takes a `MarmotDeploymentFfi`: the services a deployment's users rely on. These are the
+recovery-operated relays, discovery indexers, new-group media servers, group- and profile-image servers, Open
+Ranking, the KeyPackage client preference, the moderation label namespace, and the keychain service used when no
+`secretStore` is given. Start from `marmotDeploymentWhiteNoise()` or `marmotDeploymentNeutral()` and change what
+differs. An omitted deployment is White Noise's for now. When the default turns neutral, every constructor will
+require one, so White Noise apps should pass `marmotDeploymentWhiteNoise()` now, in every entry point, including
+background and notification-extension runtimes. Never change `keychainService` for an existing install: secrets
+stored under the old name are stranded. C hosts use `marmot_client_new_with_deployment`.
+
+```swift
+var options = MarmotOptions(clientName: "whitenoise")
+options.deployment = marmotDeploymentWhiteNoise()
+let marmot = try Marmot.newWithConfiguration(
+    rootPath: rootPath, relayUrls: relayUrls, options: options
+)
+```
+
 ## Exclusive root ownership
 
 Every `Marmot` constructor acquires a nonblocking exclusive lease on
