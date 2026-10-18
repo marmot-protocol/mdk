@@ -8,7 +8,8 @@
 //! spares the leases this process still holds: a runtime rebuilt after
 //! `shutdown_and_close` keeps a file a share sheet is still reading. The copy
 //! never needs to survive a crash, so it is written without sync or rename.
-//! These are the only plaintext files MDK writes. All work here is blocking.
+//! These are the only plaintext attachment files MDK writes. All work here
+//! is blocking.
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -64,12 +65,16 @@ pub(crate) fn handoff_directory(app: &MarmotApp, account: &str) -> PathBuf {
 }
 
 /// A full volume is the storage-full error, as admission reports a known
-/// shortfall; anything else is a failed copy.
+/// shortfall; any other filesystem failure is I/O (its kind kept, fixed
+/// text), never mistaken for invalid media.
 fn handoff_error(error: std::io::Error) -> AppError {
     if error.kind() == std::io::ErrorKind::StorageFull {
         return capacity_error();
     }
-    AppError::InvalidEncryptedMedia("attachment handoff I/O failed".into())
+    AppError::Io(std::io::Error::new(
+        error.kind(),
+        "attachment handoff copy failed",
+    ))
 }
 
 fn capacity_error() -> AppError {
@@ -362,10 +367,9 @@ fn write_copy(
     control: &MediaFileTransferControl,
 ) -> Result<bool, AppError> {
     fs_private::create_dir_all_private(directory).map_err(handoff_error)?;
-    let mut file = std::io::BufWriter::with_capacity(
-        FILE_TRANSFER_BUFFER_BYTES,
-        fs_private::create_new_private(path).map_err(handoff_error)?,
-    );
+    // Unbuffered: chunks are already 64 KiB to 1 MiB, and no plaintext is
+    // left behind in a writer buffer.
+    let mut file = fs_private::create_new_private(path).map_err(handoff_error)?;
     let now = crate::unix_now_seconds();
     let mut written = 0u64;
     // Nothing past the admitted length is ever written: a longer body is a
@@ -449,6 +453,12 @@ pub(crate) fn release(lease: &str) -> Result<(), AppError> {
 /// process holds: what a crash or an earlier process left. Returns how many
 /// entries it removed. Best effort. Blocking.
 pub(crate) fn wipe_stale(directory: &Path) -> usize {
+    // Never traverse a symlink: a handoff directory that is one (or is not
+    // a directory) is left alone, and child symlinks are unlinked, not
+    // followed.
+    if !std::fs::symlink_metadata(directory).is_ok_and(|metadata| metadata.is_dir()) {
+        return 0;
+    }
     let Ok(entries) = std::fs::read_dir(directory) else {
         return 0;
     };

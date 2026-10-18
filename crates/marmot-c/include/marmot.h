@@ -9912,6 +9912,7 @@ MarmotStatus marmot_media_file_transfer_control_new(struct MarmotMediaFileTransf
 
 /**
  * Cancel before admission starts; once admission starts, delivery belongs to the local-send queue.
+ * For an attachment handoff it stops the copy, and a cancelled copy leaves no file and no lease.
  * # Safety
  * control must be live; no concurrent free.
  */

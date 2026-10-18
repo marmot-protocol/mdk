@@ -510,10 +510,11 @@ async fn handoff_copies_either_layout_into_a_private_file_until_release() {
             .await
             .unwrap();
         assert!(
-            runtime
-                .release_attachment_handoff("not-a-lease")
-                .await
-                .is_err()
+            matches!(
+                runtime.release_attachment_handoff("not-a-lease").await,
+                Err(AppError::InvalidEncryptedMedia(_))
+            ),
+            "a malformed lease is bad input, not retryable I/O"
         );
         runtime
             .release_attachment_handoff(&second.lease)
@@ -564,13 +565,21 @@ async fn handoff_refusals_leave_nothing() {
         AppError::Storage(cgka_traits::StorageError::Capacity(_))
     ));
     assert_eq!(handoff_entries(&app), 0);
+    // With room again, only the closed runtime refuses.
+    crate::media::attachment_resume::test_free_space::set(&app.account_dir("alice"), u64::MAX / 2);
     runtime.shutdown_and_close().await.unwrap();
+    let closed = runtime
+        .open_attachment_handoff("alice", &group, target(), Default::default())
+        .await
+        .unwrap_err();
     assert!(
-        runtime
-            .open_attachment_handoff("alice", &group, target(), Default::default())
-            .await
-            .is_err()
+        matches!(
+            closed,
+            AppError::RuntimeStopping | AppError::Storage(cgka_traits::StorageError::Closed(_))
+        ),
+        "{closed:?}"
     );
+    assert_eq!(handoff_entries(&app), 0);
 }
 
 /// Abandoning an opening call mid-copy, without cancelling its control (a

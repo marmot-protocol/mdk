@@ -177,7 +177,7 @@ fn a_full_volume_during_the_copy_is_storage_full() {
     ));
     assert!(matches!(
         handoff_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
-        AppError::InvalidEncryptedMedia(_)
+        AppError::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied
     ));
 }
 
@@ -215,4 +215,28 @@ fn a_discard_lost_with_its_runtime_leaves_the_copy_to_the_wipe() {
     );
     assert_eq!(wipe_stale(directory.path()), 1);
     assert!(!copy.exists());
+}
+
+/// A handoff directory that is a symlink is never traversed: the wipe leaves
+/// its target alone. A child symlink is unlinked without touching its target.
+#[cfg(unix)]
+#[test]
+fn the_wipe_never_follows_symlinks() {
+    let directory = tempfile::tempdir().unwrap();
+    let elsewhere = directory.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("keep.bin"), b"not ours").unwrap();
+    let linked_root = directory.path().join("handoff");
+    std::os::unix::fs::symlink(&elsewhere, &linked_root).unwrap();
+    assert_eq!(wipe_stale(&linked_root), 0);
+    assert!(elsewhere.join("keep.bin").exists());
+
+    let real_root = directory.path().join("real");
+    std::fs::create_dir_all(&real_root).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, real_root.join("66".repeat(16))).unwrap();
+    assert_eq!(wipe_stale(&real_root), 1);
+    assert!(
+        elsewhere.join("keep.bin").exists(),
+        "the link went, not its target"
+    );
 }

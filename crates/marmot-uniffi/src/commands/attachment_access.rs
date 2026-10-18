@@ -89,7 +89,9 @@ impl Marmot {
     /// Delete a handoff copy once the OS surface is done with it. An unknown
     /// or already released lease is not an error. A malformed lease returns
     /// `InvalidMediaReference`, which no retry fixes. A copy that cannot be
-    /// deleted returns `Io` and stays leased: retry the release.
+    /// deleted returns `Io` and stays leased: retry the release. A release
+    /// the host stops waiting for still runs to completion.
+    #[marmot_uniffi_macros::survives_cancellation]
     pub async fn release_attachment_handoff(&self, lease: String) -> Result<(), MarmotKitError> {
         Ok(self.runtime.release_attachment_handoff(&lease).await?)
     }

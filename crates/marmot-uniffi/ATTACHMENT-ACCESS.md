@@ -109,7 +109,8 @@ and no download is started. Keep in-app display and playback on `readAttachmentA
   iOS, pass the file URL to `UIActivityViewController` or Quick Look. Exclude the account
   directory from iCloud and Android auto-backup, as for `media/`.
 
-These copies are the only plaintext files MDK writes. C hosts use
+These copies are the only plaintext attachment files MDK writes. A release the host stops
+waiting for still completes. C hosts use
 `marmot_open_attachment_handoff`, `marmot_release_attachment_handoff`, and
 `marmot_attachment_handoff_free` (which frees the record only, not the lease).
 
