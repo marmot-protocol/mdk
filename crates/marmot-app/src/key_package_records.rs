@@ -6,6 +6,7 @@
 //! decoded metadata, reconcile fresh vs cached results, merge KeyPackage
 //! records, and pick publish endpoints. They hold no `MarmotApp` state.
 
+use crate::deployment::KeyPackageClientPreference;
 use std::collections::BTreeSet;
 
 use base64::Engine as _;
@@ -267,25 +268,23 @@ pub(crate) fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQu
 /// multi-device selection can replace this preference without changing validity.
 /// Labels are self-asserted and do not authenticate an application; they only
 /// rank candidates after admission checks and never relax cryptographic gates.
-pub(crate) fn key_package_client_priority(event: &NostrTransportEvent) -> u8 {
+/// The ranking is the deployment's [`KeyPackageClientPreference`]; an event
+/// with no single, valued `client` tag ranks as unlabelled.
+pub(crate) fn key_package_client_priority(
+    event: &NostrTransportEvent,
+    preference: &KeyPackageClientPreference,
+) -> u8 {
     let mut tags = event.tags.iter().filter(|tag| {
         tag.first()
             .is_some_and(|name| name == transport_nostr_adapter::CLIENT_TAG)
     });
     let Some(tag) = tags.next() else {
-        return 1;
+        return preference.rank(None);
     };
     if tags.next().is_some() || tag.len() < 2 {
-        return 1;
+        return preference.rank(None);
     }
-    let name = tag[1].trim();
-    if name.eq_ignore_ascii_case("whitenoise") {
-        2
-    } else if name.eq_ignore_ascii_case("amethyst") {
-        0
-    } else {
-        1
-    }
+    preference.rank(Some(&tag[1]))
 }
 
 /// Directory reads deliberately share the client ranking and slot-supersession
@@ -296,9 +295,15 @@ pub(crate) fn latest_fresh_key_package_from_records(
     account_id_hex: &str,
     records: Vec<RelayEventRecord>,
     freshness: DirectoryFreshness,
+    preference: &KeyPackageClientPreference,
 ) -> Result<KeyPackageSelection<FetchedKeyPackage>, AppError> {
-    let selection =
-        preferred_fresh_key_package_from_records(account_id_hex, &records, freshness, None)?;
+    let selection = preferred_fresh_key_package_from_records(
+        account_id_hex,
+        &records,
+        freshness,
+        None,
+        preference,
+    )?;
     Ok(KeyPackageSelection {
         value: selection.value.map(|selected| selected.fetched),
         rejected_future: selection.rejected_future,
@@ -341,6 +346,7 @@ pub(crate) fn preferred_fresh_key_package_from_records(
     records: &[RelayEventRecord],
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+    preference: &KeyPackageClientPreference,
 ) -> Result<KeyPackageSelection<PreferredKeyPackage>, AppError> {
     let mut records = records.iter().collect::<Vec<_>>();
     records.sort_by(|a, b| {
@@ -371,7 +377,7 @@ pub(crate) fn preferred_fresh_key_package_from_records(
         {
             continue;
         }
-        let priority = key_package_client_priority(&record.event);
+        let priority = key_package_client_priority(&record.event, preference);
         let fetched = match key_package_from_borrowed_record(record) {
             Ok(fetched) if fetched.key_package.protocol_profile == ProtocolProfile::Current => {
                 fetched

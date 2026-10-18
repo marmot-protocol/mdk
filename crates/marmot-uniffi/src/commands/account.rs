@@ -1,7 +1,8 @@
 //! Account lifecycle, identity, relay-list, key-package, and profile commands.
 
+#[cfg(test)]
 use cgka_traits::TransportEndpoint;
-use marmot_app::{AccountSetupRequest, UserProfileMetadata, default_directory_discovery_relays};
+use marmot_app::{AccountSetupRequest, UserProfileMetadata};
 use zeroize::Zeroizing;
 
 use crate::conversions::{
@@ -127,7 +128,7 @@ impl Marmot {
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
             inbox_relays: endpoints(&inbox_relays),
-            discovery_relays: ffi_discovery_relays(),
+            discovery_relays: self.app.discovery_indexer_relays(),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         };
@@ -219,7 +220,7 @@ impl Marmot {
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
             inbox_relays: endpoints(&inbox_relays),
-            discovery_relays: ffi_discovery_relays(),
+            discovery_relays: self.app.discovery_indexer_relays(),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         };
@@ -277,7 +278,7 @@ impl Marmot {
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
             inbox_relays: endpoints(&inbox_relays),
-            discovery_relays: ffi_discovery_relays(),
+            discovery_relays: self.app.discovery_indexer_relays(),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         };
@@ -320,7 +321,7 @@ impl Marmot {
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
             inbox_relays: endpoints(&inbox_relays),
-            discovery_relays: ffi_discovery_relays(),
+            discovery_relays: self.app.discovery_indexer_relays(),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         };
@@ -395,7 +396,7 @@ impl Marmot {
             endpoints(&bootstrap_relays),
         )
         .with_inbox_relays(endpoints(&inbox_relays))
-        .with_indexer_relays(ffi_discovery_relays());
+        .with_indexer_relays(self.app.discovery_indexer_relays());
         self.app
             .publish_account_relay_lists(&account_ref, bootstrap)
             .await?;
@@ -525,7 +526,7 @@ impl Marmot {
                 &account_ref,
                 endpoints(&relays),
                 endpoints(&bootstrap_relays),
-                ffi_discovery_relays(),
+                self.app.discovery_indexer_relays(),
             )
             .await?;
         Ok(status.into())
@@ -544,7 +545,7 @@ impl Marmot {
                 &account_ref,
                 endpoints(&relays),
                 endpoints(&bootstrap_relays),
-                ffi_discovery_relays(),
+                self.app.discovery_indexer_relays(),
             )
             .await?;
         Ok(status.into())
@@ -673,7 +674,7 @@ impl Marmot {
             endpoints(&default_relays),
             endpoints(&bootstrap_relays),
         )
-        .with_indexer_relays(ffi_discovery_relays());
+        .with_indexer_relays(self.app.discovery_indexer_relays());
         let pushed = self
             .runtime
             .publish_user_profile(&account_ref, UserProfileMetadata::from(profile), bootstrap)
@@ -701,7 +702,7 @@ impl Marmot {
             .publish_user_profile_using_account_relays_and_indexers(
                 &account_ref,
                 UserProfileMetadata::from(profile),
-                ffi_discovery_relays(),
+                self.app.discovery_indexer_relays(),
             )
             .await?;
         Ok(pushed.into())
@@ -747,7 +748,7 @@ impl Marmot {
             default_relays: endpoints(&default_relays),
             bootstrap_relays: endpoints(&bootstrap_relays),
             inbox_relays: endpoints(&inbox_relays),
-            discovery_relays: ffi_discovery_relays(),
+            discovery_relays: self.app.discovery_indexer_relays(),
             publish_missing_relay_lists: true,
             publish_initial_key_package: true,
         };
@@ -775,12 +776,6 @@ impl Marmot {
             readiness: result.readiness.into(),
         })
     }
-}
-
-fn ffi_discovery_relays() -> Vec<TransportEndpoint> {
-    // Directory reads remain available for imported and external-signer
-    // accounts even when local development relays suppress public writes.
-    default_directory_discovery_relays()
 }
 
 #[cfg(test)]

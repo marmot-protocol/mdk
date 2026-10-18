@@ -714,11 +714,13 @@ fn generated_setup_context_round_trips_inbox_relays_and_reads_legacy_contexts() 
 }
 
 #[test]
-fn default_directory_discovery_relays_use_live_indexers() {
-    let relays = default_directory_discovery_relays();
+fn white_noise_discovery_indexers_use_live_indexers() {
+    let relays = crate::MarmotDeployment::white_noise().discovery_indexer_endpoints();
 
     assert!(
-        relays.iter().any(|relay| relay.0 == VERTEX_DIRECTORY_RELAY),
+        relays
+            .iter()
+            .any(|relay| relay.0 == "wss://relay.vertexlab.io"),
         "Vertex must remain available for directory bootstrap"
     );
     assert!(

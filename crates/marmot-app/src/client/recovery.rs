@@ -756,7 +756,7 @@ impl AppClient {
             let admitted = self.adapter.recovery_admitted_endpoints(endpoints);
             let required = transport_nostr::recovery_required_endpoints(
                 &admitted,
-                &self.app.config.recovery_operated_relays,
+                &self.app.config.deployment.recovery_operated_relays,
             );
             goals.push(RecoveryScopePlan {
                 scope_id: goals.len() as u64,
@@ -1026,6 +1026,7 @@ impl AppClient {
         let mut operated = self
             .app
             .config
+            .deployment
             .recovery_operated_relays
             .iter()
             .collect::<Vec<_>>();
@@ -1402,7 +1403,7 @@ impl AppClient {
                         .recovery_admitted_endpoints(&routing.local_inbox_endpoints);
                     let endpoints = transport_nostr::recovery_required_endpoints(
                         &admitted,
-                        &self.app.config.recovery_operated_relays,
+                        &self.app.config.deployment.recovery_operated_relays,
                     );
                     scopes.push(RecoveryScopePlan {
                         scope_id: 0,
@@ -1448,7 +1449,7 @@ impl AppClient {
                     let admitted = self.adapter.recovery_admitted_endpoints(&route.endpoints);
                     let endpoints = transport_nostr::recovery_required_endpoints(
                         &admitted,
-                        &self.app.config.recovery_operated_relays,
+                        &self.app.config.deployment.recovery_operated_relays,
                     );
                     scopes.push(RecoveryScopePlan {
                         scope_id: scopes.len() as u64,

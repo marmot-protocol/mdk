@@ -921,6 +921,7 @@ impl MarmotApp {
                     &account_records,
                     self.directory_freshness(),
                     requirements,
+                    &self.deployment().key_package_client_preference,
                 )
                 .map(|selection| selection.value);
                 // Batch results prove no coverage; every absence or rejection
@@ -1027,6 +1028,7 @@ impl MarmotApp {
                                 &records.records,
                                 records.freshness,
                                 requirements,
+                                &self.deployment().key_package_client_preference,
                             )?
                             // Recovery returned, so lookup coverage is complete.
                             .into_value_or_missing(&target.account_id_hex)?

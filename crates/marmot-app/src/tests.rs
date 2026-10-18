@@ -6220,7 +6220,7 @@ async fn loopback_account_relays_suppress_public_indexer_copies() {
                 vec![TransportEndpoint("ws://127.0.0.1:1234".into())],
                 Vec::new(),
             )
-            .with_indexer_relays(default_directory_discovery_relays()),
+            .with_indexer_relays(app.discovery_indexer_relays()),
             &UserProfileMetadata::default(),
         )
         .await
@@ -6238,7 +6238,7 @@ async fn loopback_account_relays_suppress_public_indexer_copies() {
                 vec![TransportEndpoint("ws://127.0.0.1:1234".into())],
                 vec![TransportEndpoint("wss://relay.example".into())],
             )
-            .with_indexer_relays(default_directory_discovery_relays()),
+            .with_indexer_relays(app.discovery_indexer_relays()),
             &UserProfileMetadata::default(),
         )
         .await

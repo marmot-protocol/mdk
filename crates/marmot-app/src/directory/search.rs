@@ -304,17 +304,16 @@ async fn run_search<F>(
     // finds nobody by definition rather than everybody.
     let query = params.query.trim().to_lowercase();
     if !query.is_empty() {
-        let open_ranking_search_endpoint =
-            app.service_endpoints().open_ranking_search_endpoint.clone();
-        let open_ranking_profile_relays = app
-            .service_endpoints()
-            .open_ranking_profile_relays
-            .iter()
-            .cloned()
+        let open_ranking = app.deployment().open_ranking.clone();
+        let open_ranking_search_endpoint = open_ranking
+            .as_ref()
+            .map(|provider| provider.search_endpoint.clone());
+        let open_ranking_profile_relays = open_ranking
+            .map(|provider| provider.profile_relays)
+            .unwrap_or_default()
+            .into_iter()
             .map(TransportEndpoint)
             .collect::<Vec<_>>();
-        let open_ranking_search_endpoint =
-            open_ranking_search_endpoint.filter(|_| !open_ranking_profile_relays.is_empty());
         let cached_app = app.clone();
         let cached_searcher = searcher_account_id_hex.clone();
         let cached_query = query.clone();
@@ -1874,9 +1873,7 @@ mod tests {
         let account = home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
         assert!(
-            app.service_endpoints()
-                .open_ranking_search_endpoint
-                .is_none(),
+            app.deployment().open_ranking.is_none(),
             "dev/test convenience constructors must never call a live provider"
         );
         let cache = app.directory_cache_for_account(&account).unwrap();

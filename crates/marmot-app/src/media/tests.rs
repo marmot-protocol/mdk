@@ -1057,7 +1057,7 @@ async fn profile_image_upload_rejects_non_raster_and_oversized_inputs_before_net
     let svg = upload_profile_image(
         b"<svg/>",
         "image/svg+xml",
-        Some("https://blossom.example"),
+        "https://blossom.example",
         &signer,
     )
     .await
@@ -1068,14 +1068,9 @@ async fn profile_image_upload_rejects_non_raster_and_oversized_inputs_before_net
     );
 
     let oversized = vec![0_u8; MAX_PROFILE_IMAGE_BYTES + 1];
-    let error = upload_profile_image(
-        &oversized,
-        "image/png",
-        Some("https://blossom.example"),
-        &signer,
-    )
-    .await
-    .unwrap_err();
+    let error = upload_profile_image(&oversized, "image/png", "https://blossom.example", &signer)
+        .await
+        .unwrap_err();
     assert_eq!(
         error.to_string(),
         "blob store request failed: profile image exceeds 10 MiB limit"
@@ -1087,7 +1082,7 @@ async fn profile_image_upload_rejects_empty_inputs_before_network() {
     let error = upload_profile_image(
         &[],
         "image/jpeg",
-        Some("https://blossom.example"),
+        "https://blossom.example",
         &signing_keys(),
     )
     .await
@@ -1103,7 +1098,7 @@ async fn profile_image_upload_rejects_mismatched_raster_bytes_before_network() {
     let error = upload_profile_image(
         b"<svg/>",
         "image/png",
-        Some("https://blossom.example"),
+        "https://blossom.example",
         &signing_keys(),
     )
     .await
@@ -1121,7 +1116,7 @@ async fn profile_image_upload_uses_media_extension_and_accepts_test_loopback_pol
     let url = upload_profile_image_with_policy(
         png_header,
         " IMAGE/PNG ; charset=binary",
-        Some(&server),
+        &server,
         &signing_keys(),
         true,
     )
@@ -1141,15 +1136,10 @@ async fn profile_image_upload_rejects_cross_site_descriptor_url() {
         "sha256": hash,
     });
     let server = spawn_http_response(http_json_response(&descriptor.to_string()));
-    let error = upload_profile_image_with_policy(
-        png_header,
-        "image/png",
-        Some(&server),
-        &signing_keys(),
-        true,
-    )
-    .await
-    .unwrap_err();
+    let error =
+        upload_profile_image_with_policy(png_header, "image/png", &server, &signing_keys(), true)
+            .await
+            .unwrap_err();
 
     assert!(
         error.to_string().contains("unsafe upload descriptor host"),
@@ -1348,17 +1338,23 @@ async fn upload_encrypted_media_drops_non_http_url_scheme_rejection_reason() {
 }
 
 #[test]
-fn built_in_blossom_endpoints_are_ciphertext_compatible_fallbacks() {
-    assert_eq!(DEFAULT_BLOSSOM_SERVER_URL, DEFAULT_BLOSSOM_SERVER_URLS[0]);
+fn white_noise_blossom_endpoints_are_ciphertext_compatible() {
+    let deployment = crate::MarmotDeployment::white_noise();
     assert_eq!(
-        DEFAULT_BLOSSOM_SERVER_URLS,
-        [
-            "https://blossom.divine.video",
-            "https://blossom.ditto.pub",
-            "https://cdn.hzrd149.com",
-        ]
+        deployment.group_image_endpoint.as_deref(),
+        deployment
+            .new_group_media_endpoints
+            .first()
+            .map(String::as_str),
+        "the group-image server is the first new-group media server"
     );
-    assert!(!DEFAULT_BLOSSOM_SERVER_URLS.contains(&"https://blossom.primal.net"));
+    // primal's server is media-only: it refuses opaque ciphertext.
+    assert!(
+        !deployment
+            .new_group_media_endpoints
+            .iter()
+            .any(|endpoint| endpoint == "https://blossom.primal.net")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

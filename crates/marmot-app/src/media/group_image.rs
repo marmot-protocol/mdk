@@ -11,7 +11,6 @@ use zeroize::Zeroizing;
 
 use cgka_traits::app_components::canonicalize_marmot_media_type;
 
-use super::DEFAULT_BLOSSOM_SERVER_URL;
 use super::blossom::{
     BlossomHttpTransport, blossom_blob_url, fetch_blossom_blob_bounded, upload_blossom_blob,
 };
@@ -162,7 +161,7 @@ fn group_image_aad(media_type: &str) -> Vec<u8> {
 pub(crate) async fn upload_group_image(
     plaintext: &[u8],
     media_type: &str,
-    server: Option<&str>,
+    server: &str,
     transport: &BlossomHttpTransport,
 ) -> Result<GroupImageUpload, AppError> {
     let prepared = prepare_group_image_upload(plaintext, media_type)?;
@@ -228,7 +227,7 @@ pub(crate) async fn upload_prepared_group_image(
     encrypted_blob: Vec<u8>,
     image_hash_hex: &str,
     upload_secret: Zeroizing<Vec<u8>>,
-    server: Option<&str>,
+    server: &str,
     allow_loopback_http: bool,
     transport: &BlossomHttpTransport,
 ) -> Result<(), AppError> {
@@ -240,7 +239,6 @@ pub(crate) async fn upload_prepared_group_image(
     let secret = nostr::prelude::SecretKey::from_slice(&upload_secret)
         .map_err(|_| AppError::InvalidEncryptedMedia("invalid group image upload key".into()))?;
     let upload_keys = nostr::prelude::Keys::new(secret);
-    let server = server.unwrap_or(DEFAULT_BLOSSOM_SERVER_URL);
     upload_blossom_blob(
         server,
         Bytes::from(encrypted_blob),
@@ -259,7 +257,7 @@ pub(crate) async fn fetch_group_image_with_transport(
     image_key_hex: &str,
     image_nonce_hex: &str,
     media_type: &str,
-    server: Option<&str>,
+    server: &str,
     transport: &BlossomHttpTransport,
 ) -> Result<Vec<u8>, AppError> {
     let media_type = canonical_group_image_media_type(media_type)?;
@@ -274,9 +272,8 @@ pub(crate) async fn fetch_group_image_with_transport(
     let nonce: [u8; 12] = hex::decode(image_nonce_hex)?.try_into().map_err(|_| {
         AppError::InvalidEncryptedMedia("group image nonce must be 12 bytes".into())
     })?;
-    let server = server.unwrap_or(DEFAULT_BLOSSOM_SERVER_URL);
     let url = blossom_blob_url(server, &image_hash_hex.to_ascii_lowercase());
-    // Group images are content-addressed over the public default Blossom server
+    // Group images are content-addressed over the deployment's group-image server
     // and are not part of the loopback-blob-endpoint dev/test path, so loopback
     // HTTP is never permitted here.
     let encrypted = fetch_blossom_blob_bounded(
@@ -464,7 +461,7 @@ mod tests {
             prepared.encrypted_blob.clone(),
             &hash,
             prepared.upload_secret.clone(),
-            Some(&url),
+            &url,
             true,
             &BlossomHttpTransport::new(true),
         )
@@ -474,7 +471,7 @@ mod tests {
             prepared.encrypted_blob,
             &hash,
             prepared.upload_secret,
-            Some(&url),
+            &url,
             true,
             &BlossomHttpTransport::new(true),
         )
@@ -510,7 +507,7 @@ mod tests {
                 prepared.encrypted_blob,
                 &hash,
                 prepared.upload_secret,
-                Some(&upload_url),
+                &upload_url,
                 true,
                 &BlossomHttpTransport::new(true),
             )

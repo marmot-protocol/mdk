@@ -44,7 +44,7 @@ use crate::groups::{
 };
 use crate::ids::{admin_pubkey_from_account_id_hex, admin_pubkey_from_member_id};
 use crate::media::{
-    BlossomHttpTransport, DEFAULT_BLOSSOM_SERVER_URLS, EncryptedMediaVersion, MediaOperationPolicy,
+    BlossomHttpTransport, EncryptedMediaVersion, MediaOperationPolicy,
     download_encrypted_media_with_transport, fetch_group_image_with_transport,
     is_loopback_http_endpoint, prepare_group_image_upload, upload_encrypted_media,
     upload_group_image, upload_prepared_group_image,
@@ -541,6 +541,7 @@ pub(crate) struct GroupImageDownloadHttp {
     image_key_hex: String,
     image_nonce_hex: String,
     media_type: String,
+    server: String,
     transport: BlossomHttpTransport,
 }
 
@@ -548,7 +549,7 @@ pub(crate) struct PreparedGroupImageUploadHttp {
     encrypted_blob: Vec<u8>,
     image_hash_hex: String,
     upload_secret: Zeroizing<Vec<u8>>,
-    server: Option<String>,
+    server: String,
     allow_loopback_http: bool,
     transport: BlossomHttpTransport,
 }
@@ -559,7 +560,7 @@ impl PreparedGroupImageUploadHttp {
             self.encrypted_blob,
             &self.image_hash_hex,
             self.upload_secret,
-            self.server.as_deref(),
+            &self.server,
             self.allow_loopback_http,
             &self.transport,
         )
@@ -587,7 +588,7 @@ impl GroupImageDownloadHttp {
             &self.image_key_hex,
             &self.image_nonce_hex,
             &self.media_type,
-            None,
+            &self.server,
             &self.transport,
         )
         .await
@@ -1791,7 +1792,10 @@ impl AppClient {
                 encrypted_blob,
                 image_hash_hex: input.image_hash_hex,
                 upload_secret: Zeroizing::new(upload_secret),
-                server,
+                server: self
+                    .app
+                    .deployment()
+                    .group_image_endpoint_or_fallback(server.as_deref()),
                 allow_loopback_http,
                 transport: self.blossom_http_transport.clone(),
             },
@@ -2114,7 +2118,7 @@ impl AppClient {
                                 let upload = upload_group_image(
                                     &image.plaintext,
                                     &image.media_type,
-                                    None,
+                                    &self.app.deployment().group_image_endpoint_or_fallback(None),
                                     &self.blossom_http_transport,
                                 )
                                 .await?;
@@ -5546,9 +5550,13 @@ impl AppClient {
         let input = if plaintext.is_empty() {
             AppGroupImageInput::default()
         } else {
-            let upload =
-                upload_group_image(&plaintext, media_type, None, &self.blossom_http_transport)
-                    .await?;
+            let upload = upload_group_image(
+                &plaintext,
+                media_type,
+                &self.app.deployment().group_image_endpoint_or_fallback(None),
+                &self.blossom_http_transport,
+            )
+            .await?;
             AppGroupImageInput::from(upload)
         };
         let data = hex::decode(AppGroupImageComponent::new(input).data_hex)?;
@@ -5603,6 +5611,7 @@ impl AppClient {
             image_key_hex: input.image_key_hex,
             image_nonce_hex: input.image_nonce_hex,
             media_type: input.media_type.unwrap_or_default(),
+            server: self.app.deployment().group_image_endpoint_or_fallback(None),
             transport: self.blossom_http_transport.clone(),
         })
     }
@@ -6608,22 +6617,10 @@ impl AppClient {
     }
 
     fn encrypted_media_component_for_new_group(&self) -> Result<AppComponentData, AppError> {
-        let endpoints = if self
+        let endpoints = self
             .app
-            .service_endpoints()
-            .encrypted_media_blob_endpoints
-            .is_empty()
-        {
-            DEFAULT_BLOSSOM_SERVER_URLS
-                .iter()
-                .map(|endpoint| (*endpoint).to_owned())
-                .collect()
-        } else {
-            self.app
-                .service_endpoints()
-                .encrypted_media_blob_endpoints
-                .clone()
-        };
+            .deployment()
+            .new_group_media_endpoints_or_fallback();
         match self.runtime.new_protocol_profile() {
             ProtocolProfile::Legacy => {
                 let policy = EncryptedMediaPolicyV1::blossom_default(endpoints, true)

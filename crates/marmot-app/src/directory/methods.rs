@@ -673,6 +673,7 @@ impl MarmotApp {
             account_id_hex,
             records.records,
             records.freshness,
+            &self.deployment().key_package_client_preference,
         )?;
         let from_cache = selection.value.is_none();
         let mut fetched = fresh_or_cached_key_package(account_id_hex, selection, cached_entry)?;

@@ -433,6 +433,32 @@ async fn long_explanation_is_bounded_on_the_wire() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deployment_without_a_label_namespace_refuses_a_report_destination() {
+    // Without the deployment's namespace a report would carry no origin label
+    // the operator's parser can match, so no destination is accepted.
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays_and_config(
+        dir.path(),
+        vec![APP_RELAY.into()],
+        crate::MarmotAppConfig::default().with_deployment(crate::MarmotDeployment {
+            moderation_label_namespace: None,
+            ..crate::MarmotDeployment::white_noise()
+        }),
+    );
+    let error = app
+        .set_moderation_report_config(Some(ModerationReportConfig {
+            recipient_pubkey: Keys::generate().public_key().to_hex(),
+            relays: vec![REPORT_RELAY.into()],
+        }))
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::InvalidModerationReportConfig(_)),
+        "{error:?}"
+    );
+    assert!(!app.moderation_reporting_available());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_validation_rejects_the_whole_config() {
     let fixture = Fixture::unconfigured(Mode::Accept);
     let moderation = fixture.moderation.public_key();

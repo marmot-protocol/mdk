@@ -1136,6 +1136,7 @@ async fn assert_recovery_keeps_checked_candidate_across_clock_boundary(membershi
             &records,
             app.directory_freshness(),
             None,
+            &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
         .unwrap()
         .value
@@ -1320,6 +1321,7 @@ async fn assert_recovery_does_not_switch_after_mls_expiry(membership: bool) {
             &records,
             app.directory_freshness(),
             None,
+            &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
         .unwrap()
         .value
@@ -1360,6 +1362,7 @@ async fn assert_recovery_does_not_switch_after_mls_expiry(membership: bool) {
             &records,
             app.directory_freshness(),
             None,
+            &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
         .unwrap()
         .value

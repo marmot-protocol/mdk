@@ -29,8 +29,6 @@ use transport_nostr::RelayEndpointPolicy;
 use transport_nostr_adapter::{NostrRelayClient, NostrSdkRelayClient};
 use transport_nostr_peeler::NostrTransportEvent;
 
-/// NIP-32 namespace of the origin label on every moderation report rumor.
-pub const MODERATION_REPORT_LABEL_NAMESPACE: &str = "chat.whitenoise.report";
 /// Longest explanation kept, in Unicode scalar values, after trimming.
 pub const MODERATION_REPORT_EXPLANATION_MAX_CHARS: usize = 1_000;
 /// A repeat of the same (target, reason, origin) inside this window returns the first outcome.
@@ -125,6 +123,8 @@ pub struct ModerationReportRetrySummary {
 pub(crate) struct ValidatedModerationReportConfig {
     pub(crate) recipient: PublicKey,
     pub(crate) relays: Vec<TransportEndpoint>,
+    /// The deployment's NIP-32 label namespace, which the operator's parser matches.
+    pub(crate) label_namespace: String,
 }
 
 /// Process-wide moderation-report state, shared by every `MarmotApp` clone.
@@ -299,6 +299,13 @@ impl MarmotApp {
         config: &ModerationReportConfig,
     ) -> Result<ValidatedModerationReportConfig, AppError> {
         let invalid = |reason: &str| AppError::InvalidModerationReportConfig(reason.to_owned());
+        // Without the deployment's namespace a report would carry no origin
+        // label the operator's parser can match.
+        let label_namespace = self
+            .deployment()
+            .moderation_label_namespace
+            .clone()
+            .ok_or_else(|| invalid("the deployment sets no moderation label namespace"))?;
         let recipient = config.recipient_pubkey.trim();
         let well_formed = (recipient.len() == 64
             && recipient.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -342,7 +349,11 @@ impl MarmotApp {
                 relays.push(TransportEndpoint(normalized));
             }
         }
-        Ok(ValidatedModerationReportConfig { recipient, relays })
+        Ok(ValidatedModerationReportConfig {
+            recipient,
+            relays,
+            label_namespace,
+        })
     }
 
     #[cfg(test)]
@@ -482,7 +493,14 @@ impl MarmotApp {
         }
 
         let signer = self.account_signer_for_summary(&account)?.as_nostr_signer();
-        let rumor = moderation_report_rumor(reporter, reported, reason, origin, &explanation);
+        let rumor = moderation_report_rumor(
+            reporter,
+            reported,
+            reason,
+            origin,
+            &explanation,
+            &config.label_namespace,
+        );
         // An external signer may be slow; a purge or shutdown must not wait on it.
         let wrap = tokio::select! {
             wrap = transport_nostr_peeler::gift_wrap_rumor(signer, config.recipient, rumor) => wrap
@@ -809,13 +827,15 @@ fn dedupe_key(
 }
 
 /// The unsigned kind-1984 rumor. Its only tags are the reported key with its NIP-56 type and
-/// the NIP-32 origin label; there is never an `e` tag or any conversation identifier.
+/// the NIP-32 origin label in `namespace`; there is never an `e` tag or any conversation
+/// identifier.
 pub(crate) fn moderation_report_rumor(
     reporter: PublicKey,
     reported: PublicKey,
     reason: ReportReason,
     origin: ModerationReportOrigin,
     explanation: &str,
+    namespace: &str,
 ) -> UnsignedEvent {
     let tags = [
         vec![
@@ -823,11 +843,11 @@ pub(crate) fn moderation_report_rumor(
             reported.to_hex(),
             reason.as_str().to_owned(),
         ],
-        vec!["L".to_owned(), MODERATION_REPORT_LABEL_NAMESPACE.to_owned()],
+        vec!["L".to_owned(), namespace.to_owned()],
         vec![
             "l".to_owned(),
             origin.label().to_owned(),
-            MODERATION_REPORT_LABEL_NAMESPACE.to_owned(),
+            namespace.to_owned(),
         ],
     ]
     .into_iter()

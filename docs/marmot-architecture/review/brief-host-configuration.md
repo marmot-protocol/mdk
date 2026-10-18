@@ -1,9 +1,9 @@
 ---
 title: "Brief — Host-Supplied Deployment Configuration"
 created: 2026-10-17
-updated: 2026-10-17
+updated: 2026-10-18
 tags: [marmot, architecture, review, brief, configuration, bindings]
-status: proposed, needs approval before implementation
+status: approved 2026-10-18, in implementation
 ---
 
 # Brief — Host-Supplied Deployment Configuration
@@ -227,6 +227,10 @@ Each PR is green on its own. PRs 1 and 2 change no default behaviour.
 - The binding READMEs and the integration notes for the release say all of the above.
 
 ## Decisions for the product owner
+
+Approved on 2026-10-18 as recommended: the preset lives in MDK, the neutral keychain service is
+`org.marmot-protocol.mdk`, a new group without media servers is created text-only, and every binding constructor
+requires a deployment after the flip.
 
 1. **An opt-in White Noise preset inside MDK** (recommended), or no preset, with the White Noise apps holding the
    values themselves. Without one, the CLI and `wn-agent` would need their own copy.

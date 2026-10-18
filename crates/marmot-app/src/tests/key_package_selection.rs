@@ -58,6 +58,7 @@ async fn client_preference_ranks_only_valid_current_slots_and_preserves_recency(
                 .collect::<Vec<_>>(),
             app.directory_freshness(),
             None,
+            &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
         .unwrap()
         .value
@@ -159,6 +160,7 @@ async fn malformed_replacement_suppresses_older_package_in_the_same_slot() {
                 .collect::<Vec<_>>(),
             app.directory_freshness(),
             None,
+            &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
     };
     for malformed in [bad_content, bad_metadata] {
@@ -703,6 +705,7 @@ async fn legacy_slots_never_select_or_mask_current_slots() {
             &records,
             app.directory_freshness(),
             None,
+            &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
     };
 

@@ -94,9 +94,10 @@ The simulator comes first; Jeff validates on a phone.
      not durably admitted, still answered and can spend the quiet budget.
 2. **The queue keeps what it drops.** Overflowed deliveries are stored durably (bytes), within
    a cap.
-3. **Required relays are the relays we operate.** `MarmotAppConfig::recovery_operated_relays`
-   names them; the default is `wss://relay.eu.whitenoise.chat` and
-   `wss://relay.us.whitenoise.chat`, and NIP-77 is a hard requirement for them. A route that
+3. **Required relays are the relays we operate.** `MarmotDeployment::recovery_operated_relays`
+   (on `MarmotAppConfig::deployment`) names them; White Noise's deployment, today's default, is
+   `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat`, and NIP-77 is a hard
+   requirement for them. A route that
    lists any operated relay requires exactly those. A route that lists none requires all of
    its relays, so its history can still certify. Every other relay is best effort: it is
    still compared and its events are admitted, but its failure, truncation or missing NIP-77

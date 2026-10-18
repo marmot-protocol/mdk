@@ -352,10 +352,12 @@ These are route URLs only. Host apps still supply audit and telemetry bearer tok
 runtime. Set any of these environment variables before invoking a build script to override the default for staging
 or local testing.
 
-Public profile-image uploads default to `https://blossom.primal.net`. Rust
-hosts can override or disable that third-party service with
-`MarmotServiceEndpoints::profile_image_blob_endpoint`; FFI callers can continue
-to pass an explicit Blossom server to `uploadProfileImage`.
+Public profile-image uploads default to `https://blossom.primal.net`, White
+Noise's deployment value. Rust hosts can override it with
+`MarmotDeployment::profile_image_endpoint` (`MarmotAppConfig::with_deployment`);
+an unset value still falls back to primal until the neutral default lands. FFI
+callers can continue to pass an explicit Blossom server to `uploadProfileImage`.
+Peers' avatars always load from the URL in their own profile.
 
 ## Interactive account onboarding
 

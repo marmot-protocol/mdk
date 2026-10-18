@@ -304,7 +304,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 
 ## Code map (modules not covered above)
 
-- Crate root `src/`: `config.rs` (`MarmotAppConfig`, service endpoints, attachment acquisition policy), `error.rs`,
+- Crate root `src/`: `config.rs` (`MarmotAppConfig`, collector endpoints, attachment acquisition policy),
+  `deployment.rs` (`MarmotDeployment`: the deployment services, with `neutral()` and the White Noise preset; the one
+  place White Noise's values are defined), `error.rs`,
   `close_registry.rs` (terminal-close closures for runtime-owned handles outside the storage caches),
   `ids.rs` (npub/nprofile/account-ref helpers), `drafts.rs` (encrypted per-account composer drafts),
   `chat_presentation.rs` + `chat_presentation/` (shared selected-chat presentation policy and maintenance),

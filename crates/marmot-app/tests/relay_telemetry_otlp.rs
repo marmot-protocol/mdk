@@ -361,8 +361,6 @@ async fn running_runtime_pushes_to_default_telemetry_endpoint_when_runtime_endpo
         .with_service_endpoints(MarmotServiceEndpoints {
             relay_telemetry_otlp_endpoint: Some(format!("http://{addr}/v1/metrics")),
             audit_log_tracker_endpoint: None,
-            encrypted_media_blob_endpoints: Vec::new(),
-            profile_image_blob_endpoint: None,
             ..MarmotServiceEndpoints::default()
         })
         .with_allow_loopback_relay_endpoints(true);

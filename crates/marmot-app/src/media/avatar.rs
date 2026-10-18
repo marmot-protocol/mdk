@@ -27,13 +27,16 @@ pub(crate) fn validate(bytes: Vec<u8>, declared: Option<&str>) -> Result<AvatarI
     )?)
 }
 
+/// `group_image_server` serves encrypted group images; a profile picture loads
+/// from the URL its signed kind-0 metadata names.
 pub(crate) async fn fetch(
     selected: &SelectedAvatar,
+    group_image_server: &str,
     transport: &BlossomHttpTransport,
 ) -> Result<AvatarImage, AppError> {
     tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        fetch_inner(selected, transport),
+        fetch_inner(selected, group_image_server, transport),
     )
     .await
     .map_err(|_| AppError::BlobStore("avatar acquisition timed out".into()))?
@@ -41,6 +44,7 @@ pub(crate) async fn fetch(
 
 async fn fetch_inner(
     selected: &SelectedAvatar,
+    group_image_server: &str,
     transport: &BlossomHttpTransport,
 ) -> Result<AvatarImage, AppError> {
     match selected {
@@ -55,7 +59,7 @@ async fn fetch_inner(
                 &image.image_key_hex,
                 &image.image_nonce_hex,
                 declared,
-                None,
+                group_image_server,
                 transport,
             )
             .await?;
@@ -116,9 +120,13 @@ mod tests {
             url: "https://127.0.0.1/image.png".into(),
             cache_key: "test".into(),
         };
-        let error = fetch(&selected, &BlossomHttpTransport::new(false))
-            .await
-            .unwrap_err();
+        let error = fetch(
+            &selected,
+            "https://blossom.example",
+            &BlossomHttpTransport::new(false),
+        )
+        .await
+        .unwrap_err();
         assert!(!retryable(&error));
         assert!(matches!(error, AppError::UnsafeMediaFetch(_)));
     }

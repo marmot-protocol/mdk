@@ -193,22 +193,6 @@ pub(crate) fn classify_chat_list_attachments(
 
 /// Built-in encrypted-media endpoints, in upload fallback order.
 ///
-/// Every endpoint in this list must accept opaque `application/octet-stream`
-/// blobs. Encrypted media and encrypted group images are indistinguishable
-/// from random bytes, so media-only Blossom servers are not compatible even
-/// when the original plaintext was an image or video.
-pub const DEFAULT_BLOSSOM_SERVER_URLS: &[&str] = &[
-    "https://blossom.divine.video",
-    "https://blossom.ditto.pub",
-    "https://cdn.hzrd149.com",
-];
-
-/// Primary built-in Blossom endpoint used by single-endpoint APIs such as
-/// encrypted group-image upload.
-pub const DEFAULT_BLOSSOM_SERVER_URL: &str = DEFAULT_BLOSSOM_SERVER_URLS[0];
-/// Public-profile images are intentionally not encrypted: their Blossom URL is
-/// published in Nostr kind:0 metadata and must be fetchable by other clients.
-pub const DEFAULT_PROFILE_IMAGE_BLOSSOM_SERVER_URL: &str = "https://blossom.primal.net";
 /// Maximum profile-image upload and dial-safe download size (10 MiB).
 pub(crate) const MAX_PROFILE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 /// Frozen legacy format label. New code chooses a version from group state.
@@ -250,7 +234,7 @@ impl EncryptedMediaVersion {
 pub(crate) async fn upload_profile_image(
     image: &[u8],
     media_type: &str,
-    server: Option<&str>,
+    server: &str,
     signer: &dyn MarmotNostrSigner,
 ) -> Result<String, AppError> {
     upload_profile_image_with_policy(image, media_type, server, signer, false).await
@@ -259,7 +243,7 @@ pub(crate) async fn upload_profile_image(
 pub(crate) async fn upload_profile_image_with_policy(
     image: &[u8],
     media_type: &str,
-    server: Option<&str>,
+    server: &str,
     signer: &dyn MarmotNostrSigner,
     allow_loopback_http: bool,
 ) -> Result<String, AppError> {
@@ -289,7 +273,6 @@ pub(crate) async fn upload_profile_image_with_policy(
             "profile image bytes do not match the declared media type".into(),
         ));
     }
-    let server = server.unwrap_or(DEFAULT_PROFILE_IMAGE_BLOSSOM_SERVER_URL);
     let hash_hex = hex::encode(Sha256::digest(image));
     let url = upload_blossom_blob_with_content_type(
         server,

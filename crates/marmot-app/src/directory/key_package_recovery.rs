@@ -53,8 +53,14 @@ impl MarmotApp {
             cached_target,
         } = request;
         let freshness = self.directory_freshness();
-        if preferred_fresh_key_package_from_records(account, &observed, freshness, requirements)
-            .is_ok_and(|selection| selection.value.is_some())
+        if preferred_fresh_key_package_from_records(
+            account,
+            &observed,
+            freshness,
+            requirements,
+            &self.deployment().key_package_client_preference,
+        )
+        .is_ok_and(|selection| selection.value.is_some())
         {
             return Ok(RecoveredKeyPackageRecords {
                 freshness,
@@ -118,6 +124,7 @@ impl MarmotApp {
                 &records,
                 freshness,
                 requirements,
+                &self.deployment().key_package_client_preference,
             )?;
             let target = selection
                 .value

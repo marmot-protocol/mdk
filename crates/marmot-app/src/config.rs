@@ -1,6 +1,8 @@
 use std::time::Duration;
 
 use marmot_account::MaintenanceTiming;
+
+use crate::deployment::{MarmotDeployment, OpenRankingProvider};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_DIRECTORY_MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
@@ -10,15 +12,6 @@ const COMPILED_AUDIT_LOG_TRACKER_ENDPOINT: Option<&str> =
     option_env!("MARMOT_AUDIT_LOG_TRACKER_ENDPOINT");
 const COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS: Option<&str> =
     option_env!("MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS");
-pub(crate) const DEFAULT_OPEN_RANKING_SEARCH_ENDPOINT: &str =
-    "https://ranking.vertexlab.io/search/pubkeys";
-pub(crate) const DEFAULT_OPEN_RANKING_PROFILE_RELAY: &str = "wss://relay.vertexlab.io";
-/// The relays White Noise operates. Recovery requires only these to certify
-/// a route's history; any other relay on the route is best effort.
-pub const DEFAULT_RECOVERY_OPERATED_RELAYS: &[&str] = &[
-    "wss://relay.eu.whitenoise.chat",
-    "wss://relay.us.whitenoise.chat",
-];
 
 /// Policy for advancing the account's durable transport cursor
 /// (`last_transport_timestamp`) from ingested deliveries.
@@ -115,11 +108,13 @@ pub struct MarmotAppConfig {
     /// delivery. Empty preserves the historical behavior of falling back to
     /// the operational relay set.
     pub directory_relay_urls: Vec<String>,
-    /// Relays this deployment operates. A route's history certifies once its
-    /// operated relays finish an untruncated comparison; every other relay on
-    /// the route is best effort and never blocks completion. A route with no
-    /// operated relay requires all of its relays.
-    pub recovery_operated_relays: Vec<String>,
+    /// The services this deployment's users rely on: recovery relays,
+    /// discovery indexers, media and image servers, Open Ranking, the
+    /// KeyPackage client preference, the moderation label namespace and the
+    /// keychain service. The default is [`MarmotDeployment::white_noise`],
+    /// with a build-time `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` list laid
+    /// over its new-group media servers.
+    pub deployment: MarmotDeployment,
     pub service_endpoints: MarmotServiceEndpoints,
     /// Durable transport-cursor persistence policy. Defaults to
     /// [`CursorPersistence::Advance`]; wake-collection runtimes (NSE,
@@ -244,12 +239,15 @@ pub struct MarmotAppConfig {
     pub directory_search_fallback_seeds: Vec<String>,
 }
 
-/// Compiled or app-level default service URLs for production telemetry export,
-/// forensic audit-log tracker uploads, media, and optional user discovery.
+/// Compiled or app-level default collector URLs for product analytics,
+/// production telemetry export and forensic audit-log tracker uploads.
+/// Deployment services such as media servers and Open Ranking live on
+/// [`MarmotDeployment`].
 ///
 /// Defaults are intentionally separate from bearer tokens. Host apps supply
 /// credentials at runtime, while the MDK/Marmot build owns stable
 /// first-party URLs. `MarmotAppConfig::default()` reads these from
+/// `MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT`,
 /// `MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT` and
 /// `MARMOT_AUDIT_LOG_TRACKER_ENDPOINT` at compile time.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -257,17 +255,6 @@ pub struct MarmotServiceEndpoints {
     pub product_analytics_events_endpoint: Option<String>,
     pub relay_telemetry_otlp_endpoint: Option<String>,
     pub audit_log_tracker_endpoint: Option<String>,
-    pub encrypted_media_blob_endpoints: Vec<String>,
-    /// Public, unencrypted profile-image upload endpoint. The resulting URL is
-    /// published in kind:0 metadata, so hosts with different privacy or
-    /// availability requirements should override the built-in service.
-    pub profile_image_blob_endpoint: Option<String>,
-    /// Optional ORE-05 pubkey search endpoint. `None` disables off-graph
-    /// provider discovery without affecting the personal graph search.
-    pub open_ranking_search_endpoint: Option<String>,
-    /// Relays used only to hydrate provider-returned pubkeys into signed kind-0
-    /// profiles. An empty list disables provider discovery.
-    pub open_ranking_profile_relays: Vec<String>,
 }
 
 impl Default for MarmotAppConfig {
@@ -280,10 +267,7 @@ impl Default for MarmotAppConfig {
             usage_diagnostics_silent: false,
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
             directory_relay_urls: Vec::new(),
-            recovery_operated_relays: DEFAULT_RECOVERY_OPERATED_RELAYS
-                .iter()
-                .map(|relay| (*relay).to_owned())
-                .collect(),
+            deployment: compiled_deployment(),
             service_endpoints: MarmotServiceEndpoints::compiled(),
             cursor_persistence: CursorPersistence::Advance,
             allow_loopback_blob_endpoints: false,
@@ -331,8 +315,15 @@ impl MarmotAppConfig {
         self
     }
 
+    /// Use `deployment` for every deployment service; see [`MarmotDeployment`].
+    pub fn with_deployment(mut self, deployment: MarmotDeployment) -> Self {
+        self.deployment = deployment.normalize();
+        self
+    }
+
     pub fn with_recovery_operated_relays(mut self, relay_urls: Vec<String>) -> Self {
-        self.recovery_operated_relays = relay_urls;
+        self.deployment.recovery_operated_relays = relay_urls;
+        self.deployment = self.deployment.normalize();
         self
     }
 
@@ -393,9 +384,11 @@ impl MarmotAppConfig {
         search_endpoint: Option<String>,
         profile_relays: Vec<String>,
     ) -> Self {
-        self.service_endpoints.open_ranking_search_endpoint = search_endpoint;
-        self.service_endpoints.open_ranking_profile_relays = profile_relays;
-        self.service_endpoints = self.service_endpoints.normalize();
+        self.deployment.open_ranking = search_endpoint.map(|search_endpoint| OpenRankingProvider {
+            search_endpoint,
+            profile_relays,
+        });
+        self.deployment = self.deployment.normalize();
         self
     }
 
@@ -516,14 +509,6 @@ impl MarmotServiceEndpoints {
             relay_telemetry_otlp_endpoint: COMPILED_RELAY_TELEMETRY_OTLP_ENDPOINT
                 .map(str::to_owned),
             audit_log_tracker_endpoint: COMPILED_AUDIT_LOG_TRACKER_ENDPOINT.map(str::to_owned),
-            encrypted_media_blob_endpoints: COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS
-                .map(split_endpoint_list)
-                .unwrap_or_default(),
-            profile_image_blob_endpoint: Some(
-                crate::media::DEFAULT_PROFILE_IMAGE_BLOSSOM_SERVER_URL.to_owned(),
-            ),
-            open_ranking_search_endpoint: Some(DEFAULT_OPEN_RANKING_SEARCH_ENDPOINT.to_owned()),
-            open_ranking_profile_relays: vec![DEFAULT_OPEN_RANKING_PROFILE_RELAY.to_owned()],
         }
         .normalize()
     }
@@ -533,14 +518,22 @@ impl MarmotServiceEndpoints {
             trim_optional(self.product_analytics_events_endpoint);
         self.relay_telemetry_otlp_endpoint = trim_optional(self.relay_telemetry_otlp_endpoint);
         self.audit_log_tracker_endpoint = trim_optional(self.audit_log_tracker_endpoint);
-        self.encrypted_media_blob_endpoints =
-            normalize_endpoint_list(self.encrypted_media_blob_endpoints);
-        self.profile_image_blob_endpoint = trim_optional(self.profile_image_blob_endpoint);
-        self.open_ranking_search_endpoint = trim_optional(self.open_ranking_search_endpoint);
-        self.open_ranking_profile_relays =
-            normalize_endpoint_list(self.open_ranking_profile_relays);
         self
     }
+}
+
+/// White Noise's deployment, with a build-time
+/// `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` list over its new-group media
+/// servers, as `MarmotServiceEndpoints::compiled()` applied it before.
+fn compiled_deployment() -> MarmotDeployment {
+    let mut deployment = MarmotDeployment::white_noise();
+    let compiled = COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS
+        .map(split_endpoint_list)
+        .unwrap_or_default();
+    if !compiled.is_empty() {
+        deployment.new_group_media_endpoints = compiled;
+    }
+    deployment.normalize()
 }
 
 /// Default export poll/push interval. Coarse on purpose: the data is
@@ -735,17 +728,6 @@ fn split_endpoint_list(value: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect()
-}
-
-fn normalize_endpoint_list(values: Vec<String>) -> Vec<String> {
-    let mut normalized = Vec::new();
-    for value in values {
-        let value = value.trim().to_owned();
-        if !value.is_empty() && !normalized.iter().any(|existing| existing == &value) {
-            normalized.push(value);
-        }
-    }
-    normalized
 }
 
 fn trim_required(name: &str, value: String) -> Result<String, String> {
@@ -993,28 +975,27 @@ mod tests {
     fn open_ranking_provider_is_configurable_and_can_be_disabled() {
         let default = MarmotAppConfig::default();
         assert_eq!(
-            default
-                .service_endpoints
-                .open_ranking_search_endpoint
-                .as_deref(),
-            Some(DEFAULT_OPEN_RANKING_SEARCH_ENDPOINT)
-        );
-        assert_eq!(
-            default.service_endpoints.open_ranking_profile_relays,
-            vec![DEFAULT_OPEN_RANKING_PROFILE_RELAY]
+            default.deployment.open_ranking,
+            MarmotDeployment::white_noise().open_ranking
         );
 
-        let disabled = default.with_open_ranking_provider(None, Vec::new());
-        assert_eq!(
-            disabled.service_endpoints.open_ranking_search_endpoint,
-            None
-        );
-        assert!(
-            disabled
-                .service_endpoints
-                .open_ranking_profile_relays
-                .is_empty()
-        );
+        let disabled = default.clone().with_open_ranking_provider(None, Vec::new());
+        assert_eq!(disabled.deployment.open_ranking, None);
+        let no_relays =
+            default.with_open_ranking_provider(Some("https://rank.example".to_owned()), Vec::new());
+        assert_eq!(no_relays.deployment.open_ranking, None);
+    }
+
+    #[test]
+    fn default_config_uses_the_white_noise_deployment() {
+        let mut expected = MarmotDeployment::white_noise();
+        if let Some(compiled) = COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS
+            .map(split_endpoint_list)
+            .filter(|list| !list.is_empty())
+        {
+            expected.new_group_media_endpoints = compiled;
+        }
+        assert_eq!(MarmotAppConfig::default().deployment, expected);
     }
 
     fn runtime_config() -> RelayTelemetryRuntimeConfig {

@@ -1745,7 +1745,9 @@ impl AccountManager {
         let mut seen = HashSet::new();
         // Public indexers are dialed on top of the cap, so they never take a
         // host or declared relay's slot and are never dropped themselves.
-        let indexers: HashSet<String> = default_directory_discovery_relays()
+        let indexers: HashSet<String> = self
+            .app
+            .discovery_indexer_relays()
             .iter()
             .map(|endpoint| relay_key(&endpoint.0))
             .collect();
@@ -1869,7 +1871,7 @@ impl AccountManager {
         let indexers = if step == OnboardingStep::SingleDevice || c.explicit_discovery {
             Vec::new()
         } else {
-            default_directory_discovery_relays()
+            self.app.discovery_indexer_relays()
         };
         self.onboarding_sources_with(c, step, &indexers).await
     }
@@ -2395,7 +2397,9 @@ impl AccountManager {
         // Every configured source, including each searched public indexer, must
         // finish: a timeout may hide a newer record. Unreachable user-declared
         // hints cannot establish absence either.
-        let indexers: HashSet<String> = default_directory_discovery_relays()
+        let indexers: HashSet<String> = self
+            .app
+            .discovery_indexer_relays()
             .iter()
             .map(|endpoint| relay_key(&endpoint.0))
             .collect();

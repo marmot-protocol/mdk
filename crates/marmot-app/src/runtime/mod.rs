@@ -4576,16 +4576,15 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         let signer = self.accounts.app.account_signer_for_summary(&account)?;
         let signer = signer.as_nostr_signer();
-        let configured_server = self
+        let server = self
             .accounts
             .app
-            .service_endpoints()
-            .profile_image_blob_endpoint
-            .as_deref();
+            .deployment()
+            .profile_image_endpoint_or_fallback(blossom_server);
         crate::media::upload_profile_image_with_policy(
             &data,
             media_type,
-            blossom_server.or(configured_server),
+            &server,
             signer.as_ref(),
             self.accounts.app.allow_loopback_blob_endpoints(),
         )
@@ -8863,33 +8862,6 @@ fn directory_bootstrap_relays_for_setup(request: &AccountSetupRequest) -> Vec<Tr
     } else {
         request.bootstrap_relays.clone()
     }
-}
-
-/// Public indexer relays used to resolve existing identities and spread newly
-/// generated accounts' public relay lists and profile metadata.
-///
-/// A brand-new external-signer account (or an imported nsec) keeps its NIP-65
-/// relay list (kind:10002) and profile (kind:0) on public indexers, not on the
-/// app's own messaging relays. Discovering an existing profile against the
-/// app's relays therefore finds nothing and the display name never resolves —
-/// the exact bug the external-signer work exists to fix. These indexers give
-/// the directory preflight a discovery set distinct from the operational
-/// messaging relays. They are never adopted as the account's messaging relays.
-pub(crate) const VERTEX_DIRECTORY_RELAY: &str = "wss://relay.vertexlab.io";
-
-const DEFAULT_DISCOVERY_INDEXER_RELAYS: &[&str] = &[
-    "wss://purplepag.es",
-    VERTEX_DIRECTORY_RELAY,
-    "wss://nos.lol",
-    "wss://relay.ditto.pub",
-    "wss://relay.primal.net",
-];
-
-pub fn default_directory_discovery_relays() -> Vec<TransportEndpoint> {
-    DEFAULT_DISCOVERY_INDEXER_RELAYS
-        .iter()
-        .map(|relay| TransportEndpoint((*relay).to_string()))
-        .collect()
 }
 
 /// Discovery relay set for the existing-account directory preflight.

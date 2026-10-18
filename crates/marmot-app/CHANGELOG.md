@@ -4,6 +4,24 @@
 
 ### Breaking changes
 
+- Deployment services move onto `MarmotDeployment`, carried as
+  `MarmotAppConfig::deployment` (host-configuration brief, PR 1). It holds the
+  recovery-operated relays, discovery indexers, new-group media servers,
+  group- and profile-image servers, Open Ranking, the KeyPackage client
+  preference, the moderation label namespace and the keychain service name.
+  `MarmotDeployment::white_noise()` holds White Noise's values, unchanged, and
+  is still the default; `MarmotDeployment::neutral()` configures none.
+  `MarmotAppConfig::recovery_operated_relays` and the `MarmotServiceEndpoints`
+  fields `encrypted_media_blob_endpoints`, `profile_image_blob_endpoint`,
+  `open_ranking_search_endpoint` and `open_ranking_profile_relays` are gone;
+  set them on the deployment with `MarmotAppConfig::with_deployment`.
+  `with_recovery_operated_relays` and `with_open_ranking_provider` still work.
+  `default_directory_discovery_relays()`, `DEFAULT_BLOSSOM_SERVER_URL(S)` and
+  `MODERATION_REPORT_LABEL_NAMESPACE` are removed: use
+  `MarmotApp::discovery_indexer_relays()` or the preset's fields. A
+  moderation report destination is now refused when the deployment sets no
+  label namespace. `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` still replaces the
+  default new-group media servers at build time.
 - `AppError` adds `GroupCatchingUp` and `GroupCommitUndelivered`; update exhaustive matches.
 - `AppError` adds `InvalidEditTarget`; update exhaustive matches.
 - `AppError` adds `DirectoryLookupIncomplete(account)` (mdk#2302). Invite member resolution,

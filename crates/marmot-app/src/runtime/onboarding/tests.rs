@@ -57,7 +57,8 @@ impl DirectoryRelayFetcher for Network {
         {
             events.extend(self.index_events.lock().iter().cloned());
         }
-        if crate::default_directory_discovery_relays()
+        if crate::MarmotDeployment::white_noise()
+            .discovery_indexer_endpoints()
             .iter()
             .any(|indexer| request.endpoints.contains(indexer))
         {
@@ -2871,7 +2872,7 @@ async fn relay_lists_published_only_on_public_indexers_are_not_missing() {
 
 fn fail_public_indexers(network: &Network) {
     let mut errors = network.inspection_errors.lock();
-    for indexer in crate::default_directory_discovery_relays() {
+    for indexer in crate::MarmotDeployment::white_noise().discovery_indexer_endpoints() {
         errors.insert(
             indexer.0,
             transport_nostr::DirectoryInspectionError::TimedOut,
@@ -2883,7 +2884,7 @@ fn fail_public_indexers(network: &Network) {
 async fn public_indexers_are_dialed_outside_the_inspection_cap() {
     let (_dir, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let indexers = crate::default_directory_discovery_relays();
+    let indexers = crate::MarmotDeployment::white_noise().discovery_indexer_endpoints();
     // The profile exists only on the indexers.
     network
         .public_indexer_events
@@ -3056,7 +3057,7 @@ async fn repairs_publish_to_host_and_declared_relays_never_to_indexers() {
             .await
             .unwrap()
     );
-    let indexers = crate::default_directory_discovery_relays();
+    let indexers = crate::MarmotDeployment::white_noise().discovery_indexer_endpoints();
     let published = network.published_endpoints.lock().clone();
     assert_eq!(published.len(), 2);
     for endpoints in published {
@@ -3072,7 +3073,7 @@ async fn repairs_publish_to_host_and_declared_relays_never_to_indexers() {
 
 #[test]
 fn public_indexers_join_discovery_except_on_loopback_routes() {
-    let indexers = crate::default_directory_discovery_relays();
+    let indexers = crate::MarmotDeployment::white_noise().discovery_indexer_endpoints();
     let mut sources = vec![
         "wss://index.example".to_owned(),
         format!("{}/", indexers[0].0),
