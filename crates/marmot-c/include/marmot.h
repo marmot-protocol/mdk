@@ -6091,7 +6091,9 @@ MarmotStatus marmot_open_attachment_handoff(const struct MarmotClient *client,
 
 /**
  * Delete a handoff copy once the OS surface is done with it. An unknown or
- * already released lease returns MARMOT_STATUS_OK. Blocking.
+ * already released lease returns MARMOT_STATUS_OK; a malformed lease returns
+ * MARMOT_STATUS_INVALID_MEDIA_REFERENCE. A copy that cannot be deleted
+ * returns an error and stays leased, so the call can be retried. Blocking.
  * # Safety
  * Client and lease must be live NUL-terminated inputs.
  */

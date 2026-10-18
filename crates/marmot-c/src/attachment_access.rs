@@ -94,7 +94,9 @@ pub unsafe extern "C" fn marmot_open_attachment_handoff(
     })
 }
 /// Delete a handoff copy once the OS surface is done with it. An unknown or
-/// already released lease returns MARMOT_STATUS_OK. Blocking.
+/// already released lease returns MARMOT_STATUS_OK; a malformed lease returns
+/// MARMOT_STATUS_INVALID_MEDIA_REFERENCE. A copy that cannot be deleted
+/// returns an error and stays leased, so the call can be retried. Blocking.
 /// # Safety
 /// Client and lease must be live NUL-terminated inputs.
 #[unsafe(no_mangle)]
@@ -164,6 +166,100 @@ mod tests {
     use crate::commands::marmot_read_attachment_asset;
     use crate::memory::{audit, boxed};
     use std::ptr;
+    /// With a real client: NULL inputs are refused before any work, an
+    /// unknown account is an error rather than a lease, and release is
+    /// idempotent for unknown leases but rejects malformed ones.
+    #[test]
+    fn attachment_handoff_c_forwards_and_validates_with_a_client() {
+        let _guard = audit::test_lock();
+        let home = tempfile::tempdir().unwrap();
+        let root = std::ffi::CString::new(home.path().to_str().unwrap()).unwrap();
+        let relay = c"wss://relay.example";
+        let relays = [relay.as_ptr()];
+        unsafe {
+            let mut client = ptr::null_mut();
+            assert_eq!(
+                crate::marmot_client_new(root.as_ptr(), relays.as_ptr(), 1, &mut client),
+                MarmotStatus::Ok
+            );
+            let message = std::ffi::CString::new("aa".repeat(32)).unwrap();
+            let source = std::ffi::CString::new("bb".repeat(32)).unwrap();
+            let group = std::ffi::CString::new("ab".repeat(16)).unwrap();
+            let target = MarmotAttachmentLocalTarget {
+                message_id_hex: message.as_ptr(),
+                source_message_id_hex: source.as_ptr(),
+                attachment_index: 0,
+            };
+            let mut control = ptr::null_mut();
+            assert_eq!(
+                crate::file_media::marmot_media_file_transfer_control_new(&mut control),
+                MarmotStatus::Ok
+            );
+            let mut out = ptr::dangling_mut();
+            assert_eq!(
+                marmot_open_attachment_handoff(
+                    client,
+                    c"alice".as_ptr(),
+                    group.as_ptr(),
+                    ptr::null(),
+                    control,
+                    &mut out
+                ),
+                MarmotStatus::NullPointer
+            );
+            assert!(out.is_null());
+            assert_eq!(
+                marmot_open_attachment_handoff(
+                    client,
+                    c"alice".as_ptr(),
+                    group.as_ptr(),
+                    &target,
+                    ptr::null(),
+                    &mut out
+                ),
+                MarmotStatus::NullPointer
+            );
+            assert_eq!(
+                marmot_open_attachment_handoff(
+                    client,
+                    c"alice".as_ptr(),
+                    group.as_ptr(),
+                    &target,
+                    control,
+                    ptr::null_mut()
+                ),
+                MarmotStatus::NullPointer
+            );
+            let status = marmot_open_attachment_handoff(
+                client,
+                c"absent-account".as_ptr(),
+                group.as_ptr(),
+                &target,
+                control,
+                &mut out,
+            );
+            assert_ne!(status, MarmotStatus::Ok, "no account, no lease");
+            assert!(out.is_null());
+            let unknown = std::ffi::CString::new("cd".repeat(16)).unwrap();
+            assert_eq!(
+                marmot_release_attachment_handoff(client, unknown.as_ptr()),
+                MarmotStatus::Ok
+            );
+            assert_eq!(
+                marmot_release_attachment_handoff(client, unknown.as_ptr()),
+                MarmotStatus::Ok,
+                "release is idempotent"
+            );
+            assert_eq!(
+                marmot_release_attachment_handoff(client, c"not-a-lease".as_ptr()),
+                MarmotStatus::InvalidMediaReference
+            );
+            crate::file_media::marmot_media_file_transfer_control_free(control);
+            assert_eq!(crate::marmot_client_shutdown(client), MarmotStatus::Ok);
+            crate::marmot_client_free(client);
+        }
+    }
+
     #[test]
     fn attachment_local_c_preflight_bounds_and_deep_free() {
         let _guard = audit::test_lock();

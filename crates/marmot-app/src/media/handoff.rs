@@ -358,7 +358,11 @@ fn write_copy(
     );
     let now = crate::unix_now_seconds();
     let mut written = 0u64;
-    while written < source.byte_count || source.byte_count == 0 {
+    // Nothing past the admitted length is ever written: a longer body is a
+    // length mismatch before its extra bytes reach the file.
+    let changed =
+        || AppError::InvalidEncryptedMedia("attachment length changed during the copy".into());
+    loop {
         control.check()?;
         match storage.app_storage().retained_attachment_read(
             &source.reference,
@@ -370,6 +374,9 @@ fn write_copy(
             Some(RetainedAttachmentRead::Bytes(bytes)) => {
                 if bytes.is_empty() {
                     break;
+                }
+                if written + bytes.len() as u64 > source.byte_count {
+                    return Err(changed());
                 }
                 file.write_all(&bytes).map_err(handoff_error)?;
                 written += bytes.len() as u64;
@@ -390,6 +397,9 @@ fn write_copy(
                     if read == 0 {
                         break;
                     }
+                    if written + read as u64 > source.byte_count {
+                        return Err(changed());
+                    }
                     file.write_all(&buffer[..read]).map_err(handoff_error)?;
                     written += read as u64;
                     control.advance(written);
@@ -400,9 +410,7 @@ fn write_copy(
     }
     file.flush().map_err(handoff_error)?;
     if written != source.byte_count {
-        return Err(AppError::InvalidEncryptedMedia(
-            "attachment length changed during the copy".into(),
-        ));
+        return Err(changed());
     }
     control.check()?;
     Ok(true)
