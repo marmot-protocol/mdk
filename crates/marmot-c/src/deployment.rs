@@ -263,6 +263,8 @@ mod tests {
 
     #[test]
     fn presets_match_the_uniffi_records() {
+        // Handles count against the process-wide allocation audit.
+        let _guard = crate::memory::audit::test_lock();
         let deployment = white_noise();
         assert_eq!(
             unsafe { &(*deployment).inner },
@@ -283,6 +285,8 @@ mod tests {
 
     #[test]
     fn setters_replace_each_field() {
+        // Handles count against the process-wide allocation audit.
+        let _guard = crate::memory::audit::test_lock();
         let deployment = white_noise();
         let relay = CString::new("wss://relay.example").unwrap();
         let relays = [relay.as_ptr()];
@@ -359,6 +363,8 @@ mod tests {
 
     #[test]
     fn null_arguments_are_rejected() {
+        // Handles count against the process-wide allocation audit.
+        let _guard = crate::memory::audit::test_lock();
         let relay = CString::new("wss://relay.example").unwrap();
         unsafe {
             assert_eq!(
@@ -385,6 +391,8 @@ mod tests {
 
     #[test]
     fn a_failed_preference_setter_leaves_both_lists_unchanged() {
+        // Handles count against the process-wide allocation audit.
+        let _guard = crate::memory::audit::test_lock();
         let deployment = white_noise();
         let preferred = CString::new("other").unwrap();
         let preferred = [preferred.as_ptr()];
