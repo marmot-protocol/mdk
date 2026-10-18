@@ -5606,7 +5606,7 @@ Create White Noise's deployment as this build compiled it, the values every cons
 MarmotStatus marmot_deployment_neutral(struct MarmotDeployment **out);
 ```
 
-Create a deployment with no services and the neutral keychain service `org.marmot-protocol.mdk`, then fill in what your deployment operates with the setters. Free it with `marmot_deployment_free`.
+Create a deployment with no services and the neutral keychain service `org.marmot-protocol.mdk`, then fill in what your deployment operates with the setters. Free it with `marmot_deployment_free`. Until the neutral default lands, an empty list or unset server still falls back to White Noise's.
 
 [Header contract](include/marmot.h#L9896)
 
@@ -5646,7 +5646,7 @@ Replace the public indexers that onboarding and account setup also search for an
 MarmotStatus marmot_deployment_set_new_group_media_endpoints(struct MarmotDeployment *deployment, const char *const *endpoints, uintptr_t endpoints_len);
 ```
 
-Replace the Blossom servers signed into a new group's encrypted-media component. Each must accept opaque `application/octet-stream` blobs. Existing groups keep their signed list.
+Replace the Blossom servers signed into a new group's encrypted-media component. Each must accept opaque `application/octet-stream` blobs. Existing groups keep their signed list. Until the neutral default lands, an empty list or unset server still falls back to White Noise's.
 
 [Header contract](include/marmot.h#L9929)
 
@@ -5656,7 +5656,7 @@ Replace the Blossom servers signed into a new group's encrypted-media component.
 MarmotStatus marmot_deployment_set_group_image_endpoint(struct MarmotDeployment *deployment, const char *endpoint);
 ```
 
-Set the Blossom server for encrypted group images, or unset it with NULL. Group state records no server, so every client sharing a group must use the same one.
+Set the Blossom server for encrypted group images, or unset it with NULL. Group state records no server, so every client sharing a group must use the same one. Until the neutral default lands, an empty list or unset server still falls back to White Noise's.
 
 [Header contract](include/marmot.h#L9938)
 
@@ -5666,7 +5666,7 @@ Set the Blossom server for encrypted group images, or unset it with NULL. Group 
 MarmotStatus marmot_deployment_set_profile_image_endpoint(struct MarmotDeployment *deployment, const char *endpoint);
 ```
 
-Set the public profile-image upload server, or unset it with NULL. Peers' avatars load from the URL in their profile, never from here.
+Set the public profile-image upload server, or unset it with NULL. Peers' avatars load from the URL in their profile, never from here. Until the neutral default lands, an empty list or unset server still falls back to White Noise's.
 
 [Header contract](include/marmot.h#L9946)
 

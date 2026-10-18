@@ -295,7 +295,10 @@ Ranking, the KeyPackage client preference, the moderation label namespace, and t
 differs. An omitted deployment is White Noise's for now. When the default turns neutral, every constructor will
 require one, so White Noise apps should pass `marmotDeploymentWhiteNoise()` now, in every entry point, including
 background and notification-extension runtimes. Never change `keychainService` for an existing install: secrets
-stored under the old name are stranded. C hosts use `marmot_client_new_with_deployment`.
+stored under the old name are stranded. Until the neutral default lands, an empty `newGroupMediaEndpoints` or an
+unset group-image or profile-image server still falls back to White Noise's servers, so even
+`marmotDeploymentNeutral()` signs those media servers into new groups and fetches group images from White Noise's.
+C hosts use `marmot_client_new_with_deployment`.
 
 ```swift
 var options = MarmotOptions(clientName: "whitenoise")
@@ -661,15 +664,17 @@ refresh.
 
 ## KeyPackage client preference
 
-Invitation discovery temporarily prefers `whitenoise`, then untagged/other clients,
-then `amethyst`. Names are trimmed and matched case-insensitively, exactly (not by
+Invitation discovery temporarily ranks KeyPackages by the deployment's client preference:
+`keyPackagePreferredClients` first, then untagged/other clients, then `keyPackageLastClients`.
+White Noise's deployment prefers `whitenoise` and ranks `amethyst` last; `marmotDeploymentNeutral()` sets no
+preference. Names are trimmed and matched case-insensitively, exactly (not by
 substring). These are advisory labels, never proof of a particular application.
 Only valid packages compatible with the proposed/existing group qualify. Within a
-tier, the existing recency order applies. Amethyst remains selectable when no
+tier, the existing recency order applies. A last-ranked client remains selectable when no
 higher-priority compatible package is available. A replacement in a publication
 slot supersedes the old package before ranking; one package per account is selected.
-This temporary selection policy applies to all hosts of this runtime; only the
-publication label is host-configurable (see [runtime options](#runtime-options-and-client-label)).
+The ranking comes from the [deployment](#deployment); the publication label is set separately (see
+[runtime options](#runtime-options-and-client-label)).
 Compatibility alone cannot identify a client that publishes usable packages but does not process Welcomes.
 
 Client ranking and slot supersession also apply to directory lookup (including
@@ -682,7 +687,7 @@ candidates still permit a per-account fallback fetch. A lower-priority batch
 winner during create/invite also triggers that fetch to look for a preferred slot omitted by a relay's
 batch limit, even if it returned fewer records than requested: relays may impose
 lower caps. Already observed replacements remain authoritative during the refetch.
-This adds a per-author request for each lower-priority batch winner. A White Noise
+This adds a per-author request for each lower-priority batch winner. A preferred-client
 winner already has the highest tier in a newest-first prefix, so it skips that
 request. Both paths remain bounded discovery: neither guarantees completeness
 when a relay omits newer events instead of returning a newest-first prefix.

@@ -200,8 +200,12 @@ pub unsafe extern "C" fn marmot_deployment_set_key_package_client_preference(
 ) -> MarmotStatus {
     unsafe {
         edit(deployment, |inner| {
-            inner.key_package_preferred_clients = str_array(preferred, preferred_len)?;
-            inner.key_package_last_clients = str_array(last, last_len)?;
+            // Read both lists before changing either, so a failure leaves the
+            // handle as it was.
+            let preferred = str_array(preferred, preferred_len)?;
+            let last = str_array(last, last_len)?;
+            inner.key_package_preferred_clients = preferred;
+            inner.key_package_last_clients = last;
             Ok(())
         })
     }
@@ -376,6 +380,31 @@ mod tests {
             );
             marmot_deployment_free(deployment);
             marmot_deployment_free(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn a_failed_preference_setter_leaves_both_lists_unchanged() {
+        let deployment = white_noise();
+        let preferred = CString::new("other").unwrap();
+        let preferred = [preferred.as_ptr()];
+        let invalid = [0xff_u8, 0];
+        let last = [invalid.as_ptr().cast::<c_char>()];
+        unsafe {
+            assert_eq!(
+                marmot_deployment_set_key_package_client_preference(
+                    deployment,
+                    preferred.as_ptr(),
+                    1,
+                    last.as_ptr(),
+                    1
+                ),
+                MarmotStatus::InvalidUtf8
+            );
+            let inner = &(*deployment).inner;
+            assert_eq!(inner.key_package_preferred_clients, ["whitenoise"]);
+            assert_eq!(inner.key_package_last_clients, ["amethyst"]);
+            marmot_deployment_free(deployment);
         }
     }
 }
