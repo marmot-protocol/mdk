@@ -104,6 +104,12 @@ and no download is started. Keep in-app display and playback on `readAttachmentA
 - **Copying.** `control` reports copied bytes and cancels; a cancelled or failed copy
   leaves nothing. A copy the disk cannot hold beyond the policy's disk reserve fails with
   `StorageFull`. Each call makes a separate copy.
+- **Cancelling.** Cancel a handoff only with `control.cancel()`. Do not cancel the
+  coroutine or task awaiting `openAttachmentHandoff` (Kotlin `Job.cancel`, Swift
+  `Task.cancel`): a call cancelled just as it completes can lose its result before your
+  code sees the lease, and that copy then stays on disk until the account worker's next
+  start in a new process deletes it. Call it from a scope you do not cancel, such as
+  Kotlin's `withContext(NonCancellable)`, and cancel through `control` instead.
 - **Exposing it.** On Android, serve the file through a `FileProvider` path for
   `accounts/*/handoff/` and grant read access with a content URI, never the raw path. On
   iOS, pass the file URL to `UIActivityViewController` or Quick Look. Exclude the account

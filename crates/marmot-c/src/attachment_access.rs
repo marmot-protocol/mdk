@@ -50,6 +50,8 @@ c_mirror! {
 /// cannot hold the copy beyond the reserve. The control reports copied bytes and
 /// cancels. Free the record with marmot_attachment_handoff_free; that does not
 /// release the lease. Blocking for the whole copy: call off the UI thread.
+/// Cancel the copy with marmot_media_file_transfer_control_cancel from
+/// another thread; a cancelled copy leaves no file and no lease.
 /// # Safety
 /// Client, control and strings must be live; target must point to a valid
 /// target whose strings stay valid until return; out must be writable.

@@ -67,6 +67,12 @@ impl Marmot {
     /// does not revoke it. `control` reports copied bytes and cancels the
     /// copy. `StorageFull` when the disk cannot hold the copy beyond the
     /// reserve. No network or download is started.
+    ///
+    /// Cancel a handoff only through `control`, which always leaves no copy
+    /// and no lease. Do not cancel the awaiting coroutine or task: if that
+    /// happens just as the call completes, the result can be dropped before
+    /// the host sees the lease, and the copy then stays until the account
+    /// worker's next start in a new process, which deletes it.
     // Polled on the caller, never spawned: a spawned export could finish and
     // drop the lease while a cancelled host never collects it. Dropped on
     // the caller, the pending copy is discarded instead.
