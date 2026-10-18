@@ -191,8 +191,6 @@ pub(crate) fn classify_chat_list_attachments(
     (Some(kind), count)
 }
 
-/// Built-in encrypted-media endpoints, in upload fallback order.
-///
 /// Maximum profile-image upload and dial-safe download size (10 MiB).
 pub(crate) const MAX_PROFILE_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 /// Frozen legacy format label. New code chooses a version from group state.

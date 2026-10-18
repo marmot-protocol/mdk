@@ -305,7 +305,8 @@ server must accept arbitrary binary data rather than only recognizable image, au
 the deployment's `MarmotDeployment::new_group_media_endpoints` (White Noise's ordered ciphertext-compatible list by
 default) unless the host build supplies `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS`. Encrypted media uploads try those
 endpoints in order; encrypted group images use the deployment's `group_image_endpoint` (White Noise's primary
-endpoint by default).
+endpoint by default). Until the neutral default lands, an empty `new_group_media_endpoints` or an unset
+`group_image_endpoint` still resolves to White Noise's servers, so clearing the list still signs them into new groups.
 
 The endpoint list is embedded in the signed `marmot.group.encrypted-media.v1` component. Changing application defaults
 does not rewrite existing group state. An active group admin can migrate an existing group with

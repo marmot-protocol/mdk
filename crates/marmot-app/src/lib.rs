@@ -1671,6 +1671,9 @@ impl MarmotApp {
         {
             config.dev_settlement_quiescence_ms = Some(0);
         }
+        // `deployment` is a public field, so a struct literal can skip
+        // `with_deployment`; normalize once where the app keeps it.
+        config.deployment = config.deployment.normalize();
         let root = root.as_ref().to_path_buf();
         let relay_plane = MarmotRelayPlane::runtime_default_with_loopback(
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
@@ -1767,8 +1770,11 @@ impl MarmotApp {
         root: impl AsRef<Path>,
         relay_urls: Vec<String>,
         account_home: AccountHome,
-        config: MarmotAppConfig,
+        mut config: MarmotAppConfig,
     ) -> Self {
+        // `deployment` is a public field, so a struct literal can skip
+        // `with_deployment`; normalize once where the app keeps it.
+        config.deployment = config.deployment.normalize();
         let relay_plane = MarmotRelayPlane::runtime_default_with_loopback(
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,

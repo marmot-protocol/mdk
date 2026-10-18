@@ -1866,6 +1866,32 @@ mod tests {
         assert_eq!(updates[0].total_result_count, 0);
     }
 
+    /// `deployment` is a public field, so a struct literal can skip
+    /// `with_deployment`. A provider with no profile relay must still be off,
+    /// whichever constructor stores the config, or every query would reach it.
+    #[test]
+    fn open_ranking_without_profile_relays_is_disabled_when_set_through_the_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::MarmotAppConfig::default();
+        config.deployment.open_ranking = Some(crate::OpenRankingProvider {
+            search_endpoint: "https://rank.example".into(),
+            profile_relays: vec!["  ".into()],
+        });
+        let relay_only = MarmotApp::with_relays_and_config(
+            dir.path().join("relay-only"),
+            vec!["wss://relay.example".into()],
+            config.clone(),
+        );
+        assert_eq!(relay_only.deployment().open_ranking, None);
+        let with_home = MarmotApp::with_relays_and_account_home_and_config(
+            dir.path().join("with-home"),
+            vec!["wss://relay.example".into()],
+            AccountHome::open(dir.path().join("with-home")),
+            config,
+        );
+        assert_eq!(with_home.deployment().open_ranking, None);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streams_a_cached_radius_zero_match_through_the_full_update_sequence() {
         let dir = tempfile::tempdir().unwrap();
