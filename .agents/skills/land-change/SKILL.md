@@ -146,16 +146,37 @@ Wait for the PR's required pre-check, then enqueue the head you verified and
 had reviewed:
 
 ```sh
-gh pr checks <pr> --required --watch --fail-fast &&
+head="$(gh pr view <pr> --json headRefOid -q .headRefOid)"
+while run="$(gh run list --workflow ci.yml --event pull_request --commit "$head" --limit 1 --json databaseId -q '.[].databaseId')" &&
+  [ -z "$run" ]; do
+  sleep 10
+done
+gh run watch "$run" --interval 30 > /dev/null
+result="$(gh pr checks <pr> --required --json bucket -q '.[].bucket' 2>&1)"
+echo "Required CI: $result"
+[ "$result" = pass ] &&
   gh api graphql \
     -f query='mutation($id: ID!, $oid: GitObjectID!) { enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $oid}) { mergeQueueEntry { position } } }' \
     -f id="$(gh pr view <pr> --json id -q .id)" \
     -f oid="$(git rev-parse HEAD)"
 ```
 
-The `&&` keeps a failed pre-check from enqueueing. `expectedHeadOid` makes the
-enqueue fail if the PR head is not the commit you verified. Do not use
-`gh pr merge`; repository auto-merge is off, so it fails.
+The only required check, `Required CI`, does not exist until the other CI jobs
+finish, so while CI runs `gh pr checks --required` exits 1 at once with "no
+required checks reported", even with `--watch`. The block instead waits for
+the PR head's `ci.yml` run to start and finish, then reads `Required CI`. It
+lasts as long as the pre-check; run it in the background if your shell limits
+command time. Only `pass` enqueues. `fail` or `cancel` is a pre-check that did
+not pass, and so is "no required checks reported" once the run has finished:
+the run ended without creating the check, for example because the workflow
+failed to start. A `gh` error also stops the block without enqueueing; read it
+and run the block again. `expectedHeadOid` makes the enqueue fail if the PR
+head is not the commit you verified. Do not use `gh pr merge`; repository
+auto-merge is off, so it fails.
+
+An enqueue refused with `Required status check "Required CI" is expected`
+means CI has not finished on the PR head yet, not that it failed. Wait for it
+and enqueue again.
 
 If the pre-check fails, open this head's pull-request run
 (`gh run list --workflow ci.yml --commit "$(git rev-parse HEAD)"`, then
