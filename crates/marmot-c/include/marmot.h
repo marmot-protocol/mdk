@@ -6077,7 +6077,7 @@ void marmot_attachment_handoff_free(struct MarmotAttachmentHandoff *ptr);
  * the attachment is not held locally. MARMOT_STATUS_STORAGE_FULL when the disk
  * cannot hold the copy beyond the reserve. The control reports copied bytes and
  * cancels. Free the record with marmot_attachment_handoff_free; that does not
- * release the lease. Blocking: call off the UI thread.
+ * release the lease. Blocking for the whole copy: call off the UI thread.
  * # Safety
  * Client, control and strings must be live; target must point to a valid
  * target whose strings stay valid until return; out must be writable.
@@ -6093,7 +6093,8 @@ MarmotStatus marmot_open_attachment_handoff(const struct MarmotClient *client,
  * Delete a handoff copy once the OS surface is done with it. An unknown or
  * already released lease returns MARMOT_STATUS_OK; a malformed lease returns
  * MARMOT_STATUS_INVALID_MEDIA_REFERENCE. A copy that cannot be deleted
- * returns an error and stays leased, so the call can be retried. Blocking.
+ * returns MARMOT_STATUS_IO and stays leased, so the call can be retried.
+ * Blocking: call off the UI thread.
  * # Safety
  * Client and lease must be live NUL-terminated inputs.
  */

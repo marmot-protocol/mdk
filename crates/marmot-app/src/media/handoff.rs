@@ -417,16 +417,21 @@ fn write_copy(
 }
 
 /// Deletes a lease's copy. An unknown or already released lease is not an
-/// error. A copy that cannot be deleted is an error and stays leased, so the
-/// host can retry. Blocking.
+/// error. A copy that cannot be deleted is an I/O error and stays leased, so
+/// the host can retry. Blocking.
 pub(crate) fn release(lease: &str) -> Result<(), AppError> {
     if lease.len() != 32 || !lease.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(AppError::InvalidEncryptedMedia(
             "invalid attachment handoff lease".into(),
         ));
     }
-    remove_lease(&lease.to_ascii_lowercase()).map_err(|_| {
-        AppError::InvalidEncryptedMedia("attachment handoff copy could not be deleted".into())
+    // An I/O error, unlike a malformed lease, tells the host a retry can
+    // succeed. Fixed text: no path or OS detail.
+    remove_lease(&lease.to_ascii_lowercase()).map_err(|error| {
+        AppError::Io(std::io::Error::new(
+            error.kind(),
+            "attachment handoff copy could not be deleted",
+        ))
     })
 }
 

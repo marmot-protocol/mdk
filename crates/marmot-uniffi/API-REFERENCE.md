@@ -580,9 +580,9 @@ Write a plaintext copy of one retained attachment for an OS surface that needs a
 pub async fn release_attachment_handoff(&self, lease: String) -> Result<(), MarmotKitError>
 ```
 
-Delete a handoff copy once the OS surface is done with it (the installer or share activity returned, the controller was dismissed). Idempotent: an unknown or already released lease succeeds; a malformed one is rejected. Do not use the path afterwards.
+Delete a handoff copy once the OS surface is done with it (the installer or share activity returned, the controller was dismissed). Idempotent: an unknown or already released lease succeeds; a malformed one is rejected with `InvalidMediaReference`. A copy that cannot be deleted returns `Io` and stays leased, so retry the release. Do not use the path afterwards.
 
-[Source](src/commands/attachment_access.rs#L91)
+[Source](src/commands/attachment_access.rs#L92)
 
 </details>
 

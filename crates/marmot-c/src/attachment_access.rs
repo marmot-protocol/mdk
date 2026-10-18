@@ -49,7 +49,7 @@ c_mirror! {
 /// the attachment is not held locally. MARMOT_STATUS_STORAGE_FULL when the disk
 /// cannot hold the copy beyond the reserve. The control reports copied bytes and
 /// cancels. Free the record with marmot_attachment_handoff_free; that does not
-/// release the lease. Blocking: call off the UI thread.
+/// release the lease. Blocking for the whole copy: call off the UI thread.
 /// # Safety
 /// Client, control and strings must be live; target must point to a valid
 /// target whose strings stay valid until return; out must be writable.
@@ -96,7 +96,8 @@ pub unsafe extern "C" fn marmot_open_attachment_handoff(
 /// Delete a handoff copy once the OS surface is done with it. An unknown or
 /// already released lease returns MARMOT_STATUS_OK; a malformed lease returns
 /// MARMOT_STATUS_INVALID_MEDIA_REFERENCE. A copy that cannot be deleted
-/// returns an error and stays leased, so the call can be retried. Blocking.
+/// returns MARMOT_STATUS_IO and stays leased, so the call can be retried.
+/// Blocking: call off the UI thread.
 /// # Safety
 /// Client and lease must be live NUL-terminated inputs.
 #[unsafe(no_mangle)]
@@ -172,6 +173,8 @@ mod tests {
     #[test]
     fn attachment_handoff_c_forwards_and_validates_with_a_client() {
         let _guard = audit::test_lock();
+        // No platform keystore on CI runners.
+        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
         let home = tempfile::tempdir().unwrap();
         let root = std::ffi::CString::new(home.path().to_str().unwrap()).unwrap();
         let relay = c"wss://relay.example";

@@ -94,7 +94,8 @@ and no download is started. Keep in-app display and playback on `readAttachmentA
   when it had none, so installers and share targets recognise it.
 - **Releasing.** Call `releaseAttachmentHandoff(lease)` when the surface is done: when the
   installer or share activity returns on Android, or the controller is dismissed on iOS.
-  Release is idempotent. Do not use the path afterwards.
+  Release is idempotent. A copy that cannot be deleted returns `Io` and stays leased:
+  retry the release. Do not use the path afterwards.
 - **What else deletes it.** Account removal, and the account worker's next start in a new
   process, which removes copies no live lease holds. Suspending through
   `shutdown_and_close` refuses new handoffs but keeps existing copies, so a share in

@@ -91,7 +91,10 @@ fn a_failed_release_stays_leased_for_a_retry() {
     let enforced = std::fs::remove_file(copy.join("probe")).is_err()
         && std::fs::File::create(copy.join("probe")).is_err();
     if enforced {
-        assert!(release(&lease).is_err());
+        assert!(
+            matches!(release(&lease), Err(AppError::Io(_))),
+            "a failed deletion is retryable I/O, not bad input"
+        );
         assert!(copy.join("held.bin").exists());
         assert_eq!(live_leases_under(directory.path()), 1, "still leased");
     }
