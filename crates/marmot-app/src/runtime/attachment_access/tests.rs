@@ -2,7 +2,7 @@ use super::*;
 use crate::MarmotApp;
 use marmot_account::AccountHome;
 use sha2::{Digest, Sha256};
-use storage_sqlite::SqliteAppStorage;
+use storage_sqlite::{SqliteAccountStorage, SqliteAppStorage};
 use storage_sqlite::{StoredAccountGroup, StoredAccountState, StoredAppEvent};
 const GROUP: &str = "abababababababababababababababab";
 fn group(pending: bool) -> StoredAccountGroup {
@@ -366,7 +366,8 @@ async fn attachment_progress_stream_observes_removal_without_network_or_erasing_
 
 /// Claims the fixture slot's acquisition and publishes `bytes` into the
 /// account's media store, as a download does.
-fn seed_file_backed(app: &MarmotApp, store: &SqliteAccountStorage, bytes: &[u8]) {
+fn seed_file_backed(app: &MarmotApp, account: &SqliteAccountStorage, bytes: &[u8]) {
+    let store = &account.app_storage();
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -416,7 +417,7 @@ fn seed_file_backed(app: &MarmotApp, store: &SqliteAccountStorage, bytes: &[u8])
         .claim_attachment_acquisition(&reference, now, now + 60)
         .unwrap()
         .unwrap();
-    let media = app.account_media_store("alice", store).unwrap();
+    let media = app.account_media_store("alice", account).unwrap();
     let clock = crate::unix_now_seconds;
     assert!(matches!(
         media
@@ -457,7 +458,7 @@ async fn handoff_copies_either_layout_into_a_private_file_until_release() {
         if file_backed {
             seed_file_backed(&app, &store, &body);
         } else {
-            seed(&store, &body);
+            seed(&store.app_storage(), &body);
         }
         let runtime = app.runtime();
         let group = GroupId::new(vec![0xab; 16]);
@@ -533,7 +534,7 @@ async fn handoff_refusals_leave_nothing() {
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let store = app.account_storage("alice").unwrap();
-    seed(&store, &[7; 4096]);
+    seed(&store.app_storage(), &[7; 4096]);
     let runtime = app.runtime();
     let group = GroupId::new(vec![0xab; 16]);
     let mut absent = target();
@@ -632,7 +633,7 @@ async fn a_finished_but_uncollected_handoff_is_discarded() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let store = app.account_storage("alice").unwrap();
     let body = vec![5u8; 4096];
-    seed(&store, &body);
+    seed(&store.app_storage(), &body);
     let runtime = app.runtime();
     let group = GroupId::new(vec![0xab; 16]);
     let control = std::sync::Arc::new(crate::MediaFileTransferControl::default());

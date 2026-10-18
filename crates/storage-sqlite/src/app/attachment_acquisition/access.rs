@@ -46,7 +46,7 @@ impl SqliteAppStorage {
     }
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// The published descriptor of one original source slot: its `imeta`
     /// tag (as stored JSON) and source epoch, for naming a local copy of a
     /// retained body. Reads no bytes and grants nothing: callers still read

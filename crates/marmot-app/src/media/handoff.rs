@@ -95,7 +95,8 @@ impl HandoffSource {
         target: &crate::AttachmentLocalTarget,
         allow_loopback: bool,
     ) -> Result<Option<Self>, AppError> {
-        let Some(asset) = storage.retained_attachment_asset(
+        let app_storage = storage.app_storage();
+        let Some(asset) = app_storage.retained_attachment_asset(
             group,
             &target.message_id_hex,
             &target.source_message_id_hex,
@@ -105,7 +106,7 @@ impl HandoffSource {
         else {
             return Ok(None);
         };
-        let descriptor = storage
+        let descriptor = app_storage
             .retained_attachment_descriptor(
                 group,
                 &target.message_id_hex,
@@ -299,7 +300,7 @@ pub(crate) fn open(
         ));
     }
     control.check()?;
-    let policy = storage.attachment_download_policy(
+    let policy = storage.app_storage().attachment_download_policy(
         &crate::runtime::attachment_controls::default_policy(&app.config),
     )?;
     if let Ok(free) = super::attachment_resume::available_space(&app.account_dir(account))
@@ -359,7 +360,7 @@ fn write_copy(
     let mut written = 0u64;
     while written < source.byte_count || source.byte_count == 0 {
         control.check()?;
-        match storage.retained_attachment_read(
+        match storage.app_storage().retained_attachment_read(
             &source.reference,
             now,
             written,
