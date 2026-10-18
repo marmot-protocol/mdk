@@ -747,3 +747,39 @@ async fn a_handoff_never_recreates_a_removed_account_directory() {
     );
     std::fs::rename(&tombstone, &account_dir).unwrap();
 }
+
+/// A handoff admitted on a storage handle that account removal then evicted
+/// (with the account reopened at the same path, as a re-import does) never
+/// writes into the new account's directory or hands out a lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handoff_on_an_evicted_handle_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let old = app.account_storage("alice").unwrap();
+    seed(&old.app_storage(), &[6; 2048]);
+    let source = crate::media::handoff::HandoffSource::find(&old, GROUP, &target(), false)
+        .unwrap()
+        .expect("admitted");
+    // Removal evicts the handle; the account then reopens at the same path.
+    app.drop_account_caches("alice");
+    let reopened = app.account_storage("alice").unwrap();
+    assert!(!reopened.shares_connection_with(&old));
+    let control = crate::MediaFileTransferControl::default();
+    let refused = crate::media::handoff::open(&app, "alice", &old, source, &control).unwrap_err();
+    assert!(matches!(
+        refused,
+        AppError::Storage(cgka_traits::StorageError::Closed(_))
+    ));
+    assert_eq!(
+        handoff_entries(&app),
+        0,
+        "nothing written into the reopened account"
+    );
+    assert_eq!(
+        crate::media::handoff::live_leases_under(&app.account_dir("alice")),
+        0
+    );
+}

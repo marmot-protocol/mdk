@@ -241,6 +241,12 @@ pub(crate) struct PendingHandoff {
     runtime: Option<tokio::runtime::Handle>,
 }
 
+impl std::fmt::Debug for PendingHandoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingHandoff").finish_non_exhaustive()
+    }
+}
+
 impl PendingHandoff {
     /// Wraps a registered copy made on the current runtime's blocking pool.
     fn new(handoff: AttachmentHandoff) -> Self {
@@ -332,11 +338,27 @@ pub(crate) fn open(
         rand::rngs::OsRng.fill_bytes(&mut bytes);
         hex::encode(bytes)
     };
+    // A handle held across account removal must not write into whatever
+    // directory now sits at the account's path (a re-import).
+    let evicted = || {
+        AppError::from(cgka_traits::StorageError::Closed(
+            "attachment handoff unavailable: account storage handle was evicted".into(),
+        ))
+    };
+    if !app.account_storage_is_current(account, storage) {
+        return Err(evicted());
+    }
     let directory = handoff_directory(app, account).join(&lease);
     // Registered before anything exists, so a concurrent wipe spares it.
     lock_leases().insert(lease.clone(), directory.clone());
     let path = directory.join(&source.file_name);
     match write_copy(app, account, storage, &source, &directory, &path, control) {
+        // Checked again once the copy exists: a removal during the copy
+        // means it came from the evicted store, so it is never handed out.
+        Ok(true) if !app.account_storage_is_current(account, storage) => {
+            discard_lease(&lease);
+            Err(evicted())
+        }
         Ok(true) => Ok(Some(PendingHandoff::new(AttachmentHandoff {
             lease,
             path,

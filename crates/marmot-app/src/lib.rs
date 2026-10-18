@@ -7332,6 +7332,21 @@ impl MarmotApp {
     /// keep writing through the stale handle, silently losing data. Clearing
     /// the warm/stale/ready flags forces the rebuilt account to re-warm its
     /// projections from the fresh database.
+    /// Whether `storage` is still the account's current cached handle:
+    /// account removal evicts it, so a handle held across a removal (and any
+    /// re-import at the same path) is no longer current.
+    pub(crate) fn account_storage_is_current(
+        &self,
+        label: &str,
+        storage: &SqliteAccountStorage,
+    ) -> bool {
+        self.account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .is_some_and(|cached| cached.shares_connection_with(storage))
+    }
+
     fn drop_account_caches(&self, label: &str) {
         // Close live bounded windows before a label can bind to another store.
         let _ = self
