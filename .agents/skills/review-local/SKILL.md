@@ -27,26 +27,35 @@ family can take that seat.
 
 ## Prepare a round
 
-From the repository root:
+From the repository root, with `<seat-a>` and `<seat-b>` the two seats you
+launch (`codex`, `claude` or `cursor`):
 
 ```sh
 git fetch origin master
 REVIEW_DIR="$(mktemp -d "${TMPDIR:-/tmp}/review-local.XXXXXX")"
+OUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/review-out.XXXXXX")"
 BASE="$(git merge-base HEAD origin/master)"
 HEAD_SHA="$(git rev-parse HEAD)"
-git diff "$BASE" HEAD > "$REVIEW_DIR/change.diff"
-git worktree add --detach "$REVIEW_DIR/tree" "$HEAD_SHA"
+IN="$REVIEW_DIR/input"
+mkdir "$IN"
+git diff "$BASE" HEAD > "$IN/change.diff"
+git worktree add --detach "$REVIEW_DIR/<seat-a>" "$HEAD_SHA"
+git worktree add --detach "$REVIEW_DIR/<seat-b>" "$HEAD_SHA"
 ```
 
-Reviewers work in `$REVIEW_DIR/tree`, a throwaway checkout of `HEAD_SHA`,
-never in your worktree. The round covers exactly that commit, and you can keep
-working while it runs. Commit before you review; uncommitted changes are not in
-the round. Write `$REVIEW_DIR/prompt.md` from this template:
+Each seat works in its own throwaway checkout of `HEAD_SHA`, never in your
+worktree. The round covers exactly that commit, and you can keep working while
+it runs. Commit before you review; uncommitted changes are not in the round.
+
+Reviewers see their checkout and `$IN`. Their output goes to `$OUT_DIR`, which
+no reviewer is given, so neither seat can read the other's verdict.
+
+Write `$IN/prompt.md` from this template:
 
 ```text
-Review a change to the mdk repository checked out at <REVIEW_DIR>/tree before
-it is merged. The change is the diff in <REVIEW_DIR>/change.diff (base <BASE>,
-head <HEAD_SHA>).
+Review a change to the mdk repository before it is merged. Your working
+directory is a checkout of the head commit. The change is the diff in
+<IN>/change.diff (base <BASE>, head <HEAD_SHA>).
 Read AGENTS.md and the nearest AGENTS.md for every file the diff touches, then
 read the surrounding code you need. Do not edit files, commit, push or post
 anything.
@@ -66,28 +75,26 @@ End with exactly one line: VERDICT: merge or VERDICT: changes-needed
 
 ## Launch
 
-Start the two seats that are not you in parallel, each as its own background
-job, and keep each PID. Each seat writes its review to `$REVIEW_DIR/<seat>.md`:
+Start your two seats in parallel, each as its own background job, and keep
+each PID. Each seat writes its review to `$OUT_DIR/<seat>.md`:
 
 ```sh
-T="$REVIEW_DIR/tree"
-
 # Codex: the read-only sandbox blocks writes; --ignore-user-config drops the
 # MCP servers in ~/.codex/config.toml, which run outside the sandbox.
-codex exec --ignore-user-config -s read-only -m gpt-6.1-sol -C "$T" \
-  -o "$REVIEW_DIR/codex.md" - < "$REVIEW_DIR/prompt.md" > "$REVIEW_DIR/codex.log" 2>&1
+codex exec --ignore-user-config -s read-only -m gpt-6.1-sol -C "$REVIEW_DIR/codex" \
+  -o "$OUT_DIR/codex.md" - < "$IN/prompt.md" > "$OUT_DIR/codex.log" 2>&1
 
 # Claude: --restricted ignores personal settings, --tools leaves only read
 # tools, and --strict-mcp-config drops every MCP server and claude.ai connector.
-(cd "$T" && claude -p --restricted --tools Read Grep Glob --strict-mcp-config \
-  --add-dir "$REVIEW_DIR" --model claude-opus-5-5 < "$REVIEW_DIR/prompt.md") \
-  > "$REVIEW_DIR/claude.md" 2> "$REVIEW_DIR/claude.log"
+(cd "$REVIEW_DIR/claude" && claude -p --restricted --tools Read Grep Glob --strict-mcp-config \
+  --add-dir "$IN" --model claude-opus-5-5 < "$IN/prompt.md") \
+  > "$OUT_DIR/claude.md" 2> "$OUT_DIR/claude.log"
 
 # Cursor: ask mode inside the sandbox; ask mode also refuses MCP tools that
 # write. Take the model id from `agent --list-models`.
-agent -p --mode ask --sandbox enabled --trust --workspace "$T" --add-dir "$REVIEW_DIR" \
-  --model <grok-*-high-fast> --output-format text "$(cat "$REVIEW_DIR/prompt.md")" \
-  > "$REVIEW_DIR/cursor.md" 2> "$REVIEW_DIR/cursor.log"
+agent -p --mode ask --sandbox enabled --trust --workspace "$REVIEW_DIR/cursor" --add-dir "$IN" \
+  --model <grok-*-high-fast> --output-format text "$(cat "$IN/prompt.md")" \
+  > "$OUT_DIR/cursor.md" 2> "$OUT_DIR/cursor.log"
 ```
 
 Keep every restriction flag. Checked on 2026-10-17 and 2026-10-18:
@@ -103,18 +110,21 @@ Keep every restriction flag. Checked on 2026-10-17 and 2026-10-18:
 
 ## Collect
 
-A seat succeeded when its process exited 0 and its `.md` ends with a `VERDICT:`
-line. Anything else is a failure: report the seat, exit code and a log
-excerpt. A quiet log while the process runs is normal. Kill and count as failed
+A seat succeeded when all three hold:
+
+- its process exited 0;
+- `$OUT_DIR/<seat>.md` ends with a `VERDICT:` line;
+- `git -C "$REVIEW_DIR/<seat>" status --porcelain` prints nothing.
+
+Anything else is a failure, whatever the verdict says. Report the seat, the exit
+code, a log excerpt, and any paths it wrote, then check that seat's launch
+flags. A quiet log while the process runs is normal. Kill and count as failed
 any seat still running after 30 minutes.
 
-If one seat fails, rerun it once. If it fails again, stop and tell the person
-who asked for the change; one review is not enough to land.
+If one seat fails, rerun it once in a fresh checkout. If it fails again, stop
+and tell the person who asked for the change; one review is not enough to land.
 
-When both seats are decided, remove the checkout with
-`git worktree remove --force "$REVIEW_DIR/tree"`. Run
-`git -C "$REVIEW_DIR/tree" status --porcelain` first: any output means a
-reviewer wrote files. Report that and check that seat's launch flags.
-
-Then answer the findings as `land-change` step 2 describes, and start the
-next round from "Prepare a round" with a new `REVIEW_DIR`.
+When a seat is decided, remove its checkout with
+`git worktree remove --force "$REVIEW_DIR/<seat>"`. Then answer the findings as
+`land-change` step 2 describes, and start the next round from "Prepare a round"
+with new directories.

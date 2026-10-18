@@ -55,8 +55,9 @@ An initial cohort-release PR follows the release exception in the root
 `just release-pr-preflight <version>`.
 
 A test that fails locally is yours until shown otherwise. Before calling it
-unrelated, run it on the merge-base (`git merge-base HEAD origin/master`). If it
-fails there too, note it in the PR. If it passes there, your change broke it.
+unrelated, run `git fetch origin master` and then run the test on the
+merge-base (`git merge-base HEAD origin/master`). If it fails there too, note
+it in the PR. If it passes there, your change broke it.
 
 ## 2. Review locally
 
@@ -206,8 +207,10 @@ gh run list --workflow ci.yml --event merge_group --limit 50 \
 ```
 
 Read the newest one with `gh run view <id> --log-failed`, and reproduce the
-failing test by name (`cargo nextest run -p <crate> -E 'test(=<name>)'`). Then
-decide which case it is:
+failing test by name (`cargo nextest run -p <crate> -E 'test(=<name>)'`). Run
+`git fetch origin master` first: changes may have landed while your PR was in
+the queue, and every comparison below must use current master. Then decide
+which case it is:
 
 | Case | How you know | What to do |
 | --- | --- | --- |
