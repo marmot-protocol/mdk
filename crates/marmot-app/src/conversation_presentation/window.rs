@@ -182,7 +182,7 @@ impl MarmotApp {
             return Err(ConversationPresentationError::MembershipMismatch);
         }
         let account = self.account_home().account(label).map_err(AppError::from)?;
-        let storage = self.account_storage(label)?;
+        let storage = self.account_storage(label)?.app_storage();
         if prepared.store_epoch() != input.source_version.store_epoch {
             return Err(ConversationPresentationError::StoreMismatch);
         }

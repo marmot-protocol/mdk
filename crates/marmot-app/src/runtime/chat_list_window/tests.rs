@@ -67,6 +67,7 @@ impl Fixture {
             })
             .collect();
         store
+            .app_storage()
             .save_account_projection_state(
                 &StoredAccountState {
                     label: "alice".into(),
@@ -79,6 +80,7 @@ impl Fixture {
             .unwrap();
         if prepared {
             store
+                .app_storage()
                 .refresh_chat_list_rows(&account.account_id_hex, &|_, _| false)
                 .unwrap();
         }
@@ -98,7 +100,11 @@ impl Fixture {
             .updates
             .send(PresentationInvalidation {
                 account_label: "alice".into(),
-                version: self.store.chat_presentation_version().unwrap(),
+                version: self
+                    .store
+                    .app_storage()
+                    .chat_presentation_version()
+                    .unwrap(),
             });
     }
     fn mutate(&self, id: &str, change: impl FnMut(&mut storage_sqlite::StoredAccountGroup)) {
@@ -112,6 +118,7 @@ impl Fixture {
     ) {
         let mut state = self
             .store
+            .app_storage()
             .load_account_projection_state("alice", 100)
             .unwrap();
         for id in ids {
@@ -124,6 +131,7 @@ impl Fixture {
             );
         }
         self.store
+            .app_storage()
             .save_account_projection_state(&state, 100, 120)
             .unwrap();
         self.signal();
@@ -131,6 +139,7 @@ impl Fixture {
     /// Background content change: a visible row's badge changes in place.
     fn mark_unread(&self, id: &str) {
         self.store
+            .app_storage()
             .set_chat_manually_unread(&self.account_id, id, true, &|_, _| false)
             .unwrap();
         self.signal();
@@ -213,15 +222,16 @@ async fn first_window_prepares_only_selected_rows_and_never_opens_legacy_list() 
         "bounded path must not warm a legacy full list"
     );
     assert!(matches!(
-        f.store.chat_presentation("0013").unwrap(),
+        f.store.app_storage().chat_presentation("0013").unwrap(),
         ChatPresentationRead::Ready(_)
     ));
     assert!(matches!(
-        f.store.chat_presentation("0014").unwrap(),
+        f.store.app_storage().chat_presentation("0014").unwrap(),
         ChatPresentationRead::Pending
     ));
     // Commit after initial snapshot, before receiver begins: no handoff gap.
     f.store
+        .app_storage()
         .set_chat_manually_unread(&f.account_id, "0000", true, &|_, _| false)
         .unwrap();
     f.signal();
@@ -453,6 +463,7 @@ async fn archive_and_anchor_loss_recover_neighbors_then_reset_without_stale_spli
 async fn lag_and_cancelled_receiver_recover_without_new_events_and_mutes_expire() {
     let f = Fixture::new(20);
     f.store
+        .app_storage()
         .set_chat_muted("0000", Some(crate::notifications::unix_now_ms() + 1500))
         .unwrap();
     let mut sub = f
@@ -467,6 +478,7 @@ async fn lag_and_cancelled_receiver_recover_without_new_events_and_mutes_expire(
             .is_err()
     );
     f.store
+        .app_storage()
         .set_chat_manually_unread(&f.account_id, "0000", true, &|_, _| false)
         .unwrap();
     // Overflow with unrelated account events. The lost invalidation must still refresh.
@@ -477,7 +489,7 @@ async fn lag_and_cancelled_receiver_recover_without_new_events_and_mutes_expire(
             .updates
             .send(PresentationInvalidation {
                 account_label: "other".into(),
-                version: f.store.chat_presentation_version().unwrap(),
+                version: f.store.app_storage().chat_presentation_version().unwrap(),
             });
     }
     let unread = next(&mut sub).await;
@@ -494,12 +506,14 @@ async fn four_views_suppress_invite_and_left_badges_without_erasing_read_intent(
     let f = Fixture::new(4);
     for id in ["0000", "0001", "0002", "0003"] {
         f.store
+            .app_storage()
             .set_chat_manually_unread(&f.account_id, id, true, &|_, _| false)
             .unwrap();
     }
     f.mutate("0001", |g| g.pending_confirmation = true);
     f.mutate("0002", |g| g.archived = true);
     f.store
+        .app_storage()
         .set_group_self_membership("0003", storage_sqlite::SelfMembership::Removed)
         .unwrap();
     for (view, expected) in [
@@ -524,6 +538,7 @@ async fn four_views_suppress_invite_and_left_badges_without_erasing_read_intent(
     }
     assert!(
         f.store
+            .app_storage()
             .chat_list_row("0001")
             .unwrap()
             .unwrap()
@@ -531,6 +546,7 @@ async fn four_views_suppress_invite_and_left_badges_without_erasing_read_intent(
     );
     assert!(
         f.store
+            .app_storage()
             .chat_list_row("0003")
             .unwrap()
             .unwrap()
@@ -656,6 +672,7 @@ async fn runtime_projection_and_lifecycle_routes_update_each_view_directly() {
     // The durable operation overlay alone moves a row immediately; no full-list
     // subscription refresh or changed selected-presentation revision is needed.
     f.store
+        .app_storage()
         .set_group_self_membership("0000", storage_sqlite::SelfMembership::Left)
         .unwrap();
     let _ = f.runtime.events.send(MarmotAppEvent::GroupStateUpdated {
@@ -710,7 +727,8 @@ async fn initial_subscription_is_attached_before_a_concurrent_storage_commit() {
             .with_transaction(|s| -> Result<(), StorageError> {
                 held_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
-                s.set_chat_manually_unread(&account, "0000", true, &|_, _| false)?;
+                s.app_storage()
+                    .set_chat_manually_unread(&account, "0000", true, &|_, _| false)?;
                 Ok(())
             })
             .unwrap();
@@ -739,6 +757,7 @@ async fn initial_subscription_is_attached_before_a_concurrent_storage_commit() {
     let mut sub = opening.await.unwrap().unwrap();
     assert_eq!(ids(&sub.snapshot), ["0000"]);
     f.store
+        .app_storage()
         .set_chat_manually_unread(&f.account_id, "0001", true, &|_, _| false)
         .unwrap();
     f.signal();
@@ -764,7 +783,7 @@ async fn authoritative_worker_acceptance_preserves_archive_and_rejoin_restores_o
     let accepted = client.accept_group_invite(&group).unwrap();
     assert!(accepted.archived);
     assert!(!accepted.pending_confirmation);
-    let storage = app.account_storage("alice").unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
     storage
         .set_group_self_membership(&id, storage_sqlite::SelfMembership::Removed)
         .unwrap();
@@ -831,6 +850,7 @@ async fn preview_sender_profile_commits_refresh_at_unchanged_selected_revision()
     let f = Fixture::new(20);
     let sender = nostr::prelude::Keys::generate().public_key().to_hex();
     f.store
+        .app_storage()
         .record_app_event(&storage_sqlite::StoredAppEvent {
             group_id_hex: "0000".into(),
             message_id_hex: "11".repeat(32),
@@ -848,6 +868,7 @@ async fn preview_sender_profile_commits_refresh_at_unchanged_selected_revision()
         })
         .unwrap();
     f.store
+        .app_storage()
         .refresh_chat_list_row(&f.account_id, "0000", &|_, _| false)
         .unwrap();
     let mut sub = f
@@ -855,7 +876,7 @@ async fn preview_sender_profile_commits_refresh_at_unchanged_selected_revision()
         .open_chat_list_window("alice", ChatListView::Chats, Some(10))
         .await
         .unwrap();
-    let version = f.store.chat_presentation_version().unwrap();
+    let version = f.store.app_storage().chat_presentation_version().unwrap();
     f.app
         .save_directory_entry(&UserDirectoryRecord {
             account_id_hex: sender.clone(),
@@ -874,7 +895,7 @@ async fn preview_sender_profile_commits_refresh_at_unchanged_selected_revision()
         .unwrap();
     let updated = next(&mut sub).await;
     assert_eq!(
-        f.store.chat_presentation_version().unwrap(),
+        f.store.app_storage().chat_presentation_version().unwrap(),
         version,
         "group selection did not change"
     );
@@ -930,6 +951,7 @@ async fn outside_view_navigation_changes_do_not_invalidate_visible_window_sequen
         .await
         .unwrap();
     f.store
+        .app_storage()
         .set_group_self_membership("0013", storage_sqlite::SelfMembership::Left)
         .unwrap();
     f.signal();
@@ -948,7 +970,13 @@ async fn outside_view_navigation_changes_do_not_invalidate_visible_window_sequen
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn initial_open_repairs_multiple_base_batches_without_a_worker_or_full_list_warm() {
     let f = Fixture::with_base_rows(120, false);
-    assert!(!f.store.pending_chat_presentation_rows().unwrap().is_empty());
+    assert!(
+        !f.store
+            .app_storage()
+            .pending_chat_presentation_rows()
+            .unwrap()
+            .is_empty()
+    );
     let sub = tokio::time::timeout(
         Duration::from_secs(10),
         f.runtime
@@ -960,9 +988,15 @@ async fn initial_open_repairs_multiple_base_batches_without_a_worker_or_full_lis
     assert_eq!(sub.snapshot.rows.len(), 20);
     assert_eq!(ids(&sub.snapshot).first().copied(), Some("0000"));
     assert!(sub.snapshot.has_more_after);
-    assert!(f.store.pending_chat_presentation_rows().unwrap().is_empty());
+    assert!(
+        f.store
+            .app_storage()
+            .pending_chat_presentation_rows()
+            .unwrap()
+            .is_empty()
+    );
     assert!(matches!(
-        f.store.chat_presentation("0014").unwrap(),
+        f.store.app_storage().chat_presentation("0014").unwrap(),
         ChatPresentationRead::Pending
     ));
     assert!(f.app.chat_list_projection_warmed.lock().unwrap().is_empty());
@@ -1002,7 +1036,12 @@ async fn lost_reset_signal_closes_window_even_when_the_durable_epoch_is_unchange
         .open_chat_list_window("alice", ChatListView::Chats, Some(5))
         .await
         .unwrap();
-    let epoch = f.store.chat_presentation_version().unwrap().store_epoch;
+    let epoch = f
+        .store
+        .app_storage()
+        .chat_presentation_version()
+        .unwrap()
+        .store_epoch;
     // Eviction of the same account database must end this handle, even when
     // its signal is subsequently overwritten by unrelated account teardowns.
     f.app.drop_account_caches("alice");
@@ -1017,6 +1056,7 @@ async fn lost_reset_signal_closes_window_even_when_the_durable_epoch_is_unchange
         f.app
             .account_storage("alice")
             .unwrap()
+            .app_storage()
             .chat_presentation_version()
             .unwrap()
             .store_epoch,
@@ -1042,7 +1082,7 @@ async fn group_source_changes_refresh_selected_display_without_legacy_rebuild() 
         .unwrap();
     f.mutate("0000", |g| g.profile_name = "Renamed group".into());
     crate::chat_presentation::maintenance::prepare_window(
-        &f.store,
+        &f.store.app_storage(),
         &f.app.shared_storage().unwrap(),
         &f.account_id,
         &["0000".into()],
@@ -1153,6 +1193,7 @@ async fn declined_invitation_rejoins_through_real_client_flow_and_restores_chats
             version: app
                 .account_storage("bob")
                 .unwrap()
+                .app_storage()
                 .chat_presentation_version()
                 .unwrap(),
         });
@@ -1166,7 +1207,7 @@ async fn system_preview_resolves_subject_fallback_and_refreshes_profile_without_
     let f = Fixture::new(1);
     let actor = "bb".repeat(32);
     let subject = "cc".repeat(32);
-    f.store.record_app_event(&storage_sqlite::StoredAppEvent {
+    f.store.app_storage().record_app_event(&storage_sqlite::StoredAppEvent {
         group_id_hex: "0000".into(), message_id_hex: "system-preview".into(),
         source_message_id_hex: None, source_epoch: Some(2), direction: "system".into(),
         sender: actor.clone(), kind: 1210,
@@ -1175,6 +1216,7 @@ async fn system_preview_resolves_subject_fallback_and_refreshes_profile_without_
         recorded_at: 100, received_at: 100, origin_commit_id: Some("commit".into()), moderation_grant: false,
     }).unwrap();
     f.store
+        .app_storage()
         .refresh_chat_list_row(&f.account_id, "0000", &|_, _| false)
         .unwrap();
     let mut sub = f
@@ -1272,7 +1314,10 @@ async fn avatar_batches_are_local_bounded_and_update_attached_windows_after_lag(
     let image =
         storage_sqlite::AvatarImage::new(vec![8; 16], storage_sqlite::AvatarImageFormat::Png, 1, 1)
             .unwrap();
-    f.store.publish_avatar(&reference, 0, &image, None).unwrap();
+    f.store
+        .app_storage()
+        .publish_avatar(&reference, 0, &image, None)
+        .unwrap();
     // A paused consumer loses individual notifications, then converges from storage.
     for _ in 0..100 {
         let _ = f.app.presentation_signals.avatars.send("alice".into());
@@ -1338,7 +1383,10 @@ async fn avatar_batches_are_local_bounded_and_update_attached_windows_after_lag(
         .await
         .unwrap();
     let restored = new[0].reference.clone().unwrap();
-    f.store.publish_avatar(&restored, 0, &image, None).unwrap();
+    f.store
+        .app_storage()
+        .publish_avatar(&restored, 0, &image, None)
+        .unwrap();
     f.runtime.shutdown_and_close().await.unwrap();
     assert!(sub.recv().await.unwrap().is_none());
     // Reconstruct only the local app/runtime. No worker or relay is started.
@@ -1477,11 +1525,17 @@ async fn chat_list_draft_acceptance_rollback_and_lag_use_authoritative_store() {
     f.store
         .set_message_draft_commit_observer(f.app.draft_commit_observer("alice"));
     f.store
+        .app_storage()
         .stage_message_draft_submission(&selected.revision, "event", b"payload")
         .unwrap();
     let result: Result<(), cgka_traits::storage::StorageError> = f.store.with_transaction(|s| {
         s.put_queued_outbound_intent(&intent)?;
-        assert!(s.selected_message_draft("0000")?.draft.is_none());
+        assert!(
+            s.app_storage()
+                .selected_message_draft("0000")?
+                .draft
+                .is_none()
+        );
         Err(cgka_traits::storage::StorageError::Backend(
             "rollback".into(),
         ))
@@ -1530,7 +1584,12 @@ fn chat_list_leave_hint_agrees_with_conversation_authority_for_projected_states(
     use crate::conversation_presentation::{ConversationAuthority, ConversationParticipation};
     use cgka_traits::GroupLifecycleState as L;
     let f = Fixture::new(1);
-    let mut row = f.store.chat_list_row("0000").unwrap().unwrap();
+    let mut row = f
+        .store
+        .app_storage()
+        .chat_list_row("0000")
+        .unwrap()
+        .unwrap();
     // Compare independently implemented public policies, including admin preflight.
     // Engine-only facts are deliberately tested separately below: list rendering
     // must not hydrate an engine just to obtain those facts.
@@ -1582,7 +1641,12 @@ fn chat_list_leave_hint_agrees_with_conversation_authority_for_projected_states(
             }
         }
     }
-    let row = f.store.chat_list_row("0000").unwrap().unwrap();
+    let row = f
+        .store
+        .app_storage()
+        .chat_list_row("0000")
+        .unwrap()
+        .unwrap();
     assert!(ChatListRowActions::for_row(&row).can_start_leave);
     for (is_member, unrecoverable, participation) in [
         (false, false, ConversationParticipation::Unavailable),

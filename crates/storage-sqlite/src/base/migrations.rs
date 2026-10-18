@@ -1256,8 +1256,8 @@ mod tests {
     use super::*;
     use crate::base::test_support::{gid, mid, sample_group, sample_message};
     use crate::{
-        SqlCipherHardening, SqlCipherKey, SqliteAccountStorage, epoch_to_i64, message_state_to_i64,
-        open_hardened_sqlcipher, serialize,
+        SqlCipherHardening, SqlCipherKey, SqliteAccountStorage, SqliteAppStorage, epoch_to_i64,
+        message_state_to_i64, open_hardened_sqlcipher, serialize,
     };
     use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
     use cgka_traits::storage::{GroupStorage, MessageStorage};
@@ -2060,22 +2060,30 @@ mod tests {
         drop(conn);
         let key = SqlCipherKey::new(TEST_DATABASE_KEY).unwrap();
         let storage = crate::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        assert!(!storage.bootstrap_avatar_acquisition().unwrap());
-        let job = storage.claim_avatar_acquisition(0).unwrap().unwrap();
+        let app = storage.app_storage();
+        assert!(!app.bootstrap_avatar_acquisition().unwrap());
+        let job = app.claim_avatar_acquisition(0).unwrap().unwrap();
         let image =
             crate::AvatarImage::new(vec![1; 8], crate::AvatarImageFormat::Png, 1, 1).unwrap();
-        storage
-            .complete_avatar_acquisition(&job, &image, None)
-            .unwrap();
+        app.complete_avatar_acquisition(&job, &image, None).unwrap();
         storage.close().unwrap();
         let reopened = crate::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(
-            reopened.read_avatar(&job.reference, 0).unwrap().image,
+            reopened
+                .app_storage()
+                .read_avatar(&job.reference, 0)
+                .unwrap()
+                .image,
             Some(image)
         );
-        reopened.remove_avatar_source(&job.reference).unwrap();
+        reopened
+            .app_storage()
+            .remove_avatar_source(&job.reference)
+            .unwrap();
         reopened.close().unwrap();
-        let reopened = crate::SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let reopened = crate::SqliteAccountStorage::open_encrypted(&path, &key)
+            .unwrap()
+            .app_storage();
         assert!(!reopened.bootstrap_avatar_acquisition().unwrap());
         assert!(reopened.claim_avatar_acquisition(0).unwrap().is_none());
     }
@@ -2312,7 +2320,7 @@ mod tests {
         panic!("promotion crash point was not reached");
     }
 
-    fn semantic_chat_list_timestamps(store: &SqliteAccountStorage) -> Vec<(String, u64, u64)> {
+    fn semantic_chat_list_timestamps(store: &SqliteAppStorage) -> Vec<(String, u64, u64)> {
         let mut rows = store
             .chat_list_rows(crate::ChatListQuery {
                 include_archived: true,
@@ -3118,6 +3126,7 @@ mod tests {
             crate::SqliteStorageOptions::default(),
         )
         .unwrap();
+        let app = store.app_storage();
         let expected = rows
             .into_iter()
             .map(|(group_id, created_at, activity_at)| {
@@ -3129,15 +3138,13 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        store
-            .refresh_chat_list_rows("local-account", &no_mentions)
+        app.refresh_chat_list_rows("local-account", &no_mentions)
             .unwrap();
-        assert_eq!(semantic_chat_list_timestamps(&store), expected);
+        assert_eq!(semantic_chat_list_timestamps(&app), expected);
 
-        store
-            .refresh_chat_list_rows("local-account", &no_mentions)
+        app.refresh_chat_list_rows("local-account", &no_mentions)
             .unwrap();
-        assert_eq!(semantic_chat_list_timestamps(&store), expected);
+        assert_eq!(semantic_chat_list_timestamps(&app), expected);
     }
 
     #[test]

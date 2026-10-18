@@ -1,5 +1,8 @@
 //! Completion handoff between the account worker and the evidence-only writer.
 use super::*;
+#[cfg(test)]
+use crate::SqliteAccountStorage;
+use crate::SqliteAppStorage;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i64)]
@@ -111,7 +114,7 @@ pub(super) fn goal_floor(
         .and_then(|seconds| u64::try_from(seconds).ok()))
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Typed evidence only. A notification count is an observation count, never
     /// a claim about how many encrypted events the receiver missed.
     pub fn record_account_recovery_loss(
@@ -325,26 +328,34 @@ mod tests {
     #[test]
     fn loss_goal_floor_is_a_running_minimum_until_any_charge_is_unknown() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.ensure_account_projection("alice").unwrap();
+        store
+            .app_storage()
+            .ensure_account_projection("alice")
+            .unwrap();
         let floor = |store: &SqliteAccountStorage| {
             store
+                .app_storage()
                 .recovery_loss_goal_floor("alice", RecoveryLossCause::Queue)
                 .unwrap()
         };
         assert_eq!(floor(&store), None, "no loss has no bound to certify");
         store
+            .app_storage()
             .mark_account_delivery_recovery_bounded("alice", 7, 1, Some(500))
             .unwrap();
         assert_eq!(floor(&store), Some(500));
         // A later drop can carry an earlier timestamp, as NIP-59 wraps do.
         store
+            .app_storage()
             .mark_account_delivery_recovery_bounded("alice", 7, 2, Some(300))
             .unwrap();
         store
+            .app_storage()
             .mark_account_delivery_recovery_bounded("alice", 7, 3, Some(900))
             .unwrap();
         assert_eq!(floor(&store), Some(300));
         store
+            .app_storage()
             .record_account_recovery_loss_bounded(
                 "alice",
                 RecoveryLossCause::Queue,
@@ -357,10 +368,12 @@ mod tests {
         assert_eq!(floor(&store), Some(200), "every generation contributes");
         // A charge with no known time leaves the whole goal unbounded.
         store
+            .app_storage()
             .record_account_recovery_loss_bounded("alice", RecoveryLossCause::Queue, 8, 2, 1, None)
             .unwrap();
         assert_eq!(floor(&store), None);
         store
+            .app_storage()
             .record_account_recovery_loss_bounded(
                 "alice",
                 RecoveryLossCause::Queue,
@@ -374,10 +387,12 @@ mod tests {
         // Rows written without a bound, including every pre-migration row,
         // are unknown too.
         store
+            .app_storage()
             .record_account_recovery_loss("alice", RecoveryLossCause::NotificationConsumer, 9, 0, 1)
             .unwrap();
         assert_eq!(
             store
+                .app_storage()
                 .recovery_loss_goal_floor("alice", RecoveryLossCause::NotificationConsumer)
                 .unwrap(),
             None
@@ -387,60 +402,52 @@ mod tests {
     #[test]
     fn loss_snapshot_preserves_every_generation_with_constant_capture_memory() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.ensure_account_projection("alice").unwrap();
+        let app = store.app_storage();
+        app.ensure_account_projection("alice").unwrap();
         store.lock().unwrap().execute_batch("WITH RECURSIVE n(x) AS (SELECT 0 UNION ALL SELECT x+1 FROM n WHERE x<1023)
             INSERT INTO account_delivery_loss_evidence(account_label,cause,marker_token,pending_since,dropped_count)
             SELECT 'alice',x%2,x,1,0 FROM n;").unwrap();
-        let before = store
+        let before = app
             .recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
             .unwrap();
         assert_eq!(before.rows, 512);
         assert_eq!(std::mem::size_of_val(&before), 40);
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        let fence = store.recovery_revision_fence().unwrap();
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        let fence = app.recovery_revision_fence().unwrap();
         assert_eq!(fence.obligations.len(), 2);
         assert!(
-            store
-                .recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
+            app.recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
                 .unwrap()
                 == before
         );
         assert_eq!(
-            store
-                .recovery_loss_watermarks("alice", RecoveryLossCause::NotificationConsumer)
+            app.recovery_loss_watermarks("alice", RecoveryLossCause::NotificationConsumer)
                 .unwrap()
                 .len(),
             512
         );
-        store
-            .record_account_delivery_loss("alice", 0, 1, 2)
-            .unwrap();
+        app.record_account_delivery_loss("alice", 0, 1, 2).unwrap();
         assert!(
-            store
-                .recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
+            app.recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
                 .unwrap()
                 != before,
             "the earliest generation is still part of the commitment"
         );
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert!(store.recovery_revision_fence().unwrap().loss_revision > fence.loss_revision);
-        let changed = store
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(app.recovery_revision_fence().unwrap().loss_revision > fence.loss_revision);
+        let changed = app
             .recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
             .unwrap();
-        store
-            .record_account_delivery_loss("alice", 0, 1, 3)
-            .unwrap();
-        store.synchronize_account_delivery_loss("alice").unwrap();
+        app.record_account_delivery_loss("alice", 0, 1, 3).unwrap();
+        app.synchronize_account_delivery_loss("alice").unwrap();
         assert!(
-            store
-                .recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
+            app.recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
                 .unwrap()
                 == changed,
             "duplicate observations cannot create another generation or rearm debt"
         );
         assert_eq!(
-            store
-                .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
+            app.recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
                 .unwrap()
                 .len(),
             512

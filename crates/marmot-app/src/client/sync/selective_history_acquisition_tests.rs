@@ -21,7 +21,8 @@ async fn unfinished_selected_id_suffix_stays_pending_and_owner_paced() {
     client.create_group("selected suffix", &[]).await.unwrap();
     client.request_bounded_comparison().unwrap();
     let storage = app.account_storage("alice").unwrap();
-    let before = storage.recovery_comparison().unwrap();
+    let app = storage.app_storage();
+    let before = app.recovery_comparison().unwrap();
     assert!(before.pending());
     let grant = client
         .authorize_account_recovery(None, EpochBackfillExecutionSeam::Startup)
@@ -56,7 +57,7 @@ async fn unfinished_selected_id_suffix_stays_pending_and_owner_paced() {
     client.run_recovery_grant_for_test(grant).await.unwrap();
     assert!(client.test_comparison_results.as_ref().unwrap().is_empty());
 
-    let after = storage.recovery_comparison().unwrap();
+    let after = app.recovery_comparison().unwrap();
     assert!(
         after.pending(),
         "a selected but unadmitted suffix is still debt"
@@ -74,7 +75,7 @@ async fn unfinished_selected_id_suffix_stays_pending_and_owner_paced() {
         1
     );
 
-    let retry_state = storage.recovery_retry_state().unwrap();
+    let retry_state = app.recovery_retry_state().unwrap();
     assert!(
         client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
@@ -82,7 +83,7 @@ async fn unfinished_selected_id_suffix_stays_pending_and_owner_paced() {
             .is_none(),
         "an incomplete comparison cannot bypass owner pacing"
     );
-    assert_eq!(storage.recovery_retry_state().unwrap(), retry_state);
+    assert_eq!(app.recovery_retry_state().unwrap(), retry_state);
     client.recovery_owner.test_advance_to_retry(&storage);
     let retry = client
         .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)

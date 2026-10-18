@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 use std::io::{Cursor, Read};
 
 use media_store::{MEDIA_DIRECTORY, MediaError, MediaStore, PublishOutcome};
@@ -39,7 +41,7 @@ impl Fixture {
             .unwrap();
         let media = MediaStore::new(
             dir.path().join(MEDIA_DIRECTORY),
-            SqliteMediaCatalog::new(store.clone()),
+            SqliteMediaCatalog::new(store.app_storage()),
         );
         Self {
             _dir: dir,
@@ -86,15 +88,17 @@ impl Fixture {
     /// A recorded message with one attachment whose download is claimed.
     fn claimed(&self, message: &str, plaintext: &[u8]) -> AttachmentAcquisition {
         let (event, entry) = Self::entry(message, plaintext);
-        self.store.record_app_event(&event).unwrap();
+        self.store.app_storage().record_app_event(&event).unwrap();
         let AttachmentDemand::Requested(reference) = self
             .store
+            .app_storage()
             .request_attachment_acquisition(GROUP, &entry, digest(plaintext), NOW)
             .unwrap()
         else {
             panic!("attachment was not requested");
         };
         self.store
+            .app_storage()
             .claim_attachment_acquisition(&reference, NOW, LEASE)
             .unwrap()
             .unwrap()
@@ -107,7 +111,10 @@ impl Fixture {
         len: u64,
     ) -> Result<PublishOutcome, MediaError> {
         self.media.publish(
-            &self.store.attachment_publication(job, &|| NOW),
+            &self
+                .store
+                .app_storage()
+                .attachment_publication(job, &|| NOW),
             Category::Retained,
             body,
             len,
@@ -129,6 +136,7 @@ impl Fixture {
         loop {
             let window = match self
                 .store
+                .app_storage()
                 .retained_attachment_read(
                     &job.reference,
                     NOW,
@@ -200,12 +208,14 @@ fn downloaded_bodies_are_retained_as_media_files_not_database_rows() {
     assert!(
         fixture
             .store
+            .app_storage()
             .read_retained_attachment(&job.reference, NOW, 0, 16)
             .is_err()
     );
 
     let status = fixture
         .store
+        .app_storage()
         .attachment_acquisition_status(&job.reference)
         .unwrap()
         .unwrap();
@@ -213,12 +223,14 @@ fn downloaded_bodies_are_retained_as_media_files_not_database_rows() {
     assert_eq!(status.byte_count, content.len() as u64);
     let asset = fixture
         .store
+        .app_storage()
         .retained_attachment_asset(GROUP, &message, &message, 0, NOW)
         .unwrap()
         .unwrap();
     assert_eq!(asset.byte_count, content.len() as u64);
     let transfer = fixture
         .store
+        .app_storage()
         .attachment_transfer_status(GROUP, &message, &message, 0, NOW, false)
         .unwrap()
         .unwrap();
@@ -227,6 +239,7 @@ fn downloaded_bodies_are_retained_as_media_files_not_database_rows() {
     assert!(
         !fixture
             .store
+            .app_storage()
             .explicitly_retry_attachment(&job.reference, NOW)
             .unwrap()
     );
@@ -283,6 +296,7 @@ fn removal_during_the_write_supersedes_publication_and_keeps_nothing() {
                 assert!(
                     self.0
                         .store
+                        .app_storage()
                         .remove_local_attachment(GROUP, self.1, 0)
                         .unwrap()
                 );
@@ -320,7 +334,10 @@ fn identical_content_is_attached_without_downloading_and_released_by_the_last_re
         fixture
             .media
             .attach_existing(
-                &fixture.store.attachment_publication(&second, &|| NOW),
+                &fixture
+                    .store
+                    .app_storage()
+                    .attachment_publication(&second, &|| NOW),
                 Category::Retained,
                 &second.plaintext_digest().unwrap(),
             )
@@ -335,6 +352,7 @@ fn identical_content_is_attached_without_downloading_and_released_by_the_last_re
     assert!(
         fixture
             .store
+            .app_storage()
             .remove_local_attachment(GROUP, &first_message, 0)
             .unwrap()
     );
@@ -342,6 +360,7 @@ fn identical_content_is_attached_without_downloading_and_released_by_the_last_re
     assert!(
         fixture
             .store
+            .app_storage()
             .remove_local_attachment(GROUP, &second_message, 0)
             .unwrap()
     );
@@ -359,7 +378,10 @@ fn a_digest_without_a_ready_file_downloads_as_usual() {
         fixture
             .media
             .attach_existing(
-                &fixture.store.attachment_publication(&job, &|| NOW),
+                &fixture
+                    .store
+                    .app_storage()
+                    .attachment_publication(&job, &|| NOW),
                 Category::Retained,
                 &job.plaintext_digest().unwrap(),
             )
@@ -376,6 +398,7 @@ fn legacy_database_bodies_stay_readable_beside_media_files() {
     assert_eq!(
         fixture
             .store
+            .app_storage()
             .complete_attachment_acquisition(&legacy, &content, NOW, u64::MAX / 2)
             .unwrap(),
         AttachmentPublishResult::Published

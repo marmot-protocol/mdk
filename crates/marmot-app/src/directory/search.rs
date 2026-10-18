@@ -36,12 +36,12 @@ use super::records::{
 };
 use crate::error::AppError;
 use crate::ids::{npub_for_account_id_lossy, parse_account_id_hex};
-use crate::relay_plane::DirectoryRelayEventRecord as RelayEventRecord;
 use crate::runtime::blocking_app_task;
 use crate::{
     KIND_NIP65_RELAY_LIST, KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp,
     relay_list_state_from_event,
 };
+use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 
 /// Deepest radius the traversal producer currently answers.
 ///

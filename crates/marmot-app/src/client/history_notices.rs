@@ -18,6 +18,7 @@ impl AppClient {
         Ok(self
             .app
             .account_storage(&self.state.label)?
+            .app_storage()
             .parked_recovery_obligations()?
             .iter()
             .map(history_notice)
@@ -32,6 +33,7 @@ impl AppClient {
         Ok(self
             .app
             .account_storage(&self.state.label)?
+            .app_storage()
             .parked_group_recovery_obligations(group_id.as_slice())?
             .into_iter()
             .map(|parked| encode_notice_id(parked.ticket))
@@ -47,10 +49,11 @@ impl AppClient {
     pub(crate) fn dismiss_history_notice(&mut self, notice_id: &str) -> Result<bool, AppError> {
         let ticket = decode_notice_id(notice_id)?;
         let storage = self.app.account_storage(&self.state.label)?;
+        let app = storage.app_storage();
         // Newer loss joins first. It re-arms the obligation under a new
         // revision, so a dismissal of the older occurrence becomes stale.
-        self.synchronize_recovery_loss(&storage)?;
-        let Some((cause, group)) = storage
+        self.synchronize_recovery_loss(&app)?;
+        let Some((cause, group)) = app
             .parked_recovery_obligations()?
             .into_iter()
             .find(|parked| parked.ticket == ticket)
@@ -66,7 +69,7 @@ impl AppClient {
         // The plane's pending generation before retirement. Releasing the
         // fence requires it to be unchanged afterwards.
         let observed = self.adapter.pending_delivery_overflow_generation();
-        if !storage.retire_parked_recovery_obligation(
+        if !app.retire_parked_recovery_obligation(
             ticket.id,
             ticket.revision,
             super::recovery::wall_now_ms()?,
@@ -134,8 +137,7 @@ impl AppClient {
             method = "dismiss_history_notice",
             cause = HistoryNoticeCause::from_recovery(cause).as_str(),
             loss_fence_released = fence_released,
-            remaining_notices = storage
-                .parked_recovery_obligations()
+            remaining_notices = app.parked_recovery_obligations()
                 .map_or(0, |parked| parked.len()),
             "retired a parked recovery occurrence; its history may be incomplete",
         );
@@ -151,7 +153,7 @@ impl AppClient {
         let current: HistoryNoticeBaseline = match self
             .app
             .account_storage(&self.state.label)
-            .and_then(|storage| Ok(storage.parked_recovery_obligations()?))
+            .and_then(|storage| Ok(storage.app_storage().parked_recovery_obligations()?))
         {
             Ok(parked) => parked
                 .into_iter()
@@ -225,7 +227,7 @@ impl AppClient {
             return;
         };
         for (id, revision, group) in previous.iter().filter(|entry| !current.contains(entry)) {
-            let Ok(Some(status)) = storage.recovery_obligation_status(*id) else {
+            let Ok(Some(status)) = storage.app_storage().recovery_obligation_status(*id) else {
                 continue;
             };
             if status.state != storage_sqlite::RecoveryObligationState::Satisfied {
@@ -267,16 +269,18 @@ pub(crate) fn settle_recovery_for_test(
         RecoveryEligibility, RecoveryEndpointCheckpoint, RecoveryScopeCheckpoint,
         RecoveryScopeOutcome, RecoveryScopePlan,
     };
-    let mut fence = storage.recovery_revision_fence().unwrap();
+    let mut fence = storage.app_storage().recovery_revision_fence().unwrap();
     fence.obligations.retain(|(candidate, _)| *candidate == id);
     let now = super::recovery::wall_now_ms().unwrap();
     let attempt = storage
+        .app_storage()
         .reserve_recovery_attempt(&fence, now, 1, true)
         .unwrap()
         .expect("explicit reservation")
         .attempt_serial;
     let endpoint = "wss://relay.example".to_owned();
     let token = storage
+        .app_storage()
         .install_recovery_scope_plan(
             &fence,
             attempt,
@@ -299,6 +303,7 @@ pub(crate) fn settle_recovery_for_test(
         .expect("fresh plan")
         .remove(0);
     storage
+        .app_storage()
         .checkpoint_recovery_obligation(
             &fence,
             attempt,
@@ -347,6 +352,7 @@ mod tests {
 
     fn pending(storage: &storage_sqlite::SqliteAccountStorage, cause: RecoveryCause) -> [u8; 16] {
         storage
+            .app_storage()
             .pending_recovery_demands()
             .unwrap()
             .into_iter()
@@ -361,6 +367,7 @@ mod tests {
     fn fence_loss(client: &mut crate::AppClient, token: u64) {
         let storage = client.app.account_storage("alice").unwrap();
         storage
+            .app_storage()
             .mark_account_delivery_recovery("alice", token, 1)
             .unwrap();
         client.delivery_overflow_recovery_pending = true;
@@ -379,6 +386,7 @@ mod tests {
         let epoch = client.group_mls_state(&group).unwrap().epoch;
         let storage = app.account_storage("alice").unwrap();
         storage
+            .app_storage()
             .arm_epoch_backfill_intents(&[StoredEpochBackfillIntent {
                 group_id_hex: hex::encode(group.as_slice()),
                 stalled_epoch: epoch,
@@ -437,11 +445,18 @@ mod tests {
         for revision in [gap_ticket.revision, gap_ticket.revision + 1] {
             assert!(
                 !storage
+                    .app_storage()
                     .recovery_obligation_is_satisfied(gap, revision)
                     .unwrap()
             );
         }
-        assert!(storage.pending_epoch_backfill_intents().unwrap().is_empty());
+        assert!(
+            storage
+                .app_storage()
+                .pending_epoch_backfill_intents()
+                .unwrap()
+                .is_empty()
+        );
         assert!(client.delivery_loss_blocks_cursor());
         assert!(
             !client
@@ -477,11 +492,18 @@ mod tests {
         );
         assert!(
             storage
+                .app_storage()
                 .account_delivery_recovery("alice")
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(storage.restore_unacknowledged_recovery_loss().unwrap(), 0);
+        assert_eq!(
+            storage
+                .app_storage()
+                .restore_unacknowledged_recovery_loss()
+                .unwrap(),
+            0
+        );
         assert_eq!(client.take_history_notice_changes(), Some(Vec::new()));
 
         // The dismissal is durable: nothing reappears or re-fences on reopen.
@@ -505,14 +527,14 @@ mod tests {
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         fence_loss(&mut client, 42);
         let storage = app.account_storage("alice").unwrap();
+        let app = storage.app_storage();
         let loss = pending(&storage, RecoveryCause::QueueLoss);
         park_recovery_for_test(&storage, loss);
         let first = client.history_notices().unwrap().remove(0);
 
         // The off-worker writer recorded more loss that no import joined yet.
         // Dismissal imports it first, so the parked occurrence is stale.
-        storage
-            .record_account_delivery_loss("alice", 42, 2, crate::unix_now_seconds())
+        app.record_account_delivery_loss("alice", 42, 2, crate::unix_now_seconds())
             .unwrap();
         assert!(!client.dismiss_history_notice(&first.notice_id).unwrap());
         assert!(
@@ -528,22 +550,13 @@ mod tests {
         assert!(!client.delivery_loss_blocks_cursor());
 
         // A late duplicate of the retired loss re-arms nothing.
-        storage
-            .mark_account_delivery_recovery("alice", 42, 2)
-            .unwrap();
-        storage.synchronize_account_delivery_loss("alice").unwrap();
-        assert!(
-            storage
-                .account_delivery_recovery("alice")
-                .unwrap()
-                .is_none()
-        );
+        app.mark_account_delivery_recovery("alice", 42, 2).unwrap();
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(app.account_delivery_recovery("alice").unwrap().is_none());
         assert!(client.history_notices().unwrap().is_empty());
 
         // New loss is a fresh pending obligation, and parks as a new notice.
-        storage
-            .mark_account_delivery_recovery("alice", 77, 1)
-            .unwrap();
+        app.mark_account_delivery_recovery("alice", 77, 1).unwrap();
         assert_eq!(pending(&storage, RecoveryCause::QueueLoss), loss);
         assert!(client.history_notices().unwrap().is_empty());
         park_recovery_for_test(&storage, loss);

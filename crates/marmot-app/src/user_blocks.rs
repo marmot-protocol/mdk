@@ -1,10 +1,10 @@
 //! Account-private block policy and NIP-51 synchronization.
-use crate::relay_plane::DirectoryEventQuery;
 use crate::{AppError, MarmotApp};
 use cgka_traits::{TransportEndpoint, TransportEndpointFailureKind};
 use nostr::prelude::{EventBuilder, FinalizeEventAsync, Kind, PublicKey, Tag, Timestamp};
 use std::sync::Arc;
 use storage_sqlite::{PendingBlockPublication, StoredBlockList};
+use transport_nostr::DirectoryEventQuery;
 use transport_nostr_peeler::{NostrTransportEvent, SdkSigner};
 
 pub use storage_sqlite::{BlockListSnapshot, BlockedUser};
@@ -66,7 +66,7 @@ impl MarmotApp {
         if event.created_at > crate::unix_now_seconds().saturating_add(300) {
             return Err(AppError::BlockListUnavailable);
         }
-        let storage = self.account_storage(label)?;
+        let storage = self.account_storage(label)?.app_storage();
         let current = storage.stored_block_list()?;
         if !event_is_newer(event, &current) {
             return Ok(());
@@ -136,7 +136,7 @@ impl MarmotApp {
     }
 
     fn reconcile_block_pending(&self, label: &str) -> Result<(), AppError> {
-        let storage = self.account_storage(label)?;
+        let storage = self.account_storage(label)?.app_storage();
         if let Some(pending) = storage.pending_block_publication()? {
             let event: NostrTransportEvent = serde_json::from_str(&pending.event_json)
                 .map_err(|_| AppError::BlockListUnavailable)?;
@@ -177,6 +177,7 @@ impl MarmotApp {
         }
         if self
             .account_storage(label)?
+            .app_storage()
             .block_list_has_unreadable_replacement()?
         {
             return Err(AppError::BlockListUnavailable);
@@ -197,7 +198,7 @@ impl MarmotApp {
         }
         let lock = self.block_update_lock(label).await;
         let _guard = lock.lock().await;
-        let storage = self.account_storage(label)?;
+        let storage = self.account_storage(label)?.app_storage();
         if storage.pending_block_publication()?.is_none()
             && storage.is_user_blocked(&target)? == blocked
         {
@@ -375,6 +376,7 @@ mod tests {
         let before = app
             .account_storage("alice")
             .unwrap()
+            .app_storage()
             .block_list_snapshot()
             .unwrap();
         let unreadable = EventBuilder::new(Kind::MuteList, "not ciphertext")
@@ -391,6 +393,7 @@ mod tests {
         assert_eq!(
             app.account_storage("alice")
                 .unwrap()
+                .app_storage()
                 .block_list_snapshot()
                 .unwrap(),
             before
@@ -398,6 +401,7 @@ mod tests {
         assert_eq!(
             app.account_storage("alice")
                 .unwrap()
+                .app_storage()
                 .stored_block_list()
                 .unwrap()
                 .private_tags[1],

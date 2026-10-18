@@ -45,7 +45,11 @@ impl MarmotAppRuntime {
         self.attachment_read(account_ref, move |storage, loopback| {
             use storage_sqlite::AccountAttachmentHistoryError as E;
             Ok(
-                match storage.account_attachment_history_page(&query, limit, cursor.as_ref()) {
+                match storage.app_storage().account_attachment_history_page(
+                    &query,
+                    limit,
+                    cursor.as_ref(),
+                ) {
                     Ok(page) => {
                         let parsed = AccountAttachmentPage {
                             entries: page
@@ -81,6 +85,7 @@ impl MarmotAppRuntime {
     ) -> Result<AccountAttachmentVersion, AppError> {
         self.attachment_read(account_ref, move |storage, _| {
             storage
+                .app_storage()
                 .account_attachment_history_version()
                 .map_err(|e| match e {
                     storage_sqlite::AccountAttachmentHistoryError::Storage(error) => error.into(),

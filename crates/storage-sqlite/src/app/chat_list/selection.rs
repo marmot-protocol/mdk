@@ -1,7 +1,7 @@
 //! Complete, compact selection intent, independent of the live display window.
 use super::{ChatListView, pages};
 use crate::base::connection::{CachedSql, ConnectionLifetime};
-use crate::{SqliteAccountStorage, SqliteResultExt};
+use crate::{SqliteAppStorage, SqliteResultExt};
 use cgka_traits::storage::StorageError;
 use rusqlite::Connection;
 use std::collections::HashSet;
@@ -37,7 +37,7 @@ pub enum ChatListSelectionError {
     Storage(#[from] StorageError),
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Capture every eligible ID in one read transaction, using the same indexed
     /// predicate and order as the native view, before any presentation pagination.
     /// Work and memory are proportional to eligible IDs, never to profile/history size.

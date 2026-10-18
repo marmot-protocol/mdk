@@ -70,7 +70,7 @@ use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
     NostrAccountRelayListKind, NostrAccountRelayListPublication, NostrEventPublishRequest,
     NostrKeyPackagePublication, NostrKeyPackagePublisher, NostrNip65RelayListPublication,
-    NostrNip65RelaySet, NostrRelayClient, NostrSdkRelayClient, parse_nip65_relay_set,
+    NostrNip65RelaySet, NostrRelayClient, parse_nip65_relay_set,
 };
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
@@ -123,10 +123,6 @@ mod nostr_verification;
 mod notifications;
 mod projection;
 mod publisher_sequences;
-mod relay_plane {
-    //! The relay plane lives in `transport-nostr`; this keeps its old paths.
-    pub use transport_nostr::*;
-}
 mod relay_telemetry_export;
 mod root_closers;
 mod root_runtime_lease;
@@ -284,11 +280,6 @@ pub use profile_pseudonyms::{default_profile_pseudonym, random_profile_pseudonym
 pub use public_event_preview::{
     MAX_PUBLIC_EVENT_REFERENCES, PublicEventPreview, PublicEventPreviewRead,
 };
-pub use relay_plane::{
-    EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
-    RelayEndpointClassification, RelayEndpointPolicy, RelayPlaneHealth, RelayRollupEntry,
-    RelayTelemetryRollup, RelayTelemetrySnapshot, retired_relay_hosts,
-};
 pub use relay_telemetry_export::{
     ExportHistogram, ExportMetricPoint, ExportMetricValue, RelayExportError,
     RelayTelemetryExportBatch, RelayTelemetryExporter, build_export_batch,
@@ -301,6 +292,11 @@ pub use storage_sqlite::{
     TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
     TimelinePagination, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
     select_reusable_direct_conversation,
+};
+pub use transport_nostr::{
+    EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
+    RelayEndpointClassification, RelayEndpointPolicy, RelayPlaneHealth, RelayRollupEntry,
+    RelayTelemetryRollup, RelayTelemetrySnapshot, retired_relay_hosts,
 };
 pub use transport_nostr_adapter::{
     DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
@@ -377,7 +373,7 @@ use key_package_records::{
     validated_cached_key_package,
 };
 use projection::LegacyAccountProjectionDb;
-use relay_plane::DirectoryRelayEventRecord as RelayEventRecord;
+use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 
 const LEGACY_ACCOUNT_APP_DB_FILE: &str = "app.sqlite3";
 const LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER: &str = "legacy-account-projection-v1";
@@ -572,10 +568,6 @@ pub struct MarmotApp {
     product_analytics: ProductAnalytics,
     startup_diagnostics: startup_diagnostics::NativeStartupDiagnostics,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
-    /// One signer-bound publisher per account. Setup publishes and the managed
-    /// account worker share this client so the worker can reuse the same relay
-    /// pool instead of constructing another TCP/TLS/WebSocket stack.
-    account_publish_clients: Arc<Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>>,
     public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
     /// In-memory view of the persisted per-kind authoring floors; see
     /// `sign_replaceable_identity_event`.
@@ -1717,7 +1709,6 @@ impl MarmotApp {
             product_analytics,
             startup_diagnostics: Default::default(),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
-            account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1815,7 +1806,6 @@ impl MarmotApp {
             product_analytics,
             startup_diagnostics: Default::default(),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
-            account_publish_clients: Arc::new(Mutex::new(HashMap::new())),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -2017,7 +2007,7 @@ impl MarmotApp {
             }
         };
         let recovery_owner = client::recovery::AccountRecoveryOwner::open(
-            &self.account_storage(&open.state.label)?,
+            &self.account_storage(&open.state.label)?.app_storage(),
             client::recovery::wall_now_ms()?,
             Instant::now(),
             recovery_policy,
@@ -2028,6 +2018,7 @@ impl MarmotApp {
         {
             Some(
                 self.account_storage(&open.state.label)?
+                    .app_storage()
                     .request_recovery_observed(
                         storage_sqlite::RecoveryRequest::IncrementalHistory,
                         client::recovery::wall_now_ms()?,
@@ -2262,7 +2253,10 @@ impl MarmotApp {
         let account = self.account_home().account(label)?;
         self.ensure_account_state(label)?;
         let state = self.load_state(label)?;
-        let message_count = self.account_storage(label)?.app_message_count()?;
+        let message_count = self
+            .account_storage(label)?
+            .app_storage()
+            .app_message_count()?;
         Ok(AppStatus {
             account: state.label,
             account_id_hex: account.account_id_hex.clone(),
@@ -3290,6 +3284,7 @@ impl MarmotApp {
         self.ensure_account_state(label)?;
         Ok(self
             .account_storage(label)?
+            .app_storage()
             .visible_app_messages(StoredAppMessageQuery {
                 group_id_hex: query.group_id_hex,
                 kinds: query.kinds,
@@ -3308,7 +3303,7 @@ impl MarmotApp {
         message_id_hex: &str,
     ) -> Result<Option<AppMessageRecord>, AppError> {
         self.ensure_account_state(label)?;
-        let storage = self.account_storage(label)?;
+        let storage = self.account_storage(label)?.app_storage();
         let Some(record) = storage.app_message(group_id_hex, message_id_hex)? else {
             return Ok(None);
         };
@@ -3334,6 +3329,7 @@ impl MarmotApp {
         self.ensure_account_state(label)?;
         Ok(self
             .account_storage(label)?
+            .app_storage()
             .timeline_message_target(group_id_hex, message_id_hex)?)
     }
 
@@ -3349,7 +3345,10 @@ impl MarmotApp {
         )
         .entered();
         self.ensure_account_state(label)?;
-        Ok(self.account_storage(label)?.message_timeline(query)?)
+        Ok(self
+            .account_storage(label)?
+            .app_storage()
+            .message_timeline(query)?)
     }
 
     pub(crate) fn timeline_messages_by_wall_clock_with_query(
@@ -3360,6 +3359,7 @@ impl MarmotApp {
         self.ensure_account_state(label)?;
         Ok(self
             .account_storage(label)?
+            .app_storage()
             .message_timeline_by_wall_clock(query)?)
     }
 
@@ -3374,6 +3374,7 @@ impl MarmotApp {
         self.ensure_account_state(label)?;
         Ok(self
             .account_storage(label)?
+            .app_storage()
             .message_edit_history(group, target, before, limit)?)
     }
 
@@ -3386,9 +3387,12 @@ impl MarmotApp {
         limit: usize,
     ) -> Result<PollVotePage, AppError> {
         self.ensure_account_state(label)?;
-        Ok(self
-            .account_storage(label)?
-            .poll_votes(group_id_hex, poll_event_id, after, limit)?)
+        Ok(self.account_storage(label)?.app_storage().poll_votes(
+            group_id_hex,
+            poll_event_id,
+            after,
+            limit,
+        )?)
     }
 
     pub fn timeline_message(
@@ -3400,6 +3404,7 @@ impl MarmotApp {
         self.ensure_account_state(label)?;
         Ok(self
             .account_storage(label)?
+            .app_storage()
             .timeline_message(group_id_hex, message_id_hex)?)
     }
 
@@ -3413,6 +3418,7 @@ impl MarmotApp {
         self.ensure_chat_list_projection(&account)?;
         let mut rows = self
             .account_storage(&account.label)?
+            .app_storage()
             .chat_list_rows(ChatListQuery { include_archived })?;
         self.hydrate_chat_list_rows(&mut rows)?;
         Ok(rows)
@@ -3428,6 +3434,7 @@ impl MarmotApp {
         self.ensure_chat_list_projection(&account)?;
         let mut row = self
             .account_storage(&account.label)?
+            .app_storage()
             .chat_list_row(group_id_hex)?;
         self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
@@ -3449,6 +3456,7 @@ impl MarmotApp {
         self.ensure_chat_list_projection(&account)?;
         Ok(self
             .account_storage(&account.label)?
+            .app_storage()
             .direct_conversation_candidate_rows(peer_account_id_hex)?)
     }
 
@@ -3462,6 +3470,7 @@ impl MarmotApp {
     ) -> Result<ChatPinState, AppError> {
         self.ensure_account_state(label)?;
         self.account_storage(label)?
+            .app_storage()
             .set_chat_pinned(group_id_hex, pinned)
             .map_err(chat_pin_error_from_storage)
     }
@@ -3476,6 +3485,7 @@ impl MarmotApp {
     ) -> Result<ChatPinState, AppError> {
         self.ensure_account_state(label)?;
         self.account_storage(label)?
+            .app_storage()
             .set_pinned_chat_order(ordered_group_ids)
             .map_err(chat_pin_error_from_storage)
     }
@@ -3525,6 +3535,7 @@ impl MarmotApp {
         self.ensure_chat_list_projection(account)?;
         let total = self
             .account_storage(&account.label)?
+            .app_storage()
             .account_unread_total()?;
         Ok(AccountUnread {
             account_id_hex: account.account_id_hex.clone(),
@@ -3544,6 +3555,7 @@ impl MarmotApp {
         let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
         let mut row = self
             .account_storage(&account.label)?
+            .app_storage()
             .refresh_chat_list_row(&account.account_id_hex, group_id_hex, &classifier)?;
         self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
@@ -3559,6 +3571,7 @@ impl MarmotApp {
         let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
         let (mut row, content_changed) = self
             .account_storage(&account.label)?
+            .app_storage()
             .refresh_chat_list_row_for_messages_with_content_change(
                 &account.account_id_hex,
                 group_id_hex,
@@ -3579,6 +3592,7 @@ impl MarmotApp {
         let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
         let mut row = self
             .account_storage(&account.label)?
+            .app_storage()
             .initialize_chat_read_state(&account.account_id_hex, group_id_hex, &classifier)?;
         self.hydrate_chat_list_row(row.as_mut());
         Ok(row)
@@ -3595,6 +3609,7 @@ impl MarmotApp {
         let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
         let mut row = self
             .account_storage(&account.label)?
+            .app_storage()
             .mark_timeline_message_read(
                 &account.account_id_hex,
                 group_id_hex,
@@ -3618,6 +3633,7 @@ impl MarmotApp {
         let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
         let mut row = self
             .account_storage(&account.label)?
+            .app_storage()
             .set_chat_manually_unread(
                 &account.account_id_hex,
                 group_id_hex,
@@ -3636,6 +3652,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         Ok(notification_settings_from_account(
             self.account_storage(&account.label)?
+                .app_storage()
                 .notification_settings(&account.label, &account.account_id_hex)?,
         ))
     }
@@ -3651,6 +3668,7 @@ impl MarmotApp {
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
         let settings = self
             .account_storage(&account.label)?
+            .app_storage()
             .chat_notification_settings(group_id_hex)?;
         Ok(chat_notification_settings_from_account(
             account.label,
@@ -3671,6 +3689,7 @@ impl MarmotApp {
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
         let settings = self
             .account_storage(&account.label)?
+            .app_storage()
             .set_chat_muted(group_id_hex, muted_until_ms)?;
         Ok(chat_notification_settings_from_account(
             account.label,
@@ -3690,6 +3709,7 @@ impl MarmotApp {
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
         let settings = self
             .account_storage(&account.label)?
+            .app_storage()
             .clear_chat_muted(group_id_hex)?;
         Ok(chat_notification_settings_from_account(
             account.label,
@@ -3707,6 +3727,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         Ok(notification_settings_from_account(
             self.account_storage(&account.label)?
+                .app_storage()
                 .set_local_notifications_enabled(
                     &account.label,
                     &account.account_id_hex,
@@ -3724,6 +3745,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         Ok(notification_settings_from_account(
             self.account_storage(&account.label)?
+                .app_storage()
                 .set_native_push_enabled(&account.label, &account.account_id_hex, enabled)?,
         ))
     }
@@ -3736,6 +3758,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         Ok(self
             .account_storage(&account.label)?
+            .app_storage()
             .push_registration(&account.label)?
             .map(stored_push_registration_from_account)
             .transpose()?
@@ -3749,6 +3772,7 @@ impl MarmotApp {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
+            .app_storage()
             .push_registration(&account.label)?
             .map(stored_push_registration_from_account)
             .transpose()
@@ -3784,6 +3808,7 @@ impl MarmotApp {
         };
         let stored = self
             .account_storage(&account.label)?
+            .app_storage()
             .upsert_push_registration(
                 account_push_registration_from_app(registration),
                 token_bytes,
@@ -3795,6 +3820,7 @@ impl MarmotApp {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
+            .app_storage()
             .clear_push_registration(&account.label)?;
         Ok(())
     }
@@ -3810,6 +3836,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         Ok(self
             .account_storage(&account.label)?
+            .app_storage()
             .mark_push_registration_shared(
                 &account.label,
                 token_fingerprint,
@@ -3828,6 +3855,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         Ok(self
             .account_storage(&account.label)?
+            .app_storage()
             .pending_push_registration_shares(token_fingerprint, registration_updated_at_ms)?)
     }
 
@@ -3842,6 +3870,7 @@ impl MarmotApp {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
+            .app_storage()
             .mark_push_registration_share_attempted(
                 group_id_hex,
                 token_fingerprint,
@@ -3862,6 +3891,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         Ok(self
             .account_storage(&account.label)?
+            .app_storage()
             .complete_push_registration_share(
                 group_id_hex,
                 token_fingerprint,
@@ -3878,6 +3908,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         Ok(self
             .account_storage(&account.label)?
+            .app_storage()
             .queue_push_registration_removals(
                 &account_push_registration_from_app(registration),
                 notifications::unix_now_ms(),
@@ -3893,6 +3924,7 @@ impl MarmotApp {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
+            .app_storage()
             .queue_push_registration_removal_for_group(
                 group_id_hex,
                 &account_push_registration_from_app(registration.clone()),
@@ -3911,6 +3943,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         Ok(self
             .account_storage(&account.label)?
+            .app_storage()
             .queue_push_registration_share_for_group(
                 group_id_hex,
                 &registration.token_fingerprint,
@@ -3927,6 +3960,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         Ok(self
             .account_storage(&account.label)?
+            .app_storage()
             .has_pending_push_registration_work()?)
     }
 
@@ -3937,6 +3971,7 @@ impl MarmotApp {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
+            .app_storage()
             .pending_push_registration_removals()?
             .into_iter()
             .map(pending_push_registration_removal_from_account)
@@ -3958,6 +3993,7 @@ impl MarmotApp {
             last_attempted_at_ms: None,
         };
         self.account_storage(&account.label)?
+            .app_storage()
             .mark_push_registration_removal_attempted(&pending, attempted_at_ms)?;
         Ok(())
     }
@@ -3977,6 +4013,7 @@ impl MarmotApp {
         };
         Ok(self
             .account_storage(&account.label)?
+            .app_storage()
             .complete_push_registration_removal(&pending)?)
     }
 
@@ -3988,6 +4025,7 @@ impl MarmotApp {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
+            .app_storage()
             .upsert_group_push_token(&account_group_push_token_from_app(token))?;
         Ok(())
     }
@@ -4000,6 +4038,7 @@ impl MarmotApp {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
+            .app_storage()
             .group_push_tokens(group_id_hex)?
             .into_iter()
             .map(group_push_token_from_account)
@@ -4025,7 +4064,7 @@ impl MarmotApp {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         let group_id_hex = hex::encode(message.group_id.as_slice());
-        let storage = self.account_storage(&account.label)?;
+        let storage = self.account_storage(&account.label)?.app_storage();
         let action =
             notifications::parse_push_gossip(message.kind, &group_id_hex, &message.plaintext)?;
         let active_leaves = active_leaves
@@ -4091,6 +4130,7 @@ impl MarmotApp {
             .map(|member| hex::encode(member.as_slice()))
             .collect::<Vec<_>>();
         self.account_storage(&account.label)?
+            .app_storage()
             .remove_group_push_tokens_for_leaves(group_id_hex, &leaves, &departed_members)?;
         Ok(())
     }
@@ -4108,6 +4148,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         let digest = removal.record_digest(group_id_hex)?;
         self.account_storage(&account.label)?
+            .app_storage()
             .apply_group_push_token_tombstone(
                 group_id_hex,
                 &removal.member_id_hex,
@@ -4129,7 +4170,7 @@ impl MarmotApp {
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        let storage = self.account_storage(&account.label)?;
+        let storage = self.account_storage(&account.label)?.app_storage();
         // A voluntary departure stays voluntary. `Left` is written the moment
         // this device publishes its leave; the commit that later realizes it
         // is authored by a peer, and the roster-derived classification of
@@ -4162,6 +4203,7 @@ impl MarmotApp {
         self.ensure_account_state(label)?;
         Ok(self
             .account_storage(label)?
+            .app_storage()
             .group_self_membership(group_id_hex)?)
     }
 
@@ -4172,6 +4214,7 @@ impl MarmotApp {
         self.ensure_account_state(label)?;
         Ok(self
             .account_storage(label)?
+            .app_storage()
             .account_group_self_memberships()?)
     }
 
@@ -4182,6 +4225,7 @@ impl MarmotApp {
     ) -> Result<(), AppError> {
         self.ensure_account_state(label)?;
         self.account_storage(label)?
+            .app_storage()
             .arm_epoch_backfill_intents(intents)?;
         Ok(())
     }
@@ -4195,6 +4239,7 @@ impl MarmotApp {
         self.ensure_account_state(label)?;
         Ok(self
             .account_storage(label)?
+            .app_storage()
             .record_recovery_evidence(evidence, fruitless_threshold)?)
     }
 
@@ -4203,7 +4248,10 @@ impl MarmotApp {
         label: &str,
     ) -> Result<Vec<storage_sqlite::StoredEpochStallEvidence>, AppError> {
         self.ensure_account_state(label)?;
-        Ok(self.account_storage(label)?.epoch_stall_evidence()?)
+        Ok(self
+            .account_storage(label)?
+            .app_storage()
+            .epoch_stall_evidence()?)
     }
 
     /// `group_id_hex` of every `account_groups` row carrying
@@ -4217,6 +4265,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         Ok(self
             .account_storage(&account.label)?
+            .app_storage()
             .account_group_ids_defaulting_to_member()?)
     }
 
@@ -4230,6 +4279,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         Ok(self
             .account_storage(&account.label)?
+            .app_storage()
             .account_import_marker(name)?)
     }
 
@@ -4242,6 +4292,7 @@ impl MarmotApp {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
+            .app_storage()
             .mark_account_import_complete(name)?;
         Ok(())
     }
@@ -4256,6 +4307,7 @@ impl MarmotApp {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
+            .app_storage()
             .reset_direct_conversation_members_backfill(
                 DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER,
             )?;
@@ -4277,6 +4329,7 @@ impl MarmotApp {
             .collect::<Vec<_>>();
         Ok(self
             .account_storage(&account.label)?
+            .app_storage()
             .reconcile_group_push_token_leaves(group_id_hex, &leaves)?)
     }
 
@@ -4290,6 +4343,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         Ok(self
             .account_storage(&account.label)?
+            .app_storage()
             .remove_stale_group_push_tokens(group_id_hex, active_members)?)
     }
 
@@ -4301,7 +4355,7 @@ impl MarmotApp {
     ) -> Result<GroupPushDebugInfo, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        let storage = self.account_storage(&account.label)?;
+        let storage = self.account_storage(&account.label)?.app_storage();
         let settings = notification_settings_from_account(
             storage.notification_settings(&account.label, &account.account_id_hex)?,
         );
@@ -4328,6 +4382,7 @@ impl MarmotApp {
         self.ensure_account_state(label)?;
         let storage = self.account_storage(label)?;
         let mut groups = storage
+            .app_storage()
             .account_groups(None)?
             .into_iter()
             .map(app_group_from_stored_group)
@@ -4384,6 +4439,7 @@ impl MarmotApp {
         let mut invites = Vec::new();
         for invite in self
             .account_storage(label)?
+            .app_storage()
             .pending_confirmation_group_invites()?
         {
             let group_id_hex = invite.group_id_hex.trim().to_ascii_lowercase();
@@ -4433,6 +4489,7 @@ impl MarmotApp {
     ) -> Result<Vec<AppGroupRecord>, AppError> {
         let blocked = self
             .account_storage(label)?
+            .app_storage()
             .block_list_snapshot()?
             .users
             .into_iter()
@@ -4460,7 +4517,11 @@ impl MarmotApp {
         // Keep overlays aligned with groups(); keyed_group_matches_list checks parity.
         self.ensure_account_state(label)?;
         let storage = self.account_storage(label)?;
-        let Some(stored) = storage.account_groups(Some(group_id_hex))?.pop() else {
+        let Some(stored) = storage
+            .app_storage()
+            .account_groups(Some(group_id_hex))?
+            .pop()
+        else {
             return Ok(None);
         };
         let mut group = app_group_from_stored_group(stored)?;
@@ -4527,10 +4588,17 @@ impl MarmotApp {
         let session_guard = self.acquire_account_session(label)?;
         let state = self.load_state(label)?;
         let recovery_storage = self.account_storage(label)?;
-        recovery_storage.restore_unacknowledged_recovery_loss()?;
-        let recovery_loss_imports = recovery_storage.synchronize_account_delivery_loss(label)?;
-        let delivery_overflow_recovery = recovery_storage.account_delivery_recovery(label)?;
+        recovery_storage
+            .app_storage()
+            .restore_unacknowledged_recovery_loss()?;
+        let recovery_loss_imports = recovery_storage
+            .app_storage()
+            .synchronize_account_delivery_loss(label)?;
+        let delivery_overflow_recovery = recovery_storage
+            .app_storage()
+            .account_delivery_recovery(label)?;
         let notification_loss = recovery_storage
+            .app_storage()
             .pending_recovery_demands()?
             .into_iter()
             .find(|demand| demand.cause == storage_sqlite::RecoveryCause::NotificationLoss);
@@ -4641,9 +4709,10 @@ impl MarmotApp {
             self.relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone());
         let recovery_storage = self.account_storage(label)?;
         let recovery_label = label.to_owned();
-        let recovery_marker: relay_plane::AccountDeliveryRecoveryMarker =
+        let recovery_marker: transport_nostr::AccountDeliveryRecoveryMarker =
             Arc::new(move |marker_token, dropped, earliest_created_at| {
                 recovery_storage
+                    .app_storage()
                     .record_account_delivery_loss_bounded(
                         &recovery_label,
                         marker_token,
@@ -4653,15 +4722,16 @@ impl MarmotApp {
                     )
                     .map_err(|error| {
                         if error.is_closed() {
-                            relay_plane::AccountDeliveryRecoveryMarkerError::Closed
+                            transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
                         } else {
-                            relay_plane::AccountDeliveryRecoveryMarkerError::Retryable
+                            transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
                         }
                     })
             });
         let spill_storage = self.account_storage(label)?;
-        let spill_store: relay_plane::AccountDeliverySpillStore = Arc::new(move |deliveries| {
+        let spill_store: transport_nostr::AccountDeliverySpillStore = Arc::new(move |deliveries| {
             spill_storage
+                .app_storage()
                 .spill_account_deliveries(
                     deliveries,
                     client::delivery_spill::ACCOUNT_DELIVERY_SPILL_LIMITS,
@@ -4675,9 +4745,9 @@ impl MarmotApp {
                 })
                 .map_err(|error| {
                     if error.is_closed() {
-                        relay_plane::AccountDeliveryRecoveryMarkerError::Closed
+                        transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
                     } else {
-                        relay_plane::AccountDeliveryRecoveryMarkerError::Retryable
+                        transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
                     }
                 })
         });
@@ -5948,7 +6018,7 @@ impl MarmotApp {
 
     fn load_state(&self, label: &str) -> Result<AccountState, AppError> {
         self.ensure_account_state(label)?;
-        let storage = self.account_storage(label)?;
+        let storage = self.account_storage(label)?.app_storage();
         // A retained route stored before switch times were kept is anchored
         // at the first load that finds it, persisted at once so the anchor
         // stays fixed across later loads. Sessions before the upgrade already
@@ -5981,6 +6051,7 @@ impl MarmotApp {
     #[cfg(test)]
     fn save_state(&self, state: &AccountState) -> Result<(), AppError> {
         self.account_storage(&state.label)?
+            .app_storage()
             .save_account_projection_state(
                 &stored_state_from_account_state(state),
                 MAX_SEEN_EVENT_IDS,
@@ -6000,7 +6071,7 @@ impl MarmotApp {
         application_event_ids_to_ack: &[MessageId],
     ) -> Result<(), AppError> {
         self.account_storage(&delta.label)?
-            .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+            .app_storage().save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
                 &stored_state_from_account_state(delta),
                 MAX_SEEN_EVENT_IDS,
                 TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
@@ -6030,6 +6101,7 @@ impl MarmotApp {
             .any(|group| group.group_id_hex != group_id_hex);
         let mut row = self
             .account_storage(&delta.label)?
+            .app_storage()
             .save_account_projection_delta_and_refresh_chat_list_row(
                 &stored_state_from_account_state(delta),
                 MAX_SEEN_EVENT_IDS,
@@ -6110,6 +6182,7 @@ impl MarmotApp {
         self.ensure_strict_cutover_replacement_intent_before_session_open(label)?;
         self.migrate_legacy_account_projection_if_needed(label)?;
         self.account_storage(label)?
+            .app_storage()
             .ensure_account_projection_with_identity(label, &account.account_id_hex)?;
         ready.insert(label.to_owned());
         Ok(())
@@ -6150,7 +6223,7 @@ impl MarmotApp {
         if warmed && !stale {
             return Ok(());
         }
-        let storage = self.account_storage(&account.label)?;
+        let storage = self.account_storage(&account.label)?.app_storage();
         let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
         if stale {
             storage.refresh_chat_list_rows(&account.account_id_hex, &classifier)?;
@@ -6517,13 +6590,17 @@ impl MarmotApp {
             )));
         }
         if let Some(store) = stores.get(label).filter(|store| {
-            !store.is_closed() && store.catalog().storage().shares_connection_with(storage)
+            !store.is_closed()
+                && store
+                    .catalog()
+                    .storage()
+                    .shares_connection_with(&storage.app_storage())
         }) {
             return Ok(store.clone());
         }
         let store = media_store::MediaStore::new(
             self.account_dir(label).join(media_store::MEDIA_DIRECTORY),
-            storage_sqlite::SqliteMediaCatalog::new(storage.clone()),
+            storage_sqlite::SqliteMediaCatalog::new(storage.app_storage()),
         );
         // Replacing a store for an older handle closes that one first.
         let closing = store.clone();
@@ -6691,18 +6768,20 @@ impl MarmotApp {
         // must leave the accepted fanout able to reconstruct its completion.
         let storage = self.account_storage(label)?;
         let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
-            let storage_update = storage.record_app_event_with_source(
+            let storage_update = storage.app_storage().record_app_event_with_source(
                 &stored_app_event_from_projection(message, received_at),
                 message.retention,
                 message.authority,
             )?;
             if message.direction == "sent" {
-                storage.retain_attachment_uploads_after_commit(
-                    &message.group_id_hex,
-                    &message.message_id_hex,
-                    received_at,
-                    runtime::attachment_controls::default_policy(&self.config).retained_bytes,
-                );
+                storage
+                    .app_storage()
+                    .retain_attachment_uploads_after_commit(
+                        &message.group_id_hex,
+                        &message.message_id_hex,
+                        received_at,
+                        runtime::attachment_controls::default_policy(&self.config).retained_bytes,
+                    );
             }
             self.app_projection_update(label, storage_update)
         })?;
@@ -6723,18 +6802,20 @@ impl MarmotApp {
         let now = unix_now_seconds();
         let storage = self.account_storage(label)?;
         let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
-            let storage_update = storage.record_app_event_with_source(
+            let storage_update = storage.app_storage().record_app_event_with_source(
                 &stored_app_event_from_projection(message, now),
                 message.retention,
                 message.authority,
             )?;
             if message.direction == "sent" {
-                storage.retain_attachment_uploads_after_commit(
-                    &message.group_id_hex,
-                    &message.message_id_hex,
-                    now,
-                    runtime::attachment_controls::default_policy(&self.config).retained_bytes,
-                );
+                storage
+                    .app_storage()
+                    .retain_attachment_uploads_after_commit(
+                        &message.group_id_hex,
+                        &message.message_id_hex,
+                        now,
+                        runtime::attachment_controls::default_policy(&self.config).retained_bytes,
+                    );
             }
             self.app_projection_update(label, storage_update)
         })?;
@@ -6768,21 +6849,26 @@ impl MarmotApp {
             .map(ProductObservation::counts_only);
         let storage = self.account_storage(label)?;
         let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
-            let authority_update =
-                storage.finalize_app_event_authority(group_id_hex, message_id_hex, authority)?;
-            let retention_update = storage.finalize_app_event_source_retention(
+            let authority_update = storage.app_storage().finalize_app_event_authority(
+                group_id_hex,
+                message_id_hex,
+                authority,
+            )?;
+            let retention_update = storage.app_storage().finalize_app_event_source_retention(
                 group_id_hex,
                 message_id_hex,
                 source_message_id_hex,
                 source_epoch,
                 retention,
             )?;
-            storage.retain_attachment_uploads_after_commit(
-                group_id_hex,
-                message_id_hex,
-                unix_now_seconds(),
-                runtime::attachment_controls::default_policy(&self.config).retained_bytes,
-            );
+            storage
+                .app_storage()
+                .retain_attachment_uploads_after_commit(
+                    group_id_hex,
+                    message_id_hex,
+                    unix_now_seconds(),
+                    runtime::attachment_controls::default_policy(&self.config).retained_bytes,
+                );
             retention_update
                 .or(authority_update)
                 .map(|update| self.app_projection_update(label, update))
@@ -6806,6 +6892,7 @@ impl MarmotApp {
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let update = self
             .account_storage(label)?
+            .app_storage()
             .invalidate_app_event_by_source(source_message_id_hex, reason)?;
         update
             .map(|update| self.app_projection_update(label, update))
@@ -6821,6 +6908,7 @@ impl MarmotApp {
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let update = self
             .account_storage(label)?
+            .app_storage()
             .invalidate_app_event_by_message_id(group_id_hex, message_id_hex, reason)?;
         update
             .map(|update| self.app_projection_update(label, update))
@@ -6848,6 +6936,7 @@ impl MarmotApp {
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let update = self
             .account_storage(label)?
+            .app_storage()
             .clear_local_publish_failure(group_id_hex, message_id_hex)?;
         update
             .map(|update| self.app_projection_update(label, update))
@@ -6865,6 +6954,7 @@ impl MarmotApp {
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let update = self
             .account_storage(label)?
+            .app_storage()
             .invalidate_app_events_by_origin_commit(origin_commit_id_hex, reason)?;
         update
             .map(|update| self.app_projection_update(label, update))
@@ -6889,6 +6979,7 @@ impl MarmotApp {
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let update = self
             .account_storage(label)?
+            .app_storage()
             .clear_branch_selection_withdrawal_by_origin_commit(origin_commit_id_hex)?;
         update
             .map(|update| self.app_projection_update(label, update))
@@ -6916,6 +7007,7 @@ impl MarmotApp {
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let update = self
             .account_storage(label)?
+            .app_storage()
             .invalidate_pending_sent_app_events_for_group(
                 group_id_hex,
                 LOCAL_PUBLISH_FAILED_REASON,
@@ -7028,6 +7120,7 @@ impl MarmotApp {
         let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
         Ok(self
             .account_storage(&account.label)?
+            .app_storage()
             .secure_prune_expired_app_events(
                 group_id_hex,
                 now,
@@ -7043,7 +7136,8 @@ impl MarmotApp {
             return Ok(());
         }
         let storage = self.account_storage(label)?;
-        if storage.account_import_marker(LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER)? {
+        let app = storage.app_storage();
+        if app.account_import_marker(LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER)? {
             return Ok(());
         }
 
@@ -7057,7 +7151,7 @@ impl MarmotApp {
         self.run_legacy_projection_open_hook_for_test();
         let legacy = self.legacy_account_projection(label)?;
         let state = legacy.load_state(label)?;
-        storage.save_account_projection_state(
+        app.save_account_projection_state(
             &stored_state_from_account_state(&state),
             MAX_SEEN_EVENT_IDS,
             TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
@@ -7066,31 +7160,31 @@ impl MarmotApp {
             if message.message_id_hex.is_empty() {
                 continue;
             }
-            storage.record_app_event(&stored_app_event_from_message_record(&message))?;
+            app.record_app_event(&stored_app_event_from_message_record(&message))?;
         }
         if let Some(settings) = legacy.existing_notification_settings(label)? {
-            storage.notification_settings(label, &settings.account_id_hex)?;
-            storage.set_local_notifications_enabled(
+            app.notification_settings(label, &settings.account_id_hex)?;
+            app.set_local_notifications_enabled(
                 label,
                 &settings.account_id_hex,
                 settings.local_notifications_enabled,
             )?;
-            storage.set_native_push_enabled(
+            app.set_native_push_enabled(
                 label,
                 &settings.account_id_hex,
                 settings.native_push_enabled,
             )?;
         }
         if let Some(registration) = legacy.push_registration(label)? {
-            storage.upsert_push_registration(
+            app.upsert_push_registration(
                 account_push_registration_from_app(registration.registration),
                 registration.token_bytes,
             )?;
         }
         for token in legacy.all_group_push_tokens()? {
-            storage.upsert_group_push_token(&account_group_push_token_from_app(&token))?;
+            app.upsert_group_push_token(&account_group_push_token_from_app(&token))?;
         }
-        storage.mark_account_import_complete(LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER)?;
+        app.mark_account_import_complete(LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER)?;
         Ok(())
     }
 
@@ -7246,10 +7340,8 @@ impl MarmotApp {
             .send(label.to_owned());
         if let Ok(account) = self.account_home().account(label) {
             let _ = self.abort_public_indexer_copies_for_account(&account.account_id_hex);
-            self.account_publish_clients
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&account.account_id_hex);
+            self.relay_plane
+                .evict_account_publish_client(&account.account_id_hex);
         }
         self.account_storages
             .lock()
@@ -7323,34 +7415,14 @@ impl MarmotApp {
         if let Some(client) = &self.test_relay_client {
             return client.clone();
         }
-        let mut clients = self
-            .account_publish_clients
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // The signer is intentionally ignored on a cache hit. Callers that
-        // replace an account signer must evict this entry first, as
-        // register_external_signer and drop_account_caches do today.
-        clients
-            .entry(account_id_hex.to_owned())
-            .or_insert_with(|| {
-                let client = network_proxy::nostr_builder()
-                    .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
-                        transport_nostr_peeler::SdkSigner(signer.clone()),
-                    ))
-                    .build();
-                let account_id =
-                    MemberId::new(hex::decode(account_id_hex).expect("validated account identity"));
-                Arc::new(NostrSdkRelayClient::with_account_signer(
-                    client, account_id, signer,
-                ))
-            })
-            .clone()
+        self.relay_plane
+            .account_publish_client(account_id_hex, signer)
     }
 
     #[cfg(test)]
     fn with_test_relay_client<C>(mut self, client: Arc<C>) -> Self
     where
-        C: NostrRelayClient + crate::relay_plane::DirectoryRelayFetcher + 'static,
+        C: NostrRelayClient + transport_nostr::DirectoryRelayFetcher + 'static,
     {
         self.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
             None,
@@ -7393,10 +7465,8 @@ impl MarmotApp {
             }
         }
         drop(signers);
-        self.account_publish_clients
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&account.account_id_hex);
+        self.relay_plane
+            .evict_account_publish_client(&account.account_id_hex);
         Ok(())
     }
 
@@ -7476,7 +7546,7 @@ impl MarmotApp {
     fn new_nostr_routing(&self, relays: Option<Vec<String>>) -> Result<NostrRoutingV1, AppError> {
         let mut nostr_group_id = [0_u8; 32];
         OsRng.fill_bytes(&mut nostr_group_id);
-        let relays = relay_plane::RelaySafetyPolicy::with_allow_loopback(
+        let relays = transport_nostr::RelaySafetyPolicy::with_allow_loopback(
             self.config.allow_loopback_relay_endpoints,
         )
         .sanitize_endpoints(

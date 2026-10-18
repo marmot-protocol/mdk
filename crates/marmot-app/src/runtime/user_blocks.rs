@@ -21,6 +21,7 @@ impl RuntimeBlockListSubscription {
                 .app
                 .account_storage(&self.label)
                 .ok()?
+                .app_storage()
                 .block_list_snapshot()
                 .ok()?;
             if snapshot.revision != self.revision {
@@ -62,6 +63,7 @@ impl MarmotAppRuntime {
             .accounts
             .app
             .account_storage(&account.label)?
+            .app_storage()
             .block_list_snapshot()?
             .users)
     }
@@ -77,6 +79,7 @@ impl MarmotAppRuntime {
             .accounts
             .app
             .account_storage(&account.label)?
+            .app_storage()
             .is_user_blocked(&key)?)
     }
     pub fn subscribe_blocked_users(
@@ -87,7 +90,10 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         let app = self.accounts.app.clone();
         let changes = app.block_list_updates.subscribe();
-        let snapshot = app.account_storage(&account.label)?.block_list_snapshot()?;
+        let snapshot = app
+            .account_storage(&account.label)?
+            .app_storage()
+            .block_list_snapshot()?;
         Ok(RuntimeBlockListSubscription {
             revision: snapshot.revision,
             snapshot,

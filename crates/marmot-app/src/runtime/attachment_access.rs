@@ -40,6 +40,7 @@ impl MarmotAppRuntime {
                 .into_iter()
                 .map(|target| {
                     storage
+                        .app_storage()
                         .retained_attachment_asset(
                             &group,
                             &target.message_id_hex,
@@ -74,7 +75,7 @@ impl MarmotAppRuntime {
         self.attachment_read_with(account_ref, move |app, label, storage, _| {
             // The database authorizes the read and locates the body; a media
             // file body is then read through the store on this blocking thread.
-            match storage.retained_attachment_read(
+            match storage.app_storage().retained_attachment_read(
                 &reference,
                 crate::unix_now_seconds(),
                 offset,

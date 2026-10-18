@@ -1,7 +1,6 @@
 use crate::base::connection::CachedSql;
 use crate::{
-    SQLITE_BIND_PARAMETER_CHUNK, SqliteAccountStorage, SqliteResultExt,
-    app::encrypted_media_secrets::retire_all_encrypted_media_secrets_for_group_tx,
+    SQLITE_BIND_PARAMETER_CHUNK, SqliteAppStorage, SqliteResultExt,
     base::connection::retry_on_busy, bool_i64, i64_to_u64, i64_to_usize, tags_from_json,
     u64_to_i64, unix_now_ms, unix_now_seconds, unix_now_seconds_i64, usize_to_i64,
 };
@@ -16,7 +15,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 const SECURE_DELETE_RETENTION_OPERATION: &str = "retention";
-const SECURE_DELETE_LOCAL_GROUP_OPERATION: &str = "local_group";
+pub(crate) const SECURE_DELETE_LOCAL_GROUP_OPERATION: &str = "local_group";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteLocalGroupDataResult {
@@ -47,9 +46,9 @@ struct SecureDeleteIntent {
 }
 
 #[derive(Clone, Debug)]
-struct SecureDeleteCheckpointFinish<T> {
-    result: Option<T>,
-    erasure_pending: bool,
+pub(crate) struct SecureDeleteCheckpointFinish<T> {
+    pub(crate) result: Option<T>,
+    pub(crate) erasure_pending: bool,
 }
 
 /// Whether a stored per-chat mute row is effective at `now_ms`.
@@ -195,7 +194,7 @@ pub struct StoredAccountGroup {
     pub prior_nostr_routes: Vec<StoredNostrRoute>,
     /// The local account's membership in this group. Read-only on this struct:
     /// it is loaded from `account_groups` but owned exclusively by
-    /// [`SqliteAccountStorage::set_group_self_membership`], so the projection
+    /// [`SqliteAppStorage::set_group_self_membership`], so the projection
     /// save deliberately ignores it (a routine resave must not clobber a
     /// membership change). New rows take the schema default `Member`.
     pub self_membership: SelfMembership,
@@ -240,7 +239,7 @@ pub struct StoredNostrRoute {
     /// Unix seconds when the device saw this route replaced as the group's
     /// current route, which anchors its retained history floor. `None` on a
     /// route still current when recorded, and on routes stored before this
-    /// field existed until [`SqliteAccountStorage::stamp_unrecorded_prior_route_switches`]
+    /// field existed until [`SqliteAppStorage::stamp_unrecorded_prior_route_switches`]
     /// stamps them. Stored inside the route JSON, so no schema change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaced_at: Option<u64>,
@@ -330,7 +329,7 @@ impl StoredAppMessageRecord {
     }
 }
 
-/// Column list for [`SqliteAccountStorage::app_messages`], decoded by
+/// Column list for [`SqliteAppStorage::app_messages`], decoded by
 /// `app_message_from_row` (including resolved source authority at indexes 15–16).
 const APP_EVENT_REPLAY_COLUMNS: &str = "message_id_hex, direction, group_id_hex, sender, plaintext, \
      kind, tags_json, source_epoch, retention_seconds, retention_expires_at, recorded_at, \
@@ -338,7 +337,7 @@ const APP_EVENT_REPLAY_COLUMNS: &str = "message_id_hex, direction, group_id_hex,
      authority_context";
 
 /// The ONE ascending order for the raw-event replay surface (recovery / lag
-/// replay), shared by [`SqliteAccountStorage::app_messages`] and — via
+/// replay), shared by [`SqliteAppStorage::app_messages`] and — via
 /// [`AppEventReplayCursor`]'s `Ord` — the runtime recovery watermark and
 /// suppression, so the query order and the watermark cut-point can never drift
 /// (#630, #736 boundary contract 1). This is the RAW-EVENT surface only: it is
@@ -464,7 +463,7 @@ struct RawStoredAccountGroup {
     self_membership: SelfMembership,
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     pub fn ensure_account_projection(&self, label: &str) -> StorageResult<()> {
         self.lock()?
             .execute_cached(
@@ -1146,12 +1145,9 @@ impl SqliteAccountStorage {
             // Probe only groups in this write, not the lifetime collection of
             // forgotten ids. Ordinary delta checkpoints usually contain one.
             if !state.groups.is_empty() {
-                let mut forgotten = conn.prepare_cached(
-                    "SELECT EXISTS(SELECT 1 FROM locally_forgotten_groups WHERE group_id = ?1 AND awaiting_welcome = 1)"
-                ).storage()?;
                 for group in &state.groups {
                     if let Ok(id) = hex::decode(&group.group_id_hex)
-                        && forgotten.query_row(params![id], |row| row.get::<_, bool>(0)).storage()? {
+                        && crate::cross::projection::group_awaits_welcome(&conn, &id)? {
                         locally_deleted_group_ids.insert(group.group_id_hex.clone());
                     }
                 }
@@ -1310,11 +1306,7 @@ impl SqliteAccountStorage {
                     group.presentation_member_ids_hex.as_deref().unwrap_or(&[]))?;
             }
             for message_id in application_event_ids_to_ack {
-                conn.execute_cached(
-                    "DELETE FROM pending_application_events WHERE message_id = ?1",
-                    params![message_id.as_slice()],
-                )
-                .storage()?;
+                crate::cross::projection::acknowledge_outbox(&conn, message_id)?;
             }
             Ok(())
         })
@@ -1395,256 +1387,6 @@ impl SqliteAccountStorage {
             .storage()?;
             Ok(())
         })
-    }
-
-    /// Transactionally removes all app-local data for one group without touching
-    /// the stored MLS/OpenMLS group state. This is the storage primitive for the
-    /// local delete/wipe UX: it drops the chat-list/account projection, plaintext
-    /// app events, timeline rows, agent-stream start projection rows, cached
-    /// encrypted-media epoch secrets, and group push-token rows keyed by
-    /// `group_id_hex`. A metadata-only media-secret retirement barrier remains
-    /// because protocol/MLS state is intentionally retained; without it that
-    /// state could immediately rederive wiped key bytes. `seen_events` and
-    /// protocol/MLS tables are left intact for active groups. A durable local
-    /// deletion frontier distinguishes the intentionally absent projection from
-    /// a torn write, suppressing historical relay replay while allowing a
-    /// causally newer chat message to re-create it. A terminal group is
-    /// different: its live MLS state is already erased, so this transaction also
-    /// removes the full `cgka_groups` row and retains only
-    /// `cgka_disband_tombstones` as the permanent anti-resurrection guard. The
-    /// logical wipe and a durable WAL checkpoint intent commit together under
-    /// `secure_delete = ON`. If `wal_checkpoint(TRUNCATE)` is blocked by a reader,
-    /// the committed result is returned with `erasure_pending`; a retry recovers
-    /// the accumulated result from the intent and attempts truncation again.
-    pub fn delete_local_group_data(
-        &self,
-        group_id_hex: &str,
-    ) -> StorageResult<DeleteLocalGroupDataResult> {
-        self.delete_local_group_data_inner(group_id_hex, None)
-    }
-
-    pub(crate) fn forget_group_local_data(
-        &self,
-        group_id_hex: &str,
-        at: cgka_traits::Timestamp,
-    ) -> StorageResult<bool> {
-        use cgka_traits::storage::GroupStorage;
-        let id = cgka_traits::GroupId::new(
-            hex::decode(group_id_hex)
-                .map_err(|_| StorageError::Serialization("invalid local group id".into()))?,
-        );
-        let already_forgotten = self.is_group_forgotten(&id)?;
-        self.delete_local_group_data_inner(group_id_hex, Some(at))?;
-        Ok(!already_forgotten)
-    }
-
-    fn delete_local_group_data_inner(
-        &self,
-        group_id_hex: &str,
-        forgotten_at: Option<cgka_traits::Timestamp>,
-    ) -> StorageResult<DeleteLocalGroupDataResult> {
-        let forget = forgotten_at.is_some();
-        if group_id_hex.trim().is_empty() {
-            return Err(StorageError::Backend(
-                "local group delete id must not be empty".to_owned(),
-            ));
-        }
-        let group_id = hex::decode(group_id_hex).map_err(|error| {
-            StorageError::Serialization(format!("invalid local group id: {error}"))
-        })?;
-
-        let newly_deleted = retry_on_busy(|| {
-            let mut conn = self.lock()?;
-            let original = secure_delete_pragma(&conn)?;
-            conn.execute_batch("PRAGMA secure_delete = ON;").storage()?;
-            let delete_result = (|| {
-                let tx = conn
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
-                    .storage()?;
-                let mut deleted =
-                    retire_all_encrypted_media_secrets_for_group_tx(&tx, group_id_hex)?;
-                let prior_nostr_routes_json = tx
-                    .query_row_cached(
-                        "SELECT prior_nostr_routes_json
-                         FROM account_groups
-                         WHERE group_id_hex = ?1",
-                        params![group_id_hex],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()
-                    .storage()?
-                    .unwrap_or_else(|| "[]".to_owned());
-                deleted = deleted.saturating_add(
-                    tx.execute_cached(
-                        "DELETE FROM pending_application_events WHERE group_id = ?1",
-                        params![&group_id],
-                    )
-                    .storage()?,
-                );
-                for table in [
-                    "app_events",
-                    "message_timeline",
-                    "agent_stream_starts",
-                    "conversation_read_state",
-                    "chat_list_rows",
-                    "account_group_app_components",
-                    "group_push_tokens",
-                    "group_push_token_tombstones",
-                    "pending_push_registration_shares",
-                    "chat_notification_settings",
-                    "encrypted_media_epoch_secret_references",
-                    "encrypted_media_epoch_secrets",
-                    "account_groups",
-                ] {
-                    deleted = deleted.saturating_add(
-                        tx.execute_cached(
-                            &format!("DELETE FROM {table} WHERE group_id_hex = ?1"),
-                            params![group_id_hex],
-                        )
-                        .storage()?,
-                    );
-                }
-                let (terminal, active, message_insert_order) = tx
-                    .query_row_cached(
-                        "SELECT
-                            EXISTS(SELECT 1 FROM cgka_disband_tombstones WHERE group_id = ?1),
-                            EXISTS(SELECT 1 FROM cgka_groups WHERE id = ?1),
-                            COALESCE(
-                                (SELECT MAX(insert_order) FROM cgka_messages WHERE group_id = ?1),
-                                0
-                            )",
-                        params![&group_id],
-                        |row| {
-                            Ok((
-                                row.get::<_, i64>(0)? != 0,
-                                row.get::<_, i64>(1)? != 0,
-                                row.get::<_, i64>(2)?,
-                            ))
-                        },
-                    )
-                    .storage()?;
-                if active && !terminal && !forget {
-                    tx.execute_cached(
-                        "INSERT INTO local_group_deletion_frontiers (
-                            group_id_hex, message_insert_order, prior_nostr_routes_json
-                         ) VALUES (?1, ?2, ?3)
-                         ON CONFLICT(group_id_hex) DO UPDATE SET
-                            message_insert_order = MAX(
-                                local_group_deletion_frontiers.message_insert_order,
-                                excluded.message_insert_order
-                            ),
-                            prior_nostr_routes_json = CASE
-                                WHEN excluded.prior_nostr_routes_json = '[]'
-                                    THEN local_group_deletion_frontiers.prior_nostr_routes_json
-                                ELSE excluded.prior_nostr_routes_json
-                            END",
-                        params![
-                            hex::encode(&group_id),
-                            message_insert_order,
-                            prior_nostr_routes_json
-                        ],
-                    )
-                    .storage()?;
-                }
-                if terminal && !forget {
-                    tx.execute_cached(
-                        "DELETE FROM local_group_deletion_frontiers WHERE group_id_hex = ?1",
-                        params![hex::encode(&group_id)],
-                    )
-                    .storage()?;
-                    deleted = deleted.saturating_add(
-                        tx.execute_cached(
-                            "DELETE FROM cgka_groups WHERE id = ?1",
-                            params![&group_id],
-                        )
-                        .storage()?,
-                    );
-                }
-                if let Some(at) = forgotten_at {
-                    deleted += tx.execute_cached(
-                        "INSERT INTO locally_forgotten_groups(group_id, forgotten_at, awaiting_welcome)
-                         VALUES (?1, ?2, 1) ON CONFLICT(group_id) DO UPDATE SET
-                         forgotten_at = MAX(locally_forgotten_groups.forgotten_at, excluded.forgotten_at),
-                         awaiting_welcome = 1 WHERE locally_forgotten_groups.awaiting_welcome = 0",
-                        params![&group_id, u64_to_i64(at.0)?],
-                    ).storage()?;
-                    crate::protocol::storage::groups::delete_group_tx(
-                        &tx,
-                        &cgka_traits::GroupId::new(group_id.clone()),
-                    )?;
-                    for table in ["cgka_welcomes", "cgka_disband_tombstones"] {
-                        tx.execute_cached(
-                            &format!("DELETE FROM {table} WHERE group_id = ?1"),
-                            params![&group_id],
-                        )
-                        .storage()?;
-                    }
-                    for table in [
-                        "local_group_deletion_frontiers",
-                        "app_pending_welcome_delivery",
-                        "pending_push_registration_removals",
-                        "app_prepared_group_image_upload",
-                        "message_drafts",
-                        "chat_pin_positions",
-                    ] {
-                        tx.execute_cached(
-                            &format!("DELETE FROM {table} WHERE group_id_hex = ?1"),
-                            params![group_id_hex],
-                        )
-                        .storage()?;
-                    }
-                    self.connection.note_openmls_write();
-                }
-                if deleted > 0 {
-                    merge_local_group_delete_intent_tx(&tx, group_id_hex, deleted)?;
-                }
-                tx.commit().storage()?;
-                Ok(deleted)
-            })();
-            let restore = restore_secure_delete_pragma(&conn, original);
-            combine_secure_delete_operation_and_restore(delete_result, restore)
-        })?;
-
-        let finish = match finish_secure_delete_checkpoint_intent::<DeleteLocalGroupDataResult>(
-            self,
-            SECURE_DELETE_LOCAL_GROUP_OPERATION,
-            group_id_hex,
-        ) {
-            Ok(finish) => finish,
-            Err(_) => {
-                // The logical deletion and its checkpoint intent committed before
-                // this best-effort finish step. Report that committed outcome and
-                // leave the durable intent for a later retry instead of inviting
-                // the caller to restore projection state that was already erased.
-                tracing::warn!(
-                    target: "storage_sqlite::account_projection",
-                    method = "delete_local_group_data",
-                    "secure-delete checkpoint cleanup remains pending after committed local deletion"
-                );
-                return Ok(DeleteLocalGroupDataResult {
-                    deleted_rows: newly_deleted,
-                    completed_pending_checkpoint: false,
-                    erasure_pending: true,
-                });
-            }
-        };
-        match finish.result {
-            Some(mut result) => {
-                result.completed_pending_checkpoint =
-                    newly_deleted == 0 && result.deleted_rows > 0 && !finish.erasure_pending;
-                result.erasure_pending = finish.erasure_pending;
-                Ok(result)
-            }
-            // Another process may have checkpointed and consumed this intent
-            // after our logical deletion committed. In that case erasure is
-            // complete, and this caller must still report its locally known
-            // deletion instead of incorrectly returning "nothing existed".
-            None => Ok(DeleteLocalGroupDataResult {
-                deleted_rows: newly_deleted,
-                completed_pending_checkpoint: false,
-                erasure_pending: false,
-            }),
-        }
     }
 
     /// Return the durable message-ingress frontier recorded by a deliberate
@@ -1746,11 +1488,7 @@ impl SqliteAccountStorage {
             })?;
             let active_route_ids = {
                 let mut statement = conn
-                    .prepare_cached(
-                        "SELECT transport_group_id
-                         FROM cgka_transport_group_routes
-                         WHERE group_id = ?1",
-                    )
+                    .prepare_cached(crate::cross::views::GROUP_ROUTE_IDS_SQL)
                     .storage()?;
                 statement
                     .query_map(params![group_id], |row| row.get::<_, Vec<u8>>(0))
@@ -1874,13 +1612,7 @@ impl SqliteAccountStorage {
         Ok(self
             .lock()?
             .execute_cached(
-                "DELETE FROM local_group_deletion_frontiers
-                 WHERE group_id_hex = ?1
-                   AND message_insert_order < (
-                       SELECT insert_order
-                       FROM cgka_messages
-                       WHERE id = ?2 AND group_id = ?3
-                   )",
+                crate::cross::views::CLEAR_DELETION_FRONTIER_IF_OLDER_SQL,
                 params![group_id_hex, message_id.as_slice(), group_id],
             )
             .storage()?
@@ -1902,11 +1634,7 @@ impl SqliteAccountStorage {
         })?;
         self.lock()?
             .query_row_cached(
-                "SELECT EXISTS(
-                    SELECT 1
-                    FROM cgka_messages
-                    WHERE id = ?1 AND group_id = ?2 AND insert_order > ?3
-                 )",
+                crate::cross::views::MESSAGE_NEWER_THAN_FRONTIER_SQL,
                 params![
                     message_id.as_slice(),
                     group_id,
@@ -2305,7 +2033,7 @@ impl SqliteAccountStorage {
         outcome.erasure_pending = finish.erasure_pending;
         if outcome.pruned_media_epoch_secrets > 0 {
             tracing::debug!(
-                target: "storage_sqlite::retention",
+                target: "storage_sqlite::app::account_projection",
                 method = mode.trace_method(),
                 pruned_media_epoch_secrets = outcome.pruned_media_epoch_secrets,
                 "retired encrypted-media epoch secrets after final retained references expired"
@@ -3523,17 +3251,17 @@ fn merged_transport_timestamp(
     }
 }
 
-fn secure_delete_pragma(conn: &Connection) -> StorageResult<i64> {
+pub(crate) fn secure_delete_pragma(conn: &Connection) -> StorageResult<i64> {
     conn.query_row_cached("PRAGMA secure_delete", [], |row| row.get(0))
         .storage()
 }
 
-fn restore_secure_delete_pragma(conn: &Connection, original: i64) -> StorageResult<()> {
+pub(crate) fn restore_secure_delete_pragma(conn: &Connection, original: i64) -> StorageResult<()> {
     conn.execute_batch(&format!("PRAGMA secure_delete = {original};"))
         .storage()
 }
 
-fn combine_secure_delete_operation_and_restore<T>(
+pub(crate) fn combine_secure_delete_operation_and_restore<T>(
     operation: StorageResult<T>,
     restore: StorageResult<()>,
 ) -> StorageResult<T> {
@@ -3545,7 +3273,7 @@ fn combine_secure_delete_operation_and_restore<T>(
                 // here would falsely tell callers that the deletion did not
                 // happen and could make them restore stale projection state.
                 tracing::warn!(
-                    target: "storage_sqlite::account_projection",
+                    target: "storage_sqlite::app::account_projection",
                     method = "combine_secure_delete_operation_and_restore",
                     "secure-delete pragma restoration failed after committed operation"
                 );
@@ -3636,7 +3364,7 @@ fn merge_secure_prune_intent_tx(
     )
 }
 
-fn merge_local_group_delete_intent_tx(
+pub(crate) fn merge_local_group_delete_intent_tx(
     tx: &Connection,
     group_id_hex: &str,
     deleted_rows: usize,
@@ -3661,8 +3389,8 @@ fn merge_local_group_delete_intent_tx(
     )
 }
 
-fn finish_secure_delete_checkpoint_intent<T>(
-    storage: &SqliteAccountStorage,
+pub(crate) fn finish_secure_delete_checkpoint_intent<T>(
+    storage: &SqliteAppStorage,
     operation_kind: &str,
     scope: &str,
 ) -> StorageResult<SecureDeleteCheckpointFinish<T>>

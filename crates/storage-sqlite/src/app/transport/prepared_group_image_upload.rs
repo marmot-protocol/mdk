@@ -1,7 +1,9 @@
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 use crate::base::connection::CachedSql;
 use std::fmt;
 
-use crate::{SqliteAccountStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
+use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64, u64_to_i64};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, params};
 
@@ -80,7 +82,7 @@ impl fmt::Debug for PreparedGroupImageUploadRecord {
     }
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     pub fn stage_prepared_group_image_upload(
         &self,
         record: &PreparedGroupImageUploadRecord,
@@ -384,10 +386,12 @@ mod tests {
     fn staged_upload_survives_reopen_state_transitions_and_consumption() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
+            .app_storage()
             .stage_prepared_group_image_upload(&staged_record())
             .unwrap();
         assert_eq!(
             store
+                .app_storage()
                 .prepared_group_image_upload("upload-1")
                 .unwrap()
                 .unwrap(),
@@ -395,9 +399,11 @@ mod tests {
         );
 
         store
+            .app_storage()
             .mark_prepared_group_image_upload_failed("upload-1", "blob_store", 11)
             .unwrap();
         let failed = store
+            .app_storage()
             .prepared_group_image_upload("upload-1")
             .unwrap()
             .unwrap();
@@ -405,12 +411,15 @@ mod tests {
         assert_eq!(failed.attempt_count, 1);
 
         store
+            .app_storage()
             .mark_prepared_group_image_upload_uploaded("upload-1", 12)
             .unwrap();
         store
+            .app_storage()
             .consume_prepared_group_image_upload("upload-1", "abcd", 13)
             .unwrap();
         let consumed = store
+            .app_storage()
             .prepared_group_image_upload("upload-1")
             .unwrap()
             .unwrap();
@@ -426,16 +435,20 @@ mod tests {
     fn uploaded_and_consumed_transitions_are_idempotent() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
+            .app_storage()
             .stage_prepared_group_image_upload(&staged_record())
             .unwrap();
         store
+            .app_storage()
             .mark_prepared_group_image_upload_uploaded("upload-1", 11)
             .unwrap();
         store
+            .app_storage()
             .mark_prepared_group_image_upload_uploaded("upload-1", 12)
             .unwrap();
         assert_eq!(
             store
+                .app_storage()
                 .prepared_group_image_upload("upload-1")
                 .unwrap()
                 .unwrap()
@@ -443,9 +456,11 @@ mod tests {
             1
         );
         store
+            .app_storage()
             .consume_prepared_group_image_upload("upload-1", "abcd", 13)
             .unwrap();
         store
+            .app_storage()
             .consume_prepared_group_image_upload("upload-1", "abcd", 14)
             .unwrap();
     }
@@ -466,6 +481,7 @@ mod tests {
         {
             let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
             store
+                .app_storage()
                 .stage_prepared_group_image_upload(&staged_record())
                 .unwrap();
             store.close().unwrap();
@@ -473,6 +489,7 @@ mod tests {
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(
             reopened
+                .app_storage()
                 .prepared_group_image_upload("upload-1")
                 .unwrap()
                 .unwrap(),
@@ -486,6 +503,7 @@ mod tests {
         let now = ACTIVE_PREPARED_GROUP_IMAGE_UPLOAD_TTL_SECONDS + 100;
         for index in 0..MAX_ACTIVE_PREPARED_GROUP_IMAGE_UPLOADS {
             store
+                .app_storage()
                 .stage_prepared_group_image_upload(&staged_record_with(
                     format!("upload-{index}"),
                     now,
@@ -494,18 +512,27 @@ mod tests {
         }
         assert!(
             store
+                .app_storage()
                 .stage_prepared_group_image_upload(&staged_record_with("over-cap".into(), now,))
                 .is_err()
         );
 
         let after_ttl = now + ACTIVE_PREPARED_GROUP_IMAGE_UPLOAD_TTL_SECONDS + 1;
         store
+            .app_storage()
             .stage_prepared_group_image_upload(&staged_record_with(
                 "after-expiry".into(),
                 after_ttl,
             ))
             .unwrap();
-        assert_eq!(store.list_prepared_group_image_uploads().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .app_storage()
+                .list_prepared_group_image_uploads()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -515,15 +542,18 @@ mod tests {
         for index in 0..=MAX_CONSUMED_PREPARED_GROUP_IMAGE_UPLOADS {
             let upload_id = format!("upload-{index:04}");
             store
+                .app_storage()
                 .stage_prepared_group_image_upload(&staged_record_with(
                     upload_id.clone(),
                     now + index as u64,
                 ))
                 .unwrap();
             store
+                .app_storage()
                 .mark_prepared_group_image_upload_uploaded(&upload_id, now + index as u64)
                 .unwrap();
             store
+                .app_storage()
                 .consume_prepared_group_image_upload(
                     &upload_id,
                     &format!("group-{index}"),
@@ -531,7 +561,10 @@ mod tests {
                 )
                 .unwrap();
         }
-        let rows = store.list_prepared_group_image_uploads().unwrap();
+        let rows = store
+            .app_storage()
+            .list_prepared_group_image_uploads()
+            .unwrap();
         assert_eq!(rows.len(), MAX_CONSUMED_PREPARED_GROUP_IMAGE_UPLOADS);
         assert!(rows.iter().all(|row| row.upload_id != "upload-0000"));
     }

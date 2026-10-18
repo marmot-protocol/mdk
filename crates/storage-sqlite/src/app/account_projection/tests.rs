@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 use crate::{SqlCipherKey, SqliteStorageOptions, StoredAppEvent};
 use cgka_traits::app_event::{
     AppMessageRetentionDecision, EVENT_REF_TAG, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
@@ -28,6 +30,7 @@ fn keyed_group_read_is_bounded() {
     }
 
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     let statements = || {
         store.lock().unwrap().trace_v2(
             TraceEventCodes::SQLITE_TRACE_STMT,
@@ -37,7 +40,7 @@ fn keyed_group_read_is_bounded() {
                 }
             }),
         );
-        store.account_groups(Some("aa")).unwrap();
+        app.account_groups(Some("aa")).unwrap();
         store
             .lock()
             .unwrap()
@@ -50,27 +53,24 @@ fn keyed_group_read_is_bounded() {
     target.member_count = Some(2);
     target.direct_member_ids_hex = Some(vec!["11".repeat(32), "22".repeat(32)]);
     target.presentation_member_ids_hex = target.direct_member_ids_hex.clone();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".into(),
-                groups: vec![target],
-                ..Default::default()
-            },
-            16_384,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
-    store
-        .set_group_self_membership("aa", SelfMembership::Removed)
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".into(),
+            groups: vec![target],
+            ..Default::default()
+        },
+        16_384,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
+    app.set_group_self_membership("aa", SelfMembership::Removed)
         .unwrap();
     let (expected, full_before_steps) = measure(&store, || {
-        store
-            .load_account_projection_state("alice", 16_384)
+        app.load_account_projection_state("alice", 16_384)
             .unwrap()
             .groups
     });
-    let (first, first_steps) = measure(&store, || store.account_groups(Some("aa")).unwrap());
+    let (first, first_steps) = measure(&store, || app.account_groups(Some("aa")).unwrap());
     assert_eq!(first, expected);
     let first_statements = statements();
     assert_eq!(first_statements.len(), 4);
@@ -98,29 +98,28 @@ fn keyed_group_read_is_bounded() {
          SELECT group_id_hex,'unrelated' FROM account_groups WHERE group_id_hex<>'aa';",
         )
         .unwrap();
-    let (second, second_steps) = measure(&store, || store.account_groups(Some("aa")).unwrap());
+    let (second, second_steps) = measure(&store, || app.account_groups(Some("aa")).unwrap());
     assert_eq!(second, expected);
     assert_eq!(first_steps, second_steps);
     assert_eq!(first_statements, statements());
     let (full, full_after_steps) = measure(&store, || {
-        store
-            .load_account_projection_state("alice", 16_384)
+        app.load_account_projection_state("alice", 16_384)
             .unwrap()
             .groups
     });
     eprintln!(
         "group projection VM steps: full={full_before_steps}->{full_after_steps}, keyed={first_steps}->{second_steps}"
     );
-    assert_eq!(store.account_groups(None).unwrap(), full);
+    assert_eq!(app.account_groups(None).unwrap(), full);
     // Neither keyed nor list reads require the transport's seen-event table.
     store
         .lock()
         .unwrap()
         .execute_batch("DROP TABLE seen_events")
         .unwrap();
-    assert_eq!(store.account_groups(Some("aa")).unwrap(), expected);
-    assert_eq!(store.account_groups(None).unwrap().len(), 501);
-    assert!(store.account_groups(Some("missing")).unwrap().is_empty());
+    assert_eq!(app.account_groups(Some("aa")).unwrap(), expected);
+    assert_eq!(app.account_groups(None).unwrap().len(), 501);
+    assert!(app.account_groups(Some("missing")).unwrap().is_empty());
 }
 
 #[test]
@@ -141,7 +140,9 @@ fn account_delivery_recovery_marker_survives_reopen_and_clears_explicitly() {
     let key = SqlCipherKey::new("delivery recovery marker test key").unwrap();
 
     {
-        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let store = SqliteAccountStorage::open_encrypted(&path, &key)
+            .unwrap()
+            .app_storage();
         store.ensure_account_projection("alice").unwrap();
         assert_eq!(store.account_delivery_recovery("alice").unwrap(), None);
         store
@@ -180,6 +181,7 @@ fn account_delivery_recovery_marker_survives_reopen_and_clears_explicitly() {
     let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     assert_eq!(
         reopened
+            .app_storage()
             .account_delivery_recovery("alice")
             .unwrap()
             .unwrap()
@@ -189,6 +191,7 @@ fn account_delivery_recovery_marker_survives_reopen_and_clears_explicitly() {
     );
     assert!(
         !reopened
+            .app_storage()
             .clear_account_delivery_recovery("alice", 10)
             .unwrap()
     );
@@ -196,10 +199,12 @@ fn account_delivery_recovery_marker_survives_reopen_and_clears_explicitly() {
     // Retiring 11 must leave both durable debt and the caller's pending flag set.
     assert!(
         !reopened
+            .app_storage()
             .clear_account_delivery_recovery("alice", 11)
             .unwrap()
     );
     let remaining = reopened
+        .app_storage()
         .account_delivery_recovery("alice")
         .unwrap()
         .unwrap();
@@ -207,51 +212,86 @@ fn account_delivery_recovery_marker_survives_reopen_and_clears_explicitly() {
     drop(reopened);
 
     let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    reopened.synchronize_account_delivery_loss("alice").unwrap();
+    reopened
+        .app_storage()
+        .synchronize_account_delivery_loss("alice")
+        .unwrap();
     assert_eq!(
-        reopened.account_delivery_recovery("alice").unwrap(),
+        reopened
+            .app_storage()
+            .account_delivery_recovery("alice")
+            .unwrap(),
         Some(remaining)
     );
     assert!(
         !reopened
+            .app_storage()
             .clear_account_delivery_recovery("alice", 11)
             .unwrap()
     );
     assert_eq!(
-        reopened.account_delivery_recovery("alice").unwrap(),
+        reopened
+            .app_storage()
+            .account_delivery_recovery("alice")
+            .unwrap(),
         Some(remaining)
     );
     assert!(
         reopened
+            .app_storage()
             .clear_account_delivery_recovery("alice", 12)
             .unwrap()
     );
-    assert_eq!(reopened.account_delivery_recovery("alice").unwrap(), None);
+    assert_eq!(
+        reopened
+            .app_storage()
+            .account_delivery_recovery("alice")
+            .unwrap(),
+        None
+    );
     drop(reopened);
 
     // Completed retirement survives reopen, and duplicate evidence from either
     // retired writer cannot resurrect it. Additional loss must still rearm.
     let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     reopened
+        .app_storage()
         .record_account_delivery_loss("alice", 11, 7, 1)
         .unwrap();
     reopened
+        .app_storage()
         .record_account_delivery_loss("alice", 12, 1, 1)
         .unwrap();
-    reopened.synchronize_account_delivery_loss("alice").unwrap();
-    assert_eq!(reopened.account_delivery_recovery("alice").unwrap(), None);
     reopened
+        .app_storage()
+        .synchronize_account_delivery_loss("alice")
+        .unwrap();
+    assert_eq!(
+        reopened
+            .app_storage()
+            .account_delivery_recovery("alice")
+            .unwrap(),
+        None
+    );
+    reopened
+        .app_storage()
         .record_account_delivery_loss("alice", 12, 2, 2)
         .unwrap();
-    reopened.synchronize_account_delivery_loss("alice").unwrap();
+    reopened
+        .app_storage()
+        .synchronize_account_delivery_loss("alice")
+        .unwrap();
     let additional = reopened
+        .app_storage()
         .account_delivery_recovery("alice")
         .unwrap()
         .unwrap();
     assert_eq!((additional.marker_token, additional.dropped_count), (12, 2));
     drop(reopened);
 
-    let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let reopened = SqliteAccountStorage::open_encrypted(&path, &key)
+        .unwrap()
+        .app_storage();
     reopened.synchronize_account_delivery_loss("alice").unwrap();
     assert_eq!(
         reopened.account_delivery_recovery("alice").unwrap(),
@@ -280,6 +320,7 @@ fn source_epoch_retention_decisions_are_frozen_and_drive_expiry() {
     let mut due = app_event("due", "aa", 10);
     due.source_epoch = Some(4);
     store
+        .app_storage()
         .record_app_event_with_retention(
             &due,
             Some(AppMessageRetentionDecision::new(due.recorded_at, 5)),
@@ -291,6 +332,7 @@ fn source_epoch_retention_decisions_are_frozen_and_drive_expiry() {
     let mut duplicate = due.clone();
     duplicate.source_epoch = Some(99);
     store
+        .app_storage()
         .record_app_event_with_retention(
             &duplicate,
             Some(AppMessageRetentionDecision::new(duplicate.recorded_at, 500)),
@@ -299,6 +341,7 @@ fn source_epoch_retention_decisions_are_frozen_and_drive_expiry() {
 
     let later = app_event("later", "aa", 12);
     store
+        .app_storage()
         .record_app_event_with_retention(
             &later,
             Some(AppMessageRetentionDecision::new(later.recorded_at, 4)),
@@ -306,6 +349,7 @@ fn source_epoch_retention_decisions_are_frozen_and_drive_expiry() {
         .unwrap();
     let disabled = app_event("disabled", "aa", 1);
     store
+        .app_storage()
         .record_app_event_with_retention(
             &disabled,
             Some(AppMessageRetentionDecision::new(disabled.recorded_at, 0)),
@@ -313,15 +357,18 @@ fn source_epoch_retention_decisions_are_frozen_and_drive_expiry() {
         .unwrap();
     let overflow = app_event("overflow", "aa", 1);
     store
+        .app_storage()
         .record_app_event_with_retention(
             &overflow,
             Some(AppMessageRetentionDecision::new(u64::MAX, 1)),
         )
         .unwrap();
     store
+        .app_storage()
         .record_app_event(&app_event("legacy", "aa", 1))
         .unwrap();
     store
+        .app_storage()
         .record_app_event_with_retention(
             &app_event("other-group", "bb", 1),
             Some(AppMessageRetentionDecision::new(1, 1)),
@@ -329,7 +376,9 @@ fn source_epoch_retention_decisions_are_frozen_and_drive_expiry() {
         .unwrap();
 
     drop(store);
-    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key)
+        .unwrap()
+        .app_storage();
     let records = store
         .app_messages(StoredAppMessageQuery {
             group_id_hex: Some("aa".to_owned()),
@@ -387,7 +436,7 @@ fn source_epoch_retention_decisions_are_frozen_and_drive_expiry() {
 
 #[test]
 fn optimistic_local_retention_is_finalized_once_from_matching_source_epoch() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let optimistic = app_event("local", "aa", 10);
     store.record_app_event(&optimistic).unwrap();
 
@@ -616,7 +665,7 @@ fn delete_event(
 
 #[test]
 fn account_projection_state_roundtrips_groups_components_and_seen_events() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let mut stored_group = group("aa", "alpha");
     stored_group.nostr_routing_last_epoch = 8;
     stored_group.prior_nostr_routes = vec![StoredNostrRoute {
@@ -657,6 +706,7 @@ fn account_projection_state_roundtrips_groups_components_and_seen_events() {
 #[test]
 fn epoch_stall_evidence_round_trips_and_replaces_in_place() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     insert_protocol_group_marker(&store, &[0xaa]);
     let group = "aa".to_owned();
     let first = StoredEpochStallEvidence {
@@ -666,10 +716,9 @@ fn epoch_stall_evidence_round_trips_and_replaces_in_place() {
         fruitless_reported: false,
         last_arm_at_ms: 1_700_000_000_000,
     };
-    store
-        .record_epoch_stall_evidence(std::slice::from_ref(&first))
+    app.record_epoch_stall_evidence(std::slice::from_ref(&first))
         .unwrap();
-    assert_eq!(store.epoch_stall_evidence().unwrap(), vec![first.clone()]);
+    assert_eq!(app.epoch_stall_evidence().unwrap(), vec![first.clone()]);
 
     // The in-memory detector is the single writer and owns the reset rules, so
     // a later row replaces the earlier one outright rather than merging.
@@ -680,10 +729,9 @@ fn epoch_stall_evidence_round_trips_and_replaces_in_place() {
         last_arm_at_ms: 1_700_000_600_000,
         ..first
     };
-    store
-        .record_epoch_stall_evidence(std::slice::from_ref(&later))
+    app.record_epoch_stall_evidence(std::slice::from_ref(&later))
         .unwrap();
-    assert_eq!(store.epoch_stall_evidence().unwrap(), vec![later]);
+    assert_eq!(app.epoch_stall_evidence().unwrap(), vec![later]);
 }
 
 #[test]
@@ -710,22 +758,35 @@ fn epoch_backfill_intents_rearm_and_clear_only_the_completed_epoch() {
         stalled_epoch: 3,
     };
     store
+        .app_storage()
         .arm_epoch_backfill_intents(&[aa_epoch_8.clone(), bb_epoch_3.clone()])
         .unwrap();
     store
+        .app_storage()
         .arm_epoch_backfill_intents(std::slice::from_ref(&aa_epoch_7))
         .unwrap();
     assert_eq!(
-        sorted(store.pending_epoch_backfill_intents().unwrap()),
+        sorted(
+            store
+                .app_storage()
+                .pending_epoch_backfill_intents()
+                .unwrap()
+        ),
         vec![aa_epoch_8.clone(), bb_epoch_3.clone()],
         "an older concurrent arm must not regress the durable epoch, even without app projection rows"
     );
 
     store
+        .app_storage()
         .clear_epoch_backfill_intents(&[aa_epoch_7, bb_epoch_3])
         .unwrap();
     assert_eq!(
-        sorted(store.pending_epoch_backfill_intents().unwrap()),
+        sorted(
+            store
+                .app_storage()
+                .pending_epoch_backfill_intents()
+                .unwrap()
+        ),
         vec![aa_epoch_8.clone()],
         "completion clears exact epochs and preserves newer recovery evidence"
     );
@@ -736,7 +797,11 @@ fn epoch_backfill_intents_rearm_and_clear_only_the_completed_epoch() {
         .execute("DELETE FROM cgka_groups WHERE id = ?1", params![&[0xaa_u8]])
         .unwrap();
     assert!(
-        store.pending_epoch_backfill_intents().unwrap().is_empty(),
+        store
+            .app_storage()
+            .pending_epoch_backfill_intents()
+            .unwrap()
+            .is_empty(),
         "deleting the owning protocol group must consume its recovery intent"
     );
 }
@@ -744,6 +809,7 @@ fn epoch_backfill_intents_rearm_and_clear_only_the_completed_epoch() {
 #[test]
 fn epoch_backfill_intents_clear_by_group_at_whatever_epoch_is_stored() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     insert_protocol_group_marker(&store, &[0xaa]);
     insert_protocol_group_marker(&store, &[0xbb]);
 
@@ -755,39 +821,35 @@ fn epoch_backfill_intents_clear_by_group_at_whatever_epoch_is_stored() {
         group_id_hex: "bb".to_owned(),
         stalled_epoch: 3,
     };
-    store
-        .arm_epoch_backfill_intents(&[aa_epoch_8, bb_epoch_3.clone()])
+    app.arm_epoch_backfill_intents(&[aa_epoch_8, bb_epoch_3.clone()])
         .unwrap();
 
-    store
-        .clear_epoch_backfill_intents_for_groups(&["aa".to_owned()])
+    app.clear_epoch_backfill_intents_for_groups(&["aa".to_owned()])
         .unwrap();
     assert_eq!(
-        store.pending_epoch_backfill_intents().unwrap(),
+        app.pending_epoch_backfill_intents().unwrap(),
         vec![bb_epoch_3.clone()],
         "clearing by group retires that group and leaves every other group armed"
     );
 
     // The stored epoch is not part of the key: re-arm at a different epoch and
     // the same by-group clear still retires it.
-    store
-        .arm_epoch_backfill_intents(&[StoredEpochBackfillIntent {
-            group_id_hex: "aa".to_owned(),
-            stalled_epoch: 41,
-        }])
-        .unwrap();
-    store
-        .clear_epoch_backfill_intents_for_groups(&["aa".to_owned()])
+    app.arm_epoch_backfill_intents(&[StoredEpochBackfillIntent {
+        group_id_hex: "aa".to_owned(),
+        stalled_epoch: 41,
+    }])
+    .unwrap();
+    app.clear_epoch_backfill_intents_for_groups(&["aa".to_owned()])
         .unwrap();
     assert_eq!(
-        store.pending_epoch_backfill_intents().unwrap(),
+        app.pending_epoch_backfill_intents().unwrap(),
         vec![bb_epoch_3.clone()],
         "a by-group clear is not epoch-sensitive"
     );
 
-    store.clear_epoch_backfill_intents_for_groups(&[]).unwrap();
+    app.clear_epoch_backfill_intents_for_groups(&[]).unwrap();
     assert_eq!(
-        store.pending_epoch_backfill_intents().unwrap(),
+        app.pending_epoch_backfill_intents().unwrap(),
         vec![bb_epoch_3],
         "an empty slice clears nothing"
     );
@@ -795,7 +857,7 @@ fn epoch_backfill_intents_clear_by_group_at_whatever_epoch_is_stored() {
 
 #[test]
 fn pending_confirmation_group_invites_reads_only_pending_outlines() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     // One applied member group, one pending invite with a welcomer, one
     // pending invite without a welcomer, and one pending-but-archived group.
     // Seen events and component rows are present so the outline result proves
@@ -935,10 +997,14 @@ fn account_projection_state_refreshes_reseen_event_recency_before_pruning() {
         groups: Vec::new(),
     };
     store
+        .app_storage()
         .save_account_projection_state(&state, 2, MAX_FUTURE_SKEW_SECS)
         .unwrap();
 
-    let restored = store.load_account_projection_state("alice", 16).unwrap();
+    let restored = store
+        .app_storage()
+        .load_account_projection_state("alice", 16)
+        .unwrap();
     assert_eq!(restored.seen_events, vec!["stale-b", "repeat"]);
 }
 
@@ -959,7 +1025,7 @@ fn account_projection_state_keeps_max_cursor_across_racing_saves() {
     };
 
     for saves in [[&ahead, &behind], [&behind, &ahead]] {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         for state in saves {
             store
                 .save_account_projection_state(state, 16, MAX_FUTURE_SKEW_SECS)
@@ -975,7 +1041,7 @@ fn account_projection_state_save_without_cursor_preserves_stored_cursor() {
     // A runtime that never learned a cursor (fresh process, no deliveries yet)
     // still saves other state; that save must never wipe an advanced stored
     // cursor back to NULL.
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let advanced = StoredAccountState {
         label: "alice".to_owned(),
         seen_events: Vec::new(),
@@ -1005,9 +1071,10 @@ fn account_projection_state_heals_poisoned_stored_cursor_on_save() {
     // save-time `now + skew`, not preserved forever by the monotonic max —
     // the save-side twin of the app layer's ingest-time heal.
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     let now_before = unix_now_seconds();
     let poisoned = now_before + 10 * 365 * 24 * 60 * 60; // ~10 years ahead
-    store.ensure_account_projection("alice").unwrap();
+    app.ensure_account_projection("alice").unwrap();
     store
         .lock()
         .unwrap()
@@ -1023,12 +1090,11 @@ fn account_projection_state_heals_poisoned_stored_cursor_on_save() {
         last_transport_timestamp: Some(now_before),
         groups: Vec::new(),
     };
-    store
-        .save_account_projection_state(&honest, 16, MAX_FUTURE_SKEW_SECS)
+    app.save_account_projection_state(&honest, 16, MAX_FUTURE_SKEW_SECS)
         .unwrap();
     let now_after = unix_now_seconds();
 
-    let restored = store.load_account_projection_state("alice", 16).unwrap();
+    let restored = app.load_account_projection_state("alice", 16).unwrap();
     let cursor = restored
         .last_transport_timestamp
         .expect("cursor must survive the save");
@@ -1062,11 +1128,15 @@ fn account_projection_state_clamps_poisoned_snapshot_into_fresh_store() {
         groups: Vec::new(),
     };
     store
+        .app_storage()
         .save_account_projection_state(&imported, 16, MAX_FUTURE_SKEW_SECS)
         .unwrap();
     let now_after = unix_now_seconds();
 
-    let restored = store.load_account_projection_state("alice", 16).unwrap();
+    let restored = store
+        .app_storage()
+        .load_account_projection_state("alice", 16)
+        .unwrap();
     let cursor = restored
         .last_transport_timestamp
         .expect("cursor must survive the save");
@@ -1207,25 +1277,24 @@ fn clamp_to_max_future_skew_bounds_only_future_values() {
 #[test]
 fn account_projection_state_deletes_groups_removed_from_snapshot() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     let state = StoredAccountState {
         label: "alice".to_owned(),
         seen_events: Vec::new(),
         last_transport_timestamp: None,
         groups: vec![group("aa", "alpha"), group("bb", "beta")],
     };
-    store
-        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+    app.save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
         .unwrap();
 
     let updated = StoredAccountState {
         groups: vec![group("bb", "beta")],
         ..state
     };
-    store
-        .save_account_projection_state(&updated, 16, MAX_FUTURE_SKEW_SECS)
+    app.save_account_projection_state(&updated, 16, MAX_FUTURE_SKEW_SECS)
         .unwrap();
 
-    let restored = store.load_account_projection_state("alice", 16).unwrap();
+    let restored = app.load_account_projection_state("alice", 16).unwrap();
     assert_eq!(restored.groups.len(), 1);
     assert_eq!(restored.groups[0].group_id_hex, "bb");
     let stale_components: i64 = store
@@ -1245,6 +1314,7 @@ fn account_projection_group_prune_chunks_stale_keys_under_sqlite_variable_limit(
     const GROUP_COUNT: usize = SQLITE_BIND_PARAMETER_CHUNK + 105;
 
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     {
         let conn = store.lock().unwrap();
         // SAFETY: The raw handle is only used to lower this test connection's
@@ -1265,18 +1335,17 @@ fn account_projection_group_prune_chunks_stale_keys_under_sqlite_variable_limit(
             stored_group
         })
         .collect::<Vec<_>>();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                seen_events: Vec::new(),
-                last_transport_timestamp: None,
-                groups: groups.clone(),
-            },
-            16,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: groups.clone(),
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
 
     let retained = StoredAccountState {
         label: "alice".to_owned(),
@@ -1284,31 +1353,27 @@ fn account_projection_group_prune_chunks_stale_keys_under_sqlite_variable_limit(
         last_transport_timestamp: None,
         groups: groups[1..].to_vec(),
     };
-    store
-        .save_account_projection_state(&retained, 16, MAX_FUTURE_SKEW_SECS)
+    app.save_account_projection_state(&retained, 16, MAX_FUTURE_SKEW_SECS)
         .expect("an unbounded retained set must not become SQL bind parameters");
     assert_eq!(
-        store
-            .load_account_projection_state("alice", GROUP_COUNT)
+        app.load_account_projection_state("alice", GROUP_COUNT)
             .unwrap()
             .groups
             .len(),
         GROUP_COUNT - 1
     );
 
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                groups: Vec::new(),
-                ..retained
-            },
-            16,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .expect("more than one chunk of stale group keys should be deleted");
+    app.save_account_projection_state(
+        &StoredAccountState {
+            groups: Vec::new(),
+            ..retained
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .expect("more than one chunk of stale group keys should be deleted");
     assert!(
-        store
-            .load_account_projection_state("alice", GROUP_COUNT)
+        app.load_account_projection_state("alice", GROUP_COUNT)
             .unwrap()
             .groups
             .is_empty()
@@ -1325,6 +1390,7 @@ fn account_projection_state_does_not_rewrite_unchanged_group_rows() {
         groups: vec![group("aa", "alpha")],
     };
     store
+        .app_storage()
         .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
         .unwrap();
     {
@@ -1363,6 +1429,7 @@ fn account_projection_state_does_not_rewrite_unchanged_group_rows() {
     let mut updated = state;
     updated.seen_events.push("event-after".to_owned());
     store
+        .app_storage()
         .save_account_projection_state(&updated, 16, MAX_FUTURE_SKEW_SECS)
         .unwrap();
 
@@ -1377,21 +1444,21 @@ fn account_projection_state_does_not_rewrite_unchanged_group_rows() {
 #[test]
 fn account_projection_delta_writes_only_observations_and_changed_groups() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     let seen_events = (0..64)
         .map(|index| format!("event-{index:05}"))
         .collect::<Vec<_>>();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                seen_events,
-                last_transport_timestamp: None,
-                groups: vec![group("aa", "alpha"), group("bb", "beta")],
-            },
-            64,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events,
+            last_transport_timestamp: None,
+            groups: vec![group("aa", "alpha"), group("bb", "beta")],
+        },
+        64,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
     {
         let conn = store.lock().unwrap();
         conn.execute_batch(
@@ -1432,8 +1499,7 @@ fn account_projection_delta_writes_only_observations_and_changed_groups() {
 
     let mut changed_group = group("bb", "beta updated");
     changed_group.components[1].component_data_hex = "0506".to_owned();
-    store
-        .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+    app.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
             &StoredAccountState {
                 label: "alice".to_owned(),
                 seen_events: vec!["event-new-a".to_owned(), "event-new-b".to_owned()],
@@ -1468,7 +1534,7 @@ fn account_projection_delta_writes_only_observations_and_changed_groups() {
     assert_eq!(write_count("component_update"), 1);
     assert_eq!(write_count("component_delete"), 0);
 
-    let restored = store.load_account_projection_state("alice", 64).unwrap();
+    let restored = app.load_account_projection_state("alice", 64).unwrap();
     assert_eq!(restored.seen_events.len(), 64);
     assert_eq!(
         &restored.seen_events[62..],
@@ -1487,8 +1553,7 @@ fn account_projection_delta_writes_only_observations_and_changed_groups() {
         .unwrap()
         .execute("DELETE FROM write_audit", [])
         .unwrap();
-    store
-        .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+    app.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
             &StoredAccountState {
                 label: "alice".to_owned(),
                 seen_events: vec!["event-00063".to_owned()],
@@ -1512,8 +1577,7 @@ fn account_projection_delta_writes_only_observations_and_changed_groups() {
         .unwrap();
     let mut archived_group = group("aa", "alpha");
     archived_group.archived = true;
-    store
-        .save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+    app.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
             &StoredAccountState {
                 label: "alice".to_owned(),
                 seen_events: Vec::new(),
@@ -1537,7 +1601,7 @@ fn account_projection_delta_writes_only_observations_and_changed_groups() {
 
 #[test]
 fn app_messages_list_raw_events_and_prune_updates_timeline() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
         .record_app_event(&app_event("old-aa", "aa", 10))
         .unwrap();
@@ -1601,7 +1665,7 @@ fn prune_app_events_before_scrubs_pruned_plaintext_and_media_before_deleting() {
             "aa".repeat(32)
         ),
     ]];
-    store.record_app_event(&old).unwrap();
+    store.app_storage().record_app_event(&old).unwrap();
     {
         let conn = store.lock().unwrap();
         let media_rows: i64 = conn
@@ -1640,6 +1704,7 @@ fn prune_app_events_before_scrubs_pruned_plaintext_and_media_before_deleting() {
 
     assert_eq!(
         store
+            .app_storage()
             .prune_app_events_before("aa", 15, "local", &no_mentions)
             .unwrap(),
         1
@@ -1699,21 +1764,21 @@ fn secure_prune_checkpoint_removes_plaintext_from_database_and_wal_files() {
         options,
     )
     .unwrap();
+    let app = store.app_storage();
     let secret = "secure-prune-disk-secret-586-plaintext";
     let secret_filename = "secure-prune-disk-secret-586.png";
     let media_hash = "ca".repeat(32);
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                seen_events: Vec::new(),
-                last_transport_timestamp: None,
-                groups: vec![group("aa", "alpha")],
-            },
-            16,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![group("aa", "alpha")],
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
     let mut old = app_event("old-disk", "aa", 10);
     old.plaintext = secret.to_owned();
     old.tags = vec![vec![
@@ -1724,9 +1789,8 @@ fn secure_prune_checkpoint_removes_plaintext_from_database_and_wal_files() {
         format!("filename {secret_filename}"),
         format!("locator blossom-v1 https://blossom.example/{media_hash}"),
     ]];
-    store.record_app_event(&old).unwrap();
-    store
-        .refresh_chat_list_row("alice-account", "aa", &no_mentions)
+    app.record_app_event(&old).unwrap();
+    app.refresh_chat_list_row("alice-account", "aa", &no_mentions)
         .unwrap();
     {
         let conn = store.lock().unwrap();
@@ -1742,19 +1806,19 @@ fn secure_prune_checkpoint_removes_plaintext_from_database_and_wal_files() {
         "fixture should place plaintext in the database file before secure prune"
     );
 
-    let outcome = store
+    let outcome = app
         .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
         .unwrap();
     assert_eq!(outcome.pruned_messages, 1);
     assert_eq!(outcome.media_ciphertext_sha256, vec![media_hash.clone()]);
     assert!(
-        store
-            .chat_list_row("aa")
+        app.chat_list_row("aa")
             .unwrap()
             .unwrap()
             .last_message
             .is_none()
     );
+    drop(app);
     drop(store);
 
     for path in [
@@ -1790,15 +1854,16 @@ fn secure_prune_removes_pruned_plaintext_from_search_index() {
         },
     )
     .unwrap();
+    let app = store.app_storage();
     let old_secret = "secure-prune-index-secret-586-old";
     let survivor_secret = "secure-prune-index-secret-586-survivor";
     let mut old = app_event("old-index", "aa", 10);
     old.plaintext = old_secret.to_owned();
     let mut survivor = app_event("survivor-index", "aa", 20);
     survivor.plaintext = survivor_secret.to_owned();
-    store.record_app_event(&old).unwrap();
-    store.record_app_event(&survivor).unwrap();
-    let indexed = store
+    app.record_app_event(&old).unwrap();
+    app.record_app_event(&survivor).unwrap();
+    let indexed = app
         .message_timeline(crate::TimelineMessageQuery {
             group_id_hex: Some("aa".to_owned()),
             search: Some("secure-prune-index-secret".to_owned()),
@@ -1820,11 +1885,12 @@ fn secure_prune_removes_pruned_plaintext_from_search_index() {
         "fixture should place indexed plaintext in the database file before secure prune"
     );
 
-    let outcome = store
+    let outcome = app
         .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
         .unwrap();
 
     assert_eq!(outcome.pruned_messages, 1);
+    drop(app);
     drop(store);
     assert!(
         !file_contains(&db_path, old_secret.as_bytes()),
@@ -1845,7 +1911,7 @@ fn file_contains(path: &std::path::Path, needle: &[u8]) -> bool {
 
 #[test]
 fn secure_prune_clears_chat_list_preview_for_pruned_latest_message() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -1899,10 +1965,12 @@ fn secure_prune_restores_caller_secure_delete_setting() {
     .unwrap();
     assert_eq!(secure_delete_pragma(&store), 0);
     store
+        .app_storage()
         .record_app_event(&app_event("old-aa", "aa", 10))
         .unwrap();
 
     let outcome = store
+        .app_storage()
         .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
         .unwrap();
 
@@ -1929,7 +1997,7 @@ fn secure_prune_retry_after_reopen_recovers_committed_outcome() {
         "v encrypted-media-v1".to_owned(),
         format!("ciphertext_sha256 {media_hash}"),
     ]];
-    store.record_app_event(&old).unwrap();
+    store.app_storage().record_app_event(&old).unwrap();
 
     let reader = rusqlite::Connection::open(&db_path).unwrap();
     reader.execute_batch("BEGIN").unwrap();
@@ -1938,6 +2006,7 @@ fn secure_prune_retry_after_reopen_recovers_committed_outcome() {
         .unwrap();
 
     let pending = store
+        .app_storage()
         .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
         .expect("checkpoint contention is a committed result with pending erasure");
 
@@ -1945,7 +2014,7 @@ fn secure_prune_retry_after_reopen_recovers_committed_outcome() {
     assert_eq!(pending.media_ciphertext_sha256, vec![media_hash.clone()]);
     assert!(pending.erasure_pending);
     assert_eq!(
-        store.app_message_count().unwrap(),
+        store.app_storage().app_message_count().unwrap(),
         0,
         "logical deletion commits before the checkpoint failure is surfaced"
     );
@@ -1960,7 +2029,8 @@ fn secure_prune_retry_after_reopen_recovers_committed_outcome() {
             ..crate::SqliteStorageOptions::default()
         },
     )
-    .unwrap();
+    .unwrap()
+    .app_storage();
     let outcome = store
         .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
         .expect("retry after reopen must re-drive the durable pending checkpoint");
@@ -2011,7 +2081,7 @@ fn competing_storage_handles_consume_one_checkpoint_intent_once() {
 
     let a = std::thread::spawn(move || {
         finish_secure_delete_checkpoint_intent::<crate::SecurePruneAppEventsResult>(
-            &store_a,
+            &store_a.app_storage(),
             SECURE_DELETE_RETENTION_OPERATION,
             "aa",
         )
@@ -2019,7 +2089,7 @@ fn competing_storage_handles_consume_one_checkpoint_intent_once() {
     });
     let b = std::thread::spawn(move || {
         finish_secure_delete_checkpoint_intent::<crate::SecurePruneAppEventsResult>(
-            &store_b,
+            &store_b.app_storage(),
             SECURE_DELETE_RETENTION_OPERATION,
             "aa",
         )
@@ -2111,11 +2181,10 @@ fn secure_delete_pragma(store: &SqliteAccountStorage) -> i64 {
 #[test]
 fn prune_app_events_before_does_not_delete_surviving_timeline_rows() {
     let store = SqliteAccountStorage::in_memory().unwrap();
-    store
-        .record_app_event(&app_event("old-aa", "aa", 10))
+    let app = store.app_storage();
+    app.record_app_event(&app_event("old-aa", "aa", 10))
         .unwrap();
-    store
-        .record_app_event(&app_event("new-aa", "aa", 20))
+    app.record_app_event(&app_event("new-aa", "aa", 20))
         .unwrap();
     {
         let conn = store.lock().unwrap();
@@ -2131,13 +2200,12 @@ fn prune_app_events_before_does_not_delete_surviving_timeline_rows() {
     }
 
     assert_eq!(
-        store
-            .prune_app_events_before("aa", 15, "local", &no_mentions)
+        app.prune_app_events_before("aa", 15, "local", &no_mentions)
             .unwrap(),
         1
     );
 
-    let timeline = store
+    let timeline = app
         .message_timeline(crate::TimelineMessageQuery {
             group_id_hex: Some("aa".to_owned()),
             ..crate::TimelineMessageQuery::default()
@@ -2150,22 +2218,21 @@ fn prune_app_events_before_does_not_delete_surviving_timeline_rows() {
 #[test]
 fn prune_app_events_before_deletes_only_pruned_agent_stream_start_rows() {
     let store = SqliteAccountStorage::in_memory().unwrap();
-    store
-        .record_app_event(&agent_stream_start_event(
-            "old-stream",
-            "aa",
-            "stream-old",
-            10,
-        ))
-        .unwrap();
-    store
-        .record_app_event(&agent_stream_start_event(
-            "new-stream",
-            "aa",
-            "stream-new",
-            20,
-        ))
-        .unwrap();
+    let app = store.app_storage();
+    app.record_app_event(&agent_stream_start_event(
+        "old-stream",
+        "aa",
+        "stream-old",
+        10,
+    ))
+    .unwrap();
+    app.record_app_event(&agent_stream_start_event(
+        "new-stream",
+        "aa",
+        "stream-new",
+        20,
+    ))
+    .unwrap();
     {
         let conn = store.lock().unwrap();
         conn.execute_batch(
@@ -2180,8 +2247,7 @@ fn prune_app_events_before_deletes_only_pruned_agent_stream_start_rows() {
     }
 
     assert_eq!(
-        store
-            .prune_app_events_before("aa", 15, "local", &no_mentions)
+        app.prune_app_events_before("aa", 15, "local", &no_mentions)
             .unwrap(),
         1
     );
@@ -2217,12 +2283,14 @@ fn prune_app_events_before_chunks_projection_deletes_under_sqlite_variable_limit
     }
     for index in 0..EVENT_COUNT {
         store
+            .app_storage()
             .record_app_event(&app_event(&format!("old-{index:04}"), "aa", index as u64))
             .unwrap();
     }
 
     assert_eq!(
         store
+            .app_storage()
             .prune_app_events_before("aa", 2_000, "local", &no_mentions)
             .unwrap(),
         EVENT_COUNT
@@ -2242,11 +2310,10 @@ fn prune_app_events_before_chunks_projection_deletes_under_sqlite_variable_limit
 #[test]
 fn prune_app_events_before_does_not_reproject_replies_when_parent_is_pruned() {
     let store = SqliteAccountStorage::in_memory().unwrap();
-    store
-        .record_app_event(&app_event("old-parent", "aa", 10))
+    let app = store.app_storage();
+    app.record_app_event(&app_event("old-parent", "aa", 10))
         .unwrap();
-    store
-        .record_app_event(&reply_event("reply", "aa", "old-parent", 20))
+    app.record_app_event(&reply_event("reply", "aa", "old-parent", 20))
         .unwrap();
     {
         let conn = store.lock().unwrap();
@@ -2268,13 +2335,12 @@ fn prune_app_events_before_does_not_reproject_replies_when_parent_is_pruned() {
     }
 
     assert_eq!(
-        store
-            .prune_app_events_before("aa", 15, "local", &no_mentions)
+        app.prune_app_events_before("aa", 15, "local", &no_mentions)
             .unwrap(),
         1
     );
 
-    let timeline = store
+    let timeline = app
         .message_timeline(crate::TimelineMessageQuery {
             group_id_hex: Some("aa".to_owned()),
             ..crate::TimelineMessageQuery::default()
@@ -2290,11 +2356,10 @@ fn prune_app_events_before_does_not_reproject_replies_when_parent_is_pruned() {
 #[test]
 fn prune_app_events_before_reprojects_survivor_when_reaction_is_pruned() {
     let store = SqliteAccountStorage::in_memory().unwrap();
-    store
-        .record_app_event(&app_event("target", "aa", 20))
+    let app = store.app_storage();
+    app.record_app_event(&app_event("target", "aa", 20))
         .unwrap();
-    store
-        .record_app_event(&reaction_event("old-reaction", "aa", "target", 10))
+    app.record_app_event(&reaction_event("old-reaction", "aa", "target", 10))
         .unwrap();
     {
         let conn = store.lock().unwrap();
@@ -2310,13 +2375,12 @@ fn prune_app_events_before_reprojects_survivor_when_reaction_is_pruned() {
     }
 
     assert_eq!(
-        store
-            .prune_app_events_before("aa", 15, "local", &no_mentions)
+        app.prune_app_events_before("aa", 15, "local", &no_mentions)
             .unwrap(),
         1
     );
 
-    let timeline = store
+    let timeline = app
         .message_timeline(crate::TimelineMessageQuery {
             group_id_hex: Some("aa".to_owned()),
             ..crate::TimelineMessageQuery::default()
@@ -2332,11 +2396,10 @@ fn prune_app_events_before_reprojects_survivor_when_reaction_is_pruned() {
 #[test]
 fn prune_app_events_preserves_minimal_delete_evidence() {
     let store = SqliteAccountStorage::in_memory().unwrap();
-    store
-        .record_app_event(&app_event("target", "aa", 20))
+    let app = store.app_storage();
+    app.record_app_event(&app_event("target", "aa", 20))
         .unwrap();
-    store
-        .record_app_event(&delete_event("old-delete", "aa", "sender", "target", 10))
+    app.record_app_event(&delete_event("old-delete", "aa", "sender", "target", 10))
         .unwrap();
     {
         let conn = store.lock().unwrap();
@@ -2352,13 +2415,12 @@ fn prune_app_events_preserves_minimal_delete_evidence() {
     }
 
     assert_eq!(
-        store
-            .prune_app_events_before("aa", 15, "local", &no_mentions)
+        app.prune_app_events_before("aa", 15, "local", &no_mentions)
             .unwrap(),
         1
     );
 
-    let timeline = store
+    let timeline = app
         .message_timeline(crate::TimelineMessageQuery {
             group_id_hex: Some("aa".to_owned()),
             ..crate::TimelineMessageQuery::default()
@@ -2378,7 +2440,7 @@ fn app_messages_tie_break_on_message_id_matches_cursor_order() {
     // cursor ties on `(recorded_at, message_id_hex)`, so the projection must
     // return same-timestamp rows in `message_id_hex` order or pagination skips
     // or duplicates rows. Regression test for issue #390.
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let recorded_at = 100;
     // Insert so that received_at order (and insert order) is the REVERSE of
     // message_id_hex lexical order: "aaa" received last, "ccc" received first.
@@ -2415,7 +2477,7 @@ fn app_messages_tie_break_on_message_id_matches_cursor_order() {
 
 #[test]
 fn app_messages_kinds_filter_restricts_to_listed_kinds() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let mut custom = app_event("custom-1", "gg", 110);
     custom.kind = 30078;
     custom.tags = vec![vec!["d".to_owned(), "game-1".to_owned()]];
@@ -2465,7 +2527,7 @@ fn app_messages_kinds_filter_restricts_to_listed_kinds() {
 
 #[test]
 fn notification_settings_default_local_notifications_on() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let account_id_hex = "aa".repeat(32);
 
     let settings = store
@@ -2492,7 +2554,7 @@ fn notification_settings_default_local_notifications_on() {
 
 #[test]
 fn chat_notification_settings_track_timed_forever_and_cleared_mutes() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -2545,7 +2607,7 @@ fn chat_notification_settings_track_timed_forever_and_cleared_mutes() {
 
 #[test]
 fn push_registration_preserves_created_at_when_token_rotates() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let registration = AccountPushRegistration {
         account_label: "alice".to_owned(),
         account_id_hex: "aa".repeat(32),
@@ -2579,7 +2641,7 @@ fn push_registration_preserves_created_at_when_token_rotates() {
 
 #[test]
 fn push_registration_preserves_progress_on_resume_and_requeues_changed_routing() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -2712,7 +2774,7 @@ fn push_registration_preserves_progress_on_resume_and_requeues_changed_routing()
 
 #[test]
 fn push_registration_completion_is_version_guarded_and_membership_scoped() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -2785,7 +2847,7 @@ fn push_registration_completion_is_version_guarded_and_membership_scoped() {
 
 #[test]
 fn push_registration_rotation_and_clear_queue_durable_removals() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -2872,7 +2934,7 @@ fn push_registration_rotation_and_clear_queue_durable_removals() {
 
 #[test]
 fn push_registration_removal_outbox_preserves_same_server_revisions() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -2934,6 +2996,7 @@ fn local_group_delete_preserves_exact_prior_nostr_routes_across_reopen() {
         replaced_at: Some(1_800_000_000),
     }];
     store
+        .app_storage()
         .save_account_projection_state(
             &StoredAccountState {
                 label: "alice".to_owned(),
@@ -2953,6 +3016,7 @@ fn local_group_delete_preserves_exact_prior_nostr_routes_across_reopen() {
     let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     assert_eq!(
         reopened
+            .app_storage()
             .local_group_deletion_prior_nostr_routes("aa")
             .unwrap(),
         vec![StoredNostrRoute {
@@ -2968,6 +3032,7 @@ fn local_group_delete_preserves_exact_prior_nostr_routes_across_reopen() {
 #[test]
 fn retaining_a_local_delete_route_keeps_its_earliest_known_switch() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     let route = |replaced_at| StoredNostrRoute {
         nostr_group_id_hex: "22".repeat(32),
         relays: vec!["wss://retained.example".to_owned()],
@@ -2976,34 +3041,30 @@ fn retaining_a_local_delete_route_keeps_its_earliest_known_switch() {
     };
     let mut deleted_group = group("aa", "alpha");
     deleted_group.prior_nostr_routes = vec![route(Some(1_800_000_000))];
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                seen_events: Vec::new(),
-                last_transport_timestamp: None,
-                groups: vec![deleted_group],
-            },
-            16,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![deleted_group],
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
     insert_protocol_group_marker(&store, &[0xaa]);
     store.delete_local_group_data("aa").unwrap();
-    let frontier = || store.local_group_deletion_prior_nostr_routes("aa").unwrap();
+    let frontier = || app.local_group_deletion_prior_nostr_routes("aa").unwrap();
 
     // Retained again as the hidden group's current route: that records no
     // switch, and the earlier one stays.
-    store
-        .retain_local_group_deletion_nostr_routes("aa", &[route(None)])
+    app.retain_local_group_deletion_nostr_routes("aa", &[route(None)])
         .unwrap();
     assert_eq!(frontier(), vec![route(Some(1_800_000_000))]);
-    store
-        .retain_local_group_deletion_nostr_routes("aa", &[route(Some(1_799_999_000))])
+    app.retain_local_group_deletion_nostr_routes("aa", &[route(Some(1_799_999_000))])
         .unwrap();
     assert_eq!(frontier(), vec![route(Some(1_799_999_000))]);
-    store
-        .retain_local_group_deletion_nostr_routes("aa", &[route(Some(1_800_001_000))])
+    app.retain_local_group_deletion_nostr_routes("aa", &[route(Some(1_800_001_000))])
         .unwrap();
     assert_eq!(
         frontier(),
@@ -3029,6 +3090,7 @@ fn a_retained_route_stored_without_a_switch_is_stamped_once_at_first_load() {
     let mut hidden = group("bb", "beta");
     hidden.prior_nostr_routes = vec![route("33", None)];
     store
+        .app_storage()
         .save_account_projection_state(
             &StoredAccountState {
                 label: "alice".to_owned(),
@@ -3045,7 +3107,7 @@ fn a_retained_route_stored_without_a_switch_is_stamped_once_at_first_load() {
     insert_protocol_group_marker(&store, &[0xbb]);
     store.delete_local_group_data("bb").unwrap();
     let retained = |store: &SqliteAccountStorage| {
-        store.account_groups(Some("aa")).unwrap()[0]
+        store.app_storage().account_groups(Some("aa")).unwrap()[0]
             .prior_nostr_routes
             .clone()
     };
@@ -3053,6 +3115,7 @@ fn a_retained_route_stored_without_a_switch_is_stamped_once_at_first_load() {
     let first_load = 1_800_000_000;
     assert_eq!(
         store
+            .app_storage()
             .stamp_unrecorded_prior_route_switches(first_load)
             .unwrap(),
         1
@@ -3063,13 +3126,17 @@ fn a_retained_route_stored_without_a_switch_is_stamped_once_at_first_load() {
     ];
     assert_eq!(retained(&store), stamped);
     assert_eq!(
-        store.local_group_deletion_prior_nostr_routes("bb").unwrap(),
+        store
+            .app_storage()
+            .local_group_deletion_prior_nostr_routes("bb")
+            .unwrap(),
         vec![route("33", None)]
     );
 
     // Later loads, in this process and after a restart, keep the stamp.
     assert_eq!(
         store
+            .app_storage()
             .stamp_unrecorded_prior_route_switches(first_load + 600)
             .unwrap(),
         0
@@ -3078,6 +3145,7 @@ fn a_retained_route_stored_without_a_switch_is_stamped_once_at_first_load() {
     let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     assert_eq!(
         reopened
+            .app_storage()
             .stamp_unrecorded_prior_route_switches(first_load + 86_400)
             .unwrap(),
         0
@@ -3088,6 +3156,7 @@ fn a_retained_route_stored_without_a_switch_is_stamped_once_at_first_load() {
 #[test]
 fn retained_local_delete_routes_prune_ids_outside_the_engine_overlap_window() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     let mut deleted_group = group("aa", "alpha");
     deleted_group.prior_nostr_routes = vec![
         StoredNostrRoute {
@@ -3103,18 +3172,17 @@ fn retained_local_delete_routes_prune_ids_outside_the_engine_overlap_window() {
             replaced_at: None,
         },
     ];
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                seen_events: Vec::new(),
-                last_transport_timestamp: None,
-                groups: vec![deleted_group],
-            },
-            16,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![deleted_group],
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
     insert_protocol_group_marker(&store, &[0xaa]);
     {
         let conn = store.lock().unwrap();
@@ -3130,20 +3198,19 @@ fn retained_local_delete_routes_prune_ids_outside_the_engine_overlap_window() {
     }
     store.delete_local_group_data("aa").unwrap();
 
-    store
-        .retain_local_group_deletion_nostr_routes(
-            "aa",
-            &[StoredNostrRoute {
-                nostr_group_id_hex: "33".repeat(32),
-                relays: vec!["wss://current.example".to_owned()],
-                last_epoch: 3,
-                replaced_at: None,
-            }],
-        )
-        .unwrap();
+    app.retain_local_group_deletion_nostr_routes(
+        "aa",
+        &[StoredNostrRoute {
+            nostr_group_id_hex: "33".repeat(32),
+            relays: vec!["wss://current.example".to_owned()],
+            last_epoch: 3,
+            replaced_at: None,
+        }],
+    )
+    .unwrap();
 
     assert_eq!(
-        store.local_group_deletion_prior_nostr_routes("aa").unwrap(),
+        app.local_group_deletion_prior_nostr_routes("aa").unwrap(),
         vec![
             StoredNostrRoute {
                 nostr_group_id_hex: "22".repeat(32),
@@ -3165,21 +3232,21 @@ fn retained_local_delete_routes_prune_ids_outside_the_engine_overlap_window() {
 #[test]
 fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
     let store = SqliteAccountStorage::in_memory().unwrap();
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".to_owned(),
-                seen_events: Vec::new(),
-                last_transport_timestamp: None,
-                groups: vec![group("aa", "alpha")],
-            },
-            16,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
+    let app = store.app_storage();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![group("aa", "alpha")],
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
     insert_protocol_group_marker(&store, &[0xaa]);
     store.delete_local_group_data("aa").unwrap();
-    let frontier = store.local_group_deletion_frontier("aa").unwrap().unwrap();
+    let frontier = app.local_group_deletion_frontier("aa").unwrap().unwrap();
     let fresh_message_id = MessageId::new(vec![9]);
     store
         .lock()
@@ -3213,7 +3280,7 @@ fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
         )
         .unwrap();
 
-    let result = store.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+    let result = app.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
         &StoredAccountState {
             label: "alice".to_owned(),
             seen_events: Vec::new(),
@@ -3228,13 +3295,12 @@ fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
 
     assert!(result.is_err());
     assert_eq!(
-        store.local_group_deletion_frontier("aa").unwrap(),
+        app.local_group_deletion_frontier("aa").unwrap(),
         Some(frontier),
         "the marker clear must roll back when the crossing projection fails to persist",
     );
     assert!(
-        store
-            .load_account_projection_state("alice", 16)
+        app.load_account_projection_state("alice", 16)
             .unwrap()
             .groups
             .is_empty(),
@@ -3250,6 +3316,7 @@ fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
 #[test]
 fn repeated_local_group_delete_advances_frontier_past_buffered_messages() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     insert_protocol_group_marker(&store, &[0xaa]);
     let first_message_id = MessageId::new(vec![1]);
     store
@@ -3262,7 +3329,7 @@ fn repeated_local_group_delete_advances_frontier_past_buffered_messages() {
         )
         .unwrap();
     store.delete_local_group_data("aa").unwrap();
-    let first_frontier = store.local_group_deletion_frontier("aa").unwrap().unwrap();
+    let first_frontier = app.local_group_deletion_frontier("aa").unwrap().unwrap();
 
     let buffered_message_id = MessageId::new(vec![2]);
     store
@@ -3275,17 +3342,16 @@ fn repeated_local_group_delete_advances_frontier_past_buffered_messages() {
         )
         .unwrap();
     store.delete_local_group_data("aa").unwrap();
-    let repeated_frontier = store.local_group_deletion_frontier("aa").unwrap().unwrap();
+    let repeated_frontier = app.local_group_deletion_frontier("aa").unwrap().unwrap();
 
     assert!(repeated_frontier > first_frontier);
     assert!(
-        !store
-            .clear_local_group_deletion_frontier_if_message_is_newer("aa", &buffered_message_id)
+        !app.clear_local_group_deletion_frontier_if_message_is_newer("aa", &buffered_message_id)
             .unwrap(),
         "a message buffered before the repeated delete must remain behind its frontier"
     );
     assert_eq!(
-        store.local_group_deletion_frontier("aa").unwrap(),
+        app.local_group_deletion_frontier("aa").unwrap(),
         Some(repeated_frontier)
     );
 
@@ -3300,8 +3366,7 @@ fn repeated_local_group_delete_advances_frontier_past_buffered_messages() {
         )
         .unwrap();
     assert!(
-        store
-            .clear_local_group_deletion_frontier_if_message_is_newer("aa", &fresh_message_id)
+        app.clear_local_group_deletion_frontier_if_message_is_newer("aa", &fresh_message_id)
             .unwrap(),
         "a message inserted after the repeated delete must cross the advanced frontier"
     );
@@ -3317,13 +3382,18 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         groups: vec![group("aa", "alpha"), group("bb", "beta")],
     };
     store
+        .app_storage()
         .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
         .unwrap();
     let mut group_a_message = app_event("msg-aa", "aa", 10);
     group_a_message.source_epoch = Some(7);
     group_a_message.tags = vec![vec!["imeta".to_owned(), "v encrypted-media-v1".to_owned()]];
-    store.record_app_event(&group_a_message).unwrap();
     store
+        .app_storage()
+        .record_app_event(&group_a_message)
+        .unwrap();
+    store
+        .app_storage()
         .record_app_event(&agent_stream_start_event(
             "stream-aa",
             "aa",
@@ -3332,12 +3402,15 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         ))
         .unwrap();
     store
+        .app_storage()
         .record_app_event(&app_event("msg-bb", "bb", 12))
         .unwrap();
     store
+        .app_storage()
         .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
         .unwrap();
     store
+        .app_storage()
         .remember_encrypted_media_epoch_secret("bb", 0x8008, 7, &[4, 5, 6])
         .unwrap();
     store
@@ -3356,9 +3429,11 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
     // above; a local wipe must clear these too, or stale tombstones keep
     // rejecting relayed records after the group is re-bootstrapped.
     store
+        .app_storage()
         .apply_group_push_token_tombstone("aa", "member-aa", 9, 1, &"cc".repeat(32), 500, "rd", 500)
         .unwrap();
     store
+        .app_storage()
         .apply_group_push_token_tombstone("bb", "member-bb", 9, 1, &"cc".repeat(32), 500, "rd", 500)
         .unwrap();
     insert_read_and_chat_rows(&store, "aa");
@@ -3385,28 +3460,42 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         last_shared_at_ms: None,
     };
     store
+        .app_storage()
         .upsert_push_registration(registration.clone(), vec![1])
         .unwrap();
     store
+        .app_storage()
         .queue_push_registration_removals(&registration, 11)
         .unwrap();
 
     assert!(store.delete_local_group_data("aa").unwrap().did_delete());
-    let deletion_frontier = store.local_group_deletion_frontier("aa").unwrap().unwrap();
+    let deletion_frontier = store
+        .app_storage()
+        .local_group_deletion_frontier("aa")
+        .unwrap()
+        .unwrap();
     assert!(
         !store
+            .app_storage()
             .clear_local_group_deletion_frontier_if_message_is_newer("aa", &historical_message_id,)
             .unwrap(),
         "historical replay already inside the deletion frontier must stay suppressed"
     );
     assert_eq!(
-        store.local_group_deletion_frontier("aa").unwrap(),
+        store
+            .app_storage()
+            .local_group_deletion_frontier("aa")
+            .unwrap(),
         Some(deletion_frontier)
     );
     store
+        .app_storage()
         .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
         .unwrap();
-    let after_stale_save = store.load_account_projection_state("alice", 16).unwrap();
+    let after_stale_save = store
+        .app_storage()
+        .load_account_projection_state("alice", 16)
+        .unwrap();
     assert!(
         after_stale_save
             .groups
@@ -3422,7 +3511,10 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         "unrelated groups must survive stale snapshot suppression"
     );
     assert_eq!(
-        store.local_group_deletion_frontier("aa").unwrap(),
+        store
+            .app_storage()
+            .local_group_deletion_frontier("aa")
+            .unwrap(),
         Some(deletion_frontier)
     );
     let newer_message_id = MessageId::new(vec![2]);
@@ -3437,16 +3529,27 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         .unwrap();
     assert!(
         store
+            .app_storage()
             .clear_local_group_deletion_frontier_if_message_is_newer("aa", &newer_message_id,)
             .unwrap(),
         "causally newer group activity must clear the deletion frontier"
     );
-    assert_eq!(store.local_group_deletion_frontier("aa").unwrap(), None);
+    assert_eq!(
+        store
+            .app_storage()
+            .local_group_deletion_frontier("aa")
+            .unwrap(),
+        None
+    );
     store
+        .app_storage()
         .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[9, 9, 9])
         .unwrap();
     assert_eq!(
-        store.encrypted_media_epoch_secret("aa", 0x8008, 7).unwrap(),
+        store
+            .app_storage()
+            .encrypted_media_epoch_secret("aa", 0x8008, 7)
+            .unwrap(),
         None,
         "local group deletion must prevent retained MLS state from rehydrating wiped secrets"
     );
@@ -3514,6 +3617,7 @@ fn delete_local_group_data_reopens_and_retries_a_committed_pending_checkpoint() 
     .unwrap();
     let group_id_hex = "aa";
     store
+        .app_storage()
         .save_account_projection_state(
             &StoredAccountState {
                 label: "alice".to_owned(),
@@ -3528,7 +3632,7 @@ fn delete_local_group_data_reopens_and_retries_a_committed_pending_checkpoint() 
     let secret = "local-wipe-plaintext-secret";
     let mut message = app_event("wipe-me", group_id_hex, 10);
     message.plaintext = secret.to_owned();
-    store.record_app_event(&message).unwrap();
+    store.app_storage().record_app_event(&message).unwrap();
     {
         let conn = store.lock().unwrap();
         let (busy, _, _): (i64, i64, i64) = conn
@@ -3552,7 +3656,7 @@ fn delete_local_group_data_reopens_and_retries_a_committed_pending_checkpoint() 
     assert!(pending.did_delete());
     assert!(pending.erasure_pending);
     assert!(!pending.completed_pending_checkpoint);
-    assert_eq!(store.app_message_count().unwrap(), 0);
+    assert_eq!(store.app_storage().app_message_count().unwrap(), 0);
     assert_eq!(
         secure_delete_pragma(&store),
         0,
@@ -3607,20 +3711,18 @@ fn delete_local_group_data_rejects_blank_group_id() {
 #[test]
 fn delete_local_group_data_rolls_back_all_tables_on_failure() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     let state = StoredAccountState {
         label: "alice".to_owned(),
         seen_events: Vec::new(),
         last_transport_timestamp: None,
         groups: vec![group("aa", "alpha")],
     };
-    store
-        .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
+    app.save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
         .unwrap();
-    store
-        .record_app_event(&app_event("msg-aa", "aa", 10))
+    app.record_app_event(&app_event("msg-aa", "aa", 10))
         .unwrap();
-    store
-        .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
+    app.remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
         .unwrap();
     insert_group_push_token(&store, "aa", "member-aa");
     store
@@ -3688,11 +3790,12 @@ fn record_app_event_retries_concurrent_writer_contention() {
         .expect("blocker should hold BEGIN IMMEDIATE before writer starts");
 
     writer
+        .app_storage()
         .record_app_event(&app_event("contended", "aa", 10))
         .expect("projection writer should wait out transient sqlite write-lock contention");
 
     blocker.join().unwrap();
-    assert_eq!(writer.app_message_count().unwrap(), 1);
+    assert_eq!(writer.app_storage().app_message_count().unwrap(), 1);
 }
 
 fn push_token(
@@ -3727,7 +3830,8 @@ fn push_token_apply_retries_concurrent_writer_contention() {
         ..SqliteStorageOptions::default()
     };
     let writer = SqliteAccountStorage::open_encrypted_with_options(&path, &key, options.clone())
-        .expect("writer storage opens");
+        .expect("writer storage opens")
+        .app_storage();
     let group_id = "aa".repeat(32);
     let member_id = "bb".repeat(32);
 
@@ -3789,7 +3893,7 @@ fn apply_group_push_token_keeps_sibling_leaves_distinct() {
     // leaf's token overwrites the other's and a removal for one leaf does not
     // touch the sibling. Regression for the pre-migration 4-tuple key that
     // collapsed sibling devices (#628).
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let g = "aa".repeat(32);
     let m = "bb".repeat(32);
     let leaf = |leaf_index: u32, owner_ts: i64, digest: &str| AccountGroupPushToken {
@@ -3818,7 +3922,7 @@ fn apply_group_push_token_keeps_sibling_leaves_distinct() {
 
 #[test]
 fn apply_group_push_token_rejects_stale_stamp_rollback() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let g = "aa".repeat(32);
     let m = "bb".repeat(32);
     assert!(
@@ -3857,7 +3961,7 @@ fn apply_group_push_token_rejects_stale_stamp_rollback() {
 
 #[test]
 fn removal_tombstone_blocks_stale_resurrection_until_fresh_record() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let g = "aa".repeat(32);
     let m = "bb".repeat(32);
     assert!(
@@ -3892,7 +3996,7 @@ fn removal_tombstone_blocks_stale_resurrection_until_fresh_record() {
 
 #[test]
 fn member_cleanup_clears_tokens_and_tombstones() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let g = "aa".repeat(32);
     let m = "bb".repeat(32);
     store
@@ -3964,6 +4068,7 @@ fn stale_push_token_cleanup_chunks_stale_keys_and_does_not_bind_retained_members
 
     assert_eq!(
         store
+            .app_storage()
             .remove_stale_group_push_tokens(&group_id, &active_members)
             .expect("retained members must not become an unbounded NOT IN bind set"),
         STALE_COUNT
@@ -4047,7 +4152,7 @@ fn app_messages_replay_order_matches_cursor_comparator() {
     // Covers the unscoped (all-groups) case where two groups share the same
     // `(recorded_at, message_id_hex)` and only the local `insert_order`
     // distinguishes them.
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     // Same second, ids inserted in NON-lexical order; plus a cross-group
     // duplicate id at the same second; plus a later-second row.
     store.record_app_event(&app_event("bbb", "aa", 50)).unwrap(); // insert_order 1
@@ -4133,6 +4238,7 @@ fn seen_event_pruning_edges() {
             .unwrap();
         }
         store
+            .app_storage()
             .save_account_projection_state(
                 &StoredAccountState {
                     label: "alice".to_owned(),
@@ -4142,7 +4248,10 @@ fn seen_event_pruning_edges() {
                 MAX_FUTURE_SKEW_SECS,
             )
             .unwrap();
-        let restored = store.load_account_projection_state("alice", 8).unwrap();
+        let restored = store
+            .app_storage()
+            .load_account_projection_state("alice", 8)
+            .unwrap();
         let expected = ["old", "tie-first", "tie-last"];
         assert_eq!(
             restored.seen_events,
@@ -4171,6 +4280,7 @@ fn seen_event_prune_query_work() {
         }),
     );
     store
+        .app_storage()
         .save_account_projection_state(
             &StoredAccountState {
                 label: "alice".to_owned(),
@@ -4238,11 +4348,13 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
         groups: vec![group("aa", "forgotten"), group("bb", "kept")],
     };
     store
+        .app_storage()
         .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
         .unwrap();
     insert_protocol_group_marker(&store, &[0xaa]);
     insert_protocol_group_marker(&store, &[0xbb]);
     store
+        .app_storage()
         .record_app_event(&app_event("msg-aa", "aa", 10))
         .unwrap();
     store
@@ -4301,6 +4413,7 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
     assert!(store.is_group_forgotten(&id).unwrap());
     assert!(
         store
+            .app_storage()
             .pending_push_registration_removals()
             .unwrap()
             .is_empty()
@@ -4309,8 +4422,15 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
         store.list_groups().unwrap(),
         vec![cgka_traits::GroupId::new(vec![0xbb])]
     );
-    assert!(store.local_group_deletion_frontier("aa").unwrap().is_none());
+    assert!(
+        store
+            .app_storage()
+            .local_group_deletion_frontier("aa")
+            .unwrap()
+            .is_none()
+    );
     store
+        .app_storage()
         .save_account_projection_state(&state, 16, MAX_FUTURE_SKEW_SECS)
         .unwrap();
     assert_eq!(
@@ -4354,18 +4474,18 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
 fn group_reset_completion_rolls_back_and_keeps_replay_cutoff_after_rejoin() {
     use cgka_traits::storage::{GroupStorage, StorageProvider};
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     let id = cgka_traits::GroupId::new(vec![0xaa]);
-    store
-        .save_account_projection_state(
-            &StoredAccountState {
-                label: "alice".into(),
-                groups: vec![group("aa", "old membership")],
-                ..Default::default()
-            },
-            16,
-            MAX_FUTURE_SKEW_SECS,
-        )
-        .unwrap();
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".into(),
+            groups: vec![group("aa", "old membership")],
+            ..Default::default()
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
     assert!(
         store
             .forget_group_local(&id, cgka_traits::Timestamp(100))
@@ -4381,8 +4501,7 @@ fn group_reset_completion_rolls_back_and_keeps_replay_cutoff_after_rejoin() {
         Some(cgka_traits::Timestamp(100))
     );
     assert!(
-        !store
-            .encrypted_media_epoch_secret_may_be_served("aa", 1)
+        !app.encrypted_media_epoch_secret_may_be_served("aa", 1)
             .unwrap()
     );
     let failed: Result<(), StorageError> = store.with_transaction(|storage| {
@@ -4392,8 +4511,7 @@ fn group_reset_completion_rolls_back_and_keeps_replay_cutoff_after_rejoin() {
     });
     assert!(failed.is_err());
     assert!(
-        !store
-            .encrypted_media_epoch_secret_may_be_served("aa", 1)
+        !app.encrypted_media_epoch_secret_may_be_served("aa", 1)
             .unwrap()
     );
     assert!(store.is_group_forgotten(&id).unwrap());
@@ -4407,8 +4525,7 @@ fn group_reset_completion_rolls_back_and_keeps_replay_cutoff_after_rejoin() {
         .unwrap();
     assert!(!store.is_group_forgotten(&id).unwrap());
     assert!(
-        store
-            .encrypted_media_epoch_secret_may_be_served("aa", 1)
+        app.encrypted_media_epoch_secret_may_be_served("aa", 1)
             .unwrap()
     );
     assert_eq!(
@@ -4441,35 +4558,32 @@ fn secure_prune_scrubs_retained_edit_copies_before_reprojection() {
             },
         )
         .unwrap();
-        store
-            .save_account_projection_state(
-                &StoredAccountState {
-                    label: "alice".into(),
-                    seen_events: vec![],
-                    last_transport_timestamp: None,
-                    groups: vec![group("aa", "edits")],
-                },
-                16,
-                MAX_FUTURE_SKEW_SECS,
-            )
-            .unwrap();
+        let app = store.app_storage();
+        app.save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".into(),
+                seen_events: vec![],
+                last_transport_timestamp: None,
+                groups: vec![group("aa", "edits")],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
         let mut target = app_event("target", "aa", 100);
         target.plaintext = "retained original".into();
-        store.record_app_event(&target).unwrap();
+        app.record_app_event(&target).unwrap();
         let secret = "accepted-edit-prune-secret-1864-unique";
         let mut edit = app_event("edit", "aa", 10);
         edit.kind = 1009;
         edit.plaintext = secret.into();
         edit.tags = vec![vec!["e".into(), "target".into()]];
-        store
-            .record_app_event_with_retention(&edit, Some(AppMessageRetentionDecision::new(10, 5)))
+        app.record_app_event_with_retention(&edit, Some(AppMessageRetentionDecision::new(10, 5)))
             .unwrap();
-        store
-            .refresh_chat_list_row("local", "aa", &no_mentions)
+        app.refresh_chat_list_row("local", "aa", &no_mentions)
             .unwrap();
         assert_eq!(
-            store
-                .timeline_message("aa", "target")
+            app.timeline_message("aa", "target")
                 .unwrap()
                 .unwrap()
                 .plaintext,
@@ -4490,19 +4604,18 @@ fn secure_prune_scrubs_retained_edit_copies_before_reprojection() {
         }
         assert!(file_contains(&path, secret.as_bytes()));
         let result = if expiry {
-            store.secure_prune_expired_app_events("aa", 15, "local", &no_mentions)
+            app.secure_prune_expired_app_events("aa", 15, "local", &no_mentions)
         } else {
-            store.secure_prune_app_events_before("aa", 15, "local", &no_mentions)
+            app.secure_prune_app_events_before("aa", 15, "local", &no_mentions)
         }
         .unwrap();
         assert_eq!(result.pruned_messages, 1);
         assert!(!result.erasure_pending);
-        let row = store.timeline_message("aa", "target").unwrap().unwrap();
+        let row = app.timeline_message("aa", "target").unwrap().unwrap();
         assert_eq!(row.plaintext, "retained original");
         assert!(row.edit.is_none());
         assert!(
-            store
-                .message_edit_history("aa", "target", None, 10)
+            app.message_edit_history("aa", "target", None, 10)
                 .unwrap()
                 .versions
                 .is_empty()
@@ -4531,6 +4644,7 @@ fn secure_prune_scrubs_retained_edit_copies_before_reprojection() {
                 .unwrap();
             assert_eq!(secure_delete, 0, "restore caller setting");
         }
+        drop(app);
         drop(store);
         for file in [path.clone(), path.with_extension("sqlite-wal")] {
             if file.exists() {
@@ -4548,7 +4662,7 @@ fn secure_prune_scrubs_retained_edit_copies_before_reprojection() {
 /// including stale unknown indexes.
 #[test]
 fn leaf_cleanup_preserves_sibling_tombstones_until_account_departure() {
-    let store = SqliteAccountStorage::in_memory().unwrap();
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let g = "aa".repeat(32);
     let m = "bb".repeat(32);
     let first = push_token(&g, &m, 100, "first");
@@ -4593,6 +4707,7 @@ fn leaf_cleanup_preserves_sibling_tombstones_until_account_departure() {
 #[test]
 fn canonical_push_leaf_reconciliation_is_atomic_and_account_scoped() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     let g = "aa".repeat(32);
     let m = "bb".repeat(32);
     let peer = "cc".repeat(32);
@@ -4603,35 +4718,33 @@ fn canonical_push_leaf_reconciliation_is_atomic_and_account_scoped() {
     let peer_token = push_token(&g, &peer, 100, "peer");
     let other_token = push_token(&other_group, &m, 100, "other");
     for token in [&departed, &sibling, &peer_token, &other_token] {
-        store.apply_group_push_token(token).unwrap();
+        app.apply_group_push_token(token).unwrap();
     }
     let mut old = push_token(&g, &m, 100, "old");
     old.leaf_index = 2;
     old.server_pubkey_hex = "dd".repeat(32);
-    store
-        .apply_group_push_token_tombstone(
-            &g,
-            &m,
-            2,
-            1,
-            &old.server_pubkey_hex,
-            500,
-            "withdrawn",
-            500,
-        )
-        .unwrap();
-    store
-        .apply_group_push_token_tombstone(
-            &g,
-            &peer,
-            2,
-            1,
-            &old.server_pubkey_hex,
-            500,
-            "peer-withdrawn",
-            500,
-        )
-        .unwrap();
+    app.apply_group_push_token_tombstone(
+        &g,
+        &m,
+        2,
+        1,
+        &old.server_pubkey_hex,
+        500,
+        "withdrawn",
+        500,
+    )
+    .unwrap();
+    app.apply_group_push_token_tombstone(
+        &g,
+        &peer,
+        2,
+        1,
+        &old.server_pubkey_hex,
+        500,
+        "peer-withdrawn",
+        500,
+    )
+    .unwrap();
     store
         .lock()
         .unwrap()
@@ -4641,13 +4754,9 @@ fn canonical_push_leaf_reconciliation_is_atomic_and_account_scoped() {
         )
         .unwrap();
     let roster = [(m.clone(), 1)];
-    assert!(
-        store
-            .reconcile_group_push_token_leaves(&g, &roster)
-            .is_err()
-    );
+    assert!(app.reconcile_group_push_token_leaves(&g, &roster).is_err());
     assert_eq!(
-        store.group_push_tokens(&g).unwrap().len(),
+        app.group_push_tokens(&g).unwrap().len(),
         3,
         "token deletes roll back with tombstones"
     );
@@ -4657,36 +4766,30 @@ fn canonical_push_leaf_reconciliation_is_atomic_and_account_scoped() {
         .execute_batch("DROP TRIGGER fail_leaf_reconcile")
         .unwrap();
     assert_eq!(
-        store
-            .reconcile_group_push_token_leaves(&g, &roster)
-            .unwrap(),
+        app.reconcile_group_push_token_leaves(&g, &roster).unwrap(),
         2
     );
-    assert_eq!(store.group_push_tokens(&g).unwrap(), vec![sibling]);
+    assert_eq!(app.group_push_tokens(&g).unwrap(), vec![sibling]);
     assert_eq!(
-        store.group_push_tokens(&other_group).unwrap(),
+        app.group_push_tokens(&other_group).unwrap(),
         vec![other_token]
     );
     assert!(
-        !store.apply_group_push_token(&old).unwrap(),
+        !app.apply_group_push_token(&old).unwrap(),
         "surviving sibling retains tombstones"
     );
     let mut old_peer = old.clone();
     old_peer.member_id_hex = peer;
     assert!(
-        store.apply_group_push_token(&old_peer).unwrap(),
+        app.apply_group_push_token(&old_peer).unwrap(),
         "fully departed account drops tombstones"
     );
     assert_eq!(
-        store
-            .reconcile_group_push_token_leaves(&g, &roster)
-            .unwrap(),
+        app.reconcile_group_push_token_leaves(&g, &roster).unwrap(),
         1
     );
     assert_eq!(
-        store
-            .reconcile_group_push_token_leaves(&g, &roster)
-            .unwrap(),
+        app.reconcile_group_push_token_leaves(&g, &roster).unwrap(),
         0
     );
 }

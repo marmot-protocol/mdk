@@ -9,6 +9,7 @@
 //! SQLCipher, `file_id IS NULL`) keep their own promotion path until they
 //! expire. No retained-byte budget applies here: free disk, checked by the
 //! caller with `media_store::DiskPolicy::send_need`, is the only limit.
+use crate::SqliteAppStorage;
 use media_store::{
     CatalogResult, FileId, FilePresence, Presence, PromoteTarget, PromotedOutcome, StageTarget,
     StagedOutcome,
@@ -20,7 +21,7 @@ use crate::app::media_catalog::{STATE_STAGED, attach_slot, catalog_error};
 
 /// A file-backed upload and one sent message that carries its descriptor:
 /// what the worker promotes
-/// ([`SqliteAccountStorage::attachment_upload_promotion`]).
+/// ([`SqliteAppStorage::attachment_upload_promotion`]).
 #[derive(Clone, PartialEq, Eq)]
 pub struct AttachmentUploadOwner {
     pub token: Vec<u8>,
@@ -38,20 +39,20 @@ impl std::fmt::Debug for AttachmentUploadOwner {
 
 /// The outgoing upload row that owns one staged body.
 pub struct AttachmentUploadStage {
-    storage: SqliteAccountStorage,
+    storage: SqliteAppStorage,
     token: Vec<u8>,
 }
 
 /// Promotion of one upload's file into the slots of a published message.
 pub struct AttachmentUploadPromotion {
-    storage: SqliteAccountStorage,
+    storage: SqliteAppStorage,
     group: String,
     message: String,
     token: Vec<u8>,
     clock: fn() -> u64,
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Reserves an upload row for a file-backed send before its body is
     /// staged. Its digest and file are recorded when the body is staged.
     /// `None` when the account already holds the maximum number of staged

@@ -347,7 +347,7 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
 - **Announce-once is paid for by derived-state reconciliation, not a durable event queue.** `events_buf` is in-memory,
   so a crash between the convergence apply and the app projection loses an announcement. A commit's branch-selection
   tombstone state is derivable from `cgka_messages.state`, and engine messages and `app_events` share one account
-  database: `SqliteAccountStorage::diverged_branch_selection_withdrawals` reports disagreements (`ConvergenceDeferred`
+  database: `SqliteAppStorage::diverged_branch_selection_withdrawals` reports disagreements (`ConvergenceDeferred`
   with live rows owes a withdrawal; `Processed` with a `SupersededByBranchSelection` tombstone owes a revival) and
   `AppClient::reconcile_branch_selection_withdrawals` applies them on every account open. Keep that derivation total;
   a withdrawal the stored disposition cannot express needs its own durable evidence. The maintenance consumer has the

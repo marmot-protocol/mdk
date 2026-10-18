@@ -4,6 +4,17 @@
 
 ### Breaking changes
 
+- App storage has its own handle, `SqliteAppStorage`.
+  `SqliteAccountStorage::app_storage()` returns one over the same connection:
+  it opens nothing, closes with the account storage, and fails the same way
+  once closed. Every app and transport method (account projection, timeline,
+  chat list, drafts, attachments, avatars, media catalog, recovery ledger,
+  local submissions, transport state) moves from `SqliteAccountStorage` to it,
+  so callers write `storage.app_storage().method(..)`. `SqliteAccountStorage`
+  keeps the protocol traits, open and close, `delete_local_group_data` and
+  `set_message_draft_commit_observer`. `SqliteMediaCatalog::new` and
+  `SlotPublication::new` take a `SqliteAppStorage`, and
+  `SqliteMediaCatalog::storage` returns one. No schema or behaviour change.
 - Migration 0113 advances account storage to schema 113 on first open. Older
   binaries reject the upgraded database; downgrade is unsupported. It rebuilds
   `media_files` to allow a `staged` state (an outgoing body its upload owns,

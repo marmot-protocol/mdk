@@ -2229,7 +2229,7 @@ impl<S: StorageProvider> Engine<S> {
             // applied is always a genuine branch-selection withdrawal whatever
             // the pass recorded as its reason. Reason-agnostic repair is
             // therefore sound, and it is how the residue is covered:
-            // `SqliteAccountStorage::diverged_branch_selection_withdrawals`
+            // `SqliteAppStorage::diverged_branch_selection_withdrawals`
             // reconciles any parked commit whose rows are still live at the next
             // account open, and `mark_evolution_superseded`'s state-derived
             // caller does the same for the maintenance record behind it. Neither

@@ -361,8 +361,9 @@ impl From<MediaFileUploadRequestFfi> for marmot_app::MediaFileUploadRequest {
 }
 
 /// Cancellation and progress for one file-backed media operation. Create one
-/// per operation; `processed_bytes` is monotonic across snapshot, encryption
-/// and body transfer and is not a percentage. Cancellation observed before
+/// per operation; `processed_bytes` is monotonic across the copy into the
+/// account's encrypted media store, the digest pass over that copy and the
+/// body transfer, and is not a percentage. Cancellation observed before
 /// message admission starts prevents publication. Admission is not
 /// interruptible once started; delivery follows the normal local-send status.
 #[derive(uniffi::Object)]

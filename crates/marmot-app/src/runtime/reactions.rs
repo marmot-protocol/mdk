@@ -120,7 +120,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let storage = app.account_storage("alice").unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
         let mut event = StoredAppEvent {
             group_id_hex: group.clone(),
             message_id_hex: target.clone(),

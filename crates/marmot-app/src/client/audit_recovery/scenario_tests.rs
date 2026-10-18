@@ -78,6 +78,7 @@ fn quiet_routes() -> crate::client::sync::ScriptedComparisons {
 
 fn queue_loss_id(storage: &storage_sqlite::SqliteAccountStorage) -> [u8; 16] {
     storage
+        .app_storage()
         .pending_recovery_demands()
         .unwrap()
         .into_iter()
@@ -100,18 +101,21 @@ async fn loss_charged_at_authorization_records_its_cause_bound_and_count() {
     // What the off-worker marker writer persists for a queue-loss generation.
     fixture
         .storage
+        .app_storage()
         .record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
         .unwrap();
     drop(authorize(&mut fixture.client));
     // The same generation grows: charged to the pending obligation.
     fixture
         .storage
+        .app_storage()
         .record_account_delivery_loss_bounded("alice", 41, 5, unix_now_seconds(), Some(floor))
         .unwrap();
     drop(authorize(&mut fixture.client));
     // A notification lag whose REQ floor was unknown.
     fixture
         .storage
+        .app_storage()
         .record_account_recovery_loss_bounded(
             "alice",
             RecoveryLossCause::NotificationConsumer,
@@ -166,6 +170,7 @@ async fn quiet_passes_record_attempts_verdicts_parking_notice_and_dismissal() {
     // No known start: every served comparison finishes, none can certify.
     fixture
         .storage
+        .app_storage()
         .record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), None)
         .unwrap();
     let passes = storage_sqlite::RECOVERY_PARK_AFTER_QUIET_PASSES;
@@ -299,6 +304,7 @@ async fn quiet_passes_record_attempts_verdicts_parking_notice_and_dismissal() {
     assert_eq!(
         fixture
             .storage
+            .app_storage()
             .recovery_obligation_status(id)
             .unwrap()
             .unwrap()
@@ -309,6 +315,7 @@ async fn quiet_passes_record_attempts_verdicts_parking_notice_and_dismissal() {
     // New loss reopens the retired obligation.
     fixture
         .storage
+        .app_storage()
         .record_account_delivery_loss_bounded("alice", 42, 1, unix_now_seconds(), None)
         .unwrap();
     drop(authorize(&mut fixture.client));
@@ -326,11 +333,12 @@ async fn a_parked_obligation_that_completes_records_closed() {
     let mut fixture = fixture().await;
     fixture
         .storage
+        .app_storage()
         .record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), None)
         .unwrap();
     fixture
         .client
-        .synchronize_recovery_loss(&fixture.storage)
+        .synchronize_recovery_loss(&fixture.storage.app_storage())
         .unwrap();
     let id = queue_loss_id(&fixture.storage);
     crate::client::history_notices::park_recovery_for_test(&fixture.storage, id);
@@ -356,6 +364,7 @@ async fn new_loss_during_a_pass_supersedes_it() {
     let mut fixture = fixture().await;
     fixture
         .storage
+        .app_storage()
         .record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), None)
         .unwrap();
     let grant = authorize(&mut fixture.client).expect("loss selects a grant");
@@ -363,6 +372,7 @@ async fn new_loss_during_a_pass_supersedes_it() {
     // New loss while the pass runs moves the obligation to a newer revision.
     fixture
         .storage
+        .app_storage()
         .record_account_delivery_loss_bounded("alice", 41, 9, unix_now_seconds(), None)
         .unwrap();
     fixture

@@ -10,6 +10,7 @@
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
+use storage_sqlite::SqliteAppStorage;
 
 use media_store::{
     Admission, Category, DiskPolicy, FileId, FileState, MediaCatalog, MediaError, MediaStore,
@@ -673,9 +674,15 @@ fn release_uploads_blocking(app: &MarmotApp, account: &str, tokens: &[Vec<u8>]) 
         let media = app.account_media_store(account, &storage)?;
         let files = tokens
             .iter()
-            .filter_map(|token| storage.attachment_upload_file(token).ok().flatten())
+            .filter_map(|token| {
+                storage
+                    .app_storage()
+                    .attachment_upload_file(token)
+                    .ok()
+                    .flatten()
+            })
             .collect::<Vec<_>>();
-        storage.abandon_attachment_uploads(tokens)?;
+        storage.app_storage().abandon_attachment_uploads(tokens)?;
         media.unlink_released(&files);
         Ok(())
     })();
@@ -709,13 +716,14 @@ impl SendStaging {
         let storage = app.account_storage(account)?;
         let media = app.account_media_store(account, &storage)?;
         if storage
+            .app_storage()
             .prune_attachment_uploads(crate::unix_now_seconds(), 64)
             .is_err()
         {
             tracing::warn!(target: "marmot_app::media", method = "outgoing_upload_prune",
                 "outgoing upload cleanup deferred");
         }
-        let policy = storage.attachment_download_policy(
+        let policy = storage.app_storage().attachment_download_policy(
             &crate::runtime::attachment_controls::default_policy(&app.config),
         )?;
         Ok(Self {
@@ -761,6 +769,7 @@ impl SendStaging {
         self.admit(len)?;
         let token = self
             .storage
+            .app_storage()
             .reserve_attachment_upload(&self.group, self.source_epoch, crate::unix_now_seconds())?
             .ok_or_else(|| {
                 AppError::InvalidEncryptedMedia(
@@ -768,7 +777,10 @@ impl SendStaging {
                 )
             })?;
         uploads.push(token.clone());
-        stage(&self.media, &self.storage.attachment_upload_stage(&token))
+        stage(
+            &self.media,
+            &self.storage.app_storage().attachment_upload_stage(&token),
+        )
     }
 
     /// Binds each upload to its published descriptor. Blocking.
@@ -789,7 +801,9 @@ impl SendStaging {
                 ))
             })
             .collect::<Result<Vec<_>, AppError>>()?;
-        self.storage.bind_attachment_uploads(tokens, &slots)?;
+        self.storage
+            .app_storage()
+            .bind_attachment_uploads(tokens, &slots)?;
         Ok(())
     }
 }
@@ -809,7 +823,7 @@ pub(crate) const UPLOAD_PROMOTION_BATCH: usize = 32;
 /// next page (`None` once a page comes back short) and whether any slot
 /// gained a body. Blocking.
 pub(crate) fn promote_uploads(
-    storage: &SqliteAccountStorage,
+    storage: &SqliteAppStorage,
     media: &AccountMediaStore,
     after: Option<&AttachmentUploadOwner>,
     limit: usize,

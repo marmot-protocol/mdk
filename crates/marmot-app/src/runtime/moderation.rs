@@ -61,6 +61,7 @@ impl MarmotAppRuntime {
             .accounts
             .app
             .account_storage(&account.label)?
+            .app_storage()
             .content_reports(&hex::encode(group.as_slice()), message_id, after, limit)?)
     }
     pub fn reported_message(
@@ -75,6 +76,7 @@ impl MarmotAppRuntime {
             .accounts
             .app
             .account_storage(&account.label)?
+            .app_storage()
             .reported_message(&hex::encode(group.as_slice()), message_id)?)
     }
     /// Each authorized admin label is returned independently; no winner is chosen.
@@ -92,6 +94,7 @@ impl MarmotAppRuntime {
             .accounts
             .app
             .account_storage(&account.label)?
+            .app_storage()
             .report_dismissals(&hex::encode(group.as_slice()), report_id, after, limit)?)
     }
 

@@ -1,7 +1,7 @@
 //! Account badges combine Unread-list attention with active pending invitations.
 use super::ChatListView;
 use crate::base::connection::CachedSql;
-use crate::{SqliteAccountStorage, SqliteResultExt, i64_to_u64};
+use crate::{SqliteAppStorage, SqliteResultExt, i64_to_u64};
 use cgka_traits::storage::{StorageError, StorageResult};
 
 /// Screen-effective counters. No separate counter store, history or roster reads.
@@ -20,7 +20,7 @@ impl AccountAttentionTotal {
         self.unread_conversations > 0
     }
 }
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// One statement observes readiness and aggregates at the same SQLite snapshot.
     /// NotFound means missing base rows: the total is unavailable, never zero.
     pub fn account_attention_total(&self) -> StorageResult<AccountAttentionTotal> {

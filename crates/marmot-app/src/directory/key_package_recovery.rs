@@ -11,8 +11,8 @@ use crate::key_package_records::{
     KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, preferred_fresh_key_package_from_records,
     without_revoked_slot_winners,
 };
-use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord};
 use crate::{AppError, DirectoryFreshness, MarmotApp};
+use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord};
 
 const RECOVERY_ENDPOINT_LIMIT: usize = 8;
 const RECOVERY_CANDIDATE_LIMIT: usize = 12;

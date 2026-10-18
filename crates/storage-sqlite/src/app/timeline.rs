@@ -20,7 +20,7 @@ use crate::base::connection::CachedSql;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
-    SQLITE_BIND_PARAMETER_CHUNK, SqliteAccountStorage, SqliteResultExt,
+    SQLITE_BIND_PARAMETER_CHUNK, SqliteAppStorage, SqliteResultExt,
     app::encrypted_media_secrets::{
         encrypted_media_component_ids, replace_encrypted_media_secret_references_for_parts_tx,
         replace_encrypted_media_secret_references_tx,
@@ -84,12 +84,12 @@ pub const MAX_TIMELINE_LIMIT: usize = 200;
 /// no one. Storage owns the literal because it is both a stored column value
 /// and a projection predicate (a retracted own send stays visible as `failed`
 /// rather than vanishing), and because it is the one reason
-/// [`SqliteAccountStorage::clear_local_publish_failure`] may clear.
+/// [`SqliteAppStorage::clear_local_publish_failure`] may clear.
 pub const LOCAL_PUBLISH_FAILED_REASON: &str = "local_publish_failed";
 
 /// The invalidation reason a kind-1210 system row carries when branch selection
 /// withdrew the commit that synthesized it. Storage owns the literal because it
-/// is the one reason [`SqliteAccountStorage::clear_branch_selection_withdrawal_by_origin_commit`]
+/// is the one reason [`SqliteAppStorage::clear_branch_selection_withdrawal_by_origin_commit`]
 /// may clear.
 ///
 /// **Frozen.** This exact string is already persisted in shipped account
@@ -111,7 +111,7 @@ pub const BRANCH_SELECTION_WITHDRAWAL_REASON: &str = "SupersededByBranchSelectio
 
 /// Commits whose stored engine disposition disagrees with the branch-selection
 /// tombstones on the rows they synthesized. See
-/// [`SqliteAccountStorage::diverged_branch_selection_withdrawals`].
+/// [`SqliteAppStorage::diverged_branch_selection_withdrawals`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BranchSelectionWithdrawalDivergence {
     /// Hex commit ids parked `ConvergenceDeferred` that still have live rows.
@@ -129,7 +129,7 @@ impl BranchSelectionWithdrawalDivergence {
     }
 }
 
-/// The one row shape [`SqliteAccountStorage::clear_local_publish_failure`] may
+/// The one row shape [`SqliteAppStorage::clear_local_publish_failure`] may
 /// revive, bound to `?1` group id, `?2` message id, `?3` reason. Its early-exit
 /// probe and its UPDATE interpolate this same fragment: the probe decides
 /// whether a revival happens, so a conjunct present in one and not the other
@@ -514,7 +514,7 @@ struct ValidatedPagination {
     limit: usize,
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     pub fn record_app_event(
         &self,
         event: &StoredAppEvent,
@@ -1293,28 +1293,11 @@ impl SqliteAccountStorage {
         // Decode the text id to use the existing binary id index. Keep the
         // original comparison so noncanonical hex still does not match.
         let to_withdraw = collect(
-            "SELECT DISTINCT app_events.origin_commit_id
-             FROM app_events
-             CROSS JOIN cgka_messages
-               ON cgka_messages.id = unhex(app_events.origin_commit_id)
-              AND lower(hex(cgka_messages.id)) = app_events.origin_commit_id
-             WHERE app_events.origin_commit_id IS NOT NULL
-               AND cgka_messages.state = ?1
-               AND app_events.invalidated = 0
-             ORDER BY app_events.origin_commit_id",
+            crate::cross::views::BRANCH_WITHDRAWAL_ORIGINS_SQL,
             vec![deferred.into()],
         )?;
         let to_revive = collect(
-            "SELECT DISTINCT app_events.origin_commit_id
-             FROM app_events
-             CROSS JOIN cgka_messages
-               ON cgka_messages.id = unhex(app_events.origin_commit_id)
-              AND lower(hex(cgka_messages.id)) = app_events.origin_commit_id
-             WHERE app_events.origin_commit_id IS NOT NULL
-               AND cgka_messages.state = ?1
-               AND app_events.invalidated = 1
-               AND app_events.invalidation_reason = ?2
-             ORDER BY app_events.origin_commit_id",
+            crate::cross::views::BRANCH_REVIVAL_ORIGINS_SQL,
             vec![
                 processed.into(),
                 BRANCH_SELECTION_WITHDRAWAL_REASON.to_owned().into(),
@@ -1555,7 +1538,7 @@ impl SqliteAccountStorage {
         };
         {
             let _span = tracing::debug_span!(
-                target: "storage_sqlite::timeline",
+                target: "storage_sqlite::app::timeline",
                 "reply_preview_hydration",
                 method = "message_timeline"
             )
@@ -2873,7 +2856,7 @@ fn collect_media_ciphertext_hashes(tags: &[Vec<String>], out: &mut BTreeSet<Stri
     }
     if malformed_media_hashes > 0 {
         tracing::debug!(
-            target: "storage_sqlite::retention",
+            target: "storage_sqlite::app::timeline",
             method = "collect_media_hashes",
             malformed_media_hashes,
             "ignored malformed media hashes during secure prune"
@@ -3406,7 +3389,7 @@ fn select_timeline_rows_tx(
 ) -> StorageResult<Vec<TimelineMessageRecord>> {
     let (sql, params) = timeline_query_sql(query, pagination, canonical_group_order, hide_blocked)?;
     let _span = tracing::debug_span!(
-        target: "storage_sqlite::timeline",
+        target: "storage_sqlite::app::timeline",
         "timeline_select",
         method = "message_timeline"
     )

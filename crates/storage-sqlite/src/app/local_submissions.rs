@@ -1,6 +1,6 @@
 //! Device-local submission identity and durable admission before engine work.
 use crate::base::connection::CachedSql;
-use crate::{SqliteAccountStorage, SqliteResultExt};
+use crate::{SqliteAppStorage, SqliteResultExt};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{OptionalExtension, params};
 
@@ -45,7 +45,7 @@ fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalSubmission> {
 }
 const COLUMNS: &str = "group_id_hex, client_token, message_id_hex, request_hash, payload_hash, payload, state, outcome_json, request_json";
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     pub fn local_submission(
         &self,
         group: &str,

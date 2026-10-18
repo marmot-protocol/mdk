@@ -151,7 +151,7 @@ impl MarmotAppRuntime {
         let generation = hex::encode(rand::random::<[u8; 32]>());
         let result = self
             .attachment_read(account_ref, move |storage, _| {
-                let store = storage.attachment_store_identity()?;
+                let store = storage.app_storage().attachment_store_identity()?;
                 let mut map = permissions.lock();
                 let account = app.account_home().account(&account_reference)?;
                 if account.signed_out {
@@ -166,7 +166,9 @@ impl MarmotAppRuntime {
                         categories: AttachmentAutomaticPermission::default(),
                     },
                 );
-                storage.pause_automatic_attachments(crate::unix_now_seconds())?;
+                storage
+                    .app_storage()
+                    .pause_automatic_attachments(crate::unix_now_seconds())?;
                 Ok(generation)
             })
             .await?;
@@ -188,7 +190,7 @@ impl MarmotAppRuntime {
         let account_reference = account_ref.to_owned();
         let applied = self
             .attachment_read(account_ref, move |storage, _| {
-                let store = storage.attachment_store_identity()?;
+                let store = storage.app_storage().attachment_store_identity()?;
                 let mut map = permissions.lock();
                 if app.account_home().account(&account_reference)?.signed_out {
                     return Ok(false);
@@ -230,7 +232,7 @@ impl MarmotAppRuntime {
                     status: None,
                     newly_queued: false,
                 };
-                let Some(entry) = storage.attachment_control_entry(
+                let Some(entry) = storage.app_storage().attachment_control_entry(
                     &group,
                     &target.message_id_hex,
                     &target.source_message_id_hex,
@@ -251,14 +253,14 @@ impl MarmotAppRuntime {
                     return Ok(unavailable());
                 };
                 let digest = crate::media::media_hash_from_reference(&reference)?;
-                let identity = storage.attachment_store_identity()?;
+                let identity = storage.app_storage().attachment_store_identity()?;
                 // Serialize admission with revocation; never hold this lock over asynchronous IO.
                 let map = permissions.lock();
                 let allowed = config.cursor_persistence != CursorPersistence::Frozen
                     && (config.attachment_acquisition_mode
                         == AttachmentAcquisitionMode::NativeAutomatic
                         || Permissions::allows_locked(&map, &identity, &reference.media_type));
-                let (status, newly_queued) = storage.request_automatic_attachment(
+                let (status, newly_queued) = storage.app_storage().request_automatic_attachment(
                     &group,
                     &entry,
                     digest,

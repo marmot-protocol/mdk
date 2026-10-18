@@ -118,7 +118,7 @@ impl MarmotAppRuntime {
         let mut block_changes = self.accounts.app.block_list_updates.subscribe();
         let policy_account = self.accounts.resolve(account_ref)?;
         let policy_storage = self.accounts.app.account_storage(&policy_account.label)?;
-        if policy_storage.is_user_blocked(&sender_hex)? {
+        if policy_storage.app_storage().is_user_blocked(&sender_hex)? {
             return Err(AppError::UserBlocked);
         }
         let handle = tokio::spawn(async move {
@@ -146,7 +146,7 @@ impl MarmotAppRuntime {
                         }
                         let storage = policy_storage.clone();
                         let sender = sender_hex.clone();
-                        match blocking_app_task(move || Ok(storage.is_user_blocked(&sender)?)).await {
+                        match blocking_app_task(move || Ok(storage.app_storage().is_user_blocked(&sender)?)).await {
                             Ok(false) => continue,
                             Ok(true) => return Some("agent stream preview withdrawn by block policy"),
                             Err(_) => return Some("agent stream preview policy check unavailable"),

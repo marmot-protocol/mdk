@@ -294,7 +294,7 @@ impl StorageProvider<CURRENT_VERSION> for SqliteOpenMlsStorage {
             // transient backend fault is never mistaken for corruption.
             Err(SqliteOpenMlsStorageError::Serialization(_)) => {
                 tracing::warn!(
-                    target: "marmot.storage_sqlite.openmls",
+                    target: "storage_sqlite::protocol::openmls_storage::provider",
                     method = "queued_proposals",
                     "clearing corrupted OpenMLS proposal queue after undeserializable proposal-queue ref list"
                 );
@@ -717,7 +717,7 @@ impl SqliteOpenMlsStorage {
         warning: &'static str,
     ) -> Result<(), SqliteOpenMlsStorageError> {
         tracing::warn!(
-            target: "marmot.storage_sqlite.openmls",
+            target: "storage_sqlite::protocol::openmls_storage::provider",
             method = "queued_proposals",
             "{warning}"
         );

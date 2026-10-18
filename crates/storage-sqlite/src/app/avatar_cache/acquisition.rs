@@ -1,5 +1,6 @@
 //! Durable, bounded acquisition intent. Network/source policy belongs to marmot-app.
 use super::*;
+use crate::SqliteAppStorage;
 use crate::{ChatPresentationRead, ChatPresentationVersion, SelectedAvatar};
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -32,7 +33,7 @@ impl fmt::Debug for AvatarAcquisition {
     }
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Persist demand after selecting an authoritative source. Callers must
     /// propagate errors out of any enclosing transaction. Repeated demand joins
     /// existing work and never clears a retry deadline or duplicates a fetch.

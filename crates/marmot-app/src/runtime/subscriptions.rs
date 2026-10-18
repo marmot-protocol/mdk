@@ -58,8 +58,12 @@ impl RuntimeMessagesSubscription {
             let sender = message.sender.clone();
             let group = hex::encode(message.group_id.as_slice());
             let storage = self.policy_storage.clone();
-            match blocking_app_task(move || Ok(storage.is_app_author_visible(&sender, &group)?))
-                .await
+            match blocking_app_task(move || {
+                Ok(storage
+                    .app_storage()
+                    .is_app_author_visible(&sender, &group)?)
+            })
+            .await
             {
                 Ok(true) => return Some(update),
                 Ok(false) => continue,
@@ -85,7 +89,7 @@ pub enum RuntimeTimelineMessageUpdate {
 /// Rehydrate a queued delta by id, retaining incremental window updates even
 /// when another conversation has a blocked participant.
 fn filter_projection_for_block_policy(
-    storage: &storage_sqlite::SqliteAccountStorage,
+    storage: &storage_sqlite::SqliteAppStorage,
     mut update: RuntimeProjectionUpdate,
 ) -> Result<RuntimeProjectionUpdate, AppError> {
     if !storage.has_blocked_users()? {
@@ -480,7 +484,7 @@ impl RuntimeTimelineMessagesSubscription {
             let signal = if let TimelineSubscriptionSignal::Projection(update) = signal {
                 let storage = self.policy_storage.clone();
                 match blocking_app_task(move || {
-                    filter_projection_for_block_policy(&storage, *update)
+                    filter_projection_for_block_policy(&storage.app_storage(), *update)
                 })
                 .await
                 {
@@ -1163,7 +1167,7 @@ impl MarmotAppRuntime {
         let mut block_changes = app.block_list_updates.subscribe();
         let policy_storage = app.account_storage(&account_label)?;
         let subscription_policy_storage = policy_storage.clone();
-        let mut policy_revision = policy_storage.block_list_revision()?;
+        let mut policy_revision = policy_storage.app_storage().block_list_revision()?;
         let mut stopping = self.shared.lifecycle().subscribe_shutdown();
         let snapshot_query = query.clone();
         let app_for_snapshot = app.clone();
@@ -1217,7 +1221,7 @@ impl MarmotAppRuntime {
                             return;
                         }
                         let storage = policy_storage.clone();
-                        let Ok(revision) = blocking_app_task(move || Ok(storage.block_list_revision()?)).await else {
+                        let Ok(revision) = blocking_app_task(move || Ok(storage.app_storage().block_list_revision()?)).await else {
                             return;
                         };
                         if revision != policy_revision {
@@ -1372,6 +1376,7 @@ impl MarmotAppRuntime {
                         && let Some(inviter) = &group.welcomer_account_id_hex
                         && app_for_lookup
                             .account_storage(&account_label_for_lookup)?
+                            .app_storage()
                             .is_user_blocked(inviter)?
                     {
                         return Ok(None);

@@ -1,6 +1,8 @@
 //! Bounded list-only draft metadata and local row action hints. These reads share
 //! the row transaction; they never load attachment bytes or change list ordering.
 use super::*;
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 use crate::{ChatListAttachmentKind, ChatListRow, SelfMembership};
 use cgka_traits::GroupLifecycleState;
 
@@ -219,7 +221,10 @@ mod tests {
         });
         assert_eq!(preview(&store, &row), SelectedChatPreview::Message);
         assert!(row.pending_confirmation);
-        store.save_message_draft("11", "draft", None, &[]).unwrap();
+        store
+            .app_storage()
+            .save_message_draft("11", "draft", None, &[])
+            .unwrap();
         assert!(matches!(
             preview(&store, &row),
             SelectedChatPreview::Draft(_)
@@ -228,12 +233,22 @@ mod tests {
 
         for text in ["", " \n\t", "\u{2003}\u{00a0}"] {
             store
+                .app_storage()
                 .save_message_draft("11", text, Some(&"aa".repeat(32)), &[])
                 .unwrap();
             assert_eq!(preview(&store, &row), SelectedChatPreview::Invitation);
-            assert_eq!(store.message_draft("11").unwrap().unwrap().content, text);
+            assert_eq!(
+                store
+                    .app_storage()
+                    .message_draft("11")
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                text
+            );
         }
         store
+            .app_storage()
             .save_message_draft("11", "  hello\n", None, &[])
             .unwrap();
         let SelectedChatPreview::Draft(draft) = preview(&store, &row) else {
@@ -242,11 +257,14 @@ mod tests {
         assert_eq!(draft.text, "hello");
         assert!(!draft.text_truncated);
         assert_eq!(draft.attachment_count, 0);
-        store.save_message_draft("11", "\0text", None, &[]).unwrap();
+        store
+            .app_storage()
+            .save_message_draft("11", "\0text", None, &[])
+            .unwrap();
         assert!(
             matches!(preview(&store, &row), SelectedChatPreview::Draft(d) if d.text == "\0text")
         );
-        store.delete_message_draft("11").unwrap();
+        store.app_storage().delete_message_draft("11").unwrap();
         assert_eq!(preview(&store, &row), SelectedChatPreview::Invitation);
         assert_eq!(
             crate::app::chat_list::chat_list_row_tx(&store.lock().unwrap(), "11")
@@ -260,7 +278,10 @@ mod tests {
     fn chat_list_preview_bounds_unicode_text_and_summarizes_without_loading_blobs() {
         let (store, row) = fixture();
         let content = "🦀".repeat(CHAT_LIST_DRAFT_PREVIEW_CHARS + 100);
-        store.save_message_draft("11", &content, None, &[]).unwrap();
+        store
+            .app_storage()
+            .save_message_draft("11", &content, None, &[])
+            .unwrap();
         // Corrupt optional waveform metadata must not be decoded for a row preview.
         // Large BLOBs remain in SQLCipher; only type/count aggregates are selected.
         store.lock().unwrap().execute("INSERT INTO message_draft_attachments(group_id_hex,position,attachment_id,file_name,media_type,plaintext,waveform_samples_json) VALUES ('11',0,'a','secret','image/png',zeroblob(8000000),'invalid-json'),('11',1,'b','secret','audio/mp4',zeroblob(8000000),'invalid-json')", []).unwrap();
@@ -319,6 +340,7 @@ mod tests {
         for count in [200, 20_000] {
             let (store, row) = fixture();
             store
+                .app_storage()
                 .save_message_draft("11", "selected", None, &[])
                 .unwrap();
             let size = if count == 200 { 1024 } else { 8 * 1024 * 1024 };

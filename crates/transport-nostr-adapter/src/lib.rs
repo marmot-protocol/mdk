@@ -97,7 +97,7 @@ pub use sdk_client::{
     NostrReconciliationEndpointFailure, NostrReconciliationFailure, NostrReconciliationItem,
     NostrReconciliationProgress, NostrReconciliationSummary, NostrSdkRelayClient,
     NostrSdkRelayHealth, NostrSdkSubscriptionPlan, RelayRegistrationOutcome,
-    sdk_subscription_refusal, sign_transport_event_for_publish,
+    dispatch_sdk_notification, sdk_subscription_refusal, sign_transport_event_for_publish,
 };
 use telemetry::EoseRepairClaim;
 pub use telemetry::{

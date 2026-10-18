@@ -15,11 +15,11 @@ use storage_sqlite::PublicDirectoryUserRecord;
 
 use crate::error::AppError;
 use crate::ids::parse_account_id_hex;
-use crate::relay_plane::DirectoryRelayEventRecord as RelayEventRecord;
 use crate::{
     AccountRelayListStatus, DirectoryFreshness, DirectorySelection, KIND_NOSTR_CONTACT_LIST,
     KIND_NOSTR_METADATA, sort_directory_records,
 };
+use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserDirectoryRecord {

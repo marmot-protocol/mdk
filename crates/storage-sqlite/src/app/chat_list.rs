@@ -4,14 +4,13 @@ mod selection;
 mod window;
 use crate::app::account_projection::chat_mute_is_effective;
 use crate::base::connection::CachedSql;
-use crate::protocol::storage::disband_requests::{
+use crate::cross::views::{
     disband_requests_by_group_hex_tx, disbanding_group_ids_hex_tx,
-    disbanding_group_ids_hex_with_requests_tx,
+    disbanding_group_ids_hex_with_requests_tx, pending_leave_requests_by_group_hex_tx,
 };
-use crate::protocol::storage::leave_requests::pending_leave_requests_by_group_hex_tx;
 use crate::{
-    SelfMembership, SqliteAccountStorage, SqliteResultExt, StoredAccountState, bool_i64,
-    i64_to_u64, optional_u64_to_i64, u64_to_i64, unix_now_ms, unix_now_seconds,
+    SelfMembership, SqliteAppStorage, SqliteResultExt, StoredAccountState, bool_i64, i64_to_u64,
+    optional_u64_to_i64, u64_to_i64, unix_now_ms, unix_now_seconds,
 };
 pub use attention::AccountAttentionTotal;
 use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
@@ -160,7 +159,7 @@ pub struct ExistingDirectConversation {
 /// When several reusable matches exist, selection follows durable chat-list
 /// activity order: highest `activity_sort_at`, then lowest `group_id_hex`.
 /// That is the same durable clock as the chat-list projection, not the
-/// local pin order used by [`SqliteAccountStorage::chat_list_rows`]. A pin
+/// local pin order used by [`SqliteAppStorage::chat_list_rows`]. A pin
 /// must not change which historical duplicate is reused.
 pub fn select_reusable_direct_conversation(
     candidates: &[ChatListRow],
@@ -447,7 +446,7 @@ impl TimelineReadMarker {
     }
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     pub fn chat_list_rows(&self, query: ChatListQuery) -> StorageResult<Vec<ChatListRow>> {
         let conn = self.lock()?;
         chat_list_rows_tx(&conn, query)
@@ -2529,10 +2528,7 @@ macro_rules! chat_list_columns {
             ag.member_count,
             mute.group_id_hex IS NOT NULL,
             mute.muted_until_ms,
-            EXISTS (
-                SELECT 1 FROM cgka_disband_tombstones AS tomb
-                WHERE lower(hex(tomb.group_id)) = lower(row.group_id_hex)
-            ),
+            ", crate::cross::views::disband_tombstone_exists_sql!(), ",
             pin.group_id_hex IS NOT NULL,
             CASE WHEN row.last_message_kind = 1210 THEN EXISTS (SELECT 1 FROM app_events AS system_source
               WHERE system_source.group_id_hex = row.group_id_hex

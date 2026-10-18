@@ -15,7 +15,7 @@ impl PresentationMaintenance {
             crate::chat_presentation::maintenance::prepare_batch(&storage, &shared, account_id);
         // Inspect committed state even after a failed later step. A fresh worker always compares,
         // so interruption between a row commit and this send recovers without another message.
-        let version = storage.chat_presentation_version()?;
+        let version = storage.app_storage().chat_presentation_version()?;
         if self.last_notified.as_ref() != Some(&version) {
             let _ = app.presentation_signals.updates.send(
                 crate::chat_presentation::signals::PresentationInvalidation {
@@ -48,7 +48,7 @@ mod tests {
         let mut client = app.client("alice").await.unwrap();
         let group = client.create_group("Original", &[]).await.unwrap();
         let id = hex::encode(group.as_slice());
-        let storage = app.account_storage("alice").unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
         app.chat_list_row("alice", &id).unwrap().unwrap();
         let mut snapshot = storage.load_account_projection_state("alice", 100).unwrap();
         storage

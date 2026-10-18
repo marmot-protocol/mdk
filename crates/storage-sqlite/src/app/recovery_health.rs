@@ -1,10 +1,12 @@
 //! Durable reports of unsuccessful automatic synchronization recovery.
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 use crate::base::connection::CachedSql;
-use crate::{SqliteAccountStorage, SqliteResultExt, StoredEpochStallEvidence};
+use crate::{SqliteAppStorage, SqliteResultExt, StoredEpochStallEvidence};
 use cgka_traits::GroupId;
-use cgka_traits::storage::{StorageProvider, StorageResult};
+use cgka_traits::storage::StorageResult;
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Whether completed automatic recovery has failed to restore synchronization.
     pub fn automatic_recovery_failed(&self, group_id: &GroupId) -> StorageResult<bool> {
         self.lock()?
@@ -27,7 +29,8 @@ impl SqliteAccountStorage {
         if evidence.is_empty() {
             return Ok(Vec::new());
         }
-        self.with_transaction(|storage| {
+        self.connection.with_transaction(|| {
+            let storage = self;
             storage.record_epoch_stall_evidence(evidence)?;
             let conn = storage.lock()?;
             let mut changed = Vec::new();
@@ -68,7 +71,8 @@ impl SqliteAccountStorage {
         if !has_evidence {
             return Ok(false);
         }
-        self.with_transaction(|storage| {
+        self.connection.with_transaction(|| {
+            let storage = self;
             let conn = storage.lock()?;
             conn.execute_cached(
                 "DELETE FROM app_epoch_stall_evidence WHERE group_id = ?1",
@@ -105,49 +109,50 @@ mod tests {
     #[test]
     fn warning_requires_failed_replays_and_survives_epoch_movement() {
         let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
         storage.put_group(&sample_group(gid(1), 1, 2)).unwrap();
         for n in 0..3 {
             assert!(
-                storage
-                    .record_recovery_evidence(&[evidence(n)], 3)
+                app.record_recovery_evidence(&[evidence(n)], 3)
                     .unwrap()
                     .is_empty()
             );
-            assert!(!storage.automatic_recovery_failed(&gid(1)).unwrap());
+            assert!(!app.automatic_recovery_failed(&gid(1)).unwrap());
         }
         assert_eq!(
-            storage.record_recovery_evidence(&[evidence(3)], 3).unwrap(),
+            app.record_recovery_evidence(&[evidence(3)], 3).unwrap(),
             vec![gid(1)]
         );
         let mut moved = evidence(0);
         moved.stalled_epoch = 2;
-        storage.record_recovery_evidence(&[moved], 3).unwrap();
-        assert!(storage.automatic_recovery_failed(&gid(1)).unwrap());
-        assert!(storage.clear_recovery_failure(&gid(1)).unwrap());
-        assert!(storage.epoch_stall_evidence().unwrap().is_empty());
-        assert!(!storage.automatic_recovery_failed(&gid(1)).unwrap());
+        app.record_recovery_evidence(&[moved], 3).unwrap();
+        assert!(app.automatic_recovery_failed(&gid(1)).unwrap());
+        assert!(app.clear_recovery_failure(&gid(1)).unwrap());
+        assert!(app.epoch_stall_evidence().unwrap().is_empty());
+        assert!(!app.automatic_recovery_failed(&gid(1)).unwrap());
         storage
             .lock()
             .unwrap()
             .execute_batch("PRAGMA query_only = ON")
             .unwrap();
-        assert!(!storage.clear_recovery_failure(&gid(1)).unwrap());
+        assert!(!app.clear_recovery_failure(&gid(1)).unwrap());
     }
 
     #[test]
     fn warning_and_replay_evidence_commit_atomically_and_cascade() {
         let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
         storage.put_group(&sample_group(gid(1), 1, 2)).unwrap();
         storage.lock().unwrap().execute_batch("CREATE TRIGGER reject_warning BEFORE INSERT ON app_group_recovery_failures BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
-        assert!(storage.record_recovery_evidence(&[evidence(3)], 3).is_err());
-        assert!(storage.epoch_stall_evidence().unwrap().is_empty());
+        assert!(app.record_recovery_evidence(&[evidence(3)], 3).is_err());
+        assert!(app.epoch_stall_evidence().unwrap().is_empty());
         storage
             .lock()
             .unwrap()
             .execute_batch("DROP TRIGGER reject_warning")
             .unwrap();
-        storage.record_recovery_evidence(&[evidence(3)], 3).unwrap();
+        app.record_recovery_evidence(&[evidence(3)], 3).unwrap();
         storage.delete_group(&gid(1)).unwrap();
-        assert!(!storage.automatic_recovery_failed(&gid(1)).unwrap());
+        assert!(!app.automatic_recovery_failed(&gid(1)).unwrap());
     }
 }

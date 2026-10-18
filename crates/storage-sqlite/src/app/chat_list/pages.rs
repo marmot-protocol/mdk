@@ -12,7 +12,7 @@
 //! Account attention reuses these keys and additionally counts active pending invitations;
 //! the Unread list continues to exclude invitations.
 use crate::base::connection::CachedSql;
-use crate::{ChatListRow, SqliteAccountStorage, SqliteResultExt, deserialize};
+use crate::{ChatListRow, SqliteAppStorage, SqliteResultExt, deserialize};
 use cgka_traits::storage::StorageError;
 use cgka_traits::storage::{DisbandRequest, DisbandRequestStatus, LeaveRequest};
 use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value};
@@ -180,7 +180,7 @@ pub enum ChatListPageError {
     Storage(#[from] StorageError),
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Recover around a stable row after cursor invalidation, without replaying earlier pages.
     /// Includes the anchor at the beginning (Forward) or end (Backward) of the returned page.
     /// Anchor lookup, fresh boundaries and page read are one transaction, so unrelated traffic
@@ -352,19 +352,15 @@ fn page_rows_sql() -> String {
     // json_each supplies at most 200 keys (100 for standalone pages); row order is restored from navigation below.
     format!(
         "{} row.list_pin_position AS pinned_position,
-            leave_request.record AS page_leave_record,
-            disband_request.record AS page_disband_record,
-            EXISTS(SELECT 1 FROM cgka_disband_candidates
-                WHERE lower(hex(group_id)) = lower(row.group_id_hex)) AS page_candidate
+            {}
          {} {}
-         LEFT JOIN cgka_leave_requests AS leave_request
-            ON lower(hex(leave_request.group_id)) = lower(row.group_id_hex)
-         LEFT JOIN cgka_disband_requests AS disband_request
-            ON lower(hex(disband_request.group_id)) = lower(row.group_id_hex)
+         {}
          WHERE row.group_id_hex IN (SELECT value FROM json_each(?1))",
         super::CHAT_LIST_PAGE_SELECT_LIST,
+        crate::cross::views::CHAT_LIST_PAGE_ENGINE_COLUMNS,
         super::CHAT_LIST_ROW_JOINS,
-        super::CHAT_PIN_JOIN
+        super::CHAT_PIN_JOIN,
+        crate::cross::views::CHAT_LIST_PAGE_ENGINE_JOINS,
     )
 }
 

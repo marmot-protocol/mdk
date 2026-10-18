@@ -101,7 +101,7 @@ mod max_startup_investigation {
             .unwrap();
         assert_eq!(remaining, 0);
         tracing::info!(
-            target: "storage_sqlite::upgrade_measurement", method = "retained_upgrade",
+            target: "storage_sqlite::base::migrations::media_open_upgrade_bench", method = "retained_upgrade",
             strategy, mib, enhanced_memory = enhanced, apply_ms = apply_ms as u64,
             total_ms = total_ms as u64, verified_bytes = len,
             "synthetic retained upgrade verified"
@@ -203,7 +203,7 @@ mod max_partial_investigation {
             .unwrap();
         assert_eq!(usage, 0);
         tracing::info!(
-            target: "storage_sqlite::upgrade_measurement", method = "partial_upgrade",
+            target: "storage_sqlite::base::migrations::media_open_upgrade_bench", method = "partial_upgrade",
             mib, apply_ms = apply_ms as u64, total_ms = total_ms as u64,
             verified_bytes = verified,
             "synthetic partial upgrade verified"

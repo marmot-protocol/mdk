@@ -7,7 +7,7 @@
 mod maintenance;
 pub(crate) mod row_contract;
 use crate::base::connection::CachedSql;
-use crate::{ChatListAvatar, SqliteAccountStorage, SqliteResultExt, serialize, u64_to_i64};
+use crate::{ChatListAvatar, SqliteAppStorage, SqliteResultExt, serialize, u64_to_i64};
 use cgka_traits::app_components::GROUP_AVATAR_URL_COMPONENT_ID;
 use cgka_traits::storage::{StorageError, StorageResult};
 pub use maintenance::{
@@ -162,7 +162,7 @@ fn invalid(detail: &str) -> StorageError {
     StorageError::Serialization(detail.to_owned())
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     pub fn chat_presentation_version(&self) -> StorageResult<ChatPresentationVersion> {
         let conn = self.lock()?;
         conn.query_row(
@@ -512,7 +512,7 @@ impl std::fmt::Debug for PresentedChatListSnapshot {
             .finish()
     }
 }
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Read existing row fields, selection and version in one local read transaction.
     /// `None` means preparation is required, never an empty successful cache miss.
     /// A keyed read with no group returns a ready snapshot with zero rows.

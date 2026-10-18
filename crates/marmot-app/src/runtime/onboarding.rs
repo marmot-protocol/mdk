@@ -2,9 +2,9 @@
 //! A repair is a separate proposal and revision-checked approval; its signed
 //! bytes are checkpointed before they can reach a relay.
 use super::*;
-use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord, RelayEndpointPolicy};
 use nostr::prelude::{EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag, Timestamp};
 use std::future::Future;
+use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord, RelayEndpointPolicy};
 use transport_nostr_peeler::NostrTransportEvent;
 
 mod cancellation;
@@ -1804,7 +1804,7 @@ impl AccountManager {
                 .await;
                 let result = match result {
                     Ok(result) => result,
-                    Err(_) => Err(crate::relay_plane::DirectoryInspectionError::TimedOut),
+                    Err(_) => Err(transport_nostr::DirectoryInspectionError::TimedOut),
                 };
                 (endpoint, result)
             });
@@ -1828,7 +1828,7 @@ impl AccountManager {
                     records.extend(events.into_iter().map(|r| r.event));
                 }
                 Ok((endpoint, Err(error))) => {
-                    use crate::relay_plane::DirectoryInspectionError::*;
+                    use transport_nostr::DirectoryInspectionError::*;
                     let issue = match error {
                         TimedOut => OnboardingIssue::TimedOut,
                         AuthenticationRequired => OnboardingIssue::AuthenticationRequired,

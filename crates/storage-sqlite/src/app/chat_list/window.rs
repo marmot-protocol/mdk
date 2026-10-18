@@ -3,7 +3,7 @@ use super::pages::read_page_tx;
 use crate::base::connection::CachedSql;
 use crate::{
     ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery, ChatListView,
-    ChatPresentationVersion, PresentedChatListSnapshot, PresentedChatRow, SqliteAccountStorage,
+    ChatPresentationVersion, PresentedChatListSnapshot, PresentedChatRow, SqliteAppStorage,
     SqliteResultExt,
 };
 use rusqlite::{Connection, OptionalExtension};
@@ -27,7 +27,7 @@ pub struct ChatListWindowRead {
     pub anchor: Option<String>,
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Rows, selections, boundaries and anchor choice share one read snapshot. Work is
     /// bounded by the window and retained fallback keys, never account size or history.
     /// Missing legacy base rows report NotFound rather than claiming a complete empty list;

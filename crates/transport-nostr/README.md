@@ -10,6 +10,8 @@ publishes, and below [`marmot-app`](../marmot-app/README.md), which drives it pe
   (`delivery_spill.rs`) when an account's queue is full.
 - Forwards relay notifications to the right account, re-issues subscriptions after notification lag, and reports the
   losses it could not repair.
+- Builds and caches each account's signer-bound publish client, so setup publishes and the account worker share one
+  relay pool.
 - Counts each account's publishes, and keeps relay telemetry snapshots and the export rollup (`telemetry.rs`).
 - Fetches directory events by author and kind, and keeps the directory subscriptions the app asks for
   (`directory.rs`).
@@ -21,5 +23,5 @@ publishes, and below [`marmot-app`](../marmot-app/README.md), which drives it pe
   plane callbacks for them.
 - No MLS peeling (`transport-nostr-peeler`) and no relay socket mechanics (`transport-nostr-adapter`, `nostr-sdk`).
 
-`marmot-app` still reaches the plane as `crate::relay_plane`, a re-export of this crate, until its callers are
-repointed. See the [relay-plane brief](../../docs/marmot-architecture/review/brief-relay-plane.md).
+`marmot-app` drives it through `transport_nostr::`. See the
+[relay-plane brief](../../docs/marmot-architecture/review/brief-relay-plane.md) for how it moved out of the app.

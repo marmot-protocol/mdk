@@ -362,10 +362,17 @@ fn capture_conversation_from_session(
     let group_hex = hex::encode(group.as_slice());
     let capture = || {
         session.with_group_authority_snapshot(group, |storage, authority| {
-            if storage.chat_presentation_version()?.store_epoch != epoch {
+            if storage
+                .app_storage()
+                .chat_presentation_version()?
+                .store_epoch
+                != epoch
+            {
                 return Err(ConversationWindowError::Closed);
             }
-            let mut account = storage.conversation_account_snapshot(&group_hex, query.clone())?;
+            let mut account = storage
+                .app_storage()
+                .conversation_account_snapshot(&group_hex, query.clone())?;
             // A startup migration can still carry Member until its owner backfills.
             // Use this capture's compact live membership, without loading another roster.
             // Live removal facts do not distinguish voluntary departure from eviction.
@@ -399,7 +406,7 @@ fn capture_conversation_from_session(
         Err(ConversationWindowError::NotReady) => {
             // Readiness belongs to the existing keyed projection owner. Repair
             // outside the read boundary, only when missing/dirty; never mark read.
-            let storage = app.account_storage(label)?;
+            let storage = app.account_storage(label)?.app_storage();
             if storage.chat_presentation_version()?.store_epoch != epoch {
                 return Err(ConversationWindowError::Closed);
             }
@@ -721,17 +728,18 @@ impl Reader {
                     return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
                 }
                 let store = app.account_storage(&label)?;
-                if store.chat_presentation_version()?.store_epoch != expected_epoch {
+                let app = store.app_storage();
+                if app.chat_presentation_version()?.store_epoch != expected_epoch {
                     return Ok(Err(ConversationOpenError::Storage(StorageError::Closed(
                         "conversation store replaced".into(),
                     ))));
                 }
-                let read = || store.conversation_account_snapshot(&group, query.clone());
+                let read = || app.conversation_account_snapshot(&group, query.clone());
                 let account = match read() {
                     Err(ConversationOpenError::ReadStateNotReady) => {
                         // Reuse the keyed durable projection owner. Never hydrate
                         // MLS or mark read merely to render retained local content.
-                        store.refresh_chat_list_row(
+                        app.refresh_chat_list_row(
                             &local,
                             &group,
                             &MarmotApp::chat_list_mention_classifier(&local),
@@ -897,7 +905,7 @@ impl MarmotAppRuntime {
                 let epoch = blocking_app_task(move || {
                     Ok(app
                         .account_storage(&label)?
-                        .chat_presentation_version()?
+                        .app_storage().chat_presentation_version()?
                         .store_epoch)
                 })
                 .await?;

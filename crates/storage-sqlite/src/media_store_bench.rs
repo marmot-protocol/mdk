@@ -394,6 +394,7 @@ impl SqlcipherBench {
             format!("x {}", hex::encode(self.digest)),
         ];
         self.store
+            .app_storage()
             .record_app_event(&StoredAppEvent {
                 group_id_hex: GROUP.into(),
                 message_id_hex: message.clone(),
@@ -423,6 +424,7 @@ impl SqlcipherBench {
         };
         let reference = match self
             .store
+            .app_storage()
             .request_attachment_acquisition(GROUP, &selected, self.digest, NOW)
             .map_err(error)?
         {
@@ -430,6 +432,7 @@ impl SqlcipherBench {
             other => return Err(format!("unexpected attachment demand {other:?}")),
         };
         self.store
+            .app_storage()
             .claim_attachment_acquisition(&reference, NOW, LEASE_UNTIL)
             .map_err(error)?
             .ok_or_else(|| "attachment job was not claimable".to_owned())
@@ -440,6 +443,7 @@ impl SqlcipherBench {
         while offset < len {
             let window = self
                 .store
+                .app_storage()
                 .read_retained_attachment(reference, NOW, offset as u64, WINDOW)
                 .map_err(error)?
                 .ok_or_else(|| "retained attachment missing".to_owned())?;
@@ -491,6 +495,7 @@ fn sqlcipher_rows(
         let (elapsed, published) = timed(|| {
             bench
                 .store
+                .app_storage()
                 .complete_attachment_acquisition_from_reader(
                     &job,
                     &mut Cursor::new(body),
@@ -513,6 +518,7 @@ fn sqlcipher_rows(
             let (elapsed, published) = timed(|| {
                 bench
                     .store
+                    .app_storage()
                     .complete_attachment_acquisition(&job, body, NOW, i64::MAX as u64)
                     .map_err(error)
             })?;
@@ -536,6 +542,7 @@ fn sqlcipher_rows(
         let (elapsed, ()) = timed(|| {
             bench
                 .store
+                .app_storage()
                 .read_retained_attachment(reference, NOW, 0, WINDOW)
                 .map_err(error)?
                 .ok_or_else(|| "retained attachment missing".to_owned())

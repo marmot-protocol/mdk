@@ -5,6 +5,7 @@
 //! store generation, attempt, lease, source, acceptance and expiry. The
 //! retained-byte budget is not applied: free disk, checked by the caller, is
 //! the only limit on retained media.
+use crate::SqliteAppStorage;
 use media_store::{
     CatalogResult, Category, ExistingOutcome, FileId, Presence, PublishTarget, ReadyOutcome,
 };
@@ -14,12 +15,12 @@ use crate::app::media_catalog::{attach_slot, catalog_error, commit_existing_in, 
 
 /// One claimed acquisition's publication into the media store.
 pub struct AttachmentPublication<'a> {
-    storage: &'a SqliteAccountStorage,
+    storage: &'a SqliteAppStorage,
     job: &'a AttachmentAcquisition,
     clock: &'a dyn Fn() -> u64,
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Whether a ready media file already holds this job's content, from the
     /// database alone (no file check). A scheduler can then attach it before
     /// download-only gates; the blocking reuse attempt confirms the file.

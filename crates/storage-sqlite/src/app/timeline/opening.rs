@@ -1,5 +1,6 @@
 //! Bounded, read-only conversation opening over existing timeline/read projections.
 use super::*;
+use crate::SqliteAppStorage;
 
 /// Account-store/group scoped canonical anchor. Opaque, local, and not a wire cursor.
 #[derive(Clone, PartialEq, Eq)]
@@ -98,7 +99,7 @@ pub enum ConversationOpenError {
     #[error(transparent)]
     Storage(#[from] StorageError),
 }
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Read opening history and retained read state in one deferred transaction.
     /// No preparation, read acknowledgement, roster load or network work occurs.
     /// A dirty/missing unread projection returns `ReadStateNotReady`; its existing

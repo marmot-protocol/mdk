@@ -42,8 +42,6 @@ use crate::key_package_records::{
     latest_fresh_key_package_from_records, merge_relay_list_status,
     publish_endpoints_from_bootstrap, relay_list_queries,
 };
-use crate::relay_plane::DirectorySyncPlan;
-use crate::relay_plane::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 use crate::{
     APP_CACHE_DB_FILE, AccountRelayListBootstrap, AccountRelayListStatus, AppError,
     DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER, DirectoryFreshness, FetchedKeyPackage,
@@ -51,6 +49,8 @@ use crate::{
     SqlcipherDatabaseKind, USER_DIRECTORY_SEARCH_MAX_FRONTIER, USER_DIRECTORY_SEARCH_MAX_VISITED,
     blocking_app_task, push_unique_strings, relay_list_state_from_event, remove_sqlite_file_set,
 };
+use transport_nostr::DirectorySyncPlan;
+use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 
 impl MarmotApp {
     /// Resolve batched profile names with first-cache precedence, then local labels.

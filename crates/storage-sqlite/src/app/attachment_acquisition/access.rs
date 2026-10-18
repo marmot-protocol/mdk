@@ -1,5 +1,6 @@
 //! Read-only retained-asset discovery. Looking up bytes never registers demand.
 use super::*;
+use crate::SqliteAppStorage;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetainedAttachmentAsset {
@@ -7,7 +8,7 @@ pub struct RetainedAttachmentAsset {
     pub byte_count: u64,
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Metadata only for the exact original source slot. None means no currently
     /// readable retained asset; it does not imply that a download was requested.
     pub fn retained_attachment_asset(

@@ -110,6 +110,7 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
         .unwrap();
     let storage = app.account_storage(&alice.label).unwrap();
     let inventory = storage
+        .app_storage()
         .transport_reconciliation_inventory(
             &storage_sqlite::TransportReconciliationRoute::Group(route),
             crate::unix_now_seconds(),
@@ -152,6 +153,7 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
     let route = storage_sqlite::TransportReconciliationRoute::Group(route);
     assert!(
         !storage
+            .app_storage()
             .retained_recovery_event(&route, &event_id, None, crate::unix_now_seconds())
             .unwrap()
     );
@@ -181,6 +183,7 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
     );
     assert!(
         !storage
+            .app_storage()
             .retained_recovery_event(&route, &event_id, None, crate::unix_now_seconds())
             .unwrap()
     );
@@ -192,6 +195,7 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
     }
     assert!(
         storage
+            .app_storage()
             .retained_recovery_event(&route, &event_id, None, crate::unix_now_seconds())
             .unwrap()
     );

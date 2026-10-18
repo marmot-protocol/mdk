@@ -1,9 +1,10 @@
 use super::*;
 use crate::*;
+use storage_sqlite::SqliteAppStorage;
 use storage_sqlite::{
     ChatPresentationRead, PresentationText, PublicDirectoryUserRecord, StoredAccountState,
 };
-fn seed(account: &SqliteAccountStorage, id: &str, name: &str) {
+fn seed(account: &SqliteAppStorage, id: &str, name: &str) {
     let routing = AppGroupNostrRoutingComponent::new(cgka_traits::app_components::NostrRoutingV1 {
         nostr_group_id: [1; 32],
         relays: vec!["wss://relay.example.com".into()],
@@ -60,7 +61,7 @@ fn drain(account: &SqliteAccountStorage, shared: &SqliteSharedStorage) {
     }
     panic!("presentation maintenance did not quiesce");
 }
-fn title(account: &SqliteAccountStorage, id: &str) -> PresentationText {
+fn title(account: &SqliteAppStorage, id: &str) -> PresentationText {
     match account.chat_presentation(id).unwrap() {
         ChatPresentationRead::Ready(value) => value.presentation.title,
         _ => panic!("presentation was not prepared"),
@@ -69,32 +70,34 @@ fn title(account: &SqliteAccountStorage, id: &str) -> PresentationText {
 #[test]
 fn cached_before_creation_and_later_profile_changes_apply_without_a_subscriber() {
     let account = SqliteAccountStorage::in_memory().unwrap();
+    let account_app = account.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("First"));
-    seed(&account, "11", "");
+    seed(&account_app, "11", "");
     drain(&account, &shared);
-    assert!(title(&account, "11") == PresentationText::Literal("First".into()));
+    assert!(title(&account_app, "11") == PresentationText::Literal("First".into()));
     profile(&shared, Some("Second"));
     drain(&account, &shared);
-    assert!(title(&account, "11") == PresentationText::Literal("Second".into()));
+    assert!(title(&account_app, "11") == PresentationText::Literal("Second".into()));
 }
 
 #[test]
 fn dirty_same_subject_display_survives_until_maintenance_and_new_titles_notify_once() {
     let account = SqliteAccountStorage::in_memory().unwrap();
+    let account_app = account.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("Peer"));
-    seed(&account, "11", "");
+    seed(&account_app, "11", "");
     drain(&account, &shared);
-    let before = account.chat_presentation_version().unwrap();
-    let mut state = account
+    let before = account_app.chat_presentation_version().unwrap();
+    let mut state = account_app
         .load_account_projection_state("fixture", 100)
         .unwrap();
     state.groups[0].image_media_type = Some("image/jpeg".into());
-    account.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+    account_app.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
         &state, 101, 121, &[], &[],
     ).unwrap();
-    let ChatPresentationRead::Ready(value) = account.chat_presentation("11").unwrap() else {
+    let ChatPresentationRead::Ready(value) = account_app.chat_presentation("11").unwrap() else {
         panic!("same-subject display was erased");
     };
     assert_eq!(
@@ -103,29 +106,29 @@ fn dirty_same_subject_display_survives_until_maintenance_and_new_titles_notify_o
     );
     assert!(value.presentation.title == PresentationText::Literal("Peer".into()));
     drain(&account, &shared);
-    assert_eq!(account.chat_presentation_version().unwrap(), before);
+    assert_eq!(account_app.chat_presentation_version().unwrap(), before);
     state.groups[0].profile_name = "Custom".into();
-    account.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+    account_app.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
         &state, 102, 122, &[], &[],
     ).unwrap();
     drain(&account, &shared);
-    assert!(title(&account, "11") == PresentationText::Literal("Custom".into()));
+    assert!(title(&account_app, "11") == PresentationText::Literal("Custom".into()));
     assert_eq!(
-        account.chat_presentation_version().unwrap().revision,
+        account_app.chat_presentation_version().unwrap().revision,
         before.revision + 1
     );
     state.groups[0].profile_name.clear();
-    account.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+    account_app.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
         &state, 103, 123, &[], &[],
     ).unwrap();
     assert_eq!(
-        account.chat_presentation("11").unwrap(),
+        account_app.chat_presentation("11").unwrap(),
         ChatPresentationRead::Pending
     );
     drain(&account, &shared);
-    assert!(title(&account, "11") == PresentationText::Literal("Peer".into()));
+    assert!(title(&account_app, "11") == PresentationText::Literal("Peer".into()));
     assert!(
-        account
+        account_app
             .pending_chat_presentation_inputs()
             .unwrap()
             .is_empty()
@@ -141,10 +144,11 @@ fn restart_mid_fanout_and_coalesced_newer_profiles_do_not_skip_other_identities(
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("Original"));
     for i in 0..65 {
-        seed(&account, &format!("{i:04x}"), "");
+        seed(&account.app_storage(), &format!("{i:04x}"), "");
     }
-    seed(&account, "cc", "");
+    seed(&account.app_storage(), "cc", "");
     account
+        .app_storage()
         .set_chat_presentation_members("cc", &["aa".repeat(32), "cc".repeat(32)])
         .unwrap();
     drain(&account, &shared);
@@ -152,7 +156,10 @@ fn restart_mid_fanout_and_coalesced_newer_profiles_do_not_skip_other_identities(
     // Select the changed identity, then commit one bounded group page.
     assert!(maintain(&account, &shared, &"aa".repeat(32)).unwrap());
     assert!(maintain(&account, &shared, &"aa".repeat(32)).unwrap());
-    let checkpoint = account.chat_presentation_checkpoint().unwrap();
+    let checkpoint = account
+        .app_storage()
+        .chat_presentation_checkpoint()
+        .unwrap();
     assert!(
         checkpoint
             .state
@@ -188,78 +195,86 @@ fn restart_mid_fanout_and_coalesced_newer_profiles_do_not_skip_other_identities(
     drain(&account, &shared);
     for i in 0..65 {
         assert!(
-            title(&account, &format!("{i:04x}"))
+            title(&account.app_storage(), &format!("{i:04x}"))
                 == PresentationText::Literal("Latest update".into())
         );
     }
-    assert!(title(&account, "cc") == PresentationText::Literal("Other peer".into()));
+    assert!(title(&account.app_storage(), "cc") == PresentationText::Literal("Other peer".into()));
 }
 
 #[test]
 fn removal_store_replacement_and_new_dependency_after_watermark_clear_stale_data() {
     let account = SqliteAccountStorage::in_memory().unwrap();
+    let account_app = account.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("Cached"));
-    seed(&account, "11", "");
+    seed(&account_app, "11", "");
     drain(&account, &shared);
-    let before = account.chat_list_row("11").unwrap();
-    seed(&account, "22", "");
+    let before = account_app.chat_list_row("11").unwrap();
+    seed(&account_app, "22", "");
     drain(&account, &shared);
-    assert!(title(&account, "22") == PresentationText::Literal("Cached".into()));
+    assert!(title(&account_app, "22") == PresentationText::Literal("Cached".into()));
     profile(&shared, None);
     drain(&account, &shared);
     assert!(
-        title(&account, "11")
+        title(&account_app, "11")
             == PresentationText::Literal(crate::default_profile_pseudonym(&"bb".repeat(32)))
     );
-    assert_eq!(account.chat_list_row("11").unwrap(), before);
+    assert_eq!(account_app.chat_list_row("11").unwrap(), before);
     profile(&shared, Some("Cached again"));
     drain(&account, &shared);
     let replacement = SqliteSharedStorage::in_memory().unwrap();
     drain(&account, &replacement);
     assert!(
-        title(&account, "11")
+        title(&account_app, "11")
             == PresentationText::Literal(crate::default_profile_pseudonym(&"bb".repeat(32)))
     );
-    let generation = account.chat_presentation_checkpoint().unwrap().generation;
-    let version = account.chat_presentation_version().unwrap();
+    let generation = account_app
+        .chat_presentation_checkpoint()
+        .unwrap()
+        .generation;
+    let version = account_app.chat_presentation_version().unwrap();
     assert!(!maintain(&account, &replacement, &"aa".repeat(32)).unwrap());
     assert_eq!(
-        account.chat_presentation_checkpoint().unwrap().generation,
+        account_app
+            .chat_presentation_checkpoint()
+            .unwrap()
+            .generation,
         generation
     );
-    assert_eq!(account.chat_presentation_version().unwrap(), version);
+    assert_eq!(account_app.chat_presentation_version().unwrap(), version);
 }
 
 #[test]
 fn named_pair_depends_on_peer_avatar_and_membership_changes_clear_old_peer_immediately() {
     let account = SqliteAccountStorage::in_memory().unwrap();
+    let account_app = account.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("Peer"));
-    seed(&account, "11", "Custom");
+    seed(&account_app, "11", "Custom");
     drain(&account, &shared);
     assert_eq!(
-        account
+        account_app
             .chat_presentation_dependents(&"bb".repeat(32), None)
             .unwrap(),
         ["11"]
     );
-    assert!(title(&account, "11") == PresentationText::Literal("Custom".into()));
-    account
+    assert!(title(&account_app, "11") == PresentationText::Literal("Custom".into()));
+    account_app
         .set_chat_presentation_members("11", &["aa".repeat(32), "cc".repeat(32)])
         .unwrap();
     assert!(matches!(
-        account.chat_presentation("11").unwrap(),
+        account_app.chat_presentation("11").unwrap(),
         ChatPresentationRead::Pending
     ));
     assert!(
-        account
+        account_app
             .chat_presentation_dependents(&"bb".repeat(32), None)
             .unwrap()
             .is_empty()
     );
     drain(&account, &shared);
-    let ChatPresentationRead::Ready(selected) = account.chat_presentation("11").unwrap() else {
+    let ChatPresentationRead::Ready(selected) = account_app.chat_presentation("11").unwrap() else {
         panic!("not ready")
     };
     assert_eq!(selected.presentation.peer_id, Some("cc".repeat(32)));
@@ -267,11 +282,11 @@ fn named_pair_depends_on_peer_avatar_and_membership_changes_clear_old_peer_immed
         selected.presentation.avatar,
         storage_sqlite::SelectedAvatar::Placeholder { .. }
     ));
-    account
+    account_app
         .set_group_self_membership("11", storage_sqlite::SelfMembership::Left)
         .unwrap();
     drain(&account, &shared);
-    let ChatPresentationRead::Ready(selected) = account.chat_presentation("11").unwrap() else {
+    let ChatPresentationRead::Ready(selected) = account_app.chat_presentation("11").unwrap() else {
         panic!("not ready")
     };
     assert!(selected.presentation.peer_id.is_none());
@@ -280,6 +295,7 @@ fn named_pair_depends_on_peer_avatar_and_membership_changes_clear_old_peer_immed
 #[test]
 fn unrelated_directory_history_is_skipped_and_new_unrelated_changes_are_batched() {
     let account = SqliteAccountStorage::in_memory().unwrap();
+    let account_app = account.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     for i in 0..250 {
         shared
@@ -297,14 +313,14 @@ fn unrelated_directory_history_is_skipped_and_new_unrelated_changes_are_batched(
             .unwrap();
     }
     profile(&shared, Some("Relevant"));
-    seed(&account, "11", "");
+    seed(&account_app, "11", "");
     assert!(maintain(&account, &shared, &"aa".repeat(32)).unwrap());
     assert!(maintain(&account, &shared, &"aa".repeat(32)).unwrap());
     assert!(
         !maintain(&account, &shared, &"aa".repeat(32)).unwrap(),
         "initial reconciliation must not replay pre-existing unrelated changes"
     );
-    let version = account.chat_presentation_version().unwrap();
+    let version = account_app.chat_presentation_version().unwrap();
     for i in 0..100 {
         let mut record = shared
             .public_directory_user(&format!("{i:064x}"))
@@ -319,44 +335,60 @@ fn unrelated_directory_history_is_skipped_and_new_unrelated_changes_are_batched(
         !maintain(&account, &shared, &"aa".repeat(32)).unwrap(),
         "unrelated changes should advance 50 identities per batch"
     );
-    assert_eq!(account.chat_presentation_version().unwrap(), version);
+    assert_eq!(account_app.chat_presentation_version().unwrap(), version);
 }
 
 #[test]
 fn rejected_pending_presentation_yields_until_new_evidence_allows_progress() {
     let account = SqliteAccountStorage::in_memory().unwrap();
+    let account_app = account.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("First"));
-    seed(&account, "11", "");
+    seed(&account_app, "11", "");
     drain(&account, &shared);
-    let input = account.chat_presentation_input("11").unwrap().unwrap();
-    let ChatPresentationRead::Ready(mut future) = account.chat_presentation("11").unwrap() else {
+    let input = account_app.chat_presentation_input("11").unwrap().unwrap();
+    let ChatPresentationRead::Ready(mut future) = account_app.chat_presentation("11").unwrap()
+    else {
         panic!("initial presentation");
     };
     future.profile_version.as_mut().unwrap().revision += 1;
-    account.store_chat_presentation(&input, &future).unwrap();
-    let mut state = account
+    account_app
+        .store_chat_presentation(&input, &future)
+        .unwrap();
+    let mut state = account_app
         .load_account_projection_state("fixture", 100)
         .unwrap();
     state.groups[0].image_media_type = Some("image/png".into());
-    account.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+    account_app.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
         &state, 101, 121, &[], &[],
     ).unwrap();
-    let generation = account.chat_presentation_checkpoint().unwrap().generation;
+    let generation = account_app
+        .chat_presentation_checkpoint()
+        .unwrap()
+        .generation;
     assert!(
         !maintain(&account, &shared, &"aa".repeat(32)).unwrap(),
         "an entirely rejected pending batch must wait instead of scheduling a hot loop"
     );
     assert_eq!(
-        account.chat_presentation_checkpoint().unwrap().generation,
+        account_app
+            .chat_presentation_checkpoint()
+            .unwrap()
+            .generation,
         generation
     );
-    assert_eq!(account.pending_chat_presentation_inputs().unwrap().len(), 1);
+    assert_eq!(
+        account_app
+            .pending_chat_presentation_inputs()
+            .unwrap()
+            .len(),
+        1
+    );
     profile(&shared, Some("Second"));
     drain(&account, &shared);
-    assert!(title(&account, "11") == PresentationText::Literal("Second".into()));
+    assert!(title(&account_app, "11") == PresentationText::Literal("Second".into()));
     assert!(
-        account
+        account_app
             .pending_chat_presentation_inputs()
             .unwrap()
             .is_empty()
@@ -366,12 +398,14 @@ fn rejected_pending_presentation_yields_until_new_evidence_allows_progress() {
 #[test]
 fn account_catchup_and_replacement_cannot_restore_another_accounts_deleted_chat() {
     let first = SqliteAccountStorage::in_memory().unwrap();
+    let first_app = first.app_storage();
     let second = SqliteAccountStorage::in_memory().unwrap();
+    let second_app = second.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("Initial"));
-    seed(&first, "11", "");
-    seed(&second, "11", "");
-    second
+    seed(&first_app, "11", "");
+    seed(&second_app, "11", "");
+    second_app
         .set_chat_presentation_members("11", &["cc".repeat(32), "bb".repeat(32)])
         .unwrap();
     drain(&first, &shared);
@@ -380,30 +414,37 @@ fn account_catchup_and_replacement_cannot_restore_another_accounts_deleted_chat(
             break;
         }
     }
-    assert!(title(&second, "11") == PresentationText::Literal("Initial".into()));
-    let delayed_input = first.chat_presentation_input("11").unwrap().unwrap();
-    let ChatPresentationRead::Ready(delayed_value) = first.chat_presentation("11").unwrap() else {
+    assert!(title(&second_app, "11") == PresentationText::Literal("Initial".into()));
+    let delayed_input = first_app.chat_presentation_input("11").unwrap().unwrap();
+    let ChatPresentationRead::Ready(delayed_value) = first_app.chat_presentation("11").unwrap()
+    else {
         panic!("first presentation");
     };
     assert_eq!(
-        second
+        second_app
             .store_chat_presentation(&delayed_input, &delayed_value)
             .unwrap(),
         storage_sqlite::ChatPresentationWrite::Stale
     );
     second.delete_local_group_data("11").unwrap();
-    let second_checkpoint = second.chat_presentation_checkpoint().unwrap();
-    let second_version = second.chat_presentation_version().unwrap();
+    let second_checkpoint = second_app.chat_presentation_checkpoint().unwrap();
+    let second_version = second_app.chat_presentation_version().unwrap();
     profile(&shared, Some("Updated"));
     drain(&first, &shared);
-    assert!(title(&first, "11") == PresentationText::Literal("Updated".into()));
+    assert!(title(&first_app, "11") == PresentationText::Literal("Updated".into()));
     assert_eq!(
-        second.chat_presentation_checkpoint().unwrap().generation,
+        second_app
+            .chat_presentation_checkpoint()
+            .unwrap()
+            .generation,
         second_checkpoint.generation
     );
-    assert_eq!(second.chat_presentation_version().unwrap(), second_version);
     assert_eq!(
-        second.chat_presentation("11").unwrap(),
+        second_app.chat_presentation_version().unwrap(),
+        second_version
+    );
+    assert_eq!(
+        second_app.chat_presentation("11").unwrap(),
         ChatPresentationRead::Missing
     );
     let replacement = SqliteSharedStorage::in_memory().unwrap();
@@ -414,20 +455,21 @@ fn account_catchup_and_replacement_cannot_restore_another_accounts_deleted_chat(
         }
     }
     assert_eq!(
-        second.chat_presentation("11").unwrap(),
+        second_app.chat_presentation("11").unwrap(),
         ChatPresentationRead::Missing
     );
     assert!(
-        second
+        second_app
             .chat_presentation_dependents(&"bb".repeat(32), None)
             .unwrap()
             .is_empty()
     );
     let replacement_account = SqliteAccountStorage::in_memory().unwrap();
-    seed(&replacement_account, "11", "");
+    seed(&replacement_account.app_storage(), "11", "");
     drain(&replacement_account, &replacement);
     assert_eq!(
         replacement_account
+            .app_storage()
             .store_chat_presentation(&delayed_input, &delayed_value)
             .unwrap(),
         storage_sqlite::ChatPresentationWrite::Stale
@@ -437,10 +479,11 @@ fn account_catchup_and_replacement_cannot_restore_another_accounts_deleted_chat(
 #[test]
 fn named_pair_roster_matches_durable_order_and_unchanged_hydration_stays_clean() {
     let account = SqliteAccountStorage::in_memory().unwrap();
+    let account_app = account.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
-    seed(&account, "11", "Named pair");
+    seed(&account_app, "11", "Named pair");
     drain(&account, &shared);
-    let mut state = account
+    let mut state = account_app
         .load_account_projection_state("fixture", 100)
         .unwrap();
     let mut group =
@@ -456,14 +499,14 @@ fn named_pair_roster_matches_durable_order_and_unchanged_hydration_stays_clean()
         "MLS leaf order must not appear as a source change after a durable reload"
     );
     assert!(group.direct_member_ids_hex.is_none());
-    let version = account.chat_presentation_version().unwrap();
-    let input = account.chat_presentation_input("11").unwrap().unwrap();
+    let version = account_app.chat_presentation_version().unwrap();
+    let input = account_app.chat_presentation_input("11").unwrap().unwrap();
     state.groups[0] = crate::conversions::stored_group_from_app_group(&group);
-    account.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+    account_app.save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
         &state, 101, 121, &[], &[],
     ).unwrap();
     assert_eq!(
-        account
+        account_app
             .chat_presentation_input("11")
             .unwrap()
             .unwrap()
@@ -471,7 +514,7 @@ fn named_pair_roster_matches_durable_order_and_unchanged_hydration_stays_clean()
         input.source_version
     );
     assert!(!maintain(&account, &shared, &"aa".repeat(32)).unwrap());
-    assert_eq!(account.chat_presentation_version().unwrap(), version);
+    assert_eq!(account_app.chat_presentation_version().unwrap(), version);
     group.profile.name.clear();
     group.set_direct_member_ids_from_roster(&members);
     assert_eq!(group.direct_member_ids_hex, before);
@@ -483,21 +526,22 @@ fn named_pair_roster_matches_durable_order_and_unchanged_hydration_stays_clean()
 #[test]
 fn avatar_maintenance_tracks_profile_removal_without_a_screen_subscription() {
     let account = SqliteAccountStorage::in_memory().unwrap();
+    let account_app = account.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("Avatar"));
-    seed(&account, "11", "");
+    seed(&account_app, "11", "");
     drain(&account, &shared);
-    let reference = account.chat_avatar_reference("11").unwrap().unwrap();
-    let job = account.claim_avatar_acquisition(0).unwrap().unwrap();
+    let reference = account_app.chat_avatar_reference("11").unwrap().unwrap();
+    let job = account_app.claim_avatar_acquisition(0).unwrap().unwrap();
     assert_eq!(job.reference, reference);
     profile(&shared, None);
     drain(&account, &shared);
-    assert!(account.chat_avatar_reference("11").unwrap().is_none());
+    assert!(account_app.chat_avatar_reference("11").unwrap().is_none());
     let image =
         storage_sqlite::AvatarImage::new(vec![1; 8], storage_sqlite::AvatarImageFormat::Png, 1, 1)
             .unwrap();
     assert_eq!(
-        account
+        account_app
             .complete_avatar_acquisition(&job, &image, None)
             .unwrap(),
         storage_sqlite::AvatarPublishResult::Superseded

@@ -1,24 +1,25 @@
 use super::*;
 use crate::SqlCipherKey;
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 
 #[test]
 fn presented_rows_expose_draft_versions_for_identical_edits_and_deletion() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "11");
-    let input = store.chat_presentation_input("11").unwrap().unwrap();
-    store
-        .store_chat_presentation(&input, &value("bb", "Peer", 1))
+    let input = app.chat_presentation_input("11").unwrap().unwrap();
+    app.store_chat_presentation(&input, &value("bb", "Peer", 1))
         .unwrap();
     let read = || {
-        store
-            .read_presented_chat_list(crate::ChatListQuery::default(), Some("11"))
+        app.read_presented_chat_list(crate::ChatListQuery::default(), Some("11"))
             .unwrap()
             .unwrap()
             .rows
             .remove(0)
     };
-    store.save_message_draft("11", "same", None, &[]).unwrap();
-    let selected = store.selected_message_draft("11").unwrap();
+    app.save_message_draft("11", "same", None, &[]).unwrap();
+    let selected = app.selected_message_draft("11").unwrap();
     let first = read();
     assert!(matches!(first.preview, SelectedChatPreview::Draft(_)));
     assert!(
@@ -26,7 +27,7 @@ fn presented_rows_expose_draft_versions_for_identical_edits_and_deletion() {
             .revision
             .includes_chat_list_version(first.draft_version.as_ref().unwrap())
     );
-    store.save_message_draft("11", "same", None, &[]).unwrap();
+    app.save_message_draft("11", "same", None, &[]).unwrap();
     let edited = read();
     assert_eq!(first.preview, edited.preview);
     assert!(
@@ -34,7 +35,7 @@ fn presented_rows_expose_draft_versions_for_identical_edits_and_deletion() {
             .revision
             .includes_chat_list_version(edited.draft_version.as_ref().unwrap())
     );
-    store.delete_message_draft("11").unwrap();
+    app.delete_message_draft("11").unwrap();
     let deleted = read();
     assert!(!matches!(deleted.preview, SelectedChatPreview::Draft(_)));
     assert!(
@@ -69,6 +70,7 @@ fn seed(store: &SqliteAccountStorage, id: &str) {
     .unwrap();
     drop(conn);
     store
+        .app_storage()
         .set_chat_presentation_members(id, &["aa".repeat(32), "bb".repeat(32)])
         .unwrap();
 }
@@ -95,6 +97,7 @@ fn value(peer: &str, name: &str, rev: u64) -> StoredChatPresentation {
 #[test]
 fn presented_chat_preview_retention_comes_from_selected_message() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "11");
     let event = crate::StoredAppEvent {
         group_id_hex: "11".to_owned(),
@@ -111,23 +114,20 @@ fn presented_chat_preview_retention_comes_from_selected_message() {
         origin_commit_id: None,
         moderation_grant: false,
     };
-    store
-        .record_app_event_with_retention(
-            &event,
-            Some(cgka_traits::app_event::AppMessageRetentionDecision::new(
-                10, 300,
-            )),
-        )
+    app.record_app_event_with_retention(
+        &event,
+        Some(cgka_traits::app_event::AppMessageRetentionDecision::new(
+            10, 300,
+        )),
+    )
+    .unwrap();
+    app.refresh_chat_list_rows(&"aa".repeat(32), &|_, _| false)
         .unwrap();
-    store
-        .refresh_chat_list_rows(&"aa".repeat(32), &|_, _| false)
-        .unwrap();
-    let input = store.chat_presentation_input("11").unwrap().unwrap();
-    store
-        .store_chat_presentation(&input, &value("bb", "Peer", 1))
+    let input = app.chat_presentation_input("11").unwrap().unwrap();
+    app.store_chat_presentation(&input, &value("bb", "Peer", 1))
         .unwrap();
     for group in [None, Some("11")] {
-        let snapshot = store
+        let snapshot = app
             .read_presented_chat_list(crate::ChatListQuery::default(), group)
             .unwrap()
             .unwrap();
@@ -146,28 +146,41 @@ fn selected_value_reopens_without_mutation_and_keeps_activity() {
     let key = SqlCipherKey::new("presentation fixture key").unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     seed(&store, "11");
-    let input = store.chat_presentation_input("11").unwrap().unwrap();
+    let input = store
+        .app_storage()
+        .chat_presentation_input("11")
+        .unwrap()
+        .unwrap();
     let expected = value("bb", "Peer name", 4);
     assert_eq!(
-        store.store_chat_presentation(&input, &expected).unwrap(),
+        store
+            .app_storage()
+            .store_chat_presentation(&input, &expected)
+            .unwrap(),
         ChatPresentationWrite::Applied
     );
-    let version = store.chat_presentation_version().unwrap();
-    assert_eq!(
-        store.store_chat_presentation(&input, &expected).unwrap(),
-        ChatPresentationWrite::Unchanged
-    );
-    assert_eq!(store.chat_presentation_version().unwrap(), version);
-    drop(store);
-    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    assert_eq!(
-        store.chat_presentation("11").unwrap(),
-        ChatPresentationRead::Ready(Box::new(expected))
-    );
-    assert_eq!(store.chat_presentation_version().unwrap(), version);
+    let version = store.app_storage().chat_presentation_version().unwrap();
     assert_eq!(
         store
-            .chat_presentation_dependents(&"bb".repeat(32), None)
+            .app_storage()
+            .store_chat_presentation(&input, &expected)
+            .unwrap(),
+        ChatPresentationWrite::Unchanged
+    );
+    assert_eq!(
+        store.app_storage().chat_presentation_version().unwrap(),
+        version
+    );
+    drop(store);
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let app = store.app_storage();
+    assert_eq!(
+        app.chat_presentation("11").unwrap(),
+        ChatPresentationRead::Ready(Box::new(expected))
+    );
+    assert_eq!(app.chat_presentation_version().unwrap(), version);
+    assert_eq!(
+        app.chat_presentation_dependents(&"bb".repeat(32), None)
             .unwrap(),
         ["11"]
     );
@@ -180,41 +193,42 @@ fn selected_value_reopens_without_mutation_and_keeps_activity() {
             .unwrap(),
         19
     );
-    assert!(store.pending_chat_presentation_inputs().unwrap().is_empty());
+    assert!(app.pending_chat_presentation_inputs().unwrap().is_empty());
 }
 #[test]
 fn source_generation_and_store_epoch_reject_stale_preparation() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "11");
     let other = SqliteAccountStorage::in_memory().unwrap();
     seed(&other, "11");
-    let old = store.chat_presentation_input("11").unwrap().unwrap();
+    let old = app.chat_presentation_input("11").unwrap().unwrap();
     let v = value("bb", "Old peer", 1);
     assert_eq!(
-        other.store_chat_presentation(&old, &v).unwrap(),
+        other
+            .app_storage()
+            .store_chat_presentation(&old, &v)
+            .unwrap(),
         ChatPresentationWrite::Stale
     );
-    store.store_chat_presentation(&old, &v).unwrap();
-    store
-        .set_chat_presentation_members("11", &["aa".repeat(32), "cc".repeat(32)])
+    app.store_chat_presentation(&old, &v).unwrap();
+    app.set_chat_presentation_members("11", &["aa".repeat(32), "cc".repeat(32)])
         .unwrap();
     assert_eq!(
-        store.chat_presentation("11").unwrap(),
+        app.chat_presentation("11").unwrap(),
         ChatPresentationRead::Pending
     );
     assert!(
-        store
-            .chat_presentation_dependents(&"bb".repeat(32), None)
+        app.chat_presentation_dependents(&"bb".repeat(32), None)
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        store.store_chat_presentation(&old, &v).unwrap(),
+        app.store_chat_presentation(&old, &v).unwrap(),
         ChatPresentationWrite::Stale
     );
-    let current = store.chat_presentation_input("11").unwrap().unwrap();
-    store
-        .store_chat_presentation(&current, &value("cc", "New peer", 2))
+    let current = app.chat_presentation_input("11").unwrap().unwrap();
+    app.store_chat_presentation(&current, &value("cc", "New peer", 2))
         .unwrap();
     store
         .lock()
@@ -225,14 +239,12 @@ fn source_generation_and_store_epoch_reject_stale_preparation() {
         )
         .unwrap();
     assert_eq!(
-        store
-            .store_chat_presentation(&current, &value("cc", "New peer", 2))
+        app.store_chat_presentation(&current, &value("cc", "New peer", 2))
             .unwrap(),
         ChatPresentationWrite::Stale
     );
     assert_eq!(
-        store
-            .chat_presentation_input("11")
+        app.chat_presentation_input("11")
             .unwrap()
             .unwrap()
             .group_name,
@@ -248,61 +260,64 @@ fn backfill_is_bounded_and_resumes_from_persisted_pending_rows() {
     for i in 0..57 {
         seed(&store, &format!("{i:04x}"));
     }
-    let first = store.pending_chat_presentation_inputs().unwrap();
+    let first = store
+        .app_storage()
+        .pending_chat_presentation_inputs()
+        .unwrap();
     assert_eq!(first.len(), 50);
     for input in first.iter().take(13) {
         store
+            .app_storage()
             .store_chat_presentation(input, &value("bb", "Peer", 0))
             .unwrap();
     }
     drop(store);
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-    let next = store.pending_chat_presentation_inputs().unwrap();
+    let app = store.app_storage();
+    let next = app.pending_chat_presentation_inputs().unwrap();
     assert_eq!(next.len(), 44);
     assert_eq!(next[0].group_id_hex, "000d");
     for input in next {
-        store
-            .store_chat_presentation(&input, &value("bb", "Peer", 0))
+        app.store_chat_presentation(&input, &value("bb", "Peer", 0))
             .unwrap();
     }
-    assert!(store.pending_chat_presentation_inputs().unwrap().is_empty());
+    assert!(app.pending_chat_presentation_inputs().unwrap().is_empty());
     seed(&store, "0000a"); // New work can sort before the previous completion boundary.
-    assert_eq!(store.pending_chat_presentation_inputs().unwrap().len(), 1);
+    assert_eq!(app.pending_chat_presentation_inputs().unwrap().len(), 1);
 }
 #[test]
 fn failed_dependency_write_rolls_back_value_and_revision() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "11");
-    let before = store.chat_presentation_version().unwrap();
+    let before = app.chat_presentation_version().unwrap();
     store.lock().unwrap().execute_batch("CREATE TRIGGER fail_dependency BEFORE INSERT ON chat_presentation_dependencies BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
-    let input = store.chat_presentation_input("11").unwrap().unwrap();
+    let input = app.chat_presentation_input("11").unwrap().unwrap();
     assert!(
-        store
-            .store_chat_presentation(&input, &value("bb", "Peer", 1))
+        app.store_chat_presentation(&input, &value("bb", "Peer", 1))
             .is_err()
     );
     assert_eq!(
-        store.chat_presentation("11").unwrap(),
+        app.chat_presentation("11").unwrap(),
         ChatPresentationRead::Pending
     );
-    assert_eq!(store.chat_presentation_version().unwrap(), before);
+    assert_eq!(app.chat_presentation_version().unwrap(), before);
 }
 #[test]
 fn profile_order_and_missing_unknown_format_are_explicit() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "11");
-    let input = store.chat_presentation_input("11").unwrap().unwrap();
-    store
-        .store_chat_presentation(&input, &value("bb", "New", 9))
+    let input = app.chat_presentation_input("11").unwrap().unwrap();
+    app.store_chat_presentation(&input, &value("bb", "New", 9))
         .unwrap();
     assert_eq!(
-        store
-            .store_chat_presentation(&input, &value("bb", "Old", 8))
+        app.store_chat_presentation(&input, &value("bb", "Old", 8))
             .unwrap(),
         ChatPresentationWrite::Stale
     );
     assert_eq!(
-        store.chat_presentation("absent").unwrap(),
+        app.chat_presentation("absent").unwrap(),
         ChatPresentationRead::Missing
     );
     let json = serde_json::to_value(Envelope {
@@ -318,15 +333,14 @@ fn profile_order_and_missing_unknown_format_are_explicit() {
             [serde_json::to_vec(&json).unwrap()],
         )
         .unwrap();
-    assert!(store.chat_presentation("11").is_err());
+    assert!(app.chat_presentation("11").is_err());
     assert_eq!(
-        store
-            .store_chat_presentation(&input, &value("bb", "Peer", 10))
+        app.store_chat_presentation(&input, &value("bb", "Peer", 10))
             .unwrap(),
         ChatPresentationWrite::Applied
     );
     assert!(matches!(
-        store.chat_presentation("11").unwrap(),
+        app.chat_presentation("11").unwrap(),
         ChatPresentationRead::Ready(_)
     ));
     store
@@ -337,18 +351,17 @@ fn profile_order_and_missing_unknown_format_are_explicit() {
             [br#"{"format":"private profile sentinel"}"#.as_slice()],
         )
         .unwrap();
-    let error = store.chat_presentation("11").unwrap_err();
+    let error = app.chat_presentation("11").unwrap_err();
     assert!(!format!("{error:?}").contains("private profile sentinel"));
-    let before_repair = store.chat_presentation_version().unwrap();
+    let before_repair = app.chat_presentation_version().unwrap();
     assert_eq!(
-        store
-            .store_chat_presentation(&input, &value("bb", "Peer", 11))
+        app.store_chat_presentation(&input, &value("bb", "Peer", 11))
             .unwrap(),
         ChatPresentationWrite::Applied
     );
-    assert!(store.chat_presentation_version().unwrap().revision > before_repair.revision);
+    assert!(app.chat_presentation_version().unwrap().revision > before_repair.revision);
     assert!(matches!(
-        store.chat_presentation("11").unwrap(),
+        app.chat_presentation("11").unwrap(),
         ChatPresentationRead::Ready(_)
     ));
     // Reset/deletion cannot leave a dependency behind.
@@ -358,8 +371,7 @@ fn profile_order_and_missing_unknown_format_are_explicit() {
         .execute("DELETE FROM account_groups WHERE group_id_hex = '11'", [])
         .unwrap();
     assert!(
-        store
-            .chat_presentation_dependents(&"bb".repeat(32), None)
+        app.chat_presentation_dependents(&"bb".repeat(32), None)
             .unwrap()
             .is_empty()
     );
@@ -369,7 +381,11 @@ fn profile_order_and_missing_unknown_format_are_explicit() {
 fn deleted_and_recreated_row_rejects_old_prepared_value() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "11");
-    let old = store.chat_presentation_input("11").unwrap().unwrap();
+    let old = store
+        .app_storage()
+        .chat_presentation_input("11")
+        .unwrap()
+        .unwrap();
     store
         .lock()
         .unwrap()
@@ -378,6 +394,7 @@ fn deleted_and_recreated_row_rejects_old_prepared_value() {
     seed(&store, "11");
     assert_eq!(
         store
+            .app_storage()
             .store_chat_presentation(&old, &value("bb", "Old display", 1))
             .unwrap(),
         ChatPresentationWrite::Stale
@@ -387,20 +404,19 @@ fn deleted_and_recreated_row_rejects_old_prepared_value() {
 #[test]
 fn bookkeeping_only_profile_progress_does_not_notify_or_allow_unversioned_rollback() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "11");
-    let input = store.chat_presentation_input("11").unwrap().unwrap();
-    store
-        .store_chat_presentation(&input, &value("bb", "Same name", 1))
+    let input = app.chat_presentation_input("11").unwrap().unwrap();
+    app.store_chat_presentation(&input, &value("bb", "Same name", 1))
         .unwrap();
-    let version = store.chat_presentation_version().unwrap();
-    store
-        .store_chat_presentation(&input, &value("bb", "Same name", 2))
+    let version = app.chat_presentation_version().unwrap();
+    app.store_chat_presentation(&input, &value("bb", "Same name", 2))
         .unwrap();
-    assert_eq!(store.chat_presentation_version().unwrap(), version);
+    assert_eq!(app.chat_presentation_version().unwrap(), version);
     let mut unversioned = value("bb", "Old name", 0);
     unversioned.profile_version = None;
     assert_eq!(
-        store.store_chat_presentation(&input, &unversioned).unwrap(),
+        app.store_chat_presentation(&input, &unversioned).unwrap(),
         ChatPresentationWrite::Stale
     );
 }
@@ -408,13 +424,13 @@ fn bookkeeping_only_profile_progress_does_not_notify_or_allow_unversioned_rollba
 #[test]
 fn unchanged_source_observations_keep_a_ready_selection_and_generation() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "11");
-    let input = store.chat_presentation_input("11").unwrap().unwrap();
+    let input = app.chat_presentation_input("11").unwrap().unwrap();
     let selected = value("bb", "Peer", 1);
-    store.store_chat_presentation(&input, &selected).unwrap();
-    let version = store.chat_presentation_version().unwrap();
-    store
-        .set_chat_presentation_members("11", &["BB".repeat(32), "aa".repeat(32)])
+    app.store_chat_presentation(&input, &selected).unwrap();
+    let version = app.chat_presentation_version().unwrap();
+    app.set_chat_presentation_members("11", &["BB".repeat(32), "aa".repeat(32)])
         .unwrap();
     store
         .lock()
@@ -425,13 +441,12 @@ fn unchanged_source_observations_keep_a_ready_selection_and_generation() {
         )
         .unwrap();
     assert_eq!(
-        store.chat_presentation("11").unwrap(),
+        app.chat_presentation("11").unwrap(),
         ChatPresentationRead::Ready(Box::new(selected))
     );
-    assert_eq!(store.chat_presentation_version().unwrap(), version);
+    assert_eq!(app.chat_presentation_version().unwrap(), version);
     assert_eq!(
-        store
-            .chat_presentation_input("11")
+        app.chat_presentation_input("11")
             .unwrap()
             .unwrap()
             .source_version,
@@ -446,10 +461,17 @@ fn same_subject_source_changes_reopen_as_last_known_and_identical_repair_does_no
     let key = SqlCipherKey::new("last known fixture key").unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     seed(&store, "11");
-    let input = store.chat_presentation_input("11").unwrap().unwrap();
+    let input = store
+        .app_storage()
+        .chat_presentation_input("11")
+        .unwrap()
+        .unwrap();
     let selected = value("bb", "Peer", 1);
-    store.store_chat_presentation(&input, &selected).unwrap();
-    let version = store.chat_presentation_version().unwrap();
+    store
+        .app_storage()
+        .store_chat_presentation(&input, &selected)
+        .unwrap();
+    let version = store.app_storage().chat_presentation_version().unwrap();
     store
         .lock()
         .unwrap()
@@ -459,7 +481,9 @@ fn same_subject_source_changes_reopen_as_last_known_and_identical_repair_does_no
         )
         .unwrap();
     drop(store);
-    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let store = SqliteAccountStorage::open_encrypted(&path, &key)
+        .unwrap()
+        .app_storage();
     let mut last_known = selected.clone();
     last_known.presentation.resolution = PresentationResolution::LastKnown;
     assert_eq!(
@@ -488,10 +512,12 @@ fn malformed_member_identity_clears_peer_evidence() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "11");
     store
+        .app_storage()
         .set_chat_presentation_members("11", &["aa".repeat(32), "bb".repeat(16)])
         .unwrap();
     assert!(
         store
+            .app_storage()
             .chat_presentation_input("11")
             .unwrap()
             .unwrap()
@@ -500,7 +526,7 @@ fn malformed_member_identity_clears_peer_evidence() {
     );
 }
 
-fn save_selected(store: &SqliteAccountStorage, selected: &StoredChatPresentation) {
+fn save_selected(store: &SqliteAppStorage, selected: &StoredChatPresentation) {
     let input = store.chat_presentation_input("11").unwrap().unwrap();
     store.store_chat_presentation(&input, selected).unwrap();
 }
@@ -523,34 +549,35 @@ fn put_avatar_component(store: &SqliteAccountStorage, url: &str) {
 #[test]
 fn avatar_component_insert_replace_clear_and_delete_keep_work_and_display_consistent() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "11");
     let peer = value("bb", "Peer", 1);
-    save_selected(&store, &peer);
-    let initial = store.chat_presentation_version().unwrap();
+    save_selected(&app, &peer);
+    let initial = app.chat_presentation_version().unwrap();
     put_avatar_component(&store, "https://example.com/first.png");
-    assert_eq!(store.pending_chat_presentation_inputs().unwrap().len(), 1);
-    let ChatPresentationRead::Ready(retained) = store.chat_presentation("11").unwrap() else {
+    assert_eq!(app.pending_chat_presentation_inputs().unwrap().len(), 1);
+    let ChatPresentationRead::Ready(retained) = app.chat_presentation("11").unwrap() else {
         panic!("lost peer display");
     };
     assert_eq!(
         retained.presentation.resolution,
         PresentationResolution::LastKnown
     );
-    assert_eq!(store.chat_presentation_version().unwrap(), initial);
+    assert_eq!(app.chat_presentation_version().unwrap(), initial);
     let mut group = peer.clone();
     group.presentation.avatar_source = PresentationSource::Group;
     group.presentation.avatar = SelectedAvatar::RemoteImage {
         url: "https://example.com/first.png".into(),
         cache_key: "group fixture".into(),
     };
-    save_selected(&store, &group);
-    let ready = store.chat_presentation_version().unwrap();
+    save_selected(&app, &group);
+    let ready = app.chat_presentation_version().unwrap();
     put_avatar_component(&store, "https://example.com/first.png");
-    assert!(store.pending_chat_presentation_inputs().unwrap().is_empty());
+    assert!(app.pending_chat_presentation_inputs().unwrap().is_empty());
     put_avatar_component(&store, "https://example.com/second.png");
-    assert_eq!(store.pending_chat_presentation_inputs().unwrap().len(), 1);
-    assert_eq!(store.chat_presentation_version().unwrap(), ready);
-    let ChatPresentationRead::Ready(retained) = store.chat_presentation("11").unwrap() else {
+    assert_eq!(app.pending_chat_presentation_inputs().unwrap().len(), 1);
+    assert_eq!(app.chat_presentation_version().unwrap(), ready);
+    let ChatPresentationRead::Ready(retained) = app.chat_presentation("11").unwrap() else {
         panic!("lost replacement display");
     };
     assert!(retained.presentation.avatar == group.presentation.avatar);
@@ -558,23 +585,22 @@ fn avatar_component_insert_replace_clear_and_delete_keep_work_and_display_consis
         url: "https://example.com/second.png".into(),
         cache_key: "second fixture".into(),
     };
-    save_selected(&store, &group);
+    save_selected(&app, &group);
     // Clearing uses a valid encoded absent component, not just deletion of its row.
     put_avatar_component(&store, "");
     assert_eq!(
-        store.chat_presentation("11").unwrap(),
+        app.chat_presentation("11").unwrap(),
         ChatPresentationRead::Pending
     );
     assert!(
-        store
-            .chat_presentation_dependents(&"bb".repeat(32), None)
+        app.chat_presentation_dependents(&"bb".repeat(32), None)
             .unwrap()
             .is_empty()
     );
-    assert_eq!(store.pending_chat_presentation_inputs().unwrap().len(), 1);
-    save_selected(&store, &peer);
+    assert_eq!(app.pending_chat_presentation_inputs().unwrap().len(), 1);
+    save_selected(&app, &peer);
     put_avatar_component(&store, "https://example.com/second.png");
-    save_selected(&store, &group);
+    save_selected(&app, &group);
     store
         .lock()
         .unwrap()
@@ -584,10 +610,10 @@ fn avatar_component_insert_replace_clear_and_delete_keep_work_and_display_consis
         )
         .unwrap();
     assert_eq!(
-        store.chat_presentation("11").unwrap(),
+        app.chat_presentation("11").unwrap(),
         ChatPresentationRead::Pending
     );
-    assert_eq!(store.pending_chat_presentation_inputs().unwrap().len(), 1);
+    assert_eq!(app.pending_chat_presentation_inputs().unwrap().len(), 1);
 }
 #[test]
 fn removing_group_name_or_required_image_material_never_returns_removed_display() {
@@ -599,13 +625,14 @@ fn removing_group_name_or_required_image_material_never_returns_removed_display(
         "image_upload_key_hex",
     ] {
         let store = SqliteAccountStorage::in_memory().unwrap();
+        let app = store.app_storage();
         seed(&store, "11");
         store.lock().unwrap().execute(
             "UPDATE account_groups SET profile_name='Custom', image_hash_hex=?1, image_key_hex=?2,
                 image_nonce_hex=?3, image_upload_key_hex=?4 WHERE group_id_hex='11'",
             params!["01".repeat(32), "02".repeat(32), "03".repeat(12), "04".repeat(32)],
         ).unwrap();
-        let input = store.chat_presentation_input("11").unwrap().unwrap();
+        let input = app.chat_presentation_input("11").unwrap().unwrap();
         let mut selected = value("bb", "Custom", 1);
         selected.presentation.title_source = PresentationSource::Group;
         selected.presentation.avatar_source = PresentationSource::Group;
@@ -613,7 +640,7 @@ fn removing_group_name_or_required_image_material_never_returns_removed_display(
             image: input.avatar.unwrap(),
             cache_key: "group fixture".into(),
         };
-        save_selected(&store, &selected);
+        save_selected(&app, &selected);
         store
             .lock()
             .unwrap()
@@ -623,60 +650,58 @@ fn removing_group_name_or_required_image_material_never_returns_removed_display(
             )
             .unwrap();
         assert_eq!(
-            store.chat_presentation("11").unwrap(),
+            app.chat_presentation("11").unwrap(),
             ChatPresentationRead::Pending,
             "{column}"
         );
-        assert_eq!(store.pending_chat_presentation_inputs().unwrap().len(), 1);
+        assert_eq!(app.pending_chat_presentation_inputs().unwrap().len(), 1);
     }
 }
 
 #[test]
 fn catchup_checkpoint_and_batch_roll_back_together_and_fence_old_workers() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "11");
     seed(&store, "22");
-    let initial = store.chat_presentation_checkpoint().unwrap();
+    let initial = app.chat_presentation_checkpoint().unwrap();
     let mut next = initial.state.clone();
     next.shared_epoch = vec![3; 16];
-    let first = store.chat_presentation_input("11").unwrap().unwrap();
-    let second = store.chat_presentation_input("22").unwrap().unwrap();
+    let first = app.chat_presentation_input("11").unwrap().unwrap();
+    let second = app.chat_presentation_input("22").unwrap().unwrap();
     assert!(
-        store
-            .commit_chat_presentation_batch(
-                &initial,
-                &next,
-                &[
-                    (first.clone(), value("bb", "First", 1)),
-                    (second, value("cc", "Invalid peer", 1))
-                ]
-            )
-            .is_err()
+        app.commit_chat_presentation_batch(
+            &initial,
+            &next,
+            &[
+                (first.clone(), value("bb", "First", 1)),
+                (second, value("cc", "Invalid peer", 1))
+            ]
+        )
+        .is_err()
     );
     assert!(matches!(
-        store.chat_presentation("11").unwrap(),
+        app.chat_presentation("11").unwrap(),
         ChatPresentationRead::Pending
     ));
     assert_eq!(
-        store.chat_presentation_checkpoint().unwrap().generation,
+        app.chat_presentation_checkpoint().unwrap().generation,
         initial.generation
     );
     assert!(
-        store
-            .commit_chat_presentation_batch(
-                &initial,
-                &next,
-                &[(first.clone(), value("bb", "Current", 2))]
-            )
-            .unwrap()
+        app.commit_chat_presentation_batch(
+            &initial,
+            &next,
+            &[(first.clone(), value("bb", "Current", 2))]
+        )
+        .unwrap()
     );
     assert!(
-        !store
-            .commit_chat_presentation_batch(&initial, &next, &[(first, value("bb", "Old", 1))])
+        !app.commit_chat_presentation_batch(&initial, &next, &[(first, value("bb", "Old", 1))])
             .unwrap()
     );
     assert_eq!(
-        store.chat_presentation("11").unwrap(),
+        app.chat_presentation("11").unwrap(),
         ChatPresentationRead::Ready(Box::new(value("bb", "Current", 2)))
     );
 }
@@ -684,6 +709,7 @@ fn catchup_checkpoint_and_batch_roll_back_together_and_fence_old_workers() {
 #[test]
 fn initialization_completes_an_upsert_over_an_existing_chat_row() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "11");
     // Inject overlapping queued/existing state defensively. Normal snapshot
     // pruning cascades the chat row; it does not create this overlap.
@@ -692,40 +718,36 @@ fn initialization_completes_an_upsert_over_an_existing_chat_row() {
         .unwrap()
         .execute("INSERT INTO chat_presentation_row_work VALUES ('11')", [])
         .unwrap();
-    store
-        .refresh_chat_list_row(&"aa".repeat(32), "11", &|_, _| false)
+    app.refresh_chat_list_row(&"aa".repeat(32), "11", &|_, _| false)
         .unwrap();
     assert_eq!(
-        store.pending_chat_presentation_rows().unwrap(),
+        app.pending_chat_presentation_rows().unwrap(),
         ["11"],
         "an upsert alone does not run the INSERT-only completion trigger"
     );
-    let row_epoch = store
+    let row_epoch = app
         .chat_presentation_input("11")
         .unwrap()
         .unwrap()
         .row_epoch;
     assert!(
-        store
-            .initialize_chat_presentation_row(&"aa".repeat(32), "11", &|_, _| false)
+        app.initialize_chat_presentation_row(&"aa".repeat(32), "11", &|_, _| false)
             .unwrap()
     );
-    assert!(store.pending_chat_presentation_rows().unwrap().is_empty());
+    assert!(app.pending_chat_presentation_rows().unwrap().is_empty());
     assert_eq!(
-        store
-            .chat_presentation_input("11")
+        app.chat_presentation_input("11")
             .unwrap()
             .unwrap()
             .row_epoch,
         row_epoch
     );
-    let row = store.chat_list_row("11").unwrap();
+    let row = app.chat_list_row("11").unwrap();
     assert!(
-        !store
-            .initialize_chat_presentation_row(&"aa".repeat(32), "11", &|_, _| false)
+        !app.initialize_chat_presentation_row(&"aa".repeat(32), "11", &|_, _| false)
             .unwrap()
     );
-    assert_eq!(store.chat_list_row("11").unwrap(), row);
+    assert_eq!(app.chat_list_row("11").unwrap(), row);
 }
 
 #[test]
@@ -746,49 +768,56 @@ fn initialization_completion_failure_rolls_back_refresh_and_retries_after_reopen
              BEGIN SELECT RAISE({fail_with}); END;"
             ))
             .unwrap();
-        let before = store.chat_list_row("11").unwrap();
+        let before = store.app_storage().chat_list_row("11").unwrap();
         assert!(
             store
+                .app_storage()
                 .initialize_chat_presentation_row(&"aa".repeat(32), "11", &|_, _| false)
                 .is_err()
         );
         assert_eq!(
-            store.chat_list_row("11").unwrap(),
+            store.app_storage().chat_list_row("11").unwrap(),
             before,
             "refresh and completion must roll back together"
         );
-        assert_eq!(store.pending_chat_presentation_rows().unwrap(), ["11"]);
+        assert_eq!(
+            store
+                .app_storage()
+                .pending_chat_presentation_rows()
+                .unwrap(),
+            ["11"]
+        );
         drop(store);
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        assert_eq!(store.pending_chat_presentation_rows().unwrap(), ["11"]);
-        assert_eq!(store.chat_list_row("11").unwrap(), before);
+        let app = store.app_storage();
+        assert_eq!(app.pending_chat_presentation_rows().unwrap(), ["11"]);
+        assert_eq!(app.chat_list_row("11").unwrap(), before);
         store
             .lock()
             .unwrap()
             .execute_batch("DROP TRIGGER prevent_completion")
             .unwrap();
         assert!(
-            store
-                .initialize_chat_presentation_row(&"aa".repeat(32), "11", &|_, _| false)
+            app.initialize_chat_presentation_row(&"aa".repeat(32), "11", &|_, _| false)
                 .unwrap()
         );
-        assert!(store.pending_chat_presentation_rows().unwrap().is_empty());
-        assert_ne!(store.chat_list_row("11").unwrap(), before);
+        assert!(app.pending_chat_presentation_rows().unwrap().is_empty());
+        assert_ne!(app.chat_list_row("11").unwrap(), before);
     }
 }
 
 #[test]
 fn initialization_completes_a_new_row_and_ignores_deleted_work() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     store.lock().unwrap().execute("INSERT INTO account_groups(group_id_hex,endpoint,profile_name,updated_at) VALUES ('11','fixture','New',7)", []).unwrap();
-    assert_eq!(store.pending_chat_presentation_rows().unwrap(), ["11"]);
+    assert_eq!(app.pending_chat_presentation_rows().unwrap(), ["11"]);
     assert!(
-        store
-            .initialize_chat_presentation_row(&"aa".repeat(32), "11", &|_, _| false)
+        app.initialize_chat_presentation_row(&"aa".repeat(32), "11", &|_, _| false)
             .unwrap()
     );
-    assert!(store.chat_list_row("11").unwrap().is_some());
-    assert!(store.pending_chat_presentation_rows().unwrap().is_empty());
+    assert!(app.chat_list_row("11").unwrap().is_some());
+    assert!(app.pending_chat_presentation_rows().unwrap().is_empty());
     store.lock().unwrap().execute("INSERT INTO account_groups(group_id_hex,endpoint,profile_name,updated_at) VALUES ('22','fixture','Removed',7)", []).unwrap();
     store
         .lock()
@@ -796,36 +825,34 @@ fn initialization_completes_a_new_row_and_ignores_deleted_work() {
         .execute("DELETE FROM account_groups WHERE group_id_hex='22'", [])
         .unwrap();
     assert!(
-        !store
-            .initialize_chat_presentation_row(&"aa".repeat(32), "22", &|_, _| false)
+        !app.initialize_chat_presentation_row(&"aa".repeat(32), "22", &|_, _| false)
             .unwrap()
     );
-    assert!(store.chat_list_row("22").unwrap().is_none());
+    assert!(app.chat_list_row("22").unwrap().is_none());
 }
 
 #[test]
 fn presented_snapshot_is_complete_read_only_and_clears_replaced_peer() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "11");
     let query = crate::ChatListQuery {
         include_archived: true,
     };
     assert!(
-        store
-            .read_presented_chat_list(query.clone(), None)
+        app.read_presented_chat_list(query.clone(), None)
             .unwrap()
             .is_none()
     );
-    let input = store.chat_presentation_input("11").unwrap().unwrap();
-    store
-        .store_chat_presentation(&input, &value("bb", "Peer", 1))
+    let input = app.chat_presentation_input("11").unwrap().unwrap();
+    app.store_chat_presentation(&input, &value("bb", "Peer", 1))
         .unwrap();
     let before: i64 = store
         .lock()
         .unwrap()
         .query_row("SELECT total_changes()", [], |r| r.get(0))
         .unwrap();
-    let snapshot = store
+    let snapshot = app
         .read_presented_chat_list(query.clone(), None)
         .unwrap()
         .unwrap();
@@ -834,11 +861,10 @@ fn presented_snapshot_is_complete_read_only_and_clears_replaced_peer() {
     assert_eq!(snapshot.rows[0].presentation.peer_id, Some("bb".repeat(32)));
     assert_eq!(
         snapshot.presentation_version,
-        store.chat_presentation_version().unwrap()
+        app.chat_presentation_version().unwrap()
     );
     assert!(
-        store
-            .read_presented_chat_list(query.clone(), Some("22"))
+        app.read_presented_chat_list(query.clone(), Some("22"))
             .unwrap()
             .unwrap()
             .rows
@@ -850,14 +876,10 @@ fn presented_snapshot_is_complete_read_only_and_clears_replaced_peer() {
         .query_row("SELECT total_changes()", [], |r| r.get(0))
         .unwrap();
     assert_eq!(before, after, "ready reads must not repair or write");
-    store
-        .set_chat_presentation_members("11", &["aa".repeat(32), "cc".repeat(32)])
+    app.set_chat_presentation_members("11", &["aa".repeat(32), "cc".repeat(32)])
         .unwrap();
     assert!(
-        store
-            .read_presented_chat_list(query, None)
-            .unwrap()
-            .is_none(),
+        app.read_presented_chat_list(query, None).unwrap().is_none(),
         "a new peer must not inherit the old selection"
     );
 }
@@ -865,24 +887,25 @@ fn presented_snapshot_is_complete_read_only_and_clears_replaced_peer() {
 #[test]
 fn dirty_fallback_remains_fallback_in_both_presentation_reads() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "11");
-    let input = store.chat_presentation_input("11").unwrap().unwrap();
+    let input = app.chat_presentation_input("11").unwrap().unwrap();
     let mut fallback = value("bb", "Peer", 1);
     fallback.presentation.resolution = PresentationResolution::Fallback;
     fallback.presentation.title_source = PresentationSource::PeerFallback;
-    store.store_chat_presentation(&input, &fallback).unwrap();
+    app.store_chat_presentation(&input, &fallback).unwrap();
     store.lock().unwrap().execute(
         "UPDATE chat_list_rows SET presentation_source_revision = presentation_source_revision + 1",
         [],
     ).unwrap();
-    let ChatPresentationRead::Ready(retained) = store.chat_presentation("11").unwrap() else {
+    let ChatPresentationRead::Ready(retained) = app.chat_presentation("11").unwrap() else {
         panic!("same-subject fallback remains renderable");
     };
     assert_eq!(
         retained.presentation.resolution,
         PresentationResolution::Fallback
     );
-    let snapshot = store
+    let snapshot = app
         .read_presented_chat_list(
             crate::ChatListQuery {
                 include_archived: true,
@@ -900,6 +923,7 @@ fn dirty_fallback_remains_fallback_in_both_presentation_reads() {
 #[test]
 fn selected_avatar_and_demand_commit_atomically_even_for_pending_invitations() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "11");
     store
         .lock()
@@ -909,15 +933,15 @@ fn selected_avatar_and_demand_commit_atomically_even_for_pending_invitations() {
             [],
         )
         .unwrap();
-    let input = store.chat_presentation_input("11").unwrap().unwrap();
+    let input = app.chat_presentation_input("11").unwrap().unwrap();
     let mut selected = value("bb", "Invite", 1);
     selected.presentation.avatar = SelectedAvatar::RemoteImage {
         url: "https://example.com/a.png".into(),
         cache_key: "a".into(),
     };
-    store.store_chat_presentation(&input, &selected).unwrap();
-    let reference = store.chat_avatar_reference("11").unwrap().unwrap();
-    let job = store.claim_avatar_acquisition(0).unwrap().unwrap();
+    app.store_chat_presentation(&input, &selected).unwrap();
+    let reference = app.chat_avatar_reference("11").unwrap().unwrap();
+    let job = app.claim_avatar_acquisition(0).unwrap().unwrap();
     assert_eq!(job.reference, reference);
     store.lock().unwrap().execute_batch("CREATE TRIGGER reject_avatar_demand BEFORE INSERT ON avatar_acquisition BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
     let mut changed = selected.clone();
@@ -925,23 +949,21 @@ fn selected_avatar_and_demand_commit_atomically_even_for_pending_invitations() {
         url: "https://example.com/b.png".into(),
         cache_key: "b".into(),
     };
-    assert!(store.store_chat_presentation(&input, &changed).is_err());
+    assert!(app.store_chat_presentation(&input, &changed).is_err());
     assert_eq!(
-        store.chat_presentation("11").unwrap(),
+        app.chat_presentation("11").unwrap(),
         ChatPresentationRead::Ready(Box::new(selected))
     );
-    assert_eq!(store.chat_avatar_reference("11").unwrap(), Some(reference));
+    assert_eq!(app.chat_avatar_reference("11").unwrap(), Some(reference));
     store
         .lock()
         .unwrap()
         .execute_batch("DROP TRIGGER reject_avatar_demand;")
         .unwrap();
-    store.store_chat_presentation(&input, &changed).unwrap();
+    app.store_chat_presentation(&input, &changed).unwrap();
     let image = crate::AvatarImage::new(vec![1; 8], crate::AvatarImageFormat::Png, 1, 1).unwrap();
     assert_eq!(
-        store
-            .complete_avatar_acquisition(&job, &image, None)
-            .unwrap(),
+        app.complete_avatar_acquisition(&job, &image, None).unwrap(),
         crate::AvatarPublishResult::Superseded
     );
 }
@@ -951,13 +973,18 @@ fn avatar_ownership_does_not_limit_opaque_group_id_length() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let group = "ab".repeat(300);
     seed(&store, &group);
-    let input = store.chat_presentation_input(&group).unwrap().unwrap();
+    let input = store
+        .app_storage()
+        .chat_presentation_input(&group)
+        .unwrap()
+        .unwrap();
     let mut selected = value("bb", "Group", 1);
     selected.presentation.avatar = SelectedAvatar::RemoteImage {
         url: "https://example.com/avatar.png".into(),
         cache_key: "source".into(),
     };
     store
+        .app_storage()
         .store_chat_presentation(&input, &selected)
         .expect("avatar ownership must not impose a new MLS group ID bound");
 }
@@ -968,15 +995,15 @@ fn chat_list_draft_preview_reopens_from_encrypted_store_without_projection_write
     let path = temp.path().join("draft-preview.db");
     let key = SqlCipherKey::new("draft preview fixture key").unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let app = store.app_storage();
     seed(&store, "11");
-    let input = store.chat_presentation_input("11").unwrap().unwrap();
-    store
-        .store_chat_presentation(&input, &value("bb", "Peer", 1))
+    let input = app.chat_presentation_input("11").unwrap().unwrap();
+    app.store_chat_presentation(&input, &value("bb", "Peer", 1))
         .unwrap();
-    store
-        .save_message_draft("11", "persisted draft", None, &[])
+    app.save_message_draft("11", "persisted draft", None, &[])
         .unwrap();
     store.close().unwrap();
+    drop(app);
     drop(store);
     let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let before: i64 = reopened
@@ -985,6 +1012,7 @@ fn chat_list_draft_preview_reopens_from_encrypted_store_without_projection_write
         .query_row("SELECT total_changes()", [], |r| r.get(0))
         .unwrap();
     let snapshot = reopened
+        .app_storage()
         .read_presented_chat_list(
             crate::ChatListQuery {
                 include_archived: true,

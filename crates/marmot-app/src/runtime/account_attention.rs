@@ -150,11 +150,11 @@ async fn read_accounts(
                 // One bounded upgrade/import batch. No selected presentation,
                 // full-list warm, timeline DTOs, MLS session or network needed.
                 progressed = crate::chat_presentation::maintenance::prepare_base_rows(
-                    &storage,
+                    &storage.app_storage(),
                     &current.account_id_hex,
                 )?;
                 Ok(AccountAttentionState::Ready(
-                    storage.account_attention_total()?,
+                    storage.app_storage().account_attention_total()?,
                 ))
             };
             let state = match read() {

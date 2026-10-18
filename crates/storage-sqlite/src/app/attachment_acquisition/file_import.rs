@@ -2,7 +2,7 @@
 use super::*;
 
 struct Reservation<'a> {
-    store: &'a SqliteAccountStorage,
+    store: &'a SqliteAppStorage,
     token: &'a [u8],
     nonce: Vec<u8>,
     published: bool,
@@ -25,14 +25,14 @@ impl Drop for Reservation<'_> {
             Ok(())
         });
         if result.is_err() {
-            tracing::debug!(target: "storage_sqlite::attachments", method = "file_import_cleanup",
+            tracing::debug!(target: "storage_sqlite::app::attachment_acquisition::file_import", method = "file_import_cleanup",
                 "unpublished import cleanup deferred");
         }
     }
 }
 
 pub(super) fn complete(
-    store: &SqliteAccountStorage,
+    store: &SqliteAppStorage,
     job: &AttachmentAcquisition,
     reader: &mut dyn std::io::Read,
     len: u64,

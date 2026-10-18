@@ -27,6 +27,7 @@ async fn group_fixture() -> (tempfile::TempDir, MarmotApp, GroupId, GroupId) {
     app.save_state(&state).unwrap();
     let storage = app.account_storage("alice").unwrap();
     storage
+        .app_storage()
         .set_group_self_membership(&id_hex, SelfMembership::Removed)
         .unwrap();
     (dir, app, group_id, other_id)

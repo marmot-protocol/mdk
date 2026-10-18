@@ -18,6 +18,7 @@ impl SqlitePublisherSequenceStore {
 impl PublisherSequenceStore for SqlitePublisherSequenceStore {
     fn load(&self, context_id: &[u8; 32]) -> Result<Option<PublisherSequenceSnapshot>, String> {
         self.storage
+            .app_storage()
             .agent_stream_publisher_state(context_id)
             .map_err(|err| err.to_string())?
             .map(|state| {
@@ -48,6 +49,7 @@ impl PublisherSequenceStore for SqlitePublisherSequenceStore {
             .checked_sub(reservation.expected.chunk_count)
             .ok_or_else(|| "publisher transcript count regressed".to_owned())?;
         self.storage
+            .app_storage()
             .reserve_agent_stream_publisher_records(AgentStreamPublisherReservationRequest {
                 context_id,
                 initial_transcript_hash,
@@ -64,6 +66,7 @@ impl PublisherSequenceStore for SqlitePublisherSequenceStore {
 
     fn confirm(&self, context_id: &[u8; 32], token: &[u8; 16]) -> Result<(), String> {
         self.storage
+            .app_storage()
             .confirm_agent_stream_publisher_reservation(context_id, token)
             .map_err(|err| err.to_string())
     }

@@ -238,21 +238,23 @@ async fn send_history_timings() {
     for count in [0, 100, 1_000, 10_000] {
         cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
             for index in seeded..count {
-                storage.record_app_event(&storage_sqlite::StoredAppEvent {
-                    group_id_hex: group_hex.clone(),
-                    message_id_hex: format!("{index:064x}"),
-                    source_message_id_hex: Some(format!("{:064x}", index + 100_000)),
-                    source_epoch: Some(epoch),
-                    direction: "received".into(),
-                    sender: "ee".repeat(32),
-                    plaintext: "historical message".into(),
-                    kind: MARMOT_APP_EVENT_KIND_CHAT,
-                    tags: Vec::new(),
-                    recorded_at: now - 100_000 + index,
-                    received_at: now - 100_000 + index,
-                    origin_commit_id: None,
-                    moderation_grant: false,
-                })?;
+                storage
+                    .app_storage()
+                    .record_app_event(&storage_sqlite::StoredAppEvent {
+                        group_id_hex: group_hex.clone(),
+                        message_id_hex: format!("{index:064x}"),
+                        source_message_id_hex: Some(format!("{:064x}", index + 100_000)),
+                        source_epoch: Some(epoch),
+                        direction: "received".into(),
+                        sender: "ee".repeat(32),
+                        plaintext: "historical message".into(),
+                        kind: MARMOT_APP_EVENT_KIND_CHAT,
+                        tags: Vec::new(),
+                        recorded_at: now - 100_000 + index,
+                        received_at: now - 100_000 + index,
+                        origin_commit_id: None,
+                        moderation_grant: false,
+                    })?;
             }
             Ok::<_, cgka_traits::StorageError>(())
         })
@@ -399,6 +401,7 @@ fn uploaded_prepared_group_image_retry_recovers_from_engine_without_projection()
         let component_data = app
             .account_storage("alice")
             .unwrap()
+            .app_storage()
             .prepared_group_image_upload(&staged.upload_id)
             .unwrap()
             .unwrap()
@@ -546,7 +549,7 @@ pub(crate) struct ScriptedPushRelayClient {
 
 #[derive(Default)]
 pub(crate) struct MemberResolutionDirectoryFetcher {
-    pub(crate) requests: std::sync::Mutex<Vec<crate::relay_plane::DirectoryFetchRequest>>,
+    pub(crate) requests: std::sync::Mutex<Vec<transport_nostr::DirectoryFetchRequest>>,
     events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     events_by_endpoint:
         std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
@@ -598,11 +601,11 @@ impl MemberResolutionDirectoryFetcher {
 }
 
 #[async_trait]
-impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher {
+impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher {
     async fn fetch_directory_events(
         &self,
-        request: crate::relay_plane::DirectoryFetchRequest,
-    ) -> Result<Vec<crate::relay_plane::DirectoryRelayEventRecord>, String> {
+        request: transport_nostr::DirectoryFetchRequest,
+    ) -> Result<Vec<transport_nostr::DirectoryRelayEventRecord>, String> {
         self.requests.lock().unwrap().push(request.clone());
         let gate = {
             let mut fetch_gate = self.fetch_gate.lock().unwrap();
@@ -687,7 +690,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
                 .unwrap()
                 .iter()
                 .filter(|event| matches_query(event))
-                .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
+                .map(|event| transport_nostr::DirectoryRelayEventRecord {
                     endpoints: request.endpoints.clone(),
                     event: event.clone(),
                 })
@@ -702,7 +705,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
                     .into_iter()
                     .flatten()
                     .filter(|event| matches_query(event))
-                    .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
+                    .map(|event| transport_nostr::DirectoryRelayEventRecord {
                         endpoints: vec![endpoint.clone()],
                         event: event.clone(),
                     })
@@ -712,15 +715,15 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
 
     async fn fetch_directory_events_with_completion(
         &self,
-        request: crate::relay_plane::DirectoryFetchRequest,
-    ) -> Result<crate::relay_plane::DirectoryFetchOutcome, String> {
+        request: transport_nostr::DirectoryFetchRequest,
+    ) -> Result<transport_nostr::DirectoryFetchOutcome, String> {
         if self
             .reject_multi_author_incomplete
             .load(std::sync::atomic::Ordering::SeqCst)
             && request.queries.iter().any(|query| query.authors.len() > 1)
         {
             self.requests.lock().unwrap().push(request);
-            return Ok(crate::relay_plane::DirectoryFetchOutcome::default());
+            return Ok(transport_nostr::DirectoryFetchOutcome::default());
         }
         let incomplete_kind = *self.incomplete_query_kind.lock().unwrap();
         let complete = !self
@@ -748,7 +751,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
                 .cmp(&a.event.created_at)
                 .then_with(|| b.event.id.cmp(&a.event.id))
         });
-        let mut retained = Vec::<crate::relay_plane::DirectoryRelayEventRecord>::new();
+        let mut retained = Vec::<transport_nostr::DirectoryRelayEventRecord>::new();
         let mut complete = complete;
         for endpoint in &endpoints {
             for query in &queries {
@@ -769,7 +772,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
                             existing.endpoints.push(endpoint.clone());
                         }
                     } else {
-                        retained.push(crate::relay_plane::DirectoryRelayEventRecord {
+                        retained.push(transport_nostr::DirectoryRelayEventRecord {
                             endpoints: vec![endpoint.clone()],
                             event: record.event.clone(),
                         });
@@ -777,7 +780,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for MemberResolutionDirectoryFetc
                 }
             }
         }
-        Ok(crate::relay_plane::DirectoryFetchOutcome {
+        Ok(transport_nostr::DirectoryFetchOutcome {
             records: retained,
             complete,
         })
@@ -1038,11 +1041,11 @@ impl ScriptedPushRelayClient {
 // Directory reads must use the same simulated relay publications as writes;
 // invitation tests can no longer rely on a local KeyPackage cache shortcut.
 #[async_trait]
-impl crate::relay_plane::DirectoryRelayFetcher for ScriptedPushRelayClient {
+impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
     async fn fetch_directory_events(
         &self,
-        request: crate::relay_plane::DirectoryFetchRequest,
-    ) -> Result<Vec<crate::relay_plane::DirectoryRelayEventRecord>, String> {
+        request: transport_nostr::DirectoryFetchRequest,
+    ) -> Result<Vec<transport_nostr::DirectoryRelayEventRecord>, String> {
         Ok(self
             .published_events
             .lock()
@@ -1050,7 +1053,7 @@ impl crate::relay_plane::DirectoryRelayFetcher for ScriptedPushRelayClient {
             .iter()
             .filter(|event| request.queries.iter().any(|query| query.matches(event)))
             .cloned()
-            .map(|event| crate::relay_plane::DirectoryRelayEventRecord {
+            .map(|event| transport_nostr::DirectoryRelayEventRecord {
                 endpoints: request.endpoints.clone(),
                 event,
             })
@@ -1410,7 +1413,14 @@ pub(crate) fn bounded_epoch_backfill_config() -> MarmotAppConfig {
 /// deadline instead of bypassing the automatic seam or waiting in wall-clock.
 fn expire_epoch_backfill_retry_cooldown(client: &mut crate::AppClient) {
     let storage = client.app.account_storage(&client.state.label).unwrap();
-    assert!(storage.recovery_retry_state().unwrap().attempt_serial > 0);
+    assert!(
+        storage
+            .app_storage()
+            .recovery_retry_state()
+            .unwrap()
+            .attempt_serial
+            > 0
+    );
     client.recovery_owner.test_advance_to_retry(&storage);
     // The helper advances by whole milliseconds from a monotonic remainder.
     // Cross the boundary even when that remainder was truncated below 1 ms.
@@ -1721,7 +1731,7 @@ fn catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
             .unwrap()
             .unwrap()
             .unwrap();
-        let storage = app.account_storage("alice").unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
         let retry = storage.recovery_retry_state().unwrap();
         assert_eq!(
             relay.unfloored_account_subscription_count(),
@@ -2090,7 +2100,7 @@ fn recovery_warning_requires_qualified_local_observations_and_survives_local_com
                 .automatic_recovery_failed
         );
         client.persist_epoch_stall_evidence([&group_id]);
-        let storage = app.account_storage("alice").unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
         let mut permit = crate::client::recovery::ExplicitRecoveryPermit::default();
         let grant = client
             .authorize_account_recovery(
@@ -2205,6 +2215,7 @@ fn recovery_warning_requires_qualified_local_observations_and_survives_local_com
         assert!(
             app.account_storage("alice")
                 .unwrap()
+                .app_storage()
                 .epoch_stall_evidence()
                 .unwrap()
                 .is_empty()
@@ -2235,6 +2246,7 @@ async fn recovery_warning_is_hidden_for_terminal_groups_but_not_repairable_group
     let storage = app.account_storage("alice").unwrap();
     let original = storage.get_group(&group_id).unwrap();
     storage
+        .app_storage()
         .record_recovery_evidence(
             &[storage_sqlite::StoredEpochStallEvidence {
                 group_id_hex: hex::encode(group_id.as_slice()),
@@ -2288,7 +2300,7 @@ async fn recovery_warning_is_hidden_for_terminal_groups_but_not_repairable_group
 /// through: the armed group's own `arm()` has already latched its epoch, so a
 /// bystander is the only place the disarm rule is observable.
 fn qualify_group_recovery_for_test(
-    storage: &storage_sqlite::SqliteAccountStorage,
+    storage: &storage_sqlite::SqliteAppStorage,
     grant: &crate::client::recovery::AttemptGrant,
     group: &cgka_traits::GroupId,
 ) -> bool {
@@ -2435,7 +2447,7 @@ fn a_backfill_whose_every_delivery_was_refused_does_not_disarm_the_detector() {
             .ingest_received_delivery(route.probe(filled_through + 400, "refusal-that-arms"))
             .await
             .expect("a refused ingest still completes its pass");
-        let storage = app.account_storage("alice").unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
         assert_eq!(storage.pending_epoch_backfill_intents().unwrap().len(), 1);
         client
             .recovery_owner
@@ -2511,7 +2523,8 @@ fn capacity_refusal_retains_debt_until_an_owner_paced_probe() {
             .await
             .unwrap();
         let storage = app.account_storage("alice").unwrap();
-        let demand = storage
+        let app = storage.app_storage();
+        let demand = app
             .pending_recovery_demands()
             .unwrap()
             .into_iter()
@@ -2538,7 +2551,7 @@ fn capacity_refusal_retains_debt_until_an_owner_paced_probe() {
                 .unwrap(),
             crate::EpochBackfillRunOutcome::Incomplete(_)
         ));
-        let retry = storage.recovery_retry_state().unwrap();
+        let retry = app.recovery_retry_state().unwrap();
         let subscriptions = relay.unfloored_account_subscription_count();
         assert!(matches!(
             client
@@ -2549,7 +2562,7 @@ fn capacity_refusal_retains_debt_until_an_owner_paced_probe() {
                 .unwrap(),
             crate::EpochBackfillRunOutcome::Deferred
         ));
-        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        assert_eq!(app.recovery_retry_state().unwrap(), retry);
         assert_eq!(relay.unfloored_account_subscription_count(), subscriptions);
         client.recovery_owner.test_advance_to_retry(&storage);
         client
@@ -2565,7 +2578,7 @@ fn capacity_refusal_retains_debt_until_an_owner_paced_probe() {
             crate::EpochBackfillRunOutcome::Incomplete(_)
         ));
         assert_eq!(
-            storage.recovery_retry_state().unwrap().attempt_serial,
+            app.recovery_retry_state().unwrap().attempt_serial,
             retry.attempt_serial + 1
         );
         assert_eq!(
@@ -2573,7 +2586,7 @@ fn capacity_refusal_retains_debt_until_an_owner_paced_probe() {
             subscriptions,
             "automatic recovery restores only the live tail"
         );
-        let pending = storage
+        let pending = app
             .pending_recovery_demands()
             .unwrap()
             .into_iter()
@@ -2584,8 +2597,7 @@ fn capacity_refusal_retains_debt_until_an_owner_paced_probe() {
             storage_sqlite::RecoveryEligibility::WaitingCapacity
         );
         assert!(
-            !storage
-                .recovery_obligation_is_satisfied(ticket.id, ticket.revision)
+            !app.recovery_obligation_is_satisfied(ticket.id, ticket.revision)
                 .unwrap()
         );
     });
@@ -2631,7 +2643,8 @@ fn capacity_duplicates_preserve_deadline_and_one_explicit_override() {
             "refused admission cannot complete coverage",
         );
         let storage = app.account_storage("alice").unwrap();
-        let retry = storage.recovery_retry_state().unwrap();
+        let app = storage.app_storage();
+        let retry = app.recovery_retry_state().unwrap();
         let subscriptions = relay.unfloored_account_subscription_count();
         assert_eq!(retry.attempt_serial, 1);
 
@@ -2657,7 +2670,7 @@ fn capacity_duplicates_preserve_deadline_and_one_explicit_override() {
             "the second fruitless cycle must wait out the cooldown instead of \
              comparing the account again immediately",
         );
-        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        assert_eq!(app.recovery_retry_state().unwrap(), retry);
         assert_eq!(relay.unfloored_account_subscription_count(), subscriptions);
         for index in 0..10 {
             client
@@ -2668,7 +2681,7 @@ fn capacity_duplicates_preserve_deadline_and_one_explicit_override() {
                 .await
                 .unwrap();
         }
-        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        assert_eq!(app.recovery_retry_state().unwrap(), retry);
         client.recovery_owner.test_advance_to_retry(&storage);
         client
             .recovery_owner
@@ -2678,7 +2691,7 @@ fn capacity_duplicates_preserve_deadline_and_one_explicit_override() {
             .await
             .unwrap();
         assert_eq!(
-            storage.recovery_retry_state().unwrap().attempt_serial,
+            app.recovery_retry_state().unwrap().attempt_serial,
             retry.attempt_serial + 1
         );
         assert_eq!(
@@ -2695,7 +2708,7 @@ fn capacity_duplicates_preserve_deadline_and_one_explicit_override() {
             .await
             .unwrap();
         assert_eq!(
-            storage.recovery_retry_state().unwrap().attempt_serial,
+            app.recovery_retry_state().unwrap().attempt_serial,
             retry.attempt_serial + 2
         );
         assert_eq!(
@@ -2764,6 +2777,7 @@ fn a_failed_epoch_backfill_execution_paces_the_next_automatic_seam() {
                 .app
                 .account_storage(&client.state.label)
                 .unwrap()
+                .app_storage()
                 .recovery_retry_state()
                 .unwrap()
                 .attempt_serial
@@ -2882,7 +2896,7 @@ fn capacity_pressure_is_scoped_to_the_refused_group() {
             .expect("the armed replay must run");
 
         let storage = app.account_storage("alice").unwrap();
-        let demands = storage.pending_recovery_demands().unwrap();
+        let demands = storage.app_storage().pending_recovery_demands().unwrap();
         let refused = demands
             .iter()
             .find(|d| d.group_id.as_deref() == Some(route.group_id.as_slice()))
@@ -2951,7 +2965,7 @@ async fn verify_qualified_local_escalation(reopen: bool, qualified: bool) {
         .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
         .await
         .unwrap();
-    let storage = app.account_storage("alice").unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
     let retry = storage.recovery_retry_state().unwrap();
     let subscriptions = relay.subscription_count();
     let interval = Duration::from_millis(
@@ -3042,7 +3056,7 @@ fn recovery_reopen_preserves_pending_debt_and_the_retry_deadline() {
             .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
             .await
             .expect("the armed replay must run");
-        let storage = app.account_storage("alice").unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
         let retry = storage.recovery_retry_state().unwrap();
         let pending = storage.recovery_revision_fence().unwrap().obligations;
         drop(client);
@@ -3344,7 +3358,7 @@ fn in_flight_epoch_backfill_arm_preserves_both_demands_on_failure() {
         )
         .await;
         let group_b = client.create_group("second demand", &[]).await.unwrap();
-        let storage = app.account_storage("alice").unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
         let grant = client
             .authorize_account_recovery(
                 None,
@@ -3427,7 +3441,7 @@ fn repeated_epoch_backfill_deferral_does_not_multiply_identical_evidence() {
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
         .await;
-        let storage = app.account_storage("alice").unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
         let epoch = client.group_mls_state(&group).unwrap().epoch;
         let grant = client
             .authorize_account_recovery(
@@ -3499,6 +3513,7 @@ fn owner_deferral_deduplicates_identical_observations_but_keeps_epoch_changes() 
         orphan.id = phantom;
         storage.put_group(&orphan).unwrap();
         storage
+            .app_storage()
             .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
                 group_id_hex: "deadbeef".into(),
                 stalled_epoch: 1,
@@ -3528,7 +3543,7 @@ fn owner_deferral_deduplicates_identical_observations_but_keeps_epoch_changes() 
             recorded_rows_of_kind(&rows, "epoch_stall_backfill_deferred").len(),
             1
         );
-        let retry = storage.recovery_retry_state().unwrap();
+        let retry = storage.app_storage().recovery_retry_state().unwrap();
         let mut record = storage.get_group(&group).unwrap();
         record.epoch = cgka_traits::EpochId(record.epoch.0 + 1);
         storage.put_group(&record).unwrap();
@@ -3543,7 +3558,7 @@ fn owner_deferral_deduplicates_identical_observations_but_keeps_epoch_changes() 
                     .is_none()
             );
         }
-        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        assert_eq!(storage.app_storage().recovery_retry_state().unwrap(), retry);
         let rows = recorded_audit_rows(&app);
         let deferred = recorded_rows_of_kind(&rows, "epoch_stall_backfill_deferred");
         assert_eq!(
@@ -3572,6 +3587,7 @@ fn unresolved_epoch_backfill_scope_does_not_starve_another_group() {
         orphan.id = phantom.clone();
         cgka_traits::storage::GroupStorage::put_group(&storage, &orphan).unwrap();
         storage
+            .app_storage()
             .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
                 group_id_hex: hex::encode(phantom.as_slice()),
                 stalled_epoch: 1,
@@ -3601,14 +3617,26 @@ fn unresolved_epoch_backfill_scope_does_not_starve_another_group() {
         let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
         client.run_recovery_grant_for_test(grant).await.unwrap();
-        assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 1);
         assert_eq!(
-            storage.pending_epoch_backfill_intents().unwrap().len(),
+            storage
+                .app_storage()
+                .recovery_retry_state()
+                .unwrap()
+                .attempt_serial,
+            1
+        );
+        assert_eq!(
+            storage
+                .app_storage()
+                .pending_epoch_backfill_intents()
+                .unwrap()
+                .len(),
             1,
             "qualified real-group coverage cannot erase the unsupported group's debt"
         );
         assert_eq!(
             storage
+                .app_storage()
                 .pending_recovery_demands()
                 .unwrap()
                 .into_iter()
@@ -3630,7 +3658,11 @@ fn unresolved_epoch_backfill_scope_does_not_starve_another_group() {
             crate::EpochBackfillRunOutcome::Deferred
         ));
         assert_eq!(
-            storage.recovery_retry_state().unwrap().attempt_serial,
+            storage
+                .app_storage()
+                .recovery_retry_state()
+                .unwrap()
+                .attempt_serial,
             1,
             "a timer cannot investigate a group with no acquisition route repeatedly"
         );
@@ -4196,6 +4228,7 @@ async fn edit_target_preflight_body() {
     let retrying = client.send(&group_id, b"retrying").await.unwrap();
     app.account_storage("alice")
         .unwrap()
+        .app_storage()
         .invalidate_app_event_by_message_id(
             &group_hex,
             &retrying.message_ids[0],
@@ -4635,6 +4668,7 @@ fn founding_create_leaves_reconstructable_welcome_index_off_response_path() {
         assert!(
             app.account_storage("alice")
                 .unwrap()
+                .app_storage()
                 .list_pending_welcome_deliveries()
                 .unwrap()
                 .is_empty(),
@@ -4643,6 +4677,7 @@ fn founding_create_leaves_reconstructable_welcome_index_off_response_path() {
         assert_eq!(
             app.account_storage("alice")
                 .unwrap()
+                .app_storage()
                 .chat_list_row(&created.chat_list_row.group_id_hex)
                 .unwrap(),
             Some(created.chat_list_row),
@@ -10120,11 +10155,11 @@ fn newer_all_read_nip65_list_clears_stale_write_targets() {
     let status = relay_list_status_from_records(
         &account_id,
         vec![
-            crate::relay_plane::DirectoryRelayEventRecord {
+            transport_nostr::DirectoryRelayEventRecord {
                 endpoints: vec![TransportEndpoint("wss://source.example".into())],
                 event: newer,
             },
-            crate::relay_plane::DirectoryRelayEventRecord {
+            transport_nostr::DirectoryRelayEventRecord {
                 endpoints: vec![TransportEndpoint("wss://source.example".into())],
                 event: older,
             },
@@ -10156,7 +10191,7 @@ fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
             String::new(),
         );
         event.created_at = created_at;
-        crate::relay_plane::DirectoryRelayEventRecord {
+        transport_nostr::DirectoryRelayEventRecord {
             endpoints: vec![TransportEndpoint("wss://source.example".into())],
             event,
         }
@@ -10210,7 +10245,7 @@ fn stale_live_relay_list_events_do_not_replace_newer_cached_lists() {
                 String::new(),
             );
             event.created_at = created_at;
-            crate::relay_plane::DirectoryRelayEventRecord {
+            transport_nostr::DirectoryRelayEventRecord {
                 endpoints: vec![TransportEndpoint("wss://source.example".into())],
                 event,
             }
@@ -10252,7 +10287,7 @@ fn zero_timestamp_relay_list_event_populates_legacy_empty_state() {
     );
     event.created_at = 0;
 
-    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+    app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
         endpoints: vec![TransportEndpoint("wss://source.example".into())],
         event,
     })
@@ -10792,7 +10827,7 @@ fn same_second_multiline_bio_does_not_replace_cached_single_line_bio() {
                 serde_json::json!({ "name": "bob", "about": "one\ntwo" }).to_string(),
             );
             event.created_at = created_at;
-            app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+            app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
                 endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
                 event,
             })
@@ -10950,7 +10985,7 @@ fn directory_entry_reconciles_nostr_components_independently() {
         String::new(),
     );
     stale_event.created_at = 15;
-    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+    app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
         event: stale_event,
         endpoints: vec![TransportEndpoint("wss://source.example".into())],
     })
@@ -11692,7 +11727,7 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
     let follows = (0..total_follows)
         .map(|index| format!("{:064x}", index + 1000))
         .collect::<Vec<_>>();
-    let record = crate::relay_plane::DirectoryRelayEventRecord {
+    let record = transport_nostr::DirectoryRelayEventRecord {
         endpoints: vec![TransportEndpoint("wss://relay.example".to_owned())],
         event: contact_list_event(&author, &follows),
     };
@@ -11771,7 +11806,7 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
         .to_string(),
     );
     event.created_at = 1_700_000_867;
-    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+    app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
         endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
         event,
     })
@@ -11873,7 +11908,7 @@ fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
         .to_string(),
     );
     event.created_at = 1_700_000_868;
-    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+    app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
         endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
         event,
     })
@@ -12396,6 +12431,7 @@ fn legacy_account_projection_clamps_poisoned_transport_cursor_on_import() {
     let cursor = app
         .account_storage("alice")
         .unwrap()
+        .app_storage()
         .load_account_projection_state("alice", MAX_SEEN_EVENT_IDS)
         .unwrap()
         .last_transport_timestamp
@@ -12432,7 +12468,7 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
             app.relay_plane
                 .disable_account_delivery_spill_for_test(client.adapter.account_id())
         );
-        const HISTORY: usize = crate::relay_plane::ACCOUNT_DELIVERY_BUFFER + 16;
+        const HISTORY: usize = transport_nostr::ACCOUNT_DELIVERY_BUFFER + 16;
         for index in 0..HISTORY {
             let event = epoch_gap_probe(
                 &group.nostr_routing.nostr_group_id_hex,
@@ -12446,7 +12482,7 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
             loop {
                 let health = app.relay_plane.relay_health().await;
                 if health.account_delivery_dropped
-                    >= (HISTORY - crate::relay_plane::ACCOUNT_DELIVERY_BUFFER) as u64
+                    >= (HISTORY - transport_nostr::ACCOUNT_DELIVERY_BUFFER) as u64
                 {
                     break;
                 }
@@ -12462,11 +12498,12 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let watermarks = storage
+                    .app_storage()
                     .recovery_loss_watermarks("alice", storage_sqlite::RecoveryLossCause::Queue)
                     .unwrap();
                 if watermarks.len() == 1
                     && watermarks[0].observed_count
-                        == (HISTORY - crate::relay_plane::ACCOUNT_DELIVERY_BUFFER) as u64
+                        == (HISTORY - transport_nostr::ACCOUNT_DELIVERY_BUFFER) as u64
                 {
                     break;
                 }
@@ -12487,7 +12524,11 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
                 .await
                 .unwrap();
             if !matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)) {
-                let storage = client.app.account_storage(&client.state.label).unwrap();
+                let storage = client
+                    .app
+                    .account_storage(&client.state.label)
+                    .unwrap()
+                    .app_storage();
                 let routing = client.routing.snapshot();
                 let group_endpoints = routing
                     .group_routes
@@ -12522,7 +12563,7 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
                 );
             }
             let storage = client.app.account_storage(&client.state.label).unwrap();
-            let retry = storage.recovery_retry_state().unwrap();
+            let retry = storage.app_storage().recovery_retry_state().unwrap();
             let expected = Duration::from_secs(15 * (1 << ordinal));
             assert_eq!(
                 retry.delay_ms,
@@ -12568,6 +12609,7 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
         assert!(
             app.account_storage("alice")
                 .unwrap()
+                .app_storage()
                 .account_delivery_recovery("alice")
                 .unwrap()
                 .is_some()
@@ -12592,6 +12634,7 @@ fn reopened_unbounded_overflow_waits_for_explicit_full_history_repair() {
             app.save_state(&state).unwrap();
             app.account_storage("alice")
                 .unwrap()
+                .app_storage()
                 .mark_account_delivery_recovery("alice", 17, 1)
                 .unwrap();
         }
@@ -12666,7 +12709,7 @@ fn reopened_unbounded_overflow_waits_for_explicit_full_history_repair() {
             "a loss with no known bound cannot be certified by comparison"
         );
         assert_eq!(relay.unfloored_account_subscription_count(), 0);
-        let storage = reopened.account_storage("alice").unwrap();
+        let storage = reopened.account_storage("alice").unwrap().app_storage();
         assert!(
             storage
                 .account_delivery_recovery("alice")
@@ -12689,6 +12732,7 @@ fn reopened_unbounded_overflow_waits_for_explicit_full_history_repair() {
             reopened
                 .account_storage("alice")
                 .unwrap()
+                .app_storage()
                 .account_delivery_recovery("alice")
                 .unwrap()
                 .is_none(),
@@ -12739,7 +12783,7 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
         }
         app.save_state(&client.state).unwrap();
         let mut expected = Vec::new();
-        for index in 0..crate::relay_plane::ACCOUNT_DELIVERY_BUFFER + NEW {
+        for index in 0..transport_nostr::ACCOUNT_DELIVERY_BUFFER + NEW {
             let event = probe(index);
             expected.push(event.id.clone());
             inject_epoch_gap_probe(&app, event).await;
@@ -12764,7 +12808,7 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
         assert_eq!(health.account_delivery_spill_already_seen, KNOWN as u64);
         assert_eq!(health.account_delivery_dropped, 0);
         assert!(!client.adapter.delivery_loss_blocks_cursor());
-        let storage = app.account_storage("alice").unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
         assert!(
             storage
                 .account_delivery_recovery("alice")
@@ -12784,7 +12828,7 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
         // would. The in-memory queue is gone; the durable spill is not.
         for _ in 0..4 {
             let received = client.receive_next_delivery().await.unwrap();
-            let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+            let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
                 panic!("a spill never creates a loss generation");
             };
             client.ingest_received_delivery(*delivery).await.unwrap();
@@ -12802,7 +12846,7 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
                     .await
                     .expect("spilled rows are admitted after reopen")
                     .unwrap();
-            let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+            let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
                 panic!("a spill never creates a loss generation");
             };
             client.ingest_received_delivery(*delivery).await.unwrap();
@@ -12816,7 +12860,7 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
         );
         // The queue kept the oldest injections; every later one was spilled.
         let receipts = client.transport_receipts().unwrap();
-        for id in &expected[crate::relay_plane::ACCOUNT_DELIVERY_BUFFER..] {
+        for id in &expected[transport_nostr::ACCOUNT_DELIVERY_BUFFER..] {
             assert!(receipts.contains(id), "a spilled delivery was admitted");
         }
         assert!(!client.delivery_overflow_recovery_pending);
@@ -12858,13 +12902,14 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         let release = release_marker.clone();
         let attempts = marker_attempts.clone();
         let storage = app.account_storage("alice").unwrap();
-        let marker: crate::relay_plane::AccountDeliveryRecoveryMarker =
+        let marker: transport_nostr::AccountDeliveryRecoveryMarker =
             Arc::new(move |marker_token, dropped, _| {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if !release.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err(crate::relay_plane::AccountDeliveryRecoveryMarkerError::Retryable);
+                    return Err(transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable);
                 }
                 storage
+                    .app_storage()
                     .record_account_delivery_loss(
                         "alice",
                         marker_token,
@@ -12873,9 +12918,9 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
                     )
                     .map_err(|error| {
                         if error.is_closed() {
-                            crate::relay_plane::AccountDeliveryRecoveryMarkerError::Closed
+                            transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
                         } else {
-                            crate::relay_plane::AccountDeliveryRecoveryMarkerError::Retryable
+                            transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
                         }
                     })
             });
@@ -12904,7 +12949,7 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
             )
             .await;
             let received = client.receive_next_delivery().await.unwrap();
-            let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+            let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
                 panic!("the pre-overflow delivery must not produce a control record");
             };
             client
@@ -12919,9 +12964,9 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
 
         let newest = cursor_before + 2_000;
         let mut omitted_timestamp = 0;
-        for index in 0..=crate::relay_plane::ACCOUNT_DELIVERY_BUFFER {
+        for index in 0..=transport_nostr::ACCOUNT_DELIVERY_BUFFER {
             let created_at = newest.saturating_sub(index as u64);
-            if index == crate::relay_plane::ACCOUNT_DELIVERY_BUFFER {
+            if index == transport_nostr::ACCOUNT_DELIVERY_BUFFER {
                 omitted_timestamp = created_at;
             }
             inject_epoch_gap_probe(
@@ -12943,7 +12988,7 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         .expect("overflow must start its one marker worker");
 
         let received = client.receive_next_delivery().await.unwrap();
-        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+        let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
             panic!("the retained newest-first prefix must precede the overflow signal");
         };
         client
@@ -12954,6 +12999,7 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         let persisted = app
             .account_storage("alice")
             .unwrap()
+            .app_storage()
             .load_account_projection_state("alice", MAX_SEEN_EVENT_IDS)
             .unwrap();
         assert_eq!(
@@ -12964,6 +13010,7 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         assert!(
             app.account_storage("alice")
                 .unwrap()
+                .app_storage()
                 .account_delivery_recovery("alice")
                 .unwrap()
                 .is_none(),
@@ -12982,6 +13029,7 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
                 if !app
                     .account_storage("alice")
                     .unwrap()
+                    .app_storage()
                     .recovery_loss_watermarks("alice", storage_sqlite::RecoveryLossCause::Queue)
                     .unwrap()
                     .is_empty()
@@ -12993,7 +13041,7 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         })
         .await
         .expect("the single marker worker must persist after the retry clears");
-        let storage = app.account_storage("alice").unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
         assert!(
             storage
                 .account_delivery_recovery("alice")
@@ -13189,6 +13237,7 @@ impl LiveCursorFixture {
         let spilled = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let rows = storage
+                    .app_storage()
                     .spilled_account_deliveries(10, crate::unix_now_seconds())
                     .unwrap()
                     .deliveries;
@@ -13225,6 +13274,7 @@ impl LiveCursorFixture {
                 .app
                 .account_storage("alice")
                 .unwrap()
+                .app_storage()
                 .spilled_account_deliveries(10, crate::unix_now_seconds())
                 .unwrap()
                 .deliveries
@@ -13256,7 +13306,7 @@ impl LiveCursorFixture {
                 .await
                 .expect("a delivery is ready")
                 .unwrap();
-        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+        let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
             panic!("a live delivery must not produce a control record");
         };
         let event_id = hex::encode(delivery.message.id.as_slice());
@@ -13316,7 +13366,7 @@ fn live_ingest_keeps_the_cursor_until_every_subscription_replayed_stored_history
         )
         .await;
         let received = client.receive_next_delivery().await.unwrap();
-        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+        let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
             panic!("a live delivery must not produce a control record");
         };
         client.ingest_received_delivery(*delivery).await.unwrap();
@@ -13448,7 +13498,7 @@ fn a_delivery_arriving_during_the_promoting_save_without_a_spill_is_bounded_loss
             fixture.client.delivery_loss_blocks_cursor(),
             "the loss fences the cursor at once"
         );
-        let storage = fixture.app.account_storage("alice").unwrap();
+        let storage = fixture.app.account_storage("alice").unwrap().app_storage();
         tokio::time::timeout(Duration::from_secs(5), async {
             while storage
                 .recovery_loss_goal_floor("alice", storage_sqlite::RecoveryLossCause::Queue)
@@ -13540,9 +13590,9 @@ fn live_ingest_keeps_the_cursor_behind_a_queue_omission_after_replay() {
         );
         let marker_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts = marker_attempts.clone();
-        let marker: crate::relay_plane::AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _| {
+        let marker: transport_nostr::AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _| {
             attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(crate::relay_plane::AccountDeliveryRecoveryMarkerError::Retryable)
+            Err(transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable)
         });
         assert!(
             fixture
@@ -13550,7 +13600,7 @@ fn live_ingest_keeps_the_cursor_behind_a_queue_omission_after_replay() {
                 .relay_plane
                 .set_account_delivery_recovery_marker_for_test(&fixture.account_id, marker)
         );
-        for index in 0..=crate::relay_plane::ACCOUNT_DELIVERY_BUFFER {
+        for index in 0..=transport_nostr::ACCOUNT_DELIVERY_BUFFER {
             inject_epoch_gap_probe(
                 &fixture.app,
                 fixture.probe(
@@ -13689,6 +13739,7 @@ fn ingest_applies_owner_signed_transitive_448_and_drops_spoof() {
     // Neither a late list in the same pass nor a later delivery may re-add it.
     app.account_storage("alice")
         .unwrap()
+        .app_storage()
         .remove_group_push_tokens_for_leaves(&group_id_hex, &[(owner_id.clone(), 1)], &[])
         .unwrap();
     for (owner_ts, kind) in [(3000, 447), (4000, 448)] {
@@ -16887,6 +16938,7 @@ async fn account_open_repairs_a_branch_selection_announcement_a_crash_lost() {
     let storage = app.account_storage("alice").unwrap();
     assert!(
         storage
+            .app_storage()
             .diverged_branch_selection_withdrawals()
             .unwrap()
             .is_empty(),
@@ -17229,6 +17281,7 @@ fn a_legacy_retained_route_is_stamped_at_first_load_and_keeps_that_stamp() {
     assert_eq!(
         app.account_storage("alice")
             .unwrap()
+            .app_storage()
             .account_groups(None)
             .unwrap()[0]
             .prior_nostr_routes[0]
@@ -17336,7 +17389,7 @@ async fn a_deferred_open_never_subscribes_a_departed_groups_route() {
         .await
         .expect("the removal commit must fan out to bob's group route")
         .unwrap();
-    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+    let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
         panic!("the test did not overflow its account delivery queue");
     };
     bob_client
@@ -17600,7 +17653,7 @@ async fn an_admin_removal_clears_the_removed_devices_group_routes() {
         .await
         .expect("the removal commit must fan out to bob's group route")
         .unwrap();
-    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+    let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
         panic!("the test did not overflow its account delivery queue");
     };
     bob_client
@@ -17749,7 +17802,7 @@ async fn a_routing_rebuild_after_a_removal_does_not_resubscribe_the_removed_grou
         .await
         .expect("the removal commit must fan out to bob's group route")
         .unwrap();
-    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+    let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
         panic!("the test did not overflow its account delivery queue");
     };
     bob_client
@@ -17854,7 +17907,7 @@ async fn a_removed_device_fails_a_composer_send_before_projecting_a_row() {
         .await
         .expect("the removal commit must fan out to bob's group route")
         .unwrap();
-    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = received else {
+    let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
         panic!("the test did not overflow its account delivery queue");
     };
     bob_client
@@ -18223,6 +18276,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
         assert_eq!(
             app.account_storage("alice")
                 .unwrap()
+                .app_storage()
                 .local_group_deletion_frontier(&group_id_hex)
                 .unwrap(),
             None,
@@ -18308,6 +18362,7 @@ async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash(
     );
     assert_eq!(
         storage
+            .app_storage()
             .local_group_deletion_frontier(&group_id_hex)
             .unwrap(),
         None,
@@ -18385,6 +18440,7 @@ async fn account_open_keeps_first_fresh_chat_pending_when_group_projection_is_un
     );
     assert!(
         storage
+            .app_storage()
             .local_group_deletion_frontier(&group_id_hex)
             .unwrap()
             .is_some(),
@@ -18548,6 +18604,7 @@ pub(crate) fn armed_group_ids(client: &crate::AppClient) -> Vec<cgka_traits::Gro
         .app
         .account_storage(&client.state.label)
         .unwrap()
+        .app_storage()
         .pending_epoch_backfill_intents()
         .unwrap()
         .into_iter()
@@ -18598,6 +18655,7 @@ async fn a_resource_refusal_for_a_terminal_group_arms_no_recovery() {
     assert!(
         app.account_storage("alice")
             .unwrap()
+            .app_storage()
             .pending_epoch_backfill_intents()
             .unwrap()
             .is_empty(),
@@ -18780,7 +18838,7 @@ async fn invite_recovery_failure_preserves_committed_effects_and_results() {
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
         let group_id = client.create_group("committed effects", &[]).await.unwrap();
-        let storage = app.account_storage("alice").unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
         let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
         storage
             .record_recovery_evidence(
@@ -20140,7 +20198,7 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
         .await
         .expect("locally fanned-out application message")
         .unwrap();
-    let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) = delivery else {
+    let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = delivery else {
         panic!("the test did not overflow its account delivery queue");
     };
     let delivery = *delivery;
@@ -20219,7 +20277,7 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
                 .await
                 .expect("redelivered application message")
                 .unwrap();
-        let crate::relay_plane::AccountDeliveryReceive::Delivery(redelivery) = redelivery else {
+        let transport_nostr::AccountDeliveryReceive::Delivery(redelivery) = redelivery else {
             panic!("the test did not overflow its account delivery queue");
         };
         let redelivery = *redelivery;
@@ -20760,7 +20818,7 @@ fn close_storage_releases_every_database_and_the_root_lease() {
     // the only way to prove the *connections* were closed rather than merely
     // dropped from the app's caches.
     let session_storage = app.account_storage(&account.label).unwrap();
-    session_storage.app_message_count().unwrap();
+    session_storage.app_storage().app_message_count().unwrap();
     let shared_storage = app.shared_storage().unwrap();
     shared_storage
         .set_relay_telemetry_settings(&StoredRelayTelemetrySettings {
@@ -21008,7 +21066,10 @@ fn close_storage_waits_for_legacy_projection_import() {
     // marker. Verify both the imported data and the marker after encrypted reopen.
     let reopened =
         MarmotApp::with_relays_and_account_home(root, Vec::new(), AccountHome::open(root));
-    let storage = reopened.account_storage("legacy-racing").unwrap();
+    let storage = reopened
+        .account_storage("legacy-racing")
+        .unwrap()
+        .app_storage();
     assert!(
         storage
             .account_import_marker(LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER)
@@ -21131,7 +21192,7 @@ fn open_suspension_shutdown_fixture(
     )
     .unwrap();
     let session = app.account_storage(&account.label).unwrap();
-    session.app_message_count().unwrap();
+    session.app_storage().app_message_count().unwrap();
     let shared = app.shared_storage().unwrap();
     shared
         .set_relay_telemetry_settings(&StoredRelayTelemetrySettings {
@@ -22066,7 +22127,7 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
     let group_id = client.create_group("left epoch media", &[]).await.unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
     let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
-    let storage = app.account_storage("alice").unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
 
     // Group creation warms its founding epoch, so the media message comes
     // from a later epoch that no warm pass ever saw as current. Raw engine
@@ -22326,6 +22387,7 @@ fn pending_group_invites_skips_malformed_rows() {
     };
     app.account_storage("alice")
         .unwrap()
+        .app_storage()
         .save_account_projection_state(&state, 16, 300)
         .unwrap();
 
@@ -22390,7 +22452,7 @@ fn account_unread_summary_includes_badge_attention_without_session_load() {
             self_membership: storage_sqlite::SelfMembership::Member,
             components: Vec::new(),
         };
-    let storage = app.account_storage("alice").unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
     storage
         .save_account_projection_state(
             &storage_sqlite::StoredAccountState {
@@ -22654,8 +22716,7 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                         .await
                         .unwrap()
                         .unwrap();
-                        let crate::relay_plane::AccountDeliveryReceive::Delivery(delivery) =
-                            received
+                        let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received
                         else {
                             panic!("unexpected overflow")
                         };
@@ -22708,6 +22769,7 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
             assert!(!client.state.seen_events.contains(&probe.id));
             assert!(client.has_pending_epoch_backfill());
             let inventory = storage
+                .app_storage()
                 .transport_reconciliation_inventory(
                     &storage_sqlite::TransportReconciliationRoute::Group(
                         hex::decode(&route.nostr_group_id_hex)
@@ -23254,7 +23316,7 @@ fn presentation_worker_refreshes_without_screen_subscribers_and_recovers_notific
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let storage_sqlite::ChatPresentationRead::Ready(value) =
-                    storage.chat_presentation(&group).unwrap()
+                    storage.app_storage().chat_presentation(&group).unwrap()
                     && value.presentation.title
                         == storage_sqlite::PresentationText::Literal("Updated peer".into())
                 {
@@ -23290,11 +23352,11 @@ fn presentation_worker_refreshes_without_screen_subscribers_and_recovers_notific
                 let update = updates.recv().await.unwrap();
                 if update.account_label == "alice"
                     && let storage_sqlite::ChatPresentationRead::Ready(value) =
-                        storage.chat_presentation(&group).unwrap()
+                        storage.app_storage().chat_presentation(&group).unwrap()
                     && value.presentation.title
                         == storage_sqlite::PresentationText::Literal("Restarted peer".into())
                     // Earlier valid invalidations can remain queued after a newer commit.
-                    && update.version == storage.chat_presentation_version().unwrap()
+                    && update.version == storage.app_storage().chat_presentation_version().unwrap()
                 {
                     break;
                 }
@@ -23321,7 +23383,7 @@ fn presentation_worker_refreshes_without_screen_subscribers_and_recovers_notific
         )
         .unwrap()
         {}
-        let committed = storage.chat_presentation_version().unwrap();
+        let committed = storage.app_storage().chat_presentation_version().unwrap();
         let mut recovered = app.presentation_signals.updates.subscribe();
         let third = MarmotAppRuntime::new(app.clone());
         third.reconcile_accounts().await.unwrap();
@@ -23379,12 +23441,17 @@ fn presentation_quarantine_preserves_existing_chat_kind_and_direct_reuse() {
         assert_eq!(quarantined.conversation_kind, before.conversation_kind);
         assert_eq!(
             storage
+                .app_storage()
                 .direct_conversation_candidate_rows(&bob_account.account_id_hex)
                 .unwrap()
                 .len(),
             1
         );
-        let input = storage.chat_presentation_input(&id).unwrap().unwrap();
+        let input = storage
+            .app_storage()
+            .chat_presentation_input(&id)
+            .unwrap()
+            .unwrap();
         assert_eq!(input.member_count, Some(2));
         assert!(
             input.members.is_empty(),
@@ -23402,6 +23469,7 @@ fn presentation_quarantine_preserves_existing_chat_kind_and_direct_reuse() {
         alice.reconcile_hydrated_account_state().unwrap();
         assert_eq!(
             storage
+                .app_storage()
                 .chat_presentation_input(&id)
                 .unwrap()
                 .unwrap()
@@ -23411,6 +23479,7 @@ fn presentation_quarantine_preserves_existing_chat_kind_and_direct_reuse() {
         );
         assert_eq!(
             storage
+                .app_storage()
                 .direct_conversation_candidate_rows(&bob_account.account_id_hex)
                 .unwrap()
                 .len(),
@@ -23447,7 +23516,7 @@ async fn group_changes_refuse_while_epoch_gap_recovery_holds_the_group() {
     let group_id = client.create_group("behind", &[]).await.unwrap();
     let group_hex = hex::encode(group_id.as_slice());
     let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
-    let storage = app.account_storage("alice").unwrap();
+    let storage = app.account_storage("alice").unwrap().app_storage();
     let intent = storage_sqlite::StoredEpochBackfillIntent {
         group_id_hex: group_hex.clone(),
         stalled_epoch: epoch.0,
@@ -23757,6 +23826,7 @@ async fn both_advisory_gates_can_be_acknowledged_in_turn() {
     let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
     app.account_storage("alice")
         .unwrap()
+        .app_storage()
         .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
             group_id_hex: hex::encode(group_id.as_slice()),
             stalled_epoch: epoch.0,
@@ -23807,6 +23877,7 @@ async fn epoch_gap_below_the_local_epoch_does_not_hold_group_changes() {
         .unwrap();
     app.account_storage("alice")
         .unwrap()
+        .app_storage()
         .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
             group_id_hex: hex::encode(group_id.as_slice()),
             stalled_epoch: stalled.0,
@@ -23836,6 +23907,7 @@ async fn forget_group_local_stops_work_and_survives_reopen() {
     client.pending_convergence_groups.insert(forgotten.clone());
     app.account_storage("alice")
         .unwrap()
+        .app_storage()
         .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
             group_id_hex: group_hex.clone(),
             stalled_epoch: 0,
@@ -24355,6 +24427,7 @@ async fn authenticated_system_previews_keep_actor_subject_and_multi_commit_row_i
         .unwrap();
     let store = app.account_storage("alice").unwrap();
     let selected = store
+        .app_storage()
         .timeline_message(&group_hex, &preview.message_id_hex)
         .unwrap()
         .unwrap();
@@ -24454,7 +24527,7 @@ fn group_create_relay_options_preserve_defaults_and_enforce_host_safety() {
         vec![],
         vec!["ws://127.0.0.1:1234".into()],
         vec!["wss://192.168.1.1".into()],
-        crate::relay_plane::retired_relay_hosts()
+        transport_nostr::retired_relay_hosts()
             .into_iter()
             .map(|host| format!("wss://{host}"))
             .collect(),

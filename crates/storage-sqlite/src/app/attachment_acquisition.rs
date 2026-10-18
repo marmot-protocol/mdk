@@ -4,7 +4,7 @@
 //! Bytes stay in the account's SQLCipher store; there is no attachment LRU.
 use crate::app::chat_presentation::nonnegative;
 use crate::base::connection::CachedSql;
-use crate::{SqliteAccountStorage, SqliteResultExt, u64_to_i64};
+use crate::{SqliteAppStorage, SqliteResultExt, u64_to_i64};
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -220,7 +220,7 @@ impl AttachmentAcquisition {
     }
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Read source changes without a history scan. Oversized descriptors are
     /// represented as null so the shared parser rejects them without allocation.
     pub fn attachment_worker_demands(

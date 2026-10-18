@@ -461,7 +461,10 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
         .await
         .is_err()
     {
-        let storage = reopened_app.account_storage(&alice.label).unwrap();
+        let storage = reopened_app
+            .account_storage(&alice.label)
+            .unwrap()
+            .app_storage();
         panic!(
             "startup exact request absent: hits={} broad={} active={} epoch={} target={} retry={:?} comparison_pending={} comparison_attempt={} demands={:?} messages={:?}",
             gate.hits.load(Ordering::SeqCst),
@@ -499,6 +502,7 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
         reopened_app
             .account_storage(&alice.label)
             .unwrap()
+            .app_storage()
             .recovery_retry_state()
             .unwrap()
             .attempt_serial,
@@ -598,6 +602,7 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     let source_id = reopened_app
         .account_storage(&alice.label)
         .unwrap()
+        .app_storage()
         .timeline_message(&hex::encode(groups[1].as_slice()), &accepted.message_id_hex)
         .unwrap()
         .unwrap()
@@ -807,12 +812,14 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
             reopened_app
                 .account_storage(&alice.label)
                 .unwrap()
+                .app_storage()
                 .recovery_comparison()
                 .unwrap()
                 .pending(),
             reopened_app
                 .account_storage(&alice.label)
                 .unwrap()
+                .app_storage()
                 .pending_recovery_demands()
                 .unwrap()
                 .iter()
@@ -828,10 +835,11 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
         recovery_credits::MAX_CONCURRENT_JOBS - 1,
     );
     let storage = reopened_app.account_storage(&alice.label).unwrap();
+    let app = storage.app_storage();
     let route_key = storage_sqlite::TransportReconciliationRoute::Group(route);
     timeout(Duration::from_secs(15), async {
         loop {
-            if storage
+            if app
                 .pending_recovery_demands()
                 .unwrap()
                 .iter()
@@ -846,18 +854,16 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     .expect("ordinary later MLS deliveries durably arm a natural EpochGap");
     assert!(database.broad_queries.load(Ordering::SeqCst) > 0);
     assert!(
-        !storage
-            .retained_recovery_event(
-                &route_key,
-                &missing.id.to_bytes(),
-                None,
-                crate::unix_now_seconds(),
-            )
-            .unwrap()
+        !app.retained_recovery_event(
+            &route_key,
+            &missing.id.to_bytes(),
+            None,
+            crate::unix_now_seconds(),
+        )
+        .unwrap()
     );
     assert!(
-        storage
-            .pending_recovery_demands()
+        app.pending_recovery_demands()
             .unwrap()
             .iter()
             .all(|demand| demand.cause != storage_sqlite::RecoveryCause::KnownEvent)
@@ -941,17 +947,17 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     .await
     .expect("no comparison job outlives recovery");
     assert!(
-        storage
-            .retained_recovery_event(
-                &route_key,
-                &missing.id.to_bytes(),
-                None,
-                crate::unix_now_seconds(),
-            )
-            .unwrap()
+        app.retained_recovery_event(
+            &route_key,
+            &missing.id.to_bytes(),
+            None,
+            crate::unix_now_seconds(),
+        )
+        .unwrap()
     );
     reopened.shutdown_and_close().await.unwrap();
     drop(reopened);
+    drop(app);
     drop(storage);
     drop(reopened_app);
 
@@ -980,6 +986,7 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
         final_app
             .account_storage(&alice.label)
             .unwrap()
+            .app_storage()
             .retained_recovery_event(
                 &route_key,
                 &missing.id.to_bytes(),
@@ -1027,7 +1034,7 @@ async fn startup_comparison_waits_for_credit_before_reserving_retry() {
         .await
         .expect("startup serves deferred command with a saturated shared pool")
         .unwrap();
-    let storage = app.account_storage(&account.label).unwrap();
+    let storage = app.account_storage(&account.label).unwrap().app_storage();
     assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 0);
     assert!(storage.recovery_comparison().unwrap().pending());
     assert_eq!(recovery_credits::available_credits(&pool), 0);
@@ -1091,6 +1098,7 @@ async fn startup_inline_wait_releases_unused_comparison_credit() {
     assert_eq!(
         app.account_storage(&account.label)
             .unwrap()
+            .app_storage()
             .recovery_retry_state()
             .unwrap()
             .attempt_serial,
@@ -1174,6 +1182,7 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
     let retry_not_before_ms = initial_app
         .account_storage(&account.label)
         .unwrap()
+        .app_storage()
         .recovery_retry_state()
         .unwrap()
         .not_before_ms;
@@ -1230,7 +1239,7 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
         .await
         .is_err()
     {
-        let storage = app.account_storage(&account.label).unwrap();
+        let storage = app.account_storage(&account.label).unwrap().app_storage();
         panic!(
             "startup cancellation request absent: hits={} active={} jobs={} requests={} retry={:?} comparison_pending={} demands={:?}",
             gate.hits.load(Ordering::SeqCst),
@@ -1252,6 +1261,7 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
     let retry = app
         .account_storage(&account.label)
         .unwrap()
+        .app_storage()
         .recovery_retry_state()
         .unwrap()
         .attempt_serial;
@@ -1330,6 +1340,7 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
     let retained = app
         .account_storage(&account.label)
         .unwrap()
+        .app_storage()
         .local_submission(&hex::encode(&group), token)
         .unwrap()
         .unwrap();
@@ -1372,11 +1383,22 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
     let reopened = MarmotApp::with_relay_and_config(dir.path(), url, config);
     let storage = reopened.account_storage(&account.label).unwrap();
     assert_eq!(
-        storage.recovery_retry_state().unwrap().attempt_serial,
+        storage
+            .app_storage()
+            .recovery_retry_state()
+            .unwrap()
+            .attempt_serial,
         retry
     );
-    assert!(storage.recovery_comparison().unwrap().pending());
+    assert!(
+        storage
+            .app_storage()
+            .recovery_comparison()
+            .unwrap()
+            .pending()
+    );
     let restored = storage
+        .app_storage()
         .local_submission(&hex::encode(&group), token)
         .unwrap()
         .unwrap();
@@ -1412,6 +1434,7 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
     let source = reopened
         .account_storage(&account.label)
         .unwrap()
+        .app_storage()
         .timeline_message(&hex::encode(&group), &accepted.message_id_hex)
         .unwrap()
         .unwrap()
@@ -1515,6 +1538,7 @@ async fn unhydrated_durable_send_waits_for_safety_and_survives_terminal_close() 
     assert_eq!(
         app.account_storage(&account.label)
             .unwrap()
+            .app_storage()
             .local_submission(&hex::encode(&group), token)
             .unwrap()
             .unwrap()
@@ -1575,6 +1599,7 @@ async fn unhydrated_durable_send_waits_for_safety_and_survives_terminal_close() 
     let source = restored
         .account_storage(&account.label)
         .unwrap()
+        .app_storage()
         .timeline_message(&hex::encode(&group), &accepted.message_id_hex)
         .unwrap()
         .unwrap()

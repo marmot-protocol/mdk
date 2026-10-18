@@ -161,7 +161,7 @@ async fn run_held_comparison(
     .await
     .expect("Bob joined before the target message");
 
-    let storage = app.account_storage(&alice.label).unwrap();
+    let storage = app.account_storage(&alice.label).unwrap().app_storage();
     let route: [u8; 32] = hex::decode(
         app.group(&alice.label, &hex::encode(&group))
             .unwrap()
@@ -528,7 +528,7 @@ async fn comparison_credit_exhaustion_does_not_spend_reservation() {
         .use_private_recovery_credit_pool_for_test();
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();
-    let storage = app.account_storage(&account.label).unwrap();
+    let storage = app.account_storage(&account.label).unwrap().app_storage();
     let credits = recovery_credits::hold_all_credits_for_test(&pool);
     let commands = runtime
         .accounts()
@@ -677,6 +677,7 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         .unwrap()
         .unwrap();
     let inventory = storage
+        .app_storage()
         .transport_reconciliation_inventory(&recovery_route, crate::unix_now_seconds())
         .unwrap();
     let before = inventory
@@ -696,6 +697,7 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
     drop(credit);
     assert!(matches!(result, EpochBackfillRunOutcome::Incomplete(_)));
     let after = storage
+        .app_storage()
         .transport_reconciliation_inventory(&recovery_route, crate::unix_now_seconds())
         .unwrap();
     assert!(

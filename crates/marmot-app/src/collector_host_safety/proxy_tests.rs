@@ -52,12 +52,12 @@ fn clear_proxy_environment() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::disallowed_methods)]
 async fn socks5_pins_dns_fail_closed() {
-    use crate::relay_plane::{
+    use cgka_traits::TransportEndpoint;
+    use futures::{SinkExt, StreamExt};
+    use transport_nostr::{
         DirectoryEventQuery, DirectoryFetchRequest, DirectoryRelayFetcher,
         NostrSdkDirectoryRelayFetcher,
     };
-    use cgka_traits::TransportEndpoint;
-    use futures::{SinkExt, StreamExt};
 
     const CHILD: &str = "WN_PROXY_ROUTING_TEST_CHILD";
     const MODE: &str = "WN_PROXY_ROUTING_TEST_MODE";

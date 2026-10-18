@@ -7,13 +7,15 @@
 
 mod app;
 mod base;
-mod protocol;
+mod cross;
 #[cfg(feature = "media-store-benchmarks")]
-pub use app::media_store_bench;
+pub mod media_store_bench;
+mod protocol;
 
 pub use app::group_system::{
     GroupSystemEventProjection, GroupSystemEventProvenance, group_system_event_from_message,
 };
+pub use app::handle::SqliteAppStorage;
 
 pub use app::account_recovery::{
     ParkedRecoveryObligation, QualifiedRecoveryStallSample, RECOVERY_PARK_AFTER_QUIET_PASSES,
@@ -88,10 +90,9 @@ pub use app::chat_presentation::{
     PresentedChatRow, SelectedAvatar, SelectedChatPreview, StoredChatPresentation,
 };
 pub use app::message_drafts::{
-    ChatListDraftVersion, MessageDraftCommitObserver, MessageDraftRevision,
-    MessageDraftRevisionError, SelectedMessageDraft, SelectedMessageDraftAttachment,
-    SelectedMessageDraftContent, StoredMessageDraft, StoredMessageDraftAttachment,
-    StoredMessageDraftAttachmentSummary, StoredMessageDraftSummary,
+    ChatListDraftVersion, MessageDraftRevision, MessageDraftRevisionError, SelectedMessageDraft,
+    SelectedMessageDraftAttachment, SelectedMessageDraftContent, StoredMessageDraft,
+    StoredMessageDraftAttachment, StoredMessageDraftAttachmentSummary, StoredMessageDraftSummary,
 };
 pub use app::pending_welcome_delivery::PendingWelcomeDeliveryRecord;
 pub use app::timeline::{
@@ -116,13 +117,15 @@ pub use app::transport::transport_reconciliation::{
     TRANSPORT_RECONCILIATION_MAX_ITEMS_PER_ROUTE, TRANSPORT_RECONCILIATION_RETENTION_SECS,
     TransportReconciliationInventory, TransportReconciliationItem, TransportReconciliationRoute,
 };
-#[allow(deprecated)]
-pub use base::connection::SqliteStorage;
 pub use base::connection::{
     CloseableConnection, ConnectionGuard, DatabaseCloser, SqlCipherHardening, SqlCipherKey,
-    SqliteAccountStorage, SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous,
-    SqliteTimingObserver, SqliteTimingOperation, open_hardened_sqlcipher,
+    SqliteJournalMode, SqliteStorageOptions, SqliteSynchronous, SqliteTimingObserver,
+    SqliteTimingOperation, open_hardened_sqlcipher,
 };
+pub use cross::outbound::MessageDraftCommitObserver;
+pub use protocol::handle::SqliteAccountStorage;
+#[allow(deprecated)]
+pub use protocol::handle::SqliteStorage;
 pub use protocol::openmls_storage::SqliteOpenMlsStorageError;
 pub use protocol::storage::messages::MessageFormatPromotionProgress;
 #[cfg(feature = "storage-format-benchmarks")]

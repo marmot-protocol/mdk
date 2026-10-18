@@ -99,7 +99,10 @@ impl SqliteAccountStorage {
             let mut unknown_bounds = false;
             for id in &ids {
                 let invalidated:bool=conn.query_row_cached("SELECT inventory_invalidated FROM cgka_released_transport_receipts WHERE id=?1",[id],|r|r.get(0)).storage()?;
-                let removed = retire_transport_receipts(&conn, &MessageId::new(id.clone()))?;
+                let removed = crate::cross::release::retire_transport_receipts(
+                    &conn,
+                    &MessageId::new(id.clone()),
+                )?;
                 unknown_bounds |= removed == 0 && !invalidated;
             }
             let groups = conn.prepare_cached(
@@ -107,7 +110,7 @@ impl SqliteAccountStorage {
             ).storage()?.query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)))
                 .storage()?.collect::<Result<Vec<_>, _>>().storage()?;
             for (group_id, epoch) in groups {
-                crate::app::account_recovery::arm_released_epoch_tx(
+                crate::cross::release::arm_released_epoch(
                     &conn,
                     &group_id,
                     epoch,
@@ -115,7 +118,7 @@ impl SqliteAccountStorage {
                 )?;
             }
             if unknown_bounds {
-                crate::app::account_recovery::invalidate_inventory_tx(&conn)?;
+                crate::cross::release::invalidate_recovery_inventory(&conn)?;
             }
             conn.execute_cached("DELETE FROM cgka_released_transport_receipts", [])
                 .storage()?;
@@ -316,12 +319,7 @@ impl MessageStorage for SqliteAccountStorage {
             // depend on individual receipts: the app's active seen ring may
             // not have checkpointed yet, and inventory writes are best-effort.
             // A standalone engine has no app consumer and needs only deletion.
-            if !conn
-                .query_row_cached("SELECT EXISTS(SELECT 1 FROM account_state)", [], |row| {
-                    row.get::<_, bool>(0)
-                })
-                .storage()?
-            {
+            if !crate::cross::release::app_owns_released_messages(&conn)? {
                 return delete_message_on_connection(&conn, &record.id);
             }
             // Bound journal metadata even if a host never consumes it. At the
@@ -350,8 +348,10 @@ impl MessageStorage for SqliteAccountStorage {
                 "SELECT inventory_invalidated FROM cgka_released_transport_receipts WHERE id=?1",
                 [record.id.as_slice()], |row| row.get(0),
             ).storage()?;
-            if retire_transport_receipts(&conn, &record.id)? == 0 && !invalidated {
-                crate::app::account_recovery::invalidate_inventory_tx(&conn)?;
+            if crate::cross::release::retire_transport_receipts(&conn, &record.id)? == 0
+                && !invalidated
+            {
+                crate::cross::release::invalidate_recovery_inventory(&conn)?;
             }
             conn.execute_cached(
                 "UPDATE cgka_released_transport_receipts SET inventory_invalidated=1 WHERE id=?1",
@@ -1295,15 +1295,6 @@ fn update_message_state_on_connection(
     Ok(())
 }
 
-fn retire_transport_receipts(conn: &rusqlite::Connection, id: &MessageId) -> StorageResult<usize> {
-    conn.execute_cached(
-        "DELETE FROM seen_events WHERE event_id = ?1",
-        params![hex::encode(id.as_slice())],
-    )
-    .storage()?;
-    crate::app::account_recovery::delete_inventory_tx(conn, "event_id = ?1", params![id.as_slice()])
-}
-
 /// Delete a protocol message and its not-yet-acknowledged application event on
 /// the same connection/transaction so neither row can outlive the other.
 fn delete_message_on_connection(conn: &rusqlite::Connection, id: &MessageId) -> StorageResult<()> {
@@ -1482,13 +1473,22 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(store.pending_epoch_backfill_intents().unwrap().is_empty());
+        assert!(
+            store
+                .app_storage()
+                .pending_epoch_backfill_intents()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn released_transport_receipt_journal_tracks_app_without_persisted_receipts() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.ensure_account_projection("app-owner").unwrap();
+        store
+            .app_storage()
+            .ensure_account_projection("app-owner")
+            .unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         let mut record = sample_message(mid(1), gid(1), 0);
         record.state = MessageState::PeelDeferred;
@@ -1508,7 +1508,10 @@ mod tests {
         let path = dir.path().join("release.db");
         let key = crate::SqlCipherKey::new("synthetic release regression").unwrap();
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        store.ensure_account_projection("app-owner").unwrap();
+        store
+            .app_storage()
+            .ensure_account_projection("app-owner")
+            .unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         let mut record = sample_message(MessageId::new(vec![42; 32]), gid(1), 3);
         record.state = MessageState::PeelDeferred;
@@ -1554,7 +1557,14 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(store.pending_epoch_backfill_intents().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .app_storage()
+                .pending_epoch_backfill_intents()
+                .unwrap()
+                .len(),
+            1
+        );
         for table in ["seen_events", "transport_reconciliation_items"] {
             assert_eq!(
                 store
@@ -1569,7 +1579,11 @@ mod tests {
         store.close().unwrap();
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         assert_eq!(
-            store.pending_epoch_backfill_intents().unwrap().len(),
+            store
+                .app_storage()
+                .pending_epoch_backfill_intents()
+                .unwrap()
+                .len(),
             1,
             "death after journal acknowledgement must not lose recovery intent"
         );
@@ -1579,7 +1593,10 @@ mod tests {
     #[test]
     fn released_transport_receipt_transaction_rolls_back_with_raw_bytes() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.ensure_account_projection("app-owner").unwrap();
+        store
+            .app_storage()
+            .ensure_account_projection("app-owner")
+            .unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         let mut record = sample_message(mid(1), gid(1), 0);
         record.state = MessageState::PeelDeferred;
@@ -1606,7 +1623,13 @@ mod tests {
             )
             .unwrap();
         assert!(store.consume_released_transport_receipts().is_err());
-        assert!(store.pending_epoch_backfill_intents().unwrap().is_empty());
+        assert!(
+            store
+                .app_storage()
+                .pending_epoch_backfill_intents()
+                .unwrap()
+                .is_empty()
+        );
         store
             .lock()
             .unwrap()
@@ -1621,7 +1644,10 @@ mod tests {
     #[test]
     fn released_transport_receipt_capacity_never_drops_replay_evidence_or_raw_bytes() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.ensure_account_projection("app-owner").unwrap();
+        store
+            .app_storage()
+            .ensure_account_projection("app-owner")
+            .unwrap();
         store.put_group(&sample_group(gid(1), 0, 0)).unwrap();
         store
             .with_transaction(|storage| -> StorageResult<()> {

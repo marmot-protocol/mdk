@@ -178,7 +178,7 @@ async fn known_event_demand_runs_as_a_job_without_a_broad_request() {
         .expect("the same status command runs before the relay gate")
         .unwrap()
         .unwrap();
-    let storage = app.account_storage(&account.label).unwrap();
+    let storage = app.account_storage(&account.label).unwrap().app_storage();
     let ticket = storage
         .request_recovery(
             storage_sqlite::RecoveryRequest::KnownEvent {

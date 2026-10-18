@@ -42,7 +42,10 @@ async fn retained_submission_preserves_noncanonical_json_bytes_for_engine_handof
         outcome_json: None,
     };
     let store = h.app.account_storage("alice").unwrap();
-    store.insert_local_submission(&submission).unwrap();
+    store
+        .app_storage()
+        .insert_local_submission(&submission)
+        .unwrap();
     let (decoded, retained) = crate::local_submissions::retained_event(&submission).unwrap();
     assert_eq!(decoded.id, event.id);
     assert_eq!(retained, payload);
@@ -61,13 +64,20 @@ async fn retained_submission_preserves_noncanonical_json_bytes_for_engine_handof
         .unwrap();
     assert_eq!(
         store
+            .app_storage()
             .local_submission(&submission.group_id_hex, &submission.client_token)
             .unwrap()
             .unwrap()
             .state,
         1
     );
-    assert!(store.next_local_submission().unwrap().is_none());
+    assert!(
+        store
+            .app_storage()
+            .next_local_submission()
+            .unwrap()
+            .is_none()
+    );
     submission.payload.as_mut().unwrap().push(b' ');
     assert!(
         crate::local_submissions::retained_event(&submission).is_err(),
@@ -127,7 +137,7 @@ async fn durable_admission_is_atomic_correlated_and_retry_stable() {
         .unwrap();
     assert_eq!(first, retry);
     assert!(update.is_none());
-    let store = h.app.account_storage("alice").unwrap();
+    let store = h.app.account_storage("alice").unwrap().app_storage();
     let retained = store.next_local_submission().unwrap().unwrap();
     let event =
         cgka_traits::app_event::MarmotAppEvent::decode(retained.payload.as_ref().unwrap()).unwrap();
@@ -284,6 +294,7 @@ async fn pending_edit_is_durable_while_original_publication_is_blocked() {
         .app
         .account_storage("alice")
         .unwrap()
+        .app_storage()
         .timeline_message(&hex::encode(h.group.as_slice()), &original.message_id_hex)
         .unwrap()
         .unwrap();
@@ -316,6 +327,7 @@ async fn pending_edit_requires_an_existing_local_original() {
         h.app
             .account_storage("alice")
             .unwrap()
+            .app_storage()
             .local_submission(&group_hex, "edit-token")
             .unwrap()
             .is_none()
@@ -417,7 +429,7 @@ async fn multiple_rapid_pending_edits_survive_restart_and_target_the_original_se
             crate::unix_now_seconds(),
         )
         .unwrap();
-    let storage = h.app.account_storage("alice").unwrap();
+    let storage = h.app.account_storage("alice").unwrap().app_storage();
     let retained = storage
         .local_submission(&group_hex, "edit-token")
         .unwrap()
@@ -510,6 +522,7 @@ async fn multiple_rapid_pending_edits_survive_restart_and_target_the_original_se
     let row = reopened
         .account_storage("alice")
         .unwrap()
+        .app_storage()
         .timeline_message(&group_hex, &original.message_id_hex)
         .unwrap()
         .unwrap();
@@ -553,6 +566,7 @@ async fn rejected_original_cannot_publish_a_retained_pending_edit() {
     h.app
         .account_storage("alice")
         .unwrap()
+        .app_storage()
         .finish_local_submission(&group_hex, "original-token", None)
         .unwrap();
     h.app.close_storage().unwrap();
@@ -589,6 +603,7 @@ async fn rejected_original_cannot_publish_a_retained_pending_edit() {
         reopened
             .account_storage("alice")
             .unwrap()
+            .app_storage()
             .next_local_submission()
             .unwrap()
             .is_none()
@@ -612,6 +627,7 @@ async fn durable_admission_proceeds_while_relay_publication_is_blocked() {
         h.app
             .account_storage("alice")
             .unwrap()
+            .app_storage()
             .local_submission(&hex::encode(h.group.as_slice()), "first-token")
             .unwrap()
             .unwrap()
@@ -644,7 +660,7 @@ async fn durable_admission_proceeds_while_relay_publication_is_blocked() {
     })
     .await
     .unwrap();
-    let store = h.app.account_storage("alice").unwrap();
+    let store = h.app.account_storage("alice").unwrap().app_storage();
     assert!(store.next_local_submission().unwrap().is_none());
     let row = store
         .timeline_message(&hex::encode(h.group.as_slice()), &second.message_id_hex)
@@ -675,7 +691,7 @@ async fn durable_admission_is_drained_by_a_new_worker() {
     h.app.close_storage().unwrap();
     let reopened = MarmotApp::with_relay(h._dir.path(), "wss://relay.example")
         .with_test_relay_client(h.relay.clone());
-    let storage = reopened.account_storage("alice").unwrap();
+    let storage = reopened.account_storage("alice").unwrap().app_storage();
     let group_hex = hex::encode(h.group.as_slice());
     storage
         .rebuild_message_timeline_for_group(&group_hex)
@@ -717,6 +733,7 @@ async fn durable_admission_is_drained_by_a_new_worker() {
         reopened
             .account_storage("alice")
             .unwrap()
+            .app_storage()
             .next_local_submission()
             .unwrap()
             .is_none()
@@ -727,6 +744,7 @@ async fn durable_admission_is_drained_by_a_new_worker() {
     let retained = reopened
         .account_storage("alice")
         .unwrap()
+        .app_storage()
         .local_submission(&group_hex, "restart-token")
         .unwrap()
         .unwrap();
@@ -781,6 +799,7 @@ async fn rejected_submission_requires_a_new_token_after_restart() {
         .app
         .account_storage("alice")
         .unwrap()
+        .app_storage()
         .next_local_submission()
         .unwrap()
         .unwrap();
@@ -810,7 +829,7 @@ async fn rejected_submission_requires_a_new_token_after_restart() {
     assert!(
         matches!(error, AppError::InvalidAppMessagePayload(ref detail) if detail.contains("rejected submission"))
     );
-    let store = reopened.account_storage("alice").unwrap();
+    let store = reopened.account_storage("alice").unwrap().app_storage();
     assert!(store.next_local_submission().unwrap().is_none());
     let original = store
         .local_submission(&hex::encode(h.group.as_slice()), "rejected-token")
@@ -866,7 +885,7 @@ async fn completion_write_failure_does_not_stall_later_submissions() {
     drop(connection);
     let runtime = MarmotAppRuntime::new(h.app.clone());
     runtime.start().await.unwrap();
-    let store = h.app.account_storage("alice").unwrap();
+    let store = h.app.account_storage("alice").unwrap().app_storage();
     let group = hex::encode(h.group.as_slice());
     // Three rows also prevent the initial maintenance tick from masking the bug.
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -1030,6 +1049,7 @@ async fn prepared_media_snapshot_consumption_survives_restart_before_host_cleanu
     );
     let store = reopened.account_storage("alice").unwrap();
     let retained = store
+        .app_storage()
         .local_submission(&group, "snapshot-token")
         .unwrap()
         .unwrap();
@@ -1137,6 +1157,7 @@ async fn prepared_media_snapshot_preserves_changed_cleared_and_identical_newer_d
             .app
             .account_storage("alice")
             .unwrap()
+            .app_storage()
             .timeline_message(&group, &accepted.message_id_hex)
             .unwrap()
             .unwrap();
@@ -1188,6 +1209,7 @@ async fn prepared_media_snapshot_rejects_unrelated_payload_without_consuming_the
             h.app
                 .account_storage("alice")
                 .unwrap()
+                .app_storage()
                 .local_submission(&group, &format!("mismatched-{mismatch}"))
                 .unwrap()
                 .is_none()
@@ -1223,12 +1245,14 @@ async fn prepared_media_snapshot_rollback_preserves_both_draft_and_admission() {
     assert!(result.is_err());
     assert!(
         store
+            .app_storage()
             .local_submission(&group, "rollback-token")
             .unwrap()
             .is_none()
     );
     assert!(
         store
+            .app_storage()
             .timeline_message(&group, &message_id.unwrap())
             .unwrap()
             .is_none()
@@ -1292,7 +1316,7 @@ async fn retained_edit_of_a_deleted_message_is_refused_at_admission() {
             },
         )
         .unwrap();
-    let storage = h.app.account_storage("alice").unwrap();
+    let storage = h.app.account_storage("alice").unwrap().app_storage();
     assert!(
         storage
             .timeline_message(&group_hex, &original.message_id_hex)

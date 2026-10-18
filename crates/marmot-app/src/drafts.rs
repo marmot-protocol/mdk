@@ -265,6 +265,7 @@ impl MarmotApp {
         attachment: &str,
     ) -> Result<Option<Vec<u8>>, AppError> {
         self.draft_storage(account)?
+            .app_storage()
             .message_draft_attachment_if_revision(revision, attachment)
             .map_err(|error| revision_error(error, revision.group_id_hex()))
     }
@@ -274,6 +275,7 @@ impl MarmotApp {
         group: &str,
     ) -> Result<SelectedMessageDraft, AppError> {
         self.draft_storage(account_ref)?
+            .app_storage()
             .selected_message_draft(group)
             .map_err(|error| draft_storage_error(error, group))
     }
@@ -289,6 +291,7 @@ impl MarmotApp {
         let storage = self.draft_storage(account_ref)?;
         let attachments = attachments.into_iter().map(Into::into).collect::<Vec<_>>();
         let result = storage
+            .app_storage()
             .save_message_draft_if_revision(expected, content, reply, &attachments)
             .map_err(|error| revision_error(error, expected.group_id_hex()))?;
         self.notify_draft_changed(account_ref, expected.group_id_hex());
@@ -301,6 +304,7 @@ impl MarmotApp {
     ) -> Result<SelectedMessageDraft, AppError> {
         let result = self
             .draft_storage(account_ref)?
+            .app_storage()
             .clear_message_draft_if_revision(expected)
             .map_err(|error| revision_error(error, expected.group_id_hex()))?;
         self.notify_draft_changed(account_ref, expected.group_id_hex());
@@ -330,6 +334,7 @@ impl Drop for DraftSubmissionGuard {
     fn drop(&mut self) {
         let _ = self
             .storage
+            .app_storage()
             .cancel_message_draft_submission(&self.revision, &self.app_event_id);
     }
 }
@@ -345,6 +350,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         Ok(self
             .account_storage(&account.label)?
+            .app_storage()
             .message_drafts()?
             .into_iter()
             .map(Into::into)
@@ -361,6 +367,7 @@ impl MarmotApp {
         self.ensure_account_state(&account.label)?;
         Ok(self
             .account_storage(&account.label)?
+            .app_storage()
             .message_draft(group_id_hex)?
             .map(Into::into))
     }
@@ -384,12 +391,10 @@ impl MarmotApp {
             .into_iter()
             .map(Into::into)
             .collect::<Vec<_>>();
-        let result = self.account_storage(&account.label)?.save_message_draft(
-            group_id_hex,
-            content,
-            reply_to_message_id_hex,
-            &attachments,
-        );
+        let result = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .save_message_draft(group_id_hex, content, reply_to_message_id_hex, &attachments);
         match result {
             Ok(draft) => {
                 self.notify_draft_changed(&account.label, group_id_hex);
@@ -409,6 +414,7 @@ impl MarmotApp {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
+            .app_storage()
             .delete_message_draft(group_id_hex)?;
         self.notify_draft_changed(&account.label, group_id_hex);
         Ok(())

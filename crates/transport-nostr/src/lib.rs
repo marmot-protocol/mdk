@@ -135,6 +135,10 @@ struct MarmotRelayPlaneInner {
     transport: Arc<RelayPlaneTransport>,
     directory: DirectoryRelayPlane,
     directory_subscription_sync: Mutex<()>,
+    /// One signer-bound publisher per account. Setup publishes and the managed
+    /// account worker share this client so the worker can reuse the same relay
+    /// pool instead of constructing another TCP/TLS/WebSocket stack.
+    account_publish_clients: std::sync::Mutex<HashMap<String, Arc<dyn NostrRelayClient>>>,
 }
 
 struct RelayPlaneTransport {
@@ -1382,10 +1386,57 @@ impl MarmotRelayPlane {
                 transport,
                 directory: DirectoryRelayPlane::new(directory_fetcher),
                 directory_subscription_sync: Mutex::new(()),
+                account_publish_clients: std::sync::Mutex::new(HashMap::new()),
             }),
         };
         this.spawn_router();
         this
+    }
+
+    /// The account's signer-bound publish client, built on first use with the
+    /// plane's proxy-aware builder and shared by every later caller.
+    ///
+    /// The signer is ignored on a cache hit. A caller that replaces an
+    /// account's signer must call [`Self::evict_account_publish_client`]
+    /// first; registering an external signer and dropping an account's
+    /// caches do.
+    #[doc(hidden)]
+    pub fn account_publish_client(
+        &self,
+        account_id_hex: &str,
+        signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+    ) -> Arc<dyn NostrRelayClient> {
+        let mut clients = self
+            .inner
+            .account_publish_clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        clients
+            .entry(account_id_hex.to_owned())
+            .or_insert_with(|| {
+                let client = nostr_builder()
+                    .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
+                        transport_nostr_peeler::SdkSigner(signer.clone()),
+                    ))
+                    .build();
+                let account_id =
+                    MemberId::new(hex::decode(account_id_hex).expect("validated account identity"));
+                Arc::new(NostrSdkRelayClient::with_account_signer(
+                    client, account_id, signer,
+                ))
+            })
+            .clone()
+    }
+
+    /// Forgets the account's publish client, so the next
+    /// [`Self::account_publish_client`] builds one with the current signer.
+    #[doc(hidden)]
+    pub fn evict_account_publish_client(&self, account_id_hex: &str) {
+        self.inner
+            .account_publish_clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(account_id_hex);
     }
 
     /// Build an account adapter without durable queue-overflow recovery.
@@ -3025,102 +3076,21 @@ async fn handle_relay_notification(
     account_id: Option<&MemberId>,
     classify_closed: &(dyn Fn(&str) -> transport_nostr_adapter::SubscriptionRefusal + Sync),
 ) -> bool {
-    match notification {
-        ClientNotification::Event {
-            relay_url,
-            subscription_id,
-            event,
-        } => {
-            if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
-                tracing::trace!(
-                    target: "marmot_app::relay_plane",
-                    method = "handle_relay_notification",
-                    "forwarding SDK relay event"
-                );
-                let endpoint = TransportEndpoint(relay_url.to_string());
-                let subscription_id = subscription_id.to_string();
-                let relay_event = transport_nostr_adapter::NostrRelayEvent {
-                    endpoint,
-                    subscription_id: Some(subscription_id),
-                    event,
-                };
-                // Account notifications feed only account/group delivery.
-                // Public directory interests use the anonymous receiver.
-                let _ = if let Some(account_id) = account_id {
-                    adapter
-                        .handle_reconciled_event(account_id, relay_event)
-                        .await
-                } else {
-                    adapter.handle_relay_event(relay_event).await
-                };
-            }
-            false
-        }
-        ClientNotification::Message { relay_url, message } => {
-            match *message {
-                RelayMessage::Event {
-                    subscription_id,
-                    event,
-                } => {
-                    // Raw per-relay copy feeds telemetry and replay-page
-                    // accounting, in order with this relay's EOSE. Delivery
-                    // uses the deduplicated Event notification above.
-                    match NostrTransportEvent::from_nostr_event(&event) {
-                        Ok(event) => {
-                            adapter
-                                .observe_relay_event(transport_nostr_adapter::NostrRelayEvent {
-                                    endpoint: TransportEndpoint(relay_url.to_string()),
-                                    subscription_id: Some(subscription_id.to_string()),
-                                    event,
-                                })
-                                .await;
-                        }
-                        Err(_) => {
-                            adapter
-                                .observe_unconvertible_relay_event(
-                                    TransportEndpoint(relay_url.to_string()),
-                                    subscription_id.to_string(),
-                                    event.created_at.as_secs(),
-                                )
-                                .await;
-                        }
-                    }
-                }
-                RelayMessage::EndOfStoredEvents(subscription_id) => {
-                    adapter
-                        .handle_relay_eose(
-                            TransportEndpoint(relay_url.to_string()),
-                            subscription_id.to_string(),
-                        )
-                        .await;
-                }
-                // Classified from this message's reason, not from the SDK's
-                // registry, which a later re-send may already have changed.
-                RelayMessage::Closed {
-                    subscription_id,
-                    message,
-                } => {
-                    adapter
-                        .handle_relay_closed(
-                            TransportEndpoint(relay_url.to_string()),
-                            subscription_id.to_string(),
-                            classify_closed(&message),
-                        )
-                        .await;
-                }
-                _ => {}
-            }
-            false
-        }
-        ClientNotification::Shutdown => {
-            tracing::debug!(
-                target: "marmot_app::relay_plane",
-                method = "handle_relay_notification",
-                "SDK relay pool shutdown observed"
-            );
-            true
-        }
+    let shutdown = transport_nostr_adapter::dispatch_sdk_notification(
+        notification,
+        adapter,
+        account_id,
+        classify_closed,
+    )
+    .await;
+    if shutdown {
+        tracing::debug!(
+            target: "marmot_app::relay_plane",
+            method = "handle_relay_notification",
+            "SDK relay pool shutdown observed"
+        );
     }
+    shutdown
 }
 
 fn recover_relay_notification_forwarder(

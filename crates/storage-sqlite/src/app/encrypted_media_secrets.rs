@@ -1,9 +1,10 @@
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 use crate::base::connection::CachedSql;
 use std::collections::BTreeSet;
 
 use crate::{
-    SqliteAccountStorage, SqliteResultExt, StoredAppEvent, i64_to_u64, u64_to_i64,
-    unix_now_seconds_i64,
+    SqliteAppStorage, SqliteResultExt, StoredAppEvent, i64_to_u64, u64_to_i64, unix_now_seconds_i64,
 };
 use cgka_traits::app_components::{
     ENCRYPTED_MEDIA_FORMAT_V1, ENCRYPTED_MEDIA_FORMAT_V2, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
@@ -13,7 +14,7 @@ use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_R
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::{Connection, OptionalExtension, params};
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     pub fn remember_encrypted_media_epoch_secret(
         &self,
         group_id_hex: &str,
@@ -492,7 +493,7 @@ mod tests {
 
     #[test]
     fn encrypted_media_epoch_secret_round_trips_and_replaces() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let group_id_hex = "aa";
         store
             .record_app_event(&media_event("retained", 10, 7))
@@ -527,7 +528,7 @@ mod tests {
 
     #[test]
     fn encrypted_media_v1_and_v2_epoch_secrets_are_isolated() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let group_id_hex = "cd".repeat(32);
         store
             .remember_encrypted_media_epoch_secret(&group_id_hex, 0x8008, 7, &[1; 32])
@@ -554,11 +555,15 @@ mod tests {
     fn unreferenced_non_retired_cached_secret_can_be_served() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
+            .app_storage()
             .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
             .unwrap();
 
         assert_eq!(
-            store.encrypted_media_epoch_secret("aa", 0x8008, 7).unwrap(),
+            store
+                .app_storage()
+                .encrypted_media_epoch_secret("aa", 0x8008, 7)
+                .unwrap(),
             Some(vec![1, 2, 3])
         );
         let durable_rows: i64 = store
@@ -578,7 +583,7 @@ mod tests {
 
     #[test]
     fn final_retained_media_message_prune_deletes_its_epoch_secret() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         store
             .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
             .unwrap();
@@ -599,6 +604,7 @@ mod tests {
     fn duplicate_attachments_create_one_epoch_secret_reference() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
+            .app_storage()
             .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
             .unwrap();
         let duplicate = media_event_with_versions(
@@ -608,7 +614,7 @@ mod tests {
             &[ENCRYPTED_MEDIA_FORMAT_V1, ENCRYPTED_MEDIA_FORMAT_V1],
         );
 
-        store.record_app_event(&duplicate).unwrap();
+        store.app_storage().record_app_event(&duplicate).unwrap();
 
         let references: i64 = store
             .lock()
@@ -627,11 +633,12 @@ mod tests {
     fn conflicting_replay_cannot_retarget_a_durable_source_epoch_reference() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
+            .app_storage()
             .record_app_event(&media_event("stable", 10, 7))
             .unwrap();
 
         let replay = media_event("stable", 20, 8);
-        store.record_app_event(&replay).unwrap();
+        store.app_storage().record_app_event(&replay).unwrap();
 
         let referenced_epochs = {
             let conn = store.lock().unwrap();
@@ -660,11 +667,11 @@ mod tests {
             format!("v {ENCRYPTED_MEDIA_FORMAT_V1}"),
             format!("v {ENCRYPTED_MEDIA_FORMAT_V2}"),
         ]];
-        store.record_app_event(&malformed).unwrap();
+        store.app_storage().record_app_event(&malformed).unwrap();
 
         let mut non_chat = media_event("non-chat", 20, 8);
         non_chat.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_EDIT;
-        store.record_app_event(&non_chat).unwrap();
+        store.app_storage().record_app_event(&non_chat).unwrap();
 
         let references: i64 = store
             .lock()
@@ -684,7 +691,7 @@ mod tests {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let mut reaction = media_event("reaction", 20, 8);
         reaction.kind = cgka_traits::app_event::MARMOT_APP_EVENT_KIND_REACTION;
-        store.record_app_event(&reaction).unwrap();
+        store.app_storage().record_app_event(&reaction).unwrap();
 
         let epochs: Vec<i64> = {
             let conn = store.lock().unwrap();
@@ -706,30 +713,30 @@ mod tests {
     #[test]
     fn shared_epoch_secret_survives_partial_sweep_until_final_reference() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store
-            .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
+        let app = store.app_storage();
+        app.remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
             .unwrap();
-        store.record_app_event(&media_event("old", 10, 7)).unwrap();
-        store.record_app_event(&media_event("new", 20, 7)).unwrap();
+        app.record_app_event(&media_event("old", 10, 7)).unwrap();
+        app.record_app_event(&media_event("new", 20, 7)).unwrap();
 
-        let partial = store
+        let partial = app
             .secure_prune_app_events_before("aa", 15, "local", &no_mentions)
             .unwrap();
         assert_eq!(partial.pruned_messages, 1);
         assert_eq!(partial.pruned_media_epoch_secrets, 0);
         assert!(secret_is_referenced(&store, "aa", 0x8008, 7));
         assert_eq!(
-            store.encrypted_media_epoch_secret("aa", 0x8008, 7).unwrap(),
+            app.encrypted_media_epoch_secret("aa", 0x8008, 7).unwrap(),
             Some(vec![1, 2, 3])
         );
 
-        let final_sweep = store
+        let final_sweep = app
             .secure_prune_app_events_before("aa", 21, "local", &no_mentions)
             .unwrap();
         assert_eq!(final_sweep.pruned_messages, 1);
         assert_eq!(final_sweep.pruned_media_epoch_secrets, 1);
         assert_eq!(
-            store.encrypted_media_epoch_secret("aa", 0x8008, 7).unwrap(),
+            app.encrypted_media_epoch_secret("aa", 0x8008, 7).unwrap(),
             None
         );
     }
@@ -737,22 +744,21 @@ mod tests {
     #[test]
     fn media_v2_reference_is_tracked_under_its_distinct_component_id() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store
-            .remember_encrypted_media_epoch_secret(
-                "aa",
-                GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
-                7,
-                &[4, 5, 6],
-            )
-            .unwrap();
-        store
-            .record_app_event(&media_event_with_versions(
-                "v2",
-                10,
-                7,
-                &[ENCRYPTED_MEDIA_FORMAT_V2],
-            ))
-            .unwrap();
+        let app = store.app_storage();
+        app.remember_encrypted_media_epoch_secret(
+            "aa",
+            GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+            7,
+            &[4, 5, 6],
+        )
+        .unwrap();
+        app.record_app_event(&media_event_with_versions(
+            "v2",
+            10,
+            7,
+            &[ENCRYPTED_MEDIA_FORMAT_V2],
+        ))
+        .unwrap();
 
         assert!(secret_is_referenced(
             &store,
@@ -766,13 +772,12 @@ mod tests {
             GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
             7,
         ));
-        let outcome = store
+        let outcome = app
             .secure_prune_app_events_before("aa", 11, "local", &no_mentions)
             .unwrap();
         assert_eq!(outcome.pruned_media_epoch_secrets, 1);
         assert_eq!(
-            store
-                .encrypted_media_epoch_secret("aa", GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, 7,)
+            app.encrypted_media_epoch_secret("aa", GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, 7,)
                 .unwrap(),
             None
         );
@@ -780,7 +785,7 @@ mod tests {
 
     #[test]
     fn retired_secret_cannot_be_rehydrated_without_a_new_retained_reference() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         store
             .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
             .unwrap();
@@ -823,19 +828,24 @@ mod tests {
     fn retirement_watermark_is_bounded_and_advances_monotonically() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store
+            .app_storage()
             .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
             .unwrap();
         store
+            .app_storage()
             .record_app_event(&media_event("seven", 10, 7))
             .unwrap();
         store
+            .app_storage()
             .secure_prune_app_events_before("aa", 11, "local", &no_mentions)
             .unwrap();
 
         store
+            .app_storage()
             .remember_encrypted_media_epoch_secret("aa", 0x8008, 6, &[6])
             .unwrap();
         store
+            .app_storage()
             .remember_encrypted_media_epoch_secret("aa", 0x8008, 8, &[8])
             .unwrap();
         let durable_epochs = |store: &SqliteAccountStorage| {
@@ -855,9 +865,11 @@ mod tests {
         assert_eq!(durable_epochs(&store), vec![8]);
 
         store
+            .app_storage()
             .record_app_event(&media_event("eight", 20, 8))
             .unwrap();
         store
+            .app_storage()
             .secure_prune_app_events_before("aa", 21, "local", &no_mentions)
             .unwrap();
         let watermark: (i64, i64) = store
@@ -882,20 +894,21 @@ mod tests {
             crate::SqliteStorageOptions::default(),
         )
         .unwrap();
-        store
-            .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
+        let app = store.app_storage();
+        app.remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
             .unwrap();
-        store.record_app_event(&media_event("old", 10, 7)).unwrap();
-        store
-            .secure_prune_app_events_before("aa", 11, "local", &no_mentions)
+        app.record_app_event(&media_event("old", 10, 7)).unwrap();
+        app.secure_prune_app_events_before("aa", 11, "local", &no_mentions)
             .unwrap();
+        drop(app);
         drop(store);
 
         let reopened = SqliteAccountStorage::from_connection_with_options(
             rusqlite::Connection::open(&path).unwrap(),
             crate::SqliteStorageOptions::default(),
         )
-        .unwrap();
+        .unwrap()
+        .app_storage();
         reopened
             .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[9, 9, 9])
             .unwrap();
@@ -918,27 +931,27 @@ mod tests {
             crate::SqliteStorageOptions::default(),
         )
         .unwrap();
-        store
-            .record_app_event(&media_event("reference-only", 10, 7))
+        let app = store.app_storage();
+        app.record_app_event(&media_event("reference-only", 10, 7))
             .unwrap();
-        store
-            .secure_prune_app_events_before("aa", 11, "local", &no_mentions)
+        app.secure_prune_app_events_before("aa", 11, "local", &no_mentions)
             .unwrap();
-        store
-            .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
+        app.remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
             .unwrap();
         assert_eq!(
-            store.encrypted_media_epoch_secret("aa", 0x8008, 7).unwrap(),
+            app.encrypted_media_epoch_secret("aa", 0x8008, 7).unwrap(),
             None,
             "retirement must not depend on a key row existing at prune time"
         );
+        drop(app);
         drop(store);
 
         let reopened = SqliteAccountStorage::from_connection_with_options(
             rusqlite::Connection::open(&path).unwrap(),
             crate::SqliteStorageOptions::default(),
         )
-        .unwrap();
+        .unwrap()
+        .app_storage();
         reopened
             .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[4, 5, 6])
             .unwrap();
@@ -952,7 +965,7 @@ mod tests {
 
     #[test]
     fn v1_and_v2_references_share_one_exporter_secret_lifetime() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         store
             .remember_encrypted_media_epoch_secret(
                 "aa",
@@ -1007,10 +1020,10 @@ mod tests {
     #[test]
     fn prune_failure_rolls_back_message_reference_secret_and_retirement() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store
-            .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
+        let app = store.app_storage();
+        app.remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
             .unwrap();
-        store.record_app_event(&media_event("old", 10, 7)).unwrap();
+        app.record_app_event(&media_event("old", 10, 7)).unwrap();
         store
             .lock()
             .unwrap()
@@ -1023,14 +1036,14 @@ mod tests {
             )
             .unwrap();
 
-        let error = store
+        let error = app
             .secure_prune_app_events_before("aa", 11, "local", &no_mentions)
             .expect_err("secret-delete failure must abort the whole prune");
         assert!(format!("{error}").contains("abort media secret delete"));
-        assert_eq!(store.app_message_count().unwrap(), 1);
+        assert_eq!(app.app_message_count().unwrap(), 1);
         assert!(secret_is_referenced(&store, "aa", 0x8008, 7));
         assert_eq!(
-            store.encrypted_media_epoch_secret("aa", 0x8008, 7).unwrap(),
+            app.encrypted_media_epoch_secret("aa", 0x8008, 7).unwrap(),
             Some(vec![1, 2, 3])
         );
         let retirement_watermarks: i64 = store

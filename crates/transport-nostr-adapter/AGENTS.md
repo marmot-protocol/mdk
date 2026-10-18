@@ -93,9 +93,10 @@ for reconnect/backoff and relay status mechanics.
   got nothing has its re-issue released and counted in `EoseReissueSummary::failed_relays` so the caller repairs it
   again later. Never wait for queue room under the lifecycle lock. Never infer EOSE at a lag, change
   a re-issued REQ's filter, or reopen a closed REQ.
-- Hand every relay `CLOSED` on a live REQ to `handle_relay_closed` from every notification consumer: this crate's
-  `spawn_notification_forwarder` and `marmot-app`'s relay-plane consumer (`handle_relay_notification`). Classify each
-  message on its own with `sdk_subscription_refusal` / `NostrSdkRelayClient::subscription_refusal`, which mirrors how
+- Hand every relay `CLOSED` on a live REQ to `handle_relay_closed` in `dispatch_sdk_notification`, the one dispatch
+  both notification consumers share (the relay plane's in `transport-nostr`, and this crate's test forwarder); change
+  `CLOSED` handling there, never in a consumer loop. Classify each message on its own with `sdk_subscription_refusal` /
+  `NostrSdkRelayClient::subscription_refusal`, which mirrors how
   nostr-sdk settles that REQ (kept for `rate-limited:`, and for `auth-required:` with an authenticator); never read
   the SDK registry when the queued notification is handled, since a later re-send may have changed it. An unknown
   authenticator keeps `auth-required:` pending. The forwarder test pins the table against the SDK registry. Treat a
@@ -105,6 +106,8 @@ for reconnect/backoff and relay status mechanics.
   (superseded attempts, one-shot fetches). Keep only the reason's category, never its text, in state, logs,
   telemetry and the audit queue.
 - Keep real relay clients behind `NostrRelayClient`.
+- `dispatch_sdk_notification` is the one place an SDK notification is routed into the adapter. The relay plane's
+  consumer (`transport-nostr`) and `spawn_notification_forwarder`, which only tests use, both call it.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.
 - Relay endpoints are host-safety filtered before any connect at the `RelaySafetyPolicy` chokepoint in `transport-nostr`
   (`crates/transport-nostr/src/safety.rs`); relay hosts that are non-public IP literals are rejected, and literal

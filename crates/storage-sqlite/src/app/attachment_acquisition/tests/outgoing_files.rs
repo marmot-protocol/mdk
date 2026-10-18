@@ -27,8 +27,9 @@ impl Read for HeldReader {
 fn held_file_import_rejects_lease_elapsed_during_reader_io() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "elapsed-import");
-    let asset = request(&store, "elapsed-import");
+    let asset = request(&store.app_storage(), "elapsed-import");
     let job = store
+        .app_storage()
         .claim_attachment_acquisition(&asset, 12, 13)
         .unwrap()
         .unwrap();
@@ -43,6 +44,7 @@ fn held_file_import_rejects_lease_elapsed_during_reader_io() {
             hold_at: 0,
         };
         worker_store
+            .app_storage()
             .complete_attachment_acquisition_from_reader(
                 &job,
                 &mut reader,
@@ -63,6 +65,7 @@ fn held_file_import_rejects_lease_elapsed_during_reader_io() {
     assert_eq!(import.join().unwrap(), AttachmentPublishResult::Superseded);
     assert!(
         store
+            .app_storage()
             .read_retained_attachment(&asset, 13, 0, 100)
             .unwrap()
             .is_none()
@@ -77,8 +80,9 @@ fn held_file_import_deadline_control(source_expiry: bool, hold_at: u64, finish_t
     use std::sync::atomic::{AtomicU64, Ordering};
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "expired-import");
-    let asset = request(&store, "expired-import");
+    let asset = request(&store.app_storage(), "expired-import");
     let job = store
+        .app_storage()
         .claim_attachment_acquisition(&asset, 12, if source_expiry { 100 } else { 13 })
         .unwrap()
         .unwrap();
@@ -98,6 +102,7 @@ fn held_file_import_deadline_control(source_expiry: bool, hold_at: u64, finish_t
             hold_at,
         };
         worker_store
+            .app_storage()
             .complete_attachment_acquisition_from_reader_with_clock(
                 &job,
                 &mut reader,
@@ -119,12 +124,13 @@ fn held_file_import_deadline_control(source_expiry: bool, hold_at: u64, finish_t
     let outcome = import.join().unwrap();
     if finish_time == 12 {
         assert_eq!(outcome, AttachmentPublishResult::Published);
-        assert_eq!(read(&store, &asset), BODY);
+        assert_eq!(read(&store.app_storage(), &asset), BODY);
         assert_eq!(usage(&store), BODY.len() as u64);
     } else {
         assert_eq!(outcome, AttachmentPublishResult::Superseded);
         assert!(
             store
+                .app_storage()
                 .read_retained_attachment(&asset, finish_time, 0, 100)
                 .unwrap()
                 .is_none()
@@ -166,8 +172,9 @@ fn held_file_import_publishes_with_valid_clock() {
 fn held_file_import_allows_account_read_and_removal_without_publishing_bytes() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "held-import");
-    let asset = request(&store, "held-import");
+    let asset = request(&store.app_storage(), "held-import");
     let job = store
+        .app_storage()
         .claim_attachment_acquisition(&asset, 12, 100)
         .unwrap()
         .unwrap();
@@ -181,14 +188,16 @@ fn held_file_import_allows_account_read_and_removal_without_publishing_bytes() {
             release: resume,
             hold_at: 0,
         };
-        worker_store.complete_attachment_acquisition_from_reader(
-            &job,
-            &mut reader,
-            BODY.len() as u64,
-            12,
-            10000,
-            &|| false,
-        )
+        worker_store
+            .app_storage()
+            .complete_attachment_acquisition_from_reader(
+                &job,
+                &mut reader,
+                BODY.len() as u64,
+                12,
+                10000,
+                &|| false,
+            )
     });
     waiting
         .recv_timeout(std::time::Duration::from_secs(5))
@@ -205,12 +214,14 @@ fn held_file_import_allows_account_read_and_removal_without_publishing_bytes() {
         );
         assert!(
             probe_store
+                .app_storage()
                 .read_retained_attachment(&probe_asset, 12, 0, 10)
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
             probe_store
+                .app_storage()
                 .attachment_acquisition_status(&probe_asset)
                 .unwrap()
                 .unwrap()
@@ -219,6 +230,7 @@ fn held_file_import_allows_account_read_and_removal_without_publishing_bytes() {
         );
         assert!(
             probe_store
+                .app_storage()
                 .remove_local_attachment(GROUP, "held-import", 0)
                 .unwrap()
         );
@@ -241,8 +253,9 @@ fn held_file_import_allows_account_read_and_removal_without_publishing_bytes() {
 fn replacement_attempt_preserves_its_bytes_when_old_import_resumes() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store, "replace-import");
-    let asset = request(&store, "replace-import");
+    let asset = request(&store.app_storage(), "replace-import");
     let old = store
+        .app_storage()
         .claim_attachment_acquisition(&asset, 12, 13)
         .unwrap()
         .unwrap();
@@ -256,19 +269,21 @@ fn replacement_attempt_preserves_its_bytes_when_old_import_resumes() {
             release: resume,
             hold_at: 0,
         };
-        old_store.complete_attachment_acquisition_from_reader(
-            &old,
-            &mut reader,
-            BODY.len() as u64,
-            12,
-            10000,
-            &|| false,
-        )
+        old_store
+            .app_storage()
+            .complete_attachment_acquisition_from_reader(
+                &old,
+                &mut reader,
+                BODY.len() as u64,
+                12,
+                10000,
+                &|| false,
+            )
     });
     waiting
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
-    let replacement_store = store.clone();
+    let replacement_store = store.app_storage();
     let replacement_asset = asset.clone();
     let (finished, done) = std::sync::mpsc::channel();
     let replacement = std::thread::spawn(move || {
@@ -303,6 +318,7 @@ fn replacement_attempt_preserves_its_bytes_when_old_import_resumes() {
     assert_eq!(usage(&store), BODY.len() as u64);
     assert_eq!(
         store
+            .app_storage()
             .read_retained_attachment(&asset, 14, 0, 100)
             .unwrap()
             .unwrap()
@@ -330,7 +346,7 @@ fn cancelled_staging_releases_committed_chunks_without_blocking_account_commands
             release: resume,
             hold_at: 1024 * 1024,
         };
-        worker_store.stage_attachment_upload_files(
+        worker_store.app_storage().stage_attachment_upload_files(
             GROUP,
             3,
             &mut [AttachmentUploadSource {
@@ -380,6 +396,7 @@ fn file_import_reads_across_chunk_boundaries_and_reopens_encrypted_storage() {
     let path = directory.path().join("chunked.sqlite");
     let key = SqlCipherKey::new("synthetic-chunk-reopen").unwrap();
     let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let app = store.app_storage();
     seed(&store, "chunked");
     let body = (0..(2 * 1024 * 1024 + 17))
         .map(|i| (i % 251) as u8)
@@ -387,34 +404,34 @@ fn file_import_reads_across_chunk_boundaries_and_reopens_encrypted_storage() {
     let digest: [u8; 32] = Sha256::digest(&body).into();
     let mut event = source("chunked");
     event.tags[0][2] = format!("x {}", hex::encode(digest));
-    store.record_app_event(&event).unwrap();
+    app.record_app_event(&event).unwrap();
     let mut entry = selected("chunked");
     entry.slot = serde_json::to_value(&event.tags[0]).unwrap();
-    let AttachmentDemand::Requested(asset) = store
+    let AttachmentDemand::Requested(asset) = app
         .request_attachment_acquisition(GROUP, &entry, digest, 11)
         .unwrap()
     else {
         panic!("expected demand")
     };
-    let job = store
+    let job = app
         .claim_attachment_acquisition(&asset, 12, 100)
         .unwrap()
         .unwrap();
     assert_eq!(
-        store
-            .complete_attachment_acquisition_from_reader(
-                &job,
-                &mut Cursor::new(&body),
-                body.len() as u64,
-                12,
-                body.len() as u64,
-                &|| false
-            )
-            .unwrap(),
+        app.complete_attachment_acquisition_from_reader(
+            &job,
+            &mut Cursor::new(&body),
+            body.len() as u64,
+            12,
+            body.len() as u64,
+            &|| false
+        )
+        .unwrap(),
         AttachmentPublishResult::Published
     );
     store.close().unwrap();
     let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let reopened_app = reopened.app_storage();
     assert_eq!(usage(&reopened), body.len() as u64);
     for (offset, limit) in [
         (0, 11),
@@ -423,7 +440,7 @@ fn file_import_reads_across_chunk_boundaries_and_reopens_encrypted_storage() {
         (body.len() - 17, 100),
         (body.len(), 100),
     ] {
-        let bytes = reopened
+        let bytes = reopened_app
             .read_retained_attachment(&asset, 12, offset as u64, limit)
             .unwrap()
             .unwrap();
@@ -433,14 +450,14 @@ fn file_import_reads_across_chunk_boundaries_and_reopens_encrypted_storage() {
         );
     }
     assert_eq!(
-        reopened
+        reopened_app
             .retained_attachment_asset(GROUP, "chunked", "source-chunked", 0, 12)
             .unwrap()
             .unwrap()
             .byte_count,
         body.len() as u64
     );
-    reopened
+    reopened_app
         .remove_local_attachment(GROUP, "chunked", 0)
         .unwrap();
     assert_eq!(usage(&reopened), 0);
@@ -450,33 +467,28 @@ fn file_import_reads_across_chunk_boundaries_and_reopens_encrypted_storage() {
 #[test]
 fn shared_file_promotion_keeps_one_body_and_charges_each_source() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     sent(&store, "file-a");
     sent(&store, "file-b");
     let tokens = stage(&store, BODY, BODY.len() as u64, digest(), 10000, &|| false).unwrap();
-    store
-        .bind_attachment_uploads(&tokens, &[(selected("file-a").slot, digest())])
+    app.bind_attachment_uploads(&tokens, &[(selected("file-a").slot, digest())])
         .unwrap();
-    store
-        .protect_attachment_uploads(GROUP, "file-a", &source("file-a").tags)
+    app.protect_attachment_uploads(GROUP, "file-a", &source("file-a").tags)
         .unwrap();
-    store
-        .protect_attachment_uploads(GROUP, "file-b", &source("file-b").tags)
+    app.protect_attachment_uploads(GROUP, "file-b", &source("file-b").tags)
         .unwrap();
     assert_eq!(
-        store
-            .promote_attachment_uploads(GROUP, "file-a", 12, BODY.len() as u64)
+        app.promote_attachment_uploads(GROUP, "file-a", 12, BODY.len() as u64)
             .unwrap(),
         0
     );
     assert_eq!(
-        store
-            .promote_attachment_uploads(GROUP, "file-a", 12, 2 * BODY.len() as u64)
+        app.promote_attachment_uploads(GROUP, "file-a", 12, 2 * BODY.len() as u64)
             .unwrap(),
         1
     );
     assert_eq!(
-        store
-            .promote_attachment_uploads(GROUP, "file-b", 12, 2 * BODY.len() as u64)
+        app.promote_attachment_uploads(GROUP, "file-b", 12, 2 * BODY.len() as u64)
             .unwrap(),
         1
     );
@@ -491,10 +503,10 @@ fn shared_file_promotion_keeps_one_body_and_charges_each_source() {
             .is_err(),
         "verified chunks are immutable"
     );
-    store.remove_local_attachment(GROUP, "file-a", 0).unwrap();
+    app.remove_local_attachment(GROUP, "file-a", 0).unwrap();
     assert_eq!(usage(&store), BODY.len() as u64);
-    assert_eq!(read(&store, &request(&store, "file-b")), BODY);
-    store.remove_local_attachment(GROUP, "file-b", 0).unwrap();
+    assert_eq!(read(&app, &request(&app, "file-b")), BODY);
+    app.remove_local_attachment(GROUP, "file-b", 0).unwrap();
     assert_eq!(usage(&store), 0);
     assert_eq!(count(&store, "attachment_chunk_bodies"), 0);
 }
@@ -530,10 +542,12 @@ fn promotion_snapshot_control(interleave: PromotionInterleave) {
     tokens.sort();
     let slot = selected("late-binding").slot;
     store
+        .app_storage()
         .bind_attachment_uploads(&tokens[1..], &[(slot.clone(), digest())])
         .unwrap();
     if expires {
         store
+            .app_storage()
             .bind_attachment_uploads(&tokens[..1], &[(slot.clone(), digest())])
             .unwrap();
         sql(&store, "UPDATE app_events SET retention_expires_at=13");
@@ -556,12 +570,19 @@ fn promotion_snapshot_control(interleave: PromotionInterleave) {
     let promotion = writer
         .with_transaction(|writer| -> StorageResult<_> {
             let promotion = std::thread::spawn(move || {
-                worker_store.promote_attachment_uploads(GROUP, "late-binding", 12, 10000)
+                worker_store.app_storage().promote_attachment_uploads(
+                    GROUP,
+                    "late-binding",
+                    12,
+                    10000,
+                )
             });
             waiting
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
-            writer.bind_attachment_uploads(&tokens[..1], &[(slot, digest())])?;
+            writer
+                .app_storage()
+                .bind_attachment_uploads(&tokens[..1], &[(slot, digest())])?;
             if expires {
                 std::thread::sleep(std::time::Duration::from_millis(1100));
             }
@@ -586,10 +607,11 @@ fn promotion_snapshot_control(interleave: PromotionInterleave) {
         assert_eq!(count(&store, "attachment_acquisition"), 0);
     } else {
         let asset = store
+            .app_storage()
             .retained_attachment_asset(GROUP, "late-binding", "source-late-binding", 0, 12)
             .unwrap()
             .unwrap();
-        assert_eq!(read(&store, &asset.reference), BODY);
+        assert_eq!(read(&store.app_storage(), &asset.reference), BODY);
     }
 }
 
@@ -597,7 +619,7 @@ fn sent(store: &SqliteAccountStorage, message: &str) {
     seed(store, message);
     let mut event = source(message);
     event.direction = "sent".into();
-    store.record_app_event(&event).unwrap();
+    store.app_storage().record_app_event(&event).unwrap();
 }
 
 fn usage(store: &SqliteAccountStorage) -> u64 {
@@ -629,7 +651,7 @@ fn stage(
     cancelled: &dyn Fn() -> bool,
 ) -> StorageResult<Vec<Vec<u8>>> {
     let mut reader = Cursor::new(body.to_vec());
-    store.stage_attachment_upload_files(
+    store.app_storage().stage_attachment_upload_files(
         GROUP,
         3,
         &mut [AttachmentUploadSource {
@@ -658,6 +680,7 @@ impl Read for Chunked<'_> {
 #[test]
 fn file_staging_promotes_multi_chunk_body_with_bounded_reads_and_shared_quota() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     sent(&store, "file");
     let body = (0..(3 * ATTACHMENT_STAGING_CHUNK_BYTES + 17))
         .map(|i| (i % 251) as u8)
@@ -668,7 +691,7 @@ fn file_staging_promotes_multi_chunk_body_with_bounded_reads_and_shared_quota() 
         inner: Cursor::new(body.as_slice()),
         largest: &largest,
     };
-    let tokens = store
+    let tokens = app
         .stage_attachment_upload_files(
             GROUP,
             3,
@@ -697,11 +720,9 @@ fn file_staging_promotes_multi_chunk_body_with_bounded_reads_and_shared_quota() 
         parent_len, 0,
         "file bodies never live in the mutable parent row"
     );
-    store
-        .bind_attachment_uploads(&tokens, &[(selected("file").slot, digest)])
+    app.bind_attachment_uploads(&tokens, &[(selected("file").slot, digest)])
         .unwrap();
-    store
-        .protect_attachment_uploads(GROUP, "file", &source("file").tags)
+    app.protect_attachment_uploads(GROUP, "file", &source("file").tags)
         .unwrap();
     assert_eq!(
         usage(&store),
@@ -709,8 +730,7 @@ fn file_staging_promotes_multi_chunk_body_with_bounded_reads_and_shared_quota() 
         "binding never rewrites the body"
     );
     assert_eq!(
-        store
-            .promote_attachment_uploads(GROUP, "file", 12, u64::MAX / 4)
+        app.promote_attachment_uploads(GROUP, "file", 12, u64::MAX / 4)
             .unwrap(),
         1
     );
@@ -720,14 +740,14 @@ fn file_staging_promotes_multi_chunk_body_with_bounded_reads_and_shared_quota() 
         "promotion converts, never double charges"
     );
     assert_eq!(count(&store, "outgoing_attachment_upload_bodies"), 0);
-    let asset = store
+    let asset = app
         .retained_attachment_asset(GROUP, "file", "source-file", 0, 12)
         .unwrap()
         .unwrap();
     assert_eq!(asset.byte_count, body.len() as u64);
     let mut copied = Vec::new();
     while copied.len() < body.len() {
-        let chunk = store
+        let chunk = app
             .read_retained_attachment(
                 &asset.reference,
                 12,
@@ -782,7 +802,7 @@ fn file_staging_rolls_back_short_growing_mismatched_cancelled_and_over_quota_sou
     assert_eq!(usage(&store), 0);
     let oversized = {
         let mut reader = std::io::empty();
-        store.stage_attachment_upload_files(
+        store.app_storage().stage_attachment_upload_files(
             GROUP,
             3,
             &mut [AttachmentUploadSource {
@@ -823,10 +843,11 @@ fn generated_758_mb_reader_retention_is_available_above_legacy_array_limit() {
     let digest: [u8; 32] = hasher.finalize().into();
     let mut event = source("large-retained");
     event.tags[0][2] = format!("x {}", hex::encode(digest));
-    store.record_app_event(&event).unwrap();
+    store.app_storage().record_app_event(&event).unwrap();
     let mut entry = selected("large-retained");
     entry.slot = serde_json::to_value(&event.tags[0]).unwrap();
     let asset = match store
+        .app_storage()
         .request_attachment_acquisition(GROUP, &entry, digest, 11)
         .unwrap()
     {
@@ -834,6 +855,7 @@ fn generated_758_mb_reader_retention_is_available_above_legacy_array_limit() {
         other => panic!("unexpected demand: {other:?}"),
     };
     let job = store
+        .app_storage()
         .claim_attachment_acquisition(&asset, 12, 100)
         .unwrap()
         .unwrap();
@@ -872,6 +894,7 @@ fn generated_758_mb_reader_retention_is_available_above_legacy_array_limit() {
     let import_started = std::time::Instant::now();
     assert_eq!(
         store
+            .app_storage()
             .complete_attachment_acquisition_from_reader(
                 &job,
                 &mut reader,
@@ -893,11 +916,13 @@ fn generated_758_mb_reader_retention_is_available_above_legacy_array_limit() {
     assert!(reader.largest <= ATTACHMENT_STAGING_CHUNK_BYTES);
     assert_eq!(usage(&store), LEN);
     let asset_meta = store
+        .app_storage()
         .retained_attachment_asset(GROUP, "large-retained", "source-large-retained", 0, 12)
         .unwrap()
         .unwrap();
     assert_eq!(asset_meta.byte_count, LEN);
     let tail = store
+        .app_storage()
         .read_retained_attachment(&asset, 12, LEN - 17, 17)
         .unwrap()
         .unwrap();
@@ -911,6 +936,7 @@ fn corrupt_file_body_is_quarantined_and_released_without_publication() {
     sent(&store, "corrupt-file");
     let tokens = stage(&store, BODY, BODY.len() as u64, digest(), 10000, &|| false).unwrap();
     store
+        .app_storage()
         .bind_attachment_uploads(&tokens, &[(selected("corrupt-file").slot, digest())])
         .unwrap();
     {
@@ -921,6 +947,7 @@ fn corrupt_file_body_is_quarantined_and_released_without_publication() {
     }
     assert_eq!(
         store
+            .app_storage()
             .promote_attachment_uploads(GROUP, "corrupt-file", 12, 10000)
             .unwrap(),
         0
@@ -933,15 +960,16 @@ fn corrupt_file_body_is_quarantined_and_released_without_publication() {
 #[test]
 fn reader_publication_shares_fences_and_rolls_back_mismatch() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store, "received-file");
-    let asset = request(&store, "received-file");
-    let job = store
+    let asset = request(&app, "received-file");
+    let job = app
         .claim_attachment_acquisition(&asset, 12, 100)
         .unwrap()
         .unwrap();
     let wrong = b"private retained attachment plaintexX";
     assert!(matches!(
-        store.complete_attachment_acquisition_from_reader(
+        app.complete_attachment_acquisition_from_reader(
             &job,
             &mut Cursor::new(&wrong[..]),
             wrong.len() as u64,
@@ -952,63 +980,59 @@ fn reader_publication_shares_fences_and_rolls_back_mismatch() {
         Err(StorageError::InvalidAttachmentBody(_))
     ));
     assert!(
-        store
-            .complete_attachment_acquisition_from_reader(
-                &job,
-                &mut Cursor::new(BODY),
-                BODY.len() as u64,
-                12,
-                10000,
-                &|| true,
-            )
-            .is_err()
+        app.complete_attachment_acquisition_from_reader(
+            &job,
+            &mut Cursor::new(BODY),
+            BODY.len() as u64,
+            12,
+            10000,
+            &|| true,
+        )
+        .is_err()
     );
     assert_eq!(count(&store, "retained_attachment_bytes"), 0);
     assert_eq!(usage(&store), 0);
     assert_eq!(
-        store
-            .complete_attachment_acquisition_from_reader(
-                &job,
-                &mut Cursor::new(BODY),
-                BODY.len() as u64,
-                12,
-                BODY.len() as u64 - 1,
-                &|| false,
-            )
-            .unwrap(),
+        app.complete_attachment_acquisition_from_reader(
+            &job,
+            &mut Cursor::new(BODY),
+            BODY.len() as u64,
+            12,
+            BODY.len() as u64 - 1,
+            &|| false,
+        )
+        .unwrap(),
         AttachmentPublishResult::CapacityBlocked
     );
     seed(&store, "received-ok");
-    let asset = request(&store, "received-ok");
-    let job = store
+    let asset = request(&app, "received-ok");
+    let job = app
         .claim_attachment_acquisition(&asset, 12, 100)
         .unwrap()
         .unwrap();
     assert_eq!(
-        store
-            .complete_attachment_acquisition_from_reader(
-                &job,
-                &mut Cursor::new(BODY),
-                BODY.len() as u64,
-                12,
-                10000,
-                &|| false,
-            )
-            .unwrap(),
+        app.complete_attachment_acquisition_from_reader(
+            &job,
+            &mut Cursor::new(BODY),
+            BODY.len() as u64,
+            12,
+            10000,
+            &|| false,
+        )
+        .unwrap(),
         AttachmentPublishResult::Published
     );
-    assert_eq!(read(&store, &asset), BODY);
+    assert_eq!(read(&app, &asset), BODY);
     assert_eq!(
-        store
-            .complete_attachment_acquisition_from_reader(
-                &job,
-                &mut Cursor::new(BODY),
-                BODY.len() as u64,
-                12,
-                10000,
-                &|| false,
-            )
-            .unwrap(),
+        app.complete_attachment_acquisition_from_reader(
+            &job,
+            &mut Cursor::new(BODY),
+            BODY.len() as u64,
+            12,
+            10000,
+            &|| false,
+        )
+        .unwrap(),
         AttachmentPublishResult::Superseded,
         "a finished attempt cannot publish twice"
     );

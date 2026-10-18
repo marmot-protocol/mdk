@@ -328,21 +328,30 @@ impl Reader {
                 return Err(marmot_account::AccountHomeError::AccountIdMismatch.into());
             }
             let storage = app.account_storage(&label)?;
-            if !epoch.is_empty() && storage.chat_presentation_version()?.store_epoch != epoch {
+            if !epoch.is_empty()
+                && storage
+                    .app_storage()
+                    .chat_presentation_version()?
+                    .store_epoch
+                    != epoch
+            {
                 return Err(AppError::RuntimeStopping);
             }
             // Legacy/imported accounts can lack navigation rows entirely. Repair
             // one bounded batch even without an active account worker; selected
             // preparation below remains limited to the requested window.
-            crate::chat_presentation::maintenance::prepare_base_rows(&storage, &account_id)?;
-            let read = || storage.read_chat_list_window(query.clone());
+            crate::chat_presentation::maintenance::prepare_base_rows(
+                &storage.app_storage(),
+                &account_id,
+            )?;
+            let read = || storage.app_storage().read_chat_list_window(query.clone());
             let mut result = match read().inspect_err(|_| app.presentation_signals.wake()) {
                 Ok(result) => result,
                 Err(error) => return Ok(Err(error)),
             };
             if result.snapshot.is_none() {
                 let prepared = crate::chat_presentation::maintenance::prepare_window(
-                    &storage,
+                    &storage.app_storage(),
                     &app.shared_storage()?,
                     &account_id,
                     &result.pending_presentations,
@@ -354,7 +363,7 @@ impl Reader {
                     .updates
                     .send(PresentationInvalidation {
                         account_label: label,
-                        version: storage.chat_presentation_version()?,
+                        version: storage.app_storage().chat_presentation_version()?,
                     });
                 prepared?;
                 result = match read() {

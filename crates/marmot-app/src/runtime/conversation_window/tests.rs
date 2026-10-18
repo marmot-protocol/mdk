@@ -145,6 +145,7 @@ impl Fixture {
     }
     fn add_sender(&self, i: usize, sender: &str) {
         self.store
+            .app_storage()
             .record_app_event(&StoredAppEvent {
                 group_id_hex: self.group_hex(),
                 message_id_hex: id(i),
@@ -169,7 +170,11 @@ impl Fixture {
             .updates
             .send(PresentationInvalidation {
                 account_label: "alice".into(),
-                version: self.store.chat_presentation_version().unwrap(),
+                version: self
+                    .store
+                    .app_storage()
+                    .chat_presentation_version()
+                    .unwrap(),
             });
     }
     fn projection_event(&self, account_id: &str, group_hex: &str) {
@@ -266,9 +271,11 @@ async fn next_where(
 async fn open_combines_first_unread_draft_identity_and_permissions_without_marking_read() {
     let f = Fixture::new(12).await;
     f.store
+        .app_storage()
         .refresh_chat_list_row(&f.account, &f.group_hex(), &|_, _| false)
         .unwrap();
     f.store
+        .app_storage()
         .mark_timeline_message_read(&f.account, &f.group_hex(), &id(3), &|_, _| false)
         .unwrap();
     f.draft("unsent");
@@ -640,6 +647,7 @@ async fn viewport_move_abandoned_after_its_target_expires_does_not_supersede_rev
     ));
     assert!(sub.recv().await.is_err());
     f.store
+        .app_storage()
         .prune_app_events_before(&f.group_hex(), 105, &f.account, &|_, _| false)
         .unwrap();
     f.draft("saved while the jump target expired");
@@ -674,6 +682,7 @@ async fn lag_recovers_newer_draft_and_missing_explicit_target_does_not_close_han
             .is_err()
     );
     f.store
+        .app_storage()
         .save_message_draft(&f.group_hex(), "newest", None, &[])
         .unwrap();
     // Overwrite the relevant signal with unrelated traffic. Lag itself requires a read.
@@ -734,6 +743,7 @@ async fn retained_anchor_recovers_after_expiry_and_profile_only_updates_refresh_
     let f = Fixture::new(15).await;
     let mut sub = f.open(ConversationOpenTarget::Message(id(5)), 5).await;
     f.store
+        .app_storage()
         .prune_app_events_before(&f.group_hex(), 106, &f.account, &|_, _| false)
         .unwrap();
     f.signal();
@@ -772,7 +782,12 @@ async fn draft_acceptance_cannot_erase_newer_edit_and_unrelated_signals_do_not_r
     let mut sub = f.open(ConversationOpenTarget::Latest, 3).await;
     let accepted = sub.snapshot.draft.revision.clone();
     f.draft("new edit");
-    assert!(f.store.clear_message_draft_if_revision(&accepted).is_err());
+    assert!(
+        f.store
+            .app_storage()
+            .clear_message_draft_if_revision(&accepted)
+            .is_err()
+    );
     let refreshed = next(&mut sub).await;
     assert_eq!(refreshed.draft.draft.unwrap().content, "new edit");
     // An unchanged account-wide invalidation may read once but must not create a redraw loop.
@@ -887,6 +902,7 @@ async fn closed_session_storage_terminates_retry_and_missing_jump_recovers_origi
     ));
     assert!(sub.recv().await.is_err());
     f.store
+        .app_storage()
         .prune_app_events_before(&f.group_hex(), 105, &f.account, &|_, _| false)
         .unwrap();
     f.mode.store(0, Ordering::SeqCst);
@@ -994,9 +1010,17 @@ async fn provenance_only_change_is_not_suppressed_as_unchanged_content() {
         origin_commit_id: Some(id(900)),
         moderation_grant: false,
     };
-    let untrusted = f.store.conversation_presentation_page(raw.clone()).unwrap();
-    f.store.record_app_event(&event).unwrap();
-    let trusted = f.store.conversation_presentation_page(raw).unwrap();
+    let untrusted = f
+        .store
+        .app_storage()
+        .conversation_presentation_page(raw.clone())
+        .unwrap();
+    f.store.app_storage().record_app_event(&event).unwrap();
+    let trusted = f
+        .store
+        .app_storage()
+        .conversation_presentation_page(raw)
+        .unwrap();
     assert!(untrusted.authenticated_system_content(0).is_none());
     assert!(trusted.authenticated_system_content(0).is_some());
     // Even if the presentation parser does not yet interpret this system payload,
@@ -1117,7 +1141,12 @@ async fn production_reconnect_backoff_keeps_conversation_captures_retryable() {
                 queued: None,
                 group_id: f.group.clone(),
                 query: Default::default(),
-                store_epoch: f.store.chat_presentation_version().unwrap().store_epoch,
+                store_epoch: f
+                    .store
+                    .app_storage()
+                    .chat_presentation_version()
+                    .unwrap()
+                    .store_epoch,
                 observer: None,
                 respond,
             })
@@ -1160,6 +1189,7 @@ async fn conversation_viewer_reaction_updates_after_add_and_remove() {
     let f = Fixture::new(1).await;
     let record = |number: usize, sender: &str, kind: u64, target: String| {
         f.store
+            .app_storage()
             .record_app_event(&StoredAppEvent {
                 group_id_hex: f.group_hex(),
                 message_id_hex: id(number),
@@ -1212,6 +1242,7 @@ async fn conversation_viewer_reaction_updates_after_add_and_remove() {
 async fn cold_open_returns_stored_history_while_authority_is_not_ready() {
     let f = Fixture::new(200).await;
     f.store
+        .app_storage()
         .refresh_chat_list_row(&f.account, &f.group_hex(), &|_, _| false)
         .unwrap();
     f.mode.store(1, Ordering::SeqCst);
@@ -1304,7 +1335,11 @@ async fn cold_capture_does_not_force_group_hydration() {
         &mut client,
         &f.group,
         Default::default(),
-        &f.store.chat_presentation_version().unwrap().store_epoch,
+        &f.store
+            .app_storage()
+            .chat_presentation_version()
+            .unwrap()
+            .store_epoch,
     );
     assert!(matches!(result, Err(ConversationWindowError::NotReady)));
     assert_eq!(
@@ -1337,7 +1372,11 @@ async fn send_checkpoints_are_query_scoped_coherent_and_released_on_close() {
     };
     let observer = Arc::new(SendCapture::new(
         f.group.clone(),
-        f.store.chat_presentation_version().unwrap().store_epoch,
+        f.store
+            .app_storage()
+            .chat_presentation_version()
+            .unwrap()
+            .store_epoch,
         query.clone(),
     ));
     client.register_conversation_capture(Some(Arc::downgrade(&observer)));
@@ -1383,13 +1422,18 @@ async fn send_checkpoints_are_query_scoped_coherent_and_released_on_close() {
 
     let other_group = client.create_group("unrelated window", &[]).await.unwrap();
     f.store
+        .app_storage()
         .refresh_chat_list_row(&f.account, &hex::encode(other_group.as_slice()), &|_, _| {
             false
         })
         .unwrap();
     let other = Arc::new(SendCapture::new(
         other_group.clone(),
-        f.store.chat_presentation_version().unwrap().store_epoch,
+        f.store
+            .app_storage()
+            .chat_presentation_version()
+            .unwrap()
+            .store_epoch,
         query.clone(),
     ));
     client.register_conversation_capture(Some(Arc::downgrade(&other)));
@@ -1454,7 +1498,12 @@ async fn checkpoint_older_than_drained_draft_invalidation_is_followed_by_a_fresh
         },
         before_anchor: None,
     };
-    let epoch = f.store.chat_presentation_version().unwrap().store_epoch;
+    let epoch = f
+        .store
+        .app_storage()
+        .chat_presentation_version()
+        .unwrap()
+        .store_epoch;
     let (respond, response) = oneshot::channel();
     worker
         .send(AccountWorkerCommand::CaptureConversation {
@@ -1823,7 +1872,10 @@ async fn avatar_identity_sidecar_tracks_local_bytes_without_new_timeline_activit
     let image =
         storage_sqlite::AvatarImage::new(vec![1; 8], storage_sqlite::AvatarImageFormat::Png, 1, 1)
             .unwrap();
-    f.store.publish_avatar(&reference, 0, &image, None).unwrap();
+    f.store
+        .app_storage()
+        .publish_avatar(&reference, 0, &image, None)
+        .unwrap();
     for _ in 0..100 {
         let _ = f.app.presentation_signals.avatars.send("alice".into());
     }
@@ -1949,7 +2001,12 @@ fn return_to_latest_reuses_checkpoint_when_background_presentation_is_cancelled(
                 },
                 before_anchor: None,
             };
-            let epoch = f.store.chat_presentation_version().unwrap().store_epoch;
+            let epoch = f
+                .store
+                .app_storage()
+                .chat_presentation_version()
+                .unwrap()
+                .store_epoch;
             f.draft("checkpoint composer");
             let (respond, response) = oneshot::channel();
             worker
@@ -2092,7 +2149,12 @@ async fn send_checkpoint_capture_cost() {
         .unwrap();
     worker.shutdown().await;
     let mut client = f.app.client("alice").await.unwrap();
-    let epoch = f.store.chat_presentation_version().unwrap().store_epoch;
+    let epoch = f
+        .store
+        .app_storage()
+        .chat_presentation_version()
+        .unwrap()
+        .store_epoch;
     for (label, target) in [
         ("tail", ConversationOpenTarget::Latest),
         ("history", ConversationOpenTarget::Message(id(50))),
@@ -2151,7 +2213,12 @@ async fn publication_checkpoint_refreshes_epoch_and_dirty_rows_without_reviving_
         .await;
     let mut client = f.app.client("alice").await.unwrap();
     let query = ConversationWindowQuery::default();
-    let store_epoch = f.store.chat_presentation_version().unwrap().store_epoch;
+    let store_epoch = f
+        .store
+        .app_storage()
+        .chat_presentation_version()
+        .unwrap()
+        .store_epoch;
     let observer = Arc::new(SendCapture::new(
         f.group.clone(),
         store_epoch.clone(),
@@ -2184,6 +2251,7 @@ async fn publication_checkpoint_refreshes_epoch_and_dirty_rows_without_reviving_
     f.add(2);
     assert!(matches!(
         f.store
+            .app_storage()
             .conversation_account_snapshot(&f.group_hex(), query.clone()),
         Err(ConversationOpenError::ReadStateNotReady)
     ));
@@ -2265,7 +2333,9 @@ async fn publication_checkpoint_refreshes_epoch_and_dirty_rows_without_reviving_
     );
     assert!(
         matches!(
-            f.store.conversation_account_snapshot(&f.group_hex(), query),
+            f.store
+                .app_storage()
+                .conversation_account_snapshot(&f.group_hex(), query),
             Err(ConversationOpenError::ReadStateNotReady)
         ),
         "cold capture must not even repair the projection or hydrate the engine"
@@ -2289,7 +2359,12 @@ async fn assert_hot_checkpoints_do_not_postpone_refresh(prior_not_ready: bool) {
         },
         before_anchor: None,
     };
-    let epoch = f.store.chat_presentation_version().unwrap().store_epoch;
+    let epoch = f
+        .store
+        .app_storage()
+        .chat_presentation_version()
+        .unwrap()
+        .store_epoch;
     f.add(99);
     let (respond, response) = oneshot::channel();
     worker

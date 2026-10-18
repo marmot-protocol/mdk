@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 use rusqlite::params;
 fn seed(s: &SqliteAccountStorage, group: &str, id: usize, slots: usize, at: i64) {
     s.lock().unwrap().execute("INSERT INTO message_timeline(group_id_hex,message_id_hex,source_message_id_hex,
@@ -20,6 +22,7 @@ fn global_albums_equal_times_and_sparse_chats_page_once() {
         let mut result = Vec::new();
         loop {
             let page = s
+                .app_storage()
                 .account_attachment_history_page(
                     &AccountAttachmentQuery::default(),
                     limit,
@@ -64,6 +67,7 @@ fn global_albums_equal_times_and_sparse_chats_page_once() {
 #[test]
 fn filtered_empty_page_keeps_its_authoritative_continuation() {
     let s = SqliteAccountStorage::in_memory().unwrap();
+    let s_app = s.app_storage();
     seed(&s, "aa", 1, 3, 10);
     seed(&s, "bb", 2, 2, 9);
     let query = AccountAttachmentQuery {
@@ -72,9 +76,11 @@ fn filtered_empty_page_keeps_its_authoritative_continuation() {
         min_timeline_at: Some(9),
         max_timeline_at: Some(10),
     };
-    let first = s.account_attachment_history_page(&query, 3, None).unwrap();
+    let first = s_app
+        .account_attachment_history_page(&query, 3, None)
+        .unwrap();
     assert!(first.entries.is_empty());
-    let next = s
+    let next = s_app
         .account_attachment_history_page(&query, 3, first.next_cursor.as_ref())
         .unwrap();
     assert_eq!(next.entries.len(), 2);
@@ -85,7 +91,7 @@ fn filtered_empty_page_keeps_its_authoritative_continuation() {
         ..query.clone()
     };
     assert!(matches!(
-        s.account_attachment_history_page(&other, 3, first.next_cursor.as_ref()),
+        s_app.account_attachment_history_page(&other, 3, first.next_cursor.as_ref()),
         Err(AccountAttachmentHistoryError::CursorMismatch)
     ));
 }
@@ -99,14 +105,15 @@ fn every_source_visibility_role_and_incarnation_change_fences_old_pages() {
         "DELETE FROM attachment_history_versions WHERE group_id_hex='bb'",
     ] {
         let s = SqliteAccountStorage::in_memory().unwrap();
+        let s_app = s.app_storage();
         seed(&s, "aa", 1, 1, 12);
         seed(&s, "bb", 2, 1, 11);
-        let first = s
+        let first = s_app
             .account_attachment_history_page(&AccountAttachmentQuery::default(), 1, None)
             .unwrap();
         s.lock().unwrap().execute_batch(mutation).unwrap();
         assert!(matches!(
-            s.account_attachment_history_page(
+            s_app.account_attachment_history_page(
                 &AccountAttachmentQuery::default(),
                 1,
                 first.next_cursor.as_ref()
@@ -114,18 +121,19 @@ fn every_source_visibility_role_and_incarnation_change_fences_old_pages() {
             Err(AccountAttachmentHistoryError::RestartRequired)
         ));
         assert_ne!(
-            s.account_attachment_history_version().unwrap(),
+            s_app.account_attachment_history_version().unwrap(),
             first.version
         );
     }
     let s = SqliteAccountStorage::in_memory().unwrap();
     seed(&s, "aa", 1, 2, 1);
     let first = s
+        .app_storage()
         .account_attachment_history_page(&AccountAttachmentQuery::default(), 1, None)
         .unwrap();
     let other = SqliteAccountStorage::in_memory().unwrap();
     assert!(matches!(
-        other.account_attachment_history_page(
+        other.app_storage().account_attachment_history_page(
             &AccountAttachmentQuery::default(),
             1,
             first.next_cursor.as_ref()
@@ -136,8 +144,9 @@ fn every_source_visibility_role_and_incarnation_change_fences_old_pages() {
 #[test]
 fn reactions_are_quiet_and_additions_keep_old_seek_boundaries() {
     let s = SqliteAccountStorage::in_memory().unwrap();
+    let s_app = s.app_storage();
     seed(&s, "aa", 1, 2, 1);
-    let first = s
+    let first = s_app
         .account_attachment_history_page(&AccountAttachmentQuery::default(), 1, None)
         .unwrap();
     s.lock()
@@ -145,16 +154,17 @@ fn reactions_are_quiet_and_additions_keep_old_seek_boundaries() {
         .execute_batch("UPDATE message_timeline SET reactions_json='[1]'")
         .unwrap();
     assert_eq!(
-        s.account_attachment_history_version().unwrap(),
+        s_app.account_attachment_history_version().unwrap(),
         first.version
     );
     seed(&s, "bb", 2, 1, 2);
     assert!(
-        !s.account_attachment_history_version()
+        !s_app
+            .account_attachment_history_version()
             .unwrap()
             .requires_restart_since(&first.version)
     );
-    let next = s
+    let next = s_app
         .account_attachment_history_page(
             &AccountAttachmentQuery::default(),
             1,
@@ -162,7 +172,7 @@ fn reactions_are_quiet_and_additions_keep_old_seek_boundaries() {
         )
         .unwrap();
     assert_eq!(next.entries[0].attachment.attachment_index, 1);
-    let refresh = s
+    let refresh = s_app
         .account_attachment_history_page(&AccountAttachmentQuery::default(), 1, None)
         .unwrap();
     assert_eq!(refresh.entries[0].group_id_hex, "bb");
@@ -170,9 +180,10 @@ fn reactions_are_quiet_and_additions_keep_old_seek_boundaries() {
 #[test]
 fn invalid_bounds_ids_ceilings_and_oversized_metadata_fail_without_partial_results() {
     let s = SqliteAccountStorage::in_memory().unwrap();
+    let s_app = s.app_storage();
     for limit in [0, 101, usize::MAX] {
         assert!(matches!(
-            s.account_attachment_history_page(&AccountAttachmentQuery::default(), limit, None),
+            s_app.account_attachment_history_page(&AccountAttachmentQuery::default(), limit, None),
             Err(AccountAttachmentHistoryError::InvalidLimit)
         ));
     }
@@ -196,7 +207,7 @@ fn invalid_bounds_ids_ceilings_and_oversized_metadata_fail_without_partial_resul
         },
     ] {
         assert!(matches!(
-            s.account_attachment_history_page(&query, 100, None),
+            s_app.account_attachment_history_page(&query, 100, None),
             Err(AccountAttachmentHistoryError::InvalidQuery)
         ));
     }
@@ -208,7 +219,7 @@ fn invalid_bounds_ids_ceilings_and_oversized_metadata_fail_without_partial_resul
             [serde_json::json!({"imeta":[["imeta","x".repeat(40000)]]}).to_string()],
         )
         .unwrap();
-    let page = s
+    let page = s_app
         .account_attachment_history_page(&AccountAttachmentQuery::default(), 100, None)
         .unwrap();
     assert_eq!(page.entries.len(), 1);
@@ -242,23 +253,25 @@ fn account_seek_uses_index_without_a_history_sized_sort() {
 #[test]
 fn expiry_fences_existing_cursors_before_maintenance_erases_sources() {
     let s = SqliteAccountStorage::in_memory().unwrap();
+    let s_app = s.app_storage();
     for id in [1u64, 2] {
-        s.record_app_event(&crate::StoredAppEvent {
-            group_id_hex: "aa".into(),
-            message_id_hex: format!("{id:064x}"),
-            source_message_id_hex: Some(format!("{id:064x}")),
-            source_epoch: Some(0),
-            direction: "received".into(),
-            sender: "11".repeat(32),
-            plaintext: "private".into(),
-            kind: 9,
-            tags: vec![vec!["imeta".into(), "v future".into()]],
-            recorded_at: id,
-            received_at: id,
-            origin_commit_id: None,
-            moderation_grant: false,
-        })
-        .unwrap();
+        s_app
+            .record_app_event(&crate::StoredAppEvent {
+                group_id_hex: "aa".into(),
+                message_id_hex: format!("{id:064x}"),
+                source_message_id_hex: Some(format!("{id:064x}")),
+                source_epoch: Some(0),
+                direction: "received".into(),
+                sender: "11".repeat(32),
+                plaintext: "private".into(),
+                kind: 9,
+                tags: vec![vec!["imeta".into(), "v future".into()]],
+                recorded_at: id,
+                received_at: id,
+                origin_commit_id: None,
+                moderation_grant: false,
+            })
+            .unwrap();
     }
     s.lock()
         .unwrap()
@@ -267,12 +280,12 @@ fn expiry_fences_existing_cursors_before_maintenance_erases_sources() {
             [format!("{:064x}", 2)],
         )
         .unwrap();
-    let first = s
+    let first = s_app
         .account_attachment_history_page_at(&AccountAttachmentQuery::default(), 1, None, 10)
         .unwrap();
     assert_eq!(first.version.next_expiry, Some(11));
     assert!(matches!(
-        s.account_attachment_history_page_at(
+        s_app.account_attachment_history_page_at(
             &AccountAttachmentQuery::default(),
             1,
             first.next_cursor.as_ref(),
@@ -280,7 +293,7 @@ fn expiry_fences_existing_cursors_before_maintenance_erases_sources() {
         ),
         Err(AccountAttachmentHistoryError::RestartRequired)
     ));
-    let fresh = s
+    let fresh = s_app
         .account_attachment_history_page_at(&AccountAttachmentQuery::default(), 10, None, 11)
         .unwrap();
     assert_eq!(fresh.entries.len(), 1);
@@ -325,6 +338,7 @@ fn oversized_slots_and_page_budgets_never_block_older_files() {
     let mut pages = 0;
     loop {
         let page = s
+            .app_storage()
             .account_attachment_history_page(
                 &AccountAttachmentQuery::default(),
                 100,
@@ -354,9 +368,10 @@ fn oversized_slots_and_page_budgets_never_block_older_files() {
 #[test]
 fn blocked_senders_and_blocked_welcomers_are_excluded_and_fence_existing_pages() {
     let s = SqliteAccountStorage::in_memory().unwrap();
+    let s_app = s.app_storage();
     seed(&s, "aa", 1, 2, 1);
     seed(&s, "bb", 2, 1, 2);
-    let first = s
+    let first = s_app
         .account_attachment_history_page(&AccountAttachmentQuery::default(), 1, None)
         .unwrap();
     s.lock()
@@ -364,7 +379,7 @@ fn blocked_senders_and_blocked_welcomers_are_excluded_and_fence_existing_pages()
         .execute("INSERT INTO user_blocks VALUES(?1,0,0)", ["11".repeat(32)])
         .unwrap();
     assert!(matches!(
-        s.account_attachment_history_page(
+        s_app.account_attachment_history_page(
             &AccountAttachmentQuery::default(),
             1,
             first.next_cursor.as_ref()
@@ -372,7 +387,8 @@ fn blocked_senders_and_blocked_welcomers_are_excluded_and_fence_existing_pages()
         Err(AccountAttachmentHistoryError::RestartRequired)
     ));
     assert!(
-        s.account_attachment_history_page(&AccountAttachmentQuery::default(), 100, None)
+        s_app
+            .account_attachment_history_page(&AccountAttachmentQuery::default(), 100, None)
             .unwrap()
             .entries
             .is_empty()
@@ -382,13 +398,14 @@ fn blocked_senders_and_blocked_welcomers_are_excluded_and_fence_existing_pages()
         .execute("DELETE FROM user_blocks", [])
         .unwrap();
     assert_eq!(
-        s.account_attachment_history_page(&AccountAttachmentQuery::default(), 100, None)
+        s_app
+            .account_attachment_history_page(&AccountAttachmentQuery::default(), 100, None)
             .unwrap()
             .entries
             .len(),
         3
     );
-    let first = s
+    let first = s_app
         .account_attachment_history_page(&AccountAttachmentQuery::default(), 1, None)
         .unwrap();
     s.lock().unwrap().execute("INSERT INTO account_groups(group_id_hex,endpoint,pending_confirmation,welcomer_account_id_hex,updated_at) VALUES('aa','wss://relay.example',1,?1,0)",["22".repeat(32)]).unwrap();
@@ -397,14 +414,14 @@ fn blocked_senders_and_blocked_welcomers_are_excluded_and_fence_existing_pages()
         .execute("INSERT INTO user_blocks VALUES(?1,0,0)", ["22".repeat(32)])
         .unwrap();
     assert!(matches!(
-        s.account_attachment_history_page(
+        s_app.account_attachment_history_page(
             &AccountAttachmentQuery::default(),
             1,
             first.next_cursor.as_ref()
         ),
         Err(AccountAttachmentHistoryError::RestartRequired)
     ));
-    let page = s
+    let page = s_app
         .account_attachment_history_page(&AccountAttachmentQuery::default(), 100, None)
         .unwrap();
     assert_eq!(page.entries.len(), 1);
@@ -415,10 +432,12 @@ fn same_group_additions_keep_seek_and_non_attachment_expiry_is_quiet() {
     let s = SqliteAccountStorage::in_memory().unwrap();
     seed(&s, "aa", 1, 2, 1);
     let first = s
+        .app_storage()
         .account_attachment_history_page_at(&AccountAttachmentQuery::default(), 1, None, 10)
         .unwrap();
     seed(&s, "aa", 2, 1, 2);
     let next = s
+        .app_storage()
         .account_attachment_history_page_at(
             &AccountAttachmentQuery::default(),
             1,
@@ -440,28 +459,30 @@ fn same_group_additions_keep_seek_and_non_attachment_expiry_is_quiet() {
 #[test]
 fn record_time_retention_copies_expiry_before_any_maintenance_or_update() {
     let s = SqliteAccountStorage::in_memory().unwrap();
+    let s_app = s.app_storage();
     for id in [1u64, 2] {
-        s.record_app_event_with_retention(
-            &crate::StoredAppEvent {
-                group_id_hex: "aa".into(),
-                message_id_hex: format!("{id:064x}"),
-                source_message_id_hex: Some(format!("{id:064x}")),
-                source_epoch: Some(0),
-                direction: "received".into(),
-                sender: "11".repeat(32),
-                plaintext: "private".into(),
-                kind: 9,
-                tags: vec![vec!["imeta".into(), "v future".into()]],
-                recorded_at: id,
-                received_at: id,
-                origin_commit_id: None,
-                moderation_grant: false,
-            },
-            Some(cgka_traits::app_event::AppMessageRetentionDecision::new(
-                id, 10,
-            )),
-        )
-        .unwrap();
+        s_app
+            .record_app_event_with_retention(
+                &crate::StoredAppEvent {
+                    group_id_hex: "aa".into(),
+                    message_id_hex: format!("{id:064x}"),
+                    source_message_id_hex: Some(format!("{id:064x}")),
+                    source_epoch: Some(0),
+                    direction: "received".into(),
+                    sender: "11".repeat(32),
+                    plaintext: "private".into(),
+                    kind: 9,
+                    tags: vec![vec!["imeta".into(), "v future".into()]],
+                    recorded_at: id,
+                    received_at: id,
+                    origin_commit_id: None,
+                    moderation_grant: false,
+                },
+                Some(cgka_traits::app_event::AppMessageRetentionDecision::new(
+                    id, 10,
+                )),
+            )
+            .unwrap();
     }
     let copied: Vec<i64> = s
         .lock()
@@ -473,13 +494,13 @@ fn record_time_retention_copies_expiry_before_any_maintenance_or_update() {
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(copied, vec![11, 12]);
-    let first = s
+    let first = s_app
         .account_attachment_history_page_at(&AccountAttachmentQuery::default(), 1, None, 10)
         .unwrap();
     assert_eq!(first.entries.len(), 1);
     assert_eq!(first.version.next_expiry, Some(11));
     assert!(matches!(
-        s.account_attachment_history_page_at(
+        s_app.account_attachment_history_page_at(
             &AccountAttachmentQuery::default(),
             1,
             first.next_cursor.as_ref(),
@@ -487,7 +508,7 @@ fn record_time_retention_copies_expiry_before_any_maintenance_or_update() {
         ),
         Err(AccountAttachmentHistoryError::RestartRequired)
     ));
-    let remaining = s
+    let remaining = s_app
         .account_attachment_history_page_at(&AccountAttachmentQuery::default(), 10, None, 11)
         .unwrap();
     assert_eq!(remaining.entries.len(), 1);
@@ -496,7 +517,7 @@ fn record_time_retention_copies_expiry_before_any_maintenance_or_update() {
         format!("{:064x}", 2)
     );
     assert_eq!(remaining.version.next_expiry, Some(12));
-    let expired = s
+    let expired = s_app
         .account_attachment_history_page_at(&AccountAttachmentQuery::default(), 10, None, 12)
         .unwrap();
     assert!(expired.entries.is_empty());
@@ -527,7 +548,10 @@ fn canonical_filters_match_historical_row_casing_without_changing_cursor_order()
         senders: vec!["ab".repeat(32)],
         ..Default::default()
     };
-    let first = s.account_attachment_history_page(&query, 1, None).unwrap();
+    let first = s
+        .app_storage()
+        .account_attachment_history_page(&query, 1, None)
+        .unwrap();
     assert_eq!(first.entries.len(), 1);
     assert_eq!(first.entries[0].group_id_hex, "AA");
     assert_eq!(first.entries[0].attachment.sender, "AB".repeat(32));
@@ -535,6 +559,7 @@ fn canonical_filters_match_historical_row_casing_without_changing_cursor_order()
     let mut slots = vec![first.entries[0].attachment.attachment_index];
     while let Some(next) = cursor {
         let page = s
+            .app_storage()
             .account_attachment_history_page(&query, 1, Some(&next))
             .unwrap();
         assert_eq!(page.entries.len(), 1);

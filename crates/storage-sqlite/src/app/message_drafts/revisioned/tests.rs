@@ -1,30 +1,33 @@
 use super::*;
+#[cfg(test)]
+use crate::SqliteAccountStorage;
 
 #[test]
 fn chat_list_versions_preserve_newer_identical_drafts_and_reject_foreign_owners() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store);
-    let initial = store.selected_message_draft(GROUP).unwrap().revision;
-    store.save_message_draft(GROUP, "same", None, &[]).unwrap();
-    let sending = store.selected_message_draft(GROUP).unwrap().revision;
+    let initial = app.selected_message_draft(GROUP).unwrap().revision;
+    app.save_message_draft(GROUP, "same", None, &[]).unwrap();
+    let sending = app.selected_message_draft(GROUP).unwrap().revision;
     assert!(sending.includes_chat_list_version(&initial.chat_list_version()));
     assert!(sending.includes_chat_list_version(&sending.chat_list_version()));
-    store.delete_message_draft(GROUP).unwrap();
-    let deleted = store.selected_message_draft(GROUP).unwrap().revision;
+    app.delete_message_draft(GROUP).unwrap();
+    let deleted = app.selected_message_draft(GROUP).unwrap().revision;
     assert!(!sending.includes_chat_list_version(&deleted.chat_list_version()));
-    store.save_message_draft(GROUP, "same", None, &[]).unwrap();
-    let newer = store.selected_message_draft(GROUP).unwrap().revision;
+    app.save_message_draft(GROUP, "same", None, &[]).unwrap();
+    let newer = app.selected_message_draft(GROUP).unwrap().revision;
     assert!(!sending.includes_chat_list_version(&newer.chat_list_version()));
     assert!(newer.includes_chat_list_version(&sending.chat_list_version()));
-    store
-        .save_message_draft(GROUP, "same", None, &[attachment()])
+    app.save_message_draft(GROUP, "same", None, &[attachment()])
         .unwrap();
-    let with_attachment = store.selected_message_draft(GROUP).unwrap().revision;
+    let with_attachment = app.selected_message_draft(GROUP).unwrap().revision;
     assert!(!newer.includes_chat_list_version(&with_attachment.chat_list_version()));
 
     let foreign_store = SqliteAccountStorage::in_memory().unwrap();
     seed(&foreign_store);
     let foreign = foreign_store
+        .app_storage()
         .selected_message_draft(GROUP)
         .unwrap()
         .revision;
@@ -36,6 +39,7 @@ fn chat_list_versions_preserve_newer_identical_drafts_and_reject_foreign_owners(
 #[test]
 fn legacy_save_delete_recreate_never_reuses_a_draft_revision() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     let group = "11".repeat(16);
     store
         .lock()
@@ -45,21 +49,15 @@ fn legacy_save_delete_recreate_never_reuses_a_draft_revision() {
             [&group],
         )
         .unwrap();
-    let empty = store.selected_message_draft(&group).unwrap();
-    store
-        .save_message_draft(&group, "first", None, &[])
-        .unwrap();
-    let first = store.selected_message_draft(&group).unwrap();
-    store
-        .save_message_draft(&group, "second", None, &[])
-        .unwrap();
-    let second = store.selected_message_draft(&group).unwrap();
-    store.delete_message_draft(&group).unwrap();
-    let deleted = store.selected_message_draft(&group).unwrap();
-    store
-        .save_message_draft(&group, "first", None, &[])
-        .unwrap();
-    let recreated = store.selected_message_draft(&group).unwrap();
+    let empty = app.selected_message_draft(&group).unwrap();
+    app.save_message_draft(&group, "first", None, &[]).unwrap();
+    let first = app.selected_message_draft(&group).unwrap();
+    app.save_message_draft(&group, "second", None, &[]).unwrap();
+    let second = app.selected_message_draft(&group).unwrap();
+    app.delete_message_draft(&group).unwrap();
+    let deleted = app.selected_message_draft(&group).unwrap();
+    app.save_message_draft(&group, "first", None, &[]).unwrap();
+    let recreated = app.selected_message_draft(&group).unwrap();
     let versions = [
         empty.revision,
         first.revision,
@@ -116,6 +114,7 @@ fn local_submission_handoff_rolls_back_with_engine_queue_write() {
     seed(&store);
     let payload = b"retained local message";
     store
+        .app_storage()
         .insert_local_submission(&crate::LocalSubmission {
             group_id_hex: GROUP.into(),
             client_token: "caller-token".into(),
@@ -130,12 +129,13 @@ fn local_submission_handoff_rolls_back_with_engine_queue_write() {
         .unwrap();
     let result: StorageResult<()> = StorageProvider::with_transaction(&store, |store| {
         store.put_queued_outbound_intent(&queued(payload))?;
-        assert!(store.next_local_submission()?.is_none());
+        assert!(store.app_storage().next_local_submission()?.is_none());
         Err(StorageError::Backend("injected rollback".into()))
     });
     assert!(result.is_err());
     assert_eq!(
         store
+            .app_storage()
             .next_local_submission()
             .unwrap()
             .unwrap()
@@ -145,13 +145,20 @@ fn local_submission_handoff_rolls_back_with_engine_queue_write() {
     );
     store.put_queued_outbound_intent(&queued(payload)).unwrap();
     let accepted = store
+        .app_storage()
         .local_submission(GROUP, "caller-token")
         .unwrap()
         .unwrap();
     assert_eq!(accepted.state, 1);
     assert!(accepted.payload.is_none());
     assert!(accepted.request_json.is_none());
-    assert!(store.next_local_submission().unwrap().is_none());
+    assert!(
+        store
+            .app_storage()
+            .next_local_submission()
+            .unwrap()
+            .is_none()
+    );
 }
 fn attachment() -> StoredMessageDraftAttachment {
     StoredMessageDraftAttachment {
@@ -168,40 +175,42 @@ fn attachment() -> StoredMessageDraftAttachment {
 #[test]
 fn conditional_mutations_reject_stale_cross_store_and_failed_attachment_edits() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store);
-    let initial = store.selected_message_draft(GROUP).unwrap();
-    let first = store
+    let initial = app.selected_message_draft(GROUP).unwrap();
+    let first = app
         .save_message_draft_if_revision(&initial.revision, "first", None, &[])
         .unwrap();
     assert!(matches!(
-        store.save_message_draft_if_revision(&initial.revision, "lost edit", None, &[]),
+        app.save_message_draft_if_revision(&initial.revision, "lost edit", None, &[]),
         Err(MessageDraftRevisionError::Conflict)
     ));
     assert!(matches!(
-        store.clear_message_draft_if_revision(&initial.revision),
+        app.clear_message_draft_if_revision(&initial.revision),
         Err(MessageDraftRevisionError::Conflict)
     ));
     let other = SqliteAccountStorage::in_memory().unwrap();
     seed(&other);
     assert!(matches!(
-        other.clear_message_draft_if_revision(&first.revision),
+        other
+            .app_storage()
+            .clear_message_draft_if_revision(&first.revision),
         Err(MessageDraftRevisionError::Conflict)
     ));
     assert!(
-        store
-            .save_message_draft_if_revision(
-                &first.revision,
-                "broken",
-                None,
-                &[attachment(), attachment()]
-            )
-            .is_err()
+        app.save_message_draft_if_revision(
+            &first.revision,
+            "broken",
+            None,
+            &[attachment(), attachment()]
+        )
+        .is_err()
     );
     assert_eq!(
-        store.selected_message_draft(GROUP).unwrap().revision,
+        app.selected_message_draft(GROUP).unwrap().revision,
         first.revision
     );
-    let empty = store
+    let empty = app
         .clear_message_draft_if_revision(&first.revision)
         .unwrap();
     assert!(empty.draft.is_none() && empty.revision != first.revision);
@@ -214,15 +223,15 @@ fn conditional_mutations_reject_stale_cross_store_and_failed_attachment_edits() 
         )
         .unwrap();
     seed(&store);
-    assert!(store.selected_message_draft(GROUP).unwrap().revision != initial.revision);
+    assert!(app.selected_message_draft(GROUP).unwrap().revision != initial.revision);
 }
 #[test]
 fn selected_metadata_and_keyed_bytes_are_revision_coherent_and_read_only() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store);
     let media = attachment();
-    store
-        .save_message_draft(GROUP, "voice", None, std::slice::from_ref(&media))
+    app.save_message_draft(GROUP, "voice", None, std::slice::from_ref(&media))
         .unwrap();
     let changes = store.lock().unwrap().total_changes();
     store
@@ -230,20 +239,18 @@ fn selected_metadata_and_keyed_bytes_are_revision_coherent_and_read_only() {
         .unwrap()
         .execute_batch("PRAGMA query_only=ON")
         .unwrap();
-    let selected = store.selected_message_draft(GROUP).unwrap();
+    let selected = app.selected_message_draft(GROUP).unwrap();
     let metadata = &selected.draft.as_ref().unwrap().media_attachments[0];
     assert_eq!(metadata.plaintext_size, media.plaintext.len() as u64);
     assert_eq!(metadata.waveform_samples, media.waveform_samples);
     assert_eq!(metadata.duration_seconds, media.duration_seconds);
     assert_eq!(
-        store
-            .message_draft_attachment_if_revision(&selected.revision, "one")
+        app.message_draft_attachment_if_revision(&selected.revision, "one")
             .unwrap(),
         Some(media.plaintext)
     );
     assert!(
-        store
-            .message_draft_attachment_if_revision(&selected.revision, "missing")
+        app.message_draft_attachment_if_revision(&selected.revision, "missing")
             .unwrap()
             .is_none()
     );
@@ -253,9 +260,9 @@ fn selected_metadata_and_keyed_bytes_are_revision_coherent_and_read_only() {
         .unwrap()
         .execute_batch("PRAGMA query_only=OFF")
         .unwrap();
-    store.save_message_draft(GROUP, "new", None, &[]).unwrap();
+    app.save_message_draft(GROUP, "new", None, &[]).unwrap();
     assert!(matches!(
-        store.message_draft_attachment_if_revision(&selected.revision, "one"),
+        app.message_draft_attachment_if_revision(&selected.revision, "one"),
         Err(MessageDraftRevisionError::Conflict)
     ));
 }
@@ -268,9 +275,10 @@ fn accepted_queue_and_draft_clear_commit_together_and_rollback_without_wakeup() 
     let store = SqliteAccountStorage::in_memory().unwrap();
     seed(&store);
     store
+        .app_storage()
         .save_message_draft(GROUP, "send", None, &[attachment()])
         .unwrap();
-    let selected = store.selected_message_draft(GROUP).unwrap();
+    let selected = store.app_storage().selected_message_draft(GROUP).unwrap();
     let notifications = Arc::new(AtomicUsize::new(0));
     let counter = notifications.clone();
     store.set_message_draft_commit_observer(Arc::new(move |group| {
@@ -278,17 +286,27 @@ fn accepted_queue_and_draft_clear_commit_together_and_rollback_without_wakeup() 
         counter.fetch_add(1, Ordering::SeqCst);
     }));
     store
+        .app_storage()
         .stage_message_draft_submission(&selected.revision, "event", b"payload")
         .unwrap();
     let result: StorageResult<()> = store.with_transaction(|s| {
         s.put_queued_outbound_intent(&queued(b"payload"))?;
-        assert!(s.selected_message_draft(GROUP)?.draft.is_none());
+        assert!(
+            s.app_storage()
+                .selected_message_draft(GROUP)?
+                .draft
+                .is_none()
+        );
         assert_eq!(notifications.load(Ordering::SeqCst), 0);
         Err(StorageError::Backend("rollback".into()))
     });
     assert!(result.is_err());
     assert_eq!(
-        store.selected_message_draft(GROUP).unwrap().revision,
+        store
+            .app_storage()
+            .selected_message_draft(GROUP)
+            .unwrap()
+            .revision,
         selected.revision
     );
     assert!(
@@ -310,7 +328,14 @@ fn accepted_queue_and_draft_clear_commit_together_and_rollback_without_wakeup() 
             .unwrap()
             .is_empty()
     );
-    assert!(store.selected_message_draft(GROUP).unwrap().draft.is_some());
+    assert!(
+        store
+            .app_storage()
+            .selected_message_draft(GROUP)
+            .unwrap()
+            .draft
+            .is_some()
+    );
     store
         .lock()
         .unwrap()
@@ -323,7 +348,14 @@ fn accepted_queue_and_draft_clear_commit_together_and_rollback_without_wakeup() 
             Ok(())
         })
         .unwrap();
-    assert!(store.selected_message_draft(GROUP).unwrap().draft.is_none());
+    assert!(
+        store
+            .app_storage()
+            .selected_message_draft(GROUP)
+            .unwrap()
+            .draft
+            .is_none()
+    );
     assert_eq!(notifications.load(Ordering::SeqCst), 1);
     assert_eq!(
         store
@@ -339,42 +371,47 @@ fn accepted_queue_and_draft_clear_commit_together_and_rollback_without_wakeup() 
     store
         .delete_queued_outbound_intent(&queued(b"payload").id)
         .unwrap();
-    assert!(store.selected_message_draft(GROUP).unwrap().draft.is_none());
+    assert!(
+        store
+            .app_storage()
+            .selected_message_draft(GROUP)
+            .unwrap()
+            .draft
+            .is_none()
+    );
     assert_eq!(notifications.load(Ordering::SeqCst), 1);
 }
 #[test]
 fn mismatched_acceptance_cancellation_and_late_acceptance_keep_newer_drafts() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store);
-    store.save_message_draft(GROUP, "old", None, &[]).unwrap();
-    let old = store.selected_message_draft(GROUP).unwrap();
-    store
-        .stage_message_draft_submission(&old.revision, "event", b"old")
+    app.save_message_draft(GROUP, "old", None, &[]).unwrap();
+    let old = app.selected_message_draft(GROUP).unwrap();
+    app.stage_message_draft_submission(&old.revision, "event", b"old")
         .unwrap();
     store
         .put_queued_outbound_intent(&queued(b"different"))
         .unwrap();
     assert_eq!(
-        store.selected_message_draft(GROUP).unwrap().revision,
+        app.selected_message_draft(GROUP).unwrap().revision,
         old.revision
     );
-    store
-        .cancel_message_draft_submission(&old.revision, "event")
+    app.cancel_message_draft_submission(&old.revision, "event")
         .unwrap();
     store.put_queued_outbound_intent(&queued(b"old")).unwrap();
     assert_eq!(
-        store.selected_message_draft(GROUP).unwrap().revision,
+        app.selected_message_draft(GROUP).unwrap().revision,
         old.revision
     );
-    store
-        .stage_message_draft_submission(&old.revision, "event", b"old")
+    app.stage_message_draft_submission(&old.revision, "event", b"old")
         .unwrap();
-    let new = store
+    let new = app
         .save_message_draft_if_revision(&old.revision, "new", None, &[])
         .unwrap();
     store.put_queued_outbound_intent(&queued(b"old")).unwrap();
     assert_eq!(
-        store.selected_message_draft(GROUP).unwrap().revision,
+        app.selected_message_draft(GROUP).unwrap().revision,
         new.revision
     );
 }
@@ -385,13 +422,12 @@ fn accepted_and_unaccepted_draft_revisions_survive_encrypted_reopen() {
         let path = dir.path().join("draft.sqlite");
         let key = crate::SqlCipherKey::new("ab".repeat(32)).unwrap();
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let app = store.app_storage();
         seed(&store);
-        store
-            .save_message_draft(GROUP, "retained", None, &[attachment()])
+        app.save_message_draft(GROUP, "retained", None, &[attachment()])
             .unwrap();
-        let selected = store.selected_message_draft(GROUP).unwrap();
-        store
-            .stage_message_draft_submission(&selected.revision, "event", b"payload")
+        let selected = app.selected_message_draft(GROUP).unwrap();
+        app.stage_message_draft_submission(&selected.revision, "event", b"payload")
             .unwrap();
         if accepted {
             store
@@ -399,9 +435,13 @@ fn accepted_and_unaccepted_draft_revisions_survive_encrypted_reopen() {
                 .unwrap();
         }
         store.close().unwrap();
+        drop(app);
         drop(store);
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        let now = reopened.selected_message_draft(GROUP).unwrap();
+        let now = reopened
+            .app_storage()
+            .selected_message_draft(GROUP)
+            .unwrap();
         assert_eq!(now.draft.is_none(), accepted);
         assert_eq!(now.revision == selected.revision, !accepted);
         assert_eq!(
@@ -423,6 +463,7 @@ fn selected_query_work_ignores_other_drafts_and_attachment_blob_size() {
         let mut media = attachment();
         media.plaintext = vec![17; if count == 200 { 1024 } else { 8 * 1024 * 1024 }];
         store
+            .app_storage()
             .save_message_draft(GROUP, "selected", None, &[media])
             .unwrap();
         store.lock().unwrap().execute_batch(&format!("INSERT INTO account_groups(group_id_hex,endpoint,updated_at)
@@ -430,7 +471,9 @@ fn selected_query_work_ignores_other_drafts_and_attachment_blob_size() {
             SELECT printf('other-%08d',x),'',0 FROM n;
             INSERT INTO message_drafts(group_id_hex,content,created_at_ms,updated_at_ms)
                 SELECT group_id_hex,'unrelated',0,0 FROM account_groups WHERE group_id_hex != '{GROUP}';")).unwrap();
-        let (selected, steps) = measure(&store, || store.selected_message_draft(GROUP).unwrap());
+        let (selected, steps) = measure(&store, || {
+            store.app_storage().selected_message_draft(GROUP).unwrap()
+        });
         assert_eq!(selected.draft.unwrap().media_attachments.len(), 1);
         assert!(steps < 500, "{count} unrelated drafts: {steps} VM steps");
     }
@@ -438,11 +481,10 @@ fn selected_query_work_ignores_other_drafts_and_attachment_blob_size() {
 #[test]
 fn revision_exhaustion_fails_without_reusing_tokens_or_changing_draft() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store);
-    store
-        .save_message_draft(GROUP, "before", None, &[])
-        .unwrap();
-    let before = store.selected_message_draft(GROUP).unwrap();
+    app.save_message_draft(GROUP, "before", None, &[]).unwrap();
+    let before = app.selected_message_draft(GROUP).unwrap();
     store
         .lock()
         .unwrap()
@@ -452,11 +494,10 @@ fn revision_exhaustion_fails_without_reusing_tokens_or_changing_draft() {
         )
         .unwrap();
     assert!(
-        store
-            .save_message_draft_if_revision(&before.revision, "after", None, &[])
+        app.save_message_draft_if_revision(&before.revision, "after", None, &[])
             .is_err()
     );
-    let after = store.selected_message_draft(GROUP).unwrap();
+    let after = app.selected_message_draft(GROUP).unwrap();
     assert_eq!(before.revision, after.revision);
     assert_eq!(after.draft.unwrap().content, "before");
 }
@@ -515,9 +556,10 @@ fn selected_draft_debug_redacts_content_identities_and_media_metadata() {
     media.id = "private-attachment-id".into();
     media.file_name = "private-file-name".into();
     store
+        .app_storage()
         .save_message_draft(GROUP, "private-content", Some(&"ab".repeat(32)), &[media])
         .unwrap();
-    let selected = store.selected_message_draft(GROUP).unwrap();
+    let selected = store.app_storage().selected_message_draft(GROUP).unwrap();
     let debug = format!(
         "{selected:?} {:?}",
         selected.draft.as_ref().unwrap().media_attachments
@@ -538,20 +580,18 @@ fn selected_draft_debug_redacts_content_identities_and_media_metadata() {
 #[test]
 fn cancelling_older_event_preserves_a_replacement_for_the_same_draft_revision() {
     let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
     seed(&store);
-    store.save_message_draft(GROUP, "draft", None, &[]).unwrap();
-    let selected = store.selected_message_draft(GROUP).unwrap();
-    store
-        .stage_message_draft_submission(&selected.revision, "first", b"first")
+    app.save_message_draft(GROUP, "draft", None, &[]).unwrap();
+    let selected = app.selected_message_draft(GROUP).unwrap();
+    app.stage_message_draft_submission(&selected.revision, "first", b"first")
         .unwrap();
-    store
-        .stage_message_draft_submission(&selected.revision, "replacement", b"replacement")
+    app.stage_message_draft_submission(&selected.revision, "replacement", b"replacement")
         .unwrap();
-    store
-        .cancel_message_draft_submission(&selected.revision, "first")
+    app.cancel_message_draft_submission(&selected.revision, "first")
         .unwrap();
     store
         .put_queued_outbound_intent(&queued(b"replacement"))
         .unwrap();
-    assert!(store.selected_message_draft(GROUP).unwrap().draft.is_none());
+    assert!(app.selected_message_draft(GROUP).unwrap().draft.is_none());
 }

@@ -1,5 +1,7 @@
 //! Account-private NIP-51 state. Never stored in the shared directory database.
-use crate::{SqliteAccountStorage, SqliteResultExt};
+#[cfg(test)]
+use crate::SqliteAccountStorage;
+use crate::{SqliteAppStorage, SqliteResultExt};
 use cgka_traits::storage::StorageResult;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -32,7 +34,7 @@ pub struct PendingBlockPublication {
     pub event_json: String,
 }
 
-impl SqliteAccountStorage {
+impl SqliteAppStorage {
     /// Cheap policy probes for live subscriptions; never materialize the list.
     pub fn has_blocked_users(&self) -> StorageResult<bool> {
         self.lock()?
@@ -246,6 +248,7 @@ mod tests {
     use super::*;
     fn adopt(store: &SqliteAccountStorage, id: &str, at: u64, entries: &[(&str, bool)]) -> bool {
         store
+            .app_storage()
             .adopt_block_list(
                 &StoredBlockList {
                     event_id: id.into(),
@@ -272,7 +275,7 @@ mod tests {
             10,
             &[("alice", true), ("alice", false), ("bob", true)]
         ));
-        let first = store.block_list_snapshot().unwrap();
+        let first = store.app_storage().block_list_snapshot().unwrap();
         assert_eq!(
             first
                 .users
@@ -282,14 +285,28 @@ mod tests {
             ["alice", "bob"]
         );
         assert!(!first.users[0].is_private);
-        assert!(other.block_list_snapshot().unwrap().users.is_empty());
+        assert!(
+            other
+                .app_storage()
+                .block_list_snapshot()
+                .unwrap()
+                .users
+                .is_empty()
+        );
         assert!(!adopt(&store, "cc", 10, &[]));
         assert!(!adopt(&store, "aa", 9, &[]));
-        assert_eq!(store.block_list_snapshot().unwrap(), first);
+        assert_eq!(store.app_storage().block_list_snapshot().unwrap(), first);
         assert!(adopt(&store, "aa", 10, &[]));
-        assert!(store.block_list_snapshot().unwrap().users.is_empty());
+        assert!(
+            store
+                .app_storage()
+                .block_list_snapshot()
+                .unwrap()
+                .users
+                .is_empty()
+        );
         assert_eq!(
-            store.block_list_snapshot().unwrap().revision,
+            store.app_storage().block_list_snapshot().unwrap().revision,
             first.revision + 1
         );
     }
@@ -297,10 +314,11 @@ mod tests {
     fn user_blocks_transaction_failure_preserves_list_and_revision() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         adopt(&store, "a", 1, &[("alice", true)]);
-        let before = store.block_list_snapshot().unwrap();
+        let before = store.app_storage().block_list_snapshot().unwrap();
         store.lock().unwrap().execute_batch("CREATE TRIGGER fail_block_version BEFORE UPDATE ON user_block_list BEGIN SELECT RAISE(ABORT,'test'); END;").unwrap();
         assert!(
             store
+                .app_storage()
                 .adopt_block_list(
                     &StoredBlockList {
                         event_id: "b".into(),
@@ -314,7 +332,7 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(store.block_list_snapshot().unwrap(), before);
+        assert_eq!(store.app_storage().block_list_snapshot().unwrap(), before);
     }
     #[test]
     fn user_blocks_pending_and_dismissal_survive_reopen() {
@@ -324,24 +342,34 @@ mod tests {
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         adopt(&store, "a", 1, &[("alice", true)]);
         store
+            .app_storage()
             .stage_block_publication(&PendingBlockPublication {
                 target: "bob".into(),
                 blocked: true,
                 event_json: "signed bytes".into(),
             })
             .unwrap();
-        store.dismiss_blocked_welcome("welcome").unwrap();
+        store
+            .app_storage()
+            .dismiss_blocked_welcome("welcome")
+            .unwrap();
         drop(store);
         let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        assert!(reopened.is_user_blocked("alice").unwrap());
+        assert!(reopened.app_storage().is_user_blocked("alice").unwrap());
         assert_eq!(
             reopened
+                .app_storage()
                 .pending_block_publication()
                 .unwrap()
                 .unwrap()
                 .event_json,
             "signed bytes"
         );
-        assert!(reopened.is_blocked_welcome_dismissed("welcome").unwrap());
+        assert!(
+            reopened
+                .app_storage()
+                .is_blocked_welcome_dismissed("welcome")
+                .unwrap()
+        );
     }
 }

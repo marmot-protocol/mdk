@@ -238,7 +238,10 @@ impl MarmotAppRuntime {
         let group = hex::encode(group.as_slice());
         self.attachment_read(account_ref, move |storage, allow_loopback| {
             use storage_sqlite::AttachmentHistoryError as E;
-            match storage.attachment_history_page(&group, limit, cursor.as_ref()) {
+            match storage
+                .app_storage()
+                .attachment_history_page(&group, limit, cursor.as_ref())
+            {
                 Ok(page) => Ok(AttachmentPageRead::Page(Box::new(AttachmentPage {
                     entries: page
                         .entries
@@ -267,6 +270,7 @@ impl MarmotAppRuntime {
         let group = hex::encode(group.as_slice());
         self.attachment_read(account_ref, move |storage, _| {
             storage
+                .app_storage()
                 .attachment_history_version(&group)
                 .map_err(|error| match error {
                     storage_sqlite::AttachmentHistoryError::Storage(error) => error.into(),

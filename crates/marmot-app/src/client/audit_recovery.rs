@@ -13,6 +13,7 @@
 //! None of these kinds exists in audit v4, so each helper first checks that a
 //! v5 recorder is installed.
 use std::collections::BTreeSet;
+use storage_sqlite::SqliteAppStorage;
 
 use cgka_traits::GroupId;
 use marmot_forensics::{
@@ -25,7 +26,6 @@ use marmot_forensics::{
 use storage_sqlite::{
     RecoveryCause, RecoveryDemandTicket, RecoveryDemandTransition, RecoveryEligibility,
     RecoveryLossCause, RecoveryLossImport, RecoveryObligationState, RecoveryPassProgress,
-    SqliteAccountStorage,
 };
 
 use super::AppClient;
@@ -373,7 +373,7 @@ impl AppClient {
     /// change. The storage import is the authority; the rows follow it.
     pub(crate) fn synchronize_recovery_loss(
         &self,
-        storage: &SqliteAccountStorage,
+        storage: &SqliteAppStorage,
     ) -> Result<(), AppError> {
         let imports = storage.synchronize_account_delivery_loss(&self.state.label)?;
         self.record_recovery_loss_imports(imports);
@@ -611,7 +611,7 @@ impl AppClient {
     /// storage after its checkpoint committed.
     pub(crate) fn record_recovery_reassessments(
         &self,
-        storage: &SqliteAccountStorage,
+        storage: &SqliteAppStorage,
         grant: &AttemptGrant,
         context: &AuditEventContext,
         settled: Vec<ReassessedObligation>,
