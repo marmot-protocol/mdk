@@ -157,7 +157,10 @@ impl MarmotDeployment {
         self.key_package_client_preference.last =
             normalize_list(self.key_package_client_preference.last);
         self.moderation_label_namespace = trim_optional(self.moderation_label_namespace);
-        self.keychain_service = self.keychain_service.trim().to_owned();
+        self.keychain_service = match self.keychain_service.trim() {
+            "" => NEUTRAL_KEYCHAIN_SERVICE_NAME.to_owned(),
+            name => name.to_owned(),
+        };
         self
     }
 
@@ -359,6 +362,15 @@ mod tests {
             "no profile relay disables the tier"
         );
         assert_eq!(deployment.moderation_label_namespace.as_deref(), Some("ns"));
+        let blank_keychain = MarmotDeployment {
+            keychain_service: "  ".into(),
+            ..MarmotDeployment::neutral()
+        }
+        .normalize();
+        assert_eq!(
+            blank_keychain.keychain_service,
+            NEUTRAL_KEYCHAIN_SERVICE_NAME
+        );
     }
 
     #[test]

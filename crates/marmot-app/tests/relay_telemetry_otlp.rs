@@ -363,6 +363,8 @@ async fn running_runtime_pushes_to_default_telemetry_endpoint_when_runtime_endpo
             audit_log_tracker_endpoint: None,
             ..MarmotServiceEndpoints::default()
         })
+        // Replacing the endpoints used to clear Open Ranking too; keep tests off the live provider.
+        .with_open_ranking_provider(None, Vec::new())
         .with_allow_loopback_relay_endpoints(true);
     let app = MarmotApp::with_relay_and_config(tmp.path(), relay.url().await.to_string(), config);
     let runtime = MarmotAppRuntime::new(app);

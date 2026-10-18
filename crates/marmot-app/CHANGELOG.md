@@ -21,7 +21,10 @@
   `MarmotApp::discovery_indexer_relays()` or the preset's fields. A
   moderation report destination is now refused when the deployment sets no
   label namespace. `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` still replaces the
-  default new-group media servers at build time.
+  default new-group media servers at build time. `with_service_endpoints` now
+  sets only the collector routes, so passing `..Default::default()` no longer
+  turns Open Ranking off or clears a build-time media list; call
+  `with_open_ranking_provider(None, Vec::new())` to turn search off.
 - `AppError` adds `GroupCatchingUp` and `GroupCommitUndelivered`; update exhaustive matches.
 - `AppError` adds `InvalidEditTarget`; update exhaustive matches.
 - `AppError` adds `DirectoryLookupIncomplete(account)` (mdk#2302). Invite member resolution,

@@ -244,11 +244,14 @@ async fn post_audit_log_tracker_update_uses_default_endpoint_with_host_token() {
     let (tx, rx) = oneshot::channel();
     let server = tokio::spawn(capture_one_request(listener, tx));
 
-    let config = MarmotAppConfig::default().with_service_endpoints(MarmotServiceEndpoints {
-        relay_telemetry_otlp_endpoint: None,
-        audit_log_tracker_endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
-        ..MarmotServiceEndpoints::default()
-    });
+    let config = MarmotAppConfig::default()
+        .with_service_endpoints(MarmotServiceEndpoints {
+            relay_telemetry_otlp_endpoint: None,
+            audit_log_tracker_endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
+            ..MarmotServiceEndpoints::default()
+        })
+        // Replacing the endpoints used to clear Open Ranking too; keep tests off the live provider.
+        .with_open_ranking_provider(None, Vec::new());
     let app = MarmotApp::with_relay_and_config(tmp.path(), "wss://relay.example", config);
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
