@@ -148,8 +148,8 @@ pub const GROUP_BATCH_ROUTES: usize = 50;
 /// Budget for one backward replay page. The item cap sits well above
 /// [`RELAY_REPLAY_PAGE_LIMIT`] so a relay that does not clamp still answers a
 /// page with EOSE instead of hitting the cap.
-/// Its duration also bounds initial waiting and each active route's service,
-/// including release; queued groups do not consume that service allowance.
+/// Its duration also bounds initial waiting and each active route's fetch.
+/// Queueing, peer-release waits and delivery draining do not spend that allowance.
 const REPLAY_PAGE_LIMITS: NostrAcquisitionLimits = NostrAcquisitionLimits {
     max_endpoints: 1,
     max_requested_event_ids: 1,
@@ -1534,7 +1534,7 @@ impl NostrTransportAdapter {
         epoch: [u64; 2],
         reason: ReplayRestart,
     ) -> bool {
-        let pages = {
+        {
             let mut state = self.state.write().await;
             let relay = state.relay_index.index_for(endpoint);
             let key = (account.cloned(), relay);
@@ -1555,7 +1555,6 @@ impl NostrTransportAdapter {
             } else {
                 ReplayRestart::Connection
             };
-            let mut pages = Vec::new();
             for (account_id, coverage) in &mut state.account_replay_coverage {
                 if account.is_some_and(|account| account != account_id) {
                     continue;
@@ -1570,7 +1569,7 @@ impl NostrTransportAdapter {
                     },
                     self.now_ms(),
                 ) {
-                    pages.push(ReplayPaging {
+                    coverage.queue_capture(ReplayPaging {
                         account_id: account_id.clone(),
                         subscription_id,
                         endpoint: endpoint.clone(),
@@ -1583,11 +1582,6 @@ impl NostrTransportAdapter {
                     });
                 }
             }
-            pages
-        };
-        self.flush_group_replays().await;
-        for paging in pages {
-            self.spawn_replay_paging(paging);
         }
         true
     }
@@ -1648,14 +1642,13 @@ impl NostrTransportAdapter {
         lag: NotificationLagMark,
     ) -> ReplayRecoverySummary {
         let _subscription_guard = self.lock_subscriptions().await;
-        let (summary, pages) = {
+        let summary = {
             let mut state = self.state.write().await;
             for coverage in state.account_replay_coverage.values_mut() {
                 coverage.expire_replay(tokio::time::Instant::now());
             }
             let pending = state.pending_replay_windows(account_id, lag.0);
             let mut summary = ReplayRecoverySummary::default();
-            let mut pages = Vec::new();
             for source in pending {
                 let coverage = state
                     .account_replay_coverage
@@ -1681,7 +1674,7 @@ impl NostrTransportAdapter {
                     continue;
                 }
                 let (window, serial) = capture.expect("new capture exists");
-                pages.push(ReplayPaging {
+                coverage.queue_capture(ReplayPaging {
                     account_id: source.account_id,
                     subscription_id: source.subscription_id,
                     endpoint: source.endpoint,
@@ -1693,12 +1686,8 @@ impl NostrTransportAdapter {
                 summary.pending_relays += 1;
                 summary.started_relays += 1;
             }
-            (summary, pages)
+            summary
         };
-        self.flush_group_replays().await;
-        for paging in pages {
-            self.spawn_replay_paging(paging);
-        }
         tracing::debug!(target: "transport_nostr_adapter::adapter", method = "recover_pending_replay",
             pending_relays = summary.pending_relays, started_relays = summary.started_relays, active_relays = summary.active_relays,
             "scheduled owned history recovery after notification loss");
@@ -1799,10 +1788,10 @@ impl NostrTransportAdapter {
             state.record_scoped_subscription_start(&subscription, &subscription_id, now_ms);
             state.stage_replay_subscription(account_id, &subscription, subscription_id.clone());
         }
-        self.flush_group_replays().await;
+
         let (complete, abandoned) = oneshot::channel();
         let cleanup_state = self.state.clone();
-        let cleanup_adapter = self.clone();
+
         let cleanup_subscription = subscription.clone();
         let cleanup_id = subscription_id.clone();
         tokio::spawn(async move {
@@ -1824,7 +1813,6 @@ impl NostrTransportAdapter {
                 }
                 state.rebuild_transport_group_index();
                 drop(state);
-                cleanup_adapter.flush_group_replays().await;
             }
         });
         let result = if attempt.is_some() {
@@ -1849,7 +1837,7 @@ impl NostrTransportAdapter {
             state.rebuild_transport_group_index();
             let _ = complete.send(());
             drop(state);
-            self.flush_group_replays().await;
+
             return Err(error);
         }
         let _ = complete.send(());
@@ -1882,7 +1870,7 @@ impl NostrTransportAdapter {
             .write()
             .await
             .remove_pending_unsubscribe_by_id(&subscription_id);
-        self.flush_group_replays().await;
+
         Ok(())
     }
 
@@ -1928,7 +1916,7 @@ impl NostrTransportAdapter {
             .await
             .pending_scoped_unsubscribes
             .remove(subscription_id);
-        self.flush_group_replays().await;
+
         Ok(())
     }
 
@@ -2036,10 +2024,8 @@ impl NostrTransportAdapter {
         let Some(account) = self.group_copy_account(&relay_event, account_id).await else {
             return Ok(0);
         };
-        let deliveries = self
-            .deliveries_for(&relay_event, message, Some(&account))
-            .await;
-        self.admit_deliveries(deliveries, RelayCopy::RawGroup).await
+        self.admit_relay_message(&relay_event, message, Some(&account), RelayCopy::RawGroup)
+            .await
     }
 
     /// Route a comparison result to one account without the delivery queue.
@@ -2053,52 +2039,10 @@ impl NostrTransportAdapter {
             .event
             .to_transport_message()
             .map_err(map_inbound_event_error)?;
-        let deliveries = self
-            .deliveries_for(&relay_event, message, Some(account_id))
-            .await;
-        self.state
-            .write()
-            .await
-            .record_inbound_event(deliveries.len());
+        let mut state = self.state.write().await;
+        let deliveries = state.deliveries_for(&relay_event, message, Some(account_id));
+        state.record_inbound_event(deliveries.len());
         Ok(deliveries)
-    }
-
-    async fn deliveries_for(
-        &self,
-        relay_event: &NostrRelayEvent,
-        message: TransportMessage,
-        account_id: Option<&MemberId>,
-    ) -> Vec<TransportDelivery> {
-        let received_at = Timestamp(unix_now_seconds());
-        let mut routes = {
-            let state = self.state.read().await;
-            state.routes_for(&message, &relay_event.endpoint)
-        };
-        if let Some(account_id) = account_id {
-            routes.retain(|route| &route.account_id == account_id);
-        }
-        let mut routes = routes.into_iter();
-        let Some(last_route) = routes.next_back() else {
-            return Vec::new();
-        };
-        let wire = inbound_wire_metadata(&relay_event.event, &message.envelope);
-        let delivery_for = |route: DeliveryRoute, message| TransportDelivery {
-            account_id: route.account_id,
-            group_id_hint: route.group_id_hint,
-            message,
-            received_at,
-            source: TransportDeliverySource {
-                transport: TransportSource(NOSTR_SOURCE.into()),
-                plane: route.plane,
-                endpoint: Some(relay_event.endpoint.clone()),
-                subscription_id: relay_event.subscription_id.clone(),
-                wire: Some(wire.clone()),
-            },
-        };
-        let mut deliveries = Vec::with_capacity(routes.len() + 1);
-        deliveries.extend(routes.map(|route| delivery_for(route, message.clone())));
-        deliveries.push(delivery_for(last_route, message));
-        deliveries
     }
 
     async fn handle_relay_event_scoped(
@@ -2111,102 +2055,23 @@ impl NostrTransportAdapter {
             .event
             .to_transport_message()
             .map_err(map_inbound_event_error)?;
-        let deliveries = self.deliveries_for(&relay_event, message, account_id).await;
-        self.admit_deliveries(deliveries, copy).await
+        self.admit_relay_message(&relay_event, message, account_id, copy)
+            .await
     }
 
-    async fn admit_deliveries(
+    async fn admit_relay_message(
         &self,
-        deliveries: Vec<TransportDelivery>,
+        relay_event: &NostrRelayEvent,
+        message: TransportMessage,
+        account_id: Option<&MemberId>,
         copy: RelayCopy,
     ) -> Result<usize, TransportAdapterError> {
-        let mut delivered = 0;
-        for delivery in deliveries {
-            let delivery = {
-                let mut state = self.state.write().await;
-                let relay = delivery
-                    .source
-                    .endpoint
-                    .as_ref()
-                    .and_then(|endpoint| state.relay_index.existing_index_for(endpoint));
-                // Classify against the issuing REQ, not a destination account's
-                // unrelated route. Physical post-EOSE copies are live even
-                // while owned backward pages are still being acquired.
-                let source = delivery.source.subscription_id.as_ref().and_then(|id| {
-                    state.account_replay_coverage.values().find_map(|coverage| {
-                        let window = coverage.windows.get(id)?;
-                        let replay =
-                            relay.and_then(|relay| coverage.subscriptions.get(id)?.get(&relay));
-                        let serial = relay
-                            .and_then(|relay| coverage.endpoint_deadlines.get(id)?.get(&relay))
-                            .map(|endpoint| endpoint.serial);
-                        let ended = relay
-                            .and_then(|relay| coverage.stored.get(id)?.get(&relay))
-                            .is_some_and(|stored| stored.ended);
-                        Some((
-                            matches!(window.scope, ReplayScope::Groups(_)),
-                            replay.copied(),
-                            serial,
-                            ended,
-                        ))
-                    })
-                });
-                if copy != RelayCopy::Deduplicated && source.is_none() {
-                    continue;
-                }
-                if copy == RelayCopy::RawGroup && !source.is_some_and(|source| source.0) {
-                    continue;
-                }
-                if let RelayCopy::Page(serial) = copy
-                    && !source.is_some_and(|source| source.2 == Some(serial))
-                {
-                    continue;
-                }
-                let input = match copy {
-                    RelayCopy::Page(_) => ReplayInput::Page,
-                    _ if source.is_some_and(|source| {
-                        source.1.is_some() && source.1 != Some(RelayReplay::Eose) && !source.3
-                    }) =>
-                    {
-                        ReplayInput::History
-                    }
-                    _ => ReplayInput::Live,
-                };
-                delivered += 1;
-                match state.account_replay_coverage.get_mut(&delivery.account_id) {
-                    Some(coverage)
-                        if source.is_some()
-                            || coverage.flushing
-                            || delivery
-                                .group_id_hint
-                                .as_ref()
-                                .and_then(|group| coverage.groups.get(group))
-                                .is_some_and(|group| !group.events.is_empty()) =>
-                    {
-                        coverage.stage_delivery(delivery, relay, input)
-                    }
-                    _ => Some(delivery),
-                }
-            };
-            let Some(delivery) = delivery else {
-                continue;
-            };
-            self.delivery_tx
-                .send(delivery)
-                .await
-                .map_err(|_| TransportAdapterError::Closed)?;
-        }
-
-        // Delivery only. The relay pool emits one deduplicated `Event` per
-        // message, so this path counts delivered copies for routing metrics but
-        // MUST NOT record cross-relay spread or per-relay first-event timing:
-        // those need every relay's copy, which arrives on the raw per-relay
-        // stream via `observe_relay_event`, not this deduplicated path.
-        self.state.write().await.record_inbound_event(delivered);
+        let mut state = self.state.write().await;
+        let deliveries = state.deliveries_for(relay_event, message, account_id);
+        let delivered = state.admit_deliveries(deliveries, copy, &self.delivery_tx)?;
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
-            method = "handle_relay_event",
-            delivered,
+            method = "handle_relay_event", delivered,
             "handled relay event"
         );
         Ok(delivered)
@@ -2303,7 +2168,7 @@ impl NostrTransportAdapter {
                 .or_default()
                 .record(*route_kind, &endpoint, refusal);
         }
-        self.flush_group_replays().await;
+
         let route_kind = live.map(|(_, route_kind)| route_kind);
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
@@ -2342,95 +2207,94 @@ impl NostrTransportAdapter {
     /// background and delivered like reconciled events.
     pub async fn handle_relay_eose(&self, endpoint: TransportEndpoint, subscription_id: String) {
         let now_ms = self.now_ms();
-        let paging =
-            self.state
-                .write()
-                .await
-                .record_subscription_eose(&subscription_id, &endpoint, now_ms);
-        if let Some(paging) = paging {
-            self.spawn_replay_paging(paging);
-        }
-        self.flush_group_replays().await;
+        self.state
+            .write()
+            .await
+            .record_subscription_eose(&subscription_id, &endpoint, now_ms);
+
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "handle_relay_eose",
             "handled relay eose"
         );
     }
+}
 
-    /// Page a clamped replay in the background: the caller is a notification
-    /// consumer that must not wait on relay round trips.
-    fn spawn_replay_paging(&self, paging: ReplayPaging) {
-        let adapter = self.clone();
-        tokio::spawn(async move { adapter.page_replay(paging).await });
-    }
+/// Owns work across frontend replacement without retaining the delivery receiver.
+struct ReplaySupervisor {
+    state: std::sync::Weak<RwLock<AdapterState>>,
+    relay_client: Arc<dyn NostrRelayClient>,
+    delivery_tx: mpsc::Sender<TransportDelivery>,
+    account_id: MemberId,
+    cancellation: NostrAcquisitionCancellation,
+    wake: Arc<Notify>,
+    monotonic_start: Instant,
+}
 
-    async fn flush_group_replays(&self) {
-        let mut state = self.state.write().await;
-        for (account_id, coverage) in &mut state.account_replay_coverage {
-            if !coverage.watcher_started {
-                coverage.watcher_started = true;
-                let state = Arc::downgrade(&self.state);
-                let delivery_tx = self.delivery_tx.clone();
-                let account_id = account_id.clone();
-                let cancellation = coverage.cancellation.clone();
-                let wake = coverage.wake.clone();
-                tokio::spawn(async move {
-                    Self::watch_replay(state, delivery_tx, account_id, cancellation, wake).await;
-                });
-            }
-            Self::start_group_drain(&self.state, &self.delivery_tx, account_id, coverage);
-        }
-    }
-
-    fn start_group_drain(
-        state: &Arc<RwLock<AdapterState>>,
-        delivery_tx: &mpsc::Sender<TransportDelivery>,
-        account_id: &MemberId,
-        coverage: &mut AccountReplayCoverage,
-    ) {
-        if coverage.flushing || !coverage.has_ready_deliveries() {
-            return;
-        }
-        coverage.flushing = true;
-        let state = Arc::downgrade(state);
-        let delivery_tx = delivery_tx.clone();
-        let account_id = account_id.clone();
-        let cancellation = coverage.cancellation.clone();
-        tokio::spawn(async move {
-            Self::drain_group_replay(state, delivery_tx, account_id, cancellation).await;
-        });
-    }
-
-    async fn watch_replay(
-        state: std::sync::Weak<RwLock<AdapterState>>,
-        delivery_tx: mpsc::Sender<TransportDelivery>,
-        account_id: MemberId,
-        cancellation: NostrAcquisitionCancellation,
-        wake: Arc<Notify>,
-    ) {
+impl ReplaySupervisor {
+    async fn run(self: Arc<Self>) {
+        let mut tasks = JoinSet::new();
         loop {
-            let notified = wake.notified();
+            let notified = self.wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             let deadline = {
-                let Some(state) = state.upgrade() else {
+                let Some(state) = self.state.upgrade() else {
                     return;
                 };
                 let mut guard = state.write().await;
-                if cancellation.is_cancelled() {
+                if self.cancellation.is_cancelled() {
                     return;
                 }
-                let Some(coverage) = guard.account_replay_coverage.get_mut(&account_id) else {
+                let Some(coverage) = guard.account_replay_coverage.get_mut(&self.account_id) else {
                     return;
                 };
                 coverage.expire_replay(tokio::time::Instant::now());
-                Self::start_group_drain(&state, &delivery_tx, &account_id, coverage);
-                coverage.next_deadline()
+                let mut deadline = coverage.deadlines.first_key_value().map(|(at, _)| *at);
+                for endpoint in coverage
+                    .endpoint_deadlines
+                    .values_mut()
+                    .flat_map(HashMap::values_mut)
+                {
+                    if let Some(paging) = endpoint.queued.take() {
+                        let owner = self.clone();
+                        tasks.spawn(async move { owner.page_replay(paging).await });
+                    }
+                    if let Some(next) = endpoint.deadline {
+                        deadline = Some(deadline.map_or(next, |at| at.min(next)));
+                    }
+                }
+                if !coverage.flushing && coverage.has_ready_deliveries() {
+                    coverage.flushing = true;
+                    let owner = self.clone();
+                    tasks.spawn(async move { owner.drain_deliveries().await });
+                }
+                deadline
             };
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return,
+                _ = self.cancellation.cancelled() => return,
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        {
+                            let Some(state) = self.state.upgrade() else {
+                                return;
+                            };
+                            let mut guard = state.write().await;
+                            if self.cancellation.is_cancelled() {
+                                return;
+                            }
+                            if let Some(coverage) = guard.account_replay_coverage.get_mut(&self.account_id) {
+                                coverage.fail_execution();
+                            }
+                        }
+                        // Fence lost bodies before cancelling the remaining work.
+                        tasks.shutdown().await;
+                        tracing::error!(target: "transport_nostr_adapter::adapter",
+                            method = "replay_supervisor", panicked = error.is_panic(),
+                            "parked replay work after executor failure");
+                    }
+                },
                 _ = &mut notified => {},
                 _ = async { match deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -2440,68 +2304,23 @@ impl NostrTransportAdapter {
         }
     }
 
-    async fn wait_route_release(&self, paging: &ReplayPaging, window: &ReplayWindow) -> bool {
-        let (wake, cancellation, deadline) = {
-            let state = self.state.read().await;
-            let Some(coverage) = state.account_replay_coverage.get(&paging.account_id) else {
-                return false;
-            };
-            let Some(deadline) = coverage.page_deadline(paging, window) else {
-                return false;
-            };
-            (
-                coverage.wake.clone(),
-                coverage.cancellation.clone(),
-                deadline,
-            )
-        };
-        loop {
-            let notified = wake.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let pending = self
-                .state
-                .read()
-                .await
-                .account_replay_coverage
-                .get(&paging.account_id)
-                .is_some_and(|coverage| {
-                    coverage.page_deadline(paging, window).is_some()
-                        && coverage.route_release_pending(paging, window)
-                });
-            if !pending {
-                return true;
-            }
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return false,
-                _ = tokio::time::sleep_until(deadline) => return false,
-                _ = &mut notified => {},
-            }
-        }
-    }
-
-    async fn drain_group_replay(
-        state: std::sync::Weak<RwLock<AdapterState>>,
-        delivery_tx: mpsc::Sender<TransportDelivery>,
-        account_id: MemberId,
-        cancellation: NostrAcquisitionCancellation,
-    ) {
+    async fn drain_deliveries(&self) {
         loop {
             let deliveries = {
-                let Some(state) = state.upgrade() else {
+                let Some(state) = self.state.upgrade() else {
                     return;
                 };
-                let mut state = state.write().await;
-                if cancellation.is_cancelled() {
+                let mut guard = state.write().await;
+                if self.cancellation.is_cancelled() {
                     return;
                 }
-                let Some(coverage) = state.account_replay_coverage.get_mut(&account_id) else {
+                let Some(coverage) = guard.account_replay_coverage.get_mut(&self.account_id) else {
                     return;
                 };
                 let deliveries = coverage.take_ready_deliveries();
                 if deliveries.is_empty() {
                     coverage.flushing = false;
+                    coverage.wake_replay();
                     return;
                 }
                 deliveries
@@ -2509,9 +2328,18 @@ impl NostrTransportAdapter {
             for delivery in deliveries {
                 tokio::select! {
                     biased;
-                    _ = cancellation.cancelled() => return,
-                    sent = delivery_tx.send(delivery) => {
+                    _ = self.cancellation.cancelled() => return,
+                    sent = self.delivery_tx.send(delivery) => {
                         if sent.is_err() {
+                            let Some(state) = self.state.upgrade() else {
+                                return;
+                            };
+                            let mut guard = state.write().await;
+                            if !self.cancellation.is_cancelled()
+                                && let Some(coverage) = guard.account_replay_coverage.get_mut(&self.account_id)
+                            {
+                                coverage.fail_execution();
+                            }
                             return;
                         }
                     }
@@ -2520,33 +2348,73 @@ impl NostrTransportAdapter {
         }
     }
 
-    /// Fetch one relay's stored history for one activation REQ backwards from
-    /// the oldest event its live replay delivered, a page at a time, until a
-    /// page comes back short. Events are delivered to the REQ's account like
-    /// reconciled events. Only then does the relay's EOSE count as coverage;
-    /// a failed or over-long paging leaves it incomplete.
+    async fn wait_route_release(&self, paging: &ReplayPaging, window: &ReplayWindow) -> bool {
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let (pending, cancellation) = {
+                let Some(state) = self.state.upgrade() else {
+                    return false;
+                };
+                let guard = state.read().await;
+                let Some(coverage) = guard.account_replay_coverage.get(&self.account_id) else {
+                    return false;
+                };
+                if !coverage.capture_current(paging) || coverage.capture_outdated(paging) {
+                    return false;
+                }
+                (
+                    coverage.route_release_pending(paging, window),
+                    coverage.endpoint_deadlines[&paging.subscription_id][&paging.relay]
+                        .cancellation
+                        .clone(),
+                )
+            };
+            if !pending {
+                return true;
+            }
+            // Peer claims have their own finite service leases. They do not
+            // spend this source's network allowance or abandon its next group.
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => return false,
+                _ = cancellation.cancelled() => return false,
+                _ = &mut notified => {},
+            }
+        }
+    }
+
     async fn page_replay(&self, paging: ReplayPaging) {
         let units = {
-            let state = self.state.read().await;
-            let Some(coverage) = state.account_replay_coverage.get(&paging.account_id) else {
+            let Some(state) = self.state.upgrade() else {
                 return;
             };
+            let guard = state.read().await;
+            let Some(coverage) = guard.account_replay_coverage.get(&self.account_id) else {
+                return;
+            };
+            if self.cancellation.is_cancelled() || !coverage.capture_current(&paging) {
+                return;
+            }
             coverage.page_units(&paging)
         };
         let mut pages = 0;
         let mut delivered = 0;
         let mut complete = true;
-        // Finish all routes of one MLS group before releasing its history.
-        // Canonical group order also prevents overlapping REQs waiting in a cycle.
+        // Canonical group order prevents overlapping sources waiting in a cycle.
         for unit in units {
             for route in unit.per_route() {
                 {
-                    let mut state = self.state.write().await;
-                    let Some(coverage) = state.account_replay_coverage.get_mut(&paging.account_id)
+                    let Some(state) = self.state.upgrade() else {
+                        return;
+                    };
+                    let mut guard = state.write().await;
+                    let Some(coverage) = guard.account_replay_coverage.get_mut(&self.account_id)
                     else {
                         return;
                     };
-                    if !coverage.capture_current(&paging) {
+                    if self.cancellation.is_cancelled() || !coverage.capture_current(&paging) {
                         return;
                     }
                     if !coverage.start_route(&paging, &route) {
@@ -2564,65 +2432,73 @@ impl NostrTransportAdapter {
                         &mut delivered,
                     )
                     .await;
-                let mut state = self.state.write().await;
-                let Some(coverage) = state.account_replay_coverage.get_mut(&paging.account_id)
-                else {
+                let Some(state) = self.state.upgrade() else {
                     return;
                 };
-                if !coverage.capture_current(&paging) {
+                let mut guard = state.write().await;
+                let Some(coverage) = guard.account_replay_coverage.get_mut(&self.account_id) else {
+                    return;
+                };
+                if self.cancellation.is_cancelled() || !coverage.capture_current(&paging) {
                     return;
                 }
-                match outcome {
-                    PagedWindow::Complete => coverage.finish_route(&paging, &route),
-                    PagedWindow::Closed => {
-                        if coverage.cancellation.is_cancelled() {
-                            return;
-                        }
-                        complete = false;
-                        coverage.fail_route(&paging, &route);
-                    }
-                    PagedWindow::Incomplete | PagedWindow::Saturated(_) => {
-                        complete = false;
-                        coverage.fail_route(&paging, &route);
-                    }
+                if outcome != PagedWindow::Complete || !coverage.finish_route(&paging, &route) {
+                    complete = false;
+                    coverage.fail_route(&paging, &route);
                 }
             }
-            self.flush_group_replays().await;
+            {
+                let Some(state) = self.state.upgrade() else {
+                    return;
+                };
+                let mut guard = state.write().await;
+                if self.cancellation.is_cancelled() {
+                    return;
+                }
+                if guard.repeat_capture(&paging) {
+                    return;
+                }
+            }
             if !self.wait_route_release(&paging, &unit).await {
-                let mut state = self.state.write().await;
-                if let Some(coverage) = state.account_replay_coverage.get_mut(&paging.account_id)
+                let Some(state) = self.state.upgrade() else {
+                    return;
+                };
+                let mut guard = state.write().await;
+                if self.cancellation.is_cancelled() {
+                    return;
+                }
+                if !guard.repeat_capture(&paging)
+                    && let Some(coverage) = guard.account_replay_coverage.get_mut(&self.account_id)
                     && coverage.capture_current(&paging)
                 {
                     coverage.park_capture(&paging.subscription_id, paging.relay);
                 }
-                drop(state);
-                self.flush_group_replays().await;
                 return;
             }
         }
-        if complete {
-            self.state
-                .write()
-                .await
-                .finish_replay_paging(&paging, self.now_ms());
-        } else {
-            let mut state = self.state.write().await;
-            if let Some(coverage) = state.account_replay_coverage.get_mut(&paging.account_id)
+        {
+            let Some(state) = self.state.upgrade() else {
+                return;
+            };
+            let mut guard = state.write().await;
+            if self.cancellation.is_cancelled() {
+                return;
+            }
+            if complete {
+                guard.finish_replay_paging(
+                    &paging,
+                    self.monotonic_start.elapsed().as_millis() as u64,
+                );
+            } else if let Some(coverage) = guard.account_replay_coverage.get_mut(&self.account_id)
                 && coverage.capture_current(&paging)
             {
                 coverage.park_capture(&paging.subscription_id, paging.relay);
             }
         }
-        self.flush_group_replays().await;
-        tracing::debug!(
-            target: "transport_nostr_adapter::adapter",
-            method = "page_replay", pages, delivered, complete,
-            "paged a clamped relay replay"
-        );
+        tracing::debug!(target: "transport_nostr_adapter::adapter",
+            method = "page_replay", pages, delivered, "paged a clamped relay replay");
     }
 
-    /// Page one window of `paging`'s relay backwards from `until`, at most
-    /// `max_pages` pages, delivering what arrives to the REQ's account.
     async fn page_window(
         &self,
         paging: &ReplayPaging,
@@ -2636,17 +2512,25 @@ impl NostrTransportAdapter {
         let mut retrying = false;
         loop {
             let (cancellation, deadline) = {
-                let state = self.state.read().await;
-                let Some(coverage) = state.account_replay_coverage.get(&paging.account_id) else {
+                let Some(state) = self.state.upgrade() else {
                     return PagedWindow::Closed;
                 };
-                if !coverage.page_allowed(paging, window) {
+                let guard = state.read().await;
+                let Some(coverage) = guard.account_replay_coverage.get(&self.account_id) else {
+                    return PagedWindow::Closed;
+                };
+                if self.cancellation.is_cancelled() || !coverage.page_allowed(paging, window) {
                     return PagedWindow::Closed;
                 }
                 let Some(deadline) = coverage.page_deadline(paging, window) else {
                     return PagedWindow::Closed;
                 };
-                (coverage.cancellation.clone(), deadline)
+                (
+                    coverage.endpoint_deadlines[&paging.subscription_id][&paging.relay]
+                        .cancellation
+                        .clone(),
+                    deadline,
+                )
             };
             if window_pages == max_pages {
                 return PagedWindow::Incomplete;
@@ -2654,7 +2538,7 @@ impl NostrTransportAdapter {
             window_pages += 1;
             *pages += 1;
             let request = NostrAcquisitionRequest {
-                account_id: paging.account_id.clone(),
+                account_id: self.account_id.clone(),
                 scope: window.acquisition_scope(until),
                 endpoints: vec![paging.endpoint.clone()],
                 limits: NostrAcquisitionLimits {
@@ -2672,16 +2556,19 @@ impl NostrTransportAdapter {
                     }
                 }
             };
-            if cancellation.is_cancelled()
-                || !self
-                    .state
-                    .read()
-                    .await
-                    .account_replay_coverage
-                    .get(&paging.account_id)
-                    .is_some_and(|coverage| coverage.page_allowed(paging, window))
             {
-                return PagedWindow::Closed;
+                let Some(state) = self.state.upgrade() else {
+                    return PagedWindow::Closed;
+                };
+                let guard = state.read().await;
+                if cancellation.is_cancelled()
+                    || !guard
+                        .account_replay_coverage
+                        .get(&self.account_id)
+                        .is_some_and(|coverage| coverage.page_allowed(paging, window))
+                {
+                    return PagedWindow::Closed;
+                }
             }
             let page = match result {
                 Ok(mut result) => match result.endpoints.pop() {
@@ -2700,28 +2587,32 @@ impl NostrTransportAdapter {
                     subscription_id: Some(paging.subscription_id.clone()),
                     event,
                 };
-                match self
-                    .handle_relay_event_scoped(
-                        relay_event,
-                        Some(&paging.account_id),
-                        RelayCopy::Page(paging.serial),
-                    )
-                    .await
-                {
-                    Ok(count) => *delivered += count,
-                    Err(TransportAdapterError::Closed) => return PagedWindow::Closed,
-                    // Live replay rejects malformed events as well.
-                    Err(_) => {}
-                }
-                if !self
-                    .state
-                    .read()
-                    .await
-                    .account_replay_coverage
-                    .get(&paging.account_id)
-                    .is_some_and(|coverage| coverage.page_allowed(paging, window))
+                // Decode outside the state lock, once for all destinations.
+                let Ok(message) = relay_event.event.to_transport_message() else {
+                    continue;
+                };
+                let Some(state) = self.state.upgrade() else {
+                    return PagedWindow::Closed;
+                };
+                let mut guard = state.write().await;
+                if cancellation.is_cancelled()
+                    || !guard
+                        .account_replay_coverage
+                        .get(&self.account_id)
+                        .is_some_and(|coverage| coverage.page_allowed(paging, window))
                 {
                     return PagedWindow::Closed;
+                }
+                let deliveries =
+                    guard.deliveries_for(&relay_event, message, Some(&self.account_id));
+                match guard.admit_deliveries(
+                    deliveries,
+                    RelayCopy::Page(paging.serial),
+                    &self.delivery_tx,
+                ) {
+                    Ok(count) => *delivered += count,
+                    Err(TransportAdapterError::Closed) => return PagedWindow::Closed,
+                    Err(_) => unreachable!("delivery admission only reports a closed channel"),
                 }
             }
             if page.end != NostrAcquisitionEnd::RequestPolicySatisfied {
@@ -2739,8 +2630,8 @@ impl NostrTransportAdapter {
                 return PagedWindow::Incomplete;
             }
             retrying = false;
-            // The boundary second is inclusive. Repeated copies retain one body;
-            // a full page stuck at that second cannot prove older coverage.
+            // Inclusive boundary copies share a body; a stuck full second is
+            // explicit incomplete coverage, never a reason to skip that second.
             match oldest {
                 Some(oldest) if received >= RELAY_REPLAY_PAGE_LIMIT && oldest < until => {
                     until = oldest
@@ -2834,9 +2725,19 @@ impl TransportAdapter for NostrTransportAdapter {
             state.record_subscription_starts(&issued, now_ms);
             state.record_account_replay_start(&account_id, &issued);
             state.activate(activation, replaced_count, attempt, &routes, &batches);
+            let coverage = &state.account_replay_coverage[&account_id];
+            let owner = Arc::new(ReplaySupervisor {
+                state: Arc::downgrade(&self.state),
+                relay_client: self.relay_client.clone(),
+                delivery_tx: self.delivery_tx.clone(),
+                account_id: account_id.clone(),
+                cancellation: coverage.cancellation.clone(),
+                wake: coverage.wake.clone(),
+                monotonic_start: self.monotonic_start,
+            });
+            tokio::spawn(owner.run());
         }
 
-        self.flush_group_replays().await;
         if let Err(error) = self.subscribe_all("activate_account", &issued).await {
             // Some concurrent REQs may already have succeeded. Tear those
             // down best-effort, then always remove the pre-registered local
@@ -2985,7 +2886,7 @@ impl TransportAdapter for NostrTransportAdapter {
         let cleanup_barriers = Arc::clone(&self.subscribe_tasks);
         let cleanup_batch = batches.clone();
         let cleanup_account = sync.account_id.clone();
-        let cleanup_adapter = self.clone();
+
         tokio::spawn(async move {
             let _subscription_guard = subscription_guard;
             if staging_abandoned.await.is_err() {
@@ -3002,7 +2903,6 @@ impl TransportAdapter for NostrTransportAdapter {
                     cleanup_batch,
                 )
                 .await;
-                cleanup_adapter.flush_group_replays().await;
             }
         });
 
@@ -3027,7 +2927,7 @@ impl TransportAdapter for NostrTransportAdapter {
             )
             .await;
             let _ = staging_complete.send(());
-            self.flush_group_replays().await;
+
             return Err(error);
         }
 
@@ -3045,8 +2945,6 @@ impl TransportAdapter for NostrTransportAdapter {
             state.forget_subscription_starts(&replaced);
             state.queue_pending_unsubscribes(replaced);
         };
-
-        self.flush_group_replays().await;
 
         let (confirmed, failed_unsubscribe_count) = self.drain_pending_unsubscribes().await;
 
@@ -3249,6 +3147,10 @@ struct AccountReplayCoverage {
     request_groups: HashMap<String, HashSet<GroupId>>,
     buffered_bytes: usize,
     buffered_items: usize,
+    outbox: VecDeque<TransportDelivery>,
+    inbox_placements: usize,
+    /// Covers retired windows and wider reconciliation bodies until scope exit.
+    retained_since: Option<u64>,
     released: HashSet<[u8; 32]>,
     release_order: VecDeque<[u8; 32]>,
     unplaced: HashMap<[u8; 32], HashSet<GroupId>>,
@@ -3256,7 +3158,6 @@ struct AccountReplayCoverage {
     endpoint_deadlines: HashMap<String, HashMap<RelayIndex, ReplayEndpoint>>,
     source_serial: u64,
     wake: Arc<tokio::sync::Notify>,
-    watcher_started: bool,
     flushing: bool,
     cancellation: NostrAcquisitionCancellation,
     loss: Option<(MemberId, Arc<ReplayLosses>)>,
@@ -3265,14 +3166,8 @@ struct AccountReplayCoverage {
 impl Drop for AccountReplayCoverage {
     fn drop(&mut self) {
         self.cancellation.cancel();
-        if self.flushing || self.buffered_items > 0 || !self.unplaced.is_empty() {
-            self.record_loss(
-                self.windows
-                    .values()
-                    .map(|window| window.since)
-                    .min()
-                    .unwrap_or(0),
-            );
+        if self.admission_pending() {
+            self.record_loss(self.retained_since.unwrap_or(0));
         }
     }
 }
@@ -3313,12 +3208,19 @@ struct ReplayEndpoint {
     capturing: bool,
     /// A failed generation is dormant until a real connection starts another.
     parked: bool,
-    /// Newer loss is not covered by this capture's already-started first page.
-    /// On success it remains explicit Incomplete work for the paced caller.
-    dirty: bool,
-    /// Failure and expiry retain the generation's original floor only once.
-    loss_charged: bool,
+    /// The owner takes this ticket; frontend cancellation cannot orphan it.
+    queued: Option<ReplayPaging>,
+    cancellation: NostrAcquisitionCancellation,
+    demand_revision: u64,
+    capture_revision: u64,
+    charged_revision: Option<u64>,
     last_lag: Option<u64>,
+}
+
+impl Drop for ReplayEndpoint {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3369,6 +3271,8 @@ enum ReplayInput {
     History,
     Live,
     Page,
+    /// Routed input with no tracked historical REQ attribution.
+    Untracked,
 }
 
 /// The stored-history window of one activation REQ.
@@ -3562,8 +3466,8 @@ impl AccountReplayCoverage {
         else {
             return;
         };
-        if !endpoint.loss_charged {
-            endpoint.loss_charged = true;
+        if endpoint.charged_revision != Some(endpoint.demand_revision) {
+            endpoint.charged_revision = Some(endpoint.demand_revision);
             if let Some(window) = self.windows.get(id) {
                 self.record_loss(window.since);
             }
@@ -3624,7 +3528,21 @@ impl AccountReplayCoverage {
                             .is_some_and(|stored| stored.events > 0);
                 }
                 ReplayAdmission::Queued | ReplayAdmission::Paging => return false,
-                ReplayAdmission::Complete | ReplayAdmission::Covered => complete = true,
+                ReplayAdmission::Complete | ReplayAdmission::Covered => {
+                    if self
+                        .endpoint_deadlines
+                        .get(owner.request.as_ref())
+                        .and_then(|relays| relays.get(&owner.relay))
+                        .is_some_and(|endpoint| {
+                            endpoint.capturing
+                                && !endpoint.parked
+                                && endpoint.capture_revision != endpoint.demand_revision
+                        })
+                    {
+                        return false;
+                    }
+                    complete = true;
+                }
                 ReplayAdmission::Dormant | ReplayAdmission::Abandoned => {}
             }
         }
@@ -3646,23 +3564,21 @@ impl AccountReplayCoverage {
     }
 
     fn has_ready_deliveries(&self) -> bool {
-        self.groups
-            .values()
-            .any(|group| !group.events.is_empty() && self.group_ready(group))
+        !self.outbox.is_empty()
+            || self
+                .groups
+                .values()
+                .any(|group| !group.events.is_empty() && self.group_ready(group))
     }
 
     fn admission_pending(&self) -> bool {
         self.flushing
             || self.buffered_items != 0
             || !self.unplaced.is_empty()
-            || self.groups.values().any(|group| {
-                group.streams.values().any(|stream| {
-                    matches!(
-                        stream.phase,
-                        ReplayAdmission::Queued | ReplayAdmission::Paging
-                    )
-                })
-            })
+            || self
+                .endpoint_deadlines
+                .values()
+                .any(|relays| relays.values().any(|endpoint| endpoint.capturing))
     }
 
     fn request_admitted(&self, id: &str, relay: Option<RelayIndex>) -> bool {
@@ -3708,21 +3624,27 @@ impl AccountReplayCoverage {
             }
         }
         grouped
-            || self
-                .subscriptions
-                .get(id)
-                .is_some_and(|relays| match relay {
-                    Some(relay) => relays.get(&relay) == Some(&RelayReplay::Eose),
-                    None => relays.values().any(|replay| *replay == RelayReplay::Eose),
-                })
+            || (self.outbox.is_empty()
+                && self.inbox_placements == 0
+                && self
+                    .subscriptions
+                    .get(id)
+                    .is_some_and(|relays| match relay {
+                        Some(relay) => relays.get(&relay) == Some(&RelayReplay::Eose),
+                        None => relays.values().any(|replay| *replay == RelayReplay::Eose),
+                    }))
     }
 
-    fn pin_delivery(&mut self, id: [u8; 32], group_id: &GroupId) {
-        if self
-            .unplaced
-            .entry(id)
-            .or_default()
-            .insert(group_id.clone())
+    fn pin_delivery(&mut self, id: [u8; 32], group_id: Option<&GroupId>) {
+        let groups = match self.unplaced.entry(id) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                self.inbox_placements += usize::from(group_id.is_none());
+                entry.insert(HashSet::new())
+            }
+        };
+        if let Some(group_id) = group_id
+            && groups.insert(group_id.clone())
             && let Some(group) = self.groups.get_mut(group_id)
         {
             group.placements += 1;
@@ -3734,6 +3656,7 @@ impl AccountReplayCoverage {
             return;
         };
         if let Some(groups) = self.unplaced.remove(&id) {
+            self.inbox_placements -= usize::from(groups.is_empty());
             for group_id in groups {
                 if let Some(group) = self.groups.get_mut(&group_id) {
                     group.placements -= 1;
@@ -3795,6 +3718,7 @@ impl AccountReplayCoverage {
         }
         let window = ReplayWindow::for_subscription(subscription);
         let since = window.as_ref().map_or(0, |window| window.since);
+        self.retained_since = Some(self.retained_since.map_or(since, |held| held.min(since)));
         if let Some(window) = window {
             self.windows.insert(id.clone(), window);
         }
@@ -3858,8 +3782,11 @@ impl AccountReplayCoverage {
                             serial,
                             capturing: false,
                             parked: false,
-                            dirty: false,
-                            loss_charged: false,
+                            queued: None,
+                            cancellation: self.cancellation.child_token(),
+                            demand_revision: 0,
+                            capture_revision: 0,
+                            charged_revision: None,
                             last_lag: None,
                         },
                     )
@@ -3971,29 +3898,81 @@ impl AccountReplayCoverage {
         self.wake_replay();
     }
 
+    fn stage_ready(
+        &mut self,
+        delivery: TransportDelivery,
+        id: [u8; 32],
+        delivery_tx: &mpsc::Sender<TransportDelivery>,
+    ) -> Result<(), TransportAdapterError> {
+        if !self.flushing && self.outbox.is_empty() {
+            match delivery_tx.try_reserve() {
+                Ok(permit) => {
+                    self.pin_delivery(id, delivery.group_id_hint.as_ref());
+                    permit.send(delivery);
+                    return Ok(());
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.record_loss(self.retained_since.unwrap_or(0));
+                    return Err(TransportAdapterError::Closed);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+            }
+        }
+        let bytes = delivery.message.payload.len();
+        if self.buffered_items >= REPLAY_BUFFER_MAX_ITEMS
+            || bytes > REPLAY_BUFFER_MAX_BYTES.saturating_sub(self.buffered_bytes)
+        {
+            self.record_loss(self.retained_since.unwrap_or(0));
+            return Ok(());
+        }
+        self.buffered_items += 1;
+        self.buffered_bytes += bytes;
+        self.outbox.push_back(delivery);
+        self.wake_replay();
+        Ok(())
+    }
+
     fn stage_delivery(
         &mut self,
         delivery: TransportDelivery,
         relay: Option<RelayIndex>,
         input: ReplayInput,
-    ) -> Option<TransportDelivery> {
+        delivery_tx: &mpsc::Sender<TransportDelivery>,
+    ) -> Result<(), TransportAdapterError> {
         self.expire_replay(tokio::time::Instant::now());
+        let Ok(id) = <[u8; 32]>::try_from(delivery.message.id.as_slice()) else {
+            return Ok(());
+        };
+        let since = delivery.message.timestamp.0;
+        self.retained_since = Some(self.retained_since.map_or(since, |held| held.min(since)));
         let Some(group_id) = delivery.group_id_hint.as_ref() else {
-            return Some(delivery);
+            return self.stage_ready(delivery, id, delivery_tx);
         };
         let Some(group) = self.groups.get(group_id) else {
-            return Some(delivery);
+            self.record_loss(self.retained_since.unwrap_or(0));
+            return Ok(());
         };
-        let Ok(id) = <[u8; 32]>::try_from(delivery.message.id.as_slice()) else {
-            return None;
-        };
+        if input == ReplayInput::Untracked
+            && group.events.is_empty()
+            && group.streams.values().all(|stream| {
+                !matches!(
+                    stream.phase,
+                    ReplayAdmission::Queued | ReplayAdmission::Paging
+                )
+            })
+        {
+            return self.stage_ready(delivery, id, delivery_tx);
+        }
         let route = match &delivery.message.envelope {
             TransportEnvelope::GroupMessage { transport_group_id } => {
-                <[u8; 32]>::try_from(transport_group_id.as_slice()).ok()?
+                let Ok(route) = <[u8; 32]>::try_from(transport_group_id.as_slice()) else {
+                    return Ok(());
+                };
+                route
             }
-            _ => return Some(delivery),
+            _ => return Ok(()),
         };
-        let historical = input != ReplayInput::Live;
+        let historical = matches!(input, ReplayInput::History | ReplayInput::Page);
         let owner = self.delivery_owner(
             group,
             delivery.source.subscription_id.as_deref(),
@@ -4005,29 +3984,31 @@ impl AccountReplayCoverage {
                 .as_ref()
                 .is_some_and(|owner| group.streams[owner].phase == ReplayAdmission::Dormant)
         {
-            // A dormant source was allowed to stop blocking its healthy peer,
-            // not to discard a later stored range without its original floor.
+            // Expiry released a healthy peer, not this late stored range.
             self.abandon_stream(
                 group_id,
                 owner.as_ref().expect("dormant owner exists"),
                 ReplayAbandon::Lost,
             );
-            return None;
+            return Ok(());
         }
         let group = &self.groups[group_id];
         if historical {
-            let owner = owner.as_ref()?;
+            let Some(owner) = owner.as_ref() else {
+                return Ok(());
+            };
             let stream = &group.streams[owner];
             if stream.phase == ReplayAdmission::Abandoned
                 || (input == ReplayInput::Page && stream.phase != ReplayAdmission::Paging)
                 || stream.claims.contains(&id)
             {
-                return None;
+                return Ok(());
             }
         } else if self.released.contains(&id) || group.live.contains(&id) {
-            return None;
+            return Ok(());
         }
         if !self.flushing
+            && self.outbox.is_empty()
             && self.group_ready(group)
             && group.events.is_empty()
             && (!historical
@@ -4038,9 +4019,20 @@ impl AccountReplayCoverage {
                     )
                 }))
         {
-            self.remember_delivery(id);
-            self.pin_delivery(id, group_id);
-            return Some(delivery);
+            // No await separates the admission pin from the actual handoff.
+            match delivery_tx.try_reserve() {
+                Ok(permit) => {
+                    self.remember_delivery(id);
+                    self.pin_delivery(id, Some(group_id));
+                    permit.send(delivery);
+                    return Ok(());
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.record_loss(self.retained_since.unwrap_or(0));
+                    return Err(TransportAdapterError::Closed);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+            }
         }
         let fresh = !group.events.contains_key(&id);
         let bytes = delivery.message.payload.len();
@@ -4058,17 +4050,17 @@ impl AccountReplayCoverage {
                     .map_or(0, |owner| self.groups[group_id].streams[owner].since);
                 self.record_loss(since.min(delivery.message.timestamp.0));
             }
-            return None;
+            return Ok(());
         }
         let group = self
             .groups
             .get_mut(group_id)
             .expect("destination group exists");
         let claimed = if historical {
-            let stream = group
-                .streams
-                .get_mut(owner.as_ref()?)
-                .expect("history owner exists");
+            let Some(owner) = owner.as_ref() else {
+                return Ok(());
+            };
+            let stream = group.streams.get_mut(owner).expect("history owner exists");
             stream.observed = true;
             stream.claims.insert(id)
         } else {
@@ -4090,7 +4082,7 @@ impl AccountReplayCoverage {
             }
         }
         self.wake_replay();
-        None
+        Ok(())
     }
 
     fn take_ready_deliveries(&mut self) -> Vec<TransportDelivery> {
@@ -4100,7 +4092,13 @@ impl AccountReplayCoverage {
             .filter(|(_, group)| !group.events.is_empty() && self.group_ready(group))
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
-        let mut deliveries = Vec::new();
+        let mut deliveries = self.outbox.drain(..).collect::<Vec<_>>();
+        let ready_count = deliveries.len();
+        self.buffered_items -= ready_count;
+        self.buffered_bytes -= deliveries
+            .iter()
+            .map(|delivery| delivery.message.payload.len())
+            .sum::<usize>();
         for group_id in ready {
             let group = self.groups.get_mut(&group_id).expect("ready group exists");
             for stream in group.streams.values_mut() {
@@ -4115,7 +4113,7 @@ impl AccountReplayCoverage {
             }
             self.remember_ready(&group_id);
         }
-        deliveries.sort_unstable_by(|a, b| {
+        deliveries[ready_count..].sort_unstable_by(|a, b| {
             (a.message.timestamp, a.message.id.as_slice())
                 .cmp(&(b.message.timestamp, b.message.id.as_slice()))
                 .then_with(|| {
@@ -4132,10 +4130,10 @@ impl AccountReplayCoverage {
                 .as_slice()
                 .try_into()
                 .expect("validated Nostr event id");
-            self.remember_delivery(id);
-            if let Some(group_id) = &delivery.group_id_hint {
-                self.pin_delivery(id, group_id);
+            if delivery.group_id_hint.is_some() {
+                self.remember_delivery(id);
             }
+            self.pin_delivery(id, delivery.group_id_hint.as_ref());
         }
         self.wake_replay();
         deliveries
@@ -4258,19 +4256,83 @@ impl AccountReplayCoverage {
             return None;
         }
         let endpoint = self.endpoint_deadlines.get_mut(id)?.get_mut(&relay)?;
-        if endpoint.parked {
-            return None;
+        let fresh = demand == ReplayDemand::ReceiverLoss
+            || (!endpoint.parked
+                && endpoint.capturing
+                && endpoint.last_lag.is_some_and(|previous| lag > previous));
+        if fresh {
+            endpoint.demand_revision += 1;
         }
-        if endpoint.capturing {
-            endpoint.dirty |= demand == ReplayDemand::ReceiverLoss
-                || endpoint.last_lag.is_some_and(|previous| lag > previous);
-            endpoint.last_lag = Some(endpoint.last_lag.map_or(lag, |previous| previous.max(lag)));
+        endpoint.last_lag = Some(endpoint.last_lag.map_or(lag, |previous| previous.max(lag)));
+        let active = endpoint.capturing;
+        let parked = endpoint.parked;
+        if fresh {
+            self.charge_source(id, relay);
+        }
+        if active || parked {
             return None;
         }
         let capture = self.restart_request(id, relay, ReplayRestart::ReceiverLoss)?;
         let endpoint = self.endpoint_deadlines.get_mut(id)?.get_mut(&relay)?;
         endpoint.last_lag = Some(lag);
         Some(capture)
+    }
+
+    fn queue_capture(&mut self, paging: ReplayPaging) {
+        if let Some(endpoint) = self
+            .endpoint_deadlines
+            .get_mut(&paging.subscription_id)
+            .and_then(|relays| relays.get_mut(&paging.relay))
+            && endpoint.serial == paging.serial
+            && endpoint.capturing
+        {
+            endpoint.queued = Some(paging);
+            self.wake_replay();
+        }
+    }
+
+    fn fail_execution(&mut self) {
+        self.record_loss(self.retained_since.unwrap_or(0));
+        for endpoint in self
+            .endpoint_deadlines
+            .values_mut()
+            .flat_map(HashMap::values_mut)
+        {
+            endpoint.cancellation.cancel();
+            endpoint.queued = None;
+            endpoint.capturing = false;
+            endpoint.parked = true;
+            endpoint.deadline = None;
+            endpoint.charged_revision = Some(endpoint.demand_revision);
+        }
+        for replay in self
+            .subscriptions
+            .values_mut()
+            .flat_map(HashMap::values_mut)
+        {
+            if *replay != RelayReplay::Refused {
+                *replay = RelayReplay::Incomplete;
+            }
+        }
+        for group in self.groups.values_mut() {
+            for stream in group.streams.values_mut() {
+                stream.phase = ReplayAdmission::Abandoned;
+                stream.claims.clear();
+            }
+            group.events.clear();
+            group.live.clear();
+            group.ready_history.clear();
+            group.ready_floors.clear();
+            group.placements = 0;
+        }
+        self.outbox.clear();
+        self.unplaced.clear();
+        self.deadlines.clear();
+        self.buffered_items = 0;
+        self.buffered_bytes = 0;
+        self.inbox_placements = 0;
+        self.flushing = false;
+        self.wake_replay();
     }
 
     fn restart_request(
@@ -4369,9 +4431,12 @@ impl AccountReplayCoverage {
         endpoint.serial = serial;
         endpoint.capturing = restart == ReplayRestart::ReceiverLoss;
         endpoint.parked = false;
-        endpoint.dirty = false;
+        endpoint.queued = None;
+        endpoint.cancellation.cancel();
+        endpoint.cancellation = self.cancellation.child_token();
+        endpoint.capture_revision = endpoint.demand_revision;
         if restart == ReplayRestart::Connection {
-            endpoint.loss_charged = false;
+            endpoint.charged_revision = None;
             endpoint.last_lag = None;
         }
         *self.replay_mut(id, relay)? = match restart {
@@ -4568,7 +4633,7 @@ impl AccountReplayCoverage {
         {
             endpoint.deadline = None;
             endpoint.capturing = true;
-            endpoint.dirty = false;
+            endpoint.capture_revision = endpoint.demand_revision;
             endpoint.last_lag = Some(now_ms);
         }
         for group in self.groups.values_mut() {
@@ -4613,9 +4678,9 @@ impl AccountReplayCoverage {
         };
         endpoint.capturing = false;
         endpoint.deadline = None;
-        let dirty = endpoint.dirty;
+        let dirty = endpoint.capture_revision != endpoint.demand_revision;
         if !dirty {
-            endpoint.loss_charged = false;
+            endpoint.charged_revision = None;
         }
         if let Some(replay) = self.replay_mut(id, relay) {
             // The first page cannot cover live input lost after it started.
@@ -4637,7 +4702,8 @@ impl AccountReplayCoverage {
         {
             endpoint.capturing = false;
             endpoint.parked = true;
-            endpoint.dirty = false;
+            endpoint.queued = None;
+            endpoint.cancellation.cancel();
             endpoint.deadline = None;
         }
         let owners = self
@@ -4701,9 +4767,12 @@ impl AccountReplayCoverage {
             .endpoint_deadlines
             .get_mut(id)
             .and_then(|relays| relays.get_mut(&relay))
-            && !endpoint.capturing
         {
             endpoint.deadline = None;
+            endpoint.capturing = false;
+            endpoint.parked = true;
+            endpoint.queued = None;
+            endpoint.cancellation.cancel();
         }
         let owners = self
             .groups
@@ -4808,6 +4877,18 @@ impl AccountReplayCoverage {
             .is_some_and(|endpoint| endpoint.serial == paging.serial && endpoint.capturing)
     }
 
+    fn capture_outdated(&self, paging: &ReplayPaging) -> bool {
+        self.endpoint_deadlines
+            .get(&paging.subscription_id)
+            .and_then(|relays| relays.get(&paging.relay))
+            .is_some_and(|endpoint| {
+                endpoint.serial == paging.serial
+                    && endpoint.capturing
+                    && !endpoint.parked
+                    && endpoint.capture_revision != endpoint.demand_revision
+            })
+    }
+
     fn start_route(&mut self, paging: &ReplayPaging, window: &ReplayWindow) -> bool {
         if !self.capture_current(paging) {
             return false;
@@ -4845,11 +4926,12 @@ impl AccountReplayCoverage {
         started
     }
 
-    fn finish_route(&mut self, paging: &ReplayPaging, window: &ReplayWindow) {
-        if self.page_deadline(paging, window).is_none() {
-            return;
-        }
+    fn finish_route(&mut self, paging: &ReplayPaging, window: &ReplayWindow) -> bool {
         self.expire_replay(tokio::time::Instant::now());
+        if self.page_deadline(paging, window).is_none() {
+            return false;
+        }
+        let mut finished = matches!(window.scope, ReplayScope::Inbox);
         if let ReplayScope::Groups(routes) = &window.scope {
             for group in self.groups.values_mut() {
                 for (owner, stream) in &mut group.streams {
@@ -4859,19 +4941,35 @@ impl AccountReplayCoverage {
                         && stream.phase == ReplayAdmission::Paging
                     {
                         stream.phase = ReplayAdmission::Complete;
+                        finished = true;
                     }
                 }
             }
         }
+        self.endpoint_deadlines
+            .get_mut(&paging.subscription_id)
+            .expect("current request exists")
+            .get_mut(&paging.relay)
+            .expect("current relay exists")
+            .deadline = None;
         self.wake_replay();
+        finished
     }
 
     fn fail_route(&mut self, paging: &ReplayPaging, window: &ReplayWindow) {
-        if self.page_deadline(paging, window).is_none() {
+        if !self.capture_current(paging) {
             return;
         }
-        // Even a failed page alongside a completed peer is explicit loss.
         self.charge_source(&paging.subscription_id, paging.relay);
+        let endpoint = self
+            .endpoint_deadlines
+            .get_mut(&paging.subscription_id)
+            .expect("current request exists")
+            .get_mut(&paging.relay)
+            .expect("current relay exists");
+        endpoint.deadline = None;
+        // Park future passes while this capture finishes its healthy siblings.
+        endpoint.parked = true;
         if let ReplayScope::Groups(routes) = &window.scope {
             let owners = self
                 .groups
@@ -4911,21 +5009,6 @@ impl AccountReplayCoverage {
                         .values()
                         .any(|stream| !stream.claims.is_empty()))
         })
-    }
-
-    fn next_deadline(&self) -> Option<tokio::time::Instant> {
-        // Terminal entries are cheap tombstones. Still wake at their deadline
-        // so the worklist cannot retain retired owners indefinitely.
-        self.deadlines
-            .first_key_value()
-            .map(|(deadline, _)| *deadline)
-            .into_iter()
-            .chain(
-                self.endpoint_deadlines
-                    .values()
-                    .flat_map(|relays| relays.values().filter_map(|endpoint| endpoint.deadline)),
-            )
-            .min()
     }
 
     fn expire_replay(&mut self, now: tokio::time::Instant) {
@@ -5687,36 +5770,29 @@ impl AdapterState {
         self.sync.record_first_event(subscription_id, relay, now_ms);
     }
 
-    /// Record a relay's EOSE. Returns the paging to run when the relay sent a
-    /// full page of an activation REQ's stored history first (see
-    /// [`RELAY_REPLAY_PAGE_LIMIT`]); that relay's coverage waits for it.
+    /// Record wire EOSE and its owned paging ticket in one critical section.
     fn record_subscription_eose(
         &mut self,
         subscription_id: &str,
         endpoint: &TransportEndpoint,
         now_ms: u64,
-    ) -> Option<ReplayPaging> {
+    ) {
         let relay = self.relay_index.index_for(endpoint);
         self.sync.record_eose(subscription_id, relay, now_ms);
-        let mut paging = None;
         for (account_id, coverage) in &mut self.account_replay_coverage {
             if let Some((window, until)) = coverage.record_eose(subscription_id, relay, now_ms) {
-                paging = Some(ReplayPaging {
+                let serial = coverage.endpoint_deadlines[subscription_id][&relay].serial;
+                coverage.queue_capture(ReplayPaging {
                     account_id: account_id.clone(),
                     subscription_id: subscription_id.to_owned(),
                     endpoint: endpoint.clone(),
                     relay,
-                    serial: coverage
-                        .endpoint_deadlines
-                        .get(subscription_id)?
-                        .get(&relay)?
-                        .serial,
+                    serial,
                     window,
                     until,
                 });
             }
         }
-        paging
     }
 
     /// Count one relay's copy of a stored event for an activation REQ that has
@@ -5735,9 +5811,48 @@ impl AdapterState {
         }
     }
 
+    fn repeat_capture(&mut self, paging: &ReplayPaging) -> bool {
+        let Some(coverage) = self.account_replay_coverage.get_mut(&paging.account_id) else {
+            return false;
+        };
+        if !coverage.capture_outdated(paging) {
+            return false;
+        }
+        let endpoint = coverage
+            .endpoint_deadlines
+            .get_mut(&paging.subscription_id)
+            .expect("current request exists")
+            .get_mut(&paging.relay)
+            .expect("current relay exists");
+        let lag = endpoint.last_lag.unwrap_or(0);
+        endpoint.capturing = false;
+        if let Some((window, serial)) = coverage.capture_request(
+            &paging.subscription_id,
+            paging.relay,
+            lag,
+            ReplayDemand::SettledLag,
+        ) {
+            coverage.queue_capture(ReplayPaging {
+                account_id: paging.account_id.clone(),
+                subscription_id: paging.subscription_id.clone(),
+                endpoint: paging.endpoint.clone(),
+                relay: paging.relay,
+                serial,
+                window,
+                until: REPLAY_OPEN_UNTIL,
+            });
+        } else {
+            coverage.park_capture(&paging.subscription_id, paging.relay);
+        }
+        true
+    }
+
     /// A paged replay reached the start of its window. Applies only while the
     /// activation that issued the REQ is still current.
     fn finish_replay_paging(&mut self, paging: &ReplayPaging, now_ms: u64) {
+        if self.repeat_capture(paging) {
+            return;
+        }
         let Some(relay) = self.relay_index.existing_index_for(&paging.endpoint) else {
             return;
         };
@@ -5806,6 +5921,105 @@ impl AdapterState {
         }
         self.sync.record_refusal(relay, route_kind, refusal);
         Some((account_id, route_kind))
+    }
+
+    fn deliveries_for(
+        &self,
+        relay_event: &NostrRelayEvent,
+        message: TransportMessage,
+        account_id: Option<&MemberId>,
+    ) -> Vec<TransportDelivery> {
+        let received_at = Timestamp(unix_now_seconds());
+        let mut routes = self.routes_for(&message, &relay_event.endpoint);
+        if let Some(account_id) = account_id {
+            routes.retain(|route| &route.account_id == account_id);
+        }
+        let mut routes = routes.into_iter();
+        let Some(last_route) = routes.next_back() else {
+            return Vec::new();
+        };
+        let wire = inbound_wire_metadata(&relay_event.event, &message.envelope);
+        let delivery_for = |route: DeliveryRoute, message| TransportDelivery {
+            account_id: route.account_id,
+            group_id_hint: route.group_id_hint,
+            message,
+            received_at,
+            source: TransportDeliverySource {
+                transport: TransportSource(NOSTR_SOURCE.into()),
+                plane: route.plane,
+                endpoint: Some(relay_event.endpoint.clone()),
+                subscription_id: relay_event.subscription_id.clone(),
+                wire: Some(wire.clone()),
+            },
+        };
+        let mut deliveries = Vec::with_capacity(routes.len() + 1);
+        deliveries.extend(routes.map(|route| delivery_for(route, message.clone())));
+        deliveries.push(delivery_for(last_route, message));
+        deliveries
+    }
+
+    fn admit_deliveries(
+        &mut self,
+        deliveries: Vec<TransportDelivery>,
+        copy: RelayCopy,
+        delivery_tx: &mpsc::Sender<TransportDelivery>,
+    ) -> Result<usize, TransportAdapterError> {
+        let mut delivered = 0;
+        for delivery in deliveries {
+            let relay = delivery
+                .source
+                .endpoint
+                .as_ref()
+                .and_then(|endpoint| self.relay_index.existing_index_for(endpoint));
+            // Classify by the issuing REQ, not an unrelated destination route.
+            let source = delivery.source.subscription_id.as_ref().and_then(|id| {
+                self.account_replay_coverage.values().find_map(|coverage| {
+                    let window = coverage.windows.get(id)?;
+                    let replay =
+                        relay.and_then(|relay| coverage.subscriptions.get(id)?.get(&relay));
+                    let serial = relay
+                        .and_then(|relay| coverage.endpoint_deadlines.get(id)?.get(&relay))
+                        .map(|endpoint| endpoint.serial);
+                    let ended = relay
+                        .and_then(|relay| coverage.stored.get(id)?.get(&relay))
+                        .is_some_and(|stored| stored.ended);
+                    Some((
+                        matches!(window.scope, ReplayScope::Groups(_)),
+                        replay.copied(),
+                        serial,
+                        ended,
+                    ))
+                })
+            });
+            if copy != RelayCopy::Deduplicated && source.is_none() {
+                continue;
+            }
+            if copy == RelayCopy::RawGroup && !source.is_some_and(|source| source.0) {
+                continue;
+            }
+            if let RelayCopy::Page(serial) = copy
+                && !source.is_some_and(|source| source.2 == Some(serial))
+            {
+                continue;
+            }
+            let input = match copy {
+                RelayCopy::Page(_) => ReplayInput::Page,
+                _ if source.is_none() => ReplayInput::Untracked,
+                _ if source.is_some_and(|source| {
+                    source.1.is_some() && source.1 != Some(RelayReplay::Eose) && !source.3
+                }) =>
+                {
+                    ReplayInput::History
+                }
+                _ => ReplayInput::Live,
+            };
+            if let Some(coverage) = self.account_replay_coverage.get_mut(&delivery.account_id) {
+                delivered += 1;
+                coverage.stage_delivery(delivery, relay, input, delivery_tx)?;
+            }
+        }
+        self.record_inbound_event(delivered);
+        Ok(delivered)
     }
 
     fn routes_for(
@@ -6442,46 +6656,6 @@ mod batch_tests {
             .expect("coalesced demand remains serviceable");
         assert!(next > paging.serial);
         assert!(!coverage.capture_current(&paging), "old pages are fenced");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn failed_capture_parks_one_loss() {
-        let (mut coverage, id, losses) = replay_coverage(1);
-        coverage.record_eose(&id, RelayIndex(1), 0);
-        let paging = paging_for(&mut coverage, &id);
-        assert!(coverage.start_route(&paging, &paging.window));
-        coverage.fail_route(&paging, &paging.window);
-        coverage.park_capture(&id, RelayIndex(2));
-        let account = MemberId::new(vec![0xA1; 32]);
-        assert_eq!(
-            losses.pending.lock().unwrap().remove(&account),
-            Some(NostrNotificationLossFloor::Since(100))
-        );
-        for lag in 2..6 {
-            tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration).await;
-            coverage.expire_replay(tokio::time::Instant::now());
-            assert!(
-                coverage
-                    .capture_request(&id, RelayIndex(2), lag, ReplayDemand::ReceiverLoss)
-                    .is_none()
-            );
-            assert!(!coverage.admission_pending());
-            assert!(
-                losses.pending.lock().unwrap().is_empty(),
-                "parked work does not recharge loss"
-            );
-        }
-        coverage.restart_relay(
-            RelayIndex(2),
-            ReplayRestart::Connection,
-            ReplayOrigin::Changed,
-            200_000,
-        );
-        coverage.record_eose(&id, RelayIndex(2), 200_001);
-        assert!(
-            coverage.snapshot().complete(),
-            "a real newer source can prove empty history"
-        );
     }
 
     #[tokio::test(start_paused = true)]

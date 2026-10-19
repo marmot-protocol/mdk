@@ -74,45 +74,56 @@ for reconnect/backoff and relay status mechanics.
     only then does that relay's EOSE count.
   - A failed, unsupported or over-long paging stays incomplete for the next activation and recovery. So does a full page that
     cannot move past its oldest second, because that second may hide more events and everything older.
-- Stage each group's complete replay range before timestamp/id-ordered release, including backward pages. Keep live
-  arrivals behind the draining batch. Preserve ready route floors across equivalent/narrower repacks, not wider requests.
-  Verified raw SDK group copies feed admission; deduplicated `Event` copies must not bypass it, and retired REQs must
-  never admit late copies. SDK seen-state is not account admission.
-- Admission belongs to each REQ/relay/transport-route, never a sticky group-wide failure flag. Share ciphertext bodies
-  with separate source claims; retiring or failing one source must not discard a healthy source's older history.
-  Waiting starts again at an unfinished source's first connection boundary. Each active route/group gets one
-  `REPLAY_PAGE_LIMITS.max_duration` paging interval when service starts; queued groups do not spend it. Arrivals and
-  repeated loss never extend active leases. Empty expired streams become dormant; a first or newer connection can
-  reopen waiting. Late history without that restart is explicit loss, never a raw-EOSE certificate. Discarded history
-  retains its own floor. Fresh requests do not inherit failure.
+- Stage each group's complete replay range before timestamp/id-ordered release, including backward pages. Keep
+  live arrivals behind the draining batch. Preserve ready route floors across equivalent/narrower repacks, not
+  wider requests. Verified raw SDK group copies feed admission; deduplicated `Event` copies must not bypass
+  it, and retired REQs must never admit late copies. SDK seen-state is not account admission.
+- Admission belongs to each REQ/relay/transport-route, never a sticky group-wide failure flag. Share
+  ciphertext bodies with separate source claims; retiring or failing one source must not discard a healthy
+  source's older history. Waiting starts again at an unfinished source's first connection boundary. Each
+  active route gets one `REPLAY_PAGE_LIMITS.max_duration` fetch interval when service starts; queueing, peer
+  waits and draining do not spend it. Arrivals and repeated loss never extend active leases. Empty expired
+  streams become dormant; a first or newer connection can reopen waiting. Late history without that restart is
+  explicit loss, never a raw-EOSE certificate. Discarded history retains its own floor. Fresh requests do not
+  inherit failure.
 - Transport consumers use `NostrSdkRelayClient::notifications`, the ordered per-relay SDK frontier, and
-  `dispatch_sdk_replay`. Capture Connected/auth boundaries with the payloads; never poll SDK state to infer their
-  generation. Reader epochs are process-monotonic and survive queued frontend work. Receiver loss forces an owned
-  full-window capture through the same lease as settled lag recovery. Newer loss during a capture remains explicit
-  demand for another pass, not a new serial or deadline for the active one. Only recorded transport REQ payloads
-  enter the frontier; acquisition replies stay with their collectors. Forced paging is not physical EOSE; late
-  stored copies cannot become live by that transition.
-- Bound pending replay by `REPLAY_BUFFER_MAX_ITEMS` and `REPLAY_BUFFER_MAX_BYTES`, with one additional draining batch;
-  keep released live-copy dedup bounded by the item allowance; historical refetch bypasses it. Retry one interrupted page at the same boundary within
-  the page bound. Discard partial cancelled, saturated or failed history instead of releasing its newer suffix, and
-  retain its floor as loss until `take_replay_status` imports it. Later live input must not stay permanently stalled.
-  Silence or a terminal refusal alone must not stall a completed peer or turn incomplete coverage into a certificate.
-- Keep admission and all-relay EOSE separate. `take_replay_status` holds a read guard through a synchronous cursor seal;
-  import its loss before another await, then drop it. Notify only wakes the router; it never consumes evidence.
-  `ack_replay_delivery` follows actual pinned queue/spill placement or recorded loss, never merely adapter enqueue.
-- Record each REQ's filter `since` in its SDK account context before the REQ goes out, find it by subscription id
-  when the REQ closes, and keep a closed REQ's floor for the rest of the context's life: routing is content-keyed,
-  and a closed REQ's buffered or in-flight notifications have no deadline, so they can still be lost in a lag. Do
-  not add a time-based expiry. Read `notification_loss_floor` at the lag; an unfloored REQ or missing evidence is
-  `Unbounded`, never "no loss".
+  `dispatch_sdk_replay`. Capture connection and receiver-loss boundaries with the payloads; never poll SDK
+  state to infer their generation. Authentication alone must not advance a connection epoch or restart a
+  capture. Reader epochs are process-monotonic and survive queued frontend work. Receiver loss forces an owned
+  full-window capture through the same lease as settled lag recovery. Newer loss during a capture remains
+  explicit demand for an automatic pass at the next successful boundary, not a new serial or deadline for the
+  active one. Charge every fresh receiver gap even after earlier loss was consumed; timer checks cannot mint
+  loss. Only recorded transport REQ payloads enter the frontier; acquisition replies stay with their
+  collectors. Forced paging is not physical EOSE; late stored copies cannot become live by that transition.
+- Bound pending replay by `REPLAY_BUFFER_MAX_ITEMS` and `REPLAY_BUFFER_MAX_BYTES`, with one additional
+  draining batch; include inbox and ready-delivery backpressure. A per-account supervisor owns capture tickets
+  and draining tasks; atomically install tickets and ready-channel placements under the admission lock,
+  without a cancellation gap. Notification-worker cancellation must not orphan accepted work. Account
+  retirement cancels it and retains unresolved loss. Keep released live-copy dedup bounded by the item
+  allowance; historical refetch bypasses it. Retry one interrupted page at the same boundary within the page
+  bound. Discard partial cancelled, saturated or failed history instead of releasing its newer suffix, and
+  retain its floor as loss until `take_replay_status` imports it. Later live input must not stay permanently
+  stalled. Silence or a terminal refusal alone must not stall a completed peer or turn incomplete coverage
+  into a certificate.
+- Keep admission and all-relay EOSE separate. `take_replay_status` holds a read guard through a synchronous
+  cursor seal; import its loss before another await, then drop it. Notify only wakes the router; it never
+  consumes evidence. `ack_replay_delivery` follows actual pinned queue/spill placement or recorded loss, never
+  merely adapter enqueue.
+- Record each REQ's filter `since` in its SDK account context before the REQ goes out, find it by subscription
+  id when the REQ closes, and keep a closed REQ's floor for the rest of the context's life: routing is
+  content-keyed, and a closed REQ's buffered or in-flight notifications have no deadline, so they can still be
+  lost in a lag. Do not add a time-based expiry. Read `notification_loss_floor` at the lag; an unfloored REQ
+  or missing evidence is `Unbounded`, never "no loss".
 - Recover lag-lost replay through `recover_pending_replay`: select only current REQ/relay scopes issued by the
-  lag's `NotificationLagMark` and still awaiting complete admission. Acquire each scope's full original window under
-  a bounded, request-owned capture; join an unexpired capture rather than restarting it. Report pending, newly
-  started and already active scopes in `ReplayRecoverySummary`. Leave live REQs, filters and the SDK registry
-  untouched. Never infer EOSE from a lag or the SDK's out-of-band EOSE flag, resend the live REQ, or reopen a closed
-  REQ. The caller paces follow-ups while eligible scopes remain pending. Failed source generations retain loss once
-  and park until a newer connection; polling must not restart or recharge them. Dropped refusals stay terminal
-  because the SDK removed their live REQ from its reconnect registry.
+  lag's `NotificationLagMark` and still awaiting complete admission. Acquire each scope's full original window
+  under a bounded, request-owned capture; join an unexpired capture rather than restarting it. Report pending,
+  newly started and already active scopes in `ReplayRecoverySummary`. Leave live REQs, filters and the SDK
+  registry untouched. Never infer EOSE from a lag or the SDK's out-of-band EOSE flag, resend the live REQ, or
+  reopen a closed REQ. The caller paces settled-lag demand checks; accepted captures and fresh in-flight
+  demand belong to the supervisor. Failed source generations retain loss once and park until a newer
+  connection; polling must not restart or recharge them. Dropped refusals stay terminal because the SDK
+  removed their live REQ from its reconnect registry.
+
 - Hand every relay `CLOSED` on a live REQ to `handle_relay_closed` in `dispatch_sdk_notification`, the one dispatch
   both notification consumers share (the relay plane's in `transport-nostr`, and this crate's test forwarder); change
   `CLOSED` handling there, never in a consumer loop. Classify each message on its own with `sdk_subscription_refusal` /

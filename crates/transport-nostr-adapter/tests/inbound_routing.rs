@@ -1,6 +1,8 @@
 use std::collections::{HashSet, VecDeque};
+use std::future::{Future, poll_fn};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -363,6 +365,13 @@ impl NostrRelayClient for PartialFailureRelayClient {
 }
 
 #[derive(Default)]
+struct AcquisitionHold {
+    captured: Notify,
+    release: Notify,
+    returned: Notify,
+}
+
+#[derive(Default)]
 struct FakeRelayClient {
     scoped: Mutex<Vec<(String, NostrSubscription)>>,
     scoped_removed: Mutex<Vec<String>>,
@@ -371,6 +380,7 @@ struct FakeRelayClient {
     retained: Mutex<Option<Vec<(MemberId, TransportEndpoint, NostrTransportEvent)>>>,
     acquisitions: Mutex<Vec<NostrAcquisitionRequest>>,
     acquisition_delays: Mutex<VecDeque<Duration>>,
+    acquisition_holds: Mutex<VecDeque<(TransportEndpoint, Arc<AcquisitionHold>)>>,
     hold_acquisition: AtomicBool,
     release_acquisition: Notify,
     subscriptions: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
@@ -455,6 +465,19 @@ impl NostrRelayClient for FakeRelayClient {
         let Some((end, events)) = page else {
             return Err(NostrAcquisitionError::Unsupported);
         };
+        let hold = {
+            let mut holds = self.acquisition_holds.lock().unwrap();
+            holds
+                .iter()
+                .position(|(source, _)| *source == endpoint)
+                .and_then(|index| holds.remove(index))
+                .map(|(_, hold)| hold)
+        };
+        if let Some(hold) = hold {
+            hold.captured.notify_one();
+            hold.release.notified().await;
+            hold.returned.notify_one();
+        }
         Ok(NostrAcquisitionResult {
             endpoints: vec![NostrAcquisitionEndpoint {
                 endpoint,
@@ -4633,6 +4656,130 @@ fn subscription_since(subscription: &NostrSubscription) -> Option<Timestamp> {
     }
 }
 
+/// Cancelling the public notification future cannot cancel its staged handoff.
+#[tokio::test(start_paused = true)]
+async fn cancelled_live_is_owned() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![0x64; 32]);
+    let group = sync_fixture_group(0x73);
+    let floor = 1_700_000_000;
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![group.clone()],
+            since: Some(Timestamp(floor)),
+        })
+        .await
+        .unwrap();
+    let id = issued_group_id(&relay.take_issued_subscriptions(), &group.group_id);
+    adapter
+        .handle_relay_eose(group.endpoints[0].clone(), id.clone())
+        .await;
+
+    // Fill the adapter's 1,024-entry delivery queue without consuming it.
+    // Every body is live on a group whose original replay was admitted.
+    let queued = (0..1_024)
+        .map(|index| group_event_at("queued live body", &group, floor + index))
+        .collect::<Vec<_>>();
+    for event in &queued {
+        route_group_copy(&adapter, &group, &id, event).await;
+    }
+    let cancelled = group_event_at("cancelled live handoff", &group, floor + 1_024);
+    let copy = NostrRelayEvent {
+        endpoint: group.endpoints[0].clone(),
+        subscription_id: Some(id),
+        event: cancelled.clone(),
+    };
+    adapter.observe_relay_event(&copy).await;
+    // Give background owners a turn and replenish the task's cooperative
+    // budget, so the next poll reaches handoff rather than a budget yield.
+    tokio::task::yield_now().await;
+    let mut notification = Box::pin(adapter.handle_group_relay_copy(copy, None));
+    let polled = poll_fn(|cx| Poll::Ready(notification.as_mut().poll(cx))).await;
+    if let Poll::Ready(result) = polled {
+        // An independent owner may accept the handoff without waiting for the
+        // full public queue. Dropping this completed caller is also harmless.
+        assert_eq!(result.unwrap(), 1);
+    }
+    drop(notification);
+
+    for event in queued.iter().chain(std::iter::once(&cancelled)) {
+        assert_group_delivery(&adapter, &account, event).await;
+    }
+    assert_no_delivery(&adapter).await;
+    assert_replay_idle(&adapter, &account).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_epoch_keeps_capture() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![0x65; 32]);
+    let group = sync_fixture_group(0x74);
+    let endpoint = &group.endpoints[0];
+    let floor = 1_700_000_000;
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![group.clone()],
+            since: Some(Timestamp(floor)),
+        })
+        .await
+        .unwrap();
+    let id = issued_group_id(&relay.take_issued_subscriptions(), &group.group_id);
+    adapter
+        .observe_replay_epoch(
+            Some(&account),
+            endpoint,
+            [1, 1],
+            transport_nostr_adapter::ReplayRestart::Connection,
+        )
+        .await;
+    adapter
+        .handle_relay_eose(endpoint.clone(), id.clone())
+        .await;
+    let missing = group_event_at("capture survives cancelled metadata", &group, floor + 1);
+    *relay.retained.lock().unwrap() =
+        Some(vec![(account.clone(), endpoint.clone(), missing.clone())]);
+
+    // Queue the metadata writer before a second status reader. The fair lock
+    // lets metadata commit once, then holds any later write behind that reader.
+    let before = adapter.take_replay_status(&account).await;
+    let mut metadata = Box::pin(adapter.observe_replay_epoch(
+        Some(&account),
+        endpoint,
+        [2, 1],
+        transport_nostr_adapter::ReplayRestart::ReceiverLoss,
+    ));
+    assert!(
+        poll_fn(|cx| Poll::Ready(metadata.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    let mut after = Box::pin(adapter.take_replay_status(&account));
+    assert!(
+        poll_fn(|cx| Poll::Ready(after.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    drop(before);
+    if let Poll::Ready(accepted) = poll_fn(|cx| Poll::Ready(metadata.as_mut().poll(cx))).await {
+        assert!(accepted);
+    }
+    let after = after.await;
+    assert_eq!(after.loss, Some(NostrNotificationLossFloor::Since(floor)));
+    drop(metadata);
+    drop(after);
+
+    assert_group_delivery(&adapter, &account, &missing).await;
+    wait_replay_eose(&adapter, &id).await;
+    assert_no_delivery(&adapter).await;
+    assert_replay_idle(&adapter, &account).await;
+}
+
 #[tokio::test]
 async fn live_suffix_reuses_budget() {
     let adapter = NostrTransportAdapter::new(Arc::new(FakeRelayClient::default()));
@@ -5061,6 +5208,7 @@ async fn maintenance_failure_cleans_up() {
         .await
         .unwrap();
     assert_eq!(adapter.handle_relay_event(event.clone()).await.unwrap(), 1);
+    assert_group_delivery(&adapter, &account_id, &event.event).await;
     let subscription_id = NostrSubscription::GroupMaintenance {
         account_id: account_id.clone(),
         group_id: group.group_id.clone(),
@@ -6358,6 +6506,19 @@ async fn assert_group_delivery(
         .await;
 }
 
+async fn wait_snapshot(hold: &AcquisitionHold) {
+    tokio::time::timeout(Duration::from_secs(1), hold.captured.notified())
+        .await
+        .expect("the backend captured its held snapshot");
+}
+
+async fn release_snapshot(hold: &AcquisitionHold) {
+    hold.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), hold.returned.notified())
+        .await
+        .expect("the backend returned its captured snapshot");
+}
+
 async fn wait_replay_eose(adapter: &NostrTransportAdapter, id: &str) {
     tokio::time::timeout(Duration::from_secs(1), async {
         while adapter.subscription_synced(id).await != Some(true) {
@@ -6781,6 +6942,123 @@ async fn newer_loss_needs_own_proof() {
     assert!(relay.take_issued_subscriptions().is_empty());
 }
 
+/// A newer real gap owns both fresh loss evidence and a serial follow-up pass.
+/// No caller retries recovery after the first held snapshot is released.
+#[tokio::test(start_paused = true)]
+async fn fresh_loss_runs_owned_pass() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![0xCB; 32]);
+    let group = sync_fixture_group(0xCC);
+    let endpoint = &group.endpoints[0];
+    let floor = 1_700_000_000;
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![group.clone()],
+            since: Some(Timestamp(floor)),
+        })
+        .await
+        .unwrap();
+    let id = issued_group_id(&relay.take_issued_subscriptions(), &group.group_id);
+    adapter
+        .observe_replay_epoch(
+            Some(&account),
+            endpoint,
+            [1, 1],
+            transport_nostr_adapter::ReplayRestart::Connection,
+        )
+        .await;
+    adapter
+        .handle_relay_eose(endpoint.clone(), id.clone())
+        .await;
+    let original = group_event_at("first retained snapshot", &group, floor + 1);
+    *relay.retained.lock().unwrap() =
+        Some(vec![(account.clone(), endpoint.clone(), original.clone())]);
+    let first = Arc::new(AcquisitionHold::default());
+    let followup = Arc::new(AcquisitionHold::default());
+    relay.acquisition_holds.lock().unwrap().extend([
+        (endpoint.clone(), first.clone()),
+        (endpoint.clone(), followup.clone()),
+    ]);
+    adapter
+        .observe_replay_epoch(
+            Some(&account),
+            endpoint,
+            [2, 1],
+            transport_nostr_adapter::ReplayRestart::ReceiverLoss,
+        )
+        .await;
+    wait_snapshot(&first).await;
+    assert_eq!(
+        replay_loss(&adapter, &account).await,
+        NostrNotificationLossFloor::Since(floor)
+    );
+    assert!(adapter.take_replay_status(&account).await.loss.is_none());
+
+    // The first result is already materialized. Only the next full-window
+    // acquisition can see this tail; no live copy is sent to the adapter.
+    let missing = group_event_at("tail lost after first snapshot", &group, floor + 2);
+    relay.retained.lock().unwrap().as_mut().unwrap().push((
+        account.clone(),
+        endpoint.clone(),
+        missing.clone(),
+    ));
+    adapter
+        .observe_replay_epoch(
+            Some(&account),
+            endpoint,
+            [3, 1],
+            transport_nostr_adapter::ReplayRestart::ReceiverLoss,
+        )
+        .await;
+    assert_eq!(
+        adapter.take_replay_status(&account).await.loss,
+        Some(NostrNotificationLossFloor::Since(floor)),
+        "a new gap remains observable after the first loss was transferred"
+    );
+    release_snapshot(&first).await;
+    wait_snapshot(&followup).await;
+    assert_eq!(relay.acquisitions.lock().unwrap().len(), 2);
+    assert_eq!(
+        adapter.subscription_endpoint_eose(&id, endpoint).await,
+        Some(false),
+        "the first snapshot cannot certify input lost after it was captured"
+    );
+    release_snapshot(&followup).await;
+
+    let original_message = original.to_transport_message().unwrap();
+    let missing_message = missing.to_transport_message().unwrap();
+    let mut original_copies = 0;
+    loop {
+        let delivery = tokio::time::timeout(Duration::from_secs(1), adapter.receive())
+            .await
+            .expect("the owned follow-up delivers the actual lost tail")
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.account_id, account);
+        assert_eq!(delivery.group_id_hint.as_ref(), Some(&group.group_id));
+        adapter
+            .ack_replay_delivery(&account, &delivery.message.id)
+            .await;
+        if delivery.message == missing_message {
+            assert!(original_copies > 0, "history precedes the newer lost tail");
+            break;
+        }
+        assert_eq!(delivery.message, original_message);
+        original_copies += 1;
+        // Historical refetches intentionally bypass live-copy dedup. Either
+        // the first snapshot is withheld, or each full-window pass releases it.
+        assert!(original_copies <= 2);
+    }
+    wait_replay_eose(&adapter, &id).await;
+    assert_no_delivery(&adapter).await;
+    assert_replay_idle(&adapter, &account).await;
+    assert_eq!(relay.acquisitions.lock().unwrap().len(), 2);
+    assert!(relay.take_issued_subscriptions().is_empty());
+}
+
 #[tokio::test(start_paused = true)]
 async fn batch_units_have_own_budget() {
     let relay = Arc::new(FakeRelayClient::default());
@@ -6859,6 +7137,111 @@ async fn batch_units_have_own_budget() {
     wait_replay_eose(&adapter, &id).await;
     assert_no_delivery(&adapter).await;
     assert_replay_idle(&adapter, &account).await;
+}
+
+/// A's completed network work cannot spend its remaining service budget on B.
+/// B starts later and finishes within its own unchanged thirty-second lease.
+#[tokio::test(start_paused = true)]
+async fn peer_wait_keeps_next_group() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![0xCD; 32]);
+    let a = TransportEndpoint("wss://source-a.example".into());
+    let b = TransportEndpoint("wss://source-b.example".into());
+    let mut first_group = sync_fixture_group(0xCE);
+    let mut next_group = sync_fixture_group(0xCF);
+    first_group.endpoints = vec![a.clone(), b.clone()];
+    next_group.endpoints = first_group.endpoints.clone();
+    let floor = 1_700_000_000;
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![next_group.clone(), first_group.clone()],
+            since: Some(Timestamp(floor)),
+        })
+        .await
+        .unwrap();
+    let issued = relay.take_issued_subscriptions();
+    let id = issued_group_id(&issued, &first_group.group_id);
+    assert_eq!(id, issued_group_id(&issued, &next_group.group_id));
+    for endpoint in [&a, &b] {
+        adapter
+            .observe_replay_epoch(
+                Some(&account),
+                endpoint,
+                [1, 1],
+                transport_nostr_adapter::ReplayRestart::Connection,
+            )
+            .await;
+        adapter
+            .handle_relay_eose(endpoint.clone(), id.clone())
+            .await;
+    }
+
+    let shared = group_event_at("shared first-group history", &first_group, floor + 1);
+    let unique = group_event_at("only A has the next group", &next_group, floor + 2);
+    *relay.retained.lock().unwrap() = Some(vec![
+        (account.clone(), a.clone(), shared.clone()),
+        (account.clone(), b.clone(), shared.clone()),
+        (account.clone(), a.clone(), unique.clone()),
+    ]);
+    let a_hold = Arc::new(AcquisitionHold::default());
+    let b_hold = Arc::new(AcquisitionHold::default());
+    relay
+        .acquisition_holds
+        .lock()
+        .unwrap()
+        .extend([(a.clone(), a_hold.clone()), (b.clone(), b_hold.clone())]);
+    let a_started = tokio::time::Instant::now();
+    adapter
+        .observe_replay_epoch(
+            Some(&account),
+            &a,
+            [2, 1],
+            transport_nostr_adapter::ReplayRestart::ReceiverLoss,
+        )
+        .await;
+    wait_snapshot(&a_hold).await;
+    assert_eq!(
+        replay_loss(&adapter, &account).await,
+        NostrNotificationLossFloor::Since(floor)
+    );
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let b_started = tokio::time::Instant::now();
+    adapter
+        .observe_replay_epoch(
+            Some(&account),
+            &b,
+            [2, 1],
+            transport_nostr_adapter::ReplayRestart::ReceiverLoss,
+        )
+        .await;
+    wait_snapshot(&b_hold).await;
+    assert_eq!(
+        replay_loss(&adapter, &account).await,
+        NostrNotificationLossFloor::Since(floor)
+    );
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    release_snapshot(&a_hold).await;
+    assert!(a_started.elapsed() < Duration::from_secs(30));
+    // A's complete G1 result is now held only by B's still-running G1. Pass
+    // A's original deadline while B retains nine seconds of its own budget.
+    tokio::time::advance(Duration::from_secs(11)).await;
+    assert_no_delivery(&adapter).await;
+    tokio::time::advance(Duration::from_secs(4)).await;
+    assert!(a_started.elapsed() > Duration::from_secs(30));
+    assert!(b_started.elapsed() < Duration::from_secs(30));
+    release_snapshot(&b_hold).await;
+
+    assert_group_delivery(&adapter, &account, &shared).await;
+    assert_group_delivery(&adapter, &account, &unique).await;
+    wait_replay_eose(&adapter, &id).await;
+    assert_no_delivery(&adapter).await;
+    assert_replay_idle(&adapter, &account).await;
+    assert!(relay.take_issued_subscriptions().is_empty());
 }
 
 #[tokio::test]
