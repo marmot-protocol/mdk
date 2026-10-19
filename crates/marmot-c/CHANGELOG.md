@@ -54,7 +54,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 ### Changed
 
 - `MarmotRetentionSweepStatus` drops `DeferredScanExhausted` with the sweep's
-  page scan (mdk#2425). Regenerate the header.
+  page scan (mdk#2425). `MARMOT_RETENTION_SWEEP_STATUS_FAILED` moves from 5
+  to 4; a host built against the old header reads a failed sweep as scan
+  exhaustion. Recompile against the regenerated `marmot.h` with the matching
+  library.
 - Recipients with only obsolete KeyPackages now return `MARMOT_STATUS_MISSING_KEY_PACKAGE` (15)
   instead of `MARMOT_STATUS_INVALID_KEY_PACKAGE_EVENT`; the error detail ends in
   `[obsolete_only]` (or `[not_found]`) (mdk#1975). Status values are unchanged.

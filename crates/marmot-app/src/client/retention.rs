@@ -62,8 +62,8 @@ impl AppClient {
                 group_id_hex: row.group_id_hex,
             })
             .collect();
-        let groups = run_retention_group_sweeps(inputs, |input, retention_seconds| {
-            self.sweep_expired_retention_for_group(input, retention_seconds, now_ms)
+        let groups = run_retention_group_sweeps(inputs, |input| {
+            self.sweep_expired_retention_for_group(input, now_ms)
         });
         for group in &groups {
             let outcome = match group.status {
@@ -89,29 +89,20 @@ impl AppClient {
     fn sweep_expired_retention_for_group(
         &self,
         input: &RetentionSweepGroupInput,
-        retention_seconds: u64,
         now_ms: u64,
     ) -> Result<RetentionSweepGroupOutcome, AppError> {
         let raw_now_seconds = now_ms / 1_000;
-        let raw_cutoff_seconds = raw_now_seconds.saturating_sub(retention_seconds);
-        if raw_cutoff_seconds == 0 {
-            return Ok(empty_group_outcome(
-                &input.group_id_hex,
-                RetentionSweepStatus::NoExpiredMessages,
-            ));
-        }
         let skew_now_seconds =
             now_ms.saturating_sub(RETENTION_SWEEP_CLOCK_SKEW_TOLERANCE_MS) / 1_000;
-        let skew_cutoff_seconds = skew_now_seconds.saturating_sub(retention_seconds);
 
-        // Storage answers with the projection's own read-cursor comparison:
-        // a wall-clock page scan cannot rank a later-epoch row against the
-        // marker, and no cursor fields have to cross the crate boundary.
+        // Storage answers with the projection's own read-cursor comparison
+        // over the rows the prune deletes: those whose pinned source-epoch
+        // expiry has passed, whatever the group's policy is today.
         let scan = self.app.retention_expiry_scan(
             &self.state.label,
             &input.group_id_hex,
-            raw_cutoff_seconds,
-            skew_cutoff_seconds,
+            raw_now_seconds,
+            skew_now_seconds,
         )?;
         match decide_expired_group_action(&scan) {
             ExpiredGroupDecision::NoExpiredMessages => Ok(empty_group_outcome(
@@ -145,7 +136,6 @@ fn run_retention_group_sweeps(
     mut inputs: Vec<RetentionSweepGroupInput>,
     mut sweep_group: impl FnMut(
         &RetentionSweepGroupInput,
-        u64,
     ) -> Result<RetentionSweepGroupOutcome, AppError>,
 ) -> Vec<RetentionSweepGroupOutcome> {
     inputs.sort_by(|left, right| left.group_id_hex.cmp(&right.group_id_hex));
@@ -163,7 +153,7 @@ fn run_retention_group_sweeps(
         if retention_seconds == 0 {
             continue;
         }
-        outcomes.push(match sweep_group(&input, retention_seconds) {
+        outcomes.push(match sweep_group(&input) {
             Ok(outcome) => outcome,
             Err(error) => failed_group_outcome(&input.group_id_hex, error.privacy_safe_kind()),
         });
@@ -290,7 +280,7 @@ mod tests {
             input("bb", Some(60)),
             input("dd", Some(60)),
         ];
-        let outcomes = run_retention_group_sweeps(inputs, |input, _| {
+        let outcomes = run_retention_group_sweeps(inputs, |input| {
             if input.group_id_hex == "bb" {
                 return Err(AppError::TransportClosed);
             }

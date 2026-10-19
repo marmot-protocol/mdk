@@ -5059,10 +5059,22 @@ fn deletion_provenance_changes_refresh_chat_preview() {
     assert_eq!(preview.deletion_source, crate::DeletionSource::Admin);
 }
 
+// Retention scan rows keep a pinned 50 s source-epoch retention: a row
+// recorded at `t` is due at `t + 50`.
+fn record_expiring(
+    app: &SqliteAppStorage,
+    event: &StoredAppEvent,
+) -> StorageResult<crate::TimelineProjectionUpdate> {
+    app.record_app_event_with_retention(
+        event,
+        Some(AppMessageRetentionDecision::new(event.recorded_at, 50)),
+    )
+}
+
 #[test]
 fn retention_scan_empty_group_has_nothing_due() {
     let app = setup_store().app_storage();
-    let scan = app.retention_expiry_scan(LOCAL, GROUP, 150, 145).unwrap();
+    let scan = app.retention_expiry_scan(LOCAL, GROUP, 200, 195).unwrap();
     assert_eq!(scan, RetentionExpiryScan::default());
 }
 
@@ -5074,22 +5086,20 @@ fn retention_scan_counts_same_second_message_above_marker_unread() {
     let app = setup_store().app_storage();
     app.initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
-    app.record_app_event(&chat("aaa", REMOTE, 100, "marked read"))
-        .unwrap();
-    app.record_app_event(&chat("zzz", REMOTE, 100, "same second"))
-        .unwrap();
+    record_expiring(&app, &chat("aaa", REMOTE, 100, "marked read")).unwrap();
+    record_expiring(&app, &chat("zzz", REMOTE, 100, "same second")).unwrap();
     app.mark_timeline_message_read(LOCAL, GROUP, "aaa", &no_mentions)
         .unwrap();
 
     let row = app.chat_list_row(GROUP).unwrap().unwrap();
     assert_eq!(row.unread_count, 1);
-    let scan = app.retention_expiry_scan(LOCAL, GROUP, 150, 145).unwrap();
+    let scan = app.retention_expiry_scan(LOCAL, GROUP, 200, 195).unwrap();
     assert!(scan.expired_unread);
     assert!(scan.expired_rows);
 
     app.mark_timeline_message_read(LOCAL, GROUP, "zzz", &no_mentions)
         .unwrap();
-    let scan = app.retention_expiry_scan(LOCAL, GROUP, 150, 145).unwrap();
+    let scan = app.retention_expiry_scan(LOCAL, GROUP, 200, 195).unwrap();
     assert!(!scan.expired_unread);
     assert!(scan.expired_rows, "read expired rows stay prunable");
 }
@@ -5104,10 +5114,10 @@ fn retention_scan_counts_later_epoch_message_behind_marker_time_unread() {
         .unwrap();
     let mut marker_message = chat("message-7", REMOTE, 200, "epoch seven");
     marker_message.source_epoch = Some(7);
-    app.record_app_event(&marker_message).unwrap();
+    record_expiring(&app, &marker_message).unwrap();
     let mut delayed = chat("message-8", REMOTE, 150, "earlier wall clock, later epoch");
     delayed.source_epoch = Some(8);
-    app.record_app_event(&delayed).unwrap();
+    record_expiring(&app, &delayed).unwrap();
     app.mark_timeline_message_read(LOCAL, GROUP, "message-7", &no_mentions)
         .unwrap();
 
@@ -5121,12 +5131,12 @@ fn retention_scan_counts_later_epoch_message_behind_marker_time_unread() {
         Some("message-8")
     );
 
-    let scan = app.retention_expiry_scan(LOCAL, GROUP, 250, 245).unwrap();
+    let scan = app.retention_expiry_scan(LOCAL, GROUP, 300, 295).unwrap();
     assert!(scan.expired_unread);
 
     app.mark_timeline_message_read(LOCAL, GROUP, "message-8", &no_mentions)
         .unwrap();
-    let scan = app.retention_expiry_scan(LOCAL, GROUP, 250, 245).unwrap();
+    let scan = app.retention_expiry_scan(LOCAL, GROUP, 300, 295).unwrap();
     assert!(!scan.expired_unread);
 }
 
@@ -5148,12 +5158,10 @@ fn retention_scan_legacy_marker_uses_message_id_fence() {
         )
         .unwrap();
     }
-    app.record_app_event(&chat("aaa", REMOTE, 100, "below the fence"))
-        .unwrap();
-    app.record_app_event(&chat("zzz", REMOTE, 100, "above the fence"))
-        .unwrap();
+    record_expiring(&app, &chat("aaa", REMOTE, 100, "below the fence")).unwrap();
+    record_expiring(&app, &chat("zzz", REMOTE, 100, "above the fence")).unwrap();
 
-    let scan = app.retention_expiry_scan(LOCAL, GROUP, 150, 145).unwrap();
+    let scan = app.retention_expiry_scan(LOCAL, GROUP, 200, 195).unwrap();
     assert!(scan.expired_unread);
 
     store
@@ -5165,21 +5173,19 @@ fn retention_scan_legacy_marker_uses_message_id_fence() {
             params![GROUP],
         )
         .unwrap();
-    let scan = app.retention_expiry_scan(LOCAL, GROUP, 150, 145).unwrap();
+    let scan = app.retention_expiry_scan(LOCAL, GROUP, 200, 195).unwrap();
     assert!(!scan.expired_unread);
 }
 
 #[test]
 fn retention_scan_without_read_cursor_keeps_received_rows() {
     let app = setup_store().app_storage();
-    app.record_app_event(&chat("their-message", REMOTE, 100, "hi"))
-        .unwrap();
-    app.record_app_event(&chat("my-message", LOCAL, 100, "mine"))
-        .unwrap();
+    record_expiring(&app, &chat("their-message", REMOTE, 100, "hi")).unwrap();
+    record_expiring(&app, &chat("my-message", LOCAL, 100, "mine")).unwrap();
 
     // No read state row at all: conservative, the received row blocks the
     // prune while the account's own sent rows never do.
-    let scan = app.retention_expiry_scan(LOCAL, GROUP, 150, 145).unwrap();
+    let scan = app.retention_expiry_scan(LOCAL, GROUP, 200, 195).unwrap();
     assert!(scan.expired_unread);
     assert!(scan.expired_rows);
 }
@@ -5191,28 +5197,49 @@ fn retention_scan_stays_conservative_until_first_marker() {
     // first-open stamp; there is no cursor row to compare against yet.
     app.initialize_chat_read_state(LOCAL, GROUP, &no_mentions)
         .unwrap();
-    app.record_app_event(&chat("their-message", REMOTE, 100, "hi"))
-        .unwrap();
+    record_expiring(&app, &chat("their-message", REMOTE, 100, "hi")).unwrap();
 
-    let scan = app.retention_expiry_scan(LOCAL, GROUP, 150, 145).unwrap();
+    let scan = app.retention_expiry_scan(LOCAL, GROUP, 200, 195).unwrap();
     assert!(scan.expired_unread);
 }
 
 #[test]
 fn retention_scan_flags_only_rows_inside_the_skew_window() {
     let app = setup_store().app_storage();
-    app.record_app_event(&chat("recent", LOCAL, 148, "inside the band"))
-        .unwrap();
-    app.record_app_event(&chat("old", LOCAL, 140, "below the band"))
-        .unwrap();
+    record_expiring(&app, &chat("recent", LOCAL, 148, "inside the band")).unwrap();
+    record_expiring(&app, &chat("old", LOCAL, 140, "below the band")).unwrap();
 
-    let scan = app.retention_expiry_scan(LOCAL, GROUP, 150, 145).unwrap();
+    let scan = app.retention_expiry_scan(LOCAL, GROUP, 200, 195).unwrap();
     assert!(scan.skew_boundary_rows);
     assert!(scan.expired_rows);
     assert!(!scan.expired_unread);
 
-    // Cutoffs move below both rows: the band empties, only expiry remains.
-    let scan = app.retention_expiry_scan(LOCAL, GROUP, 148, 145).unwrap();
+    // The clock moves back below the recent row's expiry: the band empties,
+    // only the old row's expiry remains.
+    let scan = app.retention_expiry_scan(LOCAL, GROUP, 197, 195).unwrap();
     assert!(!scan.skew_boundary_rows);
+    assert!(scan.expired_rows);
+}
+
+// The prune deletes on each row's pinned expiry, which keeps its source
+// epoch's policy. A recent row under a short pinned retention is due and
+// must block the prune while unread; an old row with no retention decision
+// never prunes, so it must not make the group look prunable.
+#[test]
+fn retention_scan_follows_pinned_expiry_not_timeline_age() {
+    let app = setup_store().app_storage();
+    app.record_app_event(&chat("no-decision", REMOTE, 10, "never expires"))
+        .unwrap();
+    let scan = app.retention_expiry_scan(LOCAL, GROUP, 200, 195).unwrap();
+    assert_eq!(scan, RetentionExpiryScan::default());
+
+    let short = chat("short-retention", REMOTE, 180, "pinned at 5 s");
+    app.record_app_event_with_retention(
+        &short,
+        Some(AppMessageRetentionDecision::new(short.recorded_at, 5)),
+    )
+    .unwrap();
+    let scan = app.retention_expiry_scan(LOCAL, GROUP, 200, 195).unwrap();
+    assert!(scan.expired_unread);
     assert!(scan.expired_rows);
 }

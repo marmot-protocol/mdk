@@ -391,16 +391,22 @@ pub struct ChatListRow {
 /// unread leg is computed in storage so the sweep and the unread projection
 /// share one read-cursor definition; a wall-clock page scan cannot rank a
 /// later-epoch row against the marker correctly.
+///
+/// Every leg reads the pinned `app_events.retention_expires_at` that the
+/// prune deletes on, not `timeline_at` against the group's current policy:
+/// a row keeps the expiry of its source epoch's policy, so the two can
+/// disagree after a policy change. Rows with NULL expiry never prune and
+/// never count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RetentionExpiryScan {
-    /// A row sits inside the clock-skew boundary window
-    /// `[skew_cutoff_seconds, raw_cutoff_seconds)`: too fresh to tell expiry
-    /// apart from sender/clock skew.
+    /// A row's expiry sits inside the clock-skew window
+    /// `(skew_now_seconds, now_seconds]`: due by the raw clock, not provably
+    /// due under the skew tolerance.
     pub skew_boundary_rows: bool,
-    /// A received row older than `raw_cutoff_seconds` is still unread under
-    /// the projection's read-cursor comparison.
+    /// A received row due at `now_seconds` is still unread under the
+    /// projection's read-cursor comparison.
     pub expired_unread: bool,
-    /// A row is older than the skew-adjusted cutoff: provably expired.
+    /// A row is due at `skew_now_seconds`: provably expired.
     pub expired_rows: bool,
 }
 
@@ -481,23 +487,23 @@ impl SqliteAppStorage {
     }
 
     /// One-group scan of the facts the marmot-app retention sweep prunes on
-    /// (mdk#2425). `raw_cutoff_seconds` is the retention expiry boundary;
-    /// `skew_cutoff_seconds` is the same boundary shifted back by the clock-
-    /// skew tolerance. See [`RetentionExpiryScan`] for the returned legs.
+    /// (mdk#2425). `now_seconds` is the time the prune runs at;
+    /// `skew_now_seconds` is the same time shifted back by the clock-skew
+    /// tolerance. See [`RetentionExpiryScan`] for the returned legs.
     pub fn retention_expiry_scan(
         &self,
         local_account_id_hex: &str,
         group_id_hex: &str,
-        raw_cutoff_seconds: u64,
-        skew_cutoff_seconds: u64,
+        now_seconds: u64,
+        skew_now_seconds: u64,
     ) -> StorageResult<RetentionExpiryScan> {
         let conn = self.lock()?;
         retention_expiry_scan_tx(
             &conn,
             local_account_id_hex,
             group_id_hex,
-            raw_cutoff_seconds,
-            skew_cutoff_seconds,
+            now_seconds,
+            skew_now_seconds,
         )
     }
 
@@ -2079,25 +2085,27 @@ fn retention_expiry_scan_tx(
     tx: &Connection,
     local_account_id_hex: &str,
     group_id_hex: &str,
-    raw_cutoff_seconds: u64,
-    skew_cutoff_seconds: u64,
+    now_seconds: u64,
+    skew_now_seconds: u64,
 ) -> StorageResult<RetentionExpiryScan> {
     let group = rusqlite::types::Value::Text(group_id_hex.to_owned());
-    let raw_cutoff = rusqlite::types::Value::Integer(u64_to_i64(raw_cutoff_seconds)?);
-    let skew_cutoff = rusqlite::types::Value::Integer(u64_to_i64(skew_cutoff_seconds)?);
+    let now = rusqlite::types::Value::Integer(u64_to_i64(now_seconds)?);
+    let skew_now = rusqlite::types::Value::Integer(u64_to_i64(skew_now_seconds)?);
 
+    // Comparisons against a NULL expiry are never true, so rows without a
+    // finite retention decision drop out of every leg, as they do in the prune.
     let skew_boundary_rows = timeline_exists_tx(
         tx,
-        "SELECT EXISTS(SELECT 1 FROM message_timeline
+        "SELECT EXISTS(SELECT 1 FROM app_events
                   WHERE group_id_hex = ?1
-                    AND timeline_at >= ?2 AND timeline_at < ?3)",
-        &[group.clone(), skew_cutoff.clone(), raw_cutoff.clone()],
+                    AND retention_expires_at > ?2 AND retention_expires_at <= ?3)",
+        &[group.clone(), skew_now.clone(), now.clone()],
     )?;
     let expired_rows = timeline_exists_tx(
         tx,
-        "SELECT EXISTS(SELECT 1 FROM message_timeline
-                  WHERE group_id_hex = ?1 AND timeline_at < ?2)",
-        &[group.clone(), skew_cutoff],
+        "SELECT EXISTS(SELECT 1 FROM app_events
+                  WHERE group_id_hex = ?1 AND retention_expires_at <= ?2)",
+        &[group.clone(), skew_now],
     )?;
 
     let expired_unread = match read_state_tx(tx, group_id_hex)? {
@@ -2112,13 +2120,15 @@ fn retention_expiry_scan_tx(
                     AND invalidation_status IS NULL
                     AND sender NOT IN (SELECT public_key FROM user_blocks)
                     AND sender != ?2
-                    AND timeline_at < ?3
+                    AND message_id_hex IN (
+                        SELECT message_id_hex FROM app_events
+                        WHERE group_id_hex = ?1 AND retention_expires_at <= ?3)
                     AND {cursor_sql})"
             );
             let mut params = vec![
                 group,
                 rusqlite::types::Value::Text(local_account_id_hex.to_owned()),
-                raw_cutoff,
+                now,
             ];
             params.extend(cursor_params);
             timeline_exists_tx(tx, &sql, &params)?
@@ -2128,11 +2138,11 @@ fn retention_expiry_scan_tx(
         // guessing what the account has seen.
         _ => timeline_exists_tx(
             tx,
-            "SELECT EXISTS(SELECT 1 FROM message_timeline
+            "SELECT EXISTS(SELECT 1 FROM app_events
                       WHERE group_id_hex = ?1
                         AND direction = 'received'
-                        AND timeline_at < ?2)",
-            &[group, raw_cutoff],
+                        AND retention_expires_at <= ?2)",
+            &[group, now],
         )?,
     };
 

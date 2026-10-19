@@ -94,7 +94,9 @@
   the chat-list projection's one read-cursor clause, so the sweep and the
   projection can no longer disagree: same five-column canonical key, same
   `(timeline_at, message_id_hex)` fallback for legacy markers. New
-  `RetentionExpiryScan` result type.
+  `RetentionExpiryScan` result type. Every leg reads the pinned
+  `retention_expires_at` the prune deletes on, so a policy change since a
+  row's source epoch cannot hide a due unread row from the sweep.
 - Manage storage queries (mdk#2314 step 5) on `SqliteAppStorage`:
   `attachment_storage_usage` (media-store bytes counted once, legacy database
   bytes, retained attachment count, database size and free pages),

@@ -140,7 +140,8 @@
   `timeline_at` against the read marker, so it deleted a received message
   that shared the marker's second with a higher id, or one that arrived in a
   later epoch while the sender's clock ran behind the marker. Storage now
-  answers the sweep with the projection's own cursor comparison; the page
+  answers the sweep with the projection's own cursor comparison over the rows
+  whose pinned expiry has passed, the same rows the prune deletes; the page
   scan, its 20-page cap and the per-page classifier are gone.
 - A device woken mostly by notifications now detects that it is stuck behind
   its group. Notification wakes (`CursorPersistence::Frozen`) retain

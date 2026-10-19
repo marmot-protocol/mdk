@@ -3390,8 +3390,8 @@ impl MarmotApp {
         &self,
         label: &str,
         group_id_hex: &str,
-        raw_cutoff_seconds: u64,
-        skew_cutoff_seconds: u64,
+        now_seconds: u64,
+        skew_now_seconds: u64,
     ) -> Result<storage_sqlite::RetentionExpiryScan, AppError> {
         let account = self.account_home().account(label)?;
         self.ensure_account_state(&account.label)?;
@@ -3401,8 +3401,8 @@ impl MarmotApp {
             .retention_expiry_scan(
                 &account.account_id_hex,
                 group_id_hex,
-                raw_cutoff_seconds,
-                skew_cutoff_seconds,
+                now_seconds,
+                skew_now_seconds,
             )?)
     }
 
