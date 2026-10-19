@@ -1135,6 +1135,38 @@ mod tests {
         );
     }
 
+    /// Each sticker failure crosses the FFI as its own variant; none may
+    /// fall through to the generic `Runtime` arm.
+    #[test]
+    fn sticker_errors_map_to_their_typed_variants() {
+        type Expected = fn(&MarmotKitError) -> bool;
+        let cases: Vec<(AppError, Expected)> = vec![
+            (
+                AppError::InvalidSticker("bad hash".into()),
+                |e| matches!(e, MarmotKitError::InvalidSticker { details } if details == "bad hash"),
+            ),
+            (AppError::StickerNotFound, |e| {
+                matches!(e, MarmotKitError::StickerNotFound)
+            }),
+            (
+                AppError::StickerRelay("offline".into()),
+                |e| matches!(e, MarmotKitError::StickerNetwork { details } if details == "offline"),
+            ),
+            (
+                AppError::StickerImport("refused".into()),
+                |e| matches!(e, MarmotKitError::StickerImport { details } if details == "refused"),
+            ),
+            (AppError::StickerExternalSignerImportUnsupported, |e| {
+                matches!(e, MarmotKitError::StickerImportUnsupported)
+            }),
+        ];
+        for (app_err, expected) in cases {
+            let label = format!("{app_err:?}");
+            let ffi = MarmotKitError::from(app_err);
+            assert!(expected(&ffi), "{label} mapped to {ffi:?}");
+        }
+    }
+
     #[test]
     fn invalid_key_package_event_maps_to_typed_variant() {
         let app_err = AppError::InvalidKeyPackageEvent("unsupported cipher suite".to_string());

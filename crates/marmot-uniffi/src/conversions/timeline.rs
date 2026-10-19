@@ -5,7 +5,7 @@ use marmot_app::{
     AppGroupSystemEvent, AppProjectionUpdate, RuntimeProjectionUpdate,
     RuntimeTimelineMessageUpdate, TimelineMessageChange, TimelineMessageRecord, TimelinePage,
     TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger,
-    TimelineUserReaction, sticker_ref_from_tags,
+    TimelineUserReaction,
 };
 
 use super::chat_list::{ChatListRowFfi, ChatListUpdateTriggerFfi};
@@ -234,7 +234,7 @@ impl From<TimelineReplyPreview> for TimelineReplyPreviewFfi {
     fn from(value: TimelineReplyPreview) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
         let media = timeline_media_outcomes_ffi(&value.media, value.source_epoch);
-        let sticker = sticker_ref_from_tags(value.kind, &value.tags).map(Into::into);
+        let sticker = super::sticker::presented_sticker_ref(value.kind, &value.tags, value.deleted);
         Self {
             message_id_hex: value.message_id_hex,
             sender: value.sender,
@@ -397,7 +397,7 @@ impl From<TimelineMessageRecord> for TimelineMessageRecordFfi {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
         let group_system = value.group_system;
         let media = timeline_media_outcomes_ffi(&value.media, value.source_epoch);
-        let sticker = sticker_ref_from_tags(value.kind, &value.tags).map(Into::into);
+        let sticker = super::sticker::presented_sticker_ref(value.kind, &value.tags, value.deleted);
         Self {
             client_token: value.client_token,
             has_reports: value.has_reports,
@@ -1025,6 +1025,65 @@ mod tests {
         assert_eq!(reference.file_name, "clip.mp4");
         assert_eq!(reference.source_epoch, 3);
         assert_eq!(reply.invalidation_status.as_deref(), Some("LosingBranch"));
+    }
+
+    fn sticker_tag() -> Vec<Vec<String>> {
+        vec![vec![
+            "sticker".to_owned(),
+            format!("30031:{}:cats", "ab".repeat(32)),
+            "wave".to_owned(),
+            "11".repeat(32),
+        ]]
+    }
+
+    fn reply_preview(kind: u64, tags: Vec<Vec<String>>, deleted: bool) -> TimelineReplyPreview {
+        TimelineReplyPreview {
+            message_id_hex: "parent".to_owned(),
+            sender: "bob".to_owned(),
+            plaintext: String::new(),
+            kind,
+            tags,
+            source_epoch: Some(3),
+            media: None,
+            agent_text_stream: None,
+            deleted,
+            deletion_source: Default::default(),
+            invalidation_status: None,
+        }
+    }
+
+    /// The record and its reply preview present a sticker only for a live
+    /// kind-9 row that carries a sticker tag.
+    #[test]
+    fn timeline_sticker_ref_follows_kind_tags_and_deletion() {
+        for (kind, tags, deleted, presented) in [
+            (9, sticker_tag(), false, true),
+            (7, sticker_tag(), false, false),
+            (9, Vec::new(), false, false),
+            (9, sticker_tag(), true, false),
+        ] {
+            let mut row = record_with_media(
+                Some(3),
+                None,
+                Some(reply_preview(kind, tags.clone(), deleted)),
+            );
+            row.kind = kind;
+            row.tags = tags;
+            row.deleted = deleted;
+            let ffi = TimelineMessageRecordFfi::from(row);
+            let reply = ffi.reply_preview.expect("reply preview");
+            for (label, sticker) in [("record", ffi.sticker), ("reply preview", reply.sticker)] {
+                assert_eq!(
+                    sticker.is_some(),
+                    presented,
+                    "{label}: kind={kind} deleted={deleted}"
+                );
+                if let Some(sticker) = sticker {
+                    assert_eq!(sticker.shortcode, "wave");
+                    assert_eq!(sticker.plaintext_sha256, "11".repeat(32));
+                }
+            }
+        }
     }
 }
 

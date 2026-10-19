@@ -227,6 +227,31 @@ enum MarmotStatus
    * MDK reads from one list; a follow or unfollow published nothing.
    */
   MARMOT_STATUS_FOLLOW_LIST_TOO_LARGE = 107,
+  /**
+   * Sticker data failed validation: pack metadata, a reference, a link,
+   * or downloaded bytes that do not match the exact hash, MIME type, or
+   * dimensions. Retrying the same input cannot succeed.
+   */
+  MARMOT_STATUS_INVALID_STICKER = 108,
+  /**
+   * The sticker pack, or the exact `(pack, shortcode, plaintext hash)`
+   * asset, is not known locally and could not be resolved.
+   */
+  MARMOT_STATUS_STICKER_NOT_FOUND = 109,
+  /**
+   * A sticker relay or Blossom operation did not complete. Local intent is
+   * kept; retry when connectivity returns.
+   */
+  MARMOT_STATUS_STICKER_NETWORK = 110,
+  /**
+   * Signal sticker import was refused or failed. Import is refused before
+   * any network call while its fetch cannot be pinned.
+   */
+  MARMOT_STATUS_STICKER_IMPORT = 111,
+  /**
+   * Signal sticker import is not available for external-signing accounts.
+   */
+  MARMOT_STATUS_STICKER_IMPORT_UNSUPPORTED = 112,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -3511,9 +3536,9 @@ typedef struct MarmotAppMessageRecord {
    * reaction, …).
    */
   uint64_t kind;
-  struct MarmotStickerRef *sticker;
   struct MarmotMessageTag *tags;
   uintptr_t tags_len;
+  struct MarmotStickerRef *sticker;
   bool has_source_epoch;
   /**
    *Only meaningful when the matching `has_` flag is set.
@@ -4873,7 +4898,11 @@ typedef struct MarmotSticker {
   char *pack_coordinate;
   char *shortcode;
   char *url;
-  char *sha256;
+  /**
+   * SHA-256 of the plaintext image bytes: the exact hash
+   * `marmot_fetch_sticker_asset` and `marmot_send_sticker` take.
+   */
+  char *plaintext_sha256;
   char *mime;
   bool has_width;
   /**
@@ -4925,9 +4954,15 @@ typedef struct MarmotStickerSyncResult {
   uint32_t pending_operations;
 } MarmotStickerSyncResult;
 
+/**
+ * A Signal sticker import result.
+ */
 typedef struct MarmotStickerImportResult {
   struct MarmotStickerPack pack;
-  char **skipped_signal_sticker_ids;
+  /**
+   * Signal sticker ids the import skipped; `(NULL, 0)` when there are none.
+   */
+  uint32_t *skipped_signal_sticker_ids;
   uintptr_t skipped_signal_sticker_ids_len;
 } MarmotStickerImportResult;
 
@@ -5079,9 +5114,9 @@ typedef struct MarmotReceivedMessage {
    * Nostr `kind` of the inner Marmot app event.
    */
   uint64_t kind;
-  struct MarmotStickerRef *sticker;
   struct MarmotMessageTag *tags;
   uintptr_t tags_len;
+  struct MarmotStickerRef *sticker;
   uint64_t source_epoch;
   /**
    * Unset means the engine could not recover the historical source
@@ -10224,8 +10259,10 @@ MarmotStatus marmot_uninstall_sticker_pack(const struct MarmotClient *client,
                                            const char *input);
 
 /**
- * Import a canonical Signal pack link. External-signer accounts are rejected.
- * `blossom_server` may be NULL. Free with `marmot_sticker_import_result_free`.
+ * Validate a canonical Signal pack link, then refuse before any network
+ * call. The pinned importer cannot be address-pinned, so this command
+ * does not download or upload. `blossom_server` may be NULL. Free with
+ * `marmot_sticker_import_result_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid

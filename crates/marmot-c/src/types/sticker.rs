@@ -25,7 +25,9 @@ c_mirror! {
         str pack_coordinate,
         str shortcode,
         str url,
-        str sha256,
+        /// SHA-256 of the plaintext image bytes: the exact hash
+        /// `marmot_fetch_sticker_asset` and `marmot_send_sticker` take.
+        str plaintext_sha256,
         str mime,
         opt_copy has_width/width: u32,
         opt_copy has_height/height: u32,
@@ -73,24 +75,19 @@ c_mirror! {
     }
 }
 
+/// A Signal sticker import result.
 #[repr(C)]
 pub struct MarmotStickerImportResult {
     pub pack: MarmotStickerPack,
-    pub skipped_signal_sticker_ids: *mut *mut std::ffi::c_char,
+    /// Signal sticker ids the import skipped; `(NULL, 0)` when there are none.
+    pub skipped_signal_sticker_ids: *mut u32,
     pub skipped_signal_sticker_ids_len: usize,
 }
 
 impl From<StickerImportResultFfi> for MarmotStickerImportResult {
     fn from(value: StickerImportResultFfi) -> Self {
-        let mut ids = value
-            .skipped_signal_sticker_ids
-            .into_iter()
-            .map(|id| crate::memory::owned_c_string(id.to_string()))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let skipped_signal_sticker_ids_len = ids.len();
-        let skipped_signal_sticker_ids = ids.as_mut_ptr();
-        std::mem::forget(ids);
+        let (skipped_signal_sticker_ids, skipped_signal_sticker_ids_len) =
+            crate::memory::owned_vec(value.skipped_signal_sticker_ids);
         Self {
             pack: value.pack.into(),
             skipped_signal_sticker_ids,
@@ -102,18 +99,12 @@ impl From<StickerImportResultFfi> for MarmotStickerImportResult {
 impl crate::memory::CFree for MarmotStickerImportResult {
     unsafe fn free_in_place(&mut self) {
         unsafe { self.pack.free_in_place() };
-        if !self.skipped_signal_sticker_ids.is_null() {
-            let ids = unsafe {
-                Vec::from_raw_parts(
-                    self.skipped_signal_sticker_ids,
-                    self.skipped_signal_sticker_ids_len,
-                    self.skipped_signal_sticker_ids_len,
-                )
-            };
-            for id in ids {
-                unsafe { crate::memory::free_c_string(id) };
-            }
-        }
+        unsafe {
+            crate::memory::free_vec(
+                self.skipped_signal_sticker_ids,
+                self.skipped_signal_sticker_ids_len,
+            )
+        };
         self.skipped_signal_sticker_ids = std::ptr::null_mut();
         self.skipped_signal_sticker_ids_len = 0;
     }
@@ -126,5 +117,75 @@ impl crate::memory::CFree for MarmotStickerImportResult {
 /// and it must not have been freed already.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_sticker_import_result_free(value: *mut MarmotStickerImportResult) {
-    unsafe { crate::memory::free_boxed(value) };
+    crate::memory::free_guard(|| unsafe { crate::memory::free_boxed(value) });
+}
+
+#[cfg(test)]
+mod tests {
+    use marmot_uniffi::conversions::{StickerFfi, StickerImportResultFfi, StickerPackFfi};
+
+    use super::*;
+    use crate::memory::boxed;
+
+    fn pack() -> StickerPackFfi {
+        StickerPackFfi {
+            coordinate: format!("30031:{}:cats", "ab".repeat(32)),
+            author_pubkey_hex: "ab".repeat(32),
+            identifier: "cats".to_owned(),
+            event_id_hex: "cd".repeat(32),
+            created_at: 1,
+            title: "Cats".to_owned(),
+            description: None,
+            cover: None,
+            stickers: vec![StickerFfi {
+                pack_coordinate: format!("30031:{}:cats", "ab".repeat(32)),
+                shortcode: "wave".to_owned(),
+                url: "https://cdn.example/wave.png".to_owned(),
+                plaintext_sha256: "11".repeat(32),
+                mime: "image/png".to_owned(),
+                width: Some(32),
+                height: Some(32),
+                alt: None,
+                emoji: None,
+            }],
+            license: None,
+            installed: false,
+        }
+    }
+
+    #[test]
+    fn import_result_exports_skipped_ids_as_a_u32_array() {
+        let _guard = crate::memory::audit::test_lock();
+        #[cfg(feature = "alloc-audit")]
+        let start = crate::memory::audit::live_allocations();
+
+        let populated: MarmotStickerImportResult = StickerImportResultFfi {
+            pack: pack(),
+            skipped_signal_sticker_ids: vec![3, 7],
+        }
+        .into();
+        assert_eq!(populated.skipped_signal_sticker_ids_len, 2);
+        let ids = unsafe {
+            std::slice::from_raw_parts(
+                populated.skipped_signal_sticker_ids,
+                populated.skipped_signal_sticker_ids_len,
+            )
+        };
+        assert_eq!(ids, [3, 7]);
+        assert_eq!(populated.pack.stickers_len, 1);
+        unsafe { marmot_sticker_import_result_free(boxed(populated)) };
+
+        let empty: MarmotStickerImportResult = StickerImportResultFfi {
+            pack: pack(),
+            skipped_signal_sticker_ids: Vec::new(),
+        }
+        .into();
+        assert!(empty.skipped_signal_sticker_ids.is_null());
+        assert_eq!(empty.skipped_signal_sticker_ids_len, 0);
+        unsafe { marmot_sticker_import_result_free(boxed(empty)) };
+        unsafe { marmot_sticker_import_result_free(std::ptr::null_mut()) };
+
+        #[cfg(feature = "alloc-audit")]
+        assert_eq!(crate::memory::audit::live_allocations(), start);
+    }
 }

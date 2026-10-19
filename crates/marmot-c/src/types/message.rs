@@ -26,8 +26,8 @@ c_mirror! {
         /// Nostr `kind` of the inner Marmot app event (9 chat, 7
         /// reaction, …).
         copy kind: u64,
-        opt_rec sticker: MarmotStickerRef,
         vec tags/tags_len: MarmotMessageTag,
+        opt_rec sticker: MarmotStickerRef,
         opt_copy has_source_epoch/source_epoch: u64,
         /// Unset means no recoverable source-epoch decision (legacy/safe
         /// retain); `0` means retention explicitly disabled.
@@ -62,8 +62,8 @@ c_mirror! {
         rec content_tokens: MarmotMarkdownDocument,
         /// Nostr `kind` of the inner Marmot app event.
         copy kind: u64,
-        opt_rec sticker: MarmotStickerRef,
         vec tags/tags_len: MarmotMessageTag,
+        opt_rec sticker: MarmotStickerRef,
         copy source_epoch: u64,
         /// Unset means the engine could not recover the historical source
         /// policy.

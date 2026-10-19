@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Sonar-compatible stickers. `MarmotKitError` adds `InvalidSticker`, `StickerNotFound`,
+  `StickerNetwork`, `StickerImport` and `StickerImportUnsupported`; they previously had no
+  sticker path. `AppMessageRecordFfi`, `ReceivedMessageFfi`, `NotificationUpdateFfi`,
+  `ChatListMessagePreviewFfi`, `TimelineMessageRecordFfi` and `TimelineReplyPreviewFfi` add
+  `sticker: Option<StickerRefFfi>`, the typed kind-9 sticker reference; it is `None` for a
+  deleted row. Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when`
+  handling and code that constructs these records. New `Marmot` methods `sticker_packs`,
+  `sticker_pack`, `sync_sticker_packs`, `fetch_sticker_pack`, `install_sticker_pack`,
+  `uninstall_sticker_pack`, `fetch_sticker_asset`, `send_sticker` and
+  `import_signal_sticker_pack` (which validates the link and then refuses before any
+  network call) use the new `StickerRefFfi`, `StickerFfi`, `StickerPackFfi`,
+  `StickerAssetFfi`, `StickerSyncResultFfi` and `StickerImportResultFfi` records.
+  `StickerFfi.plaintext_sha256` is the exact hash a `StickerRefFfi` carries.
+
 ## 0.14.0 - 2026-10-23
 
 Regenerate Swift/Kotlin bindings with the matching native library. Every

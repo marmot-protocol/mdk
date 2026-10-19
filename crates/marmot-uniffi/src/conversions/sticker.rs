@@ -10,6 +10,20 @@ pub struct StickerRefFfi {
     pub plaintext_sha256: String,
 }
 
+/// The sticker a projected row presents. A deleted row keeps its raw tags for
+/// reversible withdrawal, so it must never present the pack coordinate,
+/// shortcode, or plaintext hash those tags carry.
+pub(crate) fn presented_sticker_ref(
+    kind: u64,
+    tags: &[Vec<String>],
+    deleted: bool,
+) -> Option<StickerRefFfi> {
+    if deleted {
+        return None;
+    }
+    marmot_app::sticker_ref_from_tags(kind, tags).map(Into::into)
+}
+
 impl From<AppStickerRef> for StickerRefFfi {
     fn from(value: AppStickerRef) -> Self {
         Self {
@@ -35,7 +49,9 @@ pub struct StickerFfi {
     pub pack_coordinate: String,
     pub shortcode: String,
     pub url: String,
-    pub sha256: String,
+    /// SHA-256 of the sticker's plaintext image bytes: the exact hash a
+    /// `StickerRefFfi` carries and `fetch_sticker_asset` / `send_sticker` take.
+    pub plaintext_sha256: String,
     pub mime: String,
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -49,7 +65,7 @@ impl From<AppSticker> for StickerFfi {
             pack_coordinate: value.pack_coordinate,
             shortcode: value.shortcode,
             url: value.url,
-            sha256: value.sha256,
+            plaintext_sha256: value.sha256,
             mime: value.mime,
             width: value.width,
             height: value.height,

@@ -3,7 +3,7 @@
 use marmot_app::{
     AppDisbandRequest, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
     ChatListMessageDeliveryState, ChatListMessagePreview, ChatListRow, ChatNotificationSettings,
-    ChatPinState, ExistingDirectConversation, RuntimeChatListUpdate, sticker_ref_from_tags,
+    ChatPinState, ExistingDirectConversation, RuntimeChatListUpdate,
 };
 
 use super::common::{SelfMembershipFfi, markdown_content_tokens};
@@ -122,7 +122,7 @@ impl From<ChatListMessageDeliveryState> for ChatListMessageDeliveryStateFfi {
 impl From<ChatListMessagePreview> for ChatListMessagePreviewFfi {
     fn from(value: ChatListMessagePreview) -> Self {
         let content_tokens = markdown_content_tokens(value.kind, &value.plaintext);
-        let sticker = sticker_ref_from_tags(value.kind, &value.tags).map(Into::into);
+        let sticker = super::sticker::presented_sticker_ref(value.kind, &value.tags, value.deleted);
         Self {
             group_system: value.group_system.map(Into::into),
             message_id_hex: value.message_id_hex,
@@ -473,6 +473,45 @@ mod tests {
             muted_until_ms: None,
             leave_requested_at_ms: None,
         }
+    }
+
+    /// Deleted previews keep their raw tags in storage; the binding must not
+    /// expose the sticker those tags reference.
+    #[test]
+    fn chat_preview_sticker_is_hidden_once_deleted() {
+        let preview = |deleted: bool| ChatListMessagePreview {
+            group_system: None,
+            message_id_hex: "message".to_owned(),
+            sender: "sender".to_owned(),
+            sender_display_name: None,
+            plaintext: String::new(),
+            tags: vec![vec![
+                "sticker".to_owned(),
+                format!("30031:{}:cats", "ab".repeat(32)),
+                "wave".to_owned(),
+                "11".repeat(32),
+            ]],
+            kind: 9,
+            timeline_at: 1,
+            retention_seconds: None,
+            retention_expires_at: None,
+            deleted,
+            deletion_source: Default::default(),
+            attachment_kind: None,
+            attachment_count: 0,
+            delivery_state: ChatListMessageDeliveryState::NotApplicable,
+            media_json: None,
+        };
+        assert!(
+            ChatListMessagePreviewFfi::from(preview(false))
+                .sticker
+                .is_some()
+        );
+        assert!(
+            ChatListMessagePreviewFfi::from(preview(true))
+                .sticker
+                .is_none()
+        );
     }
 
     #[test]
