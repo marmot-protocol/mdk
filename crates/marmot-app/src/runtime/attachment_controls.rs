@@ -298,10 +298,13 @@ impl MarmotAppRuntime {
                 last: tokio::time::Instant::now(),
                 read: tokio::time::Instant::now(),
                 owed: None,
+                held: None,
                 reading: None,
             }),
             #[cfg(test)]
             read_gate: Default::default(),
+            #[cfg(test)]
+            waits: watch::channel(None).0,
         }))
     }
 }
@@ -316,11 +319,16 @@ struct TransferSubscriptionState {
     last: tokio::time::Instant,
     /// When the frame was last read: wakes keep their spacing from it.
     read: tokio::time::Instant,
-    /// When a read is owed, set by a wake or by a progress frame waiting out
-    /// the window and cleared by the read. It outlives a cancelled `next()` —
-    /// a C timeout drops the future — so the next call reads instead of
-    /// waiting for another wake.
+    /// When a read, or the delivery of held rows, is owed: set by a wake or by
+    /// progress waiting out the window, and cleared once it happens. It
+    /// outlives a cancelled `next()` — a C timeout drops the future — so the
+    /// next call acts on it instead of waiting for another wake.
     owed: Option<tokio::time::Instant>,
+    /// Progress rows read while the window was still open, delivered when it
+    /// ends without reading them again. A transfer notification before then
+    /// drops them, since the rows may have moved on. Like `owed`, they outlive
+    /// a cancelled `next()`.
+    held: Option<Vec<Option<AttachmentTransferStatus>>>,
     /// The read in flight. A `next()` cancelled mid-read leaves it running, and
     /// the next call awaits it rather than starting another, so caller
     /// timeouts never stack reads.
@@ -329,13 +337,27 @@ struct TransferSubscriptionState {
 
 type FrameRead = tokio::task::JoinHandle<Result<storage_sqlite::AttachmentTransferFrame, AppError>>;
 
-/// Holds a subscription's reads before they touch the database, counting
-/// those that started, so a test can cancel `next()` mid-read.
+/// Holds a subscription's reads before they touch the database until `open`
+/// is true, and records when each one started, so a test can cancel `next()`
+/// mid-read or check how far apart reads start.
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct ReadGateForTest {
-    pub(crate) started: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) starts: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
     pub(crate) open: Arc<watch::Sender<bool>>,
+}
+
+/// What a pending `next()` waits for, published as the wait begins so a test
+/// acts once it is in place rather than after a sleep.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransferWaitForTest {
+    /// A wake: a transfer notification, presentation churn or the idle fallback.
+    Wake,
+    /// A read owed this long after the previous read.
+    Read(Duration),
+    /// Progress rows held until the window ends.
+    Held,
 }
 pub struct RuntimeAttachmentTransferSubscription {
     runtime: MarmotAppRuntime,
@@ -347,6 +369,8 @@ pub struct RuntimeAttachmentTransferSubscription {
     state: Mutex<TransferSubscriptionState>,
     #[cfg(test)]
     read_gate: std::sync::Mutex<Option<ReadGateForTest>>,
+    #[cfg(test)]
+    waits: watch::Sender<Option<TransferWaitForTest>>,
 }
 impl RuntimeAttachmentTransferSubscription {
     pub fn close(&self) {
@@ -357,11 +381,17 @@ impl RuntimeAttachmentTransferSubscription {
     #[cfg(test)]
     pub(crate) fn gate_reads_for_test(&self) -> ReadGateForTest {
         let gate = ReadGateForTest {
-            started: Default::default(),
+            starts: Default::default(),
             open: Arc::new(watch::channel(false).0),
         };
         *self.read_gate.lock().unwrap() = Some(gate.clone());
         gate
+    }
+
+    /// The waits a pending `next()` enters, latest first.
+    #[cfg(test)]
+    pub(crate) fn waits_for_test(&self) -> watch::Receiver<Option<TransferWaitForTest>> {
+        self.waits.subscribe()
     }
 
     /// Read the current frame, resuming the read a cancelled call left in
@@ -382,8 +412,10 @@ impl RuntimeAttachmentTransferSubscription {
             tokio::spawn(async move {
                 #[cfg(test)]
                 if let Some(gate) = gate {
-                    gate.started
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    gate.starts
+                        .lock()
+                        .unwrap()
+                        .push(tokio::time::Instant::now());
                     let _ = gate.open.subscribe().wait_for(|open| *open).await;
                 }
                 runtime
@@ -428,6 +460,8 @@ impl RuntimeAttachmentTransferSubscription {
             let mut at = match state.owed {
                 Some(at) => at,
                 None => {
+                    #[cfg(test)]
+                    self.waits.send_replace(Some(TransferWaitForTest::Wake));
                     let interval =
                         refresh_interval(&state.rows, state.next_expiry, crate::unix_now_seconds());
                     let TransferSubscriptionState {
@@ -455,23 +489,43 @@ impl RuntimeAttachmentTransferSubscription {
                     state.read + spacing
                 }
             };
-            // A transfer notification brings a later read forward to the read
-            // floor, so a state change is never held behind presentation churn
-            // or behind progress waiting out the window.
+            #[cfg(test)]
+            self.waits.send_replace(Some(match state.held {
+                Some(_) => TransferWaitForTest::Held,
+                None => TransferWaitForTest::Read(at.saturating_duration_since(state.read)),
+            }));
+            // A transfer notification moves the read to the read floor: forward,
+            // so a state change is never held behind presentation churn or
+            // behind progress waiting out the window, and never closer to the
+            // previous read than the floor.
             loop {
                 let TransferSubscriptionState { updates, .. } = &mut *state;
                 let notified = tokio::select! {
                     biased;
                     _ = closed.changed()=>return Ok(None),
                     _ = wait_for_runtime_shutdown(&mut stopping)=>return Ok(None),
-                    _ = tokio::time::sleep_until(at)=>false,
+                    // Ahead of the deadline, so a notification that lands as
+                    // it passes still counts: held rows are delivered only
+                    // when nothing was reported since.
                     _ = updates.changed()=>true,
+                    _ = tokio::time::sleep_until(at)=>false,
                 };
                 if !notified {
                     break;
                 }
-                at = at.min(state.read + TRANSFER_READ_FLOOR);
+                state.held = None;
+                at = state.read + TRANSFER_READ_FLOOR;
                 state.owed = Some(at);
+            }
+            if let Some(rows) = state.held.take() {
+                if *closed.borrow() || self.runtime.shared.lifecycle().ensure_running().is_err() {
+                    self.close();
+                    return Ok(None);
+                }
+                state.owed = None;
+                state.last = tokio::time::Instant::now();
+                state.rows = rows.clone();
+                return Ok(Some(rows));
             }
             let storage_sqlite::AttachmentTransferFrame {
                 store_epoch: identity,
@@ -497,8 +551,9 @@ impl RuntimeAttachmentTransferSubscription {
                 state.rows = rows.clone();
                 return Ok(Some(rows));
             }
-            // Progress alone waits out the window: the read is owed at its end,
-            // or sooner when another transfer notification arrives.
+            // Progress alone waits out the window: the rows are delivered at its
+            // end, or read again on a transfer notification before then.
+            state.held = Some(rows);
             state.owed = Some(deadline);
         }
     }

@@ -695,7 +695,7 @@ Read bounded transfer state for up to 64 source slots in one group without reque
 pub async fn subscribe_attachment_transfers( &self, account_ref: String, group_id_hex: String, targets: Vec<AttachmentLocalTargetFfi>, ) -> Result<Arc<AttachmentTransferSubscription>, MarmotKitError>
 ```
 
-Observe initial transfer state and coalesced complete replacements for bounded source slots; observation does not request a transfer.
+Observe initial transfer state and complete replacements for bounded source slots: a row that appears, disappears or changes transfer state arrives as soon as the engine reports it, while progress-only replacements stay coalesced to at most four per second. Observation does not request a transfer.
 
 [Source](src/commands/attachment_controls.rs#L154)
 
