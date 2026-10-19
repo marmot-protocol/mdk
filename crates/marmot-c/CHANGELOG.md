@@ -60,6 +60,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `MARMOT_ATTACHMENT_TRANSFER_STATE_STORAGE_BLOCKED`; existing discriminants
   are unchanged. Recompile against the regenerated `marmot.h` with the matching
   library and handle the new value as "free up storage", not as a retry timer.
+- On OpenBSD, `c-bindings.sh` builds SQLCipher without `mlock` and with
+  concealed allocations, so hosts can run under `pledge(2)`. Other platforms
+  are unchanged.
 
 ## [0.13.0] - 2026-10-12
 
