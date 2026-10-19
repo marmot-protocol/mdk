@@ -2104,6 +2104,13 @@ mod tests {
                 "group_info",
             ),
             (
+                AgentControlRequest::GroupLeave {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                },
+                "group_leave",
+            ),
+            (
                 AgentControlRequest::MaintenanceStatus {
                     account_id_hex: account(),
                     group_id_hex: group(),
