@@ -383,6 +383,10 @@ pub fn prepare_directory_path(
             open_walk_anchor(start, &components, |prefix| options.open(prefix)).map_err(
                 |error| io_context("locate openable directory-walk anchor", path, error),
             )?;
+        #[cfg(target_os = "openbsd")]
+        if depth > 0 {
+            verify_unveil_anchor(&anchor, &directory)?;
+        }
         components.drain(..depth);
         (directory.into(), anchor)
     };
@@ -604,6 +608,40 @@ fn open_walk_anchor<T>(
             "every candidate prefix was denied",
         )
     })
+}
+
+/// Reject an anchor reached through a symlink unveil hid from the probe.
+///
+/// unveil reports a hidden symlink as ENOENT, but a deeper probe follows it as
+/// an intermediate component: `/tmp/alias/allowed` opens `/tmp/real/allowed`.
+/// The anchor must resolve to its own path, and that path must still name the
+/// opened directory, so a prefix swapped after the open is caught too.
+#[cfg(target_os = "openbsd")]
+fn verify_unveil_anchor(anchor: &Path, opened: &std::fs::File) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let expected = match anchor.strip_prefix(".") {
+        Ok(relative) => std::env::current_dir()?.join(relative),
+        Err(_) => anchor.to_owned(),
+    };
+    let resolved = std::fs::canonicalize(anchor)
+        .map_err(|error| io_context("resolve directory-walk anchor", anchor, error))?;
+    if resolved != expected {
+        return Err(untrusted_alias(
+            anchor,
+            "an unveil-hidden prefix is a symlink",
+        ));
+    }
+
+    let held = opened.metadata()?;
+    let named = std::fs::metadata(&resolved)?;
+    if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+        return Err(untrusted_alias(
+            anchor,
+            "the path changed after it was opened",
+        ));
+    }
+    Ok(())
 }
 
 /// Ids whose writes a private artifact path already trusts because they outrank
@@ -1900,6 +1938,9 @@ mod unix_tests {
             std::fs::create_dir(&root).unwrap();
             std::fs::create_dir(&outside).unwrap();
             symlink(&outside, root.join("escape")).unwrap();
+            // An alias above the unveiled root: hidden itself, but a deeper
+            // probe resolves through it to the unveiled directory.
+            symlink(dir.path(), dir.path().join("alias")).unwrap();
             let status = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -1911,6 +1952,7 @@ mod unix_tests {
                 .unwrap();
             assert!(status.success(), "unveiled directory creation failed");
             assert!(!outside.join("leaf").exists());
+            assert!(!root.join("aliased").exists());
             return;
         };
         let root = Path::new(&root);
@@ -1936,6 +1978,8 @@ mod unix_tests {
             )
             .is_err()
         );
+        let aliased = root.parent().unwrap().join("alias/allowed/aliased");
+        assert!(prepare_directory_path(&aliased, 0o700, ExistingDirectoryMode::Enforce).is_err());
     }
 
     #[test]
