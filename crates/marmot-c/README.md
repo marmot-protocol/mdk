@@ -512,6 +512,12 @@ evidence only. Changing `strip` changes Cargo's release-profile fingerprint, so
 alternating these scripts with an unpinned `cargo build --release` can rebuild
 release dependencies.
 
+On OpenBSD `c-bindings.sh` builds SQLCipher with `OMIT_MEMLOCK` and routes its
+`malloc`/`calloc` to `malloc_conceal`/`calloc_conceal`, so a host can run under
+`pledge(2)`, which forbids `mlock`. Concealed pages stay out of core dumps and
+are wiped on free, but are not pinned in RAM: swap protection follows the
+host's swap encryption. Flags already in `LIBSQLITE3_FLAGS` are kept.
+
 ## Regenerating the header
 
 ```sh
