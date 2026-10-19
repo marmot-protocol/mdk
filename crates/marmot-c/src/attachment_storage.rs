@@ -7,7 +7,7 @@ use crate::memory::{
     CFree, boxed_opt, free_boxed, free_c_string, free_guard, free_vec, optional_str,
     owned_c_string, owned_vec, required_str,
 };
-use crate::{MarmotClient, MarmotStatus, client_ref, ffi_guard, preflight_out_ptr};
+use crate::{MarmotClient, MarmotStatus, client_ref, ffi_guard, preflight_out, preflight_out_ptr};
 use marmot_uniffi::conversions::*;
 use std::{ffi::c_char, sync::Arc};
 
@@ -272,9 +272,7 @@ pub unsafe extern "C" fn marmot_remove_chat_attachments(
     out_removed: *mut u64,
 ) -> MarmotStatus {
     ffi_guard(|| {
-        if out_removed.is_null() {
-            return MarmotStatus::NullPointer;
-        }
+        try_arg!(unsafe { preflight_out(out_removed) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account = try_arg!(unsafe { required_str(account_ref) });
         let group = try_arg!(unsafe { required_str(group_id_hex) });
@@ -301,9 +299,7 @@ pub unsafe extern "C" fn marmot_remove_attachments_older_than(
     out_removed: *mut u64,
 ) -> MarmotStatus {
     ffi_guard(|| {
-        if out_removed.is_null() {
-            return MarmotStatus::NullPointer;
-        }
+        try_arg!(unsafe { preflight_out(out_removed) });
         let client = try_arg!(unsafe { client_ref(client) });
         let account = try_arg!(unsafe { required_str(account_ref) });
         let group = try_arg!(unsafe { optional_str(group_id_hex) });
@@ -403,6 +399,29 @@ mod tests {
                 "an unknown account is an error"
             );
             assert!(usage.is_null());
+            let mut removed = 9u64;
+            assert_ne!(
+                marmot_remove_chat_attachments(
+                    client,
+                    c"absent".as_ptr(),
+                    c"abababababababababababababababab".as_ptr(),
+                    &mut removed
+                ),
+                MarmotStatus::Ok
+            );
+            assert_eq!(removed, 0, "a failed call clears a stale count");
+            removed = 9;
+            assert_ne!(
+                marmot_remove_attachments_older_than(
+                    client,
+                    c"absent".as_ptr(),
+                    1,
+                    ptr::null(),
+                    &mut removed
+                ),
+                MarmotStatus::Ok
+            );
+            assert_eq!(removed, 0);
             assert_eq!(crate::marmot_client_shutdown(client), MarmotStatus::Ok);
             crate::marmot_client_free(client);
         }
