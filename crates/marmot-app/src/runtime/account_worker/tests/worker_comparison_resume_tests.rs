@@ -124,7 +124,7 @@ async fn run_held_comparison(
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &url);
     let runtime = crate::MarmotAppRuntime::new(app.clone());
@@ -520,7 +520,7 @@ async fn comparison_credit_exhaustion_does_not_spend_reservation() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     let pool = runtime
@@ -582,7 +582,7 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &url);
     let runtime = crate::MarmotAppRuntime::new(app.clone());

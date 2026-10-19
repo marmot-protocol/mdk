@@ -4652,7 +4652,7 @@ pub fn marmot_deployment_neutral() -> MarmotDeploymentFfi
 
 A deployment with no services: recovery requires every relay on a route, onboarding searches only the host's discovery relays, there is no Open Ranking tier or KeyPackage client preference, moderation reporting refuses a destination, and the keychain service is `org.marmot-protocol.mdk`. Start here and fill in the services your deployment operates. Until the neutral default lands, an empty media list or unset image server still falls back to White Noise's servers.
 
-[Source](src/deployment.rs#L108)
+[Source](src/deployment.rs#L110)
 
 ### `marmot_deployment_white_noise`
 

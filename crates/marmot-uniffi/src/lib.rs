@@ -232,7 +232,7 @@ pub struct MarmotOptions {
 impl MarmotOptions {
     fn app_config(&self) -> MarmotAppConfig {
         let relay_policy = self.relay_policy.unwrap_or(RelayPolicyFfi::PublicOnly);
-        let config = MarmotAppConfig::default()
+        let config = MarmotAppConfig::white_noise()
             .with_attachment_acquisition_mode(
                 self.attachment_acquisition_mode.unwrap_or_default().into(),
             )
@@ -589,7 +589,7 @@ mod tests {
     fn runtime_options_carry_the_deployment() {
         assert_eq!(
             MarmotOptions::default().app_config().deployment,
-            marmot_app::MarmotAppConfig::default().deployment,
+            marmot_app::MarmotAppConfig::white_noise().deployment,
             "an omitted deployment is White Noise's as compiled, for now"
         );
         let neutral = MarmotOptions {

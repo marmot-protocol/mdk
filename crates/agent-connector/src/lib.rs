@@ -277,7 +277,7 @@ impl AgentConnector {
             &config.home,
             relays.clone(),
             account_home.clone(),
-            MarmotAppConfig::default()
+            MarmotAppConfig::white_noise()
                 .with_allow_loopback_relay_endpoints(config.allow_loopback_relays),
         )?;
         let runtime = MarmotAppRuntime::new(app.clone());

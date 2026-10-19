@@ -57,7 +57,7 @@ async fn fixture(
         MarmotAppConfig {
             attachment_acquisition: Some(crate::AttachmentAcquisitionPolicy::default()),
             allow_loopback_blob_endpoints: true,
-            ..Default::default()
+            ..MarmotAppConfig::white_noise()
         },
     )
     .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));

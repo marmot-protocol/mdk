@@ -22,7 +22,7 @@ mod tests {
         let marmot = Marmot::open(
             root.path().to_string_lossy().into_owned(),
             vec![],
-            marmot_app::MarmotAppConfig::default(),
+            marmot_app::MarmotAppConfig::white_noise(),
             Some(std::sync::Arc::new(
                 marmot_account::LocalFileSecretStore::new(root.path()),
             )),

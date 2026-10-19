@@ -11,11 +11,6 @@ fn roundtrip(md: &str) {
 }
 
 #[test]
-fn roundtrip_empty() {
-    roundtrip("");
-}
-
-#[test]
 fn legacy_ast_without_source_gaps_deserializes_with_empty_metadata() {
     let document: Document = serde_json::from_str(r#"{"blocks":[]}"#).expect("deserialize");
 

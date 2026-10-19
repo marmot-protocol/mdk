@@ -112,7 +112,7 @@ async fn mock_relay() -> (MockRelay, String) {
 }
 
 fn open_store(dir: &tempfile::TempDir, relay_url: &str) -> MarmotApp {
-    open_store_with_config(dir, relay_url, MarmotAppConfig::default())
+    open_store_with_config(dir, relay_url, MarmotAppConfig::white_noise())
 }
 
 fn open_store_with_config(
@@ -256,7 +256,8 @@ async fn stalled_bob_in_a_live_group(
     dir_bob: &tempfile::TempDir,
     dir_alice: &tempfile::TempDir,
 ) -> StalledGroup {
-    stalled_bob_in_a_live_group_with_config(dir_bob, dir_alice, MarmotAppConfig::default()).await
+    stalled_bob_in_a_live_group_with_config(dir_bob, dir_alice, MarmotAppConfig::white_noise())
+        .await
 }
 
 async fn stalled_bob_in_a_live_group_with_config(
@@ -584,7 +585,7 @@ async fn undecryptable_traffic_ingested_only_while_frozen_arms_on_the_next_advan
     let app_frozen = open_store_with_config(
         &dir_bob,
         &relay_url,
-        MarmotAppConfig::default().with_cursor_persistence(CursorPersistence::Frozen),
+        MarmotAppConfig::white_noise().with_cursor_persistence(CursorPersistence::Frozen),
     );
     let mut frozen = app_frozen.client("bob").await.unwrap();
     let created_at = test_unix_now_seconds();
@@ -923,8 +924,8 @@ async fn a_clean_recovery_reported_as_a_passage_ends_the_arm_run() {
 async fn escalation_from_completed_delivery_survives_later_sync_failure() {
     let dir_bob = tempfile::tempdir().unwrap();
     let dir_alice = tempfile::tempdir().unwrap();
-    let config =
-        MarmotAppConfig::default().with_dev_fail_sync_before_delivery(BACKFILL_THRESHOLD as u64);
+    let config = MarmotAppConfig::white_noise()
+        .with_dev_fail_sync_before_delivery(BACKFILL_THRESHOLD as u64);
     let mut live = stalled_bob_in_a_live_group_with_config(&dir_bob, &dir_alice, config).await;
 
     // Two prior arms establish one unrecovered run. Each burst has exactly the
@@ -969,8 +970,8 @@ async fn escalation_from_completed_delivery_survives_later_sync_failure() {
 async fn compatibility_sync_retains_escalation_after_failure() {
     let dir_bob = tempfile::tempdir().unwrap();
     let dir_alice = tempfile::tempdir().unwrap();
-    let config =
-        MarmotAppConfig::default().with_dev_fail_sync_before_delivery(BACKFILL_THRESHOLD as u64);
+    let config = MarmotAppConfig::white_noise()
+        .with_dev_fail_sync_before_delivery(BACKFILL_THRESHOLD as u64);
     let mut live = stalled_bob_in_a_live_group_with_config(&dir_bob, &dir_alice, config).await;
 
     for run in 0..(ESCALATION_ARM_THRESHOLD - 1) {
@@ -1031,7 +1032,7 @@ async fn compatibility_sync_retains_escalation_after_failure() {
 async fn escalation_survives_failed_projection_checkpoint() {
     let dir_bob = tempfile::tempdir().unwrap();
     let dir_alice = tempfile::tempdir().unwrap();
-    let config = MarmotAppConfig::default()
+    let config = MarmotAppConfig::white_noise()
         .with_dev_fail_sync_before_boundary_save(BACKFILL_THRESHOLD as u64);
     let mut live = stalled_bob_in_a_live_group_with_config(&dir_bob, &dir_alice, config).await;
 

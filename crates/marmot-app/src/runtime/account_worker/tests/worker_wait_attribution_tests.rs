@@ -88,7 +88,7 @@ async fn known_event_demand_runs_as_a_job_without_a_broad_request() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();

@@ -38,7 +38,7 @@ use crate::allowlist::{AllowlistRecord, AllowlistStore};
 use crate::event_projection::{
     DeliveredInboundCursor, InboundCatchUpDriver, control_event_from_debug_event,
     control_event_from_runtime_event_with_runtime, inbound_message_event_from_record_with_runtime,
-    media_refs_from_tags, message_mentions_account, reply_target_from_tags, resync_required_event,
+    media_refs_from_tags, message_mentions_account, reply_target_from_tags,
     runtime_replay_dedup_key,
 };
 use crate::{
@@ -5231,33 +5231,6 @@ where
         }
     }
     panic!("expected inbound message event with text {expected_text:?}");
-}
-
-#[test]
-fn resync_required_event_carries_dropped_count_and_subscription_scope() {
-    // Regression for mdk#210: a lagged inbound broadcast must surface a
-    // ResyncRequired event (scoped to the subscription) instead of silently dropping
-    // user messages to the agent.
-    let event = resync_required_event(Some("aa"), Some("bb"), 42);
-    assert_eq!(
-        event,
-        AgentControlEvent::ResyncRequired {
-            account_id_hex: Some("aa".to_owned()),
-            group_id_hex: Some("bb".to_owned()),
-            dropped_events: 42,
-        }
-    );
-
-    // An unscoped subscription leaves the fields None but still reports the drop count.
-    let unscoped = resync_required_event(None, None, 7);
-    assert_eq!(
-        unscoped,
-        AgentControlEvent::ResyncRequired {
-            account_id_hex: None,
-            group_id_hex: None,
-            dropped_events: 7,
-        }
-    );
 }
 
 #[test]

@@ -24,7 +24,7 @@ async fn open_suspension_root() -> (SuspensionRoot, GroupId) {
         &root,
         vec!["wss://suspension-engine.example".to_owned()],
         AccountHome::open(&root),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     )
     .unwrap()
     .with_test_relay_client(relay.clone());

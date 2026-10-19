@@ -263,7 +263,7 @@ async fn notification_loss_is_durable_and_survives_receiver_replacement() {
     let app = crate::MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://relay.example",
-        crate::MarmotAppConfig::default(),
+        crate::MarmotAppConfig::white_noise(),
     )
     .with_test_relay_client(relay);
     let mut client = client_on_app_relay_plane(&app, "alice").await;
@@ -392,7 +392,7 @@ async fn sdk_account_worker_reopens_after_notification_consumer_exit() {
     let app = crate::MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = crate::MarmotAppRuntime::new(app);
     runtime.reconcile_accounts().await.unwrap();
@@ -455,7 +455,7 @@ async fn sdk_account_worker_keeps_serving_through_notification_lag() {
     let app = crate::MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let storage = app.account_storage(&alice.label).unwrap().app_storage();
     let runtime = crate::MarmotAppRuntime::new(app);
@@ -548,7 +548,7 @@ async fn notification_lag_while_post_join_maintenance_is_live_stays_bounded() {
     let app = crate::MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let storage = app.account_storage(&alice.label).unwrap();
     let mut client = crate::tests::client_on_app_relay_plane(&app, &alice.label).await;
@@ -641,7 +641,7 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
         .create_account("alice")
         .unwrap();
     let account = MemberId::new(hex::decode(&alice.account_id_hex).unwrap());
-    let config = || crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let config = || crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
 
     // Before the upgrade: a group whose retained route has no switch time.
     {
@@ -718,7 +718,7 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
     use transport_nostr::{AccountDeliveryReceive, MarmotRelayPlane};
     let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
-    let config = || crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let config = || crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     let alice_dir = tempfile::tempdir().unwrap();
     let bob_dir = tempfile::tempdir().unwrap();
     marmot_account::AccountHome::open(alice_dir.path())

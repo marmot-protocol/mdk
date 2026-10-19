@@ -15,7 +15,7 @@ fn open(dir: &tempfile::TempDir, relay: &str) -> MarmotApp {
     MarmotApp::with_relay_and_config(
         dir.path(),
         relay.to_owned(),
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_relay_endpoints(true)
             .with_dev_settlement_quiescence_ms(0)
             .with_dev_scheduled_convergence_delay_ms(0),

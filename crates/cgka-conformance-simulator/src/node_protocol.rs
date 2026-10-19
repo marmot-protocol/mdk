@@ -364,7 +364,7 @@ impl NodeServer {
             &root,
             relay_urls.clone(),
             home,
-            MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+            MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
         )
         .map_err(app_node_error)?;
         let runtime = MarmotAppRuntime::new(app.clone());

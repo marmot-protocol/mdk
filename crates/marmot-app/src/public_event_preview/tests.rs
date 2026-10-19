@@ -758,7 +758,7 @@ fn relay_hints_pass_the_discovered_endpoint_safety_rule() {
     let app = MarmotApp::with_relays_and_config(
         dir.path(),
         vec!["wss://relay.example".to_owned()],
-        crate::MarmotAppConfig::default().with_open_ranking_provider(None, Vec::new()),
+        crate::MarmotAppConfig::white_noise().with_open_ranking_provider(None, Vec::new()),
     );
     let hints = [
         "ws://127.0.0.1:7777",

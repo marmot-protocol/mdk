@@ -112,7 +112,7 @@ async fn genuine_outgoing_upload_is_local_after_confirmed_send_and_restart() {
         let reopened = MarmotApp::with_relay_and_config(
             dir.path(),
             url,
-            MarmotAppConfig::default()
+            MarmotAppConfig::white_noise()
                 .with_allow_loopback_relay_endpoints(true)
                 .with_allow_loopback_blob_endpoints(true),
         );
@@ -209,7 +209,7 @@ fn outgoing_retained_subprocess_probe() {
     let app = MarmotApp::with_relay_and_config(
         probe["root"].as_str().unwrap(),
         "wss://relay.example",
-        MarmotAppConfig::default(),
+        MarmotAppConfig::white_noise(),
     );
     let runtime = MarmotAppRuntime::new(app);
     let group = GroupId::new(hex::decode(probe["group"].as_str().unwrap()).unwrap());

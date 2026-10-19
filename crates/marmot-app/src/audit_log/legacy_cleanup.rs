@@ -195,7 +195,7 @@ mod tests {
             root,
             Vec::new(),
             AccountHome::open(root),
-            MarmotAppConfig::default(),
+            MarmotAppConfig::white_noise(),
         )
     }
 
@@ -319,7 +319,7 @@ mod tests {
             root.path(),
             Vec::new(),
             home,
-            MarmotAppConfig::default(),
+            MarmotAppConfig::white_noise(),
         );
         assert_eq!(fs::read(file).unwrap(), b"OUTSIDE_LEASED_ROOT");
     }

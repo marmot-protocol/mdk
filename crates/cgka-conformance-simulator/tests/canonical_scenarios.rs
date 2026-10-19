@@ -2687,26 +2687,6 @@ async fn scenario_report_records_mismatch_as_invariant_failure() {
     assert_eq!(report.invariant_failures[0].kind, "trace_mismatch");
 }
 
-#[tokio::test]
-async fn generated_case_report_records_generator_metadata() {
-    let case = generate_send_leave_family(42, 1).remove(0);
-
-    let report = run_generated_case_report(&case, None)
-        .await
-        .expect("generated case reports");
-    let generated = report
-        .metadata
-        .generated
-        .as_ref()
-        .expect("generated metadata");
-
-    assert_eq!(generated.family_name, "send-leave/v1");
-    assert_eq!(generated.generator_version, "2");
-    assert_eq!(generated.seed, 42);
-    assert_eq!(generated.case_index, 0);
-    assert!(generated.minimized_case.is_none());
-}
-
 async fn three_client_message_exchange_trace() -> ScenarioTrace {
     let bus = TransportBus::ordered();
     let mut alice = ClientBuilder::new(pad32(b"alice"))

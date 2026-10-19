@@ -261,7 +261,7 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     let home = AccountHome::open(dir.path());
     let alice = home.create_account("alice").unwrap();
     let bob = home.create_account("bob").unwrap();
-    let config = crate::MarmotAppConfig::default()
+    let config = crate::MarmotAppConfig::white_noise()
         .with_allow_loopback_relay_endpoints(true)
         .with_dev_settlement_quiescence_ms(100)
         .with_dev_epoch_backfill_retry_backoff_ms(100);
@@ -1013,7 +1013,7 @@ async fn startup_comparison_waits_for_credit_before_reserving_retry() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url,
-        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     let pool = runtime
@@ -1055,7 +1055,7 @@ async fn startup_inline_wait_releases_unused_comparison_credit() {
     let account = AccountHome::open(dir.path())
         .create_account("inline startup")
         .unwrap();
-    let config = crate::MarmotAppConfig::default()
+    let config = crate::MarmotAppConfig::white_noise()
         .with_allow_loopback_relay_endpoints(true)
         .with_cursor_persistence(crate::CursorPersistence::Frozen);
     let initial_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
@@ -1156,7 +1156,7 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
     let account = AccountHome::open(dir.path())
         .create_account("cancel startup")
         .unwrap();
-    let config = crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let config = crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     let initial_app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config.clone());
     let initial = crate::MarmotAppRuntime::new(initial_app.clone());
     initial.reconcile_accounts().await.unwrap();
@@ -1483,7 +1483,7 @@ async fn unhydrated_durable_send_waits_for_safety_and_survives_terminal_close() 
     let account = AccountHome::open(dir.path())
         .create_account("unhydrated")
         .unwrap();
-    let normal = crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let normal = crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     let group = {
         let fixture = MarmotApp::with_relay_and_config(dir.path(), url.clone(), normal.clone());
         let mut client = fixture.client(&account.label).await.unwrap();

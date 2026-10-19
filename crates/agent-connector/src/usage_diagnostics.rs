@@ -130,7 +130,7 @@ pub async fn manage_usage_diagnostics(
         {
             let config = MarmotAppConfig {
                 usage_diagnostics_silent: true,
-                ..Default::default()
+                ..MarmotAppConfig::white_noise()
             };
             let app = MarmotApp::try_with_relays_and_account_home_and_config(
                 home,
@@ -156,7 +156,7 @@ mod tests {
             root.path(),
             vec![],
             marmot_account::AccountHome::open(root.path()),
-            MarmotAppConfig::default(),
+            MarmotAppConfig::white_noise(),
         )
         .unwrap();
         app.set_usage_diagnostics_consent(true).unwrap();
@@ -234,7 +234,7 @@ mod tests {
             marmot_account::AccountHome::open(home.path()),
             MarmotAppConfig {
                 usage_diagnostics_silent: true,
-                ..Default::default()
+                ..MarmotAppConfig::white_noise()
             },
         )
         .unwrap();

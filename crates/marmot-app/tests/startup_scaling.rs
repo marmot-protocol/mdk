@@ -48,7 +48,7 @@ fn open_store(dir: &tempfile::TempDir, relay_url: &str) -> MarmotApp {
     MarmotApp::with_relay_and_config(
         dir.path(),
         relay_url.to_owned(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     )
 }
 

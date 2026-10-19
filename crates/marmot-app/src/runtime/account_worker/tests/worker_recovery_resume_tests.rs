@@ -37,7 +37,7 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &url);
     let runtime = super::super::super::MarmotAppRuntime::new(app.clone());

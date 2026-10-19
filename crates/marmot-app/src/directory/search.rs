@@ -1651,7 +1651,7 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://relay.invalid",
-            crate::MarmotAppConfig::default().with_open_ranking_provider(None, Vec::new()),
+            crate::MarmotAppConfig::white_noise().with_open_ranking_provider(None, Vec::new()),
         );
         let account = app.account_home().create_account("alice").unwrap();
         app.directory_cache_for_account(&account)
@@ -1691,7 +1691,7 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://relay.invalid",
-            crate::MarmotAppConfig::default().with_open_ranking_provider(None, Vec::new()),
+            crate::MarmotAppConfig::white_noise().with_open_ranking_provider(None, Vec::new()),
         );
         let account = app.account_home().create_account("alice").unwrap();
         let cache = app.directory_cache_for_account(&account).unwrap();
@@ -1872,7 +1872,7 @@ mod tests {
     #[test]
     fn open_ranking_without_profile_relays_is_disabled_when_set_through_the_field() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = crate::MarmotAppConfig::default();
+        let mut config = crate::MarmotAppConfig::white_noise();
         config.deployment.open_ranking = Some(crate::OpenRankingProvider {
             search_endpoint: "https://rank.example".into(),
             profile_relays: vec!["  ".into()],
@@ -2568,7 +2568,7 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://relay.invalid",
-            crate::MarmotAppConfig::default()
+            crate::MarmotAppConfig::white_noise()
                 .with_directory_search_fallback_seeds(vec![seed.clone()])
                 .with_open_ranking_provider(None, Vec::new()),
         );
@@ -2630,7 +2630,7 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://relay.invalid",
-            crate::MarmotAppConfig::default()
+            crate::MarmotAppConfig::white_noise()
                 .with_directory_search_fallback_seeds(vec![seed.clone()])
                 .with_open_ranking_provider(None, Vec::new()),
         );

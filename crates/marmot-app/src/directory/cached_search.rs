@@ -164,7 +164,7 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://relay.invalid",
-            crate::MarmotAppConfig::default().with_open_ranking_provider(None, Vec::new()),
+            crate::MarmotAppConfig::white_noise().with_open_ranking_provider(None, Vec::new()),
         );
         let other = app.account_home().create_account("a-other").unwrap();
         let searcher = app.account_home().create_account("z-searcher").unwrap();
