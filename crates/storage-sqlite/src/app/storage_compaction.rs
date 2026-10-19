@@ -21,6 +21,8 @@ use crate::{SqliteAppStorage, SqliteResultExt};
 
 /// `PRAGMA auto_vacuum` value for incremental mode.
 const AUTO_VACUUM_INCREMENTAL: i64 = 2;
+/// Virtual machine steps between the `VACUUM`'s checks of the close latch.
+const CLOSE_POLL_OPS: std::ffi::c_int = 1_000;
 
 /// The account database's pages: its size, the part that is free, and
 /// whether freed pages can be returned without a full `VACUUM`.
@@ -90,6 +92,23 @@ impl SqliteAppStorage {
     /// compaction committed, and [`Self::truncate_wal`] finishes the job
     /// later.
     pub fn compact_database(&self) -> StorageResult<bool> {
+        self.compact_database_pausing(&|| {})
+    }
+
+    /// [`Self::compact_database`], calling `pause` with the connection held
+    /// between the closing check and the `VACUUM`. Test support only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn compact_database_pausing_for_test(&self, pause: &dyn Fn()) -> StorageResult<bool> {
+        self.compact_database_pausing(pause)
+    }
+
+    /// Whether a close of the account database has begun. Test support only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn is_closing_for_test(&self) -> bool {
+        self.connection.is_closing()
+    }
+
+    fn compact_database_pausing(&self, pause: &dyn Fn()) -> StorageResult<bool> {
         let conn = self.lock()?;
         if !conn.is_autocommit() {
             return Err(StorageError::Backend(
@@ -98,19 +117,24 @@ impl SqliteAppStorage {
         }
         // Best effort: the VACUUM writes into the WAL either way.
         let _ = truncate_wal_in(&conn);
-        // A close (a host about to suspend) must not wait out the copy: it
-        // interrupts it, and the interrupted VACUUM rolls back.
-        let _interruptible = self
-            .connection
-            .interrupt_on_close(conn.get_interrupt_handle());
         if self.connection.is_closing() {
             return Err(StorageError::Closed(
                 "database compaction cancelled by close".into(),
             ));
         }
+        pause();
+        // A close (a host about to suspend) must not wait out the copy, and
+        // may begin at any moment, even before the copy starts: the VACUUM
+        // polls the close latch as it runs, stops once a close has begun,
+        // and rolls back.
+        let closing = self.connection.closing_probe();
+        conn.progress_handler(CLOSE_POLL_OPS, Some(closing))
+            .storage()?;
         let vacuumed = conn
             .execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")
             .storage();
+        conn.progress_handler(CLOSE_POLL_OPS, None::<fn() -> bool>)
+            .storage()?;
         if vacuumed.is_err() {
             // Drop the pending mode change with the failed copy.
             let _ = conn.execute_batch("PRAGMA auto_vacuum=NONE;");
@@ -190,25 +214,6 @@ impl SqliteAppStorage {
         let _conn = self.lock().expect("account connection");
         let _ = held.send(());
         let _ = release.recv();
-    }
-
-    /// Holds the account connection the way a compaction does, interruptible
-    /// by a close, until a close begins: signals `started`, then runs short
-    /// queries until the connection is closing. Test support only.
-    pub fn hold_like_compaction_for_test(&self, started: &std::sync::mpsc::Sender<()>) {
-        let conn = self.lock().expect("account connection");
-        let _interruptible = self
-            .connection
-            .interrupt_on_close(conn.get_interrupt_handle());
-        let _ = started.send(());
-        while !self.connection.is_closing() {
-            let _ = conn.query_row(
-                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<100000)
-                 SELECT count(*) FROM c",
-                [],
-                |row| row.get::<_, i64>(0),
-            );
-        }
     }
 }
 

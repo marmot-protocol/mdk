@@ -1530,11 +1530,20 @@ async fn closing_storage_cuts_short_a_compaction_with_a_sweep_behind_it() {
     seed_file_backed(&app, &store, &[4u8; 4096]);
     let media = app.account_media_store("alice", &store).unwrap();
 
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (paused_tx, paused_rx) = std::sync::mpsc::channel();
     let compacting = store.app_storage();
-    let compaction =
-        std::thread::spawn(move || compacting.hold_like_compaction_for_test(&started_tx));
-    started_rx.recv().unwrap();
+    // A real compaction, paused after its closing check and before its copy:
+    // the close below begins in exactly that window.
+    let compaction = std::thread::spawn(move || {
+        let probe = compacting.clone();
+        compacting.compact_database_pausing_for_test(&|| {
+            let _ = paused_tx.send(());
+            while !probe.is_closing_for_test() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })
+    });
+    paused_rx.recv().unwrap();
     let sweep = std::thread::spawn(move || media.sweep(256));
     // Let the sweep take its lock and block on the held connection.
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1548,6 +1557,6 @@ async fn closing_storage_cuts_short_a_compaction_with_a_sweep_behind_it() {
         .recv_timeout(std::time::Duration::from_secs(20))
         .expect("close_storage finished without waiting out the compaction");
     assert!(closed.is_ok());
-    compaction.join().unwrap();
+    assert!(compaction.join().unwrap().is_err(), "the copy stopped");
     assert!(sweep.join().unwrap().is_err(), "the sweep failed as closed");
 }

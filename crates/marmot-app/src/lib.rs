@@ -6481,10 +6481,10 @@ impl MarmotApp {
                 storage
             })
             .collect::<Vec<_>>();
-        // Latch every database closed and interrupt a running compaction
-        // first: a media sweep waiting on a compacting account's connection
-        // holds its store's sweep lock, which the media close below takes.
-        // Interrupted, the VACUUM rolls back and the sweep fails as closed.
+        // Latch every database closed first: a media sweep waiting on a
+        // compacting account's connection holds its store's sweep lock, which
+        // the media close below takes. The VACUUM polls the latch, stops and
+        // rolls back, and the sweep then fails as closed.
         self.root_closers.begin_close_all();
         // Registered handles (media stores) close with the databases. Media
         // files hold no locks; closing stops media I/O at the same instant.

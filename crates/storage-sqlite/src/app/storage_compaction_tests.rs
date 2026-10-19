@@ -106,36 +106,6 @@ fn compaction_shrinks_the_file_and_then_reclaims_incrementally() {
     assert_eq!(fixture.marker(), "kept");
 }
 
-/// An interrupted compaction leaves the database as it was: same rows, same
-/// free pages, not incremental. A later attempt succeeds.
-#[test]
-fn an_interrupted_compaction_changes_nothing() {
-    let fixture = Fixture::new();
-    let app = fixture.store.app_storage();
-    fixture.fill_and_delete();
-    let before = fixture.space();
-
-    fixture
-        .store
-        .lock()
-        .unwrap()
-        .progress_handler(1_000, Some(|| true))
-        .unwrap();
-    assert!(app.compact_database().is_err());
-    fixture
-        .store
-        .lock()
-        .unwrap()
-        .progress_handler(1_000, None::<fn() -> bool>)
-        .unwrap();
-    assert_eq!(fixture.space(), before);
-    assert_eq!(fixture.marker(), "kept");
-
-    assert!(app.compact_database().unwrap());
-    assert!(fixture.space().incremental);
-    assert_eq!(fixture.marker(), "kept");
-}
-
 /// Compaction never runs inside a caller's transaction.
 #[test]
 fn compaction_is_refused_inside_a_transaction() {
@@ -146,53 +116,52 @@ fn compaction_is_refused_inside_a_transaction() {
     assert!(!fixture.space().incremental);
 }
 
-/// A close (a host about to suspend) does not wait out a compaction: it
-/// interrupts the `VACUUM`, which rolls back, and the reopened database is
-/// as it was.
+/// A close (a host about to suspend) does not wait out a compaction, even one
+/// that begins after the compaction checked for a close and before its
+/// `VACUUM` starts: the copy polls the close latch, stops, and rolls back.
+/// The reopened database is as it was, and compacts later.
 #[test]
-fn a_close_interrupts_a_running_compaction() {
+fn a_close_stops_a_compaction_that_has_not_started_copying() {
     let fixture = Fixture::new();
     fixture.fill_and_delete();
     let before = fixture.space();
-    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
-    // Slow the copy right down, so the close lands while it runs.
-    fixture
-        .store
-        .lock()
-        .unwrap()
-        .progress_handler(
-            100,
-            Some(move || {
-                let _ = started_tx.send(());
-                std::thread::sleep(std::time::Duration::from_millis(2));
-                false
-            }),
-        )
-        .unwrap();
+    let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
     let app = fixture.store.app_storage();
-    let compacting = std::thread::spawn(move || app.compact_database());
-    started_rx.recv().unwrap();
+    let compacting = std::thread::spawn(move || {
+        let probe = app.clone();
+        app.compact_database_pausing_for_test(&|| {
+            let _ = paused_tx.send(());
+            while !probe.is_closing_for_test() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })
+    });
+    paused_rx.recv().unwrap();
+    fixture.store.closer().begin_close();
     let closing = std::time::Instant::now();
+    assert!(compacting.join().unwrap().is_err(), "the copy stopped");
     fixture.store.close().unwrap();
-    assert!(
-        closing.elapsed() < std::time::Duration::from_secs(5),
-        "the close cut the copy short"
-    );
-    assert!(compacting.join().unwrap().is_err());
+    assert!(closing.elapsed() < std::time::Duration::from_secs(5));
 
     let key = SqlCipherKey::new(hex::encode([0x5c; 32])).unwrap();
     let reopened =
         SqliteAccountStorage::open_encrypted(fixture.dir.path().join("session.sqlite"), &key)
             .unwrap();
-    let space = reopened.app_storage().database_space().unwrap();
+    let app = reopened.app_storage();
+    let space = app.database_space().unwrap();
     assert!(!space.incremental);
     assert_eq!(space.free_pages, before.free_pages);
-    let marker: String = reopened
-        .lock()
-        .unwrap()
-        .query_row("SELECT value FROM compaction_marker", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(marker, "kept");
+    let marker = || -> String {
+        reopened
+            .lock()
+            .unwrap()
+            .query_row("SELECT value FROM compaction_marker", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(marker(), "kept");
+    assert!(app.compact_database().unwrap());
+    assert!(app.database_space().unwrap().incremental);
+    assert_eq!(marker(), "kept");
 }
 
 /// A reader on another connection (the account engine's) that holds an older

@@ -22,9 +22,10 @@ pub(crate) trait RootCloser: Send {
     /// last handle is being dropped on another thread.
     fn close(&self) -> Result<(), AppError>;
 
-    /// Start closing without waiting: refuse new work and cut short a long
-    /// operation (a database compaction) so nothing blocked behind it holds
-    /// up the rest of the teardown. [`Self::close`] still follows.
+    /// Start closing without waiting: refuse new work, which also stops a
+    /// long operation that polls for it (a database compaction), so nothing
+    /// blocked behind it holds up the rest of the teardown. [`Self::close`]
+    /// still follows.
     fn begin_close(&self) {}
 
     /// Whether the resource is gone, closed or dropped with its last handle,

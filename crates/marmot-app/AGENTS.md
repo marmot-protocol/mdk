@@ -83,7 +83,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   its maintenance tick, so none of its synchronous storage calls park an async thread on the held connection, and
   `Compacting` is served from a usage snapshot so hosts never wait on it. Afterwards `reclaim` runs after every
   migration batch and bulk removal. `close_storage` calls `begin_close` on every database before closing media stores:
-  a sweep blocked behind a compacting connection holds its store's sweep lock until the VACUUM is interrupted.
+  a sweep blocked behind a compacting connection holds its store's sweep lock until the VACUUM, which polls the close latch, stops.
 - `media/handoff.rs` owns handoff leases (mdk#2314 step 4): the only plaintext attachment files MDK writes, decrypted from a
   retained body (either layout) into `<account>/handoff/<lease>/<name>` for an OS surface that needs a real file.
   Register a lease before its directory exists, delete only on explicit release or by `wipe_stale` (worker start,
