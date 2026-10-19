@@ -7764,7 +7764,7 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://relay.example",
-            crate::MarmotAppConfig::default()
+            crate::MarmotAppConfig::white_noise()
                 .with_dev_settlement_quiescence_ms(100)
                 .with_dev_scheduled_convergence_delay_ms(60_000)
                 .with_dev_epoch_backfill_retry_backoff_ms(300_000),

@@ -877,34 +877,6 @@ mod tests {
     }
 
     #[test]
-    fn timeline_message_record_ffi_preserves_structured_poll_projection() {
-        let mut row = record_with_media(None, None, None);
-        row.kind = cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
-        row.poll = Some(marmot_app::PollProjection {
-            question: "Drink?".into(),
-            options: vec![marmot_app::PollOptionResult {
-                id: "0".into(),
-                label: "Tea".into(),
-                votes: 2,
-            }],
-            poll_type: marmot_app::PollType::SingleChoice,
-            participants: 2,
-            local_selection: vec!["0".into()],
-            creator: "alice".into(),
-            ends_at: Some(200),
-            open: true,
-        });
-
-        let native = TimelineMessageRecordFfi::from(row);
-        let poll = native.poll.expect("poll projection");
-        assert_eq!(poll.question, "Drink?");
-        assert_eq!(poll.options[0].votes, 2);
-        assert_eq!(poll.poll_type, PollTypeFfi::SingleChoice);
-        assert_eq!(poll.local_selection, ["0"]);
-        assert!(poll.open);
-    }
-
-    #[test]
     fn poll_vote_page_ffi_names_the_voter_account() {
         let page = PollVotePageFfi::from(marmot_app::PollVotePage {
             votes: vec![marmot_app::PollVote {

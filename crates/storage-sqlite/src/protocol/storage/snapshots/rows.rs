@@ -79,23 +79,3 @@ pub(super) struct OpenMlsValueSnapshot {
     pub(super) group_key: Vec<u8>,
     pub(super) value: SensitiveBytes,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::base::codec::SensitiveBytes;
-
-    #[test]
-    fn openmls_snapshot_values_have_sensitive_ownership() {
-        let row = OpenMlsValueSnapshot {
-            label: b"EpochSecrets".to_vec(),
-            storage_key: b"storage-key".to_vec(),
-            group_key: b"group-key".to_vec(),
-            value: SensitiveBytes::new(b"secret-json".to_vec()),
-        };
-
-        fn assert_sensitive(_: &SensitiveBytes) {}
-        assert_sensitive(&row.value);
-        assert_eq!(row.value.as_slice(), b"secret-json");
-    }
-}

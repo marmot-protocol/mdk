@@ -1336,24 +1336,6 @@ mod tests {
     }
 
     #[test]
-    fn group_leave_request_round_trips() {
-        let request = AgentControlEnvelope::new(
-            Some("leave-1".into()),
-            AgentControlRequest::GroupLeave {
-                account_id_hex: "ab".repeat(32),
-                group_id_hex: "cd".repeat(16),
-            },
-        );
-        let encoded = encode_frame(&request).unwrap();
-        let json: Value = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(json["type"], "group_leave");
-        assert_eq!(
-            decode_envelope::<AgentControlRequest>(&encoded).unwrap(),
-            request
-        );
-    }
-
-    #[test]
     fn group_profile_update_round_trips_partial_and_clear_fields() {
         for (name, description) in [
             (Some("New name".to_owned()), None),
@@ -2120,6 +2102,13 @@ mod tests {
                     group_id_hex: group(),
                 },
                 "group_info",
+            ),
+            (
+                AgentControlRequest::GroupLeave {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                },
+                "group_leave",
             ),
             (
                 AgentControlRequest::MaintenanceStatus {

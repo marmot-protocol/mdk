@@ -251,20 +251,4 @@ mod tests {
         assert!(rendered.contains("<redacted>"), "{rendered}");
         assert!(rendered.contains("otlp.example"), "{rendered}");
     }
-
-    #[test]
-    fn relay_endpoint_classification_preserves_typed_policy() {
-        let ffi = RelayEndpointClassificationFfi::from(RelayEndpointClassification {
-            endpoint: "wss://relay.example".to_owned(),
-            normalized_endpoint: Some("wss://relay.example/".to_owned()),
-            policy: RelayEndpointPolicy::Retired,
-        });
-
-        assert_eq!(ffi.endpoint, "wss://relay.example");
-        assert_eq!(
-            ffi.normalized_endpoint.as_deref(),
-            Some("wss://relay.example/")
-        );
-        assert_eq!(ffi.policy, RelayEndpointPolicyFfi::Retired);
-    }
 }

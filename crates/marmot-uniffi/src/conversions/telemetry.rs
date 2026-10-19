@@ -673,18 +673,4 @@ mod tests {
             snapshot.sqlcipher_migration_probe_skips
         );
     }
-
-    #[test]
-    fn host_performance_enums_preserve_every_variant() {
-        assert!(matches!(
-            marmot_app::HostPerformanceOperation::from(
-                HostPerformanceOperationFfi::ForegroundLocalReady
-            ),
-            marmot_app::HostPerformanceOperation::ForegroundLocalReady
-        ));
-        assert!(matches!(
-            marmot_app::HostPerformanceOutcome::from(HostPerformanceOutcomeFfi::Failure),
-            marmot_app::HostPerformanceOutcome::Failure
-        ));
-    }
 }

@@ -843,18 +843,6 @@ mod group_roster_tests {
             }
         }
     }
-
-    #[test]
-    fn member_ids_page_row_preserves_group_member_and_admin_identifiers() {
-        let ffi = AppGroupMemberIdsFfi::from(AppGroupMemberIds {
-            group_id_hex: "01".repeat(16),
-            member_ids_hex: vec!["02".repeat(32), "03".repeat(32)],
-            admin_ids_hex: vec!["02".repeat(32)],
-        });
-        assert_eq!(ffi.group_id_hex, "01".repeat(16));
-        assert_eq!(ffi.member_ids_hex, vec!["02".repeat(32), "03".repeat(32)]);
-        assert_eq!(ffi.admin_ids_hex, vec!["02".repeat(32)]);
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]

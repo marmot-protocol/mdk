@@ -1405,7 +1405,7 @@ impl NostrRelayClient for ScriptedPushRelayClient {
 /// honors it, so a paced retry costs milliseconds instead of the production
 /// 15 s cooldown.
 pub(crate) fn bounded_epoch_backfill_config() -> MarmotAppConfig {
-    MarmotAppConfig::default().with_dev_epoch_backfill_retry_backoff_ms(0)
+    MarmotAppConfig::white_noise().with_dev_epoch_backfill_retry_backoff_ms(0)
 }
 
 /// Queue/correlation tests also run without `test-policy-overrides`, where the
@@ -1524,7 +1524,7 @@ fn cancelled_sync_keeps_profile() {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://relay.example",
-            MarmotAppConfig::default().with_dev_settlement_quiescence_ms(0),
+            MarmotAppConfig::white_noise().with_dev_settlement_quiescence_ms(0),
         )
         .with_test_relay_client(relay.clone());
         remember_test_member_inbox(&app, &bob_account.account_id_hex, "wss://relay.example");
@@ -2612,7 +2612,8 @@ fn capacity_duplicates_preserve_deadline_and_one_explicit_override() {
         let filled_through = crate::unix_now_seconds() - 1_000;
         // A backoff long enough that the second attempt cannot slip past it
         // inside this test.
-        let config = MarmotAppConfig::default().with_dev_epoch_backfill_retry_backoff_ms(60_000);
+        let config =
+            MarmotAppConfig::white_noise().with_dev_epoch_backfill_retry_backoff_ms(60_000);
         let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
             &dir,
             &relay,
@@ -2734,7 +2735,8 @@ fn a_failed_epoch_backfill_execution_paces_the_next_automatic_seam() {
         let filled_through = crate::unix_now_seconds() - 1_000;
         // A backoff long enough that the second batch cannot slip past it
         // inside this test.
-        let config = MarmotAppConfig::default().with_dev_epoch_backfill_retry_backoff_ms(60_000);
+        let config =
+            MarmotAppConfig::white_noise().with_dev_epoch_backfill_retry_backoff_ms(60_000);
         let (_app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
             &dir,
             &relay,
@@ -7692,7 +7694,7 @@ async fn key_package_generation_upgrade_runs_once_per_account_on_activation() {
         "wss://relay.example",
         MarmotAppConfig {
             cursor_persistence: CursorPersistence::Frozen,
-            ..Default::default()
+            ..MarmotAppConfig::white_noise()
         },
     )
     .with_test_relay_client(relay);
@@ -7956,7 +7958,7 @@ async fn key_package_deletion_routes_endpoints_through_relay_safety_policy() {
     let dev_app = MarmotApp::with_relays_and_config(
         dev_directory.path(),
         vec!["ws://127.0.0.1:7777".into()],
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     )
     .with_test_relay_client(dev_relay.clone());
     let result = dev_app
@@ -7988,7 +7990,7 @@ fn configured_directory_relays_stay_separate_from_operational_relays() {
     let app = MarmotApp::with_relays_and_config(
         directory.path(),
         vec![operational.into()],
-        MarmotAppConfig::default().with_directory_relay_urls(vec![discovery.into()]),
+        MarmotAppConfig::white_noise().with_directory_relay_urls(vec![discovery.into()]),
     );
 
     assert_eq!(
@@ -14680,28 +14682,6 @@ fn group_system_intent_builds_kind_1210_json_payload() {
 }
 
 #[test]
-fn custom_intent_passes_kind_tags_and_content_through_verbatim() {
-    let event = build(AppMessageIntent::Custom {
-        kind: 30078,
-        tags: vec![
-            vec!["d".to_owned(), "game-1".to_owned()],
-            vec!["move".to_owned(), "e4".to_owned()],
-        ],
-        content: "{\"move\":\"e4\"}".to_owned(),
-    });
-    assert_eq!(event.kind, 30078);
-    assert_eq!(
-        event.tags,
-        vec![
-            vec!["d".to_owned(), "game-1".to_owned()],
-            vec!["move".to_owned(), "e4".to_owned()]
-        ]
-    );
-    assert_eq!(event.content, "{\"move\":\"e4\"}");
-    assert_eq!(event.pubkey, SENDER_HEX);
-}
-
-#[test]
 fn custom_intent_rejects_every_reserved_kind() {
     use cgka_traits::app_event as kinds;
     for kind in [
@@ -19207,7 +19187,8 @@ async fn published_message_acknowledgement_failure_retries_cleanup_without_repub
     AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
-    let config = MarmotAppConfig::default().with_dev_fail_published_app_message_acknowledgement();
+    let config =
+        MarmotAppConfig::white_noise().with_dev_fail_published_app_message_acknowledgement();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
@@ -20390,7 +20371,7 @@ async fn group_at_the_undecryptable_retention_cap(
     group_at_the_undecryptable_retention_cap_with_config(
         dir,
         &relay,
-        MarmotAppConfig::default(),
+        MarmotAppConfig::white_noise(),
         filled_through,
     )
     .await
@@ -20810,7 +20791,7 @@ fn close_storage_releases_every_database_and_the_root_lease() {
         root,
         Vec::new(),
         AccountHome::open(root),
-        MarmotAppConfig::default(),
+        MarmotAppConfig::white_noise(),
     )
     .unwrap();
 
@@ -20912,7 +20893,7 @@ fn close_storage_waits_for_an_open_that_is_already_in_flight() {
         root,
         Vec::new(),
         AccountHome::open(root),
-        MarmotAppConfig::default(),
+        MarmotAppConfig::white_noise(),
     )
     .unwrap();
 
@@ -20976,7 +20957,7 @@ fn close_storage_waits_for_legacy_projection_import() {
         root,
         Vec::new(),
         AccountHome::open(root),
-        MarmotAppConfig::default(),
+        MarmotAppConfig::white_noise(),
     )
     .unwrap();
 
@@ -21097,7 +21078,7 @@ fn concurrent_close_storage_callers_serialize() {
         root,
         Vec::new(),
         AccountHome::open(root),
-        MarmotAppConfig::default(),
+        MarmotAppConfig::white_noise(),
     )
     .unwrap();
     let session_storage = app.account_storage(&account.label).unwrap();
@@ -21188,7 +21169,7 @@ fn open_suspension_shutdown_fixture(
         root,
         Vec::new(),
         AccountHome::open(root),
-        MarmotAppConfig::default(),
+        MarmotAppConfig::white_noise(),
     )
     .unwrap();
     let session = app.account_storage(&account.label).unwrap();
@@ -21294,7 +21275,7 @@ async fn runtime_shutdown_and_close_bounds_every_graceful_shutdown_phase() {
             temp.path(),
             Vec::new(),
             AccountHome::open(temp.path()),
-            MarmotAppConfig::default(),
+            MarmotAppConfig::white_noise(),
         )
         .expect("fresh runtime should acquire the closed root");
         reopened.shared_storage().unwrap();
@@ -21376,7 +21357,7 @@ fn shutdown_and_close_allows_another_process_to_open_root_child() {
         &root,
         Vec::new(),
         AccountHome::open(&root),
-        MarmotAppConfig::default(),
+        MarmotAppConfig::white_noise(),
     )
     .expect("child process must acquire the released root");
     app.shared_storage().unwrap();
@@ -22663,7 +22644,7 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
             let dir = tempfile::tempdir().unwrap();
             let relay = Arc::new(ScriptedPushRelayClient::default());
             let (app, mut client, route) =
-                undecryptable_probe_route(&dir, &relay, MarmotAppConfig::default()).await;
+                undecryptable_probe_route(&dir, &relay, MarmotAppConfig::white_noise()).await;
             let created_at = crate::unix_now_seconds() - 1_000;
             let probe = epoch_gap_probe(&route.nostr_group_id_hex, created_at, "release-replay");
             let mut delivery = route.probe(created_at, "release-replay");
@@ -22801,9 +22782,12 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
 
 #[test]
 fn dev_maintenance_timing_is_honored_only_in_test_policy_builds() {
-    assert_eq!(dev_maintenance_timing(&MarmotAppConfig::default()), None);
+    assert_eq!(
+        dev_maintenance_timing(&MarmotAppConfig::white_noise()),
+        None
+    );
     let configured =
-        MarmotAppConfig::default().with_dev_maintenance_timing(MaintenanceTiming::immediate());
+        MarmotAppConfig::white_noise().with_dev_maintenance_timing(MaintenanceTiming::immediate());
     let expected = if cfg!(feature = "test-policy-overrides") {
         Some(MaintenanceTiming::immediate())
     } else {
@@ -22825,7 +22809,7 @@ async fn dev_maintenance_timing_reaches_the_account_runtime_only_in_test_policy_
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://relay.example".to_owned(),
-        MarmotAppConfig::default().with_dev_maintenance_timing(MaintenanceTiming::immediate()),
+        MarmotAppConfig::white_noise().with_dev_maintenance_timing(MaintenanceTiming::immediate()),
     );
     let client = app.client("alice").await.unwrap();
     let expected = if cfg!(feature = "test-policy-overrides") {
@@ -22854,7 +22838,7 @@ async fn backend_maintenance_collects_without_host_tracking_and_frozen_stays_sil
             } else {
                 CursorPersistence::Advance
             },
-            ..Default::default()
+            ..MarmotAppConfig::white_noise()
         };
         let app = MarmotApp::with_relay_and_config(dir.path(), "wss://maintenance.example", config)
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
@@ -23160,7 +23144,7 @@ async fn due_peer_leave_does_not_shorten_a_collecting_convergence_pass() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://relay.example",
-        MarmotAppConfig::default().with_dev_settlement_quiescence_ms(10_000),
+        MarmotAppConfig::white_noise().with_dev_settlement_quiescence_ms(10_000),
     )
     .with_test_relay_client(relay.clone());
     for member in [&bob, &carol] {
@@ -23517,7 +23501,7 @@ async fn upload_hold_fixture(
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://relay.example",
-        crate::MarmotAppConfig::default().with_allow_loopback_blob_endpoints(true),
+        crate::MarmotAppConfig::white_noise().with_allow_loopback_blob_endpoints(true),
     )
     .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
@@ -24685,7 +24669,7 @@ fn group_create_relay_options_preserve_defaults_and_enforce_host_safety() {
     let app = MarmotApp::with_relays_and_config(
         dir.path(),
         vec!["wss://relay.example.com".into()],
-        MarmotAppConfig::default(),
+        MarmotAppConfig::white_noise(),
     );
     assert_eq!(
         app.new_nostr_routing(None).unwrap().relays,

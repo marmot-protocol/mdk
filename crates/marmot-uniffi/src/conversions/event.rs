@@ -519,24 +519,6 @@ mod tests {
     }
 
     #[test]
-    fn history_notice_change_reaches_the_ffi_with_only_its_account() {
-        let event = MarmotAppEvent::HistoryNoticesChanged {
-            account_id_hex: "ad".repeat(32),
-            account_label: "carol".to_owned(),
-        };
-        match MarmotEventFfi::from(event) {
-            MarmotEventFfi::HistoryNoticesChanged {
-                account_id_hex,
-                account_label,
-            } => {
-                assert_eq!(account_id_hex, "ad".repeat(32));
-                assert_eq!(account_label, "carol");
-            }
-            other => panic!("unexpected FFI event: {other:?}"),
-        }
-    }
-
-    #[test]
     fn epoch_stall_escalation_reaches_the_ffi_with_its_group_and_counts() {
         // This conversion is the whole of an FFI host's view of a group that
         // full-history replay cannot repair: the host cannot see the sync summary

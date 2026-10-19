@@ -3,7 +3,8 @@ use storage_sqlite::SqliteAppStorage;
 
 #[test]
 fn attachment_capacity_reserves_disk_overhead_and_never_evicts() {
-    let p = super::super::super::attachment_controls::default_policy(&MarmotAppConfig::default());
+    let p =
+        super::super::super::attachment_controls::default_policy(&MarmotAppConfig::white_noise());
     assert_eq!(p.retained_bytes, 2 * 1024 * 1024 * 1024);
     assert_eq!(p.disk_reserve, 256 * 1024 * 1024);
     assert_eq!(p.transfer_limit, 64 * 1024 * 1024);
@@ -46,8 +47,9 @@ fn readmission_threshold_agrees_with_worker_admission() {
     let mib = 1024 * 1024;
     let slack = media_store::CHECKPOINT_APPEND_MAX as u64;
     for limit in [mib, 3 * mib, 64 * mib] {
-        let mut policy =
-            super::super::super::attachment_controls::default_policy(&MarmotAppConfig::default());
+        let mut policy = super::super::super::attachment_controls::default_policy(
+            &MarmotAppConfig::white_noise(),
+        );
         policy.transfer_limit = limit;
         policy.disk_reserve = 7 * mib;
         for available in [
@@ -224,7 +226,7 @@ async fn offline_fixture() -> (
         "wss://relay.example",
         MarmotAppConfig {
             attachment_acquisition: Some(crate::AttachmentAcquisitionPolicy::default()),
-            ..Default::default()
+            ..MarmotAppConfig::white_noise()
         },
     )
     .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
@@ -319,7 +321,7 @@ async fn download_without_engine_and_retain(
         MarmotAppConfig {
             attachment_acquisition: Some(crate::AttachmentAcquisitionPolicy::default()),
             allow_loopback_blob_endpoints: true,
-            ..Default::default()
+            ..MarmotAppConfig::white_noise()
         },
     )
     .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
@@ -786,7 +788,7 @@ fn attachment_explicit_retry_derives_an_uncached_source_epoch_key() {
             MarmotAppConfig {
                 attachment_acquisition: Some(crate::AttachmentAcquisitionPolicy::default()),
                 allow_loopback_blob_endpoints: true,
-                ..Default::default()
+                ..MarmotAppConfig::white_noise()
             },
         )
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
@@ -1051,7 +1053,11 @@ async fn attachment_restart_reclaims_inflight_and_late_publication_cannot_win() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_on() {
-    assert!(MarmotAppConfig::default().attachment_acquisition.is_some());
+    assert!(
+        MarmotAppConfig::white_noise()
+            .attachment_acquisition
+            .is_some()
+    );
     let (_dir, client, storage, _) = offline_fixture().await;
     let now = crate::unix_now_seconds();
     let entry = storage
@@ -1407,7 +1413,7 @@ async fn promoted_attempt_survives_automatic_revocation_without_extending_lease(
         "wss://relay.example",
         MarmotAppConfig {
             attachment_acquisition_mode: crate::AttachmentAcquisitionMode::HostManaged,
-            ..Default::default()
+            ..MarmotAppConfig::white_noise()
         },
     );
     let runtime = crate::MarmotAppRuntime::new(app.clone());

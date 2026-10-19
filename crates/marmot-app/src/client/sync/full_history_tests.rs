@@ -21,7 +21,7 @@ fn fixture_with_relays(
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relays_and_config(dir.path(), relays, MarmotAppConfig::default())
+    let app = MarmotApp::with_relays_and_config(dir.path(), relays, MarmotAppConfig::white_noise())
         .with_test_relay_client(relay.clone());
     (dir, app, relay)
 }

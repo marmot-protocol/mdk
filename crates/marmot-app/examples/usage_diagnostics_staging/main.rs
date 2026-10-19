@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         home.path(),
         Vec::new(),
         marmot_account::AccountHome::open(home.path()),
-        MarmotAppConfig::default(),
+        MarmotAppConfig::white_noise(),
     )?;
     let runtime = app.runtime();
     runtime.set_product_analytics_runtime_config(ProductAnalyticsRuntimeConfig {

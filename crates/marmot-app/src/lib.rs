@@ -1667,7 +1667,7 @@ impl MarmotApp {
         Self::with_relays_and_config(
             root,
             relay_urls,
-            MarmotAppConfig::default()
+            MarmotAppConfig::white_noise()
                 .with_allow_loopback_relay_endpoints(true)
                 .with_open_ranking_provider(None, Vec::new()),
         )
@@ -1771,7 +1771,7 @@ impl MarmotApp {
             root,
             relay_urls,
             account_home,
-            MarmotAppConfig::default(),
+            MarmotAppConfig::white_noise(),
         )
     }
 

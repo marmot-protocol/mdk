@@ -357,7 +357,7 @@ async fn running_runtime_pushes_to_default_telemetry_endpoint_when_runtime_endpo
 
     let tmp = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
-    let config = MarmotAppConfig::default()
+    let config = MarmotAppConfig::white_noise()
         .with_service_endpoints(MarmotServiceEndpoints {
             relay_telemetry_otlp_endpoint: Some(format!("http://{addr}/v1/metrics")),
             audit_log_tracker_endpoint: None,

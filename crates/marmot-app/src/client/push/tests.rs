@@ -75,7 +75,7 @@ async fn push_batch_case(
     let app = MarmotApp::with_relays_and_config(
         home.path(),
         vec![url.clone()],
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let mut client = app.client("alice").await.unwrap();
     let group = client.create_group("push batch", &[]).await.unwrap();

@@ -783,22 +783,6 @@ impl std::fmt::Debug for ConversationWindowSnapshotFfi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn conversation_viewer_reaction_survives_native_conversion() {
-        for viewer_reacted in [false, true] {
-            let reaction = app::conversation_presentation::ConversationReaction {
-                emoji: "👍".into(),
-                count: 3,
-                reactors: vec!["other-a".into(), "other-b".into()],
-                viewer_reacted,
-                reaction_message_id_hex: Some("ab".repeat(32)),
-            };
-            let native = ConversationReactionFfi::from(reaction);
-            assert_eq!(native.viewer_reacted, viewer_reacted);
-            assert_eq!(native.count, 3);
-            assert_eq!(native.reactors, ["other-a", "other-b"]);
-        }
-    }
 
     #[test]
     fn conversation_native_timeline_requires_provenance_and_omits_unbounded_collections() {

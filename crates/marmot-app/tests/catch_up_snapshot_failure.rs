@@ -17,7 +17,7 @@ async fn explicit_catch_up_syncs_when_group_read_snapshot_fails() {
         .create_account("snapshot-failure")
         .unwrap();
 
-    let config = MarmotAppConfig::default()
+    let config = MarmotAppConfig::white_noise()
         .with_allow_loopback_relay_endpoints(true)
         .with_dev_force_group_read_snapshot_failure(true);
     let app = MarmotApp::with_relay_and_config(dir.path(), relay_url, config);

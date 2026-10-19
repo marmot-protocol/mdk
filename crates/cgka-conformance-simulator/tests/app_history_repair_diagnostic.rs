@@ -243,7 +243,7 @@ async fn retained_history_repair_diagnostic() {
     let app = marmot_app::MarmotApp::with_relay_and_config(
         &root,
         endpoint.to_owned(),
-        marmot_app::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        marmot_app::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = marmot_app::MarmotAppRuntime::new(app);
     runtime.start().await.unwrap();
