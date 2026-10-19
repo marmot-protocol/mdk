@@ -534,6 +534,10 @@ pub struct MarmotApp {
     /// cached storage handle. Its in-flight set and sweep cursor are per
     /// instance, so every caller shares this one.
     account_media_stores: Arc<Mutex<HashMap<String, AccountMediaStore>>>,
+    /// What this process's legacy attachment migration batches saw, per
+    /// account (mdk#2314 step 6). Dropped with the account's media store.
+    legacy_media_migrations:
+        Arc<Mutex<HashMap<String, media::legacy_migration::SharedLegacyMigration>>>,
     /// Closers for handles outside the storage caches; `close_storage` runs
     /// them all.
     close_registry: Arc<close_registry::CloseRegistry>,
@@ -1703,6 +1707,7 @@ impl MarmotApp {
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_media_stores: Arc::new(Mutex::new(HashMap::new())),
+            legacy_media_migrations: Arc::default(),
             close_registry: Default::default(),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
@@ -1803,6 +1808,7 @@ impl MarmotApp {
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
             account_media_stores: Arc::new(Mutex::new(HashMap::new())),
+            legacy_media_migrations: Arc::default(),
             close_registry: Default::default(),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
@@ -6482,6 +6488,10 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        self.legacy_media_migrations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let directory_caches = self
             .directory_caches
             .lock()
@@ -6586,6 +6596,20 @@ impl MarmotApp {
             ));
         }
         self.audit_export_lifecycle.admit(attempt, work).transpose()
+    }
+
+    /// This process's record of the account's legacy attachment migration
+    /// (mdk#2314 step 6), shared by the worker's batches and usage reads.
+    pub(crate) fn legacy_media_migration(
+        &self,
+        label: &str,
+    ) -> media::legacy_migration::SharedLegacyMigration {
+        self.legacy_media_migrations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(label.to_owned())
+            .or_default()
+            .clone()
     }
 
     /// The account's encrypted media store over `storage`, the caller's
@@ -7403,6 +7427,10 @@ impl MarmotApp {
             stores.remove(label);
             self.close_registry.close(&media_close_key(label));
         }
+        self.legacy_media_migrations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(label);
         self.directory_caches
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -8360,8 +8388,8 @@ pub use runtime::{
     RetainedAttachmentAsset, RuntimeAttachmentTransferSubscription,
 };
 pub use runtime::{
-    AttachmentStorageUsage, ChatAttachmentUsage, ChatUsageCursor, RetainedAttachmentSummary,
-    RetainedSizeCursor,
+    AttachmentMigrationState, AttachmentStorageUsage, ChatAttachmentUsage, ChatUsageCursor,
+    RetainedAttachmentSummary, RetainedSizeCursor,
 };
 
 pub use runtime::{

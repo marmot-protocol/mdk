@@ -56,6 +56,13 @@ impl DiskPolicy {
         body
     }
 
+    /// Bytes moving a `body`-byte legacy database body into the store
+    /// writes: its store file. The database rows it came from are deleted
+    /// afterwards, so they free nothing on the volume until compaction.
+    pub fn migration_need(body: u64) -> u64 {
+        body
+    }
+
     /// The inverse of [`Self::download_need`]: the fewest checkpointed bytes
     /// with which a download of `body` bytes still writes at most
     /// `available`, or `None` when even a complete checkpoint leaves too

@@ -267,7 +267,10 @@ pub(super) fn read(
             continue;
         }
         if start > next || bytes.is_empty() || bytes.len() > ATTACHMENT_STAGING_CHUNK_BYTES {
-            return Err(invalid("invalid retained attachment chunks"));
+            // Completed chunks are immutable: this never repairs itself.
+            return Err(StorageError::InvalidAttachmentBody(
+                "invalid retained attachment chunks",
+            ));
         }
         let take = (end - next).min(start + bytes.len() - next);
         result.extend_from_slice(&bytes[next - start..next - start + take]);
@@ -277,7 +280,9 @@ pub(super) fn read(
         }
     }
     if next != end {
-        return Err(invalid("retained attachment chunks truncated"));
+        return Err(StorageError::InvalidAttachmentBody(
+            "retained attachment chunks truncated",
+        ));
     }
     Ok(Some(result))
 }
