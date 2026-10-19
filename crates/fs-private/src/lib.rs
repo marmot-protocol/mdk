@@ -287,9 +287,9 @@ impl PreparedDirectory {
 /// complete authorized path (or deepest complete existing ancestor) with
 /// `O_NOFOLLOW_ANY`, then operate descriptor-relative below that anchor. This
 /// avoids independently opening sandbox-managed ancestors such as `/private`
-/// and `/private/var` on physical iOS. Android anchors below the ancestors its
-/// app sandbox refuses to open, including `/`. Other Unix platforms retain the
-/// component-by-component descriptor walk from `/` or `.`.
+/// and `/private/var` on physical iOS. Android and OpenBSD anchor below ancestors
+/// their sandbox refuses to open, including `/`. Other Unix platforms retain
+/// the component-by-component descriptor walk from `/` or `.`.
 #[cfg(unix)]
 pub fn prepare_directory_path(
     path: &Path,
@@ -365,9 +365,9 @@ pub fn prepare_directory_path(
 
     #[cfg(target_vendor = "apple")]
     let (mut current, components, mut current_path) = open_apple_authorized_ancestor(path)?;
-    // An Android app domain is denied opening `/` and the private root's
-    // system-owned parents, so the walk has to anchor deeper.
-    #[cfg(target_os = "android")]
+    // Android denies private-root ancestors; OpenBSD unveil hides them.
+    // Start at an authorized directory, then keep the descriptor-relative walk.
+    #[cfg(any(target_os = "android", target_os = "openbsd"))]
     let (mut current, mut current_path): (OwnedFd, PathBuf) = {
         let start = if path.is_absolute() {
             Path::new("/")
@@ -383,10 +383,14 @@ pub fn prepare_directory_path(
             open_walk_anchor(start, &components, |prefix| options.open(prefix)).map_err(
                 |error| io_context("locate openable directory-walk anchor", path, error),
             )?;
+        #[cfg(target_os = "openbsd")]
+        if depth > 0 {
+            verify_unveil_anchor(&anchor, &directory)?;
+        }
         components.drain(..depth);
         (directory.into(), anchor)
     };
-    #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
+    #[cfg(not(any(target_vendor = "apple", target_os = "android", target_os = "openbsd")))]
     let (mut current, mut current_path): (OwnedFd, PathBuf) = {
         let start = if path.is_absolute() {
             Path::new("/")
@@ -557,11 +561,14 @@ pub fn prepare_directory_path(
 /// denies, as its component depth, opened value, and path.
 ///
 /// Probing continues past denied prefixes and stops at the first missing one.
+/// OpenBSD also hides denied prefixes as ENOENT: before any directory opens,
+/// continue probing to find an unveiled anchor. Missing children below that
+/// anchor still stop the probe and are created descriptor-relative.
 /// Every other rejection fails the lookup instead of descending: `O_NOFOLLOW`
 /// only guards a path's final component, so skipping a symlinked prefix would
 /// let the next, deeper probe resolve through that symlink and anchor outside
 /// the intended tree.
-#[cfg(all(unix, any(target_os = "android", test)))]
+#[cfg(all(unix, any(target_os = "android", target_os = "openbsd", test)))]
 fn open_walk_anchor<T>(
     root: &Path,
     components: &[std::ffi::OsString],
@@ -581,6 +588,8 @@ fn open_walk_anchor<T>(
             // A denied ancestor is the only obstacle this anchor exists for,
             // so keep descending but drop the candidates above it.
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => anchor = None,
+            #[cfg(target_os = "openbsd")]
+            Err(error) if error.kind() == io::ErrorKind::NotFound && anchor.is_none() => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => break,
             // A symlinked prefix reports ELOOP or ENOTDIR depending on the
             // platform, and a non-directory prefix is unusable either way.
@@ -599,6 +608,40 @@ fn open_walk_anchor<T>(
             "every candidate prefix was denied",
         )
     })
+}
+
+/// Reject an anchor reached through a symlink unveil hid from the probe.
+///
+/// unveil reports a hidden symlink as ENOENT, but a deeper probe follows it as
+/// an intermediate component: `/tmp/alias/allowed` opens `/tmp/real/allowed`.
+/// The anchor must resolve to its own path, and that path must still name the
+/// opened directory, so a prefix swapped after the open is caught too.
+#[cfg(target_os = "openbsd")]
+fn verify_unveil_anchor(anchor: &Path, opened: &std::fs::File) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let expected = match anchor.strip_prefix(".") {
+        Ok(relative) => std::env::current_dir()?.join(relative),
+        Err(_) => anchor.to_owned(),
+    };
+    let resolved = std::fs::canonicalize(anchor)
+        .map_err(|error| io_context("resolve directory-walk anchor", anchor, error))?;
+    if resolved != expected {
+        return Err(untrusted_alias(
+            anchor,
+            "an unveil-hidden prefix is a symlink",
+        ));
+    }
+
+    let held = opened.metadata()?;
+    let named = std::fs::metadata(&resolved)?;
+    if (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+        return Err(untrusted_alias(
+            anchor,
+            "the path changed after it was opened",
+        ));
+    }
+    Ok(())
 }
 
 /// Ids whose writes a private artifact path already trusts because they outrank
@@ -1878,6 +1921,65 @@ mod unix_tests {
             anchor.expect("anchor below the blocked ancestor"),
             (3, inner)
         );
+    }
+
+    #[cfg(target_os = "openbsd")]
+    #[test]
+    fn unveil_directory_walk() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+
+        let Some(root) = std::env::var_os("FS_PRIVATE_UNVEIL_ROOT") else {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("allowed");
+            let outside = dir.path().join("outside");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            symlink(&outside, root.join("escape")).unwrap();
+            // An alias above the unveiled root: hidden itself, but a deeper
+            // probe resolves through it to the unveiled directory.
+            symlink(dir.path(), dir.path().join("alias")).unwrap();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "unix_tests::unveil_directory_walk",
+                    "--nocapture",
+                ])
+                .env("FS_PRIVATE_UNVEIL_ROOT", &root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "unveiled directory creation failed");
+            assert!(!outside.join("leaf").exists());
+            assert!(!root.join("aliased").exists());
+            return;
+        };
+        let root = Path::new(&root);
+        let croot = CString::new(root.as_os_str().as_bytes()).unwrap();
+        unsafe {
+            assert_eq!(libc::unveil(croot.as_ptr(), c"rwc".as_ptr()), 0);
+            assert_eq!(libc::unveil(std::ptr::null(), std::ptr::null()), 0);
+        }
+        assert_eq!(
+            std::fs::File::open("/").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let leaf = root.join("new/leaf");
+        prepare_directory_path(&leaf, 0o700, ExistingDirectoryMode::Enforce).unwrap();
+        assert_eq!(mode_of(&leaf), 0o700);
+        write_private(&leaf.join("secret"), b"private").unwrap();
+        assert_eq!(std::fs::read(leaf.join("secret")).unwrap(), b"private");
+        assert!(
+            prepare_directory_path(
+                &root.join("escape/leaf"),
+                0o700,
+                ExistingDirectoryMode::Enforce,
+            )
+            .is_err()
+        );
+        let aliased = root.parent().unwrap().join("alias/allowed/aliased");
+        assert!(prepare_directory_path(&aliased, 0o700, ExistingDirectoryMode::Enforce).is_err());
     }
 
     #[test]

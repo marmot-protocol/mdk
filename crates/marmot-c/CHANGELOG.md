@@ -64,6 +64,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   changes a row's transfer state as soon as the engine reports it; progress-only
   replacements still arrive at most four per second. A timeout no longer loses
   a replacement that was waiting out that window (#2157).
+- On OpenBSD, `c-bindings.sh` builds SQLCipher without `mlock` and with
+  concealed allocations, so hosts can run under `pledge(2)`. Other platforms
+  are unchanged.
 
 ## [0.13.0] - 2026-10-12
 

@@ -20,6 +20,14 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     export CARGO_PROFILE_RELEASE_STRIP=none
 fi
 
+# pledge forbids mlock/munlock. OpenBSD concealed allocations exclude SQLite
+# buffers from core dumps and wipe them on free; realloc preserves concealment.
+# These flags affect only SQLCipher, not other C dependencies. Page residency
+# is not guaranteed: swap protection follows the host's encryption policy.
+if [[ "$(uname -s)" == "OpenBSD" ]]; then
+    export LIBSQLITE3_FLAGS="${LIBSQLITE3_FLAGS:+$LIBSQLITE3_FLAGS }-DOMIT_MEMLOCK -Dmalloc=malloc_conceal -Dcalloc=calloc_conceal"
+fi
+
 CRATE_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_DIR="$(cd "$CRATE_DIR/../.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-$WORKSPACE_DIR/target}"
