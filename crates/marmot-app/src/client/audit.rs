@@ -932,4 +932,30 @@ mod tests {
             vec![VALID.to_string(), upper]
         );
     }
+
+    #[test]
+    fn sticker_send_is_a_local_human_action() {
+        use crate::messages::AppMessageIntent;
+
+        let sticker = AppMessageIntent::Sticker {
+            sticker_ref: crate::AppStickerRef {
+                pack_coordinate: format!("30031:{}:cats", "ab".repeat(32)),
+                shortcode: "wave".to_owned(),
+                plaintext_sha256: "11".repeat(32),
+            },
+        };
+        let action = super::AppClient::message_human_action_context(&sticker)
+            .and_then(|context| context.human_action)
+            .expect("a sticker send is a human action");
+        assert_eq!(action.action, "send_sticker");
+        assert_eq!(action.origin, "local_user");
+        assert_eq!(action.target_count, None);
+
+        let machine = AppMessageIntent::StreamStart {
+            stream_id: vec![1],
+            parent_message_id: None,
+            quic_candidates: Vec::new(),
+        };
+        assert!(super::AppClient::message_human_action_context(&machine).is_none());
+    }
 }

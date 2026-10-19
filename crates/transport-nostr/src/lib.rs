@@ -17,8 +17,8 @@ use cgka_traits::{
 use futures::{FutureExt, Stream, StreamExt, stream::FuturesUnordered};
 use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
-    Client as NostrSdkClient, ClientNotification, Event, Filter, Kind, PublicKey, RelayMessage,
-    RelayUrl, SubscriptionId, Timestamp as NostrTimestamp,
+    Client as NostrSdkClient, ClientNotification, Filter, Kind, PublicKey, RelayMessage, RelayUrl,
+    SubscriptionId, Timestamp as NostrTimestamp,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -1844,42 +1844,6 @@ impl MarmotRelayPlane {
             return Err("public event fetch: no safe relay endpoints".to_owned());
         }
         directory::fetch_public_events(&endpoints, filters, max_events).await
-    }
-
-    /// Publish an already-signed public event through the shared SDK transport.
-    /// The adapter owns bounded retries, write-only relay lifecycle, stable
-    /// privacy-safe errors, and acknowledgement accounting.
-    #[doc(hidden)]
-    pub async fn publish_public_event(
-        &self,
-        account_id_hex: &str,
-        endpoints: Vec<TransportEndpoint>,
-        event: &Event,
-    ) -> Result<NostrPublishOutcome, String> {
-        let endpoints = self
-            .inner
-            .relay_safety
-            .sanitize_endpoints(endpoints, "public event publish")
-            .map_err(|_| "public event publish: relay endpoints rejected".to_owned())?;
-        if endpoints.is_empty() {
-            return Err("public event publish: no relay endpoints".to_owned());
-        }
-        let relay_client = self
-            .inner
-            .transport
-            .sdk_relay_client
-            .as_ref()
-            .ok_or_else(|| "public event publish requires SDK relay plane".to_owned())?;
-        let event = NostrTransportEvent::from_nostr_event(event)
-            .map_err(|_| "public event publish: invalid signed event".to_owned())?;
-        let account_id = cgka_traits::MemberId::new(
-            hex::decode(account_id_hex)
-                .map_err(|_| "public event publish: invalid account".to_owned())?,
-        );
-        relay_client
-            .publish_event_for_account(&account_id, &endpoints, &event, 1)
-            .await
-            .map_err(|_| "public event publish failed".to_owned())
     }
 
     #[doc(hidden)]

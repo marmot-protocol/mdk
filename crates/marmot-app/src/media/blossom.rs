@@ -666,12 +666,23 @@ pub(crate) async fn fetch_blossom_blob_limited(
     allow_loopback_http: bool,
 ) -> Result<Vec<u8>, AppError> {
     let transport = BlossomHttpTransport::new(allow_loopback_http).with_download_limit(max_bytes);
+    fetch_blossom_blob_limited_with_transport(url, &transport).await
+}
+
+/// The overall deadline is the transport's transfer bound, like every other
+/// download; candidate startup keeps its own shorter bound inside the fetch.
+/// The byte ceiling is the transport's clamped limit, never a caller value
+/// above the encrypted-media maximum.
+pub(super) async fn fetch_blossom_blob_limited_with_transport(
+    url: &str,
+    transport: &BlossomHttpTransport,
+) -> Result<Vec<u8>, AppError> {
     fetch_blossom_blob_bounded(
         url,
-        &transport,
+        transport,
         None,
-        tokio::time::Instant::now() + BLOSSOM_CANDIDATE_STARTUP_TIMEOUT,
-        max_bytes,
+        tokio::time::Instant::now() + transport.transfer_timeout,
+        transport.download_limit,
     )
     .await
 }

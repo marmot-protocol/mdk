@@ -1,7 +1,11 @@
-//! Installed sticker list (kind 10031) publication against a multi-device
-//! account. A device that cannot read the current remote winner must not sign
-//! and publish a list built from its stale cached base: the newer timestamp
-//! would replace concurrent installs and uninstalls made on other devices.
+//! Sticker relay behavior against local relays.
+//!
+//! - Installed list (kind 10031) publication against a multi-device account.
+//!   A device that cannot read the current remote winner must not sign and
+//!   publish a list built from its stale cached base: the newer timestamp
+//!   would replace concurrent installs and uninstalls made on other devices.
+//! - Pack (kind 30031) lookup with relay hints. Hints add candidates; they
+//!   never hide a newer version on the account's own relays.
 
 // Test fixtures dial local relays directly; the proxy policy is crate-private.
 #![allow(clippy::disallowed_methods)]
@@ -240,6 +244,143 @@ async fn failed_installed_list_refresh_blocks_stale_publication_until_rebase() {
         "the concurrent remote install survives the local uninstall"
     );
     assert!(created_at > now - 20);
+
+    runtime.shutdown().await;
+}
+
+fn pack_tags(author: &Keys, identifier: &str, title: &str) -> Vec<Tag> {
+    use sonar_stickers::{PackAddress, Sticker, StickerPack, build_pack_tags};
+    let hash = "11".repeat(32);
+    let pack = StickerPack::new(
+        PackAddress::new(author.public_key().to_hex(), identifier.to_owned()).unwrap(),
+        title.to_owned(),
+        None,
+        None,
+        vec![
+            Sticker::new(
+                "wave".to_owned(),
+                format!("https://cdn.example/{hash}.png"),
+                hash.clone(),
+                "image/png".to_owned(),
+                Some(32),
+                Some(32),
+                None,
+                None,
+            )
+            .unwrap(),
+        ],
+        None,
+    )
+    .unwrap();
+    build_pack_tags(&pack)
+        .into_iter()
+        .map(|tag| {
+            let fields: Vec<String> =
+                serde_json::from_str(&serde_json::to_string(&tag).unwrap()).unwrap();
+            Tag::parse(fields).unwrap()
+        })
+        .collect()
+}
+
+fn pack_naddr(author: &Keys, identifier: &str, hint: &str) -> String {
+    let mut coordinate = nostr::nips::nip01::Coordinate::new(
+        Kind::Custom(sonar_stickers::STICKER_PACK_KIND),
+        author.public_key(),
+    );
+    coordinate.identifier = identifier.to_owned();
+    nostr::nips::nip19::Nip19Coordinate::new(coordinate, [RelayUrl::parse(hint).unwrap()])
+        .to_bech32()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_hint_cannot_hide_a_newer_pack_on_account_relays() {
+    install_mock_keyring();
+    let account_relay = LocalRelay::new(RelayBuilder::default());
+    account_relay.run().await.unwrap();
+    let account_url = account_relay.url().await.to_string();
+    let hint_relay = LocalRelay::new(RelayBuilder::default());
+    hint_relay.run().await.unwrap();
+    let hint_url = hint_relay.url().await.to_string();
+
+    let keys = Keys::generate();
+    let now = unix_now();
+    for (kind, tag) in [
+        (
+            10002,
+            Tag::custom("r", [account_url.clone(), "write".to_owned()]),
+        ),
+        (10050, Tag::custom("relay", [account_url.clone()])),
+    ] {
+        publish_signed(&account_url, &keys, kind, vec![tag], now - 60).await;
+    }
+    let author = Keys::generate();
+    let pack_kind = sonar_stickers::STICKER_PACK_KIND;
+    // The hint relay only knows an older version; the account relay has the
+    // current one. A second pack exists only behind the hint.
+    publish_signed(
+        &hint_url,
+        &author,
+        pack_kind,
+        pack_tags(&author, "cats", "Old"),
+        now - 100,
+    )
+    .await;
+    publish_signed(
+        &account_url,
+        &author,
+        pack_kind,
+        pack_tags(&author, "cats", "New"),
+        now - 50,
+    )
+    .await;
+    publish_signed(
+        &hint_url,
+        &author,
+        pack_kind,
+        pack_tags(&author, "dogs", "Hinted"),
+        now - 50,
+    )
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        account_url.clone(),
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let account = timeout(
+        Duration::from_secs(40),
+        runtime.create_or_import_account(AccountSetupRequest {
+            identity: None,
+            import_nsec: Some(zeroize::Zeroizing::new(
+                keys.secret_key().to_bech32().unwrap(),
+            )),
+            default_relays: vec![endpoint(&account_url)],
+            bootstrap_relays: vec![endpoint(&account_url)],
+            publish_missing_relay_lists: true,
+            ..AccountSetupRequest::default()
+        }),
+    )
+    .await
+    .expect("account import completes")
+    .expect("account import succeeds");
+    let account_id = account.account.account_id_hex;
+
+    let cats = app
+        .fetch_sticker_pack(&account_id, &pack_naddr(&author, "cats", &hint_url))
+        .await
+        .expect("the pack resolves");
+    assert_eq!(
+        cats.title, "New",
+        "the account relay's newer version must win over the hinted one"
+    );
+    let dogs = app
+        .fetch_sticker_pack(&account_id, &pack_naddr(&author, "dogs", &hint_url))
+        .await
+        .expect("a pack only the hint relay holds still resolves");
+    assert_eq!(dogs.title, "Hinted");
 
     runtime.shutdown().await;
 }

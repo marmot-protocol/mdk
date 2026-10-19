@@ -28,6 +28,8 @@ use zeroize::Zeroizing;
 use crate::external_signer::AccountSigner;
 use crate::media::fetch_blossom_blob_limited;
 use crate::{AppError, MarmotApp, ReceivedMessage, unix_now_seconds};
+use cgka_traits::MemberId;
+use transport_nostr_peeler::NostrTransportEvent;
 
 const MAX_STICKER_ASSET_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_STICKER_DIMENSION: u32 = 4096;
@@ -602,6 +604,10 @@ async fn fetch_pack_into_storage(
         .kind(Kind::Custom(STICKER_PACK_KIND))
         .custom_tag(SingleLetterTag::LOWERCASE_D, address.identifier.clone())
         .limit(MAX_REPLACEABLE_VERSIONS_PER_FETCH);
+    // Hints only add candidates. Versions from the hint relays and from the
+    // account relays all pass through NIP-01 replacement ordering, so an older
+    // version on a hint relay cannot hide a newer one on the account relays.
+    let (mut updated, mut found) = (false, false);
     if !relay_hints.is_empty() {
         match fetch_pack_from_endpoints(
             app,
@@ -612,14 +618,20 @@ async fn fetch_pack_into_storage(
         )
         .await
         {
-            Ok((updated, true)) => return Ok(updated),
-            Ok((_, false)) | Err(AppError::StickerRelay(_)) => {}
+            Ok(hinted) => (updated, found) = hinted,
+            Err(AppError::StickerRelay(_)) => {}
             Err(error) => return Err(error),
         }
     }
-    let (updated, _) =
-        fetch_pack_from_endpoints(app, context, coordinate, context.endpoints.clone(), filter)
-            .await?;
+    match fetch_pack_from_endpoints(app, context, coordinate, context.endpoints.clone(), filter)
+        .await
+    {
+        Ok((account_updated, _)) => updated |= account_updated,
+        // A hint already supplied a validated version; unreachable account
+        // relays do not discard it.
+        Err(AppError::StickerRelay(_)) if found => {}
+        Err(error) => return Err(error),
+    }
     if context.storage.sticker_pack(coordinate)?.is_none() {
         return Err(AppError::StickerNotFound);
     }
@@ -917,15 +929,50 @@ async fn publish_outboxed_event(
             event_json: event.as_json(),
             created_at: event.created_at.as_secs(),
         })?;
-    app.relay_plane
-        .publish_public_event(&context.account_id_hex, context.endpoints.clone(), event)
-        .await
-        .map_err(AppError::StickerRelay)?;
+    publish_account_event(app, context, event).await?;
     apply_published_sticker_event(&context.storage, event)?;
     context
         .storage
         .clear_sticker_outbox_event(&event.id.to_hex())?;
     Ok(())
+}
+
+/// Publish one of the account's own signed sticker events through the
+/// account's publish client: the same signer-bound, proxy-aware client that
+/// profile metadata and the NIP-51 block list use, separate from the receive
+/// pool, authenticating only as the event's own author.
+async fn publish_account_event(
+    app: &MarmotApp,
+    context: &StickerAccountContext,
+    event: &Event,
+) -> Result<(), AppError> {
+    require_account_author(event, &context.account_id_hex)?;
+    let transport_event = NostrTransportEvent::from_nostr_event(event)
+        .map_err(|_| invalid_sticker("sticker publication is invalid"))?;
+    let account_id = MemberId::new(
+        hex::decode(&context.account_id_hex)
+            .map_err(|_| invalid_sticker("invalid account identity"))?,
+    );
+    let outcome = app
+        .relay_client_for_account_id(&context.account_id_hex, context.signer.as_nostr_signer())
+        .publish_event_for_account(&account_id, &context.endpoints, &transport_event, 1)
+        .await
+        .map_err(|_| AppError::StickerRelay("sticker publication failed".into()))?;
+    if outcome.accepted.is_empty() {
+        return Err(AppError::StickerRelay(
+            "no account relay acknowledged the sticker publication".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A sticker event is only ever published for the account that signed it.
+fn require_account_author(event: &Event, account_id_hex: &str) -> Result<(), AppError> {
+    if event.pubkey.to_hex() == account_id_hex {
+        Ok(())
+    } else {
+        Err(AppError::ExternalSignerMismatch)
+    }
 }
 
 async fn flush_sticker_outbox(
@@ -945,10 +992,7 @@ async fn flush_sticker_outbox(
         event
             .verify()
             .map_err(|_| invalid_sticker("stored sticker publication signature is invalid"))?;
-        app.relay_plane
-            .publish_public_event(&context.account_id_hex, context.endpoints.clone(), &event)
-            .await
-            .map_err(AppError::StickerRelay)?;
+        publish_account_event(app, context, &event).await?;
         apply_published_sticker_event(&context.storage, &event)?;
         context
             .storage
@@ -1793,6 +1837,20 @@ mod tests {
     }
 
     #[test]
+    fn sticker_publications_must_be_authored_by_the_account() {
+        let keys = nostr::prelude::Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(USER_STICKER_PACKS_KIND), "")
+            .finalize(&keys)
+            .unwrap();
+        assert!(require_account_author(&event, &keys.public_key().to_hex()).is_ok());
+        let other = nostr::prelude::Keys::generate().public_key().to_hex();
+        assert!(matches!(
+            require_account_author(&event, &other),
+            Err(AppError::ExternalSignerMismatch)
+        ));
+    }
+
+    #[test]
     fn install_capacity_rejects_only_a_new_pack_at_the_limit() {
         let installed = (0..MAX_INSTALLED_PACKS)
             .map(|index| format!("pack-{index}"))
@@ -1866,6 +1924,14 @@ mod tests {
         assert!(inspect_image(&png_with_frames(32, 32, Some(1), &[(0, 32, 0, 0)])).is_err());
         assert!(inspect_image(&png_with_frames(32, 32, Some(1), &[(33, 32, 0, 0)])).is_err());
         assert!(inspect_image(&png_with_frames(32, 32, Some(1), &[(16, 16, 17, 0)])).is_err());
+        // In-canvas frames inspect cleanly, so the rejections below are not
+        // an always-failing frame check.
+        let gif = inspect_image(&gif_with_frame(32, 32, 8, 8, 16, 16)).unwrap();
+        assert_eq!((gif.width, gif.height, gif.frames), (32, 32, 1));
+        assert_eq!(gif.mime, "image/gif");
+        let webp = inspect_image(&webp_with_frame(32, 32, 0, 0, 16, 16)).unwrap();
+        assert_eq!((webp.width, webp.height, webp.frames), (32, 32, 1));
+        assert_eq!(webp.mime, "image/webp");
         assert!(inspect_image(&gif_with_frame(32, 32, 0, 0, 0, 32)).is_err());
         assert!(inspect_image(&gif_with_frame(32, 32, 0, 0, 33, 32)).is_err());
         assert!(inspect_image(&gif_with_frame(32, 32, 17, 0, 16, 16)).is_err());
@@ -1911,5 +1977,11 @@ mod tests {
         let mut wrong_mime = sticker.clone();
         wrong_mime.mime = "image/webp".to_owned();
         assert!(validate_downloaded_sticker(&wrong_mime, &bytes).is_err());
+        let mut wrong_width = sticker.clone();
+        wrong_width.width = Some(65);
+        assert!(validate_downloaded_sticker(&wrong_width, &bytes).is_err());
+        let mut wrong_height = sticker.clone();
+        wrong_height.height = Some(31);
+        assert!(validate_downloaded_sticker(&wrong_height, &bytes).is_err());
     }
 }
