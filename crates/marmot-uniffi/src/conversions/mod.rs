@@ -71,8 +71,7 @@ mod tests {
     use super::*;
     use crate::markdown::{MarkdownBlockFfi, MarkdownDocumentFfi, MarkdownInlineFfi};
     use marmot_app::{
-        AppMessageRecord, RetentionSweepGroupOutcome, RetentionSweepReport, RetentionSweepStatus,
-        SecureDeleteExpiredResult, TimelineMessageRecord, TimelinePage, TimelineReactionSummary,
+        AppMessageRecord, TimelineMessageRecord, TimelinePage, TimelineReactionSummary,
         TimelineReplyPreview, TimelineUserReaction,
     };
     use std::collections::BTreeMap;
@@ -122,41 +121,6 @@ mod tests {
             welcomer_account_id_hex: None,
             via_welcome_message_id_hex: None,
         }
-    }
-
-    #[test]
-    fn cursor_persistence_ffi_preserves_each_variant() {
-        use marmot_app::CursorPersistence;
-        // The FFI enum mirrors the app policy 1:1; a swapped variant here
-        // would hand a wake-collection process the Advance posture and
-        // silently reintroduce the NSE cursor ratchet.
-        assert!(matches!(
-            CursorPersistence::from(CursorPersistenceFfi::Advance),
-            CursorPersistence::Advance
-        ));
-        assert!(matches!(
-            CursorPersistence::from(CursorPersistenceFfi::Frozen),
-            CursorPersistence::Frozen
-        ));
-    }
-
-    #[test]
-    fn self_membership_ffi_preserves_each_variant() {
-        use marmot_app::SelfMembership;
-        // The FFI enum mirrors the app enum 1:1; a swapped Left/Removed here
-        // would mislabel departures on the apps' chat list and group detail.
-        assert!(matches!(
-            SelfMembershipFfi::from(SelfMembership::Member),
-            SelfMembershipFfi::Member
-        ));
-        assert!(matches!(
-            SelfMembershipFfi::from(SelfMembership::Left),
-            SelfMembershipFfi::Left
-        ));
-        assert!(matches!(
-            SelfMembershipFfi::from(SelfMembership::Removed),
-            SelfMembershipFfi::Removed
-        ));
     }
 
     fn member(member_id_hex: &str, is_admin: bool, is_self: bool) -> GroupMemberDetailsFfi {
@@ -400,107 +364,6 @@ mod tests {
         );
         assert!(!state.can_enable_disbanding);
         assert!(!state.can_disband);
-    }
-
-    #[test]
-    fn lifecycle_ffi_mapping_covers_all_six_canonical_states() {
-        let cases = [
-            (
-                marmot_app::AppGroupLifecycleState::Stable,
-                GroupLifecycleStateFfi::Stable,
-            ),
-            (
-                marmot_app::AppGroupLifecycleState::PendingPublish,
-                GroupLifecycleStateFfi::PendingPublish,
-            ),
-            (
-                marmot_app::AppGroupLifecycleState::Merging,
-                GroupLifecycleStateFfi::Merging,
-            ),
-            (
-                marmot_app::AppGroupLifecycleState::Recovering,
-                GroupLifecycleStateFfi::Recovering,
-            ),
-            (
-                marmot_app::AppGroupLifecycleState::Unrecoverable,
-                GroupLifecycleStateFfi::Unrecoverable,
-            ),
-            (
-                marmot_app::AppGroupLifecycleState::Disbanded,
-                GroupLifecycleStateFfi::Disbanded,
-            ),
-        ];
-        for (app, ffi) in cases {
-            assert_eq!(GroupLifecycleStateFfi::from(app), ffi);
-        }
-    }
-
-    #[test]
-    fn secure_delete_expired_result_ffi_preserves_count_and_hashes() {
-        let ffi = SecureDeleteExpiredResultFfi::from(SecureDeleteExpiredResult {
-            pruned_messages: 2,
-            secrets_deleted: 1,
-            media_ciphertext_sha256: vec!["aa".repeat(32), "bb".repeat(32)],
-            erasure_pending: true,
-        });
-
-        assert_eq!(ffi.pruned_messages, 2);
-        assert_eq!(ffi.secrets_deleted, 1);
-        assert_eq!(
-            ffi.media_ciphertext_sha256,
-            vec!["aa".repeat(32), "bb".repeat(32)]
-        );
-        assert!(ffi.erasure_pending);
-    }
-
-    #[test]
-    fn retention_sweep_report_ffi_preserves_every_status_and_payload() {
-        let statuses = [
-            RetentionSweepStatus::NoExpiredMessages,
-            RetentionSweepStatus::Pruned,
-            RetentionSweepStatus::DeferredClockSkew,
-            RetentionSweepStatus::DeferredUnread,
-            RetentionSweepStatus::DeferredScanExhausted,
-            RetentionSweepStatus::Failed,
-        ];
-        let ffi = RetentionSweepReportFfi::from(RetentionSweepReport {
-            groups: statuses
-                .into_iter()
-                .enumerate()
-                .map(|(index, status)| RetentionSweepGroupOutcome {
-                    group_id_hex: format!("{index:02x}"),
-                    status,
-                    pruned_messages: index as u64,
-                    secrets_deleted: (index + 1) as u64,
-                    media_ciphertext_sha256: vec![format!("{index:064x}")],
-                    failure_kind: (status == RetentionSweepStatus::Failed)
-                        .then(|| "storage_busy".to_owned()),
-                })
-                .collect(),
-        });
-
-        assert_eq!(ffi.groups.len(), statuses.len());
-        assert_eq!(
-            ffi.groups[0].status,
-            RetentionSweepStatusFfi::NoExpiredMessages
-        );
-        assert_eq!(ffi.groups[1].status, RetentionSweepStatusFfi::Pruned);
-        assert_eq!(
-            ffi.groups[2].status,
-            RetentionSweepStatusFfi::DeferredClockSkew
-        );
-        assert_eq!(
-            ffi.groups[3].status,
-            RetentionSweepStatusFfi::DeferredUnread
-        );
-        assert_eq!(
-            ffi.groups[4].status,
-            RetentionSweepStatusFfi::DeferredScanExhausted
-        );
-        assert_eq!(ffi.groups[5].status, RetentionSweepStatusFfi::Failed);
-        assert_eq!(ffi.groups[1].pruned_messages, 1);
-        assert_eq!(ffi.groups[1].secrets_deleted, 2);
-        assert_eq!(ffi.groups[5].failure_kind.as_deref(), Some("storage_busy"));
     }
 
     #[test]

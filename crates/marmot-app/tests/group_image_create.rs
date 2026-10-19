@@ -153,7 +153,7 @@ async fn run_measurement_matrix() {
     AccountHome::open(dir.path())
         .create_account(BENCH_ACCOUNT)
         .unwrap();
-    let config = MarmotAppConfig::default()
+    let config = MarmotAppConfig::white_noise()
         .with_allow_loopback_blob_endpoints(true)
         .with_allow_loopback_relay_endpoints(true)
         .with_open_ranking_provider(None, Vec::new());

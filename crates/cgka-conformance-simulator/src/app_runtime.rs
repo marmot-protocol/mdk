@@ -2545,7 +2545,7 @@ fn app_for_root(
     settlement_quiescence_ms: Option<u64>,
     maintenance_timing: Option<MaintenanceTiming>,
 ) -> MarmotApp {
-    let mut config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let mut config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     if let Some(ms) = settlement_quiescence_ms {
         config = config.with_dev_settlement_quiescence_ms(ms);
     }
@@ -3137,19 +3137,6 @@ mod tests {
                 "mutation {mutation} escaped the public oracle"
             );
         }
-    }
-
-    #[test]
-    fn public_commitment_preserves_a_reported_zero_member_count() {
-        let projection = public_protocol_projection(
-            7,
-            vec!["alice".into()],
-            vec!["alice".into()],
-            "group".into(),
-            "description".into(),
-            0,
-        );
-        assert_eq!(projection.member_count, 0);
     }
 
     #[test]

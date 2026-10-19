@@ -159,7 +159,7 @@ impl Fixture {
         let app = MarmotApp::with_relays_and_config(
             dir.path(),
             vec![APP_RELAY.into()],
-            crate::MarmotAppConfig::default(),
+            crate::MarmotAppConfig::white_noise(),
         );
         let publisher = RecordingPublisher::new(mode);
         app.install_moderation_report_publisher_for_test(publisher.clone());
@@ -440,7 +440,7 @@ async fn a_deployment_without_a_label_namespace_refuses_a_report_destination() {
     // the same as none.
     for namespace in [None, Some("  ".to_owned())] {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = crate::MarmotAppConfig::default();
+        let mut config = crate::MarmotAppConfig::white_noise();
         config.deployment.moderation_label_namespace = namespace.clone();
         let app = MarmotApp::with_relays_and_config(dir.path(), vec![APP_RELAY.into()], config);
         let error = app
@@ -537,7 +537,7 @@ async fn construction_time_config_is_adopted_or_rejected_whole() {
     let valid = MarmotApp::with_relays_and_config(
         dir.path(),
         vec![APP_RELAY.into()],
-        crate::MarmotAppConfig::default().with_moderation_report_config(Some(
+        crate::MarmotAppConfig::white_noise().with_moderation_report_config(Some(
             ModerationReportConfig {
                 recipient_pubkey: moderation.to_hex(),
                 relays: vec![REPORT_RELAY.into()],
@@ -549,7 +549,7 @@ async fn construction_time_config_is_adopted_or_rejected_whole() {
     let invalid = MarmotApp::with_relays_and_config(
         dir.path(),
         vec![APP_RELAY.into()],
-        crate::MarmotAppConfig::default().with_moderation_report_config(Some(
+        crate::MarmotAppConfig::white_noise().with_moderation_report_config(Some(
             ModerationReportConfig {
                 recipient_pubkey: moderation.to_hex(),
                 relays: vec![REPORT_RELAY.into(), "ws://192.168.1.10".into()],

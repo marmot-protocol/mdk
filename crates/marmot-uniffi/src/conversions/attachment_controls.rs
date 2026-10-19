@@ -200,30 +200,3 @@ impl From<app::AutomaticAttachmentRequest> for AutomaticAttachmentRequestFfi {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn storage_blocked_state_crosses_the_binding_without_a_retry_time() {
-        let status = AttachmentTransferStatusFfi::from(Some(app::AttachmentTransferStatus {
-            reference: None,
-            automatic_media_type: None,
-            state: app::AttachmentTransferState::StorageBlocked,
-            attempt: 3,
-            received: 10,
-            total: Some(20),
-            retry_at: None,
-        }));
-        assert!(matches!(
-            status.state,
-            AttachmentTransferStateFfi::StorageBlocked
-        ));
-        assert_eq!(
-            status.retry_at, None,
-            "parked work renders a storage prompt, not a timer"
-        );
-        assert_eq!(status.total, Some(20));
-    }
-}

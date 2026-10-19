@@ -84,6 +84,8 @@
 
 ### Added
 
+- `MarmotAppConfig::white_noise()` is today's default configuration with White Noise's deployment as this build compiled it. The CLI, `wn-agent`, the conformance simulator, the dev/test constructors and the tests now name it explicitly, so they keep White Noise's behaviour when `MarmotAppConfig::default()` turns neutral (host-configuration brief, PR 2). The CLI's default keychain service comes from `MarmotDeployment::white_noise()`; the name is unchanged.
+
 - Manage storage (mdk#2314 step 5): `attachment_storage_usage`,
   `attachment_storage_by_chat`, `largest_retained_attachments`,
   `remove_chat_attachments` and `remove_attachments_older_than` on
@@ -188,6 +190,11 @@
   withheld events, the pass's own budget, or a local error. `relays_failed`
   and `relays_incomplete` now count distinct relays; before, they were summed
   per compared route and could exceed `relays_required` (#2265).
+
+### Maintenance
+
+- Removed the 41 Delete/wiring tests identified in #2413 across the Rust crates
+  and Hermes/OpenClaw integrations. Runtime behavior and public contracts are unchanged.
 
 ## 0.13.0 - 2026-10-12
 

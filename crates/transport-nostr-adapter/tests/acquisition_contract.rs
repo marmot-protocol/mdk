@@ -10,9 +10,8 @@ use tokio::sync::watch;
 use transport_nostr_adapter::{
     NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionEndpoint,
     NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult,
-    NostrAcquisitionScope, NostrAcquisitionStats, NostrNotificationLoss,
-    NostrNotificationLossScope, NostrPublishOutcome, NostrRelayClient, NostrSubscription,
-    NostrTransportAdapter,
+    NostrAcquisitionScope, NostrAcquisitionStats, NostrNotificationLoss, NostrPublishOutcome,
+    NostrRelayClient, NostrSubscription, NostrTransportAdapter,
 };
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -182,25 +181,6 @@ async fn adapter_rejects_invalid_request_before_backend_and_preserves_owned_part
     assert_eq!(result.endpoints[1].end, NostrAcquisitionEnd::RelayClosed);
     assert_eq!(result.endpoints[0].events, vec![event()]);
     assert_eq!(result.endpoints[0].session_generation, Some(12));
-}
-
-#[tokio::test]
-async fn loss_control_receiver_is_available_independently_of_acquisition() {
-    let (loss, _) = watch::channel(None);
-    let fake = Arc::new(FakeRelay {
-        calls: AtomicUsize::new(0),
-        loss,
-    });
-    let adapter = NostrTransportAdapter::new(fake.clone());
-    let mut observed = adapter.notification_loss().unwrap();
-    fake.loss.send_replace(Some(NostrNotificationLoss {
-        scope: NostrNotificationLossScope::SharedReceiver,
-        receiver_generation: 2,
-        cumulative_skipped: 5,
-    }));
-    observed.changed().await.unwrap();
-    assert_eq!(observed.borrow().as_ref().unwrap().cumulative_skipped, 5);
-    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

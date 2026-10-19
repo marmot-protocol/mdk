@@ -99,11 +99,13 @@ impl From<MarmotDeploymentFfi> for MarmotDeployment {
 /// these values until the neutral default lands.
 #[uniffi::export]
 pub fn marmot_deployment_white_noise() -> MarmotDeploymentFfi {
-    marmot_app::MarmotAppConfig::default().deployment.into()
+    marmot_app::MarmotAppConfig::white_noise().deployment.into()
 }
 
 /// No deployment services: every list empty, every option unset, and the
-/// neutral keychain service `org.marmot-protocol.mdk`.
+/// neutral keychain service `org.marmot-protocol.mdk`. Until the neutral
+/// default lands, an empty new-group media list or an unset group-image or
+/// profile-image server still falls back to White Noise's.
 #[uniffi::export]
 pub fn marmot_deployment_neutral() -> MarmotDeploymentFfi {
     MarmotDeployment::neutral().into()
@@ -115,7 +117,7 @@ mod tests {
 
     #[test]
     fn presets_round_trip_through_the_record() {
-        let white_noise = marmot_app::MarmotAppConfig::default().deployment;
+        let white_noise = marmot_app::MarmotAppConfig::white_noise().deployment;
         assert_eq!(
             MarmotDeployment::from(marmot_deployment_white_noise()),
             white_noise

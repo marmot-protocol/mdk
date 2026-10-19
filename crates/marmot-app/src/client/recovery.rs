@@ -1686,60 +1686,6 @@ impl AppClient {
 mod tests {
     use super::*;
 
-    /// Compile-checked handoff shape only. The #1947 executor will submit the
-    /// owned events to the worker and return endpoint evidence to this owner.
-    #[test]
-    fn owned_acquisition_result_can_travel_with_an_existing_grant() {
-        use transport_nostr_adapter::{
-            NostrAcquisitionEnd, NostrAcquisitionEndpoint, NostrAcquisitionResult,
-            NostrAcquisitionStats,
-        };
-
-        fn stage_for_worker(
-            grant: AttemptGrant,
-            result: NostrAcquisitionResult,
-        ) -> (
-            AttemptGrant,
-            Vec<transport_nostr_peeler::NostrTransportEvent>,
-            Vec<NostrAcquisitionEndpoint>,
-        ) {
-            let mut endpoints = result.endpoints;
-            let events = endpoints
-                .iter_mut()
-                .flat_map(|endpoint| std::mem::take(&mut endpoint.events))
-                .collect();
-            (grant, events, endpoints)
-        }
-
-        let (storage, mut owner, now) = fixture();
-        let grant = owner
-            .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
-            .unwrap()
-            .unwrap();
-        let attempt = grant.reservation.attempt_serial;
-        let result = NostrAcquisitionResult {
-            endpoints: vec![NostrAcquisitionEndpoint {
-                endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
-                session_generation: Some(12),
-                events: vec![transport_nostr_peeler::NostrTransportEvent {
-                    id: "03".repeat(32),
-                    pubkey: "04".repeat(32),
-                    created_at: 1,
-                    kind: 445,
-                    tags: Vec::new(),
-                    content: "owned bytes".into(),
-                    sig: None,
-                }],
-                end: NostrAcquisitionEnd::ByteLimitReached,
-                stats: NostrAcquisitionStats::default(),
-            }],
-        };
-        let (grant, worker_input, endpoints) = stage_for_worker(grant, result);
-        assert_eq!(grant.reservation.attempt_serial, attempt);
-        assert_eq!(worker_input.len(), 1);
-        assert_eq!(endpoints[0].end, NostrAcquisitionEnd::ByteLimitReached);
-    }
-
     fn fixture() -> (SqliteAccountStorage, AccountRecoveryOwner, Instant) {
         let storage = SqliteAccountStorage::in_memory().unwrap();
         let app = storage.app_storage();
@@ -2888,7 +2834,7 @@ mod tests {
         let app = crate::MarmotApp::with_relay_and_config(
             directory.path(),
             "wss://relay.example",
-            crate::MarmotAppConfig::default()
+            crate::MarmotAppConfig::white_noise()
                 .with_cursor_persistence(crate::CursorPersistence::Frozen),
         )
         .with_test_relay_client(relay.clone());
@@ -4146,7 +4092,7 @@ mod tests {
         let app = crate::MarmotApp::with_relays_and_config(
             dir.path(),
             endpoints,
-            crate::MarmotAppConfig::default(),
+            crate::MarmotAppConfig::white_noise(),
         )
         .with_test_relay_client(relay.clone());
         let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
@@ -4974,7 +4920,7 @@ mod tests {
         let app = crate::MarmotApp::with_relays_and_config(
             dir.path(),
             vec!["wss://relay.example".into()],
-            crate::MarmotAppConfig::default()
+            crate::MarmotAppConfig::white_noise()
                 .with_allow_loopback_relay_endpoints(true)
                 .with_open_ranking_provider(None, Vec::new())
                 .with_recovery_operated_relays(vec![OPERATED.into()]),

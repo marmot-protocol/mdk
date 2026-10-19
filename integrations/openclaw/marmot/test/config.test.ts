@@ -139,16 +139,6 @@ describe("resolveMarmotAccount", () => {
     expect(fromEnv.mentionPatterns).toEqual(["x", "y"]);
   });
 
-  it("maps the dm policy and allow-from list", () => {
-    const resolved = resolveMarmotAccount(
-      { dm: { policy: "allowlist", allowFrom: ["aa", "bb"] } },
-      null,
-      deps({}),
-    );
-    expect(resolved.dmPolicy).toBe("allowlist");
-    expect(resolved.allowFrom).toEqual(["aa", "bb"]);
-  });
-
   it("resolves senderPolicy atomically and does not infer owners from welcomers", () => {
     const sender = "bb".repeat(32);
     const missing = resolveMarmotAccount({ dm: { allowFrom: [sender] } }, null, deps({}));

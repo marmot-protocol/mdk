@@ -34,7 +34,7 @@ async fn client_at_with_mode(
             attachment_acquisition_mode: mode,
             allow_loopback_blob_endpoints: true,
             attachment_acquisition: Some(crate::AttachmentAcquisitionPolicy::default()),
-            ..Default::default()
+            ..MarmotAppConfig::white_noise()
         },
     )
     .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));

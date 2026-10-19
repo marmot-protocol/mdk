@@ -244,7 +244,7 @@ async fn post_audit_log_tracker_update_uses_default_endpoint_with_host_token() {
     let (tx, rx) = oneshot::channel();
     let server = tokio::spawn(capture_one_request(listener, tx));
 
-    let config = MarmotAppConfig::default()
+    let config = MarmotAppConfig::white_noise()
         .with_service_endpoints(MarmotServiceEndpoints {
             relay_telemetry_otlp_endpoint: None,
             audit_log_tracker_endpoint: Some(format!("http://{addr}/api/v1/audit-logs/")),
@@ -730,7 +730,7 @@ async fn local_message_send_tags_engine_rows_with_human_action() {
     let app = MarmotApp::with_relay_and_config(
         tmp.path(),
         relay_url,
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();

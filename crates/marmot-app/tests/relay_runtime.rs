@@ -79,7 +79,7 @@ async fn active_group_send_timings() {
             let app = MarmotApp::with_relay_and_config(
                 dir.path().join(index.to_string()),
                 url.clone(),
-                MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+                MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
             );
             let runtime = MarmotAppRuntime::new(app);
             let account = timeout(
@@ -239,7 +239,7 @@ async fn send_connection_reuse() {
     let urls = std::env::var("SEND_RELAYS")
         .map(|value| value.split(",").map(str::to_owned).collect::<Vec<_>>())
         .unwrap_or_else(|_| vec![url]);
-    let mut config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let mut config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     config.usage_diagnostics_silent = true;
     let mut runtimes = Vec::new();
     let mut homes = Vec::new();
@@ -555,7 +555,7 @@ async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_blob_endpoints(true)
             .with_allow_loopback_relay_endpoints(true),
     );
@@ -583,7 +583,7 @@ async fn mock_audit_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, Strin
         dir.path(),
         vec![url.clone()],
         AccountHome::open(dir.path()),
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_blob_endpoints(true)
             .with_allow_loopback_relay_endpoints(true),
     )
@@ -655,7 +655,7 @@ async fn group_message_blocking_app(
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     (relay, app, url)
 }
@@ -898,7 +898,7 @@ async fn gift_wrap_blocking_app(
     gift_wrap_blocking_app_with_config(
         dir,
         gate,
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     )
     .await
 }
@@ -976,7 +976,7 @@ async fn gift_wrap_counting_app(
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     (relay, app, url)
 }
@@ -1064,7 +1064,7 @@ async fn deletion_rejecting_app(dir: &tempfile::TempDir) -> (LocalRelay, MarmotA
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     (relay, app, url)
 }
@@ -1765,7 +1765,7 @@ async fn app_runtime_private_key_import_recovers_orphaned_keychain_credential() 
         publish_missing_relay_lists: true,
         ..AccountSetupRequest::default()
     };
-    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
 
     let first_home = AccountHome::open_with_keychain(dir.path(), service_name.clone()).unwrap();
     let first_app = MarmotApp::with_relays_and_account_home_and_config(
@@ -1835,7 +1835,7 @@ async fn failed_key_package_setup_retries_same_nsec_after_restart() {
     );
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
-    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     let secret = Keys::generate().secret_key().to_bech32().unwrap();
     let account_id = AccountHome::account_id_for_secret(&secret).unwrap();
     let setup = |secret: &str| AccountSetupRequest {
@@ -1926,7 +1926,7 @@ async fn failed_reactivation_key_package_publish_restores_signed_out_retry() {
     );
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
-    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     let secret = Keys::generate().secret_key().to_bech32().unwrap();
     let account_id = AccountHome::account_id_for_secret(&secret).unwrap();
     let setup = |secret: &str| AccountSetupRequest {
@@ -1988,7 +1988,7 @@ async fn failed_external_signer_reactivation_restores_signed_out_retry() {
     );
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
-    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     let keys = Keys::generate();
     let public_key = keys.public_key().to_hex();
     let setup = || AccountSetupRequest {
@@ -2058,7 +2058,7 @@ async fn failed_generated_identity_setup_resumes_same_identity_after_restart() {
     );
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
-    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     let setup = || AccountSetupRequest {
         default_relays: vec![endpoint(&url)],
         bootstrap_relays: vec![endpoint(&url)],
@@ -2111,7 +2111,7 @@ async fn failed_external_signer_setup_resumes_after_restart() {
     );
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
-    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     let keys = Keys::generate();
     let public_key = keys.public_key().to_hex();
     let setup = || AccountSetupRequest {
@@ -2182,7 +2182,7 @@ async fn cancelled_key_package_setup_resumes_exact_pending_attempt_after_restart
     );
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
-    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     let secret = Keys::generate().secret_key().to_bech32().unwrap();
     let account_id = AccountHome::account_id_for_secret(&secret).unwrap();
     let setup = |secret: &str| AccountSetupRequest {
@@ -2259,7 +2259,7 @@ async fn app_runtime_private_key_setup_rollback_preserves_only_recovered_keychai
     let recovered_secret = recovered_keys.secret_key().to_bech32().unwrap();
     let recovered_service =
         format!("com.marmot.test.runtime-rollback-recovered-{recovered_account_id}");
-    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     let successful_setup = AccountSetupRequest {
         identity: None,
         import_nsec: Some(zeroize::Zeroizing::new(recovered_secret.clone())),
@@ -2772,7 +2772,7 @@ async fn app_runtime_republish_key_package_resends_exact_current_event() {
     let restarted_app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_blob_endpoints(true)
             .with_allow_loopback_relay_endpoints(true),
     );
@@ -2998,7 +2998,7 @@ async fn account_key_packages_reports_durable_ownership_merges_relay_echo_and_su
     let first_dir = tempfile::tempdir().unwrap();
     let second_dir = tempfile::tempdir().unwrap();
     let (relay, url) = mock_relay().await;
-    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     let first_app = MarmotApp::with_relay_and_config(first_dir.path(), url.clone(), config.clone());
     let second_app = MarmotApp::with_relay_and_config(second_dir.path(), url.clone(), config);
     let first_runtime = MarmotAppRuntime::new(first_app.clone());
@@ -3096,7 +3096,7 @@ async fn account_key_packages_reports_durable_ownership_merges_relay_echo_and_su
     let reopened_app = MarmotApp::with_relay_and_config(
         first_dir.path(),
         url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let restarted = MarmotAppRuntime::new(reopened_app);
     restarted.reconcile_accounts().await.unwrap();
@@ -3146,7 +3146,7 @@ async fn local_account_key_packages_are_readable_while_startup_is_held() {
 
     let first_dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
-    let config = MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     let app = MarmotApp::with_relay_and_config(first_dir.path(), url.clone(), config.clone());
     let runtime = MarmotAppRuntime::new(app);
     let created = runtime
@@ -3716,7 +3716,7 @@ async fn app_component_lifecycle() {
     let reopened = MarmotApp::with_relay_and_config(
         dir.path(),
         url,
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = MarmotAppRuntime::new(reopened);
     runtime.reconcile_accounts().await.unwrap();
@@ -4132,7 +4132,7 @@ async fn app_runtime_serves_member_reads_during_scheduled_convergence() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_relay_endpoints(true)
             .with_dev_settlement_quiescence_ms(100),
     );
@@ -6421,7 +6421,7 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_blob_endpoints(true)
             .with_allow_loopback_relay_endpoints(true),
     );
@@ -6501,7 +6501,7 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url,
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_blob_endpoints(true)
             .with_allow_loopback_relay_endpoints(true),
     );
@@ -7352,7 +7352,7 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_blob_endpoints(true)
             .with_allow_loopback_relay_endpoints(true)
             .with_dev_settlement_quiescence_ms(100)
@@ -7460,7 +7460,7 @@ async fn group_state_subscription_observes_rename_applied_during_failed_send() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_blob_endpoints(true)
             .with_allow_loopback_relay_endpoints(true)
             .with_dev_settlement_quiescence_ms(100)
@@ -7810,7 +7810,7 @@ async fn accepted_disband_finishes_for_both_members_without_followup_commands() 
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_relay_endpoints(true)
             .with_dev_settlement_quiescence_ms(100),
     );
@@ -8201,7 +8201,7 @@ async fn pending_leave_request_survives_a_cold_launch() {
     let reopened = MarmotApp::with_relay_and_config(
         dir.path(),
         url,
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_blob_endpoints(true)
             .with_allow_loopback_relay_endpoints(true),
     );
@@ -9536,7 +9536,7 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
     // Host builds may compile in MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS, which
     // the default configuration lays over the White Noise servers, so expect
     // whichever list the client actually embeds.
-    let expected_endpoints = marmot_app::MarmotAppConfig::default()
+    let expected_endpoints = marmot_app::MarmotAppConfig::white_noise()
         .deployment
         .new_group_media_endpoints;
     assert_eq!(
@@ -9904,7 +9904,7 @@ async fn existing_login_preserves_outbox_only_inbox(external_signer: bool, stale
     let app = MarmotApp::with_relay_and_config(
         app_dir.path(),
         discovery_url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = MarmotAppRuntime::new(app.clone());
     let request = AccountSetupRequest {
@@ -10030,7 +10030,7 @@ async fn import_ignores_retired_published_routes_without_rewriting_relay_lists()
     let app = MarmotApp::with_relay_and_config(
         app_dir.path(),
         relay_url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = MarmotAppRuntime::new(app.clone());
     let imported = runtime
@@ -10093,7 +10093,7 @@ async fn external_signer_login_ignores_retired_routes_without_rewriting_relay_li
     let app = MarmotApp::with_relay_and_config(
         app_dir.path(),
         relay_url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = MarmotAppRuntime::new(app.clone());
     let logged_in = runtime
@@ -10164,7 +10164,7 @@ async fn remote_key_package_fetch_falls_back_when_published_outbox_is_retired() 
     let consumer = MarmotApp::with_relay_and_config(
         consumer_dir.path(),
         relay_url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let fetched = consumer
         .fetch_latest_key_package_for_account_id(
@@ -10338,7 +10338,7 @@ async fn relay_list_future_skew_is_configurable_at_app_instantiation() {
     let app = MarmotApp::with_relays_and_config(
         dir.path(),
         vec![seed_url.clone()],
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_directory_max_future_skew(Duration::from_secs(900))
             .with_allow_loopback_relay_endpoints(true),
     );
@@ -10903,7 +10903,7 @@ async fn generated_account_declares_separate_inbox_relays() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = MarmotAppRuntime::new(app.clone());
     let created = runtime
@@ -10938,7 +10938,7 @@ async fn imported_account_publishes_missing_lists_with_separate_inbox_relays() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = MarmotAppRuntime::new(app.clone());
     let keys = Keys::generate();
@@ -10978,7 +10978,7 @@ async fn account_owned_profile_publish_uses_the_selected_accounts_relay_configur
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         alice_relay_url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = MarmotAppRuntime::new(app.clone());
 
@@ -12183,7 +12183,7 @@ async fn explicit_shutdown_during_startup_hydration_records_clean_audit_stop() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url,
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_relay_endpoints(true)
             .with_dev_startup_hydration_batch_delay_ms(3_000),
     );
@@ -12391,7 +12391,7 @@ async fn create_group_post_canonical_projection_crash_recovers_visibility_and_we
     );
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
-    let config = MarmotAppConfig::default()
+    let config = MarmotAppConfig::white_noise()
         .with_allow_loopback_relay_endpoints(true)
         .with_dev_fail_create_local_projection(true);
     let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config);
@@ -12620,7 +12620,7 @@ async fn invite_deferred_during_startup_keeps_projection_reads_off_welcome_fanou
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url,
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_relay_endpoints(true)
             .with_dev_startup_hydration_batch_delay_ms(3_000),
     );
@@ -12791,7 +12791,7 @@ async fn invite_members_returns_when_welcome_intent_recording_fails() {
     let (relay, app, url) = gift_wrap_blocking_app_with_config(
         &dir,
         BlockNextGiftWraps::new(),
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_relay_endpoints(true)
             .with_dev_fail_invite_welcome_intent(true),
     )
@@ -12869,7 +12869,7 @@ async fn invite_members_returns_when_welcome_intent_recording_fails() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = MarmotAppRuntime::new(app);
     runtime.reconcile_accounts().await.unwrap();
@@ -12898,7 +12898,7 @@ async fn invite_members_returns_when_welcome_intent_recording_fails() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_members_returns_when_local_refresh_fails() {
     invite_members_survives_injected_post_canonical_failure(
-        MarmotAppConfig::default()
+        MarmotAppConfig::white_noise()
             .with_allow_loopback_relay_endpoints(true)
             .with_dev_fail_invite_local_refresh(true),
     )
@@ -13019,7 +13019,7 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
@@ -13110,7 +13110,7 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
@@ -13174,7 +13174,7 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = MarmotAppRuntime::new(app);
     let mut restarted_events = runtime.subscribe();
@@ -13271,7 +13271,7 @@ async fn resolved_inbox_route_survives_restart_and_delivers_exact_welcome() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
@@ -13321,7 +13321,7 @@ async fn resolved_inbox_route_survives_restart_and_delivers_exact_welcome() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     assert!(
         app.directory_entry_for_account_id(&carol_id)
@@ -13372,7 +13372,7 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         discovery_url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
@@ -13484,7 +13484,7 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         discovery_url,
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     assert!(
         app.directory_entry_for_account_id(&carol_id)
@@ -13532,7 +13532,7 @@ async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool
     // R is receiver setup infrastructure, never a sender discovery source.
     // This keeps the missing-D case free of setup-created kind 10050 on D.
     let (_receiver_setup, receiver_setup_url) = mock_relay().await;
-    let config = || MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true);
+    let config = || MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     let receiver =
         MarmotApp::with_relay_and_config(receiver_dir.path(), receiver_setup_url.clone(), config());
     let receiver_runtime = MarmotAppRuntime::new(receiver.clone());
@@ -14055,7 +14055,7 @@ async fn assert_required_discovery_failure_does_not_publish_defaults(external_si
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         bootstrap_url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = MarmotAppRuntime::new(app);
     let keys = Keys::generate();
@@ -14163,7 +14163,7 @@ async fn partial_outbox_failure_does_not_publish_defaults(external_signer: bool)
     let runtime = MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
         dir.path(),
         discovery_url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     ));
     let request = AccountSetupRequest {
         default_relays: vec![endpoint(&healthy_url)],
@@ -14270,7 +14270,7 @@ async fn newer_discovery_inbox_survives_older_outbox(external_signer: bool, empt
     let app = MarmotApp::with_relay_and_config(
         app_dir.path(),
         discovery_url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let runtime = MarmotAppRuntime::new(app.clone());
     let request = AccountSetupRequest {
@@ -14376,7 +14376,7 @@ async fn explicit_empty_outbox_metadata_never_publishes_defaults(external_signer
         let runtime = MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
             dir.path(),
             url.clone(),
-            MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+            MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
         ));
         let request = AccountSetupRequest {
             default_relays: vec![endpoint(&url)],
@@ -14453,7 +14453,7 @@ async fn outbox_acceptance_closed_multi_author_queries_fall_back_per_member() {
         let runtime = MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
             member_dir.path(),
             outbox_url.clone(),
-            MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+            MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
         ));
         let setup = runtime
             .create_or_import_account(AccountSetupRequest {
@@ -14497,7 +14497,7 @@ async fn outbox_acceptance_closed_multi_author_queries_fall_back_per_member() {
     let reader = MarmotApp::with_relay_and_config(
         reader_dir.path(),
         discovery_url,
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let member_refs = member_ids.iter().map(String::as_str).collect::<Vec<_>>();
     let summary = reader
@@ -15845,7 +15845,7 @@ async fn user_blocks_two_accounts_two_devices_sync_and_restart() {
     let second_app = MarmotApp::with_relay_and_config(
         second_dir.path(),
         url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     AccountHome::open(second_dir.path())
         .import_account(
@@ -15888,7 +15888,7 @@ async fn user_blocks_two_accounts_two_devices_sync_and_restart() {
     let restarted = MarmotApp::with_relay_and_config(
         second_dir.path(),
         url,
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     )
     .runtime();
     restarted.start().await.unwrap();
@@ -16555,7 +16555,7 @@ async fn offline_member_recovers_dismissal_label_after_admin_demotion() {
             MarmotApp::with_relay_and_config(
                 dir.path(),
                 url.clone(),
-                MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+                MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
             )
         })
         .collect();
@@ -16657,7 +16657,7 @@ async fn offline_member_recovers_dismissal_label_after_admin_demotion() {
     let reopened_carol_app = MarmotApp::with_relay_and_config(
         dirs[2].path(),
         url.clone(),
-        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let carol = MarmotAppRuntime::new(reopened_carol_app.clone());
     carol.reconcile_accounts().await.unwrap();

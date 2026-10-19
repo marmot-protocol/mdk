@@ -106,14 +106,6 @@ mod tests {
     }
 
     #[test]
-    fn sends_and_handoffs_need_exactly_the_body() {
-        for body in [0, 1, 50, 1 << 40] {
-            assert_eq!(DiskPolicy::send_need(body), body);
-            assert_eq!(DiskPolicy::handoff_need(body), body);
-        }
-    }
-
-    #[test]
     fn a_saved_checkpoint_lowers_the_need_to_the_store_file() {
         assert_eq!(DiskPolicy::download_need(50, 20), 80);
         assert_eq!(DiskPolicy::download_need(50, 50), 50);

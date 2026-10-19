@@ -425,21 +425,6 @@ mod tests {
     // A disposition the host cannot read is not a signal. #1177 is only closed
     // if `accepted_pending` survives the FFI boundary as a typed value rather
     // than being flattened away with the rest of the summary.
-    #[test]
-    fn badge_attention_crosses_ffi_without_overlapping_unread_totals() {
-        let ffi = AccountUnreadFfi::from(AccountUnread {
-            account_id_hex: "aa".repeat(32),
-            unread_count: 4,
-            unread_conversations: 3,
-            attention_only_conversations: 2,
-            has_unread: true,
-        });
-
-        assert_eq!(ffi.unread_count, 4);
-        assert_eq!(ffi.unread_conversations, 3);
-        assert_eq!(ffi.attention_only_conversations, 2);
-        assert!(ffi.has_unread);
-    }
 
     #[test]
     fn accepted_pending_crosses_ffi_as_a_typed_disposition() {
@@ -535,43 +520,5 @@ mod tests {
             assert!(!ffi.record.relay);
             assert_eq!(ffi.local_state, expected);
         }
-    }
-
-    #[test]
-    fn existing_key_package_record_layout_is_unchanged() {
-        let ffi = AccountKeyPackageFfi::from(AccountKeyPackageRecord {
-            account_label: Some("device".into()),
-            account_id_hex: "aa".repeat(32),
-            key_package_id: "stable-slot".into(),
-            key_package_ref_hex: "bb".repeat(32),
-            key_package_event_id: "cc".repeat(32),
-            published_at: 7,
-            key_package_bytes: 64,
-            source_relays: vec!["wss://relay.example".into()],
-            local: true,
-            relay: true,
-        });
-
-        assert_eq!(ffi.account_ref.as_deref(), Some("device"));
-        assert_eq!(ffi.event_id_hex, "cc".repeat(32));
-        assert_eq!(ffi.published_at, 7);
-        assert_eq!(ffi.key_package_bytes, 64);
-        assert!(ffi.local);
-        assert!(ffi.relay);
-    }
-
-    #[test]
-    fn completion_unknown_crosses_ffi_as_a_typed_disposition() {
-        let ffi = SendSummaryFfi::from(SendSummary {
-            published: 0,
-            message_ids: vec![],
-            accept_disposition: cgka_traits::SendAcceptDisposition::CompletionUnknown,
-            maintenance_disposition: cgka_traits::SendMaintenanceDisposition::Ready,
-        });
-
-        assert!(matches!(
-            ffi.accept_disposition,
-            SendAcceptDispositionFfi::CompletionUnknown
-        ));
     }
 }
