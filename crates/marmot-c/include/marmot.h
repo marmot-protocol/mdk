@@ -272,6 +272,16 @@ typedef enum MarmotMediaAttachmentRejectionKind {
   MARMOT_MEDIA_ATTACHMENT_REJECTION_KIND_MALFORMED_FIELD,
 } MarmotMediaAttachmentRejectionKind;
 
+/**
+ * Where moving legacy attachment bodies into the media store stands.
+ */
+typedef enum MarmotAttachmentMigrationState {
+  MARMOT_ATTACHMENT_MIGRATION_STATE_NOT_NEEDED,
+  MARMOT_ATTACHMENT_MIGRATION_STATE_RUNNING,
+  MARMOT_ATTACHMENT_MIGRATION_STATE_PAUSED,
+  MARMOT_ATTACHMENT_MIGRATION_STATE_COMPLETE,
+} MarmotAttachmentMigrationState;
+
 typedef enum MarmotAvatarAvailability {
   MARMOT_AVATAR_AVAILABILITY_MISSING,
   MARMOT_AVATAR_AVAILABILITY_READY,
@@ -1735,6 +1745,8 @@ typedef struct MarmotAttachmentStorageUsage {
   uint64_t attachment_count;
   uint64_t database_bytes;
   uint64_t database_free_bytes;
+  enum MarmotAttachmentMigrationState migration;
+  uint64_t migration_bytes;
 } MarmotAttachmentStorageUsage;
 
 /**
