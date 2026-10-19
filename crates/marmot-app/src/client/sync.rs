@@ -7223,12 +7223,24 @@ mod live_cursor_checkpoint_tests {
             )
             .await;
             fixture.wait_for_queue_depth(1).await;
-            fixture
-                .client
-                .checkpoint_sync_prefix(&mut SyncSummary::default(), false, 0)
-                .await
-                .unwrap_or_else(|_| panic!("the checkpoint saves"));
-            assert_eq!(fixture.persisted(), Some(cursor_before + 1_000 + 120));
+            // A nonblocking seal may defer while admission is locked. The first
+            // persisted checkpoint must still stop at the queued older delivery.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    fixture
+                        .client
+                        .checkpoint_sync_prefix(&mut SyncSummary::default(), false, 0)
+                        .await
+                        .unwrap_or_else(|_| panic!("the checkpoint saves"));
+                    if let Some(cursor) = fixture.persisted() {
+                        assert_eq!(cursor, cursor_before + 1_000 + 120);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the unfenced checkpoint becomes durable");
 
             fixture.ingest_next_live_delivery().await;
             assert_eq!(
