@@ -46,6 +46,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   `MARMOT_ATTACHMENT_TRANSFER_STATE_STORAGE_BLOCKED`; existing discriminants
   are unchanged. Recompile against the regenerated `marmot.h` with the matching
   library and handle the new value as "free up storage", not as a retry timer.
+- `marmot_attachment_transfer_subscription_next` returns a replacement that
+  changes a row's transfer state as soon as the engine reports it; progress-only
+  replacements still arrive at most four per second. A timeout no longer loses
+  a replacement that was waiting out that window (#2157).
 
 ## [0.13.0] - 2026-10-12
 
