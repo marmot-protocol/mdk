@@ -23588,7 +23588,7 @@ async fn run_due_periodic_rotation(client: &mut AppClient, group_id: &GroupId) -
 /// own due periodic self-update for the group, so a rotation cannot leave the
 /// finished upload unsendable. The rotation stays owed and runs once the upload
 /// ends.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_in_flight_upload_holds_the_groups_self_update_until_it_ends() {
     let (_dir, _app, mut client, group_id, epoch) = upload_hold_fixture("uploading").await;
     let upload = prepare_held_upload(&mut client, &group_id).await;
@@ -23612,7 +23612,7 @@ async fn an_in_flight_upload_holds_the_groups_self_update_until_it_ends() {
 /// mdk#2158: an upload sent in a separate command, by token admission or by
 /// the host, keeps its group's periodic self-update held through the
 /// admission grace, so that send still finds the epoch the upload used.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_upload_sent_separately_holds_its_group_through_admission() {
     let (_dir, _app, mut client, group_id, epoch) = upload_hold_fixture("admitting").await;
     let finish = prepare_held_upload(&mut client, &group_id).await;
@@ -23625,8 +23625,9 @@ async fn an_upload_sent_separately_holds_its_group_through_admission() {
         }],
         sent: None,
     };
+    let uploads = crate::media::outgoing::OutgoingUploads::new(client.app.clone(), "alice".into());
     client
-        .finish_encrypted_media_upload(finish, result, Vec::new())
+        .finish_encrypted_media_upload(finish, result, uploads)
         .await
         .unwrap();
     assert_eq!(
@@ -23650,7 +23651,7 @@ async fn an_upload_sent_separately_holds_its_group_through_admission() {
 /// mdk#2158: an upload outlives the client that started it when the account
 /// worker rebuilds its client, as it does on reconnect, so the rebuilt client
 /// still holds the group's periodic self-update until the upload ends.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_upload_holds_its_group_across_a_client_rebuild() {
     let (_dir, app, mut client, group_id, epoch) = upload_hold_fixture("reconnecting").await;
     let upload = prepare_held_upload(&mut client, &group_id).await;
