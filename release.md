@@ -102,6 +102,22 @@ Use a new version when public behavior changes. That includes:
 Before `1.0.0`, treat `0.<minor>.0` as the breaking-compatibility line and `0.<minor>.<patch>` as the compatible bugfix
 or packaging line. Avoid `0.0.x` releases unless every update is intentionally a breaking experiment.
 
+### Development versions
+
+Between releases, master carries the next minor version with a `-dev` suffix. Once a cohort release such as `0.13.0`
+is published, open a follow-up PR that moves the root workspace version, workspace package versions in `Cargo.lock`,
+and vector `conformance_version` values to `0.14.0-dev`. Nothing is tagged or published under a `-dev` version; the
+next initial release PR replaces it with the release version.
+
+While master is on `-dev`, install guidance keeps pinning the newest published release. The agent-install and
+install-example gates, and installers run from a checkout, resolve a pre-release workspace version to the newest
+`docs/release/<X.Y.Z>.md`, so documented pins move only in the release PR that adds the next notes.
+
+Point releases such as `0.13.1` come from a `release/0.13` branch cut at the `v0.13.0` tag, with only the fixes
+cherry-picked onto it and the stable version on that branch. master stays on `0.14.0-dev`. The release coordinator and
+publishing workflows still require release commits reachable from `origin/master`, so extend those checks before
+cutting the first point release from a release branch.
+
 Each release artifact should include a manifest recording the source commit, workspace version, release tag, artifact
 version, `Cargo.lock` hash when relevant, toolchain version, and package contents. Add explicit protocol or ABI fields
 to manifests when downstream compatibility depends on more than the workspace version.
@@ -763,6 +779,7 @@ name reusable.
 ## Current Limits
 
 - The workspace is not published to crates.io.
+- Point releases from `release/X.Y` branches need coordinator and workflow support for non-master release commits.
 - The whole-workspace release is tag- and source-archive-based.
 - MarmotKit publishes SwiftPM binary-target ZIPs and separate Swift/privacy assets, but no remote version-resolved
   Swift wrapper package repository or Maven package. Hosts must synchronize the matching inputs and own resource wiring.

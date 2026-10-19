@@ -32,6 +32,7 @@ class InstallExampleSha256GateTests(unittest.TestCase):
                 target = root / name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source / name, target)
+            shutil.copytree(source / "docs/release", root / "docs/release")
             workflow = root / ".github/workflows/fixture.yml"
             workflow.parent.mkdir(parents=True)
             workflow.write_text("name: fixture\n")
@@ -61,6 +62,18 @@ class InstallExampleSha256GateTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
                 self.assertNotIn("command not found", result.stderr)
+
+    def test_documented_release_version_skips_dev_workspace_versions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.assertEqual(gate.documented_release_version(root, "0.14.0"), "0.14.0")
+            self.assertIsNone(gate.documented_release_version(root, "0.14.0-dev"))
+            notes = root / "docs/release"
+            notes.mkdir(parents=True)
+            for name in ("0.9.4.md", "0.13.0.md", "0.10.2.md", "wn-homebrew.md", "0.14.0-rc.1.md"):
+                (notes / name).write_text("notes\n")
+            self.assertEqual(gate.documented_release_version(root, "0.14.0-dev"), "0.13.0")
+            self.assertEqual(gate.documented_release_version(root, "0.14.0"), "0.14.0")
 
     def resolve_fixture(self, pages: list[list[dict]]) -> tuple[str, int]:
         readme = (Path(__file__).resolve().parents[1] / "integrations/README.md").read_text()
