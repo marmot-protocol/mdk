@@ -13364,6 +13364,7 @@ impl LiveCursorFixture {
 
     pub(crate) async fn wait_for_queue_depth(&self, depth: usize) {
         tokio::time::timeout(Duration::from_secs(5), async {
+            // Queue visibility precedes the router's replay-placement acknowledgement.
             while self
                 .app
                 .relay_plane
@@ -13371,12 +13372,18 @@ impl LiveCursorFixture {
                 .await
                 .account_delivery_queue_depth
                 < depth
+                || !self
+                    .client
+                    .adapter
+                    .account_subscription_eose()
+                    .await
+                    .complete()
             {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("the router queues every injected probe");
+        .expect("the router queues and acknowledges every injected probe");
     }
 
     pub(crate) async fn ingest_next_live_delivery(&mut self) -> String {
