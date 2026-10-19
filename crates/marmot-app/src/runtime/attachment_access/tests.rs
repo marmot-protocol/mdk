@@ -1231,6 +1231,40 @@ async fn attachment_reads_survive_cancelled_next_without_stacking() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+/// A read a cancelled call left in flight can hold a snapshot taken before a
+/// later state change. The next call collects that read before it consumes
+/// the change's notification, so `Ready` still arrives the read floor after
+/// its report, not with the stale progress at the window's end.
+#[tokio::test(start_paused = true)]
+async fn attachment_resumed_read_never_swallows_a_later_state_change() {
+    use crate::AttachmentTransferState;
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, store, job, stream) = downloading_subscription(&dir, b"resumed").await;
+    let gate = stream.gate_read_results_for_test();
+    report_progress(&runtime, &store, &job, 1024);
+    // The call snapshots that progress, then its caller gives up while the
+    // result is held.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
+            .await
+            .is_err(),
+        "a held read delivered a frame"
+    );
+    assert_eq!(gate.starts.lock().unwrap().len(), 1);
+    report_ready(&runtime, &store, &job, b"resumed");
+    let reported = tokio::time::Instant::now();
+    gate.open.send_replace(true);
+    let (row, arrived) = next_row(&stream).await;
+    assert_eq!(row.state, AttachmentTransferState::Ready);
+    assert!(
+        arrived <= reported + READ_FLOOR,
+        "Ready arrived {:?} after its report",
+        arrived - reported
+    );
+    stream.close();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 /// A caller timeout that cancels `next()` while progress waits out the window
 /// keeps the held rows, so the next call delivers that progress exactly when
 /// the window ends, from the read already made.
