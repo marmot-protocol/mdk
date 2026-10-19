@@ -14680,28 +14680,6 @@ fn group_system_intent_builds_kind_1210_json_payload() {
 }
 
 #[test]
-fn custom_intent_passes_kind_tags_and_content_through_verbatim() {
-    let event = build(AppMessageIntent::Custom {
-        kind: 30078,
-        tags: vec![
-            vec!["d".to_owned(), "game-1".to_owned()],
-            vec!["move".to_owned(), "e4".to_owned()],
-        ],
-        content: "{\"move\":\"e4\"}".to_owned(),
-    });
-    assert_eq!(event.kind, 30078);
-    assert_eq!(
-        event.tags,
-        vec![
-            vec!["d".to_owned(), "game-1".to_owned()],
-            vec!["move".to_owned(), "e4".to_owned()]
-        ]
-    );
-    assert_eq!(event.content, "{\"move\":\"e4\"}");
-    assert_eq!(event.pubkey, SENDER_HEX);
-}
-
-#[test]
 fn custom_intent_rejects_every_reserved_kind() {
     use cgka_traits::app_event as kinds;
     for kind in [

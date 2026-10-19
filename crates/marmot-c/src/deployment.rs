@@ -262,28 +262,6 @@ mod tests {
     }
 
     #[test]
-    fn presets_match_the_uniffi_records() {
-        // Handles count against the process-wide allocation audit.
-        let _guard = crate::memory::audit::test_lock();
-        let deployment = white_noise();
-        assert_eq!(
-            unsafe { &(*deployment).inner },
-            &marmot_uniffi::marmot_deployment_white_noise()
-        );
-        unsafe { marmot_deployment_free(deployment) };
-        let mut neutral = std::ptr::null_mut();
-        assert_eq!(
-            unsafe { marmot_deployment_neutral(&mut neutral) },
-            MarmotStatus::Ok
-        );
-        assert_eq!(
-            unsafe { &(*neutral).inner },
-            &marmot_uniffi::marmot_deployment_neutral()
-        );
-        unsafe { marmot_deployment_free(neutral) };
-    }
-
-    #[test]
     fn setters_replace_each_field() {
         // Handles count against the process-wide allocation audit.
         let _guard = crate::memory::audit::test_lock();

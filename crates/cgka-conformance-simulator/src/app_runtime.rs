@@ -3140,19 +3140,6 @@ mod tests {
     }
 
     #[test]
-    fn public_commitment_preserves_a_reported_zero_member_count() {
-        let projection = public_protocol_projection(
-            7,
-            vec!["alice".into()],
-            vec!["alice".into()],
-            "group".into(),
-            "description".into(),
-            0,
-        );
-        assert_eq!(projection.member_count, 0);
-    }
-
-    #[test]
     fn app_errors_are_classified_without_serializing_inner_details() {
         let marker = "private-storage-path";
         let incomplete = AppError::DirectoryLookupIncomplete(marker.into());

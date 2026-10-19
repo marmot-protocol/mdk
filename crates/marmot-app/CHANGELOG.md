@@ -184,6 +184,11 @@
   and `relays_incomplete` now count distinct relays; before, they were summed
   per compared route and could exceed `relays_required` (#2265).
 
+### Maintenance
+
+- Removed the 41 Delete/wiring tests identified in #2413 across the Rust crates
+  and Hermes/OpenClaw integrations. Runtime behavior and public contracts are unchanged.
+
 ## 0.13.0 - 2026-10-12
 
 ### Breaking changes
