@@ -92,6 +92,16 @@ impl SqliteAppStorage {
             ));
         }
         checkpoint(&conn);
+        // A close (a host about to suspend) must not wait out the copy: it
+        // interrupts it, and the interrupted VACUUM rolls back.
+        let _interruptible = self
+            .connection
+            .interrupt_on_close(conn.get_interrupt_handle());
+        if self.connection.is_closing() {
+            return Err(StorageError::Closed(
+                "database compaction cancelled by close".into(),
+            ));
+        }
         let vacuumed = conn
             .execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")
             .storage();
@@ -125,6 +135,21 @@ impl SqliteAppStorage {
         drop(statement);
         let after = database_space_in(&conn)?;
         Ok(before.free_pages.saturating_sub(after.free_pages))
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl SqliteAppStorage {
+    /// Holds the account connection, as a running `VACUUM` does: signals
+    /// `held`, then waits for `release`. Test support only.
+    pub fn hold_connection_for_test(
+        &self,
+        held: &std::sync::mpsc::Sender<()>,
+        release: &std::sync::mpsc::Receiver<()>,
+    ) {
+        let _conn = self.lock().expect("account connection");
+        let _ = held.send(());
+        let _ = release.recv();
     }
 }
 

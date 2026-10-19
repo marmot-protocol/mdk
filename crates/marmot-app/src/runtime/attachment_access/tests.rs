@@ -1383,21 +1383,18 @@ async fn a_damaged_stored_twin_does_not_replace_the_database_copy() {
 
 /// Runs the maintenance pass the worker runs after a migration batch, with
 /// plenty of free disk. Whether it woke observers.
-fn maintain_database(
-    app: &MarmotApp,
-    store: &SqliteAccountStorage,
-    attempted: &std::sync::atomic::AtomicBool,
-) -> bool {
+/// The worker's compaction step with plenty of free disk: whether it was
+/// attempted, and whether it woke observers.
+fn compact_if_due(app: &MarmotApp, store: &SqliteAccountStorage) -> (bool, bool) {
     let woke = std::sync::atomic::AtomicBool::new(false);
-    crate::media::storage_compaction::maintain(
+    let attempted = crate::media::storage_compaction::compact_if_due(
         &store.app_storage(),
         1024,
         &|| Ok(u64::MAX / 2),
         &app.legacy_media_migration("alice"),
-        attempted,
         &|| woke.store(true, std::sync::atomic::Ordering::Release),
     );
-    woke.load(std::sync::atomic::Ordering::Acquire)
+    (attempted, woke.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// Once moved legacy bodies leave enough free pages, the database is
@@ -1418,18 +1415,15 @@ async fn moved_legacy_bodies_are_compacted_out_of_the_database() {
     assert!(!before.incremental);
     assert!(before.free_bytes() >= 6_000_000);
 
-    let attempted = std::sync::atomic::AtomicBool::new(false);
-    assert!(
-        maintain_database(&app, &store, &attempted),
+    assert_eq!(
+        compact_if_due(&app, &store),
+        (true, true),
         "start and end wake observers"
     );
     let after = store.app_storage().database_space().unwrap();
     assert!(after.incremental);
     assert!(after.file_bytes() + 6_000_000 <= before.file_bytes());
-    assert!(
-        !maintain_database(&app, &store, &attempted),
-        "nothing more to do"
-    );
+    assert_eq!(compact_if_due(&app, &store), (false, false), "only once");
     let runtime = app.runtime();
     let usage = runtime.attachment_storage_usage("alice").await.unwrap();
     assert_eq!(usage.migration, AttachmentMigrationState::Complete);
@@ -1439,7 +1433,8 @@ async fn moved_legacy_bodies_are_compacted_out_of_the_database() {
 }
 
 /// While the database compacts, usage answers from the snapshot taken just
-/// before, as `Compacting`, instead of reading the busy database.
+/// before, as `Compacting`, without waiting for the connection the `VACUUM`
+/// holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn usage_reports_compacting_from_its_snapshot() {
     let dir = tempfile::tempdir().unwrap();
@@ -1457,10 +1452,24 @@ async fn usage_reports_compacting_from_its_snapshot() {
         .lock()
         .unwrap()
         .compacting = Some(snapshot.clone());
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = store.app_storage();
+    let holding =
+        std::thread::spawn(move || holder.hold_connection_for_test(&held_tx, &release_rx));
+    held_rx.recv().unwrap();
     let runtime = app.runtime();
-    let usage = runtime.attachment_storage_usage("alice").await.unwrap();
+    let usage = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        runtime.attachment_storage_usage("alice"),
+    )
+    .await
+    .expect("usage does not wait for the held connection")
+    .unwrap();
     assert_eq!(usage.migration, AttachmentMigrationState::Compacting);
     assert_eq!(usage.legacy_bytes, snapshot.legacy_bytes);
+    release_tx.send(()).unwrap();
+    holding.join().unwrap();
     app.legacy_media_migration("alice")
         .lock()
         .unwrap()

@@ -2796,6 +2796,7 @@ async fn run_app_runtime_account_worker(
                     &client,
                     &mut legacy_message_promotion,
                 );
+                attachments::compact_if_due(&client, &shared, &mut attachment_admission).await;
                 attachments::spawn_legacy_migration(
                     &client,
                     &shared,

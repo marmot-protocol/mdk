@@ -53,3 +53,36 @@ async fn the_maintenance_batch_moves_a_legacy_body_and_wakes_observers() {
     ));
     test_free_space::clear(dir.path());
 }
+
+/// The maintenance tick's compaction runs once per worker ownership, awaited
+/// off the worker's async thread, and wakes observers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_maintenance_tick_compacts_the_database_once() {
+    let (dir, client, storage, _reference) = offline_fixture().await;
+    test_free_space::set(dir.path(), 1 << 40);
+    {
+        // Free pages inside the database, as moved or removed bodies leave.
+        let conn = super::retention_fault_connection(&client.app);
+        conn.execute_batch(
+            "CREATE TABLE compaction_filler(body BLOB NOT NULL);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000)
+             INSERT INTO compaction_filler SELECT randomblob(4000) FROM n;
+             DROP TABLE compaction_filler;",
+        )
+        .unwrap();
+    }
+    let before = storage.app_storage().database_space().unwrap();
+    assert!(!before.incremental);
+    assert!(before.free_bytes() >= 3_000_000);
+    let shared = RuntimeSharedServices::default();
+    let observer = shared.attachment_updates.subscribe();
+    let mut admission = Admission::default();
+
+    compact_if_due(&client, &shared, &mut admission).await;
+    assert!(admission.compaction_attempted);
+    assert!(observer.has_changed().unwrap(), "observers hear of it");
+    let after = storage.app_storage().database_space().unwrap();
+    assert!(after.incremental);
+    assert!(after.file_bytes() < before.file_bytes());
+    test_free_space::clear(dir.path());
+}

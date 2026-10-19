@@ -82,7 +82,8 @@
   database's pages (`DatabaseSpace`: size, free pages, live bytes, whether it
   is incremental), `compact_database` switches it to
   `auto_vacuum=INCREMENTAL` with one `VACUUM` between WAL checkpoints (an
-  interrupted one changes nothing), and `reclaim_free_pages` returns freed
+  interrupted one changes nothing; closing the storage interrupts a running
+  one instead of waiting for it), and `reclaim_free_pages` returns freed
   pages in bounded steps afterwards. `AttachmentMigrationState` adds
   `Compacting`.
 

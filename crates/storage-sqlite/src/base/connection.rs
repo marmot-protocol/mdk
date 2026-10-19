@@ -173,7 +173,6 @@ impl DerefMut for ConnectionGuard<'_> {
 /// the [`SqliteAccountStorage`] aggregate (the app's shared cache and directory
 /// caches), so the checkpoint-then-close ordering and the closed-state contract
 /// live in one place.
-#[derive(Debug)]
 pub struct CloseableConnection {
     slot: Mutex<Option<rusqlite::Connection>>,
     /// Published before [`Self::close`] waits for the connection mutex. New
@@ -188,6 +187,39 @@ pub struct CloseableConnection {
     /// Detail carried by the [`StorageError::Closed`] this connection raises,
     /// naming which database is closed.
     closed_detail: &'static str,
+    /// The interrupt handle of a long statement that [`Self::close`] may cut
+    /// short (a database compaction), registered for as long as it runs.
+    interruptible: Mutex<Option<rusqlite::InterruptHandle>>,
+}
+
+impl std::fmt::Debug for CloseableConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloseableConnection")
+            .field("closed", &self.is_closed())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for InterruptOnClose<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InterruptOnClose").finish_non_exhaustive()
+    }
+}
+
+/// While alive, [`CloseableConnection::close`] interrupts the registered
+/// statement instead of waiting for it to finish.
+pub(crate) struct InterruptOnClose<'a> {
+    connection: &'a CloseableConnection,
+}
+
+impl Drop for InterruptOnClose<'_> {
+    fn drop(&mut self) {
+        *self
+            .connection
+            .interruptible
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -236,7 +268,23 @@ impl CloseableConnection {
             closed: AtomicBool::new(false),
             released: Arc::default(),
             closed_detail,
+            interruptible: Mutex::new(None),
         }
+    }
+
+    /// Lets [`Self::close`] interrupt the statement `handle` belongs to while
+    /// the returned guard lives. Register before starting the statement and
+    /// check [`Self::is_closed`] after registering: a close that began first
+    /// is then seen, and one that begins later interrupts the statement.
+    pub(crate) fn interrupt_on_close(
+        &self,
+        handle: rusqlite::InterruptHandle,
+    ) -> InterruptOnClose<'_> {
+        *self
+            .interruptible
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
+        InterruptOnClose { connection: self }
     }
 
     /// Borrow the connection, or fail with [`StorageError::Closed`] if it has
@@ -282,16 +330,41 @@ impl CloseableConnection {
         // callers still have to serialize on `slot` so every return truthfully
         // means the connection has been taken and closed.
         self.closed.store(true, Ordering::Release);
-        let mut slot = self
-            .slot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut slot = self.lock_for_close();
         let Some(connection) = slot.take() else {
             return Ok(());
         };
         let result = Self::close_taken(connection);
         self.released.mark();
         result
+    }
+
+    /// Takes the connection mutex for a close. While a registered statement
+    /// (a compaction) holds it, interrupt that statement, again until it
+    /// yields: an interrupt that lands before the statement starts is ignored
+    /// by SQLite. Otherwise wait for the current operation as usual.
+    fn lock_for_close(&self) -> std::sync::MutexGuard<'_, Option<rusqlite::Connection>> {
+        loop {
+            match self.slot.try_lock() {
+                Ok(slot) => return slot,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            let interruptible = self
+                .interruptible
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(handle) = interruptible.as_ref() else {
+                drop(interruptible);
+                return self
+                    .slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            };
+            handle.interrupt();
+            drop(interruptible);
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn close_taken(connection: rusqlite::Connection) -> StorageResult<()> {
@@ -503,6 +576,19 @@ impl SharedConnection {
         self.inner.closed.store(true, Ordering::Release);
         self.wake_transaction_waiters();
         self.inner.connection.close()
+    }
+
+    /// [`CloseableConnection::interrupt_on_close`] for this connection.
+    pub(crate) fn interrupt_on_close(
+        &self,
+        handle: rusqlite::InterruptHandle,
+    ) -> InterruptOnClose<'_> {
+        self.inner.connection.interrupt_on_close(handle)
+    }
+
+    /// Whether a close has started. Nonblocking.
+    pub(crate) fn is_closing(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire) || self.inner.connection.is_closed()
     }
 
     fn wake_transaction_waiters(&self) {

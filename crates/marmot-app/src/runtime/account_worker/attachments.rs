@@ -40,9 +40,9 @@ pub(super) struct Admission {
     upload_cursor: Arc<std::sync::Mutex<Option<storage_sqlite::AttachmentUploadOwner>>>,
     /// The legacy body migration batch running on the blocking pool, if any.
     legacy_migration: Option<tokio::task::JoinHandle<()>>,
-    /// The one-time database compaction started under this worker; it is
-    /// not attempted again until the next worker ownership.
-    compaction_attempted: Arc<std::sync::atomic::AtomicBool>,
+    /// The one-time database compaction ran under this worker; it is not
+    /// attempted again until the next worker ownership.
+    compaction_attempted: bool,
 }
 
 /// Starts a media sweep on the blocking pool unless one is still running:
@@ -116,11 +116,10 @@ fn spawn_upload_promotion(
 
 /// Starts one batch of moving legacy database bodies into the media store
 /// (mdk#2314 step 6) on the blocking pool, unless one is still running, and
-/// then returns the database's freed pages to the filesystem (compacting it
-/// once when due). The account worker calls this once per maintenance tick,
+/// then returns freed database pages to the filesystem once the database is
+/// incremental. The account worker calls this once per maintenance tick,
 /// after readiness. A batch that pauses for free space, resumes, finishes,
-/// or drops a corrupt body wakes attachment observers, and so does the start
-/// and end of a compaction.
+/// or drops a corrupt body wakes attachment observers.
 pub(super) fn spawn_legacy_migration(
     client: &AppClient,
     shared: &RuntimeSharedServices,
@@ -137,7 +136,6 @@ pub(super) fn spawn_legacy_migration(
     let app = client.app.clone();
     let label = client.state.label.clone();
     let updates = shared.attachment_updates.clone();
-    let compaction_attempted = admission.compaction_attempted.clone();
     admission.legacy_migration = Some(tokio::task::spawn_blocking(move || {
         let started = (|| {
             let storage = app.account_storage(&label)?;
@@ -170,15 +168,54 @@ pub(super) fn spawn_legacy_migration(
         if changed {
             updates.send_modify(|_| {});
         }
-        crate::media::storage_compaction::maintain(
-            &app_storage,
-            reserve,
-            &free,
-            &progress,
-            &compaction_attempted,
-            &|| updates.send_modify(|_| {}),
-        );
+        crate::media::storage_compaction::reclaim(&app_storage);
     }));
+}
+
+/// The one-time database compaction (mdk#2314 step 6), when it is due and
+/// this worker has not attempted it, awaited on the blocking pool. The worker
+/// makes no storage calls while it waits, so the `VACUUM` holding the
+/// account connection never parks an async thread. Skipped while a migration
+/// batch still runs; the next tick checks again.
+pub(super) async fn compact_if_due(
+    client: &AppClient,
+    shared: &RuntimeSharedServices,
+    admission: &mut Admission,
+) {
+    if client.app.config.cursor_persistence == crate::CursorPersistence::Frozen
+        || admission.compaction_attempted
+        || admission
+            .legacy_migration
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    {
+        return;
+    }
+    let app = client.app.clone();
+    let label = client.state.label.clone();
+    let updates = shared.attachment_updates.clone();
+    let attempted = tokio::task::spawn_blocking(move || {
+        let storage = app.account_storage(&label).ok()?;
+        let reserve = storage
+            .app_storage()
+            .attachment_download_policy(&super::super::attachment_controls::default_policy(
+                &app.config,
+            ))
+            .ok()?
+            .disk_reserve;
+        let account_dir = app.account_dir(&label);
+        Some(crate::media::storage_compaction::compact_if_due(
+            &storage.app_storage(),
+            reserve,
+            &|| crate::media::attachment_resume::available_space(&account_dir),
+            &app.legacy_media_migration(&label),
+            &|| updates.send_modify(|_| {}),
+        ))
+    })
+    .await;
+    if matches!(attempted, Ok(Some(true))) {
+        admission.compaction_attempted = true;
+    }
 }
 
 impl Admission {

@@ -142,3 +142,52 @@ fn compaction_is_refused_inside_a_transaction() {
     assert!(result.is_err());
     assert!(!fixture.space().incremental);
 }
+
+/// A close (a host about to suspend) does not wait out a compaction: it
+/// interrupts the `VACUUM`, which rolls back, and the reopened database is
+/// as it was.
+#[test]
+fn a_close_interrupts_a_running_compaction() {
+    let fixture = Fixture::new();
+    fixture.fill_and_delete();
+    let before = fixture.space();
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    // Slow the copy right down, so the close lands while it runs.
+    fixture
+        .store
+        .lock()
+        .unwrap()
+        .progress_handler(
+            100,
+            Some(move || {
+                let _ = started_tx.send(());
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                false
+            }),
+        )
+        .unwrap();
+    let app = fixture.store.app_storage();
+    let compacting = std::thread::spawn(move || app.compact_database());
+    started_rx.recv().unwrap();
+    let closing = std::time::Instant::now();
+    fixture.store.close().unwrap();
+    assert!(
+        closing.elapsed() < std::time::Duration::from_secs(5),
+        "the close cut the copy short"
+    );
+    assert!(compacting.join().unwrap().is_err());
+
+    let key = SqlCipherKey::new(hex::encode([0x5c; 32])).unwrap();
+    let reopened =
+        SqliteAccountStorage::open_encrypted(fixture.dir.path().join("session.sqlite"), &key)
+            .unwrap();
+    let space = reopened.app_storage().database_space().unwrap();
+    assert!(!space.incremental);
+    assert_eq!(space.free_pages, before.free_pages);
+    let marker: String = reopened
+        .lock()
+        .unwrap()
+        .query_row("SELECT value FROM compaction_marker", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(marker, "kept");
+}
