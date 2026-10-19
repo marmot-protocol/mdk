@@ -111,6 +111,11 @@ MarmotApp stores the cursor in its encrypted account database alongside existing
 state. There is no shared cross-route cursor cache, so activity on other routes cannot evict an
 active route's progress. State adds at most one 32-byte cursor to each existing route row.
 
+MarmotApp stages SDK progress in memory and saves a route's cursor after every owned comparison
+event has completed its ordinary ingest attempt. Capacity refusals still permit rotation, but
+remain outside inventory and cannot certify coverage. Failed network requests and interrupted
+admission preserve the pre-pass cursor.
+
 Pass budgets:
 
 - The NIP-77 remote-only selection holds at most 512 IDs from a 16,384-ID reconciliation set.

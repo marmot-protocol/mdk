@@ -71,6 +71,10 @@ struct AdmissionRoute {
     reached_endpoints: Vec<String>,
     /// Every event this route fetched was durably admitted.
     admitted: bool,
+    /// Owned comparison events still to attempt. No successful network result
+    /// means no cursor progress; refusals and definitive rejections finish an
+    /// attempt, but an ingest error leaves this count unchanged.
+    remaining: Option<usize>,
     /// Events durably admitted: progress, even without a certificate.
     fetched: usize,
     /// What the relays returned, for the attempt's audit row only.
@@ -610,6 +614,10 @@ impl AppClient {
                 route.result,
                 ComparisonRouteWorkResult::TimedOut | ComparisonRouteWorkResult::Returned(Err(_))
             );
+            let returned = matches!(
+                route.result,
+                ComparisonRouteWorkResult::Returned(Ok(Some(_)))
+            );
             let mut acquisition = super::super::audit_recovery::RouteAcquisition::default();
             let mut reached_endpoints = Vec::new();
             let (outcome, certified, answered, events) = match route.result {
@@ -691,6 +699,12 @@ impl AppClient {
                     ))
             });
             batch.dedup_by(|(_, later), (_, kept)| later.event.id == kept.event.id);
+            let remaining = returned.then(|| {
+                batch
+                    .iter()
+                    .filter(|(source, _)| *source == PendingSource::Comparison)
+                    .count()
+            });
             admission.pending.extend(
                 batch
                     .into_iter()
@@ -705,6 +719,7 @@ impl AppClient {
                 answered,
                 reached_endpoints,
                 admitted,
+                remaining,
                 fetched: 0,
                 acquisition,
             });
@@ -795,6 +810,11 @@ impl AppClient {
                         }
                     }
                 }
+            }
+            if let Some(route) = route
+                && let Some(remaining) = route.remaining.as_mut()
+            {
+                *remaining -= 1;
             }
             if !held_only {
                 spent += 1;
@@ -1077,9 +1097,10 @@ impl AppClient {
             .map_err(&mut failure)?;
         let mut outcomes = Vec::with_capacity(admission.routes.len());
         for route in admission.routes {
-            // A route whose batch was not fully admitted keeps its old cursor,
-            // so the next pass fetches the unadmitted suffix again.
-            if route.admitted && route.cursor != route.initial_cursor {
+            // Rotate past completed attempts, including capacity refusals, so
+            // later passes reach dependencies beyond them. Refused IDs stay
+            // remote-only; an unattempted suffix keeps the pre-pass cursor.
+            if route.remaining == Some(0) && route.cursor != route.initial_cursor {
                 storage
                     .app_storage()
                     .advance_transport_reconciliation_replay_cursor(&route.route, route.cursor)
@@ -1662,6 +1683,248 @@ mod tests {
         network
     }
 
+    /// A large refused first ID spends the SDK's request budget on a prefix.
+    /// A fresh SDK must resume from SQLite, not its previous set-aside cache,
+    /// to batch the small IDs first and recover Bob's genuine MLS message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::disallowed_methods)]
+    async fn refused_prefix_reaches_peer() {
+        use base64::Engine as _;
+        use nostr_sdk::local_relay::LocalRelay;
+        use nostr_sdk::prelude::Client as SdkClient;
+        use transport_nostr_adapter::{NostrSdkRelayClient, NostrSubscription};
+
+        let relay = LocalRelay::new();
+        relay.run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let mut fixture = fixture_with_group_relays(Some(vec![url.clone()])).await;
+        let app = fixture.client.app.clone();
+        let bob = crate::AccountHome::open(fixture._dir.path())
+            .create_account("bob")
+            .unwrap();
+        crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+        let mut peer = client_on_app_relay_plane(&app, "bob").await;
+        peer.sync().await.unwrap();
+        fixture
+            .client
+            .invite_members(&fixture.group_id, &[bob.account_id_hex.as_str()])
+            .await
+            .unwrap();
+        peer.sync().await.unwrap();
+        assert!(peer.group_mls_state(&fixture.group_id).is_ok());
+        let sent = peer
+            .send(&fixture.group_id, b"peer beyond refused prefix")
+            .await
+            .unwrap();
+        assert_eq!(sent.published, 1, "Bob's message reached the relay");
+        // SendSummary names the inner app event. Its durable projection links
+        // that authenticated event to the exact outer transport publication.
+        let source = app
+            .account_storage("bob")
+            .unwrap()
+            .app_storage()
+            .timeline_message(
+                &hex::encode(fixture.group_id.as_slice()),
+                &sent.message_ids[0],
+            )
+            .unwrap()
+            .expect("Bob projected his sent message")
+            .source_message_id_hex
+            .expect("the sent message has a published transport source");
+        let peer_event = fixture
+            .relay
+            .attempted_events()
+            .into_iter()
+            .find(|event| event.id == source)
+            .expect("the relay captured Bob's exact transport publication");
+        let group_route = app
+            .group("alice", &hex::encode(fixture.group_id.as_slice()))
+            .unwrap()
+            .unwrap()
+            .nostr_routing
+            .nostr_group_id_hex;
+        let at = crate::unix_now_seconds() - 60;
+        let owned = |event| transport_nostr_adapter::NostrRelayEvent {
+            endpoint: cgka_traits::TransportEndpoint(url.clone()),
+            subscription_id: None,
+            event,
+        };
+        for row in 0..cgka_engine::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
+            let event = crate::tests::epoch_gap_probe(&group_route, at - 1, &format!("fill-{row}"));
+            let deliveries = fixture
+                .client
+                .adapter
+                .recovered_deliveries(owned(event))
+                .await
+                .unwrap();
+            assert_eq!(deliveries.len(), 1);
+            for delivery in deliveries {
+                fixture
+                    .client
+                    .ingest_received_delivery(delivery)
+                    .await
+                    .unwrap();
+            }
+        }
+        // Separate seconds make the completed refusal prefix a safe time
+        // prefix. ID ranges fix the first pass's request order without relying
+        // on random event IDs or SDK process-local acquisition hints.
+        let signed_in = |content: String, created_at, range: std::ops::Range<u8>| loop {
+            let event = EventBuilder::new(Kind::MlsGroupMessage, content.clone())
+                .tags([Tag::custom("h", [group_route.clone()])])
+                .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(created_at))
+                .finalize(&Keys::generate())
+                .unwrap();
+            if range.contains(&event.id.to_bytes()[0]) {
+                break event;
+            }
+        };
+        let large = base64::engine::general_purpose::STANDARD.encode(vec![0; 675 * 1024]);
+        let mut events = vec![signed_in(large, at, 0..32)];
+        for index in 0..30 {
+            let (time, range) = if index < 15 {
+                (at, 32..128)
+            } else {
+                (at + 1, 128..224)
+            };
+            let content =
+                crate::tests::epoch_gap_probe(&group_route, time, &format!("refused-{index}"))
+                    .content;
+            events.push(signed_in(content, time, range));
+        }
+        events.push(signed_in(peer_event.content, at + 1, 224..255));
+        let ids = events.iter().map(|event| event.id).collect::<Vec<_>>();
+        for event in events {
+            relay.add_event(event).await.unwrap();
+        }
+        let route_id: [u8; 32] = hex::decode(&group_route).unwrap().try_into().unwrap();
+        let route = TransportReconciliationRoute::Group(route_id);
+        let group_id_hex = hex::encode(fixture.group_id.as_slice());
+        let peer_messages = || {
+            app.messages("alice")
+                .unwrap()
+                .into_iter()
+                .filter(|message| {
+                    message.group_id_hex == group_id_hex
+                        && message.sender == bob.account_id_hex
+                        && sent.message_ids.contains(&message.message_id_hex)
+                        && message.plaintext == "peer beyond refused prefix"
+                })
+                .count()
+        };
+        assert_eq!(peer_messages(), 0, "the peer is missing before replay");
+        for pass in 0..2 {
+            if pass > 0 {
+                fixture
+                    .client
+                    .recovery_owner
+                    .test_advance_to_retry(&fixture.storage);
+                fixture
+                    .client
+                    .recovery_owner
+                    .test_advance_clock(Duration::from_secs(60));
+            }
+            fixture.client.request_bounded_comparison().unwrap();
+            let (grant, mut execution, selected, _) = group_route_grant(&mut fixture).await;
+            assert_eq!(selected, route);
+            let inventory = grant
+                .inventory
+                .iter()
+                .find(|item| item.route == route)
+                .unwrap();
+            let initial_cursor = fixture
+                .storage
+                .app_storage()
+                .transport_reconciliation_replay_cursor(&route)
+                .unwrap();
+            let progress = MemoryProgress {
+                cursor: Mutex::new(initial_cursor),
+            };
+            // Both the SDK and progress object are new on each pass. Otherwise
+            // set-aside memory could hide a missing durable cursor checkpoint.
+            let sdk = NostrSdkRelayClient::new(SdkClient::builder().build());
+            sdk.client().add_relay(url.as_str()).await.unwrap();
+            sdk.client().connect().await;
+            let result = sdk
+                .reconcile_subscription(
+                    NostrSubscription::Group {
+                        account_id: fixture.client.runtime.session().self_id(),
+                        group_id: fixture.group_id.clone(),
+                        transport_group_id: route_id.to_vec(),
+                        endpoints: vec![cgka_traits::TransportEndpoint(url.clone())],
+                        since: None,
+                        attempt: SubscriptionAttempt::INITIAL,
+                    },
+                    &inventory.items,
+                    inventory.since,
+                    inventory.until,
+                    &progress,
+                )
+                .await
+                .unwrap();
+            sdk.client().shutdown().await;
+            let network = ComparisonNetworkResult {
+                routes: vec![ComparisonRouteResult {
+                    route: route.clone(),
+                    initial_cursor,
+                    cursor: progress.load_cursor().unwrap(),
+                    result: ComparisonRouteWorkResult::Returned(Ok(Some(result))),
+                    window: Vec::new(),
+                }],
+            };
+            let mut admission = fixture
+                .client
+                .accept_comparison_network(&grant, &mut execution, network)
+                .await
+                .unwrap()
+                .unwrap();
+            while !fixture
+                .client
+                .admit_comparison_turn(&grant, &mut execution, &mut admission)
+                .await
+                .unwrap()
+            {}
+            assert!(
+                !admission.routes[0].admitted,
+                "refusals cannot certify coverage"
+            );
+            if pass == 0 {
+                assert_eq!(
+                    execution.execution.counts.refused, 16,
+                    "the real SDK exhausted its request budget on refusals"
+                );
+                assert_eq!(peer_messages(), 0, "the first pass reached only refusals");
+                assert!(
+                    ids.iter()
+                        .all(|id| { !fixture.client.state.seen_events.contains(&id.to_hex()) })
+                );
+                let inventory = fixture
+                    .storage
+                    .app_storage()
+                    .transport_reconciliation_inventory(&route, crate::unix_now_seconds())
+                    .unwrap();
+                assert!(
+                    ids.iter().all(|id| !inventory
+                        .items
+                        .iter()
+                        .any(|item| item.event_id == id.to_bytes())),
+                    "refused IDs stay remote-only"
+                );
+            }
+            fixture
+                .client
+                .finish_comparison_grant(grant, execution, Some(admission))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            peer_messages(),
+            1,
+            "a new SDK must reach the peer using only durable replay progress"
+        );
+        relay.shutdown();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unreadable_event_withholds_the_route_without_failing_the_batch() {
         let mut fixture = fixture().await;
@@ -1683,15 +1946,6 @@ mod tests {
         assert!(
             matches!(result, Ok(EpochBackfillRunOutcome::Incomplete(_))),
             "one unreadable event must not fail the whole pass"
-        );
-        assert_eq!(
-            fixture
-                .storage
-                .app_storage()
-                .transport_reconciliation_replay_cursor(&route)
-                .unwrap(),
-            None,
-            "a route with an unadmitted event keeps its pre-pass cursor"
         );
     }
 
@@ -1881,7 +2135,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn comparison_unadmitted_event_keeps_prepass_cursor() {
+    async fn unrouted_keeps_coverage_debt() {
         let mut fixture = fixture().await;
         let (grant, execution, route, _) = group_route_grant(&mut fixture).await;
         // This event routes to no route of the account, so it is not admitted.
@@ -1891,14 +2145,6 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result, EpochBackfillRunOutcome::Incomplete(_)));
-        assert_eq!(
-            fixture
-                .storage
-                .app_storage()
-                .transport_reconciliation_replay_cursor(&route)
-                .unwrap(),
-            None,
-        );
         // The relays answered; only admission fell short. That withholds the
         // certificate but is a quiet comparison, not an outage, so the slot is
         // serviced and the debt itself carries the retry.
@@ -2747,9 +2993,6 @@ mod tests {
                     .admit_comparison_turn(&grant, &mut execution, &mut admission)
                     .await
                     .unwrap();
-                // Unreadable candidates may withhold route admission. The
-                // admitted cursor is the checkpoint whose write we fail here.
-                admission.routes[0].admitted = true;
                 connection.execute_batch("CREATE TRIGGER fail_repair_cursor BEFORE UPDATE OF replay_after ON transport_reconciliation_route_state BEGIN SELECT RAISE(FAIL, 'injected cursor'); END;").unwrap();
                 assert!(
                     fixture
