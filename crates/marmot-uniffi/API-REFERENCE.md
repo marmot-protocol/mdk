@@ -731,6 +731,71 @@ Cheap local refresh signal, including for a fully loaded or empty library. Compa
 </details>
 
 <details>
+<summary>commands/attachment_storage.rs</summary>
+
+### `Marmot::attachment_storage_usage`
+
+**Current.**
+
+```rust
+pub async fn attachment_storage_usage( &self, account_ref: String, ) -> Result<AttachmentStorageUsageFfi, MarmotKitError>
+```
+
+Account-wide attachment storage for a Manage storage screen: `media_bytes` (media-store files, a file shared by several attachments counted once), `legacy_bytes` (bodies still in the account database; they move to the media store in the background), `attachment_count`, and the database's `database_bytes` and `database_free_bytes`. Reads no bodies and starts no worker. See [Manage storage](ATTACHMENT-ACCESS.md#manage-storage).
+
+[Source](src/commands/attachment_storage.rs#L15)
+
+### `Marmot::attachment_storage_by_chat`
+
+**Current.**
+
+```rust
+pub async fn attachment_storage_by_chat( &self, account_ref: String, limit: u32, cursor: Option<Arc<ChatStorageCursor>>, ) -> Result<ChatStoragePageFfi, MarmotKitError>
+```
+
+Chats by retained attachment bytes, largest first, `limit` 1..=256 per page; pass the page's `next_cursor` to continue, and stop when it is absent (the last page may be empty). A stored file counts once per chat however many of its attachments share it; content shared with other chats counts in each, so per-chat totals can add up to more than `media_bytes`. Cursors are opaque handles: never persist them, and start over after a removal.
+
+[Source](src/commands/attachment_storage.rs#L28)
+
+### `Marmot::largest_retained_attachments`
+
+**Current.**
+
+```rust
+pub async fn largest_retained_attachments( &self, account_ref: String, group_id_hex: Option<String>, limit: u32, cursor: Option<Arc<RetainedAttachmentsCursor>>, ) -> Result<RetainedAttachmentsPageFfi, MarmotKitError>
+```
+
+Retained attachments, largest first, `limit` 1..=256 per page, optionally within one chat (`group_id_hex`); continue with `next_cursor` as for `attachment_storage_by_chat`. Each entry's `target` works with `attachment_local_assets` (for an opaque reference to pass to `control_attachment` Remove) and `open_attachment_handoff`; `media_type` and `file_name` come from the published descriptor and are empty when it does not parse.
+
+[Source](src/commands/attachment_storage.rs#L48)
+
+### `Marmot::remove_chat_attachments`
+
+**Current.**
+
+```rust
+pub async fn remove_chat_attachments( &self, account_ref: String, group_id_hex: String, ) -> Result<u64, MarmotKitError>
+```
+
+Removes every retained attachment in one chat and returns how many it removed. Each removal is exactly `control_attachment` Remove: the attachment shows as removed and download-again stays allowed. Media-store files the removal releases are deleted before this returns, so their space frees at once; legacy database bodies free database pages, which return to the filesystem only when the database is compacted. Refresh usage and listings afterwards.
+
+[Source](src/commands/attachment_storage.rs#L72)
+
+### `Marmot::remove_attachments_older_than`
+
+**Current.**
+
+```rust
+pub async fn remove_attachments_older_than( &self, account_ref: String, received_before: u64, group_id_hex: Option<String>, ) -> Result<u64, MarmotKitError>
+```
+
+Removes retained attachments of messages received before `received_before` (Unix seconds, the message's received time), across the account or within one chat (`group_id_hex`), with the same semantics and immediate reclaim as `remove_chat_attachments`. Returns how many it removed.
+
+[Source](src/commands/attachment_storage.rs#L87)
+
+</details>
+
+<details>
 <summary>commands/audit.rs</summary>
 
 ### `Marmot::audit_log_settings`
@@ -4667,3 +4732,4 @@ White Noise's deployment as this build compiled it: its recovery relays, discove
 [Source](src/deployment.rs#L101)
 
 </details>
+

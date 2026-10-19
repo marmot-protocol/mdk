@@ -1048,7 +1048,9 @@ See [the native attachment handoff](ATTACHMENT-ACCESS.md) for unavailable/EOF se
 source revalidation, host buffer ownership and integration guidance. For an OS surface
 that needs a real file (package installer, share sheet, "open with", Quick Look), use
 `openAttachmentHandoff` and release its lease when done; see
-[handoff leases](ATTACHMENT-ACCESS.md#handoff-leases). Acquisition
+[handoff leases](ATTACHMENT-ACCESS.md#handoff-leases). A Manage storage screen reads
+usage and largest-first listings and removes attachments in bulk; see
+[Manage storage](ATTACHMENT-ACCESS.md#manage-storage). Acquisition
 defaults on with bounded per-account policy. Native progress snapshots/subscriptions
 and durable cancellation, retry, remove and download-again controls use the same source slots.
 
