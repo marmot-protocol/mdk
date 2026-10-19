@@ -9661,14 +9661,16 @@ mod tests {
         assert!(started.elapsed() <= super::EOSE_QUIET_WAIT + Duration::from_millis(1));
     }
 
-    /// A lag that lost the end-of-stored-events a quiet drain ends on would
-    /// hold every later drain to its full first wait. The lag's repair
-    /// re-issues the unanswered REQ, and once the relay's fresh answer
-    /// completes coverage, a drain after the loss is in recovery ends at its
-    /// first quiet wait again.
+    /// Owned acquisition restores the quiet drain's boundary after lag without
+    /// resending live REQs or waiting for their lost wire EOSE. Once loss has
+    /// entered recovery, a drain can end at its first quiet wait again.
     // Pauses the clock, which needs the current-thread runtime.
     #[tokio::test(flavor = "current_thread")]
-    async fn quiet_drain_ends_early_again_after_a_lag_lost_its_eose() {
+    async fn lag_recovery_quiets_drain() {
+        use transport_nostr_adapter::{
+            NostrAcquisitionEnd, NostrAcquisitionEndpoint, NostrAcquisitionResult,
+        };
+
         let dir = tempfile::tempdir().unwrap();
         let alice = AccountHome::open(dir.path())
             .create_account("alice")
@@ -9679,7 +9681,22 @@ mod tests {
             .with_test_relay_client(relay.clone());
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.prepare_transport().await.unwrap();
-        assert!(!relay.accepted_subscriptions().is_empty());
+        let subscriptions = relay.accepted_subscriptions();
+        let live = subscriptions.last().expect("the live inbox REQ");
+        *relay.acquisition_result.lock().unwrap() = Some(NostrAcquisitionResult {
+            endpoints: live
+                .endpoints()
+                .iter()
+                .cloned()
+                .map(|endpoint| NostrAcquisitionEndpoint {
+                    endpoint,
+                    session_generation: None,
+                    events: Vec::new(),
+                    end: NostrAcquisitionEnd::RequestPolicySatisfied,
+                    stats: Default::default(),
+                })
+                .collect(),
+        });
 
         // No relay's answer reached the account: the lag lost them all.
         app.relay_plane
@@ -9689,34 +9706,6 @@ mod tests {
             1,
             transport_nostr_adapter::NostrNotificationLossFloor::Unbounded,
         );
-        let reissued = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let reissued = relay.reissued_subscriptions();
-                if !reissued.is_empty() {
-                    break reissued;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the repair re-issues the unanswered REQ");
-        let live = relay
-            .accepted_subscriptions()
-            .last()
-            .cloned()
-            .expect("the live activation's inbox REQ");
-        assert_eq!(
-            reissued,
-            vec![(live.subscription_id(), live.endpoints().to_vec())],
-            "only the live activation's REQ is re-issued"
-        );
-        for (id, endpoints) in reissued {
-            for endpoint in endpoints {
-                app.relay_plane
-                    .handle_relay_eose_for_test(endpoint, id.clone())
-                    .await;
-            }
-        }
         let Some(transport_nostr::AccountDeliveryReceive::Overflow(overflow)) =
             client.adapter.try_receive_account_delivery()
         else {
@@ -9727,7 +9716,14 @@ mod tests {
             .adapter
             .start_delivery_overflow_recovery(overflow.marker_token);
 
-        assert!(client.adapter.account_subscription_eose().await.complete());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !client.adapter.account_subscription_eose().await.complete() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("owned history recovery restores the replay boundary");
+        assert_eq!(relay.accepted_subscriptions(), subscriptions);
 
         tokio::time::pause();
         let started = tokio::time::Instant::now();

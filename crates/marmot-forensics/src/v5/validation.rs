@@ -614,6 +614,28 @@ fn validate_operational(kind: &crate::audit::AuditEventKind) -> Result<(), Contr
                 "a follow-up repair needs a failed relay",
             )
         }
+        AuditEventKind::RelayReplayRecovery {
+            trigger,
+            lags,
+            pending_relays,
+            started_relays,
+            active_relays,
+            follow_up_scheduled,
+            ..
+        } => {
+            require(
+                (*trigger == crate::audit::EoseRepairTrigger::FollowUp) == (*lags == 0),
+                "a follow-up pass folds in no lag, and a lag pass folds in at least one",
+            )?;
+            require(
+                started_relays.checked_add(*active_relays) == Some(*pending_relays),
+                "pending replay scopes are exactly newly started and already active scopes",
+            )?;
+            require(
+                !*follow_up_scheduled || *pending_relays > 0,
+                "a scheduled follow-up needs pending replay; shutdown may stop scheduling",
+            )
+        }
         AuditEventKind::SubscriptionRefused { refusals, dropped } => {
             let limit = crate::audit::SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES;
             require(

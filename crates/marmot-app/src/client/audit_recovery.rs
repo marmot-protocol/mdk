@@ -673,7 +673,7 @@ impl AppClient {
         }
     }
 
-    /// Record the relay plane's finished lag-lost EOSE repairs for this
+    /// Record the relay plane's lag-settled owned replay recovery passes for this
     /// account, one row per pass. The repair only queued its report, so it
     /// never waited on audit. Without a v5 recorder this account still
     /// discards its own reports, so a later enable does not replay stale
@@ -692,7 +692,7 @@ impl AppClient {
             self.runtime.session().record_audit_event(
                 None,
                 None,
-                AuditEventKind::SubscriptionEoseRepaired {
+                AuditEventKind::RelayReplayRecovery {
                     receiver: if report.scope.is_some() {
                         marmot_forensics::EoseRepairReceiver::Account
                     } else {
@@ -704,11 +704,9 @@ impl AppClient {
                         marmot_forensics::EoseRepairTrigger::NotificationLag
                     },
                     lags: report.lags,
-                    awaiting_relays: count(summary.awaiting_relays),
-                    complete_relays: count(summary.complete_relays),
-                    reissued_relays: count(summary.reissued_relays),
-                    reissued_earlier_relays: count(summary.reissued_earlier_relays),
-                    failed_relays: count(summary.failed_relays),
+                    pending_relays: count(summary.pending_relays),
+                    started_relays: count(summary.started_relays),
+                    active_relays: count(summary.active_relays),
                     follow_up_scheduled: report.follow_up_scheduled,
                     dropped_before: report.dropped_before,
                 },

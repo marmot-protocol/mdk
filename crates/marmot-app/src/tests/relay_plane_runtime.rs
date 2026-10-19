@@ -3,7 +3,6 @@
 //! become its own crate (relay-plane brief, PR 2); they reach plane state only
 //! through its `_for_test` accessors.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -31,10 +30,6 @@ struct RecordingRelayClient {
     subscriptions: StdMutex<Vec<NostrSubscription>>,
     unsubscribed: StdMutex<Vec<NostrSubscription>>,
     unsubscribed_accounts: StdMutex<Vec<MemberId>>,
-    /// REQs re-issued by lag repairs, with the endpoints they went to.
-    reissued: StdMutex<Vec<(String, Vec<TransportEndpoint>)>>,
-    /// Re-issues left that reach no relay, as when it is unreachable.
-    unsent_reissues: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -72,35 +67,6 @@ impl NostrRelayClient for RecordingRelayClient {
     ) -> Result<(), TransportAdapterError> {
         self.unsubscribed.lock().unwrap().push(subscription);
         Ok(())
-    }
-
-    async fn reissue_subscription(
-        &self,
-        _account_id: &MemberId,
-        subscription_id: &str,
-        endpoints: &[TransportEndpoint],
-    ) -> Result<transport_nostr_adapter::SubscriptionReissue, TransportAdapterError> {
-        self.reissued
-            .lock()
-            .unwrap()
-            .push((subscription_id.to_owned(), endpoints.to_vec()));
-        let outcome = if self
-            .unsent_reissues
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                left.checked_sub(1)
-            })
-            .is_ok()
-        {
-            transport_nostr_adapter::RelayReissue::Unsent
-        } else {
-            transport_nostr_adapter::RelayReissue::Sent
-        };
-        Ok(transport_nostr_adapter::SubscriptionReissue {
-            relays: endpoints
-                .iter()
-                .map(|endpoint| (endpoint.clone(), outcome))
-                .collect(),
-        })
     }
 
     async fn unsubscribe_account(

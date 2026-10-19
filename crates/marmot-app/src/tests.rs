@@ -545,7 +545,6 @@ pub(crate) struct ScriptedPushRelayClient {
     subscribe_release: tokio::sync::Notify,
     unsubscribe_started: tokio::sync::Notify,
     unsubscribe_release: tokio::sync::Notify,
-    reissued_subscriptions: std::sync::Mutex<Vec<(String, Vec<TransportEndpoint>)>>,
 }
 
 #[derive(Default)]
@@ -864,11 +863,6 @@ impl ScriptedPushRelayClient {
     /// Every subscription this relay has accepted so far.
     pub(crate) fn accepted_subscriptions(&self) -> Vec<NostrSubscription> {
         self.subscriptions.lock().unwrap().clone()
-    }
-
-    /// Every REQ a lag repair has re-issued so far, with its endpoints.
-    pub(crate) fn reissued_subscriptions(&self) -> Vec<(String, Vec<TransportEndpoint>)> {
-        self.reissued_subscriptions.lock().unwrap().clone()
     }
 
     pub(crate) fn unfloored_account_subscription_count(&self) -> usize {
@@ -1261,30 +1255,6 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         _account_id: &cgka_traits::MemberId,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         Ok(())
-    }
-
-    async fn reissue_subscription(
-        &self,
-        _account_id: &cgka_traits::MemberId,
-        subscription_id: &str,
-        endpoints: &[TransportEndpoint],
-    ) -> Result<transport_nostr_adapter::SubscriptionReissue, cgka_traits::TransportAdapterError>
-    {
-        self.reissued_subscriptions
-            .lock()
-            .unwrap()
-            .push((subscription_id.to_owned(), endpoints.to_vec()));
-        Ok(transport_nostr_adapter::SubscriptionReissue {
-            relays: endpoints
-                .iter()
-                .map(|endpoint| {
-                    (
-                        endpoint.clone(),
-                        transport_nostr_adapter::RelayReissue::Sent,
-                    )
-                })
-                .collect(),
-        })
     }
 
     async fn publish_event(

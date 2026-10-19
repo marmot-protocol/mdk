@@ -1159,11 +1159,31 @@ Notes:
   records a row; it only counts.
 - `sync_drain` keeps its own before/after cursor per drain; this row names what committed each advance.
 
-#### `subscription_eose_repaired`
+#### `relay_replay_recovery`
 
-One pass of the relay plane's lag-lost end-of-stored-events repair (#2076). A notification lag can lose a relay's EOSE
-with whatever else was buffered; once the lagging receiver settles, the plane re-issues the REQs issued by the lag on
-the relays that have not reported EOSE (`reissue_subscriptions_awaiting_eose`). Account-scoped; one row per pass.
+One bounded owned-history recovery pass after notification lag. It selects current REQ/relay scopes issued by the
+lag mark that still owe admission, acquires their full original windows, and leaves live REQs unchanged. The account
+worker records the queued report at `publish_history_notice_changes`; the recovery task never waits for audit I/O.
+
+`receiver`, `trigger`, `lags` and `dropped_before` have the same meanings as the historical repair row below.
+The scope counts are REQ/relay pairs, not distinct relays:
+
+| Field | Meaning |
+| --- | --- |
+| `pending_relays` | Eligible scopes requiring this pass's capture or an already active capture. |
+| `started_relays` | Scopes for which this pass started bounded full-window acquisition. |
+| `active_relays` | Scopes whose unexpired capture this pass joined without restarting it. |
+| `follow_up_scheduled` | Another paced pass will check pending scopes. Shutdown can leave pending scopes without scheduling one. |
+
+`pending_relays` equals `started_relays + active_relays`. A scheduled follow-up requires pending scopes. These counts
+describe acquisition, not completed replay, router placement or durable coverage. No subscription ids, relay URLs,
+filters or lag marks are recorded. New sessions write this row; v4 recorders omit it.
+
+#### `subscription_eose_repaired` (historical)
+
+Historical evidence from the relay plane's same-REQ end-of-stored-events repair (#2076), retained for decoding old
+sessions. That implementation re-issued unanswered REQs after notification lag settled. New sessions use
+`relay_replay_recovery` instead. Account-scoped; one row per pass.
 
 | Field | Meaning |
 | --- | --- |

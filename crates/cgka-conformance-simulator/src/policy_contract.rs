@@ -229,8 +229,8 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 40] = [
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),
-    // The lag-lost EOSE repair re-issues REQs unchanged, so it changes when
-    // relay history arrives, never which history.
+    // Paced lag recovery acquires original windows without changing live REQs;
+    // it changes available input, never selection given equal input.
     decision(
         "A15",
         ConstantInfluence::InputAcquisition,
@@ -243,6 +243,8 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 40] = [
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),
+    // Request-local admission, finite replay deadlines and ordered SDK input
+    // change acquired input or explicit loss, not selection given equal input.
     decision(
         "A17",
         ConstantInfluence::InputAcquisition,

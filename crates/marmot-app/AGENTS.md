@@ -141,8 +141,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the checkpoint commits, the notice publication seam and dismissal, and cursor commits after their save succeeds.
   Never add a row per scheduler evaluation, per live ingest, or on the router path; the router only counts
   placements. Rows are best effort: an audit-only read that fails skips the row, never the recovery step. The
-  relay plane's lag-lost EOSE repair only queues a bounded `EoseRepairReport`; the worker's
-  `publish_history_notice_changes` seam records it as `subscription_eose_repaired`. The same seam drains the
+  relay plane's owned lag recovery only queues a bounded `EoseRepairReport`; the worker's
+  `publish_history_notice_changes` seam records its pending/started/active scopes as `relay_replay_recovery`.
+  `subscription_eose_repaired` remains readable historical evidence, not a new write. The same seam drains the
   adapter's queued subscription refusals (`take_subscription_refusals`) into one `subscription_refused` row. Scenario
   tests live in
   `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
@@ -286,11 +287,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   unexpected consumer exit closes the route and sends the worker through reconnect (mdk#2070). The worker persists
   notification loss before waiting for its control record.
 - A lag may also lose end-of-stored-events. Never mark EOSE complete at a lag: live cursor promotion
-  would advance the cursor while a relay was still sending history. The lag schedules the adapter's `reissue_subscriptions_awaiting_eose` for its
-  receiver's scope, marked at the lag, to run once the receiver has gone `NOTIFICATION_LAG_EOSE_REPAIR_SETTLE`
-  without another lag. A later lag postpones it. Re-issuing earlier restarts replays still arriving. A repair that
-  leaves relays unrepaired (`EoseReissueSummary::failed_relays`) schedules itself again the same way, for the same lag
-  mark.
+  would advance the cursor while a relay was still sending history. Schedule `recover_pending_replay` for the
+  receiver's scope, marked at the lag, after `NOTIFICATION_LAG_EOSE_REPAIR_SETTLE` without another lag. A later lag
+  postpones it. Recovery acquires full original windows without changing live REQs. Pace follow-ups at the same
+  interval while `ReplayRecoverySummary::pending_relays` is nonzero: join active captures and retry failed ones,
+  retaining the same lag mark. Shutdown may stop follow-ups even while scopes remain pending.
 - Move `checkpointed_transport_timestamp` only through `AppClient::seal_transport_cursor`, never straight to
   `state.last_transport_timestamp`. The seal holds adapter admission stable through the router's placement lock,
   importing any discarded replay into the existing loss fence before deciding. It returns nothing while staged,

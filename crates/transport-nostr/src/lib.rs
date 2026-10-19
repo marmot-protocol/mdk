@@ -29,9 +29,9 @@ use transport_nostr_adapter::{
     AccountSubscriptionEose, NostrAcquisitionCancellation, NostrAcquisitionError,
     NostrAcquisitionRequest, NostrAcquisitionResult, NostrNotificationLossFloor,
     NostrPublishOutcome, NostrReconciliationItem, NostrReconciliationSummary, NostrRelayClient,
-    NostrSdkRelayClient, NostrSdkRelayHealth, NostrSubscription, NostrTransportAdapter,
-    NotificationLagMark, RelayExportConsent, RelayLabelResolution, RelayRegistrationOutcome,
-    SubscriptionAttempt,
+    NostrSdkNotification, NostrSdkRelayClient, NostrSdkRelayHealth, NostrSubscription,
+    NostrTransportAdapter, NotificationLagMark, RelayExportConsent, RelayLabelResolution,
+    RelayRegistrationOutcome, SubscriptionAttempt,
 };
 
 use transport_nostr_peeler::NostrTransportEvent;
@@ -108,13 +108,10 @@ const RELAY_NOTIFICATION_RESTART_HEALTHY_RUNTIME: Duration = Duration::from_secs
 /// client's per-receiver notification buffer, which bounded the inline
 /// consumer this queue replaced.
 const RELAY_NOTIFICATION_EVENT_QUEUE_CAPACITY: usize = 4096;
-/// How long a relay notification receiver must run without another lag
-/// before the REQs whose end-of-stored-events a lag may have lost are
-/// re-issued. A re-issue restarts the relay's replay of that REQ, so it waits
-/// out the burst that caused the lag. Under sustained overload lags recur
-/// within seconds, and re-issuing at each one would keep restarting replays
-/// that are still arriving. Waiting costs little: until the repair, the next
-/// activation re-subscribes, as it did before the repair existed.
+/// Quiet period before owned history recovery for a notification lag, and
+/// pacing interval while its request/relay scopes remain pending. Recovery
+/// acquires full original windows without changing live REQs. Later lags
+/// postpone the pass; follow-ups join active captures or retry failed ones.
 const NOTIFICATION_LAG_EOSE_REPAIR_SETTLE: Duration = Duration::from_secs(30);
 const ACCOUNT_PUBLISH_WAIT: Duration = Duration::from_secs(20);
 
@@ -195,8 +192,8 @@ pub struct EoseRepairReport {
     pub follow_up: bool,
     /// Lags folded into this pass while its receiver settled.
     pub lags: u64,
-    pub summary: transport_nostr_adapter::EoseReissueSummary,
-    /// Whether a follow-up repair was scheduled for the failed relays.
+    pub summary: transport_nostr_adapter::ReplayRecoverySummary,
+    /// Whether a follow-up was scheduled to observe pending owned replay.
     pub follow_up_scheduled: bool,
     /// Earlier reports for this scope dropped at the queue bound, carried
     /// forward onto this one when they were evicted.
@@ -2169,12 +2166,9 @@ impl MarmotRelayPlane {
                 sdk_relay_client.shutdown_accounts(),
             )
             .await;
-            let timed_out = timeout(
-                RELAY_PLANE_SHUTDOWN_WAIT,
-                sdk_relay_client.client().shutdown(),
-            )
-            .await
-            .is_err();
+            let timed_out = timeout(RELAY_PLANE_SHUTDOWN_WAIT, sdk_relay_client.shutdown())
+                .await
+                .is_err();
             if timed_out {
                 tracing::warn!(
                     target: "marmot_app::relay_plane",
@@ -2287,10 +2281,7 @@ impl MarmotRelayPlane {
                     .send(DirectoryRelayPlaneEvent::RecoveryRequired);
             }
             *forwarder = Some(spawn_directory_notification_forwarder(
-                Arc::new(SdkRelayNotificationSource {
-                    client: client.clone(),
-                    loss: None,
-                }),
+                client.notifications_with_gaps(),
                 self.inner.transport.directory_events.clone(),
                 self.inner.directory.clone(),
             ));
@@ -2574,6 +2565,9 @@ enum RelayNotificationConsumerExit {
 }
 
 type RelayNotificationStream =
+    Pin<Box<dyn Stream<Item = NotificationUpdate<NostrSdkNotification>> + Send>>;
+
+type DirectoryNotificationStream =
     Pin<Box<dyn Stream<Item = NotificationUpdate<ClientNotification>> + Send>>;
 
 struct RelayNotificationConsumerOutcome {
@@ -2644,6 +2638,10 @@ trait RelayNotificationSource: Send + Sync {
     fn record_loss(&self, _skipped: u64) -> NostrNotificationLossFloor {
         NostrNotificationLossFloor::Unbounded
     }
+    /// Native sources may already have charged their own gap before yielding.
+    fn record_lag(&self, skipped: u64, abandoned: u64) -> NostrNotificationLossFloor {
+        self.record_loss(skipped.saturating_add(abandoned))
+    }
     fn receiver_replaced(&self) {}
     /// Classify a relay's `CLOSED` reason as this source's SDK client settles
     /// the REQ. Without a known client the authenticator is unknown, which
@@ -2670,40 +2668,37 @@ struct NotificationWorkerFailureHook {
 }
 
 struct SdkRelayNotificationSource {
-    client: NostrSdkClient,
-    loss: Option<NostrSdkRelayClient>,
+    client: NostrSdkRelayClient,
 }
 
 impl RelayNotificationSource for SdkRelayNotificationSource {
     fn notifications(&self) -> RelayNotificationStream {
-        self.client.notifications_with_gaps()
+        self.client.notifications()
     }
 
     fn is_shutdown(&self) -> bool {
-        self.client.is_shutdown()
+        self.client.client().is_shutdown()
     }
 
     fn record_loss(&self, skipped: u64) -> NostrNotificationLossFloor {
-        let Some(loss) = &self.loss else {
-            return NostrNotificationLossFloor::Unbounded;
-        };
-        loss.record_notification_gap(skipped);
+        self.client.record_notification_gap(skipped);
+        // Fence all retained source/worker frames before the supervisor resumes
+        // this same receiver. A live REQ may never emit another EOSE.
+        self.client.notification_receiver_replaced();
         // Read at the lag: a later subscription change could raise it past
         // an event this gap lost.
-        loss.notification_loss_floor()
+        self.client.notification_loss_floor()
     }
 
-    fn receiver_replaced(&self) {
-        if let Some(loss) = &self.loss {
-            loss.notification_receiver_replaced();
-        }
+    fn record_lag(&self, _skipped: u64, abandoned: u64) -> NostrNotificationLossFloor {
+        // Native source loss has already advanced the ordered reader frontier.
+        // Only the frontend worker's additional abandoned tail remains to charge.
+        self.client.record_notification_gap(abandoned);
+        self.client.notification_loss_floor()
     }
 
     fn subscription_refusal(&self, reason: &str) -> transport_nostr_adapter::SubscriptionRefusal {
-        match &self.loss {
-            Some(client) => client.subscription_refusal(reason),
-            None => transport_nostr_adapter::sdk_subscription_refusal(reason, None),
-        }
+        self.client.subscription_refusal(reason)
     }
 }
 
@@ -2720,8 +2715,7 @@ fn spawn_relay_notification_forwarder_scoped(
     account_id: Option<MemberId>,
 ) -> JoinHandle<()> {
     let source: Arc<dyn RelayNotificationSource> = Arc::new(SdkRelayNotificationSource {
-        client: sdk_relay_client.client().clone(),
-        loss: Some(sdk_relay_client),
+        client: sdk_relay_client,
     });
     spawn_relay_notification_supervisor_scoped(source, transport, account_id)
 }
@@ -2730,12 +2724,11 @@ fn spawn_relay_notification_forwarder_scoped(
 /// receiver. A gap here invalidates directory coverage without interrupting
 /// an account's live delivery or attributing the loss to an account.
 fn spawn_directory_notification_forwarder(
-    source: Arc<dyn RelayNotificationSource>,
+    mut receiver: DirectoryNotificationStream,
     events: broadcast::Sender<DirectoryRelayPlaneEvent>,
     directory: DirectoryRelayPlane,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut receiver = source.notifications();
         loop {
             match receiver.next().await {
                 Some(NotificationUpdate::Notification(ClientNotification::Event {
@@ -3034,7 +3027,7 @@ async fn run_relay_notification_consumer_scoped(
             }
             update = receiver.next() => match update {
                 Some(NotificationUpdate::Notification(notification)) => {
-                    if matches!(notification, ClientNotification::Shutdown) {
+                    if matches!(notification, NostrSdkNotification::Shutdown) {
                         let abandoned = pending.load(Ordering::SeqCst);
                         return if abandoned > 0 {
                             RelayNotificationConsumerOutcome::lagged(
@@ -3068,13 +3061,13 @@ async fn run_relay_notification_consumer_scoped(
                     source.notification_queued();
                 }
                 Some(NotificationUpdate::Lagged { skipped }) => {
-                    let abandoned = skipped
-                        .saturating_add(pending.load(Ordering::SeqCst));
-                    return RelayNotificationConsumerOutcome::lagged(
+                    let abandoned = pending.load(Ordering::SeqCst);
+                    let lag_floor = source.record_lag(skipped, abandoned);
+                    return RelayNotificationConsumerOutcome {
                         receiver,
-                        source.as_ref(),
-                        abandoned,
-                    );
+                        exit: RelayNotificationConsumerExit::Lagged(skipped.saturating_add(abandoned)),
+                        lag_floor,
+                    };
                 }
                 None => {
                     let abandoned = pending.load(Ordering::SeqCst);
@@ -3097,12 +3090,12 @@ async fn run_relay_notification_consumer_scoped(
 }
 
 async fn handle_relay_notification(
-    notification: ClientNotification,
+    notification: NostrSdkNotification,
     adapter: &NostrTransportAdapter,
     account_id: Option<&MemberId>,
     classify_closed: &(dyn Fn(&str) -> transport_nostr_adapter::SubscriptionRefusal + Sync),
 ) -> bool {
-    let shutdown = transport_nostr_adapter::dispatch_sdk_notification(
+    let shutdown = transport_nostr_adapter::dispatch_sdk_replay(
         notification,
         adapter,
         account_id,
@@ -3229,7 +3222,8 @@ fn recover_relay_notification_forwarder_scoped(
 /// repair runs once the receiver has gone
 /// [`NOTIFICATION_LAG_EOSE_REPAIR_SETTLE`] without another lag. A later lag in
 /// the same scope postpones it and widens it to the REQs issued by then. A
-/// repair that leaves relays unrepaired schedules itself again the same way.
+/// repair with pending owned acquisitions schedules an observation the same
+/// way, until their windows complete; bounded failures may retry then.
 fn schedule_eose_repair(
     transport: &Arc<RelayPlaneTransport>,
     account_id: Option<&MemberId>,
@@ -3278,9 +3272,9 @@ fn schedule_eose_repair_pass(
     runtime.spawn(run_eose_repair(Arc::downgrade(transport), scope));
 }
 
-/// Wait until a scheduled repair is due, then repair each REQ of its scope
-/// that a relay has not answered with end-of-stored-events. Holds the plane
-/// only weakly, so it never keeps a shut-down plane alive.
+/// Wait until a scheduled repair is due, then acquire owned history for each
+/// pre-lag REQ in its scope whose retained window remains incomplete. Holds
+/// the plane only weakly, so it never keeps a shut-down plane alive.
 async fn run_eose_repair(transport: Weak<RelayPlaneTransport>, scope: Option<MemberId>) {
     let (transport, lag, lags, follow_up) = loop {
         let due = {
@@ -3325,23 +3319,20 @@ async fn run_eose_repair(transport: Weak<RelayPlaneTransport>, scope: Option<Mem
     let adapter = transport.adapter.clone();
     let weak = Arc::downgrade(&transport);
     drop(transport);
-    let summary = adapter
-        .reissue_subscriptions_awaiting_eose(scope.as_ref(), lag)
-        .await;
+    let summary = adapter.recover_pending_replay(scope.as_ref(), lag).await;
     tracing::info!(
         target: "marmot_app::relay_plane",
         method = "repair_lag_lost_eose",
-        awaiting_relays = summary.awaiting_relays,
-        complete_relays = summary.complete_relays,
-        reissued_relays = summary.reissued_relays,
-        failed_relays = summary.failed_relays,
-        "repaired subscriptions whose end-of-stored-events a notification lag may have lost",
+        pending_relays = summary.pending_relays,
+        started_relays = summary.started_relays,
+        active_relays = summary.active_relays,
+        "recovering retained replay whose end-of-stored-events a notification lag may have lost",
     );
-    let unrepaired = summary.failed_relays;
+    let pending_relays = summary.pending_relays;
     let Some(transport) = weak.upgrade() else {
         return;
     };
-    let follow_up_scheduled = unrepaired > 0 && !transport.shutting_down.load(Ordering::SeqCst);
+    let follow_up_scheduled = pending_relays > 0 && !transport.shutting_down.load(Ordering::SeqCst);
     push_eose_repair_report(
         &transport,
         EoseRepairReport {
@@ -3356,13 +3347,12 @@ async fn run_eose_repair(transport: Weak<RelayPlaneTransport>, scope: Option<Mem
     if !follow_up_scheduled {
         return;
     }
-    // Each unrepaired relay's claim was released. A relay that keeps failing
-    // is tried again at most once per settle window, while a re-issue that
-    // went out keeps its claim, so a replay that lags again cannot loop.
+    // Observe bounded acquisitions at most once per settle window. Completed
+    // windows end the follow-up; active windows coalesce and failed ones retry.
     tracing::info!(
         target: "marmot_app::relay_plane",
         method = "repair_lag_lost_eose",
-        unrepaired_relays = unrepaired,
+        pending_relays,
         "scheduling another lag-lost end-of-stored-events repair",
     );
     schedule_eose_repair_pass(&transport, scope.as_ref(), lag, true);

@@ -2,7 +2,8 @@
 //! (`recovery_need_changed`, `recovery_attempt_started`,
 //! `recovery_attempt_finished`, `recovery_obligation_reassessed`) and the
 //! transport-cursor row (`transport_cursor_advanced`) and the lag-lost EOSE
-//! repair row (`subscription_eose_repaired`). These kinds exist only
+//! recovery row (`relay_replay_recovery`) and historical wire-reissue row
+//! (`subscription_eose_repaired`). These kinds exist only
 //! in audit v5; a v4 recorder drops them (see `AuditEventKind::is_v5_only`).
 //!
 //! Each enum mirrors a name the recovery code already uses, so a reader can
@@ -264,7 +265,7 @@ pub enum EoseRepairReceiver {
 pub enum EoseRepairTrigger {
     /// One or more notification lags, once the receiver settled.
     NotificationLag,
-    /// An earlier pass left relays unrepaired and scheduled this one.
+    /// An earlier pass left recovery pending and scheduled this one.
     FollowUp,
 }
 
@@ -564,6 +565,50 @@ mod tests {
         assert!(validator.is_valid(&serde_json::from_str(rows[0]).unwrap()));
         assert!(v5::Record::from_json(rows[0].as_bytes()).is_ok());
         assert!(recorder.health_snapshot().serialization_failures >= 3);
+    }
+
+    #[test]
+    fn replay_writer_checks_pending() {
+        let recovery = AuditEventKind::RelayReplayRecovery {
+            receiver: EoseRepairReceiver::Account,
+            trigger: EoseRepairTrigger::FollowUp,
+            lags: 0,
+            pending_relays: 3,
+            started_relays: 0,
+            active_relays: 3,
+            follow_up_scheduled: true,
+            dropped_before: 2,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::audit::default_v5_jsonl_path(dir.path(), &"11".repeat(16));
+        let recorder =
+            JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, producer())
+                .unwrap();
+        recorder.record(AuditRecord::new(None, recovery.clone()));
+        let mut unaccounted = recovery.clone();
+        if let AuditEventKind::RelayReplayRecovery { pending_relays, .. } = &mut unaccounted {
+            *pending_relays = 4;
+        }
+        let mut folded_lag = recovery;
+        if let AuditEventKind::RelayReplayRecovery { lags, .. } = &mut folded_lag {
+            *lags = 1;
+        }
+        for invalid in [unaccounted, folded_lag] {
+            recorder.record(AuditRecord::new(None, invalid));
+        }
+        let written = std::fs::read_to_string(&path).unwrap();
+        let rows = written
+            .lines()
+            .filter(|line| line.contains("relay_replay_recovery"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1, "only the honest pending report is written");
+        let schema: serde_json::Value = serde_json::from_str(v5::JSON_SCHEMA).unwrap();
+        assert!(
+            jsonschema::validator_for(&schema)
+                .unwrap()
+                .is_valid(&serde_json::from_str(rows[0]).unwrap())
+        );
+        assert!(v5::Record::from_json(rows[0].as_bytes()).is_ok());
     }
 
     #[test]

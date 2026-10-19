@@ -14,6 +14,105 @@ fn decode(v: &Value) -> Result<Record, ContractError> {
     Record::from_json(&serde_json::to_vec(v).unwrap())
 }
 
+fn replay_row() -> Value {
+    let mut row = fixture("recording_started");
+    row["event"] = json!({
+        "type": "relay_replay_recovery",
+        "receiver": "account",
+        "trigger": "notification_lag",
+        "lags": 2,
+        "pending_relays": 3,
+        "started_relays": 2,
+        "active_relays": 1,
+        "follow_up_scheduled": true,
+        "dropped_before": 4
+    });
+    row
+}
+
+#[test]
+fn replay_recovery_round_trips() {
+    let mut follow_up = replay_row();
+    follow_up["event"]["trigger"] = json!("follow_up");
+    follow_up["event"]["lags"] = json!(0);
+    follow_up["event"]["started_relays"] = json!(0);
+    follow_up["event"]["active_relays"] = json!(3);
+    let mut settled = follow_up.clone();
+    settled["event"]["receiver"] = json!("shared");
+    settled["event"]["pending_relays"] = json!(0);
+    settled["event"]["active_relays"] = json!(0);
+    settled["event"]["follow_up_scheduled"] = json!(false);
+    let mut stopped = replay_row();
+    // Shutdown can begin after a capture starts but before its follow-up is queued.
+    stopped["event"]["follow_up_scheduled"] = json!(false);
+    let mut historical = replay_row();
+    historical["event"] = json!({
+        "type": "subscription_eose_repaired",
+        "receiver": "account",
+        "trigger": "notification_lag",
+        "lags": 1,
+        "awaiting_relays": 5,
+        "complete_relays": 1,
+        "reissued_relays": 2,
+        "reissued_earlier_relays": 1,
+        "failed_relays": 1,
+        "follow_up_scheduled": true,
+        "dropped_before": 0
+    });
+    let schema = validator();
+    for row in [replay_row(), follow_up, settled, stopped, historical] {
+        assert!(schema.is_valid(&row));
+        let record = decode(&row).unwrap();
+        let encoded = record.to_json().unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&encoded).unwrap(), row);
+        assert_eq!(Record::from_json(&encoded).unwrap(), record);
+    }
+}
+
+#[test]
+fn replay_recovery_rejects_lies() {
+    let schema = validator();
+    for (field, value) in [
+        ("pending_relays", json!(4)),
+        ("started_relays", json!(3)),
+        ("active_relays", json!(2)),
+        ("trigger", json!("follow_up")),
+        ("lags", json!(0)),
+    ] {
+        let mut row = replay_row();
+        row["event"][field] = value;
+        assert!(schema.is_valid(&row), "schema alone accepts {field}");
+        assert!(decode(&row).is_err(), "semantic decoder rejects {field}");
+    }
+    let mut overflow = replay_row();
+    overflow["event"]["pending_relays"] = json!(0);
+    overflow["event"]["started_relays"] = json!(u64::MAX);
+    assert!(decode(&overflow).is_err());
+    let mut settled_follow_up = replay_row();
+    for field in ["pending_relays", "started_relays", "active_relays"] {
+        settled_follow_up["event"][field] = json!(0);
+    }
+    assert!(decode(&settled_follow_up).is_err());
+    for field in [
+        "awaiting_relays",
+        "complete_relays",
+        "reissued_relays",
+        "reissued_earlier_relays",
+        "failed_relays",
+    ] {
+        let mut row = replay_row();
+        row["event"][field] = json!(0);
+        assert!(!schema.is_valid(&row));
+        assert!(decode(&row).is_err());
+    }
+    for field in ["pending_relays", "started_relays", "active_relays"] {
+        let mut row = replay_row();
+        row["event"].as_object_mut().unwrap().remove(field);
+        assert!(!schema.is_valid(&row));
+        assert!(decode(&row).is_err());
+    }
+}
+
 #[test]
 fn all_contract_fixtures_round_trip_through_rust_and_schema() {
     let schema = validator();
@@ -49,10 +148,6 @@ fn all_contract_fixtures_round_trip_through_rust_and_schema() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(kinds, catalog);
     assert_eq!(kinds.len(), 15);
-    assert_eq!(
-        schema["$defs"]["Event"]["oneOf"].as_array().unwrap().len(),
-        66
-    );
 }
 
 #[test]

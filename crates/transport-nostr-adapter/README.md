@@ -79,25 +79,43 @@ Account, endpoint-safety, and envelope validation stay outside this accounting b
 
 Initial activation, group-subscription sync, and recovery maintenance stage group deliveries through stored replay
 and any backward pages, then release each group's batch in `(created_at, event id)` order. Live arrivals during
-release queue behind that batch. Every observed active relay stream must finish before release; a silent or
-terminally refused endpoint does not freeze a completed peer. Strict account replay coverage remains incomplete
-until every required endpoint completes. This does not establish ordering across unavailable relay history.
+release queue behind that batch. Each REQ/relay/route owns its historical claims and admission state. A shared
+ciphertext body is retained once per destination group; failure or retirement removes only that source's claims.
+A fulfilled predecessor keeps its held range during handoff. Paging runs per route from the outset, finishes all
+routes of one MLS group together, and waits for its history to leave the pool before paging the next group.
+Groups use a common ordering across overlapping REQs.
+
+An initial replay gets one 30-second waiting interval and, if clamped, one 30-second paging interval, reusing
+`REPLAY_PAGE_LIMITS.max_duration`. Arriving events do not extend them. An observed partial stream must finish or
+expire before release; a silent or terminally refused peer cannot freeze available history indefinitely. Expiry
+records the failed scope's floor without turning its late EOSE into an admission certificate. Fresh recovery
+requests have fresh ownership. This does not establish ordering across unavailable relay history.
 Already-ready routes keep their admission state across an equivalent or narrower repack; a wider request still
 stages history. Group delivery uses verified raw SDK copies, so SDK duplicate suppression cannot consume the only
 copy of ciphertext discarded by a cancelled attempt. Retired subscription copies cannot bypass admission.
-Pending copies are deduplicated per REQ, then once per group on release: retiring one request cannot erase a
-successor's copy of the same ciphertext. A fulfilled predecessor's complete range stays available during handoff.
+
+Transport receivers use each relay's ordered SDK notifications, including Connected and authentication boundaries.
+Every queued payload carries reader/connection epochs. A warm reconnect resets admission before the SDK restores
+the same REQ IDs; old queued EOSE cannot satisfy the new generation. Receiver loss starts a bounded full-window
+refetch rather than waiting for another EOSE on an unchanged live request. Forced paging is not a physical EOSE:
+late stored copies remain historical until their stream ends. The separate directory client keeps its Client stream.
+
+After a notification lag settles, `recover_pending_replay` acquires the full original windows of current REQ/relay
+scopes issued by its `NotificationLagMark` that still owe admission. An unexpired capture is joined, not restarted.
+`ReplayRecoverySummary` counts pending, newly started and already active scopes. The caller paces follow-ups while
+work remains. Live REQs and the SDK registry stay unchanged; SDK EOSE flags cannot bypass queued history.
 
 Each account's pending group ciphertext is bounded by `REPLAY_BUFFER_MAX_ITEMS` (32,000 copies, the 500-event page
 limit times 64 pages) and `REPLAY_BUFFER_MAX_BYTES` (32 MiB of payload). One serialized draining batch can retain
 another batch's allowance concurrently. Pending event IDs are discarded with each batch, freeing the allowance
-for its live suffix. A separate 32,000-ID released-event window suppresses repeated raw copies. Delivery metadata,
-router-placement pins and the SDK notification queue are outside the payload cap; it is not a process, wire-byte,
-or RSS limit. Interrupted pages get one fresh request at the same boundary within the existing page bound.
-Overflow, failed paging, a saturated second, and cancellation discard the affected partial history and report its
-floor as recovery loss; they never certify it or release its newest partial page. The rest of that stored page is
-withheld, but later live input remains available. Sibling routes continue independently.
+for its live suffix. A separate 32,000-ID released-event window suppresses repeated live copies, not historical
+refetches. Delivery metadata, router-placement pins and the SDK notification queue are outside the payload cap; it
+does not bound RSS or wire bytes. Interrupted pages get one fresh request at the same boundary within the page bound.
+Overflow, failed paging, a saturated second, deadline expiry and cancellation discard the affected owner's partial
+history and report its floor as recovery loss; they never certify it or release its newest partial page. The rest
+of that stored page is withheld, but later live input remains available. Sibling routes continue independently.
 
+`dispatch_sdk_replay` is the SDK entry point; its private payload dispatcher cannot bypass generation checks.
 `take_replay_status` transfers retained loss to the consumer's existing recovery fence and holds a read guard
 through its synchronous cursor seal. Drop the status before awaiting again. `replay_loss_notified` wakes the
 router without consuming evidence. Loss survives replacement until imported. Buffered and releasing ciphertext

@@ -3,6 +3,28 @@ use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
 fn test_notification_stream(
     receiver: broadcast::Receiver<RelayPoolNotification>,
 ) -> RelayNotificationStream {
+    tag_test_stream(test_directory_stream(receiver))
+}
+
+fn tag_test_stream(receiver: DirectoryNotificationStream) -> RelayNotificationStream {
+    Box::pin(receiver.map(|update| match update {
+        NotificationUpdate::Notification(ClientNotification::Shutdown) => {
+            NotificationUpdate::Notification(NostrSdkNotification::Shutdown)
+        }
+        NotificationUpdate::Notification(notification) => {
+            NotificationUpdate::Notification(NostrSdkNotification::Payload {
+                notification,
+                epoch: [1, 0],
+                reason: transport_nostr_adapter::ReplayRestart::Connection,
+            })
+        }
+        NotificationUpdate::Lagged { skipped } => NotificationUpdate::Lagged { skipped },
+    }))
+}
+
+fn test_directory_stream(
+    receiver: broadcast::Receiver<RelayPoolNotification>,
+) -> DirectoryNotificationStream {
     Box::pin(futures::stream::unfold(
         receiver,
         |mut receiver| async move {
@@ -403,8 +425,7 @@ async fn abandoned_notification_lane_counts_queued_loss_for_only_its_account() {
     let alice_loss = sdk.notification_loss_for_account(&alice).await.unwrap();
     let bob_loss = sdk.notification_loss_for_account(&bob).await.unwrap();
     let source = SdkRelayNotificationSource {
-        client: alice_client.client().clone(),
-        loss: Some(alice_client),
+        client: alice_client,
     };
     let pending = AtomicU64::new(3);
     let failed_worker = tokio::spawn(async { panic!("forced event worker failure") });
@@ -989,21 +1010,17 @@ async fn supervised_notification_lag_charges_the_source_floor() {
     relay_plane.shutdown().await;
 }
 
-/// The REQs lag repairs have re-issued, sorted, once at least `count` have.
-async fn reissued_reqs(
-    relay: &RecordingRelayClient,
-    count: usize,
-) -> Vec<(String, Vec<TransportEndpoint>)> {
-    timeout(Duration::from_secs(5), async {
-        while relay.reissued.lock().unwrap().len() < count {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+async fn wait_acquisitions(relay: &RecordingRelayClient, count: usize) {
+    timeout(Duration::from_secs(1), async {
+        while relay.acquisitions.lock().unwrap().len() < count {
+            tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the lag repair runs once the receiver settles");
-    let mut reissued = relay.reissued.lock().unwrap().clone();
-    reissued.sort();
-    reissued
+    .expect("owned history acquisition starts after settling");
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
 }
 
 fn issued_id(relay: &RecordingRelayClient, wanted: impl Fn(&NostrSubscription) -> bool) -> String {
@@ -1017,17 +1034,14 @@ fn issued_id(relay: &RecordingRelayClient, wanted: impl Fn(&NostrSubscription) -
         .subscription_id()
 }
 
-/// A lag may have lost end-of-stored-events and cannot tell which. Once the
-/// receiver has gone the settle window without another lag, the plane
-/// re-issues just the REQs a relay never answered. Their fresh EOSE lets
-/// post-join maintenance observe its boundary, completes the coverage live
-/// cursor promotion and quiet drains wait on, and brings back activation
-/// reuse once it settles.
+/// Settling outlasts initial ownership. Recovery must deliver retained history
+/// through fresh owned capture, without changing the live subscriptions.
 #[tokio::test(start_paused = true)]
-async fn notification_lag_reissues_reqs_whose_eose_it_may_have_lost() {
+async fn lag_recovers_expired_history() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
     let account = MemberId::new(vec![0xA1; 32]);
+    let other = MemberId::new(vec![0xB2; 32]);
     let endpoint = TransportEndpoint("wss://relay.example".into());
     let group = TransportGroupSubscription {
         group_id: GroupId::new(vec![0xC3; 16]),
@@ -1035,6 +1049,12 @@ async fn notification_lag_reissues_reqs_whose_eose_it_may_have_lost() {
         endpoints: vec![endpoint.clone()],
         retained_since: None,
     };
+    let event = group_event("retained-after-expiry", &group.transport_group_id);
+    relay.history.lock().unwrap().push(RetainedHistory {
+        account_id: account.clone(),
+        routes: vec![[0xD4; 32]],
+        events: vec![event.clone()],
+    });
     let adapter = relay_plane.account_adapter(account.clone(), relay.clone());
     let activation = TransportAccountActivation {
         account_id: account.clone(),
@@ -1043,10 +1063,26 @@ async fn notification_lag_reissues_reqs_whose_eose_it_may_have_lost() {
         since: Some(Timestamp(1_699_999_000)),
     };
     adapter.activate_account(activation.clone()).await.unwrap();
-    let inbox_id = issued_id(&relay, |subscription| {
-        matches!(subscription, NostrSubscription::AccountInbox { .. })
-    });
-    let group_id = issued_id(&relay, NostrSubscription::is_group_route);
+    let other_adapter = relay_plane.account_adapter(other.clone(), relay.clone());
+    other_adapter
+        .activate_account(TransportAccountActivation {
+            account_id: other.clone(),
+            ..activation.clone()
+        })
+        .await
+        .unwrap();
+    let other_subscriptions = relay.subscriptions.lock().unwrap().clone();
+    for subscription in other_subscriptions {
+        if subscription.account_id() == &other {
+            relay_plane
+                .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+                .await;
+        }
+    }
+    let inbox_id = issued_id(
+        &relay,
+        |subscription| matches!(subscription, NostrSubscription::AccountInbox { account_id, .. } if account_id == &account),
+    );
     let maintenance_id = relay_plane
         .inner
         .transport
@@ -1054,93 +1090,120 @@ async fn notification_lag_reissues_reqs_whose_eose_it_may_have_lost() {
         .install_group_maintenance_subscription(&account, &group)
         .await
         .unwrap();
-    // The inbox's EOSE arrived. The lag lost the others.
     relay_plane
         .handle_relay_eose_for_test(endpoint.clone(), inbox_id)
         .await;
+    let subscribed = relay.subscriptions.lock().unwrap().clone();
     let floor = NostrNotificationLossFloor::Since(1_699_999_000);
     let settle = NOTIFICATION_LAG_EOSE_REPAIR_SETTLE;
-
     relay_plane.simulate_notification_lag_for_test(&account, 3, floor);
     tokio::time::sleep(settle / 2).await;
     relay_plane.simulate_notification_lag_for_test(&account, 1, floor);
     tokio::time::sleep(settle / 2 + Duration::from_millis(1)).await;
     assert!(
-        relay.reissued.lock().unwrap().is_empty(),
-        "a later lag postpones the repair"
+        relay.acquisitions.lock().unwrap().is_empty(),
+        "a later lag postpones owned recovery"
     );
     tokio::time::sleep(settle / 2).await;
-    let mut expected = vec![
-        (group_id.clone(), vec![endpoint.clone()]),
-        (maintenance_id.clone(), vec![endpoint.clone()]),
-    ];
-    expected.sort();
-    assert_eq!(reissued_reqs(&relay, 2).await, expected);
-    // The pass queued one report for the account's audit row: both lags,
-    // the two REQs whose EOSE was lost re-issued, nothing left to retry.
+    wait_acquisitions(&relay, 2).await;
+    assert!(
+        relay
+            .acquisitions
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.account_id == account)
+    );
+    assert_eq!(
+        *relay.subscriptions.lock().unwrap(),
+        subscribed,
+        "live REQs are untouched"
+    );
     let reports = relay_plane.take_eose_repair_reports(&account, true);
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].scope.as_ref(), Some(&account));
     assert_eq!(reports[0].lags, 2);
     assert!(!reports[0].follow_up);
-    assert_eq!(reports[0].summary.awaiting_relays, 2);
-    assert_eq!(reports[0].summary.reissued_relays, 2);
-    assert_eq!(reports[0].summary.failed_relays, 0);
-    assert!(!reports[0].follow_up_scheduled);
-    assert!(
-        relay_plane
-            .take_eose_repair_reports(&account, true)
-            .is_empty(),
-        "a report is recorded once"
-    );
-
-    for id in [&group_id, &maintenance_id] {
-        relay_plane
-            .handle_relay_eose_for_test(endpoint.clone(), id.clone())
-            .await;
-    }
+    assert_eq!(reports[0].summary.pending_relays, 2);
+    assert_eq!(reports[0].summary.started_relays, 2);
+    assert_eq!(reports[0].summary.active_relays, 0);
+    assert!(reports[0].follow_up_scheduled);
     assert_eq!(
         adapter
             .group_maintenance_endpoint_eose(&maintenance_id, &endpoint)
             .await,
-        Some(true),
-        "maintenance observes its boundary"
+        Some(true)
     );
     assert!(
         !adapter.account_subscription_eose().await.complete(),
-        "pending loss still fences ordinary EOSE"
+        "loss still fences ordinary EOSE"
     );
-    let Some(AccountDeliveryReceive::Overflow(overflow)) = adapter.try_receive_account_delivery()
-    else {
-        panic!("the lags queued one control record");
-    };
-    adapter.notification_loss_persisted(overflow);
-    let attempt = adapter.start_delivery_overflow_recovery(overflow.marker_token);
+    let mut delivered = Vec::new();
+    let mut overflow = None;
+    timeout(Duration::from_secs(1), async {
+        while delivered.is_empty() || overflow.is_none() {
+            match adapter
+                .receive_account_delivery()
+                .await
+                .unwrap()
+                .expect("the account route stays open through recovery")
+            {
+                AccountDeliveryReceive::Overflow(loss) => {
+                    adapter.notification_loss_persisted(loss);
+                    overflow = Some(loss);
+                }
+                AccountDeliveryReceive::Delivery(delivery) => {
+                    delivered.push(delivery.message.id.clone());
+                    adapter.release_account_delivery(&delivery.message.id);
+                }
+            }
+        }
+    })
+    .await
+    .expect("retained history reaches the consumer after ownership expired");
+    assert_eq!(delivered, vec![event.to_transport_message().unwrap().id]);
     assert!(
-        adapter.account_subscription_eose().await.complete(),
-        "a drain gated on EOSE completes during recovery"
+        adapter.try_receive_account_delivery().is_none(),
+        "retained replay is delivered exactly once"
     );
+    assert!(
+        other_adapter.try_receive_account_delivery().is_none(),
+        "account loss and recovery are isolated"
+    );
+    let attempt = adapter.start_delivery_overflow_recovery(overflow.unwrap().marker_token);
+    assert!(adapter.account_subscription_eose().await.complete());
     assert!(adapter.finish_delivery_overflow_recovery(attempt).is_some());
-
-    let subscribed = relay.subscriptions.lock().unwrap().len();
+    tokio::time::sleep(settle + Duration::from_millis(1)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    let reports = relay_plane.take_eose_repair_reports(&account, true);
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].follow_up);
+    assert_eq!(reports[0].summary.pending_relays, 0);
+    assert!(!reports[0].follow_up_scheduled);
     adapter.activate_account(activation).await.unwrap();
     assert_eq!(
-        relay.subscriptions.lock().unwrap().len(),
+        *relay.subscriptions.lock().unwrap(),
         subscribed,
-        "the next activation reuses the live REQs"
+        "settled activation reuses live REQs"
     );
-    assert_eq!(relay.unsubscribed_accounts.lock().unwrap().len(), 1);
     relay_plane.shutdown().await;
 }
 
-/// The lag marks the moment it happened. A REQ issued after it, while the
-/// receiver settles, is still replaying and keeps its replay.
+/// A replacement REQ issued after the loss is not selected by its lag mark.
 #[tokio::test(start_paused = true)]
-async fn notification_lag_repair_leaves_reqs_issued_after_the_lag() {
+async fn lag_preserves_new_requests() {
+    use transport_nostr_adapter::NostrAcquisitionScope;
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
     let account = MemberId::new(vec![0xA1; 32]);
     let endpoint = TransportEndpoint("wss://relay.example".into());
+    relay.history.lock().unwrap().push(RetainedHistory {
+        account_id: account.clone(),
+        routes: Vec::new(),
+        events: Vec::new(),
+    });
     let group = |byte: u8| TransportGroupSubscription {
         group_id: GroupId::new(vec![byte; 16]),
         transport_group_id: vec![byte; 32],
@@ -1162,7 +1225,6 @@ async fn notification_lag_repair_leaves_reqs_issued_after_the_lag() {
         1,
         NostrNotificationLossFloor::Since(1_699_999_000),
     );
-    // The adapter orders REQs against the lag on a real millisecond clock.
     std::thread::sleep(Duration::from_millis(5));
     adapter
         .sync_account_groups(TransportGroupSync {
@@ -1172,82 +1234,145 @@ async fn notification_lag_repair_leaves_reqs_issued_after_the_lag() {
         })
         .await
         .unwrap();
-    // The sync repacked both groups into one batch issued after the lag; the
-    // activation's batch it replaced is closed.
-    let live_batch = relay
-        .subscriptions
-        .lock()
-        .unwrap()
-        .iter()
-        .rev()
-        .find(|subscription| subscription.carries_group(&GroupId::new(vec![0x52; 16])))
-        .expect("the repacked batch was issued")
-        .subscription_id();
-    let inbox_id = issued_id(&relay, |subscription| {
-        matches!(subscription, NostrSubscription::AccountInbox { .. })
-    });
-
     tokio::time::sleep(NOTIFICATION_LAG_EOSE_REPAIR_SETTLE).await;
-    assert_eq!(
-        reissued_reqs(&relay, 1).await,
-        vec![(inbox_id, vec![endpoint.clone()])]
-    );
+    wait_acquisitions(&relay, 1).await;
     assert!(
-        !relay
-            .reissued
+        relay
+            .acquisitions
             .lock()
             .unwrap()
             .iter()
-            .any(|(id, _)| id == &live_batch),
-        "the REQ issued after the lag is not restarted"
+            .all(|request| matches!(
+                request.scope,
+                NostrAcquisitionScope::AccountInboxWindow { .. }
+            )),
+        "the replacement group REQ keeps its own replay"
+    );
+    let reports = relay_plane.take_eose_repair_reports(&account, true);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].summary.started_relays, 1,
+        "only the pre-lag inbox is selected"
     );
     relay_plane.shutdown().await;
 }
 
-/// A repair that leaves a relay unrepaired releases its claim and runs again
-/// after the settle window, for the same lag, until the REQ goes out. One
-/// whose re-issue went out does not run again.
+/// Failed bounded capture remains pending until a later paced attempt certifies
+/// the retained window; a successful acquisition still needs one observation.
 #[tokio::test(start_paused = true)]
-async fn unrepaired_lag_repair_runs_again_after_the_settle_window() {
+async fn lag_retries_failed_capture() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
     let account = MemberId::new(vec![0xA1; 32]);
     let endpoint = TransportEndpoint("wss://relay.example".into());
+    relay.history.lock().unwrap().push(RetainedHistory {
+        account_id: account.clone(),
+        routes: Vec::new(),
+        events: Vec::new(),
+    });
+    relay.failed_acquisitions.store(2, Ordering::SeqCst);
     let adapter = relay_plane.account_adapter(account.clone(), relay.clone());
     adapter
         .activate_account(TransportAccountActivation {
             account_id: account.clone(),
-            inbox_endpoints: vec![endpoint.clone()],
+            inbox_endpoints: vec![endpoint],
             group_subscriptions: Vec::new(),
             since: Some(Timestamp(1_699_999_000)),
         })
         .await
         .unwrap();
-    let inbox_id = issued_id(&relay, |subscription| {
-        matches!(subscription, NostrSubscription::AccountInbox { .. })
-    });
-    relay.unsent_reissues.store(2, Ordering::SeqCst);
     relay_plane.simulate_notification_lag_for_test(
         &account,
         1,
         NostrNotificationLossFloor::Since(1_699_999_000),
     );
     let settle = NOTIFICATION_LAG_EOSE_REPAIR_SETTLE;
-    for attempts in 1..=3 {
+    for attempt in 1..=3 {
         tokio::time::sleep(settle + Duration::from_millis(1)).await;
-        assert_eq!(
-            reissued_reqs(&relay, attempts).await,
-            vec![(inbox_id.clone(), vec![endpoint.clone()]); attempts],
-            "attempt {attempts} of the same REQ"
-        );
+        wait_acquisitions(&relay, attempt).await;
+        let reports = relay_plane.take_eose_repair_reports(&account, true);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].summary.pending_relays, 1);
+        assert_eq!(reports[0].summary.started_relays, 1);
+        assert!(reports[0].follow_up_scheduled);
+        assert_eq!(reports[0].follow_up, attempt > 1);
     }
+    tokio::time::sleep(settle + Duration::from_millis(1)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    let reports = relay_plane.take_eose_repair_reports(&account, true);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].summary.pending_relays, 0);
+    assert!(!reports[0].follow_up_scheduled);
     tokio::time::sleep(settle * 3).await;
-    assert_eq!(
-        relay.reissued.lock().unwrap().len(),
-        3,
-        "a re-issue that went out ends the repairs"
+    assert!(
+        relay_plane
+            .take_eose_repair_reports(&account, true)
+            .is_empty(),
+        "completion ends paced follow-ups"
     );
     relay_plane.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn lag_observes_active_capture() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let settle = Duration::from_secs(1);
+    plane.set_eose_repair_settle_for_test(settle);
+    let account = MemberId::new(vec![0xA1; 32]);
+    relay.history.lock().unwrap().push(RetainedHistory {
+        account_id: account.clone(),
+        routes: Vec::new(),
+        events: Vec::new(),
+    });
+    relay.hold_acquisitions.store(true, Ordering::SeqCst);
+    let adapter = plane.account_adapter(account.clone(), relay.clone());
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+            group_subscriptions: Vec::new(),
+            since: Some(Timestamp(1_699_999_000)),
+        })
+        .await
+        .unwrap();
+    plane.simulate_notification_lag_for_test(
+        &account,
+        1,
+        NostrNotificationLossFloor::Since(1_699_999_000),
+    );
+    tokio::time::sleep(settle + Duration::from_millis(1)).await;
+    wait_acquisitions(&relay, 1).await;
+    let reports = plane.take_eose_repair_reports(&account, true);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].summary.started_relays, 1);
+    assert!(reports[0].follow_up_scheduled);
+    tokio::time::sleep(settle + Duration::from_millis(1)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    let reports = plane.take_eose_repair_reports(&account, true);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].summary.pending_relays, 1);
+    assert_eq!(reports[0].summary.started_relays, 0);
+    assert_eq!(reports[0].summary.active_relays, 1);
+    assert!(reports[0].follow_up_scheduled);
+    relay.hold_acquisitions.store(false, Ordering::SeqCst);
+    relay.acquisition_release.notify_one();
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(settle + Duration::from_millis(1)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    let reports = plane.take_eose_repair_reports(&account, true);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].summary.pending_relays, 0);
+    assert!(!reports[0].follow_up_scheduled);
+    plane.shutdown().await;
 }
 
 #[async_trait::async_trait]
@@ -1265,10 +1390,17 @@ struct RecordingRelayClient {
     subscriptions: StdMutex<Vec<NostrSubscription>>,
     unsubscribed: StdMutex<Vec<NostrSubscription>>,
     unsubscribed_accounts: StdMutex<Vec<MemberId>>,
-    /// REQs re-issued by lag repairs, with the endpoints they went to.
-    reissued: StdMutex<Vec<(String, Vec<TransportEndpoint>)>>,
-    /// Re-issues left that reach no relay, as when it is unreachable.
-    unsent_reissues: AtomicUsize,
+    history: StdMutex<Vec<RetainedHistory>>,
+    acquisitions: StdMutex<Vec<transport_nostr_adapter::NostrAcquisitionRequest>>,
+    failed_acquisitions: AtomicUsize,
+    hold_acquisitions: AtomicBool,
+    acquisition_release: tokio::sync::Notify,
+}
+
+struct RetainedHistory {
+    account_id: MemberId,
+    routes: Vec<[u8; 32]>,
+    events: Vec<NostrTransportEvent>,
 }
 
 struct TestNotificationSource {
@@ -1333,8 +1465,8 @@ impl TestNotificationSource {
     }
 }
 
-impl RelayNotificationSource for TestNotificationSource {
-    fn notifications(&self) -> RelayNotificationStream {
+impl TestNotificationSource {
+    fn client_notifications(&self) -> DirectoryNotificationStream {
         if self.panic_first.swap(false, Ordering::SeqCst) {
             panic!("injected notification consumer panic");
         }
@@ -1348,7 +1480,13 @@ impl RelayNotificationSource for TestNotificationSource {
             let _ = self.sender.send(notice());
             let _ = self.sender.send(notice());
         }
-        test_notification_stream(receiver)
+        test_directory_stream(receiver)
+    }
+}
+
+impl RelayNotificationSource for TestNotificationSource {
+    fn notifications(&self) -> RelayNotificationStream {
+        tag_test_stream(self.client_notifications())
     }
 
     fn is_shutdown(&self) -> bool {
@@ -1629,31 +1767,80 @@ impl NostrRelayClient for RecordingRelayClient {
         Ok(())
     }
 
-    async fn reissue_subscription(
+    async fn acquire_history(
         &self,
-        _account_id: &MemberId,
-        subscription_id: &str,
-        endpoints: &[TransportEndpoint],
-    ) -> Result<transport_nostr_adapter::SubscriptionReissue, TransportAdapterError> {
-        self.reissued
+        request: transport_nostr_adapter::NostrAcquisitionRequest,
+        cancellation: transport_nostr_adapter::NostrAcquisitionCancellation,
+    ) -> Result<
+        transport_nostr_adapter::NostrAcquisitionResult,
+        transport_nostr_adapter::NostrAcquisitionError,
+    > {
+        use transport_nostr_adapter::{
+            NostrAcquisitionEnd, NostrAcquisitionEndpoint, NostrAcquisitionError,
+            NostrAcquisitionResult, NostrAcquisitionScope,
+        };
+        request.validate()?;
+        let (routes, since, until) = match &request.scope {
+            NostrAcquisitionScope::AccountInboxWindow { since, until } => {
+                (Vec::new(), *since, *until)
+            }
+            NostrAcquisitionScope::GroupsWindow {
+                transport_group_ids,
+                since,
+                until,
+            } => (transport_group_ids.clone(), *since, *until),
+            _ => return Err(NostrAcquisitionError::Unsupported),
+        };
+        let events = self
+            .history
             .lock()
             .unwrap()
-            .push((subscription_id.to_owned(), endpoints.to_vec()));
-        let outcome = if self
-            .unsent_reissues
+            .iter()
+            .find(|history| history.account_id == request.account_id && history.routes == routes)
+            .map(|history| {
+                history
+                    .events
+                    .iter()
+                    .filter(|event| event.created_at >= since && event.created_at <= until)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .ok_or(NostrAcquisitionError::Unsupported)?;
+        self.acquisitions.lock().unwrap().push(request.clone());
+        if self.hold_acquisitions.load(Ordering::SeqCst) {
+            tokio::select! {
+                _ = self.acquisition_release.notified() => {},
+                _ = cancellation.cancelled() => {},
+            }
+        }
+        let end = if cancellation.is_cancelled() {
+            NostrAcquisitionEnd::Cancelled
+        } else if self
+            .failed_acquisitions
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 left.checked_sub(1)
             })
             .is_ok()
         {
-            transport_nostr_adapter::RelayReissue::Unsent
+            NostrAcquisitionEnd::ReceiverClosed
         } else {
-            transport_nostr_adapter::RelayReissue::Sent
+            NostrAcquisitionEnd::RequestPolicySatisfied
         };
-        Ok(transport_nostr_adapter::SubscriptionReissue {
-            relays: endpoints
-                .iter()
-                .map(|endpoint| (endpoint.clone(), outcome))
+        Ok(NostrAcquisitionResult {
+            endpoints: request
+                .endpoints
+                .into_iter()
+                .map(|endpoint| NostrAcquisitionEndpoint {
+                    endpoint,
+                    session_generation: None,
+                    events: if end == NostrAcquisitionEnd::RequestPolicySatisfied {
+                        events.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    end,
+                    stats: Default::default(),
+                })
                 .collect(),
         })
     }
@@ -3242,16 +3429,30 @@ async fn seal_ignores_silent_peer() {
                 .handle_relay_eose_for_test(available.clone(), id)
                 .await;
         }
-        let Some(AccountDeliveryReceive::Delivery(delivery)) =
-            timeout(Duration::from_secs(1), adapter.receive_account_delivery())
-                .await
-                .expect("the available endpoint's replay is admitted")
-                .unwrap()
-        else {
-            panic!("replay admission must preserve the delivery");
-        };
+        let mut refused_loss = None;
+        let delivery = timeout(Duration::from_secs(1), async {
+            loop {
+                match adapter.receive_account_delivery().await.unwrap().unwrap() {
+                    AccountDeliveryReceive::Overflow(loss) => {
+                        assert!(refused, "a silent peer alone is not an observed failure");
+                        assert_eq!(loss.notification_floor, Some(OPENED_CURSOR - 1_000));
+                        assert_eq!(adapter.seal_transport_cursor(candidate), None);
+                        adapter.notification_loss_persisted(loss);
+                        refused_loss = Some(loss);
+                    }
+                    AccountDeliveryReceive::Delivery(delivery) => break delivery,
+                }
+            }
+        })
+        .await
+        .expect("the available endpoint's replay is admitted");
         adapter.release_account_delivery(&delivery.message.id);
         assert!(!adapter.account_subscription_eose().await.complete());
+        if let Some(loss) = refused_loss {
+            assert_eq!(adapter.seal_transport_cursor(candidate), None);
+            let attempt = adapter.start_delivery_overflow_recovery(loss.marker_token);
+            assert!(adapter.finish_delivery_overflow_recovery(attempt).is_some());
+        }
         timeout(Duration::from_secs(1), async {
             while adapter.seal_transport_cursor(candidate) != candidate {
                 tokio::task::yield_now().await;
@@ -4657,8 +4858,11 @@ async fn directory_forwards_immediate_event_while_rebuild_is_pending() {
         shutdown: AtomicBool::new(false),
     });
     let (sender, mut events) = broadcast::channel(8);
-    let forwarder =
-        spawn_directory_notification_forwarder(source.clone(), sender, directory.clone());
+    let forwarder = spawn_directory_notification_forwarder(
+        source.client_notifications(),
+        sender,
+        directory.clone(),
+    );
     timeout(Duration::from_secs(2), async {
         while source.subscriptions.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
@@ -4843,10 +5047,11 @@ async fn anonymous_live_directory_accepts_event_after_optional_auth() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_notification_lag_requests_refresh() {
-    let source: Arc<dyn RelayNotificationSource> = Arc::new(TestNotificationSource::lag_once());
+    let source = TestNotificationSource::lag_once();
     let (sender, mut receiver) = broadcast::channel(4);
     let directory = DirectoryRelayPlane::new(Arc::new(RecordingDirectoryFetcher::default()));
-    let task = spawn_directory_notification_forwarder(source, sender, directory);
+    let task =
+        spawn_directory_notification_forwarder(source.client_notifications(), sender, directory);
     assert!(matches!(
         timeout(Duration::from_secs(2), receiver.recv())
             .await
@@ -5346,7 +5551,7 @@ fn eose_report(scope: Option<MemberId>) -> EoseRepairReport {
         scope,
         follow_up: false,
         lags: 1,
-        summary: transport_nostr_adapter::EoseReissueSummary::default(),
+        summary: transport_nostr_adapter::ReplayRecoverySummary::default(),
         follow_up_scheduled: false,
         dropped_before: 0,
     }

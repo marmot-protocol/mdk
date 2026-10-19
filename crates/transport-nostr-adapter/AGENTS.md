@@ -78,8 +78,16 @@ for reconnect/backoff and relay status mechanics.
   arrivals behind the draining batch. Preserve ready route floors across equivalent/narrower repacks, not wider requests.
   Verified raw SDK group copies feed admission; deduplicated `Event` copies must not bypass it, and retired REQs must
   never admit late copies. SDK seen-state is not account admission.
+- Admission belongs to each REQ/relay/transport-route, never a sticky group-wide failure flag. Share ciphertext bodies
+  with separate source claims; retiring or failing one source must not discard a healthy source's older history.
+  Waiting and paging each get one `REPLAY_PAGE_LIMITS.max_duration` interval, not an interval per arriving event.
+  Expire silent/partial sources with their own loss floor. Fresh requests do not inherit abandoned admission.
+- Transport consumers use `NostrSdkRelayClient::notifications`, the ordered per-relay SDK frontier, and
+  `dispatch_sdk_replay`. Capture Connected/auth boundaries with the payloads; never poll SDK state to infer their
+  generation. Reader epochs are process-monotonic and survive queued frontend work. Receiver loss forces an owned
+  full-window refetch. Forced paging is not physical EOSE; late stored copies cannot become live by that transition.
 - Bound pending replay by `REPLAY_BUFFER_MAX_ITEMS` and `REPLAY_BUFFER_MAX_BYTES`, with one additional draining batch;
-  keep released raw-copy dedup bounded by the item allowance. Retry one interrupted page at the same boundary within
+  keep released live-copy dedup bounded by the item allowance; historical refetch bypasses it. Retry one interrupted page at the same boundary within
   the page bound. Discard partial cancelled, saturated or failed history instead of releasing its newer suffix, and
   retain its floor as loss until `take_replay_status` imports it. Later live input must not stay permanently stalled.
   Silence or a terminal refusal alone must not stall a completed peer or turn incomplete coverage into a certificate.
@@ -91,20 +99,12 @@ for reconnect/backoff and relay status mechanics.
   and a closed REQ's buffered or in-flight notifications have no deadline, so they can still be lost in a lag. Do
   not add a time-based expiry. Read `notification_loss_floor` at the lag; an unfloored REQ or missing evidence is
   `Unbounded`, never "no loss".
-- Recover a lag-lost end-of-stored-events only through `reissue_subscriptions_awaiting_eose`: only REQs issued by the
-  lag's `NotificationLagMark`, only on relays that have not reported EOSE to the adapter, all under the subscription
-  lifecycle lock. Ask the SDK first: a relay with `Relay::subscription_received_eose` true lost only the notification,
-  so record its EOSE and send nothing. Otherwise queue the REQ's CLOSE and the REQ again, unchanged and under its own
-  id, in one `Relay::batch_msg`, never as separate sends: a relay must never see a repeated live id, because one that
-  answers `CLOSED duplicate:` makes the SDK drop the REQ from the registry that restores it on reconnect, and a lone
-  CLOSE would leave it without the REQ. Keep that registry in place; a relay-level unsubscribe and subscribe drops its
-  entry when a send fails. The SDK client re-issues only to a connected relay and only while its floor record holds
-  the REQ live, and records it with `open` first. Every repair reads the SDK's EOSE record for every relay still
-  awaiting EOSE, through `subscription_eose_received` for one already re-issued to, so an answer a later lag lost
-  still completes; only the network re-issue is once per relay, so a replay that lags again cannot loop. A relay that
-  got nothing has its re-issue released and counted in `EoseReissueSummary::failed_relays` so the caller repairs it
-  again later. Never wait for queue room under the lifecycle lock. Never infer EOSE at a lag, change
-  a re-issued REQ's filter, or reopen a closed REQ.
+- Recover lag-lost replay through `recover_pending_replay`: select only current REQ/relay scopes issued by the
+  lag's `NotificationLagMark` and still awaiting complete admission. Acquire each scope's full original window under
+  a bounded, request-owned capture; join an unexpired capture rather than restarting it. Report pending, newly
+  started and already active scopes in `ReplayRecoverySummary`. Leave live REQs, filters and the SDK registry
+  untouched. Never infer EOSE from a lag or the SDK's out-of-band EOSE flag, resend the live REQ, or reopen a closed
+  REQ. The caller paces follow-ups while scopes remain pending; failed captures retain loss and can be retried.
 - Hand every relay `CLOSED` on a live REQ to `handle_relay_closed` in `dispatch_sdk_notification`, the one dispatch
   both notification consumers share (the relay plane's in `transport-nostr`, and this crate's test forwarder); change
   `CLOSED` handling there, never in a consumer loop. Classify each message on its own with `sdk_subscription_refusal` /
@@ -118,8 +118,9 @@ for reconnect/backoff and relay status mechanics.
   (superseded attempts, one-shot fetches). Keep only the reason's category, never its text, in state, logs,
   telemetry and the audit queue.
 - Keep real relay clients behind `NostrRelayClient`.
-- `dispatch_sdk_notification` is the one place an SDK notification is routed into the adapter. The relay plane's
-  consumer (`transport-nostr`) and `spawn_notification_forwarder`, which only tests use, both call it.
+- Both SDK consumers enter through `dispatch_sdk_replay`; `dispatch_sdk_notification` is its private payload handler.
+  Observe and admit a raw group copy from one validated/decoded transport message, outside the state write lock.
+  The directory-only Client stream stays separate from transport replay generations.
 - Keep the `nostr-sdk` dependency behind the `sdk` feature.
 - Relay endpoints are host-safety filtered before any connect at the `RelaySafetyPolicy` chokepoint in `transport-nostr`
   (`crates/transport-nostr/src/safety.rs`); relay hosts that are non-public IP literals are rejected, and literal
@@ -153,9 +154,10 @@ for reconnect/backoff and relay status mechanics.
   fragments batches back to the REQ limit, and a removed route's events still reach the relay client, which then
   suppresses the re-added route's replay of them. Batch numbers come from `AccountRoutes::next_batch`, which staging
   spends whether or not the sync commits, so no id is reused within an attempt. Coverage, refusals, lag repair and
-  `account_subscription_ids` are per batch; a clamped batch replay pages its whole filter
-  (`NostrAcquisitionScope::GroupsWindow`) up to `REPLAY_PAGE_MAX_PAGES` per route it carries; a full batch page that
-  cannot move past one second continues one window per route, and the batch counts only once every route's does. Post-join maintenance
+  `account_subscription_ids` are per batch; clamped replay pages per route from the outset
+  (`NostrAcquisitionScope::GroupsWindow`), up to `REPLAY_PAGE_MAX_PAGES` per route. Finish every route of one MLS group
+  before releasing it, use canonical group order across REQs, and wait for its pooled history to drain before the
+  next group. A batch counts only once every route's history completes. Post-join maintenance
   and one-shot fetches stay per route.
 - Recovery maintenance ids include the owner's durable attempt serial. A duplicate install joins only a live session;
   after failure, cancellation, removal or account reactivation, require a strictly greater serial for that account/group.
