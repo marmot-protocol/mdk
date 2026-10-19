@@ -84,7 +84,9 @@
   `auto_vacuum=INCREMENTAL` with one `VACUUM` between WAL checkpoints (an
   interrupted one changes nothing; closing the storage interrupts a running
   one instead of waiting for it), and `reclaim_free_pages` returns freed
-  pages in bounded steps afterwards. `AttachmentMigrationState` adds
+  pages in bounded steps afterwards (`PageReclaim`). Both truncate the WAL
+  without waiting on readers and report whether they did; `truncate_wal`
+  retries one a reader on another connection blocked. `AttachmentMigrationState` adds
   `Compacting`.
 
 - Moving legacy attachment bodies into the media store (mdk#2314 step 6):

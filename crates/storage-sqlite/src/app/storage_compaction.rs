@@ -84,14 +84,20 @@ impl SqliteAppStorage {
     /// account connection until it finishes. A failure, including an
     /// interrupted `VACUUM`, leaves the database as it was. Refused inside
     /// a transaction.
-    pub fn compact_database(&self) -> StorageResult<()> {
+    ///
+    /// `Ok(true)` when the WAL that held the copy was truncated too. With
+    /// `Ok(false)` a reader on another connection blocked the truncate: the
+    /// compaction committed, and [`Self::truncate_wal`] finishes the job
+    /// later.
+    pub fn compact_database(&self) -> StorageResult<bool> {
         let conn = self.lock()?;
         if !conn.is_autocommit() {
             return Err(StorageError::Backend(
                 "database compaction cannot run inside a transaction".into(),
             ));
         }
-        checkpoint(&conn);
+        // Best effort: the VACUUM writes into the WAL either way.
+        let _ = truncate_wal_in(&conn);
         // A close (a host about to suspend) must not wait out the copy: it
         // interrupts it, and the interrupted VACUUM rolls back.
         let _interruptible = self
@@ -111,18 +117,17 @@ impl SqliteAppStorage {
         }
         vacuumed?;
         // The WAL now holds the whole copy; fold it back and truncate it.
-        checkpoint(&conn);
-        Ok(())
+        truncate_wal_in(&conn)
     }
 
-    /// Returns up to `max_pages` free pages to the filesystem once the
-    /// database is incremental; a no-op before compaction. The pages leave
-    /// the file at the next checkpoint. Returns how many were freed.
-    pub fn reclaim_free_pages(&self, max_pages: u64) -> StorageResult<u64> {
+    /// Returns up to `max_pages` free pages once the database is
+    /// incremental, then truncates the WAL so they leave the file; a no-op
+    /// before compaction.
+    pub fn reclaim_free_pages(&self, max_pages: u64) -> StorageResult<PageReclaim> {
         let conn = self.lock()?;
         let before = database_space_in(&conn)?;
         if !before.incremental || before.free_pages == 0 || max_pages == 0 {
-            return Ok(0);
+            return Ok(PageReclaim::default());
         }
         let pages = i64::try_from(max_pages.min(before.free_pages)).unwrap_or(i64::MAX);
         // The pragma frees one page per step: run it to completion.
@@ -134,8 +139,29 @@ impl SqliteAppStorage {
         drop(rows);
         drop(statement);
         let after = database_space_in(&conn)?;
-        Ok(before.free_pages.saturating_sub(after.free_pages))
+        Ok(PageReclaim {
+            pages: before.free_pages.saturating_sub(after.free_pages),
+            truncated: truncate_wal_in(&conn)?,
+        })
     }
+
+    /// Checkpoints the WAL into the database and truncates it, without
+    /// waiting for readers on other connections. `false` when one held an
+    /// older snapshot: nothing is lost, and a later call finishes the job.
+    pub fn truncate_wal(&self) -> StorageResult<bool> {
+        let conn = self.lock()?;
+        truncate_wal_in(&conn)
+    }
+}
+
+/// What [`SqliteAppStorage::reclaim_free_pages`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageReclaim {
+    /// Free pages returned.
+    pub pages: u64,
+    /// The WAL was truncated, so the pages left the file. `false` while a
+    /// reader blocked it; [`SqliteAppStorage::truncate_wal`] retries.
+    pub truncated: bool,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -153,10 +179,27 @@ impl SqliteAppStorage {
     }
 }
 
-/// `wal_checkpoint(TRUNCATE)`, best effort: a reader holding an old snapshot
-/// can block it, and the next checkpoint finishes the job.
-fn checkpoint(conn: &Connection) {
-    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+/// `wal_checkpoint(TRUNCATE)` without waiting on the busy handler: a reader
+/// holding an older snapshot on another connection makes it report busy
+/// (its first column), not fail. `true` when it truncated.
+fn truncate_wal_in(conn: &Connection) -> StorageResult<bool> {
+    let wait: i64 = conn
+        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+        .storage()?;
+    conn.busy_timeout(std::time::Duration::ZERO).storage()?;
+    let checkpoint = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .storage();
+    let restored = conn
+        .busy_timeout(std::time::Duration::from_millis(
+            u64::try_from(wait).unwrap_or(0),
+        ))
+        .storage();
+    let busy = checkpoint?;
+    restored?;
+    Ok(busy == 0)
 }
 
 #[cfg(test)]

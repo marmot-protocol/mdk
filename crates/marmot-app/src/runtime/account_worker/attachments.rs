@@ -168,7 +168,7 @@ pub(super) fn spawn_legacy_migration(
         if changed {
             updates.send_modify(|_| {});
         }
-        crate::media::storage_compaction::reclaim(&app_storage);
+        crate::media::storage_compaction::reclaim(&app_storage, &progress);
     }));
 }
 
@@ -213,7 +213,12 @@ pub(super) async fn compact_if_due(
         ))
     })
     .await;
-    if matches!(attempted, Ok(Some(true))) {
+    if matches!(
+        attempted,
+        Ok(Some(
+            crate::media::storage_compaction::CompactionAttempt::Done
+        ))
+    ) {
         admission.compaction_attempted = true;
     }
 }

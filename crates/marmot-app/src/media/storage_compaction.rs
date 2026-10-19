@@ -52,23 +52,27 @@ pub(crate) fn compaction_due(space: &DatabaseSpace, reserve: u64, free: u64) -> 
 }
 
 /// Returns up to [`RECLAIM_MAX_BYTES`] of free pages once the database is
-/// incremental; a no-op before compaction. Best effort. Blocking.
-pub(crate) fn reclaim(storage: &SqliteAppStorage) {
-    let pages = match storage.database_space() {
+/// incremental, and finishes any WAL truncate a reader blocked earlier, so
+/// the pages leave the file; a no-op before compaction. Best effort.
+/// Blocking.
+pub(crate) fn reclaim(storage: &SqliteAppStorage, progress: &SharedLegacyMigration) {
+    let mut pending = truncate_pending(progress);
+    match storage.database_space() {
         Ok(space) if space.incremental && space.free_pages > 0 => {
-            RECLAIM_MAX_BYTES / space.page_size.max(1)
-        }
-        Ok(_) => return,
-        Err(_) => {
-            tracing::warn!(target: TRACE_TARGET, method = "reclaim_free_pages",
-                "database page reclaim deferred");
-            return;
-        }
-    };
-    match storage.reclaim_free_pages(pages) {
-        Ok(freed) if freed > 0 => {
-            tracing::debug!(target: TRACE_TARGET, method = "reclaim_free_pages", freed,
-                "returned free database pages to the filesystem");
+            match storage.reclaim_free_pages(RECLAIM_MAX_BYTES / space.page_size.max(1)) {
+                Ok(reclaim) => {
+                    if reclaim.pages > 0 {
+                        pending = !reclaim.truncated;
+                        tracing::debug!(target: TRACE_TARGET, method = "reclaim_free_pages",
+                            freed = reclaim.pages, truncated = reclaim.truncated,
+                            "returned free database pages to the filesystem");
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(target: TRACE_TARGET, method = "reclaim_free_pages",
+                        "database page reclaim deferred");
+                }
+            }
         }
         Ok(_) => {}
         Err(_) => {
@@ -76,11 +80,26 @@ pub(crate) fn reclaim(storage: &SqliteAppStorage) {
                 "database page reclaim deferred");
         }
     }
+    if pending {
+        pending = !storage.truncate_wal().unwrap_or(false);
+    }
+    set_truncate_pending(progress, pending);
 }
 
-/// The one-time compaction, when it is due. `true` when it was attempted
-/// (whatever its result): the caller does not attempt it again this worker
-/// ownership. `wake` tells attachment observers that it started and ended.
+/// What [`compact_if_due`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompactionAttempt {
+    /// Not due; check again next tick.
+    NotDue,
+    /// Ran (or failed for good): not again this worker ownership.
+    Done,
+    /// Another connection held the database, so the `VACUUM` rolled back
+    /// before copying anything; the next tick may try again.
+    Busy,
+}
+
+/// The one-time compaction, when it is due. `wake` tells attachment
+/// observers that it started and ended.
 ///
 /// Blocking, and the `VACUUM` holds the account connection until it ends:
 /// the account worker awaits this on the blocking pool instead of making its
@@ -91,23 +110,23 @@ pub(crate) fn compact_if_due(
     free: &dyn Fn() -> std::io::Result<u64>,
     progress: &SharedLegacyMigration,
     wake: &dyn Fn(),
-) -> bool {
+) -> CompactionAttempt {
     let space = match storage.database_space() {
         Ok(space) => space,
         Err(_) => {
             tracing::warn!(target: TRACE_TARGET, method = "compact_database",
                 "database compaction check deferred");
-            return false;
+            return CompactionAttempt::NotDue;
         }
     };
     let Ok(available) = free() else {
-        return false;
+        return CompactionAttempt::NotDue;
     };
     if !compaction_due(&space, reserve, available) {
-        return false;
+        return CompactionAttempt::NotDue;
     }
     let Ok(snapshot) = storage.attachment_storage_usage(crate::unix_now_seconds()) else {
-        return false;
+        return CompactionAttempt::NotDue;
     };
     set_compacting(progress, Some(snapshot));
     wake();
@@ -116,18 +135,42 @@ pub(crate) fn compact_if_due(
     set_compacting(progress, None);
     wake();
     let duration_ms = started.elapsed().as_millis() as u64;
-    match result.and_then(|()| storage.database_space()) {
-        Ok(after) => {
+    match result {
+        Ok(truncated) => {
+            set_truncate_pending(progress, !truncated);
+            let file_bytes = storage
+                .database_space()
+                .map_or(space.file_bytes(), |after| after.file_bytes());
             tracing::info!(target: TRACE_TARGET, method = "compact_database",
-                reclaimed_bytes = space.file_bytes().saturating_sub(after.file_bytes()),
-                duration_ms, "compacted the account database");
+                reclaimed_bytes = space.file_bytes().saturating_sub(file_bytes),
+                wal_truncated = truncated, duration_ms, "compacted the account database");
+            CompactionAttempt::Done
+        }
+        Err(error) if error.is_transient() => {
+            tracing::info!(target: TRACE_TARGET, method = "compact_database", duration_ms,
+                retry_scheduled = true, "database compaction found the database busy");
+            CompactionAttempt::Busy
         }
         Err(_) => {
             tracing::warn!(target: TRACE_TARGET, method = "compact_database", duration_ms,
                 "database compaction failed; it is not retried until the worker restarts");
+            CompactionAttempt::Done
         }
     }
-    true
+}
+
+fn truncate_pending(progress: &SharedLegacyMigration) -> bool {
+    progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .wal_truncate_pending
+}
+
+fn set_truncate_pending(progress: &SharedLegacyMigration, pending: bool) {
+    progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .wal_truncate_pending = pending;
 }
 
 fn set_compacting(

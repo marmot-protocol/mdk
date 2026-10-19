@@ -39,6 +39,9 @@ pub(crate) struct LegacyMigrationProgress {
     /// While the database compacts: the usage measured just before, which
     /// usage reads return instead of waiting for the busy database.
     pub(crate) compacting: Option<storage_sqlite::AttachmentStorageUsage>,
+    /// A compaction or reclaim could not truncate the WAL because a reader
+    /// on another connection held an older snapshot; later ticks retry.
+    pub(crate) wal_truncate_pending: bool,
 }
 
 pub(crate) type SharedLegacyMigration = Arc<Mutex<LegacyMigrationProgress>>;

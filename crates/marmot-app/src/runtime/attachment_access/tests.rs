@@ -1394,7 +1394,10 @@ fn compact_if_due(app: &MarmotApp, store: &SqliteAccountStorage) -> (bool, bool)
         &app.legacy_media_migration("alice"),
         &|| woke.store(true, std::sync::atomic::Ordering::Release),
     );
-    (attempted, woke.load(std::sync::atomic::Ordering::Acquire))
+    (
+        attempted == crate::media::storage_compaction::CompactionAttempt::Done,
+        woke.load(std::sync::atomic::Ordering::Acquire),
+    )
 }
 
 /// Once moved legacy bodies leave enough free pages, the database is

@@ -72,12 +72,12 @@ fn compaction_shrinks_the_file_and_then_reclaims_incrementally() {
     assert!(before.free_bytes() > 6_000_000, "{before:?}");
     assert_eq!(
         app.reclaim_free_pages(u64::MAX).unwrap(),
-        0,
+        PageReclaim::default(),
         "not before compaction"
     );
     let file_before = fixture.file_len();
 
-    app.compact_database().unwrap();
+    assert!(app.compact_database().unwrap(), "the WAL was truncated");
     let after = fixture.space();
     assert!(after.incremental);
     assert_eq!(after.free_pages, 0);
@@ -91,14 +91,17 @@ fn compaction_shrinks_the_file_and_then_reclaims_incrementally() {
     let freed = fixture.space().free_pages;
     assert!(freed > 1_000);
     let file_bloated = fixture.file_len();
-    assert_eq!(app.reclaim_free_pages(100).unwrap(), 100, "bounded");
-    assert_eq!(app.reclaim_free_pages(u64::MAX).unwrap(), freed - 100);
+    assert_eq!(app.reclaim_free_pages(100).unwrap().pages, 100, "bounded");
+    let rest = app.reclaim_free_pages(u64::MAX).unwrap();
+    assert_eq!(
+        rest,
+        PageReclaim {
+            pages: freed - 100,
+            truncated: true
+        }
+    );
     assert_eq!(fixture.space().free_pages, 0);
-    let _ = fixture
-        .store
-        .lock()
-        .unwrap()
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+    // The reclaim's own truncate shrank the file: no extra checkpoint here.
     assert!(fixture.file_len() + 6_000_000 < file_bloated);
     assert_eq!(fixture.marker(), "kept");
 }
@@ -128,7 +131,7 @@ fn an_interrupted_compaction_changes_nothing() {
     assert_eq!(fixture.space(), before);
     assert_eq!(fixture.marker(), "kept");
 
-    app.compact_database().unwrap();
+    assert!(app.compact_database().unwrap());
     assert!(fixture.space().incremental);
     assert_eq!(fixture.marker(), "kept");
 }
@@ -138,7 +141,7 @@ fn an_interrupted_compaction_changes_nothing() {
 fn compaction_is_refused_inside_a_transaction() {
     let fixture = Fixture::new();
     let app = fixture.store.app_storage();
-    let result: StorageResult<()> = app.connection.with_transaction(|| app.compact_database());
+    let result: StorageResult<bool> = app.connection.with_transaction(|| app.compact_database());
     assert!(result.is_err());
     assert!(!fixture.space().incremental);
 }
@@ -190,4 +193,50 @@ fn a_close_interrupts_a_running_compaction() {
         .query_row("SELECT value FROM compaction_marker", [], |r| r.get(0))
         .unwrap();
     assert_eq!(marker, "kept");
+}
+
+/// A reader on another connection (the account engine's) that holds an older
+/// snapshot blocks the truncate after the VACUUM without failing it: the
+/// compaction commits, reports the WAL untruncated, and a later truncate
+/// finishes the job once the reader is gone.
+#[test]
+fn a_reader_blocks_the_truncate_and_a_later_one_finishes_it() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    fixture.fill_and_delete();
+    let file_before = fixture.file_len();
+    let path = fixture.dir.path().join("session.sqlite");
+    let reader = rusqlite::Connection::open(&path).unwrap();
+    crate::open_hardened_sqlcipher(
+        &reader,
+        &SqlCipherKey::new(hex::encode([0x5c; 32])).unwrap(),
+        crate::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM compaction_marker", [], |r| r.get(0))
+        .unwrap();
+
+    assert!(
+        !app.compact_database().unwrap(),
+        "the reader blocked the truncate"
+    );
+    assert!(
+        fixture.space().incremental,
+        "the compaction itself committed"
+    );
+    let wal = || {
+        std::fs::metadata(fixture.dir.path().join("session.sqlite-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+    assert!(wal() > 0);
+    assert!(!app.truncate_wal().unwrap(), "still held");
+
+    reader.execute_batch("COMMIT").unwrap();
+    assert!(app.truncate_wal().unwrap());
+    assert_eq!(wal(), 0);
+    assert!(fixture.file_len() + 6_000_000 < file_before);
+    assert_eq!(fixture.marker(), "kept");
 }
