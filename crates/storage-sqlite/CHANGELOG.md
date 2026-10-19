@@ -78,6 +78,17 @@
 
 ### Added
 
+- Moving legacy attachment bodies into the media store (mdk#2314 step 6):
+  `legacy_attachment_bodies` lists completed legacy database bodies smallest
+  first, `legacy_attachment_reader` streams one (`LegacyBodyReader`, which
+  reports a body malformed as stored), `legacy_attachment_publication` is its
+  `media_store::PublishTarget` (fenced on the legacy row), and
+  `drop_migrated_legacy_body` / `drop_corrupt_legacy_body` delete its rows.
+  `AttachmentStorageUsage` gains `migration` (`AttachmentMigrationState`);
+  storage reports `NotNeeded` or `Running { remaining_bytes }`. Broken or
+  missing chunks of a completed legacy body now read as
+  `StorageError::InvalidAttachmentBody` instead of `Backend`.
+
 - Manage storage queries (mdk#2314 step 5) on `SqliteAppStorage`:
   `attachment_storage_usage` (media-store bytes counted once, legacy database
   bytes, retained attachment count, database size and free pages),

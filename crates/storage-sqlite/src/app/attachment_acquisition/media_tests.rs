@@ -750,3 +750,338 @@ fn an_age_bound_past_the_integer_range_removes_everything() {
         1
     );
 }
+
+// Moving legacy bodies into the media store (mdk#2314 step 6).
+
+impl Fixture {
+    /// Moves `body` into the store the way the runtime batch does, without
+    /// its disk admission or the row drop.
+    fn migrate(&self, body: &LegacyAttachmentBody) -> Result<PublishOutcome, MediaError> {
+        let app = self.store.app_storage();
+        self.migrate_from(body, &mut app.legacy_attachment_reader(body))
+    }
+
+    fn migrate_from(
+        &self,
+        body: &LegacyAttachmentBody,
+        reader: &mut dyn Read,
+    ) -> Result<PublishOutcome, MediaError> {
+        let app = self.store.app_storage();
+        self.media.publish(
+            &app.legacy_attachment_publication(body),
+            Category::Retained,
+            reader,
+            body.byte_len(),
+            body.digest().unwrap(),
+            NOW,
+            &|| false,
+        )
+    }
+
+    fn legacy_bodies(&self) -> Vec<LegacyAttachmentBody> {
+        self.store
+            .app_storage()
+            .legacy_attachment_bodies(ATTACHMENT_ACQUISITION_BATCH_LIMIT)
+            .unwrap()
+    }
+
+    /// Lets a test damage completed chunks, which triggers otherwise forbid.
+    fn unlock_chunks(&self) {
+        self.store
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "DROP TRIGGER attachment_file_chunk_update_immutable;
+                 DROP TRIGGER attachment_file_chunk_delete_immutable;",
+            )
+            .unwrap();
+    }
+}
+
+/// Inline and chunked legacy bodies move into store files smallest first,
+/// stay readable, and leave no rows or counted bytes behind.
+#[test]
+fn legacy_bodies_move_into_the_media_store_smallest_first() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let large = sized(200_000, 1);
+    let small = sized(1_000, 2);
+    let chunked = fixture.claimed(&"a".repeat(64), &large);
+    fixture.legacy(&chunked, &large);
+    let inline = fixture.claimed(&"b".repeat(64), &small);
+    fixture.legacy(&inline, &small);
+    assert_eq!(fixture.count("retained_attachment_files"), 1);
+    assert_eq!(app.legacy_attachment_bytes().unwrap(), 201_000);
+    assert_eq!(
+        app.attachment_storage_usage(NOW).unwrap().migration,
+        AttachmentMigrationState::Running {
+            remaining_bytes: 201_000
+        }
+    );
+
+    let bodies = fixture.legacy_bodies();
+    assert_eq!(
+        bodies
+            .iter()
+            .map(|body| body.byte_len())
+            .collect::<Vec<_>>(),
+        vec![1_000, 200_000]
+    );
+    for body in &bodies {
+        assert!(body.media_file().is_none());
+        assert!(matches!(
+            fixture.migrate(body).unwrap(),
+            PublishOutcome::Published(_)
+        ));
+        assert!(app.drop_migrated_legacy_body(body).unwrap());
+    }
+
+    assert!(fixture.legacy_bodies().is_empty());
+    let usage = app.attachment_storage_usage(NOW).unwrap();
+    assert_eq!(usage.migration, AttachmentMigrationState::NotNeeded);
+    assert_eq!((usage.legacy_bytes, usage.media_bytes), (0, 201_000));
+    for table in [
+        "retained_attachment_bytes",
+        "retained_attachment_files",
+        "retained_attachment_chunks",
+        "attachment_chunk_bodies",
+    ] {
+        assert_eq!(fixture.count(table), 0, "{table}");
+    }
+    assert_eq!(fixture.media_files_on_disk(), 2);
+    assert_eq!(fixture.read(&chunked).unwrap(), large);
+    assert_eq!(fixture.read(&inline).unwrap(), small);
+}
+
+/// A crash after the publish and before the drop leaves both copies. Reads
+/// use the file, and the next batch sees it and only drops the rows.
+#[test]
+fn an_interrupted_move_reads_the_file_and_then_only_drops_the_rows() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let content = sized(90_000, 3);
+    let job = fixture.claimed(&"c".repeat(64), &content);
+    fixture.legacy(&job, &content);
+    let PublishOutcome::Published(id) = fixture.migrate(&fixture.legacy_bodies()[0]).unwrap()
+    else {
+        panic!("not published");
+    };
+
+    let bodies = fixture.legacy_bodies();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0].media_file(), Some(id));
+    assert!(matches!(
+        app.retained_attachment_read(&job.reference, NOW, 0, 16)
+            .unwrap(),
+        Some(RetainedAttachmentRead::MediaFile(read)) if read == id
+    ));
+    assert_eq!(fixture.read(&job).unwrap(), content);
+    assert!(app.drop_migrated_legacy_body(&bodies[0]).unwrap());
+    assert!(fixture.legacy_bodies().is_empty());
+    assert_eq!(fixture.media_files_on_disk(), 1);
+    assert_eq!(fixture.read(&job).unwrap(), content);
+}
+
+/// The drop is fenced on a ready file: rows whose move never published stay.
+#[test]
+fn rows_are_not_dropped_without_a_ready_file() {
+    let fixture = Fixture::new();
+    let content = sized(4_000, 4);
+    let job = fixture.claimed(&"d".repeat(64), &content);
+    fixture.legacy(&job, &content);
+    let body = &fixture.legacy_bodies()[0];
+    assert!(
+        !fixture
+            .store
+            .app_storage()
+            .drop_migrated_legacy_body(body)
+            .unwrap()
+    );
+    assert_eq!(fixture.read(&job).unwrap(), content);
+}
+
+/// A legacy body that fails its digest, or whose chunks are missing, is
+/// refused before anything is kept. Dropping it leaves its slot completed
+/// without a body: unavailable, with download-again allowed.
+#[test]
+fn a_corrupt_legacy_body_is_refused_and_dropped_leaving_the_slot_unavailable() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let damaged = sized(200_000, 5);
+    let truncated = sized(150_000, 6);
+    let damaged_job = fixture.claimed(&"e".repeat(64), &damaged);
+    fixture.legacy(&damaged_job, &damaged);
+    let truncated_job = fixture.claimed(&"f".repeat(64), &truncated);
+    fixture.legacy(&truncated_job, &truncated);
+    fixture.unlock_chunks();
+    let nonce = |job: &AttachmentAcquisition| -> Vec<u8> {
+        fixture
+            .store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT nonce FROM retained_attachment_files WHERE token=?1",
+                [&job.reference.token],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let (damaged_nonce, truncated_nonce) = (nonce(&damaged_job), nonce(&truncated_job));
+    let conn = fixture.store.lock().unwrap();
+    conn.execute(
+        "UPDATE retained_attachment_chunks SET bytes=zeroblob(length(bytes))
+         WHERE token=?1 AND offset=0",
+        [damaged_nonce],
+    )
+    .unwrap();
+    conn.execute(
+        "DELETE FROM retained_attachment_chunks WHERE token=?1
+         AND offset=(SELECT max(offset) FROM retained_attachment_chunks WHERE token=?1)",
+        [truncated_nonce],
+    )
+    .unwrap();
+    drop(conn);
+
+    let bodies = fixture.legacy_bodies();
+    let [truncated_body, damaged_body] = bodies.as_slice() else {
+        panic!("two legacy bodies");
+    };
+    assert_eq!(
+        fixture.migrate(damaged_body),
+        Err(MediaError::InvalidBody("media body digest mismatch"))
+    );
+    let mut reader = app.legacy_attachment_reader(truncated_body);
+    assert!(matches!(
+        fixture.migrate_from(truncated_body, &mut reader),
+        Err(MediaError::Io(_))
+    ));
+    assert!(reader.body_invalid());
+    fixture.sweep();
+    assert_eq!(fixture.media_files_on_disk(), 0);
+    assert_eq!(fixture.count("media_files"), 0);
+
+    for body in [truncated_body, damaged_body] {
+        assert!(app.drop_corrupt_legacy_body(body).unwrap());
+    }
+    assert!(fixture.legacy_bodies().is_empty());
+    assert_eq!(app.retained_attachment_byte_count().unwrap(), 0);
+    for job in [&damaged_job, &truncated_job] {
+        assert_eq!(fixture.read(job), None);
+        assert_eq!(
+            app.attachment_acquisition_status(&job.reference)
+                .unwrap()
+                .unwrap()
+                .state,
+            AttachmentAcquisitionState::Ready,
+            "the slot keeps its completed acquisition without a body"
+        );
+    }
+}
+
+/// A removal while the body streams out supersedes the move: nothing is
+/// kept, and the removal's cascade takes the rows.
+#[test]
+fn removal_during_a_move_supersedes_it_and_keeps_nothing() {
+    struct RemovingReader<'a> {
+        fixture: &'a Fixture,
+        inner: LegacyBodyReader,
+        removed: bool,
+    }
+    impl Read for RemovingReader<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.inner.read(out)?;
+            if !self.removed {
+                self.removed = true;
+                self.fixture
+                    .store
+                    .app_storage()
+                    .remove_retained_attachments(NOW, None, None)
+                    .unwrap();
+            }
+            Ok(read)
+        }
+    }
+    let fixture = Fixture::new();
+    let content = sized(20_000, 7);
+    let job = fixture.claimed(&"1".repeat(64), &content);
+    fixture.legacy(&job, &content);
+    let body = fixture.legacy_bodies().remove(0);
+    let mut reader = RemovingReader {
+        fixture: &fixture,
+        inner: fixture.store.app_storage().legacy_attachment_reader(&body),
+        removed: false,
+    };
+    assert_eq!(
+        fixture.migrate_from(&body, &mut reader),
+        Ok(PublishOutcome::Superseded)
+    );
+    fixture.sweep();
+    assert_eq!(fixture.media_files_on_disk(), 0);
+    assert!(fixture.legacy_bodies().is_empty());
+}
+
+/// A body whose content the store already holds attaches that file instead
+/// of writing another copy.
+#[test]
+fn a_legacy_body_with_a_stored_twin_attaches_it() {
+    let fixture = Fixture::new();
+    let content = body();
+    let media = fixture.claimed(&"2".repeat(64), &content);
+    let PublishOutcome::Published(id) = fixture.publish(&media, &content) else {
+        panic!("not published");
+    };
+    let legacy = fixture.claimed(&"3".repeat(64), &content);
+    fixture.legacy(&legacy, &content);
+    let body = fixture.legacy_bodies().remove(0);
+    assert_eq!(fixture.migrate(&body), Ok(PublishOutcome::Existing(id)));
+    assert!(
+        fixture
+            .store
+            .app_storage()
+            .drop_migrated_legacy_body(&body)
+            .unwrap()
+    );
+    assert_eq!(fixture.media_files_on_disk(), 1);
+    assert_eq!(fixture.read(&legacy).unwrap(), content);
+}
+
+/// A chunked import still in progress and a legacy outgoing upload are not
+/// legacy bodies to move: they are neither listed nor counted, and stay.
+#[test]
+fn unfinished_imports_and_legacy_uploads_are_left_alone() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let content = sized(1_000, 8);
+    let importing = fixture.claimed(&"4".repeat(64), &content);
+    {
+        let conn = fixture.store.lock().unwrap();
+        conn.execute_batch("INSERT INTO attachment_chunk_bodies(nonce) VALUES(x'0102030405060708090a0b0c0d0e0f10')")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,0,x'')",
+            [&importing.reference.token],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO retained_attachment_files(token,nonce,attempt,byte_len)
+             VALUES(?1,x'0102030405060708090a0b0c0d0e0f10',zeroblob(16),500000)",
+            [&importing.reference.token],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO outgoing_attachment_uploads(token,group_id_hex,source_epoch,plaintext_digest,bytes,expires_at)
+             VALUES(zeroblob(16),?1,1,?2,?3,?4)",
+            params![GROUP, digest(&content).as_slice(), content, i64::MAX],
+        )
+        .unwrap();
+    }
+    assert!(app.retained_attachment_byte_count().unwrap() > 0);
+    assert!(fixture.legacy_bodies().is_empty());
+    assert_eq!(app.legacy_attachment_bytes().unwrap(), 0);
+    assert_eq!(
+        app.attachment_storage_usage(NOW).unwrap().migration,
+        AttachmentMigrationState::NotNeeded
+    );
+    assert_eq!(fixture.count("retained_attachment_files"), 1);
+    assert_eq!(fixture.count("outgoing_attachment_uploads"), 1);
+}

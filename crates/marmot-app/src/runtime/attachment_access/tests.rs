@@ -1,5 +1,5 @@
 use super::*;
-use crate::MarmotApp;
+use crate::{AttachmentMigrationState, MarmotApp};
 use marmot_account::AccountHome;
 use sha2::{Digest, Sha256};
 use storage_sqlite::{SqliteAccountStorage, SqliteAppStorage};
@@ -52,6 +52,11 @@ fn target() -> AttachmentLocalTarget {
     }
 }
 fn seed(store: &SqliteAppStorage, bytes: &[u8]) {
+    seed_at(store, target(), bytes);
+}
+
+/// A legacy database body for slot `key`, received at 10.
+fn seed_at(store: &SqliteAppStorage, key: AttachmentLocalTarget, bytes: &[u8]) {
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -63,11 +68,10 @@ fn seed(store: &SqliteAppStorage, bytes: &[u8]) {
             300,
         )
         .unwrap();
-    let key = target();
     store
         .record_app_event(&StoredAppEvent {
             group_id_hex: GROUP.into(),
-            message_id_hex: key.message_id_hex,
+            message_id_hex: key.message_id_hex.clone(),
             source_message_id_hex: Some(key.source_message_id_hex),
             source_epoch: Some(3),
             direction: "received".into(),
@@ -86,10 +90,12 @@ fn seed(store: &SqliteAppStorage, bytes: &[u8]) {
         })
         .unwrap();
     let entry = store
-        .attachment_history_page(GROUP, 1, None)
+        .attachment_history_page(GROUP, 64, None)
         .unwrap()
         .entries
-        .remove(0);
+        .into_iter()
+        .find(|entry| entry.message_id_hex == key.message_id_hex)
+        .unwrap();
     let now = crate::unix_now_seconds();
     let storage_sqlite::AttachmentDemand::Requested(reference) = store
         .request_attachment_acquisition(GROUP, &entry, Sha256::digest(bytes).into(), now)
@@ -383,7 +389,7 @@ fn seed_file_backed(app: &MarmotApp, account: &SqliteAccountStorage, bytes: &[u8
     store
         .record_app_event(&StoredAppEvent {
             group_id_hex: GROUP.into(),
-            message_id_hex: key.message_id_hex,
+            message_id_hex: key.message_id_hex.clone(),
             source_message_id_hex: Some(key.source_message_id_hex),
             source_epoch: Some(3),
             direction: "received".into(),
@@ -978,5 +984,397 @@ async fn removal_by_age_covers_legacy_bodies() {
     );
     let usage = runtime.attachment_storage_usage("alice").await.unwrap();
     assert_eq!((usage.legacy_bytes, usage.attachment_count), (0, 0));
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+// Moving legacy bodies into the media store (mdk#2314 step 6).
+
+/// A second connection to alice's database, for damaging rows directly.
+fn raw_connection(app: &MarmotApp) -> rusqlite::Connection {
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+}
+
+fn legacy_slot(n: u8) -> AttachmentLocalTarget {
+    AttachmentLocalTarget {
+        message_id_hex: format!("{n:02x}").repeat(32),
+        source_message_id_hex: format!("{n:02x}").repeat(32),
+        attachment_index: 0,
+    }
+}
+
+/// One migration batch with `free` bytes free on the volume and a 1 KiB
+/// reserve, recorded where the usage summary reads it. Whether attachment
+/// observers would wake.
+fn migrate_legacy(app: &MarmotApp, store: &SqliteAccountStorage, free: u64) -> bool {
+    let media = app.account_media_store("alice", store).unwrap();
+    crate::media::legacy_migration::run_batch(
+        &store.app_storage(),
+        &media,
+        1024,
+        &|| Ok(free),
+        &app.legacy_media_migration("alice"),
+    )
+}
+
+/// The whole retained body at `target`, read the way a host does.
+async fn read_whole(runtime: &MarmotAppRuntime, target: AttachmentLocalTarget) -> Option<Vec<u8>> {
+    let group = GroupId::new(vec![0xab; 16]);
+    let asset = runtime
+        .attachment_local_assets("alice", &group, vec![target])
+        .await
+        .unwrap()
+        .remove(0)?;
+    let mut body = Vec::new();
+    loop {
+        let window = runtime
+            .read_attachment_asset(
+                "alice",
+                asset.reference.clone(),
+                body.len() as u64,
+                MAX_ATTACHMENT_LOCAL_READ_BYTES,
+            )
+            .await
+            .unwrap()?;
+        if window.is_empty() {
+            return Some(body);
+        }
+        body.extend_from_slice(&window);
+    }
+}
+
+/// Legacy bodies move into store files, stay readable, and the usage summary
+/// follows the move from running to complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_bodies_move_into_the_media_store_and_usage_reports_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    let small = vec![1u8; 3000];
+    let large = vec![2u8; 200_000];
+    seed_at(&store.app_storage(), legacy_slot(0x11), &small);
+    seed_at(&store.app_storage(), legacy_slot(0x12), &large);
+    let runtime = app.runtime();
+    assert_eq!(
+        runtime
+            .attachment_storage_usage("alice")
+            .await
+            .unwrap()
+            .migration,
+        AttachmentMigrationState::Running {
+            remaining_bytes: 203_000
+        }
+    );
+
+    assert!(
+        migrate_legacy(&app, &store, u64::MAX / 2),
+        "completion is news"
+    );
+    let usage = runtime.attachment_storage_usage("alice").await.unwrap();
+    assert_eq!(usage.migration, AttachmentMigrationState::Complete);
+    assert_eq!((usage.legacy_bytes, usage.media_bytes), (0, 203_000));
+    assert_eq!(media_files_on_disk(&app), 2);
+    assert_eq!(
+        read_whole(&runtime, legacy_slot(0x11)).await.unwrap(),
+        small
+    );
+    assert_eq!(
+        read_whole(&runtime, legacy_slot(0x12)).await.unwrap(),
+        large
+    );
+    assert!(
+        !migrate_legacy(&app, &store, u64::MAX / 2),
+        "already announced"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// An account that never had legacy bodies has nothing to move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_account_without_legacy_bodies_needs_no_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    seed_file_backed(&app, &store, &[3u8; 4096]);
+    assert!(!migrate_legacy(&app, &store, u64::MAX / 2));
+    let runtime = app.runtime();
+    assert_eq!(
+        runtime
+            .attachment_storage_usage("alice")
+            .await
+            .unwrap()
+            .migration,
+        AttachmentMigrationState::NotNeeded
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// On a tight disk the move takes what fits (smallest first), pauses with
+/// the space it still needs, and keeps the rest in the database. Pruning the
+/// body that does not fit lets it finish; nothing is dropped to make room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tight_disk_pauses_the_move_until_the_user_prunes() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    let small = vec![4u8; 2000];
+    let large = vec![5u8; 100_000];
+    seed_at(&store.app_storage(), legacy_slot(0x21), &small);
+    seed_at(&store.app_storage(), legacy_slot(0x22), &large);
+    let runtime = app.runtime();
+
+    // Room for the reserve and the small body's store file, 10 bytes short
+    // of the large one's.
+    let free = 1024 + media_store::DiskPolicy::migration_need(100_000) - 10;
+    assert!(migrate_legacy(&app, &store, free), "the pause is news");
+    assert_eq!(
+        runtime
+            .attachment_storage_usage("alice")
+            .await
+            .unwrap()
+            .migration,
+        AttachmentMigrationState::Paused { needed_bytes: 10 }
+    );
+    assert!(!migrate_legacy(&app, &store, free), "still paused");
+    assert_eq!(media_files_on_disk(&app), 1);
+    assert_eq!(
+        read_whole(&runtime, legacy_slot(0x21)).await.unwrap(),
+        small
+    );
+    assert_eq!(
+        read_whole(&runtime, legacy_slot(0x22)).await.unwrap(),
+        large,
+        "the body that did not fit stays readable from the database"
+    );
+
+    let group = GroupId::new(vec![0xab; 16]);
+    let asset = runtime
+        .attachment_local_assets("alice", &group, vec![legacy_slot(0x22)])
+        .await
+        .unwrap()
+        .remove(0)
+        .unwrap();
+    assert!(
+        runtime
+            .control_attachment("alice", asset.reference, crate::AttachmentControl::Remove)
+            .await
+            .unwrap()
+    );
+    assert!(migrate_legacy(&app, &store, free), "resumed and finished");
+    let usage = runtime.attachment_storage_usage("alice").await.unwrap();
+    assert_eq!(usage.migration, AttachmentMigrationState::Complete);
+    assert_eq!(usage.legacy_bytes, 0);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A legacy body that fails its digest is dropped, its slot becomes
+/// unavailable with download-again allowed, and the move continues.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_corrupt_legacy_body_is_dropped_and_the_move_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    let damaged = vec![6u8; 150_000];
+    let intact = vec![7u8; 160_000];
+    seed_at(&store.app_storage(), legacy_slot(0x31), &damaged);
+    seed_at(&store.app_storage(), legacy_slot(0x32), &intact);
+    {
+        let conn = raw_connection(&app);
+        conn.execute_batch("DROP TRIGGER attachment_file_chunk_update_immutable;")
+            .unwrap();
+        conn.execute(
+            "UPDATE retained_attachment_chunks SET bytes=zeroblob(length(bytes))
+             WHERE offset=0 AND token=(SELECT nonce FROM retained_attachment_files
+                 WHERE byte_len=150000)",
+            [],
+        )
+        .unwrap();
+    }
+    let runtime = app.runtime();
+    let media = app.account_media_store("alice", &store).unwrap();
+    assert_eq!(
+        crate::media::legacy_migration::migrate_batch(
+            &store.app_storage(),
+            &media,
+            0,
+            &|| Ok(u64::MAX / 2),
+            crate::unix_now_seconds(),
+        ),
+        crate::media::legacy_migration::LegacyMigrationBatch::Progress {
+            moved: 1,
+            moved_bytes: 160_000,
+            dropped_corrupt: 1,
+            more: false,
+        }
+    );
+    assert_eq!(media_files_on_disk(&app), 1);
+    assert_eq!(
+        read_whole(&runtime, legacy_slot(0x32)).await.unwrap(),
+        intact
+    );
+    assert_eq!(read_whole(&runtime, legacy_slot(0x31)).await, None);
+    let group = GroupId::new(vec![0xab; 16]);
+    let status = runtime
+        .attachment_transfer_snapshot("alice", &group, vec![legacy_slot(0x31)])
+        .await
+        .unwrap()
+        .remove(0)
+        .unwrap();
+    assert_eq!(
+        status.state,
+        storage_sqlite::AttachmentTransferState::PreviouslyAcquiredUnavailable
+    );
+    assert_eq!(
+        runtime
+            .attachment_storage_usage("alice")
+            .await
+            .unwrap()
+            .legacy_bytes,
+        0
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A move interrupted after its publish, before the rows were dropped, is
+/// finished by the next batch without writing a second file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interrupted_move_is_finished_without_a_second_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    let body = vec![8u8; 70_000];
+    seed_at(&store.app_storage(), legacy_slot(0x41), &body);
+    let media = app.account_media_store("alice", &store).unwrap();
+    let app_storage = store.app_storage();
+    let legacy = app_storage.legacy_attachment_bodies(8).unwrap().remove(0);
+    assert!(matches!(
+        media
+            .publish(
+                &app_storage.legacy_attachment_publication(&legacy),
+                media_store::Category::Retained,
+                &mut app_storage.legacy_attachment_reader(&legacy),
+                legacy.byte_len(),
+                legacy.digest().unwrap(),
+                crate::unix_now_seconds(),
+                &|| false,
+            )
+            .unwrap(),
+        media_store::PublishOutcome::Published(_)
+    ));
+
+    assert!(migrate_legacy(&app, &store, u64::MAX / 2));
+    assert_eq!(media_files_on_disk(&app), 1);
+    assert_eq!(app_storage.legacy_attachment_bytes().unwrap(), 0);
+    let runtime = app.runtime();
+    assert_eq!(read_whole(&runtime, legacy_slot(0x41)).await.unwrap(), body);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Flips the last byte of every media file: the length, header and
+/// therefore an open still succeed, but the last segment no longer
+/// authenticates.
+fn damage_media_files(app: &MarmotApp) {
+    let root = app.account_dir("alice").join(media_store::MEDIA_DIRECTORY);
+    for shard in std::fs::read_dir(root).unwrap() {
+        for file in std::fs::read_dir(shard.unwrap().path()).unwrap() {
+            let path = file.unwrap().path();
+            let mut bytes = std::fs::read(&path).unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 1;
+            std::fs::write(&path, bytes).unwrap();
+        }
+    }
+}
+
+/// An interrupted move whose file was damaged afterwards keeps the database
+/// copy: the file is read in full before the rows go, and a fresh file is
+/// written from them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interrupted_move_with_a_damaged_file_moves_again_from_the_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    let body = vec![9u8; 150_000];
+    seed_at(&store.app_storage(), legacy_slot(0x51), &body);
+    let media = app.account_media_store("alice", &store).unwrap();
+    let app_storage = store.app_storage();
+    let legacy = app_storage.legacy_attachment_bodies(8).unwrap().remove(0);
+    media
+        .publish(
+            &app_storage.legacy_attachment_publication(&legacy),
+            media_store::Category::Retained,
+            &mut app_storage.legacy_attachment_reader(&legacy),
+            legacy.byte_len(),
+            legacy.digest().unwrap(),
+            crate::unix_now_seconds(),
+            &|| false,
+        )
+        .unwrap();
+    damage_media_files(&app);
+
+    assert!(migrate_legacy(&app, &store, u64::MAX / 2));
+    assert_eq!(app_storage.legacy_attachment_bytes().unwrap(), 0);
+    let runtime = app.runtime();
+    assert_eq!(read_whole(&runtime, legacy_slot(0x51)).await.unwrap(), body);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A stored twin that does not read back is never trusted in place of the
+/// database copy: the batch keeps the rows, and the next one writes a fresh
+/// file from them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_damaged_stored_twin_does_not_replace_the_database_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    let body = vec![10u8; 150_000];
+    seed_file_backed(&app, &store, &body);
+    seed_at(&store.app_storage(), legacy_slot(0x52), &body);
+    damage_media_files(&app);
+    let runtime = app.runtime();
+
+    migrate_legacy(&app, &store, u64::MAX / 2);
+    assert_eq!(
+        store.app_storage().legacy_attachment_bytes().unwrap(),
+        body.len() as u64,
+        "the rows stay while the twin fails"
+    );
+    assert_eq!(read_whole(&runtime, legacy_slot(0x52)).await.unwrap(), body);
+
+    assert!(migrate_legacy(&app, &store, u64::MAX / 2));
+    assert_eq!(store.app_storage().legacy_attachment_bytes().unwrap(), 0);
+    assert_eq!(read_whole(&runtime, legacy_slot(0x52)).await.unwrap(), body);
     runtime.shutdown_and_close().await.unwrap();
 }

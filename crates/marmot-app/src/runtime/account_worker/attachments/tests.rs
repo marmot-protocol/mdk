@@ -1101,6 +1101,7 @@ async fn attachment_publication_digest_bug_is_terminal_and_native_default_is_on(
     assert!(status.due.is_none());
 }
 
+mod legacy_migration;
 mod resume;
 mod storage_block;
 

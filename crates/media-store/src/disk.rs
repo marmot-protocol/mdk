@@ -56,6 +56,14 @@ impl DiskPolicy {
         body
     }
 
+    /// Bytes moving a `body`-byte legacy database body into the store
+    /// writes: its whole store file, framing included. The database rows it
+    /// came from are deleted afterwards, so they free nothing on the volume
+    /// until compaction.
+    pub fn migration_need(body: u64) -> u64 {
+        crate::format::file_bytes(body)
+    }
+
     /// The inverse of [`Self::download_need`]: the fewest checkpointed bytes
     /// with which a download of `body` bytes still writes at most
     /// `available`, or `None` when even a complete checkpoint leaves too
@@ -103,6 +111,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_migration_needs_its_whole_store_file() {
+        assert_eq!(DiskPolicy::migration_need(0), crate::format::file_bytes(0));
+        let body = 3 * 65_536 + 1;
+        assert!(DiskPolicy::migration_need(body) > body);
+        assert_eq!(
+            DiskPolicy::migration_need(body),
+            crate::format::file_bytes(body)
+        );
     }
 
     #[test]
