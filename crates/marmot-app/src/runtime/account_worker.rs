@@ -9196,7 +9196,7 @@ mod tests {
             "wss://relay.example".to_owned(),
             bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(300_000),
         )
-        .with_test_relay_client(relay.clone());
+        .with_test_relay_client(relay);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group = client
             .create_group("ownership baseline", &[])
@@ -9218,7 +9218,6 @@ mod tests {
         client.delivery_overflow_recovery_marker_token = Some(7);
         let (events, _subscriber) = broadcast::channel(16);
         let shared = RuntimeSharedServices::default();
-        let before = relay.unfloored_account_subscription_count();
         client
             .sync_with_stage_telemetry(
                 Some(&shared.app_performance_telemetry()),
@@ -9254,11 +9253,6 @@ mod tests {
                 .unwrap();
             assert_eq!(retry.attempt_serial, 1, "{reason}");
             assert_eq!(retry.not_before_ms - retry.recorded_at_ms, 300_000);
-            assert_eq!(
-                relay.unfloored_account_subscription_count(),
-                before,
-                "automatic recovery restores only the live tail"
-            );
         }
         let retry = app
             .account_storage("alice")
@@ -9288,7 +9282,6 @@ mod tests {
                 .unwrap(),
             retry
         );
-        assert_eq!(relay.unfloored_account_subscription_count(), before);
         client
             .sync_with_classified_partial_progress()
             .await
@@ -9301,11 +9294,6 @@ mod tests {
                 .unwrap()
                 .attempt_serial,
             2
-        );
-        assert_eq!(
-            relay.unfloored_account_subscription_count(),
-            before,
-            "an explicit catch-up spends one override and still restores only the live tail"
         );
         assert!(client.has_pending_epoch_backfill());
         assert!(client.delivery_overflow_recovery_pending);

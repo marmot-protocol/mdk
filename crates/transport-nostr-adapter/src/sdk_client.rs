@@ -996,10 +996,11 @@ struct PreparedPublish {
     required_acks: usize,
 }
 
-/// Routes one SDK client notification into `adapter`. The deduplicated event
-/// goes to delivery, or to `account_id`'s reconciled delivery when the receiver
-/// serves one account. Each relay copy of an event feeds telemetry and
-/// replay-page accounting, an end of stored events feeds subscription
+/// Routes one SDK client notification into `adapter`. Verified raw group copies
+/// pass through replay admission, including ciphertext the SDK already saw on
+/// an abandoned attempt. Other kinds use deduplicated delivery, scoped to
+/// `account_id` when the receiver serves one account. Each relay copy feeds
+/// telemetry and replay-page accounting, an end of stored events feeds subscription
 /// progress, and a `CLOSED` becomes a refusal classified by `classify_closed`
 /// from its own reason. Returns whether the notification was the pool's
 /// shutdown.
@@ -1019,6 +1020,12 @@ pub async fn dispatch_sdk_notification(
             subscription_id,
             event,
         } => {
+            // The SDK emits Event before its raw Message copy. Only the raw
+            // copy may admit group ciphertext: a delayed Event from a retired
+            // attempt must never bypass the subscription/replay gate.
+            if event.kind == Kind::MlsGroupMessage {
+                return false;
+            }
             if let Ok(event) = NostrTransportEvent::from_nostr_event(&event) {
                 tracing::trace!(
                     target: "transport_nostr_adapter::sdk_client",
@@ -1050,18 +1057,26 @@ pub async fn dispatch_sdk_notification(
                     subscription_id,
                     event,
                 } => {
-                    // Raw per-relay copy feeds telemetry and replay-page
-                    // accounting, in order with this relay's EOSE. Delivery
-                    // uses the deduplicated Event notification above.
+                    // The pinned SDK verifies identity and signature before
+                    // emitting Message::Event, including cache hits. Count
+                    // each raw copy in relay order before group admission;
+                    // SDK Event dedup must not consume an abandoned replay's
+                    // only chance to deliver this ciphertext.
                     match NostrTransportEvent::from_nostr_event(&event) {
                         Ok(event) => {
-                            adapter
-                                .observe_relay_event(NostrRelayEvent {
-                                    endpoint: TransportEndpoint(relay_url.to_string()),
-                                    subscription_id: Some(subscription_id.to_string()),
-                                    event,
-                                })
-                                .await;
+                            let relay_event = NostrRelayEvent {
+                                endpoint: TransportEndpoint(relay_url.to_string()),
+                                subscription_id: Some(subscription_id.to_string()),
+                                event,
+                            };
+                            if relay_event.event.kind == KIND_MARMOT_GROUP_MESSAGE {
+                                adapter.observe_relay_event(&relay_event).await;
+                                let _ = adapter
+                                    .handle_group_relay_copy(relay_event, account_id)
+                                    .await;
+                            } else {
+                                adapter.observe_relay_event(&relay_event).await;
+                            }
                         }
                         Err(_) => {
                             adapter
@@ -6652,6 +6667,189 @@ mod tests {
         NostrTransportEvent::from_nostr_event(&signed).expect("dto from signed event")
     }
 
+    /// The SDK remembers the event before the account has admitted any bytes.
+    /// Replacing that activation must recover the exact ciphertext through a
+    /// new raw copy, while queued notifications from the old REQ stay fenced.
+    #[tokio::test]
+    async fn sdk_seen_replay_survives_reset() {
+        for account_scoped in [false, true] {
+            let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+            let endpoint = TransportEndpoint(relay.url().await.to_string());
+            let event = EventBuilder::new(Kind::MlsGroupMessage, "staged old ciphertext")
+                .tag(Tag::custom("h", ["c3".repeat(32)]))
+                .finalize(&Keys::generate())
+                .unwrap();
+            relay.add_event(event.clone()).await.unwrap();
+            let account = MemberId::new(Keys::generate().public_key().to_bytes().to_vec());
+            let sdk = NostrSdkRelayClient::new(Client::default());
+            let adapter = NostrTransportAdapter::new(Arc::new(sdk.clone()));
+            // Install the real SDK receiver before the first REQ can answer.
+            let mut notifications = sdk.client.notifications();
+            let scope = account_scoped.then_some(&account);
+            let activation = crate::TransportAccountActivation {
+                account_id: account.clone(),
+                inbox_endpoints: vec![endpoint.clone()],
+                group_subscriptions: vec![crate::TransportGroupSubscription {
+                    group_id: cgka_traits::GroupId::new(vec![0xb2; 16]),
+                    transport_group_id: vec![0xc3; 32],
+                    endpoints: vec![endpoint],
+                    retained_since: None,
+                }],
+                since: None,
+            };
+            adapter.activate_account(activation.clone()).await.unwrap();
+
+            let mut deferred_event = None;
+            let mut old_raw = None;
+            let mut old_subscription = None;
+            let old_eose = timeout(Duration::from_secs(10), async {
+                loop {
+                    let notification = notifications.next().await.unwrap();
+                    match &notification {
+                        ClientNotification::Event {
+                            event: received, ..
+                        } if received.id == event.id => {
+                            // Model an SDK Event already queued when its raw
+                            // replay is staged, but handled after replacement.
+                            deferred_event = Some(notification);
+                            continue;
+                        }
+                        ClientNotification::Message { message, .. } => match message.as_ref() {
+                            RelayMessage::Event {
+                                subscription_id,
+                                event: received,
+                            } if received.id == event.id => {
+                                old_subscription = Some(subscription_id.to_string());
+                                old_raw = Some(notification.clone());
+                            }
+                            RelayMessage::EndOfStoredEvents(id)
+                                if old_subscription.as_deref() == Some(id.as_str()) =>
+                            {
+                                // Leave a partial replay staged in the adapter,
+                                // although the SDK has already consumed EOSE.
+                                break notification;
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                    dispatch_sdk_notification(notification, &adapter, scope, &|reason| {
+                        sdk.subscription_refusal(reason)
+                    })
+                    .await;
+                }
+            })
+            .await
+            .expect("the old REQ stages its stored event before EOSE");
+            assert!(adapter.take_replay_status(&account).await.pending);
+            assert!(adapter.delivery_rx.lock().await.try_recv().is_err());
+            assert_eq!(
+                sdk.client.database().check_id(&event.id).await.unwrap(),
+                DatabaseEventStatus::Saved,
+                "the SDK already deduplicates this ciphertext"
+            );
+            assert!(
+                sdk.client
+                    .database()
+                    .event_by_id(&event.id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the default SDK cache does not retain bytes for recovery"
+            );
+
+            adapter.activate_account(activation).await.unwrap();
+            let deferred_event = deferred_event.expect("the SDK emitted the first-seen Event");
+            let old_raw = old_raw.expect("the relay emitted its raw copy");
+            for notification in [deferred_event.clone(), old_raw.clone(), old_eose] {
+                dispatch_sdk_notification(notification, &adapter, scope, &|reason| {
+                    sdk.subscription_refusal(reason)
+                })
+                .await;
+            }
+            assert!(
+                adapter.delivery_rx.lock().await.try_recv().is_err(),
+                "retired Event/raw/EOSE cannot release the cancelled partial replay"
+            );
+
+            let mut successor_raw = None;
+            let mut successor_subscription = None;
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    let notification = notifications.next().await.unwrap();
+                    let mut replay_done = false;
+                    match &notification {
+                        ClientNotification::Event {
+                            event: received, ..
+                        } if received.id == event.id => {
+                            panic!("the SDK must deduplicate the successor's Event copy");
+                        }
+                        ClientNotification::Message { message, .. } => match message.as_ref() {
+                            RelayMessage::Event {
+                                subscription_id,
+                                event: received,
+                            } if received.id == event.id => {
+                                assert_ne!(Some(subscription_id.to_string()), old_subscription);
+                                successor_subscription = Some(subscription_id.to_string());
+                                successor_raw = Some(notification.clone());
+                            }
+                            RelayMessage::EndOfStoredEvents(id)
+                                if successor_subscription.as_deref() == Some(id.as_str()) =>
+                            {
+                                assert!(adapter.take_replay_status(&account).await.pending);
+                                assert!(adapter.delivery_rx.lock().await.try_recv().is_err());
+                                replay_done = true;
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                    dispatch_sdk_notification(notification, &adapter, scope, &|reason| {
+                        sdk.subscription_refusal(reason)
+                    })
+                    .await;
+                    if replay_done {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("the successor receives a raw copy despite SDK Event dedup");
+            let delivery = timeout(Duration::from_secs(5), adapter.receive())
+                .await
+                .expect("the successor releases the SDK-seen ciphertext")
+                .unwrap()
+                .unwrap();
+            assert_eq!(delivery.account_id, account);
+            let expected = NostrTransportEvent::from_nostr_event(&event)
+                .unwrap()
+                .to_transport_message()
+                .unwrap();
+            assert_eq!(delivery.message, expected);
+
+            // Once live, neither late retired notifications nor repeated raw
+            // copies may undo deduplication at the adapter admission boundary.
+            for notification in [
+                deferred_event,
+                old_raw,
+                successor_raw.expect("the successor's actual relay copy"),
+            ] {
+                dispatch_sdk_notification(notification, &adapter, scope, &|reason| {
+                    sdk.subscription_refusal(reason)
+                })
+                .await;
+            }
+            assert!(
+                timeout(Duration::from_millis(100), adapter.receive())
+                    .await
+                    .is_err(),
+                "the recovered ciphertext reaches the consumer exactly once"
+            );
+            sdk.client.shutdown().await;
+            relay.shutdown();
+        }
+    }
+
     /// A fresh explicit fetch and the SDK notification can legitimately carry
     /// the same id. Cache misses do not identify which path owns delivery.
     #[tokio::test]
@@ -9426,6 +9624,11 @@ mod tests {
                 {
                     ClientNotification::Event { .. } => {
                         panic!("failed signature verification must not emit a trusted event")
+                    }
+                    ClientNotification::Message { message, .. }
+                        if matches!(*message, RelayMessage::Event { .. }) =>
+                    {
+                        panic!("failed signature verification must not emit a raw event")
                     }
                     ClientNotification::Message { message, .. }
                         if matches!(*message, RelayMessage::EndOfStoredEvents(_)) =>

@@ -79,25 +79,37 @@ Account, endpoint-safety, and envelope validation stay outside this accounting b
 
 Initial activation, group-subscription sync, and recovery maintenance stage group deliveries through stored replay
 and any backward pages, then release each group's batch in `(created_at, event id)` order. Live arrivals during
-release queue behind that batch. Every observed relay stream must finish before release; an endpoint that sends
-nothing does not freeze available relay data, but strict account replay coverage remains incomplete until every
-required endpoint completes. This does not establish ordering across unavailable relay history.
+release queue behind that batch. Every observed active relay stream must finish before release; a silent or
+terminally refused endpoint does not freeze a completed peer. Strict account replay coverage remains incomplete
+until every required endpoint completes. This does not establish ordering across unavailable relay history.
+Already-ready routes keep their admission state across an equivalent or narrower repack; a wider request still
+stages history. Group delivery uses verified raw SDK copies, so SDK duplicate suppression cannot consume the only
+copy of ciphertext discarded by a cancelled attempt. Retired subscription copies cannot bypass admission.
+Pending copies are deduplicated per REQ, then once per group on release: retiring one request cannot erase a
+successor's copy of the same ciphertext. A fulfilled predecessor's complete range stays available during handoff.
 
-Each account's pending group ciphertext is bounded by `REPLAY_BUFFER_MAX_ITEMS` (32,000 items, the 500-event page
+Each account's pending group ciphertext is bounded by `REPLAY_BUFFER_MAX_ITEMS` (32,000 copies, the 500-event page
 limit times 64 pages) and `REPLAY_BUFFER_MAX_BYTES` (32 MiB of payload). One serialized draining batch can retain
 another batch's allowance concurrently. Pending event IDs are discarded with each batch, freeing the allowance
-for its live suffix. Delivery
-metadata and the SDK notification queue are outside the payload cap, which is not a process, wire-byte, or RSS limit.
-Overflow withholds that group's admission and coverage rather than emitting a partial newer suffix. A saturated
-one-second paging boundary withholds that route while sibling routes continue independently. Account replacement
-cancels staged and releasing work.
+for its live suffix. A separate 32,000-ID released-event window suppresses repeated raw copies. Delivery metadata,
+router-placement pins and the SDK notification queue are outside the payload cap; it is not a process, wire-byte,
+or RSS limit. Interrupted pages get one fresh request at the same boundary within the existing page bound.
+Overflow, failed paging, a saturated second, and cancellation discard the affected partial history and report its
+floor as recovery loss; they never certify it or release its newest partial page. The rest of that stored page is
+withheld, but later live input remains available. Sibling routes continue independently.
+
+`take_replay_status` transfers retained loss to the consumer's existing recovery fence and holds a read guard
+through its synchronous cursor seal. Drop the status before awaiting again. `replay_loss_notified` wakes the
+router without consuming evidence. Loss survives replacement until imported. Buffered and releasing ciphertext
+holds the cursor, but a dead relay alone does not: all-relay EOSE is a separate certificate. The router calls
+`ack_replay_delivery` only after installing its queue/spill pin or recording loss, closing the adapter-to-router gap.
 
 Timestamp sorting leaves the existing 100-generation sender-ratchet tolerance unchanged: more than 100 messages
 from one sender in the same second can still exceed it because event-id order is not sender-generation order.
 Trusted cursor floors retain their configured rewind. With no durable cursor, the app requests full retained
 history instead of substituting the recent live tail, including when the relay refuses NIP-77. Recovery maintenance
 also pages from its Welcome-anchored floor. Cursor checkpoints retain
-their previous floor while replay is incomplete or still being released to the delivery queue. Ordinary comparison
+their previous floor while replay is staged or not yet placed by the delivery router. Ordinary comparison
 acquisition is unchanged.
 
 ## Recovery maintenance sessions

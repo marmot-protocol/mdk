@@ -292,8 +292,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   leaves relays unrepaired (`EoseReissueSummary::failed_relays`) schedules itself again the same way, for the same lag
   mark.
 - Move `checkpointed_transport_timestamp` only through `AppClient::seal_transport_cursor`, never straight to
-  `state.last_transport_timestamp`. The seal runs under the lock the router places each delivery under, so it is the
-  commit's one decision point: it returns nothing while loss or a spill hand-off is pending, caps the commit at the
+  `state.last_transport_timestamp`. The seal holds adapter admission stable through the router's placement lock,
+  importing any discarded replay into the existing loss fence before deciding. It returns nothing while staged,
+  releasing or not-yet-placed replay, loss, or a spill hand-off is pending, and caps the commit at the
   lowest delivery a restart still fetches that is queued or taken and not yet released, and raises the restart floor
   before the save, so the router spills a delivery that arrives during the save and falls below it; before the
   account's first settled floor that is every older delivery. A live ingest promotes with its own save only after every
@@ -302,6 +303,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   succeeds, which ends the spilling. Every failed save undoes its seal with `abandon_transport_cursor`. Keep every
   condition cursor safety relies on inside the seal: anything read before an `.await` or a save is stale by the time
   that save commits. See `docs/marmot-architecture/further-context/account-recovery.md` section 6.
+- With no durable transport cursor, activation requests retained history rather than inventing a recent-tail floor.
+  A trusted cursor keeps its configured rewind. All-relay EOSE still gates live promotion; a silent peer alone must
+  not prevent a drain's cursor seal once available replay has reached pinned delivery or explicit recovery loss.
 - Every path that takes a delivery from the account queue calls `release_account_delivery` once its ingest returns
   `Ok`, or when it skips the delivery as already held, and before the save that follows. Never release on an ingest
   error: the key must keep capping the checkpoint that failure runs, because newest-first replay has usually remembered

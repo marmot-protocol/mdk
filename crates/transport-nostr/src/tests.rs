@@ -3172,6 +3172,396 @@ fn drain_queued_created_at(adapter: &MarmotRelayPlaneAccountAdapter) -> Vec<u64>
     queued
 }
 
+/// Replay admission, not a certificate from every configured endpoint,
+/// fences a checkpoint. An endpoint that never starts replaying must not
+/// prevent a drained available endpoint from making its cursor durable.
+#[tokio::test]
+async fn seal_ignores_silent_peer() {
+    for refused in [false, true] {
+        let relay = Arc::new(RecordingRelayClient::default());
+        let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+        let account = MemberId::new(vec![0xA1; 32]);
+        let adapter = plane.account_adapter(account.clone(), relay.clone());
+        adapter.open_transport_cursor(Some(OPENED_CURSOR));
+        let available = TransportEndpoint("wss://available.example".into());
+        let unavailable = TransportEndpoint("wss://unavailable.example".into());
+        let transport_group_id = vec![0xD3; 32];
+        adapter
+            .activate_account(TransportAccountActivation {
+                account_id: account,
+                inbox_endpoints: vec![available.clone(), unavailable.clone()],
+                group_subscriptions: vec![TransportGroupSubscription {
+                    group_id: GroupId::new(vec![0xC3; 32]),
+                    transport_group_id: transport_group_id.clone(),
+                    endpoints: vec![available.clone(), unavailable.clone()],
+                    retained_since: None,
+                }],
+                since: Some(Timestamp(OPENED_CURSOR - 1_000)),
+            })
+            .await
+            .unwrap();
+        let group_id = issued_id(&relay, |subscription| {
+            matches!(subscription, NostrSubscription::GroupBatch { .. })
+        });
+        let mut event = group_event("available-replay", &transport_group_id);
+        event.created_at = OPENED_CURSOR + 500;
+        event.id = event.computed_id();
+        let copy = NostrRelayEvent {
+            endpoint: available.clone(),
+            subscription_id: Some(group_id),
+            event,
+        };
+        plane
+            .inner
+            .transport
+            .adapter
+            .observe_relay_event(&copy)
+            .await;
+        plane.handle_relay_event_for_test(copy).await.unwrap();
+        let candidate = Some(OPENED_CURSOR + 2_000);
+        assert_eq!(adapter.seal_transport_cursor(candidate), None);
+        assert!(adapter.try_receive_account_delivery().is_none());
+
+        let issued = relay.subscriptions.lock().unwrap().clone();
+        for subscription in issued {
+            let id = subscription.subscription_id();
+            if refused {
+                plane
+                    .handle_relay_closed_for_test(
+                        unavailable.clone(),
+                        id.clone(),
+                        transport_nostr_adapter::SubscriptionRefusal {
+                            category: None,
+                            disposition:
+                                transport_nostr_adapter::SubscriptionRefusalDisposition::Dropped,
+                        },
+                    )
+                    .await;
+            }
+            plane
+                .handle_relay_eose_for_test(available.clone(), id)
+                .await;
+        }
+        let Some(AccountDeliveryReceive::Delivery(delivery)) =
+            timeout(Duration::from_secs(1), adapter.receive_account_delivery())
+                .await
+                .expect("the available endpoint's replay is admitted")
+                .unwrap()
+        else {
+            panic!("replay admission must preserve the delivery");
+        };
+        adapter.release_account_delivery(&delivery.message.id);
+        assert!(!adapter.account_subscription_eose().await.complete());
+        timeout(Duration::from_secs(1), async {
+            while adapter.seal_transport_cursor(candidate) != candidate {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an unavailable peer alone must not fence a drained cursor");
+        assert!(adapter.pending_delivery_overflow().is_none());
+        plane.shutdown().await;
+    }
+}
+
+/// A completed replay can be queued in the adapter while the plane router is
+/// paused. The admission fence must cover that queue until the actual router
+/// installs a cursor pin, not merely until the replay flusher finishes.
+#[tokio::test]
+async fn replay_handoff_fences_cursor() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let adapter = plane.account_adapter(account.clone(), relay.clone());
+    adapter.open_transport_cursor(Some(OPENED_CURSOR));
+    let router = plane.inner.transport.router.lock().await.take().unwrap();
+    router.abort();
+    let _ = router.await;
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let transport_group_id = vec![0xD3; 32];
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: GroupId::new(vec![0xC3; 32]),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+                retained_since: None,
+            }],
+            since: Some(Timestamp(OPENED_CURSOR - 1_000)),
+        })
+        .await
+        .unwrap();
+    let group_id = issued_id(&relay, |subscription| {
+        matches!(subscription, NostrSubscription::GroupBatch { .. })
+    });
+    let created_at = OPENED_CURSOR + 500;
+    let mut event = group_event("replay-router-handoff", &transport_group_id);
+    event.created_at = created_at;
+    event.id = event.computed_id();
+    plane
+        .handle_relay_event_for_test(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some(group_id),
+            event,
+        })
+        .await
+        .unwrap();
+    let issued = relay.subscriptions.lock().unwrap().clone();
+    for subscription in issued {
+        plane
+            .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+            .await;
+    }
+    timeout(Duration::from_secs(1), async {
+        while !plane
+            .inner
+            .transport
+            .adapter
+            .account_subscription_eose(&account)
+            .await
+            .complete()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the replay flusher finishes while the plane router is paused");
+    assert!(adapter.try_receive_account_delivery().is_none());
+    let candidate = Some(OPENED_CURSOR + 2_000);
+    assert_eq!(
+        adapter.seal_transport_cursor(candidate),
+        None,
+        "the adapter's queued replay is not pinned by the plane yet"
+    );
+
+    plane.spawn_router();
+    let Some(AccountDeliveryReceive::Delivery(delivery)) =
+        timeout(Duration::from_secs(1), adapter.receive_account_delivery())
+            .await
+            .expect("the resumed router installs the account delivery pin")
+            .unwrap()
+    else {
+        panic!("the replay survives the handoff");
+    };
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(sealed) = adapter.seal_transport_cursor(candidate) {
+                assert_eq!(sealed, created_at + CURSOR_LOOKBACK);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("router acknowledgment transfers the fence to the delivery pin");
+    adapter.release_account_delivery(&delivery.message.id);
+    assert_eq!(adapter.seal_transport_cursor(candidate), candidate);
+    assert!(adapter.pending_delivery_overflow().is_none());
+    plane.shutdown().await;
+}
+
+/// Replacing an activation can discard ciphertext before its EOSE. The next
+/// activation's complete coverage does not discharge that earlier loss, even
+/// when the router has not yet consumed the coalesced loss notification.
+#[tokio::test]
+async fn seal_imports_replay_loss() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let account = MemberId::new(vec![0xA1; 32]);
+    let adapter = plane.account_adapter(account.clone(), relay.clone());
+    adapter.open_transport_cursor(Some(OPENED_CURSOR));
+    let router = plane.inner.transport.router.lock().await.take().unwrap();
+    router.abort();
+    let _ = router.await;
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    let transport_group_id = vec![0xD3; 32];
+    let floor = OPENED_CURSOR - 1_000;
+    let activation = TransportAccountActivation {
+        account_id: account.clone(),
+        inbox_endpoints: vec![endpoint.clone()],
+        group_subscriptions: vec![TransportGroupSubscription {
+            group_id: GroupId::new(vec![0xC3; 32]),
+            transport_group_id: transport_group_id.clone(),
+            endpoints: vec![endpoint.clone()],
+            retained_since: None,
+        }],
+        since: Some(Timestamp(floor)),
+    };
+    adapter.activate_account(activation.clone()).await.unwrap();
+    let group_id = issued_id(&relay, |subscription| {
+        matches!(subscription, NostrSubscription::GroupBatch { .. })
+    });
+    plane
+        .handle_relay_event_for_test(NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some(group_id),
+            event: group_event("discarded-before-eose", &transport_group_id),
+        })
+        .await
+        .unwrap();
+    assert!(adapter.try_receive_account_delivery().is_none());
+    assert!(adapter.pending_delivery_overflow().is_none());
+    let first_issued = relay.subscriptions.lock().unwrap().len();
+    adapter.activate_account(activation).await.unwrap();
+    let replacement = relay.subscriptions.lock().unwrap()[first_issued..].to_vec();
+    assert!(!replacement.is_empty());
+    for subscription in replacement {
+        plane
+            .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+            .await;
+    }
+    assert!(
+        plane
+            .inner
+            .transport
+            .adapter
+            .account_subscription_eose(&account)
+            .await
+            .complete(),
+        "the replacement itself has no remaining replay"
+    );
+    assert!(adapter.pending_delivery_overflow().is_none());
+    assert_eq!(
+        adapter.seal_transport_cursor(Some(OPENED_CURSOR + 2_000)),
+        None
+    );
+    let loss = adapter
+        .pending_delivery_overflow()
+        .expect("seal imports the discard");
+    assert_eq!(loss.dropped, 0);
+    assert_eq!(loss.notification_losses, 1);
+    assert!(
+        loss.notification_floor.is_some_and(|since| since <= floor),
+        "discard recovery must start no later than the staged group's REQ"
+    );
+    assert!(adapter.delivery_loss_blocks_cursor());
+    assert_eq!(
+        adapter
+            .unpersisted_notification_loss()
+            .unwrap()
+            .notification_token,
+        loss.notification_token
+    );
+    let Some(AccountDeliveryReceive::Overflow(signal)) = adapter.try_receive_account_delivery()
+    else {
+        panic!("the worker must receive the existing recovery control record");
+    };
+    assert_eq!(signal.notification_token, loss.notification_token);
+    assert_eq!(
+        adapter.seal_transport_cursor(Some(OPENED_CURSOR + 3_000)),
+        None
+    );
+    assert_eq!(
+        adapter.notification_losses_for_test(),
+        1,
+        "loss imports once"
+    );
+    let health = plane
+        .inner
+        .transport
+        .notification_forwarder_health
+        .snapshot();
+    assert_eq!(health.lag_incidents, 0);
+    assert_eq!(health.lagged_notifications, 0);
+    assert_eq!(health.restarts, 0);
+    assert!(
+        plane
+            .inner
+            .transport
+            .eose_repairs
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    plane.shutdown().await;
+}
+
+/// Notify permits coalesce, but the adapter retains loss for every account.
+/// A router that starts after both losses must drain both without a cursor
+/// seal, so idle accounts still persist their recovery obligation.
+#[tokio::test]
+async fn replay_loss_wakes_accounts() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let accounts = [MemberId::new(vec![0xA1; 32]), MemberId::new(vec![0xB2; 32])];
+    let adapters = accounts
+        .iter()
+        .map(|account| plane.account_adapter(account.clone(), relay.clone()))
+        .collect::<Vec<_>>();
+    let router = plane.inner.transport.router.lock().await.take().unwrap();
+    router.abort();
+    let _ = router.await;
+    let endpoint = TransportEndpoint("wss://relay.example".into());
+    for (index, (account, adapter)) in accounts.iter().zip(&adapters).enumerate() {
+        let transport_group_id = vec![0xD3 + index as u8; 32];
+        let activation = TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoint.clone()],
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: GroupId::new(vec![0xC3 + index as u8; 32]),
+                transport_group_id: transport_group_id.clone(),
+                endpoints: vec![endpoint.clone()],
+                retained_since: None,
+            }],
+            since: Some(Timestamp(OPENED_CURSOR - 1_000 - index as u64)),
+        };
+        adapter.activate_account(activation.clone()).await.unwrap();
+        let group_id = issued_id(&relay, |subscription| {
+            subscription.account_id() == account
+                && matches!(subscription, NostrSubscription::GroupBatch { .. })
+        });
+        plane
+            .handle_relay_event_for_test(NostrRelayEvent {
+                endpoint: endpoint.clone(),
+                subscription_id: Some(group_id),
+                event: group_event("discarded-coalesced", &transport_group_id),
+            })
+            .await
+            .unwrap();
+        adapter.activate_account(activation).await.unwrap();
+        assert!(adapter.pending_delivery_overflow().is_none());
+    }
+    plane.spawn_router();
+    for (index, adapter) in adapters.iter().enumerate() {
+        let Some(AccountDeliveryReceive::Overflow(loss)) =
+            timeout(Duration::from_secs(1), adapter.receive_account_delivery())
+                .await
+                .expect("one coalesced wake imports all registered accounts")
+                .unwrap()
+        else {
+            panic!("replay loss reaches the worker without a cursor seal");
+        };
+        assert_eq!(loss.notification_losses, 1);
+        assert!(
+            loss.notification_floor
+                .is_some_and(|since| since <= OPENED_CURSOR - 1_000 - index as u64)
+        );
+        assert!(adapter.unpersisted_notification_loss().is_some());
+        assert!(adapter.delivery_loss_blocks_cursor());
+        assert!(adapter.try_receive_account_delivery().is_none());
+    }
+    let health = plane
+        .inner
+        .transport
+        .notification_forwarder_health
+        .snapshot();
+    assert_eq!(health.lag_incidents, 0);
+    assert_eq!(health.lagged_notifications, 0);
+    assert_eq!(health.restarts, 0);
+    assert!(
+        plane
+            .inner
+            .transport
+            .eose_repairs
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    plane.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cursor_seal_stops_where_a_restart_still_fetches_every_queued_delivery() {
     let (store, kept) = recording_spill_store();
@@ -4618,29 +5008,10 @@ fn group_event(id_prefix: &str, transport_group_id: &[u8]) -> NostrTransportEven
     event
 }
 
-fn relay_pool_group_notification(
-    id_prefix: &str,
-    transport_group_id: &[u8],
-) -> RelayPoolNotification {
-    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
-
-    let signed = EventBuilder::new(
-        Kind::MlsGroupMessage,
-        format!("encrypted recovery {id_prefix}"),
-    )
-    .tags([Tag::custom("h", [hex::encode(transport_group_id)])])
-    .custom_created_at(NostrTimestamp::from_secs(1_700_000_001))
-    .finalize(&Keys::generate())
-    .expect("sign test group event");
-    RelayPoolNotification::Event {
-        relay_url: RelayUrl::parse("wss://relay.example").unwrap(),
-        subscription_id: SubscriptionId::new("group-sub"),
-        event: Box::new(signed),
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervised_notification_lag_delivers_later_inbound_exactly_once() {
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
+
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
     let account = MemberId::new(vec![0xA1; 32]);
@@ -4710,18 +5081,48 @@ async fn supervised_notification_lag_delivers_later_inbound_exactly_once() {
         .await
         .expect("outbound publishing remains available after a lag");
 
-    let later = relay_pool_group_notification("after-lag", &transport_group_id);
-    let expected_message_id = match &later {
-        RelayPoolNotification::Event { event, .. } => {
-            NostrTransportEvent::from_nostr_event(event)
-                .unwrap()
-                .to_transport_message()
-                .unwrap()
-                .id
+    let group_subscription = issued_id(&relay, |subscription| {
+        matches!(subscription, NostrSubscription::GroupBatch { .. })
+    });
+    let later = EventBuilder::new(Kind::MlsGroupMessage, "encrypted recovery after-lag")
+        .tags([Tag::custom("h", [hex::encode(&transport_group_id)])])
+        .custom_created_at(NostrTimestamp::from_secs(1_700_000_001))
+        .finalize(&Keys::generate())
+        .unwrap();
+    let expected_message_id = NostrTransportEvent::from_nostr_event(&later)
+        .unwrap()
+        .to_transport_message()
+        .unwrap()
+        .id;
+    source.send(RelayPoolNotification::Message {
+        relay_url: RelayUrl::parse("wss://relay.example").unwrap(),
+        message: Box::new(RelayMessage::Event {
+            subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(&group_subscription)),
+            event: std::borrow::Cow::Owned(later),
+        }),
+    });
+    // This source has one slot to reproduce the original lag. Let the raw
+    // event reach staging before sending EOSE instead of causing a second lag.
+    timeout(Duration::from_secs(1), async {
+        while !relay_plane
+            .inner
+            .transport
+            .adapter
+            .take_replay_status(&account)
+            .await
+            .pending
+        {
+            tokio::task::yield_now().await;
         }
-        _ => unreachable!(),
-    };
-    source.send(later);
+    })
+    .await
+    .expect("the resumed consumer stages the exact later ciphertext");
+    source.send(RelayPoolNotification::Message {
+        relay_url: RelayUrl::parse("wss://relay.example").unwrap(),
+        message: Box::new(RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
+            SubscriptionId::new(group_subscription),
+        ))),
+    });
     let first_delivery = timeout(Duration::from_secs(1), adapter.receive())
         .await
         .expect("the resumed consumer should deliver later inbound")

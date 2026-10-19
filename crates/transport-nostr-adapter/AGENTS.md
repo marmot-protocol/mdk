@@ -66,7 +66,7 @@ for reconnect/backoff and relay status mechanics.
   - A failed or cancelled group sync closes the REQs its batch installed once its subscribe tasks settle, except ids
     the committed routes still want (`close_abandoned_sync_batch`). Its guard holds the lifecycle lock throughout.
 - Never count a replay a relay may have clamped as coverage (#2263):
-  - `observe_relay_event` counts each relay's stored events per activation REQ until that relay's EOSE, before
+  - `observe_relay_event` counts each relay's stored events per activation, sync or maintenance REQ until that relay's EOSE, before
     mapping them. Consumers must pass a relay's copies in order with its EOSE, and report events that fail
     `from_nostr_event` through `observe_unconvertible_relay_event` instead of dropping them.
   - A relay that sent `RELAY_REPLAY_PAGE_LIMIT` or more moves to `RelayReplay::Paging`, which is neither complete nor
@@ -74,6 +74,18 @@ for reconnect/backoff and relay status mechanics.
     only then does that relay's EOSE count.
   - A failed, unsupported or over-long paging stays incomplete for the next activation and recovery. So does a full page that
     cannot move past its oldest second, because that second may hide more events and everything older.
+- Stage each group's complete replay range before timestamp/id-ordered release, including backward pages. Keep live
+  arrivals behind the draining batch. Preserve ready route floors across equivalent/narrower repacks, not wider requests.
+  Verified raw SDK group copies feed admission; deduplicated `Event` copies must not bypass it, and retired REQs must
+  never admit late copies. SDK seen-state is not account admission.
+- Bound pending replay by `REPLAY_BUFFER_MAX_ITEMS` and `REPLAY_BUFFER_MAX_BYTES`, with one additional draining batch;
+  keep released raw-copy dedup bounded by the item allowance. Retry one interrupted page at the same boundary within
+  the page bound. Discard partial cancelled, saturated or failed history instead of releasing its newer suffix, and
+  retain its floor as loss until `take_replay_status` imports it. Later live input must not stay permanently stalled.
+  Silence or a terminal refusal alone must not stall a completed peer or turn incomplete coverage into a certificate.
+- Keep admission and all-relay EOSE separate. `take_replay_status` holds a read guard through a synchronous cursor seal;
+  import its loss before another await, then drop it. Notify only wakes the router; it never consumes evidence.
+  `ack_replay_delivery` follows actual pinned queue/spill placement or recorded loss, never merely adapter enqueue.
 - Record each REQ's filter `since` in its SDK account context before the REQ goes out, find it by subscription id
   when the REQ closes, and keep a closed REQ's floor for the rest of the context's life: routing is content-keyed,
   and a closed REQ's buffered or in-flight notifications have no deadline, so they can still be lost in a lag. Do

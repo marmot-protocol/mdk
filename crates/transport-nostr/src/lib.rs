@@ -305,8 +305,8 @@ pub struct AccountDeliveryOverflow {
     pub earliest_dropped: Option<u64>,
     pub notification_losses: u64,
     pub notification_token: u64,
-    /// Lowest REQ `since` floor among this generation's notification lags, or
-    /// `None` when any lag's floor is unknown.
+    /// Lowest REQ `since` floor among this generation's notification or replay
+    /// losses, or `None` when any loss's floor is unknown.
     pub notification_floor: Option<u64>,
     pub queue_depth: usize,
     pub elapsed_ms: u64,
@@ -384,8 +384,8 @@ struct AccountDeliveryOverflowInner {
     /// whether any dropped delivery's time was unknown.
     earliest_dropped: Option<u64>,
     earliest_dropped_unknown: bool,
-    /// Running minimum of the notification lags' REQ floors, and whether any
-    /// lag's floor was unknown.
+    /// Running minimum of notification and replay losses' REQ floors, and
+    /// whether any loss's floor was unknown.
     notification_floor: Option<u64>,
     notification_floor_unknown: bool,
     /// What the account queue holds, and the restart floors a cursor commit
@@ -470,8 +470,8 @@ fn account_delivery_restart_key(delivery: &TransportDelivery) -> u64 {
 enum AccountDeliveryLossCharge {
     /// A delivery the queue omitted, with its wire `created_at` if known.
     Drop { created_at: Option<u64> },
-    /// A consumer lag, bounded by the REQ floors that could have delivered
-    /// the lost notifications.
+    /// A notification or staged-replay loss, bounded by the REQ floors that
+    /// could have delivered the lost history.
     Notification { floor: NostrNotificationLossFloor },
 }
 
@@ -731,7 +731,7 @@ impl AccountDeliveryOverflowState {
         self.record_loss(queue_depth, AccountDeliveryLossCharge::Drop { created_at })
     }
 
-    /// Record a consumer lag with the REQ floor read at the lag, returning the
+    /// Record notification or replay loss with its REQ floor, returning the
     /// generation only when this caller must enqueue its control record.
     fn record_notification_loss(&self, floor: NostrNotificationLossFloor) -> Option<u64> {
         self.record_loss(0, AccountDeliveryLossCharge::Notification { floor })
@@ -758,7 +758,7 @@ impl AccountDeliveryOverflowState {
         match charge {
             AccountDeliveryLossCharge::Notification { floor } => {
                 state.notification_losses = state.notification_losses.saturating_add(1);
-                // Each lag mints a token, so a changed floor always imports as
+                // Each loss mints a token, so a changed floor always imports as
                 // new loss and bumps the obligation's revision.
                 state.notification_token = rand::rngs::OsRng.next_u64() & i64::MAX as u64;
                 match floor.since_seconds() {
@@ -2304,8 +2304,34 @@ impl MarmotRelayPlane {
         let transport = self.inner.transport.clone();
         let adapter = transport.adapter.clone();
         let handle = handle.spawn(async move {
-            while let Ok(Some(delivery)) = adapter.receive().await {
-                route_account_delivery(&transport, delivery);
+            loop {
+                tokio::select! {
+                    delivery = adapter.receive() => match delivery {
+                        Ok(Some(delivery)) => {
+                            let account_id = delivery.account_id.clone();
+                            let message_id = delivery.message.id.clone();
+                            // Install the queue/spill pin or charge loss before
+                            // releasing the staged replay's admission fence.
+                            route_account_delivery(&transport, delivery);
+                            adapter.ack_replay_delivery(&account_id, &message_id).await;
+                        }
+                        Ok(None) | Err(_) => break,
+                    },
+                    () = adapter.replay_loss_notified() => {
+                        let account_ids = account_deliveries_read(&transport.account_deliveries)
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for account_id in account_ids {
+                            let status = adapter.take_replay_status(&account_id).await;
+                            if let Some(loss) = status.loss {
+                                // Taking the status consumes the adapter's
+                                // evidence: import it before another await.
+                                import_replay_loss(&transport, &account_id, loss);
+                            }
+                        }
+                    }
+                }
             }
         });
         *router = Some(handle);
@@ -3135,15 +3161,7 @@ fn recover_relay_notification_forwarder_scoped(
                 if account_id.is_some_and(|account_id| account_id != route_account_id) {
                     continue;
                 }
-                // A queued or deferred control record already carries this
-                // generation, and the worker persists the lag without one.
-                if let Some(generation) = route.overflow.record_notification_loss(floor) {
-                    enqueue_account_delivery_overflow_signal(
-                        &route.sender,
-                        &route.overflow,
-                        generation,
-                    );
-                }
+                record_account_loss(&route.overflow, Some(&route.sender), floor);
             }
             drop(routes);
             // The lag may also have lost end-of-stored-events. It cannot tell
@@ -3847,15 +3865,20 @@ impl MarmotRelayPlaneAccountAdapter {
     pub fn seal_transport_cursor(&self, candidate: Option<u64>) -> Option<u64> {
         // Staged replay is not under the router's placement lock yet. A
         // synchronous checkpoint must not pass it. Contention conservatively
-        // defers the cursor; never block an account worker to read coverage.
+        // defers the cursor; never block an account worker to read admission.
         let replay = self
             .relay_plane
             .inner
             .transport
             .adapter
-            .account_subscription_eose(&self.account_id)
+            .take_replay_status(&self.account_id)
             .now_or_never()?;
-        if !replay.complete() {
+        if let Some(loss) = replay.loss {
+            import_replay_loss(&self.relay_plane.inner.transport, &self.account_id, loss);
+        }
+        // A quiet or refused peer with no staged ciphertext is not an
+        // admission fence. Exhaustive relay coverage is a separate signal.
+        if replay.pending {
             return None;
         }
         self.delivery_overflow.seal_cursor(
@@ -4365,6 +4388,47 @@ fn persist_retired_queue_loss(
     if overflow.start_marker_persistence() {
         let overflow = overflow.clone();
         tokio::spawn(async move { overflow.persist_marker_before_drop(marker).await });
+    }
+}
+
+/// Charge replay loss to the account's process-lifetime fence, even if its
+/// route was retired while the adapter status was being awaited.
+fn import_replay_loss(
+    transport: &RelayPlaneTransport,
+    account_id: &MemberId,
+    floor: NostrNotificationLossFloor,
+) {
+    let routes = account_deliveries_read(&transport.account_deliveries);
+    if let Some(route) = routes.get(account_id) {
+        record_account_loss(&route.overflow, Some(&route.sender), floor);
+    } else if let Some(overflow) = transport
+        .account_overflow_states
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(account_id)
+    {
+        record_account_loss(overflow, None, floor);
+    }
+}
+
+fn record_account_loss(
+    overflow: &AccountDeliveryOverflowState,
+    sender: Option<&mpsc::Sender<AccountDeliveryEvent>>,
+    floor: NostrNotificationLossFloor,
+) {
+    // A queued or deferred control record already carries this generation;
+    // the worker imports subsequent losses from the same pending snapshot.
+    if let Some(generation) = overflow.record_notification_loss(floor)
+        && let Some(sender) = sender
+    {
+        enqueue_account_delivery_overflow_signal(sender, overflow, generation);
+    }
+    if sender.is_none_or(mpsc::Sender::is_closed) {
+        overflow
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retired_loss_unsignalled = true;
     }
 }
 

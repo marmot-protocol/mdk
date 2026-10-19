@@ -13131,6 +13131,30 @@ fn replay_fences_cursor_on_save() {
                 .complete()
         );
 
+        let id = fixture
+            .relay
+            .accepted_subscriptions()
+            .iter()
+            .rev()
+            .find(|subscription| {
+                matches!(
+                    subscription,
+                    NostrSubscription::Group { .. } | NostrSubscription::GroupBatch { .. }
+                )
+            })
+            .expect("the fresh activation issued the group's REQ")
+            .subscription_id();
+        fixture
+            .app
+            .relay_plane
+            .handle_relay_event_for_test(NostrRelayEvent {
+                endpoint: TransportEndpoint("wss://relay.example".into()),
+                subscription_id: Some(id),
+                event: fixture.probe(fixture.cursor_before + 1_000, "held ciphertext"),
+            })
+            .await
+            .unwrap();
+
         // An independent inbox delivery may have advanced the in-memory
         // candidate while group ciphertext is still held outside the router.
         fixture.client.state.last_transport_timestamp = Some(fixture.cursor_before + 4_000);
@@ -13159,6 +13183,7 @@ fn replay_fences_cursor_on_save() {
 pub(crate) struct LiveCursorFixture {
     pub(crate) app: MarmotApp,
     pub(crate) client: crate::AppClient,
+    relay: Arc<ScriptedPushRelayClient>,
     account_id: MemberId,
     nostr_group_id_hex: String,
     pub(crate) cursor_before: u64,
@@ -13212,7 +13237,7 @@ impl LiveCursorFixture {
             seeded.last_transport_timestamp = Some(cursor_before);
             app.save_state(&seeded).unwrap();
         }
-        let eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+        let eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client.create_group("live cursor", &[]).await.unwrap();
         let nostr_group_id_hex = app
@@ -13231,6 +13256,7 @@ impl LiveCursorFixture {
         Self {
             app,
             client,
+            relay,
             account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
             nostr_group_id_hex,
             cursor_before,
@@ -13293,6 +13319,7 @@ impl LiveCursorFixture {
         let Self {
             app,
             client,
+            relay,
             account_id,
             nostr_group_id_hex,
             cursor_before,
@@ -13304,6 +13331,7 @@ impl LiveCursorFixture {
         Self {
             app,
             client,
+            relay,
             account_id,
             nostr_group_id_hex,
             cursor_before,
@@ -17783,9 +17811,8 @@ async fn an_admin_removal_clears_the_removed_devices_group_routes() {
 /// rebuild seeded its subscriptions back and handed them straight to the adapter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn key_package_publication_never_issues_a_full_history_subscription() {
-    // An unfloored activation replays every held event on every route and
-    // leaves a notification lag's loss unbounded. Publishing or rotating a
-    // KeyPackage reuses the live activation, or rebuilds it from the cursor.
+    // Publishing or rotating a KeyPackage must reuse the live activation or
+    // rebuild it from an established durable cursor, never widen its floor.
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -17793,6 +17820,10 @@ async fn key_package_publication_never_issues_a_full_history_subscription() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
+    app.ensure_account_state("alice").unwrap();
+    let mut seeded = app.load_state("alice").unwrap();
+    seeded.last_transport_timestamp = Some(crate::unix_now_seconds());
+    app.save_state(&seeded).unwrap();
     let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     client.create_group("floored", &[]).await.unwrap();
