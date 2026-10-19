@@ -70,6 +70,7 @@ impl SqliteAppStorage {
     /// lowest event id. Pack metadata and items change in one transaction so a
     /// reader never observes a half-replaced pack.
     pub fn replace_sticker_pack_if_newer(&self, pack: &StoredStickerPack) -> StorageResult<bool> {
+        require_canonical_event_id(&pack.version)?;
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             // Immutable message refs are (coordinate, shortcode, hash). Record
@@ -408,8 +409,20 @@ impl SqliteAppStorage {
             let conn = self.lock()?;
             let replaced = replace_installed_sticker_packs_tx(&conn, version, packs)?;
             if replaced {
-                conn.execute("DELETE FROM app_sticker_install_operations", [])
-                    .storage()?;
+                // Clear only the intent this list carries: an install whose
+                // pack it contains, or an uninstall whose pack it omits. Any
+                // other operation stays pending for the next publication.
+                let committed = packs.iter().collect::<HashSet<_>>();
+                for operation in sticker_install_operations_tx(&conn)? {
+                    if operation.installed == committed.contains(&operation.pack_coordinate) {
+                        conn.execute(
+                            "DELETE FROM app_sticker_install_operations
+                             WHERE pack_coordinate = ?1",
+                            params![&operation.pack_coordinate],
+                        )
+                        .storage()?;
+                    }
+                }
             }
             Ok(replaced)
         })
@@ -732,6 +745,25 @@ fn protected_sticker_coordinates_tx(conn: &Connection) -> StorageResult<HashSet<
     Ok(protected)
 }
 
+/// Replacement ordering needs a real NIP-01 event id. The empty id marks a
+/// placeholder parent row and reads as "no stored version", so a version
+/// carrying it could win a tie and then disable ordering for every later
+/// event. Reject it, and any non-canonical id, before writing.
+fn require_canonical_event_id(version: &StoredStickerPackVersion) -> StorageResult<()> {
+    let id = version.event_id_hex.as_bytes();
+    if id.len() == 64
+        && id
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        Ok(())
+    } else {
+        Err(StorageError::Backend(
+            "sticker event id must be 64 lowercase hex characters".to_owned(),
+        ))
+    }
+}
+
 fn replacement_wins(
     existing: Option<&StoredStickerPackVersion>,
     incoming: &StoredStickerPackVersion,
@@ -894,6 +926,7 @@ fn replace_installed_sticker_packs_tx(
     version: &StoredStickerPackVersion,
     packs: &[String],
 ) -> StorageResult<bool> {
+    require_canonical_event_id(version)?;
     let existing = installed_sticker_state_tx(conn)?.version;
     if !replacement_wins(existing.as_ref(), version) {
         return Ok(false);
@@ -1052,10 +1085,103 @@ mod tests {
             extra.identifier = format!("pack-{index}");
             assert!(store.replace_sticker_pack_if_newer(&extra).unwrap());
         }
+        // The oldest uninstalled pack is protected only by a retained message;
+        // the next one's only reference was deleted, which releases it.
+        let referenced = format!("30031:{}:pack-2", "bb".repeat(32));
+        let withdrawn = format!("30031:{}:pack-3", "bb".repeat(32));
+        record_sticker_message(&store, "kept", &referenced, false);
+        record_sticker_message(&store, "gone", &withdrawn, true);
+
         let removed = store.prune_uninstalled_sticker_discovery(2, "").unwrap();
         assert_eq!(removed, 3);
         assert!(store.sticker_pack(&installed.coordinate).unwrap().is_some());
+        assert!(
+            store.sticker_pack(&referenced).unwrap().is_some(),
+            "a pack a retained message references must survive prune"
+        );
+        assert!(store.sticker_pack(&withdrawn).unwrap().is_none());
         assert_eq!(store.sticker_packs(false, None, 20).unwrap().len(), 2);
+    }
+
+    fn record_sticker_message(
+        store: &SqliteAppStorage,
+        message_id: &str,
+        coordinate: &str,
+        deleted: bool,
+    ) {
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO message_timeline (
+                    group_id_hex, message_id_hex, direction, sender, plaintext, kind,
+                    tags_json, timeline_at, received_at, reactions_json, deleted
+                 ) VALUES ('group', ?1, 'received', 'alice', '', 9, ?2, 1, 1, '{}', ?3)",
+                rusqlite::params![
+                    message_id,
+                    serde_json::to_string(&vec![vec![
+                        "sticker",
+                        coordinate,
+                        "wave",
+                        "aa".repeat(32).as_str(),
+                    ]])
+                    .unwrap(),
+                    i64::from(deleted),
+                ],
+            )
+            .unwrap();
+    }
+
+    /// An empty id is the placeholder-parent sentinel; accepting it as a real
+    /// version would win a timestamp tie and then read as "no version", letting
+    /// any later event replace the pack.
+    #[test]
+    fn non_canonical_event_ids_never_become_the_current_version() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let current = pack(&"cc".repeat(32), 10, &"11".repeat(32));
+        assert!(store.replace_sticker_pack_if_newer(&current).unwrap());
+        for bad in ["", "CC", &"CC".repeat(32), &"zz".repeat(32)] {
+            assert!(
+                store
+                    .replace_sticker_pack_if_newer(&pack(bad, 10, &"22".repeat(32)))
+                    .is_err(),
+                "pack event id {bad:?} must be rejected"
+            );
+        }
+        let stored = store.sticker_pack(&current.coordinate).unwrap().unwrap();
+        assert_eq!(stored.version, current.version);
+        let older = pack(&"00".repeat(32), 9, &"33".repeat(32));
+        assert!(
+            !store.replace_sticker_pack_if_newer(&older).unwrap(),
+            "ordering still holds after the rejected writes"
+        );
+
+        let list = StoredStickerPackVersion {
+            event_id_hex: "cc".repeat(32),
+            created_at: 10,
+        };
+        assert!(
+            store
+                .replace_installed_sticker_packs_if_newer(&list, &["pack-a".to_owned()])
+                .unwrap()
+        );
+        let empty = StoredStickerPackVersion {
+            event_id_hex: String::new(),
+            created_at: 10,
+        };
+        assert!(
+            store
+                .replace_installed_sticker_packs_if_newer(&empty, &[])
+                .is_err()
+        );
+        assert!(
+            store
+                .commit_installed_sticker_publication(&empty, &[])
+                .is_err()
+        );
+        let state = store.installed_sticker_state().unwrap();
+        assert_eq!(state.version, Some(list));
+        assert_eq!(state.packs, vec!["pack-a".to_owned()]);
     }
 
     #[test]
@@ -1334,6 +1460,61 @@ mod tests {
             vec!["pack-c".to_owned(), "pack-b".to_owned()]
         );
         assert_eq!(store.sticker_install_operations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn winning_commit_clears_only_the_operations_its_list_represents() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        store
+            .replace_installed_sticker_packs_if_newer(
+                &StoredStickerPackVersion {
+                    event_id_hex: "cc".repeat(32),
+                    created_at: 5,
+                },
+                &["pack-d".to_owned()],
+            )
+            .unwrap();
+        // Represented by the committed list [pack-a]: install a, uninstall c.
+        store
+            .enqueue_sticker_install_operation("pack-a", true, 6)
+            .unwrap();
+        store
+            .enqueue_sticker_install_operation("pack-c", false, 6)
+            .unwrap();
+        // Not represented: install b is missing, uninstall d is contradicted.
+        store
+            .enqueue_sticker_install_operation("pack-b", true, 7)
+            .unwrap();
+        store
+            .enqueue_sticker_install_operation("pack-d", false, 7)
+            .unwrap();
+
+        assert!(
+            store
+                .commit_installed_sticker_publication(
+                    &StoredStickerPackVersion {
+                        event_id_hex: "dd".repeat(32),
+                        created_at: 8,
+                    },
+                    &["pack-a".to_owned(), "pack-d".to_owned()],
+                )
+                .unwrap()
+        );
+
+        let pending = store
+            .sticker_install_operations()
+            .unwrap()
+            .into_iter()
+            .map(|operation| (operation.pack_coordinate, operation.installed))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pending,
+            vec![("pack-b".to_owned(), true), ("pack-d".to_owned(), false)]
+        );
+        assert_eq!(
+            store.desired_installed_sticker_packs().unwrap(),
+            vec!["pack-a".to_owned(), "pack-b".to_owned()]
+        );
     }
 
     #[test]

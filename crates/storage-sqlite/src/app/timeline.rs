@@ -306,6 +306,8 @@ pub struct TimelineReplyPreview {
     pub sender: String,
     pub plaintext: String,
     pub kind: u64,
+    /// Absent in previews serialized before tags were carried.
+    #[serde(default)]
     pub tags: Vec<Vec<String>>,
     /// Source epoch of the previewed (reply target) message, carried so callers
     /// can resolve its `imeta` media into downloadable attachment references.

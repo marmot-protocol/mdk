@@ -1376,6 +1376,75 @@ mod tests {
         tx.commit().unwrap();
     }
 
+    /// 0117 adds a nullable chat-list tag column next to populated rows and
+    /// creates the sticker tables; 0118 backfills exact-hash history from the
+    /// stickers already stored. Neither may disturb existing chat rows.
+    #[test]
+    fn sticker_migrations_upgrade_populated_schema() {
+        let through = |version: i64| {
+            MIGRATIONS
+                .iter()
+                .position(|migration| migration.version == version)
+                .unwrap()
+                + 1
+        };
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..through(116)]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO account_groups(group_id_hex, endpoint, updated_at)
+                VALUES ('aa', 'fixture', 1);
+             INSERT INTO chat_list_rows(
+                group_id_hex, updated_at, last_message_id_hex,
+                last_message_preview, last_message_timeline_at
+             ) VALUES ('aa', 1, 'message', 'hello', 1);",
+        )
+        .unwrap();
+
+        run(&mut conn, &MIGRATIONS[..through(117)]).unwrap();
+        let (preview, tags): (String, Option<String>) = conn
+            .query_row(
+                "SELECT last_message_preview, last_message_tags_json
+                 FROM visible_chat_list_rows WHERE group_id_hex = 'aa'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(preview, "hello");
+        assert_eq!(tags, None, "an existing preview has no tags until rebuilt");
+        conn.execute_batch(
+            "INSERT INTO app_sticker_packs(
+                coordinate, author_pubkey_hex, identifier, event_id_hex, created_at, title
+             ) VALUES ('pack', 'ab', 'cats', 'ee', 1, 'Cats');
+             INSERT INTO app_stickers(
+                pack_coordinate, shortcode, url, sha256, mime, position
+             ) VALUES ('pack', 'wave', 'https://cdn.example/h', 'hash', 'image/webp', 0);",
+        )
+        .unwrap();
+
+        run_all(&mut conn).unwrap();
+        run_all(&mut conn).unwrap();
+        let copied: (String, String, String) = conn
+            .query_row(
+                "SELECT shortcode, sha256, url FROM app_sticker_assets
+                 WHERE pack_coordinate = 'pack'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            copied,
+            (
+                "wave".to_owned(),
+                "hash".to_owned(),
+                "https://cdn.example/h".to_owned()
+            )
+        );
+        let chat_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chat_list_rows", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(chat_rows, 1);
+    }
+
     #[test]
     fn seen_recency_index_upgrade() {
         let mut conn = Connection::open_in_memory().unwrap();

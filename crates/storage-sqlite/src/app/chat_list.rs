@@ -1505,10 +1505,19 @@ fn chat_list_projection_complete_tx(tx: &Connection) -> StorageResult<bool> {
                         row.last_message_preview,
                         row.last_message_kind,
                         row.last_message_timeline_at,
-                        row.last_message_media_json
+                        row.last_message_media_json,
+                        row.last_message_tags_json
                      ) IS NOT (
+                        -- Tags are compared as the writers store them: `[]`
+                        -- for a deleted or unreadable row, otherwise the
+                        -- timeline's own serialization.
                         SELECT mt.message_id_hex, mt.sender, mt.plaintext,
-                               mt.kind, mt.timeline_at, mt.media_json
+                               mt.kind, mt.timeline_at, mt.media_json,
+                               CASE
+                                   WHEN mt.deleted != 0 OR json_valid(mt.tags_json) = 0
+                                       THEN '[]'
+                                   ELSE mt.tags_json
+                               END
                         FROM message_timeline AS mt NOT INDEXED
                         WHERE mt.group_id_hex = ag.group_id_hex
                           AND {activity_filter}
@@ -2387,12 +2396,14 @@ fn timeline_message_for_read_marker_tx(
 
 fn chat_list_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatListMessagePreview> {
     let deleted = row.get::<_, i64>(6)? != 0;
+    // Decode like unread membership: one unreadable timeline tag list must
+    // not abort a chat-list rebuild, so it previews with no tags.
     let tags = if deleted {
         Vec::new()
     } else {
-        serde_json::from_str(&row.get::<_, String>(4)?).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
-        })?
+        row.get::<_, Option<String>>(4)?
+            .and_then(|json| crate::tags_from_json(json).ok())
+            .unwrap_or_default()
     };
     let direction = row.get::<_, String>(8)?;
     let source_message_id_hex = row.get::<_, Option<String>>(9)?;
