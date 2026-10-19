@@ -903,6 +903,45 @@ async fn explicit_remove_unlinks_a_released_file_at_once() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+/// A Remove whose media store cannot open (its storage handle was evicted)
+/// fails before anything is removed: the attachment and its file stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remove_that_cannot_open_the_store_removes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let old = app.account_storage("alice").unwrap();
+    seed_file_backed(&app, &old, &[9u8; 4096]);
+    let runtime = app.runtime();
+    let group = GroupId::new(vec![0xab; 16]);
+    let asset = runtime
+        .attachment_local_assets("alice", &group, vec![target()])
+        .await
+        .unwrap()
+        .remove(0)
+        .unwrap();
+    app.drop_account_caches("alice");
+    let refused =
+        crate::runtime::attachment_controls::remove_now(&app, "alice", &old, &asset.reference)
+            .unwrap_err();
+    assert!(matches!(
+        refused,
+        AppError::Storage(cgka_traits::StorageError::Closed(_))
+    ));
+    assert_eq!(media_files_on_disk(&app), 1, "the file stays");
+    assert!(
+        runtime
+            .attachment_local_assets("alice", &group, vec![target()])
+            .await
+            .unwrap()[0]
+            .is_some(),
+        "the attachment is still retained"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 /// Removal by age uses the message's received time and works on legacy
 /// database bodies too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
