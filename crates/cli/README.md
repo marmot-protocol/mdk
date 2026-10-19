@@ -425,10 +425,10 @@ pending commits are republished exactly, and fresh plaintext is never re-encrypt
 `target_event_id` (`null` when omitted) and does not scope the action; `retry_scope` is always `group_convergence`.
 
 **Retention sweep.** `messages sweep-expired` runs the engine-owned disappearing-message sweep for the selected account
-now, on the current wall clock (the engine applies its own clock-skew tolerance, unread deferral, and scan bounds;
+now, on the current wall clock (the engine applies its own clock-skew tolerance and unread deferral;
 there is no flag to supply a time). It returns `now_ms`, total `pruned_messages` / `secrets_deleted`, and a per-group
 `groups` array with `status` (`no_expired_messages`, `pruned`, `deferred_clock_skew`, `deferred_unread`,
-`deferred_scan_exhausted`, or `failed`), counts, `media_ciphertext_sha256` purge hints, and a privacy-safe
+or `failed`), counts, `media_ciphertext_sha256` purge hints, and a privacy-safe
 `failure_kind`. A running `wnd` does not schedule this sweep; call it explicitly.
 
 **Custom events.** `messages send-event <group-hex> <kind> [content]` sends an app-defined event. Kind, tags, and content

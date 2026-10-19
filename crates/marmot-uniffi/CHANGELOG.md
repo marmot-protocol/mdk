@@ -10,6 +10,9 @@
   (mdk#2314 step 6). Regenerate bindings; update code that constructs or
   exhaustively destructures the record.
 
+- `RetentionSweepStatusFfi::DeferredScanExhausted` is removed with the sweep's
+  page scan (mdk#2425). Regenerate bindings and remove exhaustive Swift
+  `switch` / Kotlin `when` arms for it.
 - `MarmotKitError` adds `InvalidPublicEventReferences`: a cached public event preview read named more than 16 references. Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 - `MarmotKitError` adds `DirectoryLookupIncomplete { account }` (mdk#2302): a recipient's or
   account's relay-list or KeyPackage lookup ran out of time or relay coverage, so nothing is
