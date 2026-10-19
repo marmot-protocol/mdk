@@ -5037,30 +5037,38 @@ impl AccountReplayCoverage {
                 }
             }
         }
-        let expired = self
-            .endpoint_deadlines
-            .iter_mut()
-            .flat_map(|(id, relays)| {
-                relays.iter_mut().filter_map(move |(relay, endpoint)| {
-                    if endpoint.deadline.is_some_and(|deadline| deadline <= now) {
-                        endpoint.deadline = None;
-                        Some((id.clone(), *relay))
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        for (id, relay) in expired {
-            // Group owners above retain their own loss decision. Inbox work
-            // has no group owner, but still owns a finite service allowance.
-            if self
+        let mut inbox_losses = Vec::new();
+        for (id, relays) in &mut self.endpoint_deadlines {
+            let inbox = self
                 .windows
-                .get(&id)
-                .is_some_and(|window| matches!(window.scope, ReplayScope::Inbox))
-            {
-                self.charge_source(&id, relay);
+                .get(id)
+                .is_some_and(|window| matches!(window.scope, ReplayScope::Inbox));
+            let complete_peer = inbox
+                && self.subscriptions.get(id).is_some_and(|relays| {
+                    relays.values().any(|replay| *replay == RelayReplay::Eose)
+                });
+            for (relay, endpoint) in relays {
+                if endpoint.deadline.is_none_or(|deadline| deadline > now) {
+                    continue;
+                }
+                endpoint.deadline = None;
+                if !inbox {
+                    continue;
+                }
+                let observed = self
+                    .stored
+                    .get(id)
+                    .and_then(|relays| relays.get(relay))
+                    .is_some_and(|stored| stored.events > 0);
+                // Empty waiting beside a complete peer is not evidence of loss.
+                // Keep raw Awaiting so a late inbox replay still counts and pages.
+                if observed || endpoint.capturing || !complete_peer {
+                    inbox_losses.push((id.clone(), *relay));
+                }
             }
+        }
+        for (id, relay) in inbox_losses {
+            self.charge_source(&id, relay);
         }
     }
 }

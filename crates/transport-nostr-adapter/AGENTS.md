@@ -105,6 +105,8 @@ for reconnect/backoff and relay status mechanics.
   retain its floor as loss until `take_replay_status` imports it. Later live input must not stay permanently
   stalled. Silence or a terminal refusal alone must not stall a completed peer or turn incomplete coverage
   into a certificate.
+  An empty inbox wait beside a completed inbox peer must not mint loss. Keep late stored copies countable for
+  backward paging; observed partial history and captures still retain their original loss floor.
 - Keep admission and all-relay EOSE separate. `take_replay_status` holds a read guard through a synchronous
   cursor seal; import its loss before another await, then drop it. Notify only wakes the router; it never
   consumes evidence. `ack_replay_delivery` follows actual pinned queue/spill placement or recorded loss, never

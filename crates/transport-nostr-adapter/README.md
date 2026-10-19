@@ -88,7 +88,7 @@ paging the next group. Groups use a common ordering across overlapping REQs.
 An initial replay gets a 30-second waiting interval, reconciled with its first observed connection boundary.
 Clamped routes each get a 30-second paging allowance when their service starts, reusing
 `REPLAY_PAGE_LIMITS.max_duration`; queueing, peer-release waits and delivery draining do not spend it.
-Arriving events and repeated loss do not extend an active lease. An empty expired stream becomes dormant; a
+Arriving events and repeated loss do not extend an active lease. An empty expired group stream becomes dormant; a
 first or newer connection can reopen waiting. Late history without that restart is discarded with its original
 loss floor, not certified by wire EOSE. Lost partial history also stays incomplete. A silent or terminally
 refused peer cannot freeze available history indefinitely. Fresh requests have fresh ownership. This does not
@@ -96,6 +96,10 @@ establish ordering across unavailable relay history. Already-ready routes keep t
 equivalent or narrower repack; a wider request still stages history. Group delivery uses verified raw SDK
 copies, so SDK duplicate suppression cannot consume the only copy of ciphertext discarded by a cancelled
 attempt. Retired subscription copies cannot bypass admission.
+
+An empty inbox endpoint's waiting deadline does not create loss when another inbox endpoint completed.
+Observed partial history and active captures still retain their loss. Late inbox copies remain countable so a
+late clamped replay still triggers backward paging.
 
 Transport receivers use each relay's ordered SDK notifications, including connection and receiver-loss
 boundaries. Every queued payload carries reader/connection epochs. A warm reconnect resets admission before

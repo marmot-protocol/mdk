@@ -3724,7 +3724,7 @@ fn drain_queued_created_at(adapter: &MarmotRelayPlaneAccountAdapter) -> Vec<u64>
 /// Replay admission, not a certificate from every configured endpoint,
 /// fences a checkpoint. An endpoint that never starts replaying must not
 /// prevent a drained available endpoint from making its cursor durable.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn seal_ignores_silent_peer() {
     for refused in [false, true] {
         let relay = Arc::new(RecordingRelayClient::default());
@@ -3822,6 +3822,14 @@ async fn seal_ignores_silent_peer() {
         })
         .await
         .expect("an unavailable peer alone must not fence a drained cursor");
+        assert!(adapter.pending_delivery_overflow().is_none());
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            adapter.seal_transport_cursor(candidate),
+            candidate,
+            "an empty peer's deadline cannot manufacture loss after a complete replay"
+        );
         assert!(adapter.pending_delivery_overflow().is_none());
         plane.shutdown().await;
     }
