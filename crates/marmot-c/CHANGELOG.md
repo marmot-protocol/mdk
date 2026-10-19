@@ -9,6 +9,14 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Add Manage storage calls (mdk#2314 step 5): `marmot_attachment_storage_usage`,
+  `marmot_attachment_storage_by_chat`, `marmot_largest_retained_attachments`,
+  `marmot_remove_chat_attachments` and `marmot_remove_attachments_older_than`,
+  with records freed by `marmot_attachment_storage_usage_free`,
+  `marmot_chat_storage_page_free` and `marmot_retained_attachments_page_free`
+  (page cursors are borrowed from their page). Use matching regenerated headers
+  and libraries.
+
 - Add `marmot_client_new_with_deployment` and the opaque `MarmotDeployment` (`marmot_deployment_white_noise`, `marmot_deployment_neutral`, the `marmot_deployment_set_*` setters, `marmot_deployment_free`): a host passes its recovery relays, discovery indexers, media and image servers, Open Ranking, KeyPackage client preference, moderation label namespace and keychain service at construction. A NULL deployment, and every other constructor, still uses White Noise's until the neutral default lands (host-configuration brief, PR 2). `MarmotClientOptions` is unchanged. Use matching regenerated headers and libraries.
 - Add `marmot_open_attachment_handoff` and `marmot_release_attachment_handoff`
   (record `MarmotAttachmentHandoff`, freed with `marmot_attachment_handoff_free`,

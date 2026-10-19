@@ -366,7 +366,9 @@ impl SqliteAppStorage {
         group: Option<&str>,
         received_before: Option<u64>,
     ) -> StorageResult<AttachmentRemoval> {
-        let before = received_before.map(u64_to_i64).transpose()?;
+        // A bound past SQLite's integer range is later than every stored
+        // received time, so it filters nothing.
+        let before = received_before.and_then(|before| i64::try_from(before).ok());
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let slots = {
