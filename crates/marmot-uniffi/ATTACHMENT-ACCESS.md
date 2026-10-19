@@ -129,6 +129,15 @@ account database.
 - **Usage.** `attachmentStorageUsage` returns media-store bytes (a file shared by several
   attachments counted once), legacy database bytes, the retained attachment count, and the
   database's size and free pages. It reads no bodies.
+- **Moving legacy bodies.** The account worker moves bodies still in the account database into
+  the media store in the background, a small batch every 15 seconds. `migration` says where
+  that stands: `Running` (`migrationBytes` still to move), `Paused` (the smallest remaining
+  body does not fit; `migrationBytes` more must be free), `NotNeeded` or `Complete`.
+  Attachment observers wake when it pauses, resumes or finishes. While paused, offer the
+  removals below: removing file-backed attachments frees space at once, and removing legacy
+  ones shrinks what is left to move. Nothing is deleted automatically. A legacy body that is
+  damaged is dropped, and its attachment shows as previously acquired and unavailable, with
+  download-again allowed.
 - **Largest first.** `attachmentStorageByChat` lists chats and `largestRetainedAttachments`
   lists attachments (account-wide or within one chat), each with `limit` 1..=256 per page.
   Continue with the page's `nextCursor` until it is absent; the last page may be empty.

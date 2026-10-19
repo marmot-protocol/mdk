@@ -741,7 +741,7 @@ Cheap local refresh signal, including for a fully loaded or empty library. Compa
 pub async fn attachment_storage_usage( &self, account_ref: String, ) -> Result<AttachmentStorageUsageFfi, MarmotKitError>
 ```
 
-Account-wide attachment storage for a Manage storage screen: `media_bytes` (media-store files, a file shared by several attachments counted once), `legacy_bytes` (bodies still in the account database; they move to the media store in the background), `attachment_count`, and the database's `database_bytes` and `database_free_bytes`. Reads no bodies and starts no worker. See [Manage storage](ATTACHMENT-ACCESS.md#manage-storage).
+Account-wide attachment storage for a Manage storage screen: `media_bytes` (media-store files, a file shared by several attachments counted once), `legacy_bytes` (bodies still in the account database; they move to the media store in the background), `attachment_count`, the database's `database_bytes` and `database_free_bytes`, and `migration` with `migration_bytes`: where moving legacy bodies into the media store stands (`Running` with the bytes left, `Paused` with the free space it still needs, `NotNeeded` or `Complete`). Reads no bodies and starts no worker. See [Manage storage](ATTACHMENT-ACCESS.md#manage-storage).
 
 [Source](src/commands/attachment_storage.rs#L15)
 

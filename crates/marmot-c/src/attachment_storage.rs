@@ -2,7 +2,7 @@
 //! borrowed opaque cursors, and bulk removal. Calls block: use off the UI
 //! thread.
 use crate::commands::{deliver, deliver_scalar, try_arg};
-use crate::macros::c_mirror;
+use crate::macros::{c_enum, c_mirror};
 use crate::memory::{
     CFree, boxed_opt, free_boxed, free_c_string, free_guard, free_vec, optional_str,
     owned_c_string, owned_vec, required_str,
@@ -20,6 +20,18 @@ c_mirror! {
         copy attachment_count: u64,
         copy database_bytes: u64,
         copy database_free_bytes: u64,
+        copy migration: MarmotAttachmentMigrationState,
+        copy migration_bytes: u64,
+    }
+}
+
+c_enum! {
+    /// Where moving legacy attachment bodies into the media store stands.
+    MarmotAttachmentMigrationState from AttachmentMigrationStateFfi {
+        NotNeeded,
+        Running,
+        Paused,
+        Complete,
     }
 }
 

@@ -19,17 +19,51 @@ pub struct AttachmentStorageUsageFfi {
     /// The account database file, and the part of it that is free pages.
     pub database_bytes: u64,
     pub database_free_bytes: u64,
+    /// Moving legacy bodies into the media store.
+    pub migration: AttachmentMigrationStateFfi,
+    /// With `Running`, the legacy bytes still to move; with `Paused`, how
+    /// many more bytes must be free before the move resumes. Otherwise 0.
+    pub migration_bytes: u64,
 }
 impl From<app::AttachmentStorageUsage> for AttachmentStorageUsageFfi {
     fn from(v: app::AttachmentStorageUsage) -> Self {
+        let (migration, migration_bytes) = match v.migration {
+            app::AttachmentMigrationState::NotNeeded => (AttachmentMigrationStateFfi::NotNeeded, 0),
+            app::AttachmentMigrationState::Running { remaining_bytes } => {
+                (AttachmentMigrationStateFfi::Running, remaining_bytes)
+            }
+            app::AttachmentMigrationState::Paused { needed_bytes } => {
+                (AttachmentMigrationStateFfi::Paused, needed_bytes)
+            }
+            app::AttachmentMigrationState::Complete => (AttachmentMigrationStateFfi::Complete, 0),
+        };
         Self {
             media_bytes: v.media_bytes,
             legacy_bytes: v.legacy_bytes,
             attachment_count: v.attachment_count,
             database_bytes: v.database_bytes,
             database_free_bytes: v.database_free_bytes,
+            migration,
+            migration_bytes,
         }
     }
+}
+
+/// Where moving legacy attachment bodies out of the account database into
+/// the media store stands. It runs in the background; nothing is deleted to
+/// make room for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum AttachmentMigrationStateFfi {
+    /// No legacy bodies remain, and this runtime moved none.
+    NotNeeded,
+    /// Legacy bodies are moving; `migration_bytes` remain.
+    Running,
+    /// The smallest remaining body does not fit: the move resumes once
+    /// `migration_bytes` more are free. Removing attachments frees space
+    /// (file-backed ones at once) or shrinks what is left to move.
+    Paused,
+    /// This runtime moved the last legacy body.
+    Complete,
 }
 
 /// Where the next page of chats starts.
@@ -175,5 +209,41 @@ mod tests {
         assert!(short.next_cursor.is_none());
         let empty = RetainedAttachmentsPageFfi::new(Vec::new(), 2);
         assert!(empty.attachments.is_empty() && empty.next_cursor.is_none());
+    }
+
+    #[test]
+    fn the_migration_state_carries_its_byte_count_only_where_it_means_one() {
+        let usage = |migration| {
+            AttachmentStorageUsageFfi::from(app::AttachmentStorageUsage {
+                migration,
+                ..Default::default()
+            })
+        };
+        let cases = [
+            (
+                app::AttachmentMigrationState::NotNeeded,
+                AttachmentMigrationStateFfi::NotNeeded,
+                0,
+            ),
+            (
+                app::AttachmentMigrationState::Running { remaining_bytes: 7 },
+                AttachmentMigrationStateFfi::Running,
+                7,
+            ),
+            (
+                app::AttachmentMigrationState::Paused { needed_bytes: 9 },
+                AttachmentMigrationStateFfi::Paused,
+                9,
+            ),
+            (
+                app::AttachmentMigrationState::Complete,
+                AttachmentMigrationStateFfi::Complete,
+                0,
+            ),
+        ];
+        for (state, expected, bytes) in cases {
+            let usage = usage(state);
+            assert_eq!((usage.migration, usage.migration_bytes), (expected, bytes));
+        }
     }
 }

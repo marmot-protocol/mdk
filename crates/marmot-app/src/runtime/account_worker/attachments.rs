@@ -38,6 +38,8 @@ pub(super) struct Admission {
     /// any, and where the next one resumes.
     upload_promotion: Option<tokio::task::JoinHandle<()>>,
     upload_cursor: Arc<std::sync::Mutex<Option<storage_sqlite::AttachmentUploadOwner>>>,
+    /// The legacy body migration batch running on the blocking pool, if any.
+    legacy_migration: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Starts a media sweep on the blocking pool unless one is still running:
@@ -105,6 +107,59 @@ fn spawn_upload_promotion(
                 tracing::warn!(target: "marmot_app::runtime", method = "outgoing_upload_promotion",
                     "outgoing upload promotion deferred");
             }
+        }
+    }));
+}
+
+/// Starts one batch of moving legacy database bodies into the media store
+/// (mdk#2314 step 6) on the blocking pool, unless one is still running. The
+/// account worker calls this once per maintenance tick, after readiness. A
+/// batch that pauses for free space, resumes, finishes, or drops a corrupt
+/// body wakes attachment observers.
+pub(super) fn spawn_legacy_migration(
+    client: &AppClient,
+    shared: &RuntimeSharedServices,
+    admission: &mut Admission,
+) {
+    if client.app.config.cursor_persistence == crate::CursorPersistence::Frozen
+        || admission
+            .legacy_migration
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    {
+        return;
+    }
+    let app = client.app.clone();
+    let label = client.state.label.clone();
+    let updates = shared.attachment_updates.clone();
+    admission.legacy_migration = Some(tokio::task::spawn_blocking(move || {
+        let started = (|| {
+            let storage = app.account_storage(&label)?;
+            let media = app.account_media_store(&label, &storage)?;
+            let reserve = storage
+                .app_storage()
+                .attachment_download_policy(&super::super::attachment_controls::default_policy(
+                    &app.config,
+                ))?
+                .disk_reserve;
+            Ok::<_, AppError>((storage, media, reserve))
+        })();
+        let Ok((storage, media, reserve)) = started else {
+            tracing::warn!(target: "marmot_app::storage_maintenance",
+                method = "migrate_legacy_attachments",
+                "legacy attachment migration batch deferred");
+            return;
+        };
+        let account_dir = app.account_dir(&label);
+        let changed = crate::media::legacy_migration::run_batch(
+            &storage.app_storage(),
+            &media,
+            reserve,
+            &|| crate::media::attachment_resume::available_space(&account_dir),
+            &app.legacy_media_migration(&label),
+        );
+        if changed {
+            updates.send_modify(|_| {});
         }
     }));
 }

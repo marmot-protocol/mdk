@@ -25,6 +25,9 @@ pub struct AttachmentStorageUsage {
     /// The account database file, and the part of it that is free pages.
     pub database_bytes: u64,
     pub database_free_bytes: u64,
+    /// Moving legacy bodies into the media store. From the database this is
+    /// `NotNeeded` or `Running`; the app runtime adds what its batches saw.
+    pub migration: AttachmentMigrationState,
 }
 
 /// Retained attachment bytes in one chat: each stored body once, however
@@ -233,6 +236,7 @@ impl SqliteAppStorage {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .storage()?;
+        let remaining = super::legacy_migration::legacy_attachment_bytes_in(&conn)?;
         let database_bytes = page_count.saturating_mul(page_size);
         let database_free_bytes = free_pages.saturating_mul(page_size);
         let unsigned = |value: i64| u64::try_from(value).unwrap_or(0);
@@ -242,6 +246,13 @@ impl SqliteAppStorage {
             attachment_count: unsigned(attachment_count),
             database_bytes: unsigned(database_bytes),
             database_free_bytes: unsigned(database_free_bytes),
+            migration: if remaining == 0 {
+                AttachmentMigrationState::NotNeeded
+            } else {
+                AttachmentMigrationState::Running {
+                    remaining_bytes: remaining,
+                }
+            },
         })
     }
 

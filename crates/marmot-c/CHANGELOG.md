@@ -9,6 +9,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `MarmotAttachmentStorageUsage` adds `migration`
+  (`MarmotAttachmentMigrationState`) and `migration_bytes`: where the
+  background move of legacy database bodies into the media store stands
+  (mdk#2314 step 6). The struct layout changes; use matching regenerated
+  headers and libraries.
+
 - Add Manage storage calls (mdk#2314 step 5): `marmot_attachment_storage_usage`,
   `marmot_attachment_storage_by_chat`, `marmot_largest_retained_attachments`,
   `marmot_remove_chat_attachments` and `marmot_remove_attachments_older_than`,

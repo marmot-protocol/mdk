@@ -953,19 +953,13 @@ impl SqliteAppStorage {
             let Some(row_id) = row_id else {
                 return Ok(None);
             };
-            if let Some(bytes) = file_import::read(conn, &reference.token, offset, limit)? {
-                return Ok(Some(RetainedAttachmentRead::Bytes(bytes)));
-            }
-            let blob = conn
-                .blob_open("main", "retained_attachment_bytes", "bytes", row_id, true)
-                .storage()?;
-            let count = blob.len().saturating_sub(offset).min(limit);
-            let mut bytes = Zeroizing::new(vec![0; count]);
-            if count != 0 {
-                blob.read_at_exact(&mut bytes, offset).storage()?;
-            }
-            blob.close().storage()?;
-            Ok(Some(RetainedAttachmentRead::Bytes(bytes)))
+            Ok(Some(RetainedAttachmentRead::Bytes(read_legacy_body(
+                conn,
+                &reference.token,
+                row_id,
+                offset,
+                limit,
+            )?)))
         })
     }
     /// One bounded maintenance pass. Source pruning separately cascades deletion;
@@ -1040,6 +1034,32 @@ pub(crate) fn publication_superseded(
     Ok(!valid)
 }
 
+/// Up to `limit` bytes at `offset` of slot `token`'s legacy database body,
+/// whose `retained_attachment_bytes` row is `row_id`: its chunks when it is a
+/// chunked file, otherwise the row's own bytes. Callers apply their own
+/// fences first.
+pub(crate) fn read_legacy_body(
+    conn: &Connection,
+    token: &[u8],
+    row_id: i64,
+    offset: usize,
+    limit: usize,
+) -> StorageResult<Zeroizing<Vec<u8>>> {
+    if let Some(bytes) = file_import::read(conn, token, offset, limit)? {
+        return Ok(bytes);
+    }
+    let blob = conn
+        .blob_open("main", "retained_attachment_bytes", "bytes", row_id, true)
+        .storage()?;
+    let count = blob.len().saturating_sub(offset).min(limit);
+    let mut bytes = Zeroizing::new(vec![0; count]);
+    if count != 0 {
+        blob.read_at_exact(&mut bytes, offset).storage()?;
+    }
+    blob.close().storage()?;
+    Ok(bytes)
+}
+
 /// Shared SQLCipher publication admission: the fences, then the
 /// retained+partial quota (excluding this job's own partial reservation).
 /// `Some` is the refusal to return without inserting. Media-file publication
@@ -1111,6 +1131,10 @@ pub use media::AttachmentPublication;
 
 mod access;
 pub use access::RetainedAttachmentAsset;
+mod legacy_migration;
+pub use legacy_migration::{
+    AttachmentMigrationState, LegacyAttachmentBody, LegacyBodyPublication, LegacyBodyReader,
+};
 mod storage_usage;
 pub use storage_usage::{
     ATTACHMENT_REMOVAL_BATCH, AttachmentRemoval, AttachmentStorageUsage, ChatAttachmentUsage,

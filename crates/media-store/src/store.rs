@@ -674,6 +674,45 @@ impl<C: MediaCatalog> MediaStore<C> {
         }))
     }
 
+    /// Reads ready file `id` in full, authenticating every segment, and
+    /// checks that it hashes to `digest`. `false` when there is no ready file
+    /// or it fails either check; a file that fails is marked lost (its cached
+    /// reader dropped), so reuse no longer attaches it. Use this before
+    /// deleting any other copy of the content: opening a file checks only its
+    /// header and length.
+    pub fn verify(&self, id: &FileId, digest: &[u8; 32]) -> MediaResult<bool> {
+        let mut reader = match self.open_file_reader(id) {
+            Ok(Some(reader)) => reader,
+            Ok(None) | Err(MediaError::Corruption(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let mut hasher = Sha256::new();
+        let mut buffer = Zeroizing::new(vec![0; COPY_CHUNK_BYTES]);
+        let mut offset = 0_u64;
+        loop {
+            self.inner.ensure_open()?;
+            let read = match reader
+                .read_at(offset, &mut buffer)
+                .map_err(MediaError::from)
+            {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(MediaError::Corruption(_)) => {
+                    self.inner.lose(id);
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
+            hasher.update(&buffer[..read]);
+            offset += read as u64;
+        }
+        if <[u8; 32]>::from(hasher.finalize()) != *digest {
+            self.inner.lose(id);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     fn open_file_reader(&self, id: &FileId) -> MediaResult<Option<MediaFileReader<File>>> {
         self.inner.ensure_open()?;
         let Some(row) = self.inner.catalog.ready_file(*id)? else {

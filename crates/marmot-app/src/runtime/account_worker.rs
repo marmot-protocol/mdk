@@ -2796,6 +2796,11 @@ async fn run_app_runtime_account_worker(
                     &client,
                     &mut legacy_message_promotion,
                 );
+                attachments::spawn_legacy_migration(
+                    &client,
+                    &shared,
+                    &mut attachment_admission,
+                );
                 if client.key_package_maintenance_requires_catch_up() {
                     let observation = shared.product_analytics.begin(
                         crate::ProductFamily::Maintenance, "catch_up", crate::ProductUnit::Attempt,

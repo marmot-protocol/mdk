@@ -9,7 +9,8 @@ use super::MarmotAppRuntime;
 use crate::AppError;
 use cgka_traits::GroupId;
 pub use storage_sqlite::{
-    AttachmentStorageUsage, ChatAttachmentUsage, ChatUsageCursor, RetainedSizeCursor,
+    AttachmentMigrationState, AttachmentStorageUsage, ChatAttachmentUsage, ChatUsageCursor,
+    RetainedSizeCursor,
 };
 
 /// One retained attachment in a largest-first listing. `target` feeds
@@ -38,15 +39,23 @@ impl std::fmt::Debug for RetainedAttachmentSummary {
 
 impl MarmotAppRuntime {
     /// Account-wide attachment storage across both layouts. Reads no
-    /// bodies; needs no account worker.
+    /// bodies; needs no account worker. `migration` says where moving
+    /// legacy bodies into the media store stands, including a pause for
+    /// free space, as this runtime's account worker last saw it.
     pub async fn attachment_storage_usage(
         &self,
         account_ref: &str,
     ) -> Result<AttachmentStorageUsage, AppError> {
-        self.attachment_read(account_ref, |storage, _| {
-            Ok(storage
+        self.attachment_read_with(account_ref, |app, label, storage, _| {
+            let mut usage = storage
                 .app_storage()
-                .attachment_storage_usage(crate::unix_now_seconds())?)
+                .attachment_storage_usage(crate::unix_now_seconds())?;
+            usage.migration = app
+                .legacy_media_migration(label)
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .state(usage.migration);
+            Ok(usage)
         })
         .await
     }

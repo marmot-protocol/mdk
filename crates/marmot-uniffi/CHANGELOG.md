@@ -4,6 +4,12 @@
 
 ### Breaking changes
 
+- `AttachmentStorageUsageFfi` adds `migration` (`AttachmentMigrationStateFfi`:
+  `NotNeeded`, `Running`, `Paused`, `Complete`) and `migration_bytes`: where
+  the background move of legacy database bodies into the media store stands
+  (mdk#2314 step 6). Regenerate bindings; update code that constructs or
+  exhaustively destructures the record.
+
 - `MarmotKitError` adds `InvalidPublicEventReferences`: a cached public event preview read named more than 16 references. Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 - `MarmotKitError` adds `DirectoryLookupIncomplete { account }` (mdk#2302): a recipient's or
   account's relay-list or KeyPackage lookup ran out of time or relay coverage, so nothing is

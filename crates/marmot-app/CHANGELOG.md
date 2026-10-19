@@ -86,6 +86,18 @@
 
 - `MarmotAppConfig::white_noise()` is today's default configuration with White Noise's deployment as this build compiled it. The CLI, `wn-agent`, the conformance simulator, the dev/test constructors and the tests now name it explicitly, so they keep White Noise's behaviour when `MarmotAppConfig::default()` turns neutral (host-configuration brief, PR 2). The CLI's default keychain service comes from `MarmotDeployment::white_noise()`; the name is unchanged.
 
+- Legacy attachment bodies move into the encrypted media store in the
+  background (mdk#2314 step 6): one small batch per maintenance tick, after
+  readiness, on the blocking pool. On a tight disk the move takes what fits,
+  then pauses until space frees; `attachment_storage_usage().migration`
+  reports `NotNeeded`, `Running { remaining_bytes }`,
+  `Paused { needed_bytes }` or `Complete`, and attachment observers wake when
+  it pauses, resumes or finishes. Nothing is deleted to make room. A legacy
+  body that fails its digest is dropped and its attachment shows as
+  previously acquired and unavailable, with download-again allowed. Database
+  pages freed by the move return to the filesystem at compaction, a later
+  step.
+
 - Manage storage (mdk#2314 step 5): `attachment_storage_usage`,
   `attachment_storage_by_chat`, `largest_retained_attachments`,
   `remove_chat_attachments` and `remove_attachments_older_than` on

@@ -70,6 +70,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   body layouts, and bulk removal that is exactly explicit `Remove`. Every removal path (bulk or `control_attachment`)
   unlinks the media files its transaction released through `unlink_released` before returning; never leave that to the
   sweep.
+- `media/legacy_migration.rs` moves legacy database bodies into the media store (mdk#2314 step 6): one bounded batch per
+  maintenance tick, started by the account worker on the blocking pool after readiness. Each body is admitted with
+  `DiskPolicy::migration_need`, published, then its rows dropped; the smallest body that does not fit pauses the move
+  (reported as `Paused { needed_bytes }`, never by deleting anything), and a body that fails its digest or is malformed
+  as stored is dropped so its slot shows as unavailable with download-again allowed. The per-account
+  `LegacyMigrationProgress` lives in `MarmotApp` and is dropped with the account's media store.
 - `media/handoff.rs` owns handoff leases (mdk#2314 step 4): the only plaintext attachment files MDK writes, decrypted from a
   retained body (either layout) into `<account>/handoff/<lease>/<name>` for an OS surface that needs a real file.
   Register a lease before its directory exists, delete only on explicit release or by `wipe_stale` (worker start,
