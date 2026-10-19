@@ -29,6 +29,7 @@ pub(crate) mod file_transfer;
 pub(crate) mod handoff;
 pub(crate) mod legacy_migration;
 pub(crate) mod outgoing;
+pub(crate) mod storage_compaction;
 pub(crate) use crypto::media_hash_from_reference;
 mod group_image;
 mod host_safety;

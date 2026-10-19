@@ -36,6 +36,9 @@ impl From<app::AttachmentStorageUsage> for AttachmentStorageUsageFfi {
                 (AttachmentMigrationStateFfi::Paused, needed_bytes)
             }
             app::AttachmentMigrationState::Complete => (AttachmentMigrationStateFfi::Complete, 0),
+            app::AttachmentMigrationState::Compacting => {
+                (AttachmentMigrationStateFfi::Compacting, 0)
+            }
         };
         Self {
             media_bytes: v.media_bytes,
@@ -64,6 +67,10 @@ pub enum AttachmentMigrationStateFfi {
     Paused,
     /// This runtime moved the last legacy body.
     Complete,
+    /// The account database is being compacted to return its free pages to
+    /// the filesystem; the other figures are from just before it started.
+    /// Account reads and writes wait until it finishes.
+    Compacting,
 }
 
 /// Where the next page of chats starts.
@@ -238,6 +245,11 @@ mod tests {
             (
                 app::AttachmentMigrationState::Complete,
                 AttachmentMigrationStateFfi::Complete,
+                0,
+            ),
+            (
+                app::AttachmentMigrationState::Compacting,
+                AttachmentMigrationStateFfi::Compacting,
                 0,
             ),
         ];

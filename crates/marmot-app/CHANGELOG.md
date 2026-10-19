@@ -84,6 +84,15 @@
 
 ### Added
 
+- The account database returns freed space to the filesystem (mdk#2314 step
+  6). Once a quarter of it is free pages, the volume has room for two copies
+  of the live data and that data is at most 256 MiB (the copy is built in
+  memory), the account worker compacts it once per worker ownership;
+  `attachment_storage_usage().migration` reads `Compacting` meanwhile, from a
+  snapshot taken just before, and attachment observers wake when it starts
+  and ends. Afterwards each maintenance tick and each bulk removal returns
+  freed pages, so moving legacy bodies out keeps disk use flat.
+
 - `MarmotAppConfig::white_noise()` is today's default configuration with White Noise's deployment as this build compiled it. The CLI, `wn-agent`, the conformance simulator, the dev/test constructors and the tests now name it explicitly, so they keep White Noise's behaviour when `MarmotAppConfig::default()` turns neutral (host-configuration brief, PR 2). The CLI's default keychain service comes from `MarmotDeployment::white_noise()`; the name is unchanged.
 
 - Legacy attachment bodies move into the encrypted media store in the
@@ -95,8 +104,8 @@
   it pauses, resumes or finishes. Nothing is deleted to make room. A legacy
   body that fails its digest is dropped and its attachment shows as
   previously acquired and unavailable, with download-again allowed. Database
-  pages freed by the move return to the filesystem at compaction, a later
-  step.
+  pages freed by the move return to the filesystem through compaction
+  (below).
 
 - Manage storage (mdk#2314 step 5): `attachment_storage_usage`,
   `attachment_storage_by_chat`, `largest_retained_attachments`,

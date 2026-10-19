@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- `AttachmentMigrationStateFfi` adds `Compacting`: the account database is
+  being compacted to return its free pages to the filesystem (mdk#2314 step
+  6), and the other usage figures are from just before it started. Update
+  exhaustive Swift `switch` / Kotlin `when` handling.
+
 - `AttachmentStorageUsageFfi` adds `migration` (`AttachmentMigrationStateFfi`:
   `NotNeeded`, `Running`, `Paused`, `Complete`) and `migration_bytes`: where
   the background move of legacy database bodies into the media store stands

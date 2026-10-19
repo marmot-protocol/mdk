@@ -32,6 +32,7 @@ c_enum! {
         Running,
         Paused,
         Complete,
+        Compacting,
     }
 }
 

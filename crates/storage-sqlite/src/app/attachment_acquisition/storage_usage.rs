@@ -225,27 +225,15 @@ impl SqliteAppStorage {
                 |r| r.get(0),
             )
             .storage()?;
-        // Table-valued pragmas: SQLCipher answers the `PRAGMA page_size`
-        // statement with its own cipher setting.
-        let (page_count, page_size, free_pages): (i64, i64, i64) = conn
-            .query_row(
-                "SELECT (SELECT page_count FROM pragma_page_count()),
-                        CAST((SELECT page_size FROM pragma_page_size()) AS INTEGER),
-                        (SELECT freelist_count FROM pragma_freelist_count())",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .storage()?;
+        let space = crate::app::storage_compaction::database_space_in(&conn)?;
         let remaining = super::legacy_migration::legacy_attachment_bytes_in(&conn)?;
-        let database_bytes = page_count.saturating_mul(page_size);
-        let database_free_bytes = free_pages.saturating_mul(page_size);
         let unsigned = |value: i64| u64::try_from(value).unwrap_or(0);
         Ok(AttachmentStorageUsage {
             media_bytes: unsigned(media_bytes),
             legacy_bytes: unsigned(legacy_bytes),
             attachment_count: unsigned(attachment_count),
-            database_bytes: unsigned(database_bytes),
-            database_free_bytes: unsigned(database_free_bytes),
+            database_bytes: space.file_bytes(),
+            database_free_bytes: space.free_bytes(),
             migration: if remaining == 0 {
                 AttachmentMigrationState::NotNeeded
             } else {

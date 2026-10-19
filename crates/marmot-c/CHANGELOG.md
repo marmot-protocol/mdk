@@ -9,6 +9,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `MarmotAttachmentMigrationState` adds `MARMOT_ATTACHMENT_MIGRATION_STATE_COMPACTING`
+  (the account database is being compacted; mdk#2314 step 6). Existing values
+  keep their numbers. Use matching regenerated headers and libraries.
+
 - `MarmotAttachmentStorageUsage` adds `migration`
   (`MarmotAttachmentMigrationState`) and `migration_bytes`: where the
   background move of legacy database bodies into the media store stands

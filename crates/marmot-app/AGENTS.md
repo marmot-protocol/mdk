@@ -76,6 +76,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (reported as `Paused { needed_bytes }`, never by deleting anything), and a body that fails its digest or is malformed
   as stored is dropped so its slot shows as unavailable with download-again allowed. The per-account
   `LegacyMigrationProgress` lives in `MarmotApp` and is dropped with the account's media store.
+- `media/storage_compaction.rs` returns the account database's freed pages to the filesystem (mdk#2314 step 6), after
+  each maintenance batch on the blocking pool: the one-time compaction runs only through `compaction_due` (a quarter of
+  the file free, the reserve plus two live copies free on the volume, and a live database of at most 256 MiB, since
+  the `VACUUM` copy is built in memory), at most once per worker ownership, with `Compacting` served from a usage
+  snapshot so hosts never wait on the busy database; afterwards `reclaim` runs after every batch and bulk removal.
 - `media/handoff.rs` owns handoff leases (mdk#2314 step 4): the only plaintext attachment files MDK writes, decrypted from a
   retained body (either layout) into `<account>/handoff/<lease>/<name>` for an OS surface that needs a real file.
   Register a lease before its directory exists, delete only on explicit release or by `wipe_stale` (worker start,

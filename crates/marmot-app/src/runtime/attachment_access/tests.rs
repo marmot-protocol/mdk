@@ -1378,3 +1378,128 @@ async fn a_damaged_stored_twin_does_not_replace_the_database_copy() {
     assert_eq!(read_whole(&runtime, legacy_slot(0x52)).await.unwrap(), body);
     runtime.shutdown_and_close().await.unwrap();
 }
+
+// Returning freed database pages to the filesystem (mdk#2314 step 6).
+
+/// Runs the maintenance pass the worker runs after a migration batch, with
+/// plenty of free disk. Whether it woke observers.
+fn maintain_database(
+    app: &MarmotApp,
+    store: &SqliteAccountStorage,
+    attempted: &std::sync::atomic::AtomicBool,
+) -> bool {
+    let woke = std::sync::atomic::AtomicBool::new(false);
+    crate::media::storage_compaction::maintain(
+        &store.app_storage(),
+        1024,
+        &|| Ok(u64::MAX / 2),
+        &app.legacy_media_migration("alice"),
+        attempted,
+        &|| woke.store(true, std::sync::atomic::Ordering::Release),
+    );
+    woke.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Once moved legacy bodies leave enough free pages, the database is
+/// compacted once: it shrinks on disk, switches to incremental mode, and
+/// keeps every attachment readable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moved_legacy_bodies_are_compacted_out_of_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    let body = vec![11u8; 6_000_000];
+    seed_at(&store.app_storage(), legacy_slot(0x61), &body);
+    assert!(migrate_legacy(&app, &store, u64::MAX / 2));
+    let before = store.app_storage().database_space().unwrap();
+    assert!(!before.incremental);
+    assert!(before.free_bytes() >= 6_000_000);
+
+    let attempted = std::sync::atomic::AtomicBool::new(false);
+    assert!(
+        maintain_database(&app, &store, &attempted),
+        "start and end wake observers"
+    );
+    let after = store.app_storage().database_space().unwrap();
+    assert!(after.incremental);
+    assert!(after.file_bytes() + 6_000_000 <= before.file_bytes());
+    assert!(
+        !maintain_database(&app, &store, &attempted),
+        "nothing more to do"
+    );
+    let runtime = app.runtime();
+    let usage = runtime.attachment_storage_usage("alice").await.unwrap();
+    assert_eq!(usage.migration, AttachmentMigrationState::Complete);
+    assert_eq!(usage.database_free_bytes, 0);
+    assert_eq!(read_whole(&runtime, legacy_slot(0x61)).await.unwrap(), body);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// While the database compacts, usage answers from the snapshot taken just
+/// before, as `Compacting`, instead of reading the busy database.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_reports_compacting_from_its_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    seed_at(&store.app_storage(), legacy_slot(0x62), &[1u8; 2000]);
+    let snapshot = store
+        .app_storage()
+        .attachment_storage_usage(crate::unix_now_seconds())
+        .unwrap();
+    app.legacy_media_migration("alice")
+        .lock()
+        .unwrap()
+        .compacting = Some(snapshot.clone());
+    let runtime = app.runtime();
+    let usage = runtime.attachment_storage_usage("alice").await.unwrap();
+    assert_eq!(usage.migration, AttachmentMigrationState::Compacting);
+    assert_eq!(usage.legacy_bytes, snapshot.legacy_bytes);
+    app.legacy_media_migration("alice")
+        .lock()
+        .unwrap()
+        .compacting = None;
+    assert!(matches!(
+        runtime
+            .attachment_storage_usage("alice")
+            .await
+            .unwrap()
+            .migration,
+        AttachmentMigrationState::Running { .. }
+    ));
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// After compaction, a bulk removal of legacy bodies returns their pages
+/// before the call returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bulk_removal_reclaims_pages_once_the_database_is_incremental() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    store.app_storage().compact_database().unwrap();
+    seed_at(
+        &store.app_storage(),
+        legacy_slot(0x63),
+        &vec![12u8; 3_000_000],
+    );
+    let runtime = app.runtime();
+    assert_eq!(
+        runtime
+            .remove_attachments_older_than("alice", 11, None)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(store.app_storage().database_space().unwrap().free_pages, 0);
+    runtime.shutdown_and_close().await.unwrap();
+}

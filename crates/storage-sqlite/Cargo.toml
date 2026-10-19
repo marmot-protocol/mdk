@@ -27,6 +27,8 @@ zeroize.workspace = true
 media-store = { workspace = true, features = ["catalog-conformance"] }
 proc-macro2.workspace = true
 quote.workspace = true
+# `progress_handler` interrupts a VACUUM deterministically in compaction tests.
+rusqlite = { workspace = true, features = ["hooks"] }
 syn = { workspace = true, features = ["visit"] }
 tempfile.workspace = true
 tracing-subscriber.workspace = true

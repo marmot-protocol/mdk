@@ -47,11 +47,22 @@ impl MarmotAppRuntime {
         account_ref: &str,
     ) -> Result<AttachmentStorageUsage, AppError> {
         self.attachment_read_with(account_ref, |app, label, storage, _| {
+            let progress = app.legacy_media_migration(label);
+            // A compaction holds the database: answer from the usage it
+            // measured just before, instead of waiting for it to finish.
+            if let Some(mut usage) = progress
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .compacting
+                .clone()
+            {
+                usage.migration = AttachmentMigrationState::Compacting;
+                return Ok(usage);
+            }
             let mut usage = storage
                 .app_storage()
                 .attachment_storage_usage(crate::unix_now_seconds())?;
-            usage.migration = app
-                .legacy_media_migration(label)
+            usage.migration = progress
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .state(usage.migration);
@@ -177,6 +188,9 @@ impl MarmotAppRuntime {
                     media.unlink_released(&batch.released_files);
                     removed += batch.removed as u64;
                     if !batch.more || batch.removed == 0 {
+                        // Legacy bodies freed database pages: return them
+                        // once the database is incremental.
+                        crate::media::storage_compaction::reclaim(&storage.app_storage());
                         return Ok(removed);
                     }
                 }

@@ -40,6 +40,9 @@ pub(super) struct Admission {
     upload_cursor: Arc<std::sync::Mutex<Option<storage_sqlite::AttachmentUploadOwner>>>,
     /// The legacy body migration batch running on the blocking pool, if any.
     legacy_migration: Option<tokio::task::JoinHandle<()>>,
+    /// The one-time database compaction started under this worker; it is
+    /// not attempted again until the next worker ownership.
+    compaction_attempted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Starts a media sweep on the blocking pool unless one is still running:
@@ -112,10 +115,12 @@ fn spawn_upload_promotion(
 }
 
 /// Starts one batch of moving legacy database bodies into the media store
-/// (mdk#2314 step 6) on the blocking pool, unless one is still running. The
-/// account worker calls this once per maintenance tick, after readiness. A
-/// batch that pauses for free space, resumes, finishes, or drops a corrupt
-/// body wakes attachment observers.
+/// (mdk#2314 step 6) on the blocking pool, unless one is still running, and
+/// then returns the database's freed pages to the filesystem (compacting it
+/// once when due). The account worker calls this once per maintenance tick,
+/// after readiness. A batch that pauses for free space, resumes, finishes,
+/// or drops a corrupt body wakes attachment observers, and so does the start
+/// and end of a compaction.
 pub(super) fn spawn_legacy_migration(
     client: &AppClient,
     shared: &RuntimeSharedServices,
@@ -132,6 +137,7 @@ pub(super) fn spawn_legacy_migration(
     let app = client.app.clone();
     let label = client.state.label.clone();
     let updates = shared.attachment_updates.clone();
+    let compaction_attempted = admission.compaction_attempted.clone();
     admission.legacy_migration = Some(tokio::task::spawn_blocking(move || {
         let started = (|| {
             let storage = app.account_storage(&label)?;
@@ -151,16 +157,27 @@ pub(super) fn spawn_legacy_migration(
             return;
         };
         let account_dir = app.account_dir(&label);
+        let free = || crate::media::attachment_resume::available_space(&account_dir);
+        let progress = app.legacy_media_migration(&label);
+        let app_storage = storage.app_storage();
         let changed = crate::media::legacy_migration::run_batch(
-            &storage.app_storage(),
+            &app_storage,
             &media,
             reserve,
-            &|| crate::media::attachment_resume::available_space(&account_dir),
-            &app.legacy_media_migration(&label),
+            &free,
+            &progress,
         );
         if changed {
             updates.send_modify(|_| {});
         }
+        crate::media::storage_compaction::maintain(
+            &app_storage,
+            reserve,
+            &free,
+            &progress,
+            &compaction_attempted,
+            &|| updates.send_modify(|_| {}),
+        );
     }));
 }
 

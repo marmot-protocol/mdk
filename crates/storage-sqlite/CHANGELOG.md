@@ -78,6 +78,14 @@
 
 ### Added
 
+- Database compaction (mdk#2314 step 6): `database_space` reports the account
+  database's pages (`DatabaseSpace`: size, free pages, live bytes, whether it
+  is incremental), `compact_database` switches it to
+  `auto_vacuum=INCREMENTAL` with one `VACUUM` between WAL checkpoints (an
+  interrupted one changes nothing), and `reclaim_free_pages` returns freed
+  pages in bounded steps afterwards. `AttachmentMigrationState` adds
+  `Compacting`.
+
 - Moving legacy attachment bodies into the media store (mdk#2314 step 6):
   `legacy_attachment_bodies` lists completed legacy database bodies smallest
   first, `legacy_attachment_reader` streams one (`LegacyBodyReader`, which

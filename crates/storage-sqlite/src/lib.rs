@@ -29,6 +29,7 @@ pub use app::account_recovery::{
 };
 pub use app::local_submissions::LocalSubmission;
 pub use app::media_catalog::{SlotPublication, SqliteMediaCatalog, media_storage_error};
+pub use app::storage_compaction::DatabaseSpace;
 pub use app::transport::delivery_spill::{
     DeliverySpillDisposition, DeliverySpillLimits, SpilledDelivery, SpilledDeliveryBatch,
     SpilledDeliveryDeferral,
