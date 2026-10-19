@@ -75,8 +75,8 @@ const SDK_RELAY_BATCH_MAX_IN_FLIGHT: usize = 4;
 const SDK_PUBLISH_RELAY_IDLE_LIMIT: usize = 16;
 const SDK_PUBLISH_RELAY_IDLE_WAIT: Duration = Duration::from_secs(60);
 /// One route gets a strict pass-wide budget, including set comparison, replay
-/// fetch, decoding, and materialization. The app rotates routes durably, so a
-/// slow route cannot consume the whole account startup quantum.
+/// fetch, decoding, and materialization. The app can impose a shorter
+/// account-wide deadline for background work.
 const SDK_RECONCILIATION_WAIT: Duration = Duration::from_secs(2);
 const SDK_RECONCILIATION_NEGOTIATION_WAIT: Duration = Duration::from_millis(500);
 /// Fetch a bounded rotating portion of the remote-only set. Durable admission
@@ -1380,6 +1380,8 @@ impl NostrSdkRelayClient {
     /// NIP-77 compares event ids, including SDK-seen events that the account
     /// could not retain. Replay is bounded independently of the set difference.
     /// `progress` belongs to this account and route and must survive rebuilds.
+    /// `deadline` leaves the caller time to admit partial results or recover
+    /// an epoch gap; the SDK's own route allowance can only shorten it.
     pub async fn reconcile_subscription(
         &self,
         subscription: NostrSubscription,
@@ -1387,7 +1389,9 @@ impl NostrSdkRelayClient {
         reconcile_since: u64,
         reconcile_until: u64,
         progress: &dyn NostrReconciliationProgress,
+        deadline: tokio::time::Instant,
     ) -> Result<(NostrReconciliationSummary, Vec<NostrRelayEvent>), TransportAdapterError> {
+        let deadline = deadline.min(tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT);
         if let Some(account_client) = self.account_client(subscription.account_id()).await? {
             return Box::pin(account_client.reconcile_subscription(
                 subscription,
@@ -1395,6 +1399,7 @@ impl NostrSdkRelayClient {
                 reconcile_since,
                 reconcile_until,
                 progress,
+                deadline,
             ))
             .await;
         }
@@ -1438,9 +1443,11 @@ impl NostrSdkRelayClient {
             .collect::<Vec<_>>();
         let options = SyncOptions::new()
             .initial_timeout(SDK_RECONCILIATION_NEGOTIATION_WAIT)
+            // The route guard, not an indistinguishable SDK idle timeout,
+            // classifies a relay that answered once and then went silent.
+            .idle_timeout(SDK_RECONCILIATION_WAIT)
             .direction(SyncDirection::Down)
             .dry_run();
-        let deadline = tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT;
         let syncs = endpoints.iter().cloned().map(|endpoint| {
             let client = self.client.clone();
             let filter = plan.filter.clone();
@@ -1455,6 +1462,9 @@ impl NostrSdkRelayClient {
                         Ok(None) => return Err(NostrReconciliationFailure::NotInPool),
                         Err(_) => return Err(NostrReconciliationFailure::LocalError),
                     };
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(NostrReconciliationFailure::RouteTimeout);
+                    }
                     sync_watching_neg_cap(&relay, filter, items, options).await
                 })
                 .await
@@ -1827,6 +1837,12 @@ impl NostrSdkRelayClient {
             }
             // Save only the first ID before I/O, as a one-ID request did; the
             // response decides how far past it the cursor moves.
+            let remaining_time =
+                fetch_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining_time.is_zero() {
+                out_of_time = true;
+                break;
+            }
             progress.save_cursor(Some(event_id.to_bytes()))?;
             requests += 1;
             let result = self
@@ -2514,6 +2530,9 @@ impl NostrSdkRelayClient {
                         Ok(None) => return Err(NostrReconciliationFailure::NotInPool),
                         Err(_) => return Err(NostrReconciliationFailure::LocalError),
                     };
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(NostrReconciliationFailure::RouteTimeout);
+                    }
                     sync_watching_neg_cap(&relay, filter, items, options).await
                 })
                 .await
@@ -4573,8 +4592,9 @@ fn is_neg_cap_notice(notification: &nostr_sdk::relay::RelayNotification) -> bool
 /// Classify a failed SDK negentropy sync. Only the reason's category is kept.
 fn sync_failure(error: &nostr_sdk::prelude::Error, cap_notice: bool) -> NostrReconciliationFailure {
     match error.kind() {
-        // The SDK's idle timeout outlasts the pass deadline, so its timeout
-        // is the first-reply timeout.
+        // SyncOptions keeps the idle timer at the full route allowance.
+        // The outer route guard therefore wins after a first reply; an SDK
+        // Timeout here still means no first reply arrived in time.
         SdkErrorKind::Timeout if cap_notice => NostrReconciliationFailure::NegCapNotice,
         SdkErrorKind::Timeout => NostrReconciliationFailure::FirstReplyTimeout,
         // NEG-ERR. A dry run downloads nothing, so no download CLOSED.
@@ -6593,7 +6613,14 @@ mod tests {
             attempt: SubscriptionAttempt::INITIAL,
         };
         let (_, fetched) = sdk
-            .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
+            .reconcile_subscription(
+                subscription.clone(),
+                &[],
+                0,
+                u64::MAX,
+                &progress,
+                tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT,
+            )
             .await
             .unwrap();
         assert_eq!(fetched.len(), 1);
@@ -6620,7 +6647,14 @@ mod tests {
             created_at: event.created_at.as_secs(),
         }];
         let (_, after_admission) = sdk
-            .reconcile_subscription(subscription, &inventory, 0, u64::MAX, &progress)
+            .reconcile_subscription(
+                subscription,
+                &inventory,
+                0,
+                u64::MAX,
+                &progress,
+                tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT,
+            )
             .await
             .unwrap();
         assert!(
@@ -6708,7 +6742,7 @@ mod tests {
         tokio::select! {
             biased;
             _ = progress.saved.notified() => {}
-            result = sdk.reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress) => {
+            result = sdk.reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress, tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT) => {
                 panic!("reconciliation completed before cancellation: {result:?}");
             }
         }
@@ -6719,7 +6753,14 @@ mod tests {
                 .any(|event| event.id.to_bytes() > after_cancel)
         );
         let (_, resumed) = sdk
-            .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
+            .reconcile_subscription(
+                subscription.clone(),
+                &[],
+                0,
+                u64::MAX,
+                &progress,
+                tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT,
+            )
             .await
             .unwrap();
         let resumed_ids = resumed
@@ -6737,7 +6778,14 @@ mod tests {
         progress.save_cursor(None).unwrap();
         let mut notifications = sdk.client.notifications();
         let (_, first) = sdk
-            .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
+            .reconcile_subscription(
+                subscription.clone(),
+                &[],
+                0,
+                u64::MAX,
+                &progress,
+                tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT,
+            )
             .await
             .unwrap();
         assert_eq!(first.len(), SDK_RECONCILIATION_MAX_ITEMS_PER_ENDPOINT);
@@ -6766,7 +6814,14 @@ mod tests {
             .collect::<HashSet<_>>();
         for _ in 0..9 {
             let (_, rotated) = sdk
-                .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
+                .reconcile_subscription(
+                    subscription.clone(),
+                    &[],
+                    0,
+                    u64::MAX,
+                    &progress,
+                    tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT,
+                )
                 .await
                 .unwrap();
             reached.extend(rotated.into_iter().map(|event| event.event.id));
@@ -6788,7 +6843,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let (_, second) = sdk
-            .reconcile_subscription(subscription, &inventory, 0, u64::MAX, &progress)
+            .reconcile_subscription(
+                subscription,
+                &inventory,
+                0,
+                u64::MAX,
+                &progress,
+                tokio::time::Instant::now() + SDK_RECONCILIATION_WAIT,
+            )
             .await
             .unwrap();
         assert_eq!(second.len(), 1);

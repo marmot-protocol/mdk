@@ -8,6 +8,8 @@ use nostr_relay_builder::MockRelay;
 use std::sync::Mutex;
 use transport_nostr_adapter::NostrReconciliationProgress;
 
+const RECONCILIATION_CALLER_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Default)]
 struct ComparisonCursor(Mutex<Option<[u8; 32]>>);
 
@@ -138,6 +140,7 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
             inventory.since,
             crate::unix_now_seconds(),
             &ComparisonCursor::default(),
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
         )
         .await
         .unwrap()
@@ -171,6 +174,7 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
             inventory.since,
             crate::unix_now_seconds(),
             &ComparisonCursor::default(),
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
         )
         .await
         .unwrap()

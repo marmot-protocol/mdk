@@ -14,6 +14,8 @@ use transport_nostr_adapter::{
     NostrReconciliationProgress, NostrSdkRelayClient, NostrSubscription, SubscriptionAttempt,
 };
 
+const RECONCILIATION_CALLER_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Default)]
 struct TextCounts {
     client_text: AtomicUsize,
@@ -140,7 +142,14 @@ async fn empty_endpoint_comparison_keeps_public_no_op_result() {
         attempt: SubscriptionAttempt::INITIAL,
     };
     let (summary, events) = sdk
-        .reconcile_subscription(subscription, &[], 0, u64::MAX, &Cursor::default())
+        .reconcile_subscription(
+            subscription,
+            &[],
+            0,
+            u64::MAX,
+            &Cursor::default(),
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .expect("empty endpoint set remains a no-op");
     assert_eq!(summary, Default::default());
@@ -189,7 +198,14 @@ async fn unsupported_endpoint_is_reprobed_after_connection_generation_changes() 
     let progress = Cursor::default();
     for _ in 0..2 {
         let (summary, events) = sdk
-            .reconcile_subscription(subscription.clone(), &[], 0, u64::MAX, &progress)
+            .reconcile_subscription(
+                subscription.clone(),
+                &[],
+                0,
+                u64::MAX,
+                &progress,
+                tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+            )
             .await
             .unwrap();
         assert_eq!(summary.relays_succeeded, 0);
@@ -233,7 +249,14 @@ async fn unsupported_endpoint_is_reprobed_after_connection_generation_changes() 
     .expect("same URL establishes a new connection");
 
     let (summary, events) = sdk
-        .reconcile_subscription(subscription, &[], 0, u64::MAX, &progress)
+        .reconcile_subscription(
+            subscription,
+            &[],
+            0,
+            u64::MAX,
+            &progress,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(summary.relays_succeeded, 1);

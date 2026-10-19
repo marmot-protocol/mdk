@@ -223,8 +223,9 @@ relay filter, so storage, set exchange, and startup memory remain bounded. Event
 the automatic late-publication repair contract. A first start after the inventory migration begins empty and therefore
 discovers the relay-held difference inside that bounded window; it fetches at most 128 deterministic ids per route pass,
 then durable ingestion removes that subset from the next dry-run comparison. The account attempts at most four routes
-per startup pass, using a durable rotating cursor and a two-second per-route deadline, so a slow or unsupported route
-cannot permanently hide later routes. Retiring a group transport route deletes its inventory and route state.
+per startup pass, using a durable rotating cursor. Each route gets an equal share of what is left of the 10-second pass,
+so a slow or unsupported route cannot permanently hide later routes. Retiring a group transport route deletes its
+inventory and route state.
 
 A signed, in-payload **per-sender monotonic counter** is an optional further hint: a client that holds sender A's #5 and
 #7 but not #6 knows to delay settling and re-fetch. It is protocol evidence (inside the MLS payload, signed), so it is

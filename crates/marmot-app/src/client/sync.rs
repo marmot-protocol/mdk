@@ -72,7 +72,9 @@ pub(crate) enum SyncMode {
 /// account worker indefinitely and the next sync can resume from a smaller
 /// difference.
 pub(super) const TRANSPORT_RECONCILIATION_QUANTUM: Duration = Duration::from_secs(10);
-/// Four two-second route passes leave margin inside the account-wide quantum.
+/// Four routes share the account-wide quantum. The network job gives each an
+/// equal share of what is left of it, so a slow route cannot spend the time of
+/// the routes after it.
 /// The durable cursor starts the next pass after the rotation prefix the last
 /// pass covered, so it must hold at least two routes: see
 /// [`order_reconciliation_pass`].

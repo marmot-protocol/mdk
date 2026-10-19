@@ -30,6 +30,8 @@ fn failure_classes(summary: &NostrReconciliationSummary) -> Vec<NostrReconciliat
         .collect()
 }
 
+const RECONCILIATION_CALLER_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(60);
+
 const ROUTE: [u8; 32] = [0xc3; 32];
 /// The adapter's ordinary per-pass, per-relay result budgets.
 const PASS_BYTE_BUDGET: usize = 1024 * 1024;
@@ -303,7 +305,14 @@ async fn large_retained_history_and_sparse_gap_use_finite_bounded_acquisition() 
     let route = subscription(&urls);
     let all_retained = retained.iter().chain(&missing).cloned().collect::<Vec<_>>();
     let (caught_up, events) = sdk
-        .reconcile_subscription(route.clone(), &all_retained, SINCE, UNTIL, &cursor)
+        .reconcile_subscription(
+            route.clone(),
+            &all_retained,
+            SINCE,
+            UNTIL,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(caught_up.relays_succeeded, 2);
@@ -336,7 +345,14 @@ async fn large_retained_history_and_sparse_gap_use_finite_bounded_acquisition() 
         let before_left = left_counts.sent_event_json.load(Ordering::SeqCst);
         let before_right = right_counts.sent_event_json.load(Ordering::SeqCst);
         let (summary, events) = sdk
-            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .reconcile_subscription(
+                route.clone(),
+                &admitted,
+                SINCE,
+                UNTIL,
+                &cursor,
+                tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+            )
             .await
             .unwrap();
         assert_eq!(summary.relays_succeeded + summary.relays_failed, 2);
@@ -389,7 +405,14 @@ async fn large_retained_history_and_sparse_gap_use_finite_bounded_acquisition() 
         right_counts.requests.load(Ordering::SeqCst),
     );
     let (settled, events) = sdk
-        .reconcile_subscription(route, &admitted, SINCE, UNTIL, &cursor)
+        .reconcile_subscription(
+            route,
+            &admitted,
+            SINCE,
+            UNTIL,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(settled.relays_failed, 0);
@@ -493,7 +516,14 @@ async fn large_gap_of_small_events_recovers_in_few_passes() {
             right_counts.sent_event_json.load(Ordering::SeqCst),
         ];
         let (_, events) = sdk
-            .reconcile_subscription(route.clone(), &admitted, 0, u64::MAX, &cursor)
+            .reconcile_subscription(
+                route.clone(),
+                &admitted,
+                0,
+                u64::MAX,
+                &cursor,
+                tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+            )
             .await
             .unwrap();
         largest_pass_payload = largest_pass_payload
@@ -658,7 +688,14 @@ async fn complementary_relay_results_share_one_pass_allowance() {
     let route = subscription(&urls);
     let cursor = Cursor::default();
     let (_, first) = sdk
-        .reconcile_subscription(route.clone(), &[], 0, u64::MAX, &cursor)
+        .reconcile_subscription(
+            route.clone(),
+            &[],
+            0,
+            u64::MAX,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert!(
@@ -675,7 +712,14 @@ async fn complementary_relay_results_share_one_pass_allowance() {
         })
         .collect::<Vec<_>>();
     let (_, second) = sdk
-        .reconcile_subscription(route, &admitted, 0, u64::MAX, &cursor)
+        .reconcile_subscription(
+            route,
+            &admitted,
+            0,
+            u64::MAX,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(second.len(), 1, "the deferred large event arrives next");
@@ -759,7 +803,14 @@ async fn deferred_event_leads_across_disjoint_relays(cached: bool) {
             break;
         }
         let (_, returned) = sdk
-            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .reconcile_subscription(
+                route.clone(),
+                &admitted,
+                SINCE,
+                UNTIL,
+                &cursor,
+                tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+            )
             .await
             .unwrap();
         let large_admitted = admitted
@@ -816,7 +867,14 @@ async fn large_event_cut_from_a_batch_leads_the_next_pass() {
     let route = subscription(&[url]);
     let cursor = Cursor::default();
     let (_, first) = sdk
-        .reconcile_subscription(route.clone(), &[], SINCE, UNTIL, &cursor)
+        .reconcile_subscription(
+            route.clone(),
+            &[],
+            SINCE,
+            UNTIL,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert!(
@@ -832,7 +890,14 @@ async fn large_event_cut_from_a_batch_leads_the_next_pass() {
         })
         .collect::<Vec<_>>();
     let (_, second) = sdk
-        .reconcile_subscription(route, &admitted, SINCE, UNTIL, &cursor)
+        .reconcile_subscription(
+            route,
+            &admitted,
+            SINCE,
+            UNTIL,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert!(
@@ -868,7 +933,14 @@ async fn a_gap_larger_than_one_pass_arrives_oldest_first() {
     while !pending.is_empty() && passes < 20 {
         passes += 1;
         let (summary, events) = sdk
-            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .reconcile_subscription(
+                route.clone(),
+                &admitted,
+                SINCE,
+                UNTIL,
+                &cursor,
+                tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+            )
             .await
             .unwrap();
         assert!(!events.is_empty(), "pass {passes} made no progress");
@@ -1006,6 +1078,7 @@ async fn older_history_that_appears_later_still_arrives_first() {
             SINCE,
             UNTIL,
             &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
         )
         .await
         .unwrap();
@@ -1014,7 +1087,14 @@ async fn older_history_that_appears_later_still_arrives_first() {
     // The older relay joins: its whole gap is older than anything left.
     let route = subscription(&[recent_url, older_url]);
     let (_, events) = sdk
-        .reconcile_subscription(route, &admitted, SINCE, UNTIL, &cursor)
+        .reconcile_subscription(
+            route,
+            &admitted,
+            SINCE,
+            UNTIL,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     let older_ids = older_gap
@@ -1060,7 +1140,14 @@ async fn never_admitted_history_ahead_of_a_large_gap_keeps_it_ordered() {
             break;
         }
         let (_, events) = sdk
-            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .reconcile_subscription(
+                route.clone(),
+                &admitted,
+                SINCE,
+                UNTIL,
+                &cursor,
+                tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+            )
             .await
             .unwrap();
         let returned = events
@@ -1140,7 +1227,14 @@ async fn a_gap_too_large_in_bytes_still_arrives_oldest_first() {
     while !pending.is_empty() && passes < 30 {
         passes += 1;
         let (_, events) = sdk
-            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .reconcile_subscription(
+                route.clone(),
+                &admitted,
+                SINCE,
+                UNTIL,
+                &cursor,
+                tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+            )
             .await
             .unwrap();
         let returned = events
@@ -1200,7 +1294,14 @@ async fn a_relay_that_misses_the_probes_cannot_make_newer_history_look_oldest() 
     // recovery parks it with its notice.
     for pass in 1..=5 {
         let (_, events) = sdk
-            .reconcile_subscription(route.clone(), &[], SINCE, UNTIL, &cursor)
+            .reconcile_subscription(
+                route.clone(),
+                &[],
+                SINCE,
+                UNTIL,
+                &cursor,
+                tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+            )
             .await
             .unwrap();
         assert!(
@@ -1252,7 +1353,14 @@ async fn an_unproven_delivery_boundary_holds_a_cut_short_pass() {
     let route = subscription(&[url]);
     let cursor = Cursor::default();
     let (summary, first) = sdk
-        .reconcile_subscription(route.clone(), &[], SINCE, UNTIL, &cursor)
+        .reconcile_subscription(
+            route.clone(),
+            &[],
+            SINCE,
+            UNTIL,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert!(first.is_empty(), "no proven prefix, so nothing is returned");
@@ -1268,7 +1376,14 @@ async fn an_unproven_delivery_boundary_holds_a_cut_short_pass() {
     // window unordered, and the events stay fetchable.
     for pass in 2..=4 {
         let (summary, events) = sdk
-            .reconcile_subscription(route.clone(), &[], SINCE, UNTIL, &cursor)
+            .reconcile_subscription(
+                route.clone(),
+                &[],
+                SINCE,
+                UNTIL,
+                &cursor,
+                tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+            )
             .await
             .unwrap();
         assert!(events.is_empty(), "pass {pass} returned an unproven prefix");
@@ -1317,7 +1432,14 @@ async fn a_second_the_budget_splits_is_held_together() {
     // that second run ahead of a message left behind in it.
     for pass in 1..=4 {
         let (_, events) = sdk
-            .reconcile_subscription(route.clone(), &[], SINCE, UNTIL, &cursor)
+            .reconcile_subscription(
+                route.clone(),
+                &[],
+                SINCE,
+                UNTIL,
+                &cursor,
+                tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+            )
             .await
             .unwrap();
         assert!(
@@ -1376,7 +1498,14 @@ async fn a_cached_event_over_the_ceiling_cannot_hold_a_narrow_window() {
             break;
         }
         let (_, returned) = sdk
-            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .reconcile_subscription(
+                route.clone(),
+                &admitted,
+                SINCE,
+                UNTIL,
+                &cursor,
+                tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+            )
             .await
             .unwrap();
         // Recovery parks a route after three quiet passes in a row.
@@ -1452,7 +1581,14 @@ async fn an_event_the_shared_allowance_dropped_still_holds_newer_ones() {
             break;
         }
         let (_, returned) = sdk
-            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .reconcile_subscription(
+                route.clone(),
+                &admitted,
+                SINCE,
+                UNTIL,
+                &cursor,
+                tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+            )
             .await
             .unwrap();
         for event in &returned {
@@ -1500,7 +1636,14 @@ async fn a_search_no_relay_answers_fetches_nothing() {
     let sdk = sdk_on(std::slice::from_ref(&url)).await;
     let route = subscription(&[url]);
     let (summary, events) = sdk
-        .reconcile_subscription(route, &[], SINCE, UNTIL, &Cursor::default())
+        .reconcile_subscription(
+            route,
+            &[],
+            SINCE,
+            UNTIL,
+            &Cursor::default(),
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert!(
@@ -1546,7 +1689,14 @@ async fn a_request_that_times_out_holds_the_newer_events_it_returned() {
     let sdk = sdk_on(std::slice::from_ref(&url)).await;
     let route = subscription(&[url]);
     let (_, returned) = sdk
-        .reconcile_subscription(route, &[], SINCE, UNTIL, &Cursor::default())
+        .reconcile_subscription(
+            route,
+            &[],
+            SINCE,
+            UNTIL,
+            &Cursor::default(),
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert!(
@@ -1587,7 +1737,14 @@ async fn history_never_admitted_cannot_hold_the_oldest_window() {
             break;
         }
         let (_, events) = sdk
-            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .reconcile_subscription(
+                route.clone(),
+                &admitted,
+                SINCE,
+                UNTIL,
+                &cursor,
+                tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+            )
             .await
             .unwrap();
         for event in events {
@@ -1655,7 +1812,14 @@ async fn ids_a_relay_never_serves_cannot_hold_the_oldest_window() {
             break;
         }
         let (_, events) = sdk
-            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .reconcile_subscription(
+                route.clone(),
+                &admitted,
+                SINCE,
+                UNTIL,
+                &cursor,
+                tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+            )
             .await
             .unwrap();
         for event in events {
@@ -1825,7 +1989,14 @@ async fn warm_full_event_cache_resumes_under_combined_result_budget() {
     // that fetched newer events first may return none of them.
     for _ in 0..12 {
         let (summary, events) = sdk
-            .reconcile_subscription(route.clone(), &admitted, SINCE, UNTIL, &cursor)
+            .reconcile_subscription(
+                route.clone(),
+                &admitted,
+                SINCE,
+                UNTIL,
+                &cursor,
+                tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+            )
             .await
             .unwrap();
         assert!(returned_json_bytes(&events) <= PASS_BYTE_BUDGET);
@@ -1881,7 +2052,14 @@ async fn cached_id_over_single_object_ceiling_keeps_smaller_id_reachable() {
     let (left, right, sdk, route, left_counts, right_counts, items) =
         cached_fixture(&[5 * 1024 * 1024 + 1024, 1024], &[0, 1]).await;
     let (summary, events) = sdk
-        .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
+        .reconcile_subscription(
+            route,
+            &[],
+            0,
+            u64::MAX,
+            &Cursor::default(),
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     let small = items
@@ -1913,7 +2091,14 @@ async fn one_large_network_event_is_recovered_within_single_object_ceiling() {
     let (left, right, sdk, route, left_counts, right_counts, items) =
         cached_fixture(&[OVER_PASS_EVENT_BYTES], &[]).await;
     let (summary, events) = sdk
-        .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
+        .reconcile_subscription(
+            route,
+            &[],
+            0,
+            u64::MAX,
+            &Cursor::default(),
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(summary.relays_failed, 0);
@@ -1940,14 +2125,28 @@ async fn warm_older_large_event_arrives_before_newer_small_event() {
     // The small event fits first, but the older large one did not: nothing
     // newer than it may be returned yet.
     let (first, held) = sdk
-        .reconcile_subscription(route.clone(), &[], SINCE, UNTIL, &cursor)
+        .reconcile_subscription(
+            route.clone(),
+            &[],
+            SINCE,
+            UNTIL,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(first.relays_failed, 2);
     assert!(held.is_empty());
     // The large event leads the next pass, alone in its allowance.
     let (_, large) = sdk
-        .reconcile_subscription(route.clone(), &[], SINCE, UNTIL, &cursor)
+        .reconcile_subscription(
+            route.clone(),
+            &[],
+            SINCE,
+            UNTIL,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(large.len(), 1);
@@ -1955,7 +2154,14 @@ async fn warm_older_large_event_arrives_before_newer_small_event() {
     assert!(returned_json_bytes(&large) > PASS_BYTE_BUDGET);
     assert!(returned_json_bytes(&large) <= 5 * 1024 * 1024);
     let (next, small) = sdk
-        .reconcile_subscription(route, &items[1..], SINCE, UNTIL, &cursor)
+        .reconcile_subscription(
+            route,
+            &items[1..],
+            SINCE,
+            UNTIL,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(next.relays_failed, 0);
@@ -1977,13 +2183,27 @@ async fn older_large_network_event_arrives_before_newer_cached_small_event() {
     // The cached newer small event is in hand, but the older large network
     // event did not fit after it: nothing newer than it is returned yet.
     let (first, held) = sdk
-        .reconcile_subscription(route.clone(), &[], SINCE, UNTIL, &cursor)
+        .reconcile_subscription(
+            route.clone(),
+            &[],
+            SINCE,
+            UNTIL,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(first.relays_failed, 2);
     assert!(held.is_empty());
     let (_, large) = sdk
-        .reconcile_subscription(route.clone(), &[], SINCE, UNTIL, &cursor)
+        .reconcile_subscription(
+            route.clone(),
+            &[],
+            SINCE,
+            UNTIL,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1995,7 +2215,14 @@ async fn older_large_network_event_arrives_before_newer_cached_small_event() {
     assert!(returned_json_bytes(&large) > PASS_BYTE_BUDGET);
     assert!(returned_json_bytes(&large) <= 5 * 1024 * 1024);
     let (next, small) = sdk
-        .reconcile_subscription(route, &items[1..], SINCE, UNTIL, &cursor)
+        .reconcile_subscription(
+            route,
+            &items[1..],
+            SINCE,
+            UNTIL,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(next.relays_failed, 0);
@@ -2019,13 +2246,27 @@ async fn unadmitted_small_network_id_does_not_hide_deferred_large_id() {
     // The small ID comes back first but is newer than the large one the
     // budget cut off, so it is held back.
     let (first_summary, first) = sdk
-        .reconcile_subscription(route.clone(), &[], SINCE, UNTIL, &cursor)
+        .reconcile_subscription(
+            route.clone(),
+            &[],
+            SINCE,
+            UNTIL,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(first_summary.relays_failed, 2);
     assert!(first.is_empty());
     let (second_summary, second) = sdk
-        .reconcile_subscription(route, &[], SINCE, UNTIL, &cursor)
+        .reconcile_subscription(
+            route,
+            &[],
+            SINCE,
+            UNTIL,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(second.len(), 1, "the deferred ID must lead the next pass");
@@ -2050,7 +2291,14 @@ async fn duplicate_route_endpoint_preserves_cached_prefix_and_unique_obligations
         endpoints[0].as_str().trim_end_matches('/')
     )));
     let (summary, events) = sdk
-        .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
+        .reconcile_subscription(
+            route,
+            &[],
+            0,
+            u64::MAX,
+            &Cursor::default(),
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(events.len(), 2, "cached prefix and network suffix survive");
@@ -2082,7 +2330,14 @@ async fn large_network_result_survives_one_withholding_endpoint() {
         cached_fixture(&[OVER_PASS_EVENT_BYTES], &[]).await;
     right_counts.suppress_events.store(true, Ordering::SeqCst);
     let (summary, events) = sdk
-        .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
+        .reconcile_subscription(
+            route,
+            &[],
+            0,
+            u64::MAX,
+            &Cursor::default(),
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(summary.relays_succeeded, 1);
@@ -2103,7 +2358,14 @@ async fn mixed_cache_and_network_share_one_return_budget() {
         cached_fixture(&[LARGE_EVENT_BYTES; 4], &[0]).await;
     let cursor = Cursor::default();
     let (summary, first) = sdk
-        .reconcile_subscription(route.clone(), &[], 0, u64::MAX, &cursor)
+        .reconcile_subscription(
+            route.clone(),
+            &[],
+            0,
+            u64::MAX,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(summary.relays_failed, 2);
@@ -2128,7 +2390,14 @@ async fn mixed_cache_and_network_share_one_return_budget() {
         })
         .collect::<Vec<_>>();
     let (next, remaining) = sdk
-        .reconcile_subscription(route, &admitted, 0, u64::MAX, &cursor)
+        .reconcile_subscription(
+            route,
+            &admitted,
+            0,
+            u64::MAX,
+            &cursor,
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(next.relays_failed, 0);
@@ -2152,7 +2421,14 @@ async fn duplicated_endpoint_item_limit_keeps_partial_event_and_incomplete_summa
         .extra_event_copies
         .store(PASS_ITEM_BUDGET + 20, Ordering::SeqCst);
     let (summary, events) = sdk
-        .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
+        .reconcile_subscription(
+            route,
+            &[],
+            0,
+            u64::MAX,
+            &Cursor::default(),
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(summary.relays_succeeded, 1);
@@ -2173,7 +2449,14 @@ async fn silent_endpoint_deadline_keeps_healthy_partial_event_and_incomplete_sum
         one_missing_event_fixture().await;
     right_counts.drop_requests.store(true, Ordering::SeqCst);
     let (summary, events) = sdk
-        .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
+        .reconcile_subscription(
+            route,
+            &[],
+            0,
+            u64::MAX,
+            &Cursor::default(),
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(summary.relays_succeeded, 1);
@@ -2206,7 +2489,14 @@ async fn silent_and_fast_withholding_endpoint_resume_two_ids_across_paced_passes
         let mut seen = HashSet::new();
         for pass in 0..if silent { 2 } else { 1 } {
             let (summary, events) = sdk
-                .reconcile_subscription(route.clone(), &admitted, 0, u64::MAX, &cursor)
+                .reconcile_subscription(
+                    route.clone(),
+                    &admitted,
+                    0,
+                    u64::MAX,
+                    &cursor,
+                    tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+                )
                 .await
                 .unwrap();
             if silent {
@@ -2262,7 +2552,14 @@ async fn comparison_claim_without_exact_id_bytes_remains_incomplete() {
         one_missing_event_fixture().await;
     right_counts.suppress_events.store(true, Ordering::SeqCst);
     let (summary, events) = sdk
-        .reconcile_subscription(route, &[], 0, u64::MAX, &Cursor::default())
+        .reconcile_subscription(
+            route,
+            &[],
+            0,
+            u64::MAX,
+            &Cursor::default(),
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert_eq!(summary.relays_succeeded, 1);
@@ -2320,7 +2617,14 @@ async fn endpoint_with_nothing_missing_succeeds_while_a_silent_peer_fails() {
     }
     sdk.client().connect().await;
     let (summary, events) = sdk
-        .reconcile_subscription(subscription(&urls), &[], 0, u64::MAX, &Cursor::default())
+        .reconcile_subscription(
+            subscription(&urls),
+            &[],
+            0,
+            u64::MAX,
+            &Cursor::default(),
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+        )
         .await
         .unwrap();
     assert!(events.is_empty());

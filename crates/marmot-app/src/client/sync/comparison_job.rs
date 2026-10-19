@@ -299,6 +299,33 @@ async fn fetch_epoch_gap_window(
     events
 }
 
+/// When a route starting `now` must finish comparing, with `routes_left`
+/// routes (this one included) still to run before the pass ends at `deadline`.
+///
+/// Routes run one after another, and the rotation claimed every one of them
+/// when the grant froze. Each gets an equal share of what is left, so a slow
+/// relay on one route cannot spend the turns of the routes after it; time a
+/// fast route leaves unused carries over to the rest. The comparison also
+/// leaves the time the pass needs after it: an epoch-gap route's newest
+/// `window` from relays that could not compare, or else a margin for the hard
+/// guard to receive the SDK's partial result instead of cancelling it. That
+/// margin only binds on the last route. It is not the SDK's own reserve inside
+/// this deadline, which picks what a cut-short oldest-first window may return.
+fn comparison_deadline(
+    now: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    routes_left: usize,
+    window: Option<[u8; 32]>,
+) -> tokio::time::Instant {
+    let remaining = deadline.saturating_duration_since(now);
+    let share = remaining / u32::try_from(routes_left.max(1)).unwrap_or(u32::MAX);
+    let after = match window {
+        Some(_) => (remaining / 2).min(EPOCH_GAP_WINDOW_MAX_DURATION),
+        None => (remaining / 5).min(Duration::from_millis(400)),
+    };
+    (now + share).min(deadline - after)
+}
+
 impl ComparisonNetworkJob {
     /// Cancel the request and wait until its future has dropped the shared credit.
     pub(crate) async fn abort_and_wait(mut self) {
@@ -366,14 +393,16 @@ impl ComparisonNetworkJob {
                     .store(attempt_serial, Ordering::SeqCst);
                 ActiveCounter::new(witness.active_jobs.clone())
             });
-            let mut results = Vec::with_capacity(routes.len());
-            for frozen in routes {
+            let route_count = routes.len();
+            let mut results = Vec::with_capacity(route_count);
+            for (index, frozen) in routes.into_iter().enumerate() {
                 let FrozenRoute {
                     inventory,
                     initial_cursor,
                     window,
                 } = frozen;
-                if tokio::time::Instant::now() >= deadline {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
                     results.push(ComparisonRouteResult {
                         route: inventory.route,
                         initial_cursor,
@@ -388,6 +417,8 @@ impl ComparisonNetworkJob {
                 let progress = Arc::new(MemoryProgress {
                     cursor: Mutex::new(initial_cursor),
                 });
+                let comparison_deadline =
+                    comparison_deadline(now, deadline, route_count - index, window);
                 let run = async {
                     #[cfg(test)]
                     let _request_active = witness
@@ -416,6 +447,7 @@ impl ComparisonNetworkJob {
                                     inventory.since,
                                     inventory.until,
                                     progress.as_ref(),
+                                    comparison_deadline,
                                 )
                                 .await
                         }
@@ -427,6 +459,7 @@ impl ComparisonNetworkJob {
                                     inventory.since,
                                     inventory.until,
                                     progress.as_ref(),
+                                    comparison_deadline,
                                 )
                                 .await
                         }
@@ -1683,6 +1716,163 @@ mod tests {
         network
     }
 
+    #[test]
+    fn routes_split_what_is_left_of_the_pass() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + Duration::from_secs(10);
+        assert_eq!(
+            comparison_deadline(now, deadline, 4, None),
+            now + Duration::from_millis(2_500),
+            "the first of four routes gets a quarter, not the pass"
+        );
+        let later = now + Duration::from_secs(7);
+        assert_eq!(
+            comparison_deadline(later, deadline, 3, None),
+            later + Duration::from_secs(1),
+            "a slow route leaves the rest equal shares of what it left"
+        );
+        assert_eq!(
+            comparison_deadline(now, deadline, 1, None),
+            deadline - Duration::from_millis(400),
+            "the last route leaves the guard time to take its partial result"
+        );
+    }
+
+    #[test]
+    fn an_epoch_gap_route_keeps_time_for_its_window() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + Duration::from_secs(10);
+        let window = Some([7; 32]);
+        assert_eq!(
+            comparison_deadline(now, deadline, 1, window),
+            deadline - EPOCH_GAP_WINDOW_MAX_DURATION,
+            "a whole window fetch still fits after the comparison"
+        );
+        let late = deadline - Duration::from_secs(2);
+        assert_eq!(
+            comparison_deadline(late, deadline, 1, window),
+            late + Duration::from_secs(1),
+            "with little left, the comparison and window split it"
+        );
+    }
+
+    /// Holds every exact-ID query that names `id`, as a relay that never
+    /// finishes serving it.
+    #[derive(Clone, Debug, Default)]
+    struct HeldId {
+        id: Arc<Mutex<Option<String>>>,
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl nostr_relay_builder::prelude::QueryPolicy for HeldId {
+        fn admit_query<'a>(
+            &'a self,
+            query: &'a nostr_relay_builder::prelude::Filter,
+            _addr: &'a std::net::SocketAddr,
+        ) -> nostr_relay_builder::prelude::BoxedFuture<'a, nostr_relay_builder::prelude::PolicyResult>
+        {
+            Box::pin(async move {
+                let held = self.id.lock().unwrap().clone();
+                if held.is_some_and(|held| {
+                    query
+                        .ids
+                        .as_ref()
+                        .is_some_and(|ids| ids.iter().any(|id| id.to_hex() == held))
+                }) {
+                    self.hits.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                }
+                nostr_relay_builder::prelude::PolicyResult::Accept
+            })
+        }
+    }
+
+    /// A relay holds the inbox route's second exact-ID fetch. The SDK stops at
+    /// the route's comparison deadline and returns the event it already
+    /// fetched; the job's hard guard must not cancel that result. (A group
+    /// route would also need a boundary probe the held connection cannot
+    /// answer, and would rightly return nothing.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_fetch_keeps_the_fetched_prefix() {
+        use nostr_relay_builder::prelude::{
+            MemoryDatabase, MemoryDatabaseOptions, NostrDatabase, RelayBuilder,
+        };
+        let held = HeldId::default();
+        let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+            events: true,
+            max_events: Some(8),
+        });
+        let relay = nostr_relay_builder::LocalRelay::new(
+            RelayBuilder::default()
+                .query_policy(held.clone())
+                .database(database.clone()),
+        );
+        relay.run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let mut fixture = fixture_with_group_relays(Some(vec![url.clone()])).await;
+        let inbox = hex::encode(fixture.client.runtime.session().self_id().as_slice());
+        // The inbox pass fetches in ID order: the smaller ID goes first, alone.
+        let at = crate::unix_now_seconds() - 60;
+        let signed = |offset: u64, low_id: bool| loop {
+            let event = EventBuilder::new(Kind::GiftWrap, "welcome")
+                .tags([Tag::custom("p", [inbox.clone()])])
+                .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(at + offset))
+                .finalize(&Keys::generate())
+                .unwrap();
+            if (event.id.to_bytes()[0] < 128) == low_id {
+                break event;
+            }
+        };
+        let (fetched, withheld) = (signed(0, true), signed(1, false));
+        for event in [&fetched, &withheld] {
+            database
+                .save_event(&serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap())
+                .await
+                .unwrap();
+        }
+        *held.id.lock().unwrap() = Some(withheld.id.to_hex());
+        drop(fixture.client);
+        let real_app = crate::MarmotApp::with_relay_and_config(
+            fixture._dir.path(),
+            url,
+            crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+        );
+        fixture.client = client_on_app_relay_plane(&real_app, "alice").await;
+        fixture.client.test_comparison_results = None;
+        fixture.client.request_bounded_comparison().unwrap();
+        let (grant, _execution, _, _) = group_route_grant(&mut fixture).await;
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut job = ComparisonNetworkJob::start(
+            &fixture.client,
+            &grant,
+            capacity.try_acquire_owned().unwrap(),
+            ComparisonNetworkJob::automatic_deadline(),
+            None,
+        )
+        .unwrap();
+        let (_credit, network) = job.wait().await.unwrap();
+        assert!(
+            held.hits.load(Ordering::SeqCst) > 0,
+            "the relay held a fetch"
+        );
+        let result = network
+            .routes
+            .iter()
+            .find(|result| result.route == TransportReconciliationRoute::Inbox)
+            .unwrap();
+        let ComparisonRouteWorkResult::Returned(Ok(Some((_, events)))) = &result.result else {
+            panic!("the hard guard discarded the SDK's fetched prefix");
+        };
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event.id.clone())
+                .collect::<Vec<_>>(),
+            [fetched.id.to_hex()]
+        );
+        relay.shutdown();
+    }
+
     /// A large refused first ID spends the SDK's request budget on a prefix.
     /// A fresh SDK must resume from SQLite, not its previous set-aside cache,
     /// to batch the small IDs first and recover Bob's genuine MLS message.
@@ -1859,6 +2049,7 @@ mod tests {
                     inventory.since,
                     inventory.until,
                     &progress,
+                    tokio::time::Instant::now() + Duration::from_secs(20),
                 )
                 .await
                 .unwrap();

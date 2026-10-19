@@ -3556,6 +3556,7 @@ impl MarmotRelayPlaneAccountAdapter {
         reconcile_since: u64,
         reconcile_until: u64,
         progress: &dyn transport_nostr_adapter::NostrReconciliationProgress,
+        deadline: tokio::time::Instant,
     ) -> Result<
         Option<(
             NostrReconciliationSummary,
@@ -3591,6 +3592,7 @@ impl MarmotRelayPlaneAccountAdapter {
                 reconcile_since,
                 reconcile_until,
                 progress,
+                deadline,
             )
             .await;
         let metric = result
@@ -3614,6 +3616,7 @@ impl MarmotRelayPlaneAccountAdapter {
         reconcile_since: u64,
         reconcile_until: u64,
         progress: &dyn transport_nostr_adapter::NostrReconciliationProgress,
+        deadline: tokio::time::Instant,
     ) -> Result<
         Option<(
             NostrReconciliationSummary,
@@ -3655,6 +3658,7 @@ impl MarmotRelayPlaneAccountAdapter {
                 reconcile_since,
                 reconcile_until,
                 progress,
+                deadline,
             )
             .await;
         let metric = result

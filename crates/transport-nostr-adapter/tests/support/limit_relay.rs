@@ -55,7 +55,7 @@ pub const FLUSH_PREFIX: &str = "limit-relay-flush-";
 
 /// Negentropy v1 message: version 0x61, one range up to infinity (timestamp
 /// 0, empty id prefix) in Fingerprint mode (1) with a fingerprint no set has.
-const STALLING_NEG_MSG: &str = "61000001ffeeddccbbaa99887766554433221100";
+const MISMATCHED_NEG_MSG: &str = "61000001ffeeddccbbaa99887766554433221100";
 
 /// Injected misbehaviour for NEG sessions, switchable at runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,12 +67,14 @@ pub enum NegFault {
     /// Swallow every NEG-OPEN: the session is open on the relay, but nothing
     /// answers it (exercises the client's first-reply timeout).
     SilentOpen,
-    /// Answer NEG-OPEN at once with a crafted NEG-MSG holding one mismatched
-    /// fingerprint over the whole range, which obliges the client to send
-    /// another round, then swallow the client's NEG-MSGs. The first-reply
-    /// timeout is satisfied, so only the caller's overall deadline ends the
-    /// sync.
-    FingerprintThenStall,
+    /// Send one mismatched fingerprint, then swallow subsequent NEG-MSGs.
+    StallAfterReply,
+    /// Answer NEG-OPEN and every subsequent NEG-MSG with a mismatched
+    /// whole-range fingerprint, paced at 250 ms per round. The comparison
+    /// never converges, but keeps receiving relevant replies: neither the
+    /// SDK's first-reply timeout nor its idle timeout ends the sync, so the
+    /// caller's overall deadline must do so.
+    FingerprintLoop,
 }
 
 /// How a refused REQ is answered.
@@ -188,8 +190,9 @@ pub struct LimitStats {
     pub neg_cap_notices: usize,
     /// NEG-ERR frames the upstream sent.
     pub upstream_neg_errs: usize,
-    /// NEG-MSG frames dropped by `NegFault::FingerprintThenStall`.
-    pub neg_msgs_dropped: usize,
+    /// Client NEG-MSG rounds answered by `NegFault::FingerprintLoop`, after
+    /// its initial NEG-OPEN reply.
+    pub neg_fingerprint_rounds: usize,
     pub neg_max_limit_seen: u64,
     pub neg_max_kinds_seen: usize,
     pub neg_disallowed_kinds_seen: BTreeSet<u64>,
@@ -262,7 +265,7 @@ impl LimitStats {
              clamped_filters={} max_req_limit={} reqs_with_active_id={} closes={} \
              closes_unknown={} upstream_closed={} neg_opens={} neg_active_now={} neg_closes={} \
              neg_closes_unknown={} neg_cap_notices={} neg_rejections={:?} upstream_neg_errs={} \
-             neg_msgs_dropped={} neg_max_limit={} neg_max_kinds={} neg_disallowed_kinds={:?} \
+             neg_fingerprint_rounds={} neg_max_limit={} neg_max_kinds={} neg_disallowed_kinds={:?} \
              forced_drops={}",
             self.total_reqs,
             self.accepted_reqs,
@@ -289,7 +292,7 @@ impl LimitStats {
             self.neg_cap_notices,
             self.neg_rejections,
             self.upstream_neg_errs,
-            self.neg_msgs_dropped,
+            self.neg_fingerprint_rounds,
             self.neg_max_limit_seen,
             self.neg_max_kinds_seen,
             self.neg_disallowed_kinds_seen,
@@ -353,6 +356,8 @@ enum Verdict {
     ForwardRewritten(String),
     /// Drop the frame without any reply.
     Swallow,
+    /// Send a paced, mismatched fingerprint reply for this NEG session.
+    Fingerprint(String),
     /// Reply to the client and optionally tell the upstream to drop a live id.
     Refuse {
         reply: String,
@@ -427,6 +432,19 @@ impl LimitRelay {
                                         }
                                     }
                                     Verdict::Swallow => {}
+                                    Verdict::Fingerprint(id) => {
+                                        tokio::time::sleep(Duration::from_millis(250)).await;
+                                        let reply = serde_json::json!([
+                                            "NEG-MSG", id, MISMATCHED_NEG_MSG
+                                        ]).to_string();
+                                        if client_write
+                                            .send(Message::Text(reply.into()))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
                                     Verdict::Refuse { reply, upstream } => {
                                         if let Some(upstream) = upstream
                                             && relay_write
@@ -448,10 +466,8 @@ impl LimitRelay {
                             }
                             frame = relay_read.next() => {
                                 let Some(Ok(message)) = frame else { break };
-                                if let Message::Text(text) = &message
-                                    && !inspect_relay_frame(&shared, connection, text.as_str())
-                                {
-                                    continue;
+                                if let Message::Text(text) = &message {
+                                    inspect_relay_frame(&shared, connection, text.as_str());
                                 }
                                 if matches!(message, Message::Close(_)) {
                                     break;
@@ -793,21 +809,27 @@ fn inspect_client_frame(
                     shared.refresh(connection);
                     match fault {
                         NegFault::SilentOpen => Verdict::Swallow,
-                        NegFault::FingerprintThenStall => Verdict::Refuse {
-                            reply: serde_json::json!(["NEG-MSG", id, STALLING_NEG_MSG]).to_string(),
-                            upstream: None,
-                        },
+                        NegFault::StallAfterReply | NegFault::FingerprintLoop => {
+                            Verdict::Fingerprint(id)
+                        }
                         _ => Verdict::Forward,
                     }
                 }
             }
         }
         "NEG-MSG"
-            if shared.neg_fault == Some(NegFault::FingerprintThenStall)
+            if shared.neg_fault == Some(NegFault::StallAfterReply)
                 && shared.states[connection].neg.contains(&id) =>
         {
-            shared.stats.neg_msgs_dropped += 1;
+            shared.stats.neg_fingerprint_rounds += 1;
             Verdict::Swallow
+        }
+        "NEG-MSG"
+            if shared.neg_fault == Some(NegFault::FingerprintLoop)
+                && shared.states[connection].neg.contains(&id) =>
+        {
+            shared.stats.neg_fingerprint_rounds += 1;
+            Verdict::Fingerprint(id)
         }
         "NEG-CLOSE" => {
             shared.stats.neg_closes += 1;
@@ -821,17 +843,16 @@ fn inspect_client_frame(
     }
 }
 
-/// Account for one upstream frame; `false` drops it.
-fn inspect_relay_frame(shared: &Mutex<Shared>, connection: usize, text: &str) -> bool {
+/// Account for one upstream frame.
+fn inspect_relay_frame(shared: &Mutex<Shared>, connection: usize, text: &str) {
     let Ok(Value::Array(frame)) = serde_json::from_str::<Value>(text) else {
-        return true;
+        return;
     };
     let verb = frame.first().and_then(Value::as_str).unwrap_or_default();
     let Some(id) = frame.get(1).and_then(Value::as_str) else {
-        return true;
+        return;
     };
     let mut shared = shared.lock().unwrap();
-    let fault = shared.neg_fault.unwrap_or(NegFault::None);
     match verb {
         // EOSE does not end a live subscription; only CLOSED does.
         "CLOSED" => {
@@ -846,12 +867,6 @@ fn inspect_relay_frame(shared: &Mutex<Shared>, connection: usize, text: &str) ->
             shared.states[connection].neg.remove(id);
             shared.refresh(connection);
         }
-        // Completion does not free the session; only NEG-CLOSE does.
-        "NEG-MSG" if fault == NegFault::FingerprintThenStall => {
-            shared.stats.neg_msgs_dropped += 1;
-            return false;
-        }
         _ => {}
     }
-    true
 }
