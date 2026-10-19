@@ -80,12 +80,18 @@ for reconnect/backoff and relay status mechanics.
   never admit late copies. SDK seen-state is not account admission.
 - Admission belongs to each REQ/relay/transport-route, never a sticky group-wide failure flag. Share ciphertext bodies
   with separate source claims; retiring or failing one source must not discard a healthy source's older history.
-  Waiting and paging each get one `REPLAY_PAGE_LIMITS.max_duration` interval, not an interval per arriving event.
-  Expire silent/partial sources with their own loss floor. Fresh requests do not inherit abandoned admission.
+  Waiting starts again at an unfinished source's first connection boundary. Each active route/group gets one
+  `REPLAY_PAGE_LIMITS.max_duration` paging interval when service starts; queued groups do not spend it. Arrivals and
+  repeated loss never extend active leases. Empty expired streams become dormant; a first or newer connection can
+  reopen waiting. Late history without that restart is explicit loss, never a raw-EOSE certificate. Discarded history
+  retains its own floor. Fresh requests do not inherit failure.
 - Transport consumers use `NostrSdkRelayClient::notifications`, the ordered per-relay SDK frontier, and
   `dispatch_sdk_replay`. Capture Connected/auth boundaries with the payloads; never poll SDK state to infer their
   generation. Reader epochs are process-monotonic and survive queued frontend work. Receiver loss forces an owned
-  full-window refetch. Forced paging is not physical EOSE; late stored copies cannot become live by that transition.
+  full-window capture through the same lease as settled lag recovery. Newer loss during a capture remains explicit
+  demand for another pass, not a new serial or deadline for the active one. Only recorded transport REQ payloads
+  enter the frontier; acquisition replies stay with their collectors. Forced paging is not physical EOSE; late
+  stored copies cannot become live by that transition.
 - Bound pending replay by `REPLAY_BUFFER_MAX_ITEMS` and `REPLAY_BUFFER_MAX_BYTES`, with one additional draining batch;
   keep released live-copy dedup bounded by the item allowance; historical refetch bypasses it. Retry one interrupted page at the same boundary within
   the page bound. Discard partial cancelled, saturated or failed history instead of releasing its newer suffix, and
@@ -104,7 +110,9 @@ for reconnect/backoff and relay status mechanics.
   a bounded, request-owned capture; join an unexpired capture rather than restarting it. Report pending, newly
   started and already active scopes in `ReplayRecoverySummary`. Leave live REQs, filters and the SDK registry
   untouched. Never infer EOSE from a lag or the SDK's out-of-band EOSE flag, resend the live REQ, or reopen a closed
-  REQ. The caller paces follow-ups while scopes remain pending; failed captures retain loss and can be retried.
+  REQ. The caller paces follow-ups while eligible scopes remain pending. Failed source generations retain loss once
+  and park until a newer connection; polling must not restart or recharge them. Dropped refusals stay terminal
+  because the SDK removed their live REQ from its reconnect registry.
 - Hand every relay `CLOSED` on a live REQ to `handle_relay_closed` in `dispatch_sdk_notification`, the one dispatch
   both notification consumers share (the relay plane's in `transport-nostr`, and this crate's test forwarder); change
   `CLOSED` handling there, never in a consumer loop. Classify each message on its own with `sdk_subscription_refusal` /

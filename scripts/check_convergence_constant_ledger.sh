@@ -134,7 +134,7 @@ discover_constants \
     "(SDK_RECONCILIATION_(MAX_[A-Z0-9_]+|WAIT|NEGOTIATION_WAIT|WINDOW_PROBES)|SDK_NOTIFICATION_CAPACITY)"
 discover_constants \
     "crates/transport-nostr-adapter/src/lib.rs" \
-    "(RELAY_REPLAY_PAGE_LIMIT|REPLAY_PAGE_MAX_PAGES|REPLAY_BUFFER_MAX_[A-Z0-9_]+|REPLAY_PAGE_LIMITS)"
+    "(RELAY_REPLAY_PAGE_LIMIT|REPLAY_PAGE_MAX_PAGES|REPLAY_BUFFER_MAX_[A-Z0-9_]+|REPLAY_PAGE_LIMITS|REPLAY_OPEN_UNTIL)"
 discover_constants "crates/marmot-app/src/client/epoch_stall.rs" "EPOCH_STALL_[A-Z0-9_]+"
 discover_constants \
     "crates/marmot-app/src/lib.rs" \

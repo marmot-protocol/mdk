@@ -809,6 +809,7 @@ struct SdkNotificationFrontier {
     sender: broadcast::Sender<NostrSdkNotification>,
     cutovers: watch::Sender<u64>,
     loss: watch::Sender<Option<NostrNotificationLoss>>,
+    subscription_floors: Arc<StdMutex<SubscriptionFloors>>,
     state: StdMutex<FrontierState>,
 }
 
@@ -825,13 +826,17 @@ impl Drop for SdkNotificationFrontier {
 }
 
 impl SdkNotificationFrontier {
-    fn new(loss: watch::Sender<Option<NostrNotificationLoss>>) -> Self {
+    fn new(
+        loss: watch::Sender<Option<NostrNotificationLoss>>,
+        subscription_floors: Arc<StdMutex<SubscriptionFloors>>,
+    ) -> Self {
         let (sender, receiver) = broadcast::channel(SDK_NOTIFICATION_CAPACITY);
         let reader = next_reader_epoch();
         Self {
             sender,
             cutovers: watch::channel(reader).0,
             loss,
+            subscription_floors,
             state: StdMutex::new(FrontierState {
                 reader,
                 receiver_started: false,
@@ -933,6 +938,33 @@ impl SdkNotificationFrontier {
         }));
     }
 
+    fn tracked_notification(&self, notification: &RelayNotification) -> bool {
+        let id = match notification {
+            RelayNotification::Event {
+                subscription_id, ..
+            } => subscription_id,
+            RelayNotification::Message { message } => match message.as_ref() {
+                RelayMessage::Event {
+                    subscription_id, ..
+                }
+                | RelayMessage::Closed {
+                    subscription_id, ..
+                } => subscription_id.as_ref(),
+                RelayMessage::EndOfStoredEvents(subscription_id) => subscription_id.as_ref(),
+                _ => return true,
+            },
+            _ => return true,
+        };
+        // Only transport-owned REQs feed this frontier. Request-local collectors
+        // already own acquisition replies; rebroadcasting them can trigger loss
+        // and another refetch. Raw Client observers use their independent stream.
+        self.subscription_floors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .live
+            .contains_key(id)
+    }
+
     fn attach(self: &Arc<Self>, relay: &Relay, mode: RelayMonitorAttach) {
         let url = relay.url().clone();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -970,6 +1002,9 @@ impl SdkNotificationFrontier {
                         }
                     }
                     NotificationUpdate::Notification(notification) => {
+                        if !frontier.tracked_notification(&notification) {
+                            continue;
+                        }
                         let mut state = frontier
                             .state
                             .lock()
@@ -1501,6 +1536,7 @@ pub async fn dispatch_sdk_replay(
 impl NostrSdkRelayClient {
     pub fn new(client: Client) -> Self {
         let notification_loss_tx = watch::channel(None).0;
+        let subscription_floors = Arc::new(StdMutex::new(SubscriptionFloors::default()));
         Self {
             publish_relay_cache: Arc::new(PublishRelayCache {
                 client: client.clone(),
@@ -1510,12 +1546,15 @@ impl NostrSdkRelayClient {
             signer: None,
             account_id: None,
             account_clients: Arc::new(RwLock::new(HashMap::new())),
-            frontier: Arc::new(SdkNotificationFrontier::new(notification_loss_tx.clone())),
+            frontier: Arc::new(SdkNotificationFrontier::new(
+                notification_loss_tx.clone(),
+                subscription_floors.clone(),
+            )),
             notification_loss_tx,
             require_account_context: false,
             publication: SdkPublication::OpaqueClient,
             account_subscriptions: Arc::new(RwLock::new(HashMap::new())),
-            subscription_floors: Arc::default(),
+            subscription_floors,
             #[cfg(test)]
             publish_connect_attempts: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
@@ -1680,7 +1719,9 @@ impl NostrSdkRelayClient {
     ///
     /// A replacement fences queued frames from the previous reader. Relay
     /// monitors are attached before subscription I/O, including dynamic relay
-    /// additions. The independent directory client may keep its Client stream.
+    /// additions. Only REQs issued through this transport feed the frontier;
+    /// request-local acquisition results stay with their collectors. Direct SDK
+    /// subscribers and the directory client use the independent Client stream.
     pub fn notifications(
         &self,
     ) -> Pin<Box<dyn Stream<Item = NotificationUpdate<NostrSdkNotification>> + Send>> {
@@ -1850,14 +1891,14 @@ impl NostrSdkRelayClient {
     /// the REQs it issued, live or closed. It only falls over the context's
     /// life, so reading it at the lag gives the tightest bound.
     ///
-    /// Only an account context records floors. A shared or multi-account root
+    /// Only an account context reports bounded floors. A shared or multi-account root
     /// reports [`NostrNotificationLossFloor::Unbounded`]: its receiver's loss
     /// cannot be attributed to one account's REQs.
     pub fn notification_loss_floor(&self) -> NostrNotificationLossFloor {
-        self.account_subscription_floors()
-            .map_or(NostrNotificationLossFloor::Unbounded, |floors| {
-                floors.loss_floor()
-            })
+        if self.account_id.is_none() {
+            return NostrNotificationLossFloor::Unbounded;
+        }
+        self.subscription_floors().loss_floor()
     }
 
     /// [`Self::notification_loss_floor`] of the account context a
@@ -1884,14 +1925,11 @@ impl NostrSdkRelayClient {
         }
     }
 
-    /// The REQ floor record, which only an account context keeps.
-    fn account_subscription_floors(&self) -> Option<MutexGuard<'_, SubscriptionFloors>> {
-        self.account_id.as_ref()?;
-        Some(
-            self.subscription_floors
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        )
+    /// Recorded transport ownership; shared contexts still report unbounded loss.
+    fn subscription_floors(&self) -> MutexGuard<'_, SubscriptionFloors> {
+        self.subscription_floors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Remove only one account's sockets and authentication context.
@@ -3222,7 +3260,8 @@ impl NostrSdkRelayClient {
     }
 
     /// Start forwarding `nostr-sdk` notifications into the adapter's delivery
-    /// queue. The task exits when the relay pool shuts down.
+    /// queue. It exits on pool shutdown or receiver loss; a supervisor must
+    /// retain the loss watch and start a replacement after a gap.
     pub fn spawn_notification_forwarder(&self, adapter: NostrTransportAdapter) -> JoinHandle<()> {
         let mut notifications = self.notifications();
         let loss = self.clone();
@@ -3281,6 +3320,14 @@ impl NostrSdkRelayClient {
                 match update {
                     NotificationUpdate::Notification(NostrSdkNotification::Shutdown) => break,
                     NotificationUpdate::Notification(notification) => {
+                        // Group admission uses the verified raw copy. Its SDK
+                        // deduplicated twin cannot deliver and only spends queue room.
+                        if matches!(&notification, NostrSdkNotification::Payload {
+                            notification: ClientNotification::Event { event, .. }, ..
+                        } if event.kind == Kind::MlsGroupMessage)
+                        {
+                            continue;
+                        }
                         pending.fetch_add(1, Ordering::SeqCst);
                         if sender.try_send(notification).is_err() {
                             pending.fetch_sub(1, Ordering::SeqCst);
@@ -4528,16 +4575,11 @@ impl NostrRelayClient for NostrSdkRelayClient {
         // routes before the REQ: a lag can lose the very first reply.
         let id = plan.subscription_id.clone();
         let since = plan.filter.since.map(|since| since.as_secs());
-        let replaced = self
-            .account_subscription_floors()
-            .map(|mut floors| floors.open(&id, since));
+        let replaced = self.subscription_floors().open(&id, since);
         let result = self.subscribe_planned(plan).await;
-        if result.is_err()
-            && let Some(replaced) = replaced
-            && let Some(mut floors) = self.account_subscription_floors()
-        {
+        if result.is_err() {
             // The REQ may have reached a relay before the failure.
-            floors.abandon(&id, replaced);
+            self.subscription_floors().abandon(&id, replaced);
         }
         result
     }
@@ -4572,9 +4614,7 @@ impl NostrRelayClient for NostrSdkRelayClient {
             .map_err(|_| TransportAdapterError::Subscription("unsubscribe failed".to_owned()))?;
         // Look the floor up by id: callers may rebuild the subscription
         // without the `since` it was issued with.
-        if let Some(mut floors) = self.account_subscription_floors() {
-            floors.close(&plan.subscription_id);
-        }
+        self.subscription_floors().close(&plan.subscription_id);
         if let Some(ids) = self
             .account_subscriptions
             .write()
@@ -4638,12 +4678,10 @@ impl NostrRelayClient for NostrSdkRelayClient {
             if let Some(tracked) = self.account_subscriptions.write().await.get_mut(account_id) {
                 tracked.retain(|tracked| tracked != &id);
             }
-            if let Some(mut floors) = self.account_subscription_floors() {
-                floors.close(&id);
-            }
+            self.subscription_floors().close(&id);
         }
-        if let Some(mut floors) = self.account_subscription_floors() {
-            floors.close_all_except(&failed);
+        if self.account_id.is_some() {
+            self.subscription_floors().close_all_except(&failed);
         }
         if failed.is_empty() {
             let mut tracked = self.account_subscriptions.write().await;
@@ -5724,13 +5762,7 @@ mod tests {
         root.unsubscribe(group(None)).await.unwrap();
         assert_eq!(account.notification_loss_floor(), Since(1_000));
         root.unsubscribe_account(&account_id).await.unwrap();
-        assert!(
-            account
-                .account_subscription_floors()
-                .unwrap()
-                .live
-                .is_empty()
-        );
+        assert!(account.subscription_floors().live.is_empty());
         assert_eq!(
             account.notification_loss_floor(),
             Since(1_000),
@@ -5749,13 +5781,7 @@ mod tests {
             })
             .await;
         assert!(failed.is_err());
-        assert!(
-            account
-                .account_subscription_floors()
-                .unwrap()
-                .live
-                .is_empty()
-        );
+        assert!(account.subscription_floors().live.is_empty());
         assert_eq!(account.notification_loss_floor(), Since(50));
         root.shutdown_accounts().await;
     }
@@ -5766,6 +5792,190 @@ mod tests {
             .custom_created_at(NostrTimestamp::from_secs(created_at))
             .finalize(&Keys::generate())
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn acquisition_avoids_live_lag() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let keys = Keys::generate();
+        let account = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let mut notifications = sdk.notifications();
+        let subscription = NostrSubscription::AccountInbox {
+            account_id: account.clone(),
+            endpoints: vec![endpoint.clone()],
+            since: None,
+            attempt: SubscriptionAttempt::INITIAL,
+        };
+        let live_id = subscription.subscription_id();
+        sdk.subscribe(subscription).await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(NotificationUpdate::Notification(NostrSdkNotification::Payload {
+                    notification: ClientNotification::Message { message, .. }, ..
+                })) = notifications.next().await
+                    && matches!(message.as_ref(), RelayMessage::EndOfStoredEvents(id) if id.as_str() == live_id)
+                {
+                    break;
+                }
+            }
+        }).await.expect("the live REQ reaches its initial boundary");
+
+        let route = [0xD4; 32];
+        let mut expected = HashSet::new();
+        for index in 0..256 {
+            let event = stored_group_event(&route, 5_000 + index);
+            expected.insert(event.id.to_hex());
+            relay.add_event(event).await.unwrap();
+        }
+        let expected = expected.iter().map(String::as_str).collect::<HashSet<_>>();
+        let request = NostrAcquisitionRequest {
+            account_id: account,
+            scope: NostrAcquisitionScope::GroupWindow {
+                transport_group_id: route,
+                since: 0,
+                until: 10_000,
+                newest: None,
+            },
+            endpoints: vec![endpoint],
+            limits: NostrAcquisitionLimits {
+                max_endpoints: 1,
+                max_requested_event_ids: 1,
+                max_received_items_per_endpoint: 512,
+                max_serialized_event_bytes_per_endpoint: 1024 * 1024,
+                max_duration: Duration::from_secs(10),
+            },
+        };
+        // The consumer is paused while request-local replies exceed its whole
+        // queue. Their collector must still return exact history each time.
+        for _ in 0..(SDK_NOTIFICATION_CAPACITY / expected.len() + 2) {
+            let result = sdk
+                .acquire_history(request.clone(), NostrAcquisitionCancellation::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                result.endpoints[0].end,
+                NostrAcquisitionEnd::RequestPolicySatisfied
+            );
+            assert_eq!(
+                result.endpoints[0]
+                    .events
+                    .iter()
+                    .map(|event| event.id.as_str())
+                    .collect::<HashSet<_>>(),
+                expected
+            );
+        }
+        let marker = EventBuilder::new(Kind::GiftWrap, "live after acquisition")
+            .tag(Tag::public_key(keys.public_key()))
+            .finalize(&keys)
+            .unwrap();
+        let marker_id = marker.id;
+        relay.add_event(marker).await.unwrap();
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match notifications
+                    .next()
+                    .await
+                    .expect("the live source remains open")
+                {
+                    NotificationUpdate::Lagged { .. } => {
+                        panic!("owned acquisition cannot lag the live frontier")
+                    }
+                    NotificationUpdate::Notification(NostrSdkNotification::Replay {
+                        reason: ReplayRestart::ReceiverLoss,
+                        ..
+                    }) => panic!("owned acquisition cannot restart the live source"),
+                    NotificationUpdate::Notification(NostrSdkNotification::Payload {
+                        notification,
+                        ..
+                    }) => match notification {
+                        ClientNotification::Event {
+                            subscription_id,
+                            event,
+                            ..
+                        } => {
+                            assert_eq!(subscription_id.as_str(), live_id);
+                            assert_eq!(event.id, marker_id);
+                        }
+                        ClientNotification::Message { message, .. } => {
+                            if let RelayMessage::Event {
+                                subscription_id,
+                                event,
+                            } = message.as_ref()
+                            {
+                                assert_eq!(subscription_id.as_str(), live_id);
+                                assert_eq!(event.id, marker_id);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the live marker follows isolated acquisition replies");
+        sdk.shutdown().await;
+        relay.shutdown();
+    }
+
+    #[tokio::test]
+    async fn shared_close_keeps_peer() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let keys = [Keys::generate(), Keys::generate()];
+        let accounts = keys
+            .each_ref()
+            .map(|keys| MemberId::new(keys.public_key().to_bytes().to_vec()));
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let adapter = NostrTransportAdapter::new(Arc::new(sdk.clone()));
+        let forwarder = sdk.spawn_notification_forwarder(adapter.clone());
+        for account in &accounts {
+            adapter
+                .activate_account(crate::TransportAccountActivation {
+                    account_id: account.clone(),
+                    inbox_endpoints: vec![endpoint.clone()],
+                    group_subscriptions: Vec::new(),
+                    since: None,
+                })
+                .await
+                .unwrap();
+        }
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let first = adapter.account_subscription_eose(&accounts[0]).await;
+                let second = adapter.account_subscription_eose(&accounts[1]).await;
+                if first.complete() && second.complete() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both shared-client inboxes are live before one closes");
+        adapter.deactivate_account(&accounts[0]).await.unwrap();
+        let event = EventBuilder::new(Kind::GiftWrap, "surviving shared inbox")
+            .tag(Tag::public_key(keys[1].public_key()))
+            .finalize(&keys[0])
+            .unwrap();
+        let expected_id = event.id.to_bytes();
+        relay.add_event(event).await.unwrap();
+        let delivery = timeout(Duration::from_secs(5), adapter.receive())
+            .await
+            .expect("closing one account does not untrack its peer's source")
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.account_id, accounts[1]);
+        assert_eq!(delivery.message.id.as_slice(), expected_id.as_slice());
+        sdk.shutdown().await;
+        timeout(Duration::from_secs(2), forwarder)
+            .await
+            .unwrap()
+            .unwrap();
+        relay.shutdown();
     }
 
     /// A lost raw replay and EOSE require owned history acquisition even
@@ -5892,6 +6102,9 @@ mod tests {
                 .to_transport_message()
                 .unwrap()
         );
+        adapter
+            .ack_replay_delivery(&account_id, &delivery.message.id)
+            .await;
         timeout(Duration::from_secs(5), async {
             while !adapter
                 .account_subscription_eose(&account_id)
@@ -9405,8 +9618,8 @@ mod tests {
         // Subscribe before the relay connects: unlike `handle_notifications`,
         // this synchronous receiver is installed before the first event can
         // arrive and cannot race the test relay's immediate response.
+        let mut notifications = client.notifications_with_gaps();
         let sdk = NostrSdkRelayClient::new(client.clone());
-        let mut notifications = sdk.notifications();
 
         sdk.add_subscription_relay(endpoint.clone()).await.unwrap();
         client.connect().await;
@@ -9431,20 +9644,17 @@ mod tests {
                     .await
                     .expect("notification channel remains open")
                 {
-                    NotificationUpdate::Notification(NostrSdkNotification::Payload {
-                        notification: ClientNotification::Event { .. },
-                        ..
-                    }) => {
+                    NotificationUpdate::Notification(ClientNotification::Event { .. }) => {
                         panic!("failed signature verification must not emit a trusted event")
                     }
-                    NotificationUpdate::Notification(NostrSdkNotification::Payload {
-                        notification: ClientNotification::Message { message, .. },
+                    NotificationUpdate::Notification(ClientNotification::Message {
+                        message,
                         ..
                     }) if matches!(*message, RelayMessage::Event { .. }) => {
                         panic!("failed signature verification must not emit a raw event")
                     }
-                    NotificationUpdate::Notification(NostrSdkNotification::Payload {
-                        notification: ClientNotification::Message { message, .. },
+                    NotificationUpdate::Notification(ClientNotification::Message {
+                        message,
                         ..
                     }) if matches!(*message, RelayMessage::EndOfStoredEvents(_)) => {
                         break;

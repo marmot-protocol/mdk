@@ -290,8 +290,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   would advance the cursor while a relay was still sending history. Schedule `recover_pending_replay` for the
   receiver's scope, marked at the lag, after `NOTIFICATION_LAG_EOSE_REPAIR_SETTLE` without another lag. A later lag
   postpones it. Recovery acquires full original windows without changing live REQs. Pace follow-ups at the same
-  interval while `ReplayRecoverySummary::pending_relays` is nonzero: join active captures and retry failed ones,
-  retaining the same lag mark. Shutdown may stop follow-ups even while scopes remain pending.
+  interval while `ReplayRecoverySummary::pending_relays` is nonzero: join active captures and service coalesced newer
+  demand, retaining the same lag mark. Failed source generations park until a newer connection and are excluded
+  from pending counts; a timer must not manufacture more loss. Shutdown may stop follow-ups with work pending.
 - Move `checkpointed_transport_timestamp` only through `AppClient::seal_transport_cursor`, never straight to
   `state.last_transport_timestamp`. The seal holds adapter admission stable through the router's placement lock,
   importing any discarded replay into the existing loss fence before deciding. It returns nothing while staged,

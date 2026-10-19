@@ -80,4 +80,5 @@ A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_PAGE_MAX_PAGES
 A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_BUFFER_MAX_ITEMS
 A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_BUFFER_MAX_BYTES
 A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_PAGE_LIMITS
+A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_OPEN_UNTIL
 A17|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_NOTIFICATION_CAPACITY

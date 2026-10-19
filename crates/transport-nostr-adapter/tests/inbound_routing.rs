@@ -370,6 +370,7 @@ struct FakeRelayClient {
     pages: Mutex<VecDeque<(NostrAcquisitionEnd, Vec<NostrTransportEvent>)>>,
     retained: Mutex<Option<Vec<(MemberId, TransportEndpoint, NostrTransportEvent)>>>,
     acquisitions: Mutex<Vec<NostrAcquisitionRequest>>,
+    acquisition_delays: Mutex<VecDeque<Duration>>,
     hold_acquisition: AtomicBool,
     release_acquisition: Notify,
     subscriptions: Mutex<Vec<transport_nostr_adapter::NostrSubscription>>,
@@ -429,6 +430,10 @@ impl NostrRelayClient for FakeRelayClient {
     ) -> Result<NostrAcquisitionResult, NostrAcquisitionError> {
         let endpoint = request.endpoints[0].clone();
         self.acquisitions.lock().unwrap().push(request.clone());
+        let delay = self.acquisition_delays.lock().unwrap().pop_front();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         if self.hold_acquisition.load(Ordering::SeqCst) {
             self.release_acquisition.notified().await;
         }
@@ -4098,9 +4103,9 @@ async fn recovery_after_abandonment() {
         !relay.acquisitions.lock().unwrap().is_empty()
     })
     .await;
-    assert_eq!(
-        replay_loss(&adapter, &account).await,
-        NostrNotificationLossFloor::Since(floor)
+    assert!(
+        adapter.take_replay_status(&account).await.loss.is_none(),
+        "capture must not charge the already transferred source loss twice"
     );
     assert_eq!(
         adapter.recover_pending_replay(Some(&account), lag).await,
@@ -6347,10 +6352,7 @@ async fn assert_group_delivery(
         .unwrap()
         .unwrap();
     assert_eq!(&delivery.account_id, account);
-    assert_eq!(
-        delivery.message.id,
-        event.to_transport_message().unwrap().id
-    );
+    assert_eq!(delivery.message, event.to_transport_message().unwrap());
     adapter
         .ack_replay_delivery(account, &delivery.message.id)
         .await;
@@ -6412,6 +6414,451 @@ async fn expire_admission() {
     tokio::task::yield_now().await;
     // Exercise finite expiry without depending on the precise configured interval.
     tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+}
+
+async fn late_replay_keeps_proof(stored: usize) {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![0xC1; 32]);
+    let mut group = sync_fixture_group(0xC2);
+    group
+        .endpoints
+        .push(TransportEndpoint("wss://late.example".into()));
+    let mut late = group.clone();
+    late.endpoints.swap(0, 1);
+    let floor = 1_700_000_000;
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![group.clone()],
+            since: Some(Timestamp(floor)),
+        })
+        .await
+        .unwrap();
+    let id = issued_group_id(&relay.take_issued_subscriptions(), &group.group_id);
+    let healthy = group_event_at("completed A history", &group, floor + 1);
+    route_group_copy(&adapter, &group, &id, &healthy).await;
+    adapter
+        .handle_relay_eose(group.endpoints[0].clone(), id.clone())
+        .await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(31)).await;
+    assert_group_delivery(&adapter, &account, &healthy).await;
+    let mut loss = adapter.take_replay_status(&account).await.loss;
+
+    let mut history = (0..stored)
+        .map(|index| {
+            group_event_at(
+                &format!("late B {index}"),
+                &group,
+                floor + 100 + index as u64,
+            )
+        })
+        .collect::<Vec<_>>();
+    if stored >= transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT {
+        let older = group_event_at("B history below its clamped prefix", &group, floor + 10);
+        relay.pages.lock().unwrap().push_back((
+            NostrAcquisitionEnd::RequestPolicySatisfied,
+            vec![older.clone()],
+        ));
+        for event in history.iter().rev() {
+            route_group_copy(&adapter, &late, &id, event).await;
+        }
+        history.insert(0, older);
+    } else {
+        for event in history.iter().rev() {
+            route_group_copy(&adapter, &late, &id, event).await;
+        }
+    }
+    assert_no_delivery(&adapter).await;
+    adapter
+        .handle_relay_eose(late.endpoints[0].clone(), id.clone())
+        .await;
+    let expected = history
+        .iter()
+        .map(|event| event.to_transport_message().unwrap())
+        .collect::<Vec<_>>();
+    let mut delivered = Vec::new();
+    while delivered.len() < expected.len() {
+        let Ok(delivery) = tokio::time::timeout(Duration::from_secs(1), adapter.receive()).await
+        else {
+            break;
+        };
+        let delivery = delivery.unwrap().unwrap();
+        assert_eq!(delivery.account_id, account);
+        assert_eq!(delivery.group_id_hint.as_ref(), Some(&group.group_id));
+        adapter
+            .ack_replay_delivery(&account, &delivery.message.id)
+            .await;
+        delivered.push(delivery.message);
+    }
+    {
+        let status = adapter.take_replay_status(&account).await;
+        loss = status.loss.or(loss);
+    }
+    if delivered != expected {
+        assert!(
+            delivered.is_empty(),
+            "a late stored range cannot release only its newer suffix"
+        );
+        assert_eq!(loss, Some(NostrNotificationLossFloor::Since(floor)));
+        assert_eq!(
+            adapter
+                .subscription_endpoint_eose(&id, &late.endpoints[0])
+                .await,
+            Some(false)
+        );
+        assert_eq!(adapter.subscription_synced(&id).await, Some(false));
+        assert!(!adapter.account_subscription_eose(&account).await.complete());
+    }
+    assert_no_delivery(&adapter).await;
+    let live = group_event_at("live after late B's actual boundary", &group, floor + 2_000);
+    route_group_copy(&adapter, &late, &id, &live).await;
+    assert_group_delivery(&adapter, &account, &live).await;
+    assert_no_delivery(&adapter).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_short_replay_keeps_proof() {
+    late_replay_keeps_proof(3).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_clamp_replay_keeps_proof() {
+    late_replay_keeps_proof(transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn held_loss_keeps_one_lease() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![0xC3; 32]);
+    let group = sync_fixture_group(0xC4);
+    let endpoint = &group.endpoints[0];
+    let floor = 1_700_000_000;
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![group.clone()],
+            since: Some(Timestamp(floor)),
+        })
+        .await
+        .unwrap();
+    let id = issued_group_id(&relay.take_issued_subscriptions(), &group.group_id);
+    adapter
+        .observe_replay_epoch(
+            Some(&account),
+            endpoint,
+            [1, 1],
+            transport_nostr_adapter::ReplayRestart::Connection,
+        )
+        .await;
+    adapter
+        .handle_relay_eose(endpoint.clone(), id.clone())
+        .await;
+    let stale = group_event_at("held capture must expire", &group, floor + 1);
+    relay.pages.lock().unwrap().push_back((
+        NostrAcquisitionEnd::RequestPolicySatisfied,
+        vec![stale.clone()],
+    ));
+    relay.hold_acquisition.store(true, Ordering::SeqCst);
+    adapter
+        .observe_replay_epoch(
+            Some(&account),
+            endpoint,
+            [2, 1],
+            transport_nostr_adapter::ReplayRestart::ReceiverLoss,
+        )
+        .await;
+    wait_until("the original capture is held", || {
+        relay.acquisitions.lock().unwrap().len() == 1
+    })
+    .await;
+    assert_eq!(
+        replay_loss(&adapter, &account).await,
+        NostrNotificationLossFloor::Since(floor)
+    );
+    for (reader, seconds) in [(3, 10), (4, 10), (5, 9)] {
+        tokio::time::advance(Duration::from_secs(seconds)).await;
+        adapter
+            .observe_replay_epoch(
+                Some(&account),
+                endpoint,
+                [reader, 1],
+                transport_nostr_adapter::ReplayRestart::ReceiverLoss,
+            )
+            .await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            relay.acquisitions.lock().unwrap().len(),
+            1,
+            "receiver loss joins the same finite capture, not a parallel acquisition"
+        );
+        let summary = adapter
+            .recover_pending_replay(Some(&account), adapter.notification_lag_mark())
+            .await;
+        assert_eq!(summary.active_relays, 1);
+        assert_eq!(summary.started_relays, 0);
+        assert_eq!(
+            adapter.subscription_endpoint_eose(&id, endpoint).await,
+            Some(false)
+        );
+    }
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let pending = {
+                let status = adapter.take_replay_status(&account).await;
+                if let Some(loss) = status.loss {
+                    assert_eq!(loss, NostrNotificationLossFloor::Since(floor));
+                }
+                status.pending
+            };
+            if !pending {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("later losses do not extend the original thirty-second capture lease");
+    assert_no_delivery(&adapter).await;
+    let lag = adapter.notification_lag_mark();
+    for _ in 0..2 {
+        let summary = adapter.recover_pending_replay(Some(&account), lag).await;
+        assert_eq!(
+            summary.started_relays, 0,
+            "a failed lease is parked, not recharged by lag polling"
+        );
+        assert_eq!(summary.active_relays, 0);
+        tokio::time::advance(Duration::from_secs(31)).await;
+    }
+    assert_eq!(relay.acquisitions.lock().unwrap().len(), 1);
+    relay.hold_acquisition.store(false, Ordering::SeqCst);
+    relay.release_acquisition.notify_waiters();
+    assert_no_delivery(&adapter).await;
+    adapter
+        .handle_relay_eose(endpoint.clone(), id.clone())
+        .await;
+    assert_eq!(
+        adapter.subscription_endpoint_eose(&id, endpoint).await,
+        Some(false)
+    );
+    assert!(!adapter.account_subscription_eose(&account).await.complete());
+    let live = group_event_at("live survives a parked capture", &group, floor + 2);
+    route_group_copy(&adapter, &group, &id, &live).await;
+    assert_group_delivery(&adapter, &account, &live).await;
+    assert_no_delivery(&adapter).await;
+    assert!(relay.take_issued_subscriptions().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn newer_loss_needs_own_proof() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![0xC5; 32]);
+    let group = sync_fixture_group(0xC6);
+    let endpoint = &group.endpoints[0];
+    let floor = 1_700_000_000;
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![group.clone()],
+            since: Some(Timestamp(floor)),
+        })
+        .await
+        .unwrap();
+    let id = issued_group_id(&relay.take_issued_subscriptions(), &group.group_id);
+    adapter
+        .observe_replay_epoch(
+            Some(&account),
+            endpoint,
+            [1, 1],
+            transport_nostr_adapter::ReplayRestart::Connection,
+        )
+        .await;
+    adapter
+        .handle_relay_eose(endpoint.clone(), id.clone())
+        .await;
+    let older = group_event_at("first capture's complete snapshot", &group, floor + 1);
+    let missing = group_event_at("lost after the first capture began", &group, floor + 2);
+    relay.pages.lock().unwrap().extend([
+        (
+            NostrAcquisitionEnd::RequestPolicySatisfied,
+            vec![older.clone()],
+        ),
+        (
+            NostrAcquisitionEnd::RequestPolicySatisfied,
+            vec![missing.clone(), older.clone()],
+        ),
+    ]);
+    relay.hold_acquisition.store(true, Ordering::SeqCst);
+    adapter
+        .observe_replay_epoch(
+            Some(&account),
+            endpoint,
+            [2, 1],
+            transport_nostr_adapter::ReplayRestart::ReceiverLoss,
+        )
+        .await;
+    wait_until("first snapshot is held", || {
+        relay.acquisitions.lock().unwrap().len() == 1
+    })
+    .await;
+    assert_eq!(
+        replay_loss(&adapter, &account).await,
+        NostrNotificationLossFloor::Since(floor)
+    );
+    tokio::time::advance(Duration::from_secs(5)).await;
+    adapter
+        .observe_replay_epoch(
+            Some(&account),
+            endpoint,
+            [3, 1],
+            transport_nostr_adapter::ReplayRestart::ReceiverLoss,
+        )
+        .await;
+    tokio::task::yield_now().await;
+    assert_eq!(relay.acquisitions.lock().unwrap().len(), 1);
+    relay.release_acquisition.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while relay.acquisitions.lock().unwrap().len() < 2 {
+            assert_eq!(
+                adapter.subscription_endpoint_eose(&id, endpoint).await,
+                Some(false),
+                "the old snapshot cannot certify newer lost input"
+            );
+            adapter
+                .recover_pending_replay(Some(&account), adapter.notification_lag_mark())
+                .await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("coalesced newer demand gets a serial follow-up capture");
+    assert_eq!(relay.acquisitions.lock().unwrap().len(), 2);
+    assert_eq!(
+        adapter.subscription_endpoint_eose(&id, endpoint).await,
+        Some(false)
+    );
+    assert!(!adapter.account_subscription_eose(&account).await.complete());
+    {
+        let status = adapter.take_replay_status(&account).await;
+        assert!(
+            status.pending,
+            "newer demand remains an admission gate while its capture is held"
+        );
+        if let Some(loss) = status.loss {
+            assert_eq!(loss, NostrNotificationLossFloor::Since(floor));
+        }
+    }
+    relay.hold_acquisition.store(false, Ordering::SeqCst);
+    relay.release_acquisition.notify_waiters();
+    assert_group_delivery(&adapter, &account, &older).await;
+    let next = tokio::time::timeout(Duration::from_secs(1), adapter.receive())
+        .await
+        .expect("the newer lost body is recovered")
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.account_id, account);
+    adapter
+        .ack_replay_delivery(&account, &next.message.id)
+        .await;
+    if next.message == older.to_transport_message().unwrap() {
+        // A fresh owned history acquisition deliberately bypasses live-copy
+        // dedup, so a serial full-window refetch may repeat its older body.
+        assert_group_delivery(&adapter, &account, &missing).await;
+    } else {
+        assert_eq!(next.message, missing.to_transport_message().unwrap());
+    }
+    wait_replay_eose(&adapter, &id).await;
+    assert_no_delivery(&adapter).await;
+    assert_replay_idle(&adapter, &account).await;
+    assert_eq!(relay.acquisitions.lock().unwrap().len(), 2);
+    assert!(relay.take_issued_subscriptions().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn batch_units_have_own_budget() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![0xC7; 32]);
+    let groups = [
+        sync_fixture_group(0xC8),
+        sync_fixture_group(0xC9),
+        sync_fixture_group(0xCA),
+    ];
+    let floor = 1_700_000_000;
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![groups[2].clone(), groups[0].clone(), groups[1].clone()],
+            since: Some(Timestamp(floor)),
+        })
+        .await
+        .unwrap();
+    let issued = relay.take_issued_subscriptions();
+    let id = issued_group_id(&issued, &groups[0].group_id);
+    let mut history = [Vec::new(), Vec::new(), Vec::new()];
+    for index in (0..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT).rev() {
+        let group_index = index % groups.len();
+        let event = group_event_at(
+            &format!("clamped group {group_index} event {index}"),
+            &groups[group_index],
+            floor + 1_000 * (3 - group_index) as u64 + index as u64,
+        );
+        route_group_copy(&adapter, &groups[group_index], &id, &event).await;
+        history[group_index].push(event);
+    }
+    let mut retained = Vec::new();
+    for (index, group) in groups.iter().enumerate() {
+        let older = group_event_at(
+            "older per-route page body",
+            group,
+            floor + 10 + index as u64,
+        );
+        retained.push((account.clone(), group.endpoints[0].clone(), older.clone()));
+        history[index].push(older);
+        history[index].sort_unstable_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+    }
+    *relay.retained.lock().unwrap() = Some(retained);
+    relay
+        .acquisition_delays
+        .lock()
+        .unwrap()
+        .extend([Duration::from_secs(12); 3]);
+    let started = tokio::time::Instant::now();
+    adapter
+        .handle_relay_eose(groups[0].endpoints[0].clone(), id.clone())
+        .await;
+    for (index, events) in history.iter().enumerate() {
+        wait_until("the next canonical group starts service", || {
+            relay.acquisitions.lock().unwrap().len() == index + 1
+        })
+        .await;
+        assert_eq!(
+            adapter
+                .subscription_endpoint_eose(&id, &groups[0].endpoints[0])
+                .await,
+            Some(false)
+        );
+        tokio::time::advance(Duration::from_secs(12)).await;
+        for event in events {
+            assert_group_delivery(&adapter, &account, event).await;
+        }
+        assert!(
+            adapter.take_replay_status(&account).await.loss.is_none(),
+            "queued groups do not spend their service allowance while an earlier group pages"
+        );
+    }
+    assert!(started.elapsed() >= Duration::from_secs(36));
+    wait_replay_eose(&adapter, &id).await;
+    assert_no_delivery(&adapter).await;
+    assert_replay_idle(&adapter, &account).await;
 }
 
 #[tokio::test]

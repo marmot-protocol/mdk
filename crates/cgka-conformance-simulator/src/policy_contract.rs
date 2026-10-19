@@ -243,8 +243,8 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 40] = [
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),
-    // Request-local admission, finite replay deadlines and ordered SDK input
-    // change acquired input or explicit loss, not selection given equal input.
+    // Source-local admission, finite active-unit leases and signed-safe wire
+    // bounds change input or explicit loss, not selection given equal input.
     decision(
         "A17",
         ConstantInfluence::InputAcquisition,

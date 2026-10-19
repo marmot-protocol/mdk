@@ -1175,8 +1175,9 @@ The scope counts are REQ/relay pairs, not distinct relays:
 | `active_relays` | Scopes whose unexpired capture this pass joined without restarting it. |
 | `follow_up_scheduled` | Another paced pass will check pending scopes. Shutdown can leave pending scopes without scheduling one. |
 
-`pending_relays` equals `started_relays + active_relays`. A scheduled follow-up requires pending scopes. These counts
-describe acquisition, not completed replay, router placement or durable coverage. No subscription ids, relay URLs,
+`pending_relays` equals `started_relays + active_relays`. Parked failed generations are excluded until a newer
+connection makes them eligible; one failed source must not create endless timer-driven loss. A scheduled follow-up
+requires pending scopes. These counts describe acquisition, not completed replay, router placement or durable coverage. No subscription ids, relay URLs,
 filters or lag marks are recorded. New sessions write this row; v4 recorders omit it.
 
 #### `subscription_eose_repaired` (historical)

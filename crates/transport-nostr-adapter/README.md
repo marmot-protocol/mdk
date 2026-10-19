@@ -85,11 +85,14 @@ A fulfilled predecessor keeps its held range during handoff. Paging runs per rou
 routes of one MLS group together, and waits for its history to leave the pool before paging the next group.
 Groups use a common ordering across overlapping REQs.
 
-An initial replay gets one 30-second waiting interval and, if clamped, one 30-second paging interval, reusing
-`REPLAY_PAGE_LIMITS.max_duration`. Arriving events do not extend them. An observed partial stream must finish or
-expire before release; a silent or terminally refused peer cannot freeze available history indefinitely. Expiry
-records the failed scope's floor without turning its late EOSE into an admission certificate. Fresh recovery
-requests have fresh ownership. This does not establish ordering across unavailable relay history.
+An initial replay gets a 30-second waiting interval, reconciled with its first observed connection boundary.
+Clamped routes each get a 30-second paging allowance when their service starts, reusing
+`REPLAY_PAGE_LIMITS.max_duration`; queued groups do not spend it. Arriving events and repeated loss do not extend an
+active lease. An empty expired stream becomes dormant; a first or newer connection can reopen waiting. Late history
+without that restart is discarded with its original loss floor, not certified by wire EOSE. Lost partial history
+also stays incomplete. A silent or terminally refused peer
+cannot freeze available history indefinitely. Fresh requests have fresh ownership. This does not establish
+ordering across unavailable relay history.
 Already-ready routes keep their admission state across an equivalent or narrower repack; a wider request still
 stages history. Group delivery uses verified raw SDK copies, so SDK duplicate suppression cannot consume the only
 copy of ciphertext discarded by a cancelled attempt. Retired subscription copies cannot bypass admission.
@@ -98,12 +101,17 @@ Transport receivers use each relay's ordered SDK notifications, including Connec
 Every queued payload carries reader/connection epochs. A warm reconnect resets admission before the SDK restores
 the same REQ IDs; old queued EOSE cannot satisfy the new generation. Receiver loss starts a bounded full-window
 refetch rather than waiting for another EOSE on an unchanged live request. Forced paging is not a physical EOSE:
-late stored copies remain historical until their stream ends. The separate directory client keeps its Client stream.
+late stored copies remain historical until their stream ends. Only transport-owned REQ payloads enter this frontier;
+acquisition replies stay with their request-local collectors. Direct SDK subscribers and the directory client keep
+their independent Client streams.
 
 After a notification lag settles, `recover_pending_replay` acquires the full original windows of current REQ/relay
-scopes issued by its `NotificationLagMark` that still owe admission. An unexpired capture is joined, not restarted.
-`ReplayRecoverySummary` counts pending, newly started and already active scopes. The caller paces follow-ups while
-work remains. Live REQs and the SDK registry stay unchanged; SDK EOSE flags cannot bypass queued history.
+scopes issued by its `NotificationLagMark` that still owe admission. Receiver loss and settled lag use the same
+capture lease. An active capture is joined, not restarted; newer loss stays explicit until a subsequent capture
+covers it. Failure charges a source generation once and parks it until a newer connection, instead of retrying on
+every timer pass. `ReplayRecoverySummary` counts eligible pending, newly started and already active scopes, not
+parked scopes. The caller paces follow-ups while work remains. Live REQs and the SDK registry stay unchanged;
+terminally refused REQs are not restored by a private fetch. SDK EOSE flags cannot bypass queued history.
 
 Each account's pending group ciphertext is bounded by `REPLAY_BUFFER_MAX_ITEMS` (32,000 copies, the 500-event page
 limit times 64 pages) and `REPLAY_BUFFER_MAX_BYTES` (32 MiB of payload). One serialized draining batch can retain

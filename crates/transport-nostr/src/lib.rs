@@ -111,7 +111,8 @@ const RELAY_NOTIFICATION_EVENT_QUEUE_CAPACITY: usize = 4096;
 /// Quiet period before owned history recovery for a notification lag, and
 /// pacing interval while its request/relay scopes remain pending. Recovery
 /// acquires full original windows without changing live REQs. Later lags
-/// postpone the pass; follow-ups join active captures or retry failed ones.
+/// postpone the pass; follow-ups join active captures or service newer demand.
+/// Failed source generations park instead of retrying at every interval.
 const NOTIFICATION_LAG_EOSE_REPAIR_SETTLE: Duration = Duration::from_secs(30);
 const ACCOUNT_PUBLISH_WAIT: Duration = Duration::from_secs(20);
 

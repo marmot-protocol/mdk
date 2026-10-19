@@ -326,7 +326,18 @@ async fn a_thousand_groups_fit_in_a_few_reqs_and_every_group_delivers() {
     assert_filter_shapes(&stats);
     assert_eq!(stats.total_reqs, live_reqs(G));
     assert_eq!(stats.rejections_total(), 0);
-    assert_eq!(delivered.len(), G);
+    assert_eq!(
+        delivered.len(),
+        G,
+        "forwarder_finished={} loss={:?}",
+        fx.forwarder.as_ref().is_some_and(|task| task.is_finished()),
+        fx.sdk
+            .notification_loss()
+            .unwrap()
+            .borrow()
+            .as_ref()
+            .map(|loss| (loss.receiver_generation, loss.cumulative_skipped))
+    );
     assert!(eose.complete());
     fx.shutdown().await;
 }
@@ -1101,40 +1112,29 @@ async fn queued_eose_after_reconnect() {
             .is_err()
     );
 
-    while !fx
-        .adapter
-        .account_subscription_eose(&fx.account)
-        .await
-        .complete()
-    {
-        let update = tokio::time::timeout_at(deadline, source.next())
-            .await
-            .expect("only the new connection's stored range can finish replay")
-            .expect("the native receiver remains alive through replay");
-        let NotificationUpdate::Notification(notification) = update else {
-            panic!("the small reconnect replay must not lose notifications");
-        };
-        assert!(
-            !dispatch_sdk_replay(notification, &fx.adapter, None, &|reason| fx
-                .sdk
-                .subscription_refusal(reason))
-            .await
-        );
-    }
-    for (timestamp, id) in expected {
-        let delivery = tokio::time::timeout_at(deadline, fx.adapter.receive())
-            .await
-            .expect("new-generation history is admitted in full")
-            .unwrap()
-            .unwrap();
-        assert_eq!(delivery.message.timestamp.0, timestamp);
-        assert!(delivery.message.id.as_slice() == id);
-        assert!(delivery.account_id == fx.account);
-        assert!(delivery.group_id_hint.as_ref() == Some(&group.group_id));
-        fx.adapter
-            .ack_replay_delivery(&fx.account, &delivery.message.id)
-            .await;
-    }
+    tokio::time::timeout_at(deadline, async {
+        let mut received = 0;
+        while received < expected.len() || !fx.adapter.account_subscription_eose(&fx.account).await.complete() {
+            tokio::select! {
+                update = source.next() => {
+                    let NotificationUpdate::Notification(notification) = update.expect("the native receiver remains alive through replay") else {
+                        panic!("the small reconnect replay must not lose notifications");
+                    };
+                    assert!(!dispatch_sdk_replay(notification, &fx.adapter, None, &|reason| fx.sdk.subscription_refusal(reason)).await);
+                }
+                delivery = fx.adapter.receive(), if received < expected.len() => {
+                    let delivery = delivery.unwrap().unwrap();
+                    let (timestamp, id) = &expected[received];
+                    assert_eq!(delivery.message.timestamp.0, *timestamp);
+                    assert_eq!(delivery.message.id.as_slice(), id.as_slice());
+                    assert_eq!(delivery.account_id, fx.account);
+                    assert_eq!(delivery.group_id_hint.as_ref(), Some(&group.group_id));
+                    fx.adapter.ack_replay_delivery(&fx.account, &delivery.message.id).await;
+                    received += 1;
+                }
+            }
+        }
+    }).await.expect("new-generation history is admitted and placed in full before certification");
     assert!(
         tokio::time::timeout(QUIET, fx.adapter.receive())
             .await
@@ -1302,6 +1302,221 @@ async fn reader_loss_refetches_seen() {
     forwarder.abort();
     let _ = forwarder.await;
     fx.shutdown().await;
+}
+
+/// Collect B's real native frames before advancing virtual time: socket timing
+/// cannot decide whether its first consumer-visible Connected boundary is late.
+async fn sdk_late_replay_proof(stored: usize) {
+    const START: u64 = 1_700_000_000;
+    let fx = Fixture::with_forwarder(LimitConfig::default(), FixtureNotifications::Manual).await;
+    let empty = LocalRelay::new(RelayBuilder::default());
+    empty.run().await.unwrap();
+    let a = empty.url().await.to_string();
+    let b = fx.limit.url();
+    // Attach the transport to already-connected SDK relays. Its first visible
+    // generation has no earlier zero/Connected pair to reopen the waiting lease.
+    for endpoint in [&a, &b] {
+        fx.sdk.client().add_relay(endpoint.as_str()).await.unwrap();
+    }
+    fx.sdk.client().connect().await;
+    tokio::time::timeout(SETTLE_TIMEOUT, async {
+        while !fx
+            .sdk
+            .client()
+            .relays()
+            .await
+            .values()
+            .all(|relay| relay.status() == nostr_sdk::prelude::RelayStatus::Connected)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both SDK connections exist before the transport source");
+    let mut source = fx.sdk.notifications();
+    let mut group = groups(1, &a).remove(0);
+    group.endpoints.push(TransportEndpoint(b.clone()));
+    let keys = Keys::generate();
+    let mut expected = Vec::with_capacity(stored);
+    for index in 0..stored {
+        let event = EventBuilder::new(Kind::MlsGroupMessage, format!("late-initial-B-{index}"))
+            .tags([Tag::custom("h", [hex::encode(route(0))])])
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
+                START + index as u64,
+            ))
+            .finalize(&keys)
+            .unwrap();
+        fx.database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+        expected.push(
+            transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&event)
+                .unwrap()
+                .to_transport_message()
+                .unwrap(),
+        );
+    }
+    expected.sort_unstable_by(|left, right| {
+        (left.timestamp, left.id.as_slice()).cmp(&(right.timestamp, right.id.as_slice()))
+    });
+    let mut activation = fx.activation(std::slice::from_ref(&a), vec![group.clone()]);
+    activation.since = Some(cgka_traits::Timestamp(SINCE));
+    fx.adapter.activate_account(activation).await.unwrap();
+    let id = fx
+        .adapter
+        .group_route_subscription_id(&fx.account, &group.transport_group_id)
+        .await
+        .unwrap();
+    let mut held = Vec::new();
+    let mut ended = HashSet::new();
+    let mut raw_b = 0;
+    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+    while ended.len() < 2 {
+        let update = tokio::time::timeout_at(deadline, source.next())
+            .await
+            .expect("both real relays send their initial stored boundary")
+            .expect("native SDK receiver remains alive");
+        let NotificationUpdate::Notification(notification) = update else {
+            panic!("the bounded native replay must not lose frames");
+        };
+        let endpoint = match &notification {
+            NostrSdkNotification::Replay { endpoint, .. } => endpoint.0.as_str(),
+            NostrSdkNotification::Payload {
+                notification:
+                    ClientNotification::Event { relay_url, .. }
+                    | ClientNotification::Message { relay_url, .. },
+                ..
+            } => relay_url.as_str(),
+            _ => panic!("neither live relay shuts the native receiver down"),
+        };
+        if let NostrSdkNotification::Payload {
+            notification: ClientNotification::Message { message, .. },
+            ..
+        } = &notification
+        {
+            match message.as_ref() {
+                RelayMessage::EndOfStoredEvents(subscription) if subscription.as_str() == id => {
+                    ended.insert(endpoint.to_owned());
+                }
+                RelayMessage::Event { .. } if endpoint == b => raw_b += 1,
+                _ => {}
+            }
+        }
+        if endpoint == b {
+            held.push(notification);
+        } else {
+            assert_eq!(endpoint, a);
+            assert!(
+                !dispatch_sdk_replay(notification, &fx.adapter, None, &|reason| fx
+                    .sdk
+                    .subscription_refusal(reason))
+                .await
+            );
+        }
+    }
+    assert_eq!(
+        raw_b,
+        stored.min(RELAY_REPLAY_PAGE_LIMIT),
+        "the withheld frames are the actual clamped wire range"
+    );
+    assert_eq!(
+        fx.adapter
+            .subscription_endpoint_eose(&id, &group.endpoints[0])
+            .await,
+        Some(true)
+    );
+    assert_eq!(
+        fx.adapter
+            .subscription_endpoint_eose(&id, &group.endpoints[1])
+            .await,
+        Some(false)
+    );
+
+    tokio::time::pause();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(31)).await;
+    let mut loss = fx.adapter.take_replay_status(&fx.account).await.loss;
+    for notification in held {
+        assert!(
+            !dispatch_sdk_replay(notification, &fx.adapter, None, &|reason| fx
+                .sdk
+                .subscription_refusal(reason))
+            .await
+        );
+    }
+    tokio::time::resume();
+
+    let (pending, current_loss) = {
+        let status = fx.adapter.take_replay_status(&fx.account).await;
+        (status.pending, status.loss)
+    };
+    loss = current_loss.or(loss);
+    let mut delivered = Vec::new();
+    if pending || loss.is_none() {
+        let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+        while delivered.len() < expected.len() {
+            let Ok(delivery) = tokio::time::timeout_at(deadline, fx.adapter.receive()).await else {
+                break;
+            };
+            let delivery = delivery.unwrap().unwrap();
+            assert_eq!(delivery.account_id, fx.account);
+            assert_eq!(delivery.group_id_hint.as_ref(), Some(&group.group_id));
+            fx.adapter
+                .ack_replay_delivery(&fx.account, &delivery.message.id)
+                .await;
+            delivered.push(delivery.message);
+        }
+    }
+    {
+        let status = fx.adapter.take_replay_status(&fx.account).await;
+        loss = status.loss.or(loss);
+    }
+    if delivered == expected {
+        await_account_eose(&fx).await;
+    } else {
+        assert!(
+            delivered.is_empty(),
+            "late native stored copies cannot release a newer partial range"
+        );
+        assert_eq!(
+            loss,
+            Some(transport_nostr_adapter::NostrNotificationLossFloor::Since(
+                SINCE
+            ))
+        );
+        assert_eq!(
+            fx.adapter
+                .subscription_endpoint_eose(&id, &group.endpoints[1])
+                .await,
+            Some(false)
+        );
+        assert_eq!(fx.adapter.subscription_synced(&id).await, Some(false));
+        assert!(
+            !fx.adapter
+                .account_subscription_eose(&fx.account)
+                .await
+                .complete()
+        );
+    }
+    assert!(
+        tokio::time::timeout(QUIET, fx.adapter.receive())
+            .await
+            .is_err(),
+        "no SDK cache copy bypasses late-source admission"
+    );
+    drop(source);
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn sdk_late_short_keeps_proof() {
+    sdk_late_replay_proof(3).await;
+}
+
+#[tokio::test]
+async fn sdk_late_clamp_keeps_proof() {
+    sdk_late_replay_proof(600).await;
 }
 
 /// A relay endpoint nostr-sdk refuses to operate: a closed port that has
@@ -2545,6 +2760,9 @@ async fn distinct_deliveries(adapter: &NostrTransportAdapter, wait: Duration) ->
         let next = deadline.min(tokio::time::Instant::now() + IDLE);
         match tokio::time::timeout_at(next, adapter.receive()).await {
             Ok(Ok(Some(delivery))) => {
+                adapter
+                    .ack_replay_delivery(&delivery.account_id, &delivery.message.id)
+                    .await;
                 seen.insert(delivery.message.id);
             }
             _ => return seen.len(),
