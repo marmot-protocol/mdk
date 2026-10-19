@@ -48,6 +48,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 - Add `MARMOT_STATUS_GROUP_CATCHING_UP` (101): a group change was refused because unresolved epoch-gap recovery covers the group's current local epoch (mdk#2258). Retry after it syncs, or call the new `marmot_acknowledge_group_catching_up` once the user accepts that the change may split the group, then retry. Use matching regenerated headers and libraries.
 
 - Add `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED` (102): a group change was refused because the group's last change has not reached every group relay yet (mdk#2255). Add `marmot_group_commit_delivery` (record `MarmotGroupCommitDelivery`, freed with `marmot_group_commit_delivery_free`) to list the owed relays, and `marmot_acknowledge_group_commit_undelivered` to let one change through once the user accepts the risk. Use matching regenerated headers and libraries.
+- Add `MARMOT_STATUS_MEDIA_REFERENCE_STALE_EPOCH` (107): the group left the
+  epoch an attachment was encrypted under, so upload it again; and
+  `MARMOT_STATUS_MEDIA_REFERENCE_EPOCH_UNSETTLED` (108): the group's epoch is
+  settling, so sync and send again. Both previously returned
+  `MARMOT_STATUS_INVALID_MEDIA_REFERENCE` (#2158).
 
 - Add `MARMOT_STATUS_INVALID_EDIT_TARGET` (105), returned by `marmot_edit_message`: an edit is refused, publishing nothing, unless its target is an available chat message this account sent. Before, it was published and then ignored by every recipient. Existing status values are unchanged. Use matching regenerated headers and libraries.
 

@@ -542,6 +542,10 @@ pub struct MarmotApp {
     /// them all.
     close_registry: Arc<close_registry::CloseRegistry>,
     account_session_owners: Arc<Mutex<HashSet<String>>>,
+    /// Attachment uploads holding each account's periodic self-updates, by
+    /// account label. They outlive any one client, so a client rebuilt on
+    /// reconnect still holds the rotations of uploads started before it.
+    upload_epoch_holds: Arc<Mutex<HashMap<String, client::upload_holds::UploadEpochHolds>>>,
     directory_caches: Arc<Mutex<HashMap<String, DirectoryCache>>>,
     /// When each `(account label, cache key)` public event refresh last
     /// finished; see `public_event_preview`.
@@ -1618,6 +1622,16 @@ impl MarmotApp {
         self.config.allow_loopback_blob_endpoints
     }
 
+    /// The upload hold registry every client of account `label` shares.
+    pub(crate) fn upload_epoch_holds(&self, label: &str) -> client::upload_holds::UploadEpochHolds {
+        self.upload_epoch_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(label.to_owned())
+            .or_default()
+            .clone()
+    }
+
     /// The construction-time durable transport-cursor policy every client
     /// opened from this app applies (see [`CursorPersistence`]).
     pub(crate) fn cursor_persistence(&self) -> CursorPersistence {
@@ -1710,6 +1724,7 @@ impl MarmotApp {
             legacy_media_migrations: Arc::default(),
             close_registry: Default::default(),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
+            upload_epoch_holds: Arc::new(Mutex::new(HashMap::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
             public_event_refreshes: Arc::default(),
             member_key_package_prewarm_cache: Arc::new(Mutex::new(
@@ -1811,6 +1826,7 @@ impl MarmotApp {
             legacy_media_migrations: Arc::default(),
             close_registry: Default::default(),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
+            upload_epoch_holds: Arc::new(Mutex::new(HashMap::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
             public_event_refreshes: Arc::default(),
             member_key_package_prewarm_cache: Arc::new(Mutex::new(
@@ -2102,6 +2118,7 @@ impl MarmotApp {
             blossom_http_transport: crate::media::BlossomHttpTransport::new(
                 self.allow_loopback_blob_endpoints(),
             ),
+            upload_epoch_holds: self.upload_epoch_holds(&open.state.label),
             state: open.state,
             seen_events_index,
             pending_seen_event_count: 0,

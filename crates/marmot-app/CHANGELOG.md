@@ -45,6 +45,13 @@
 - `AttachmentTransferState` adds `StorageBlocked`: free disk cannot cover the
   publication reserve for the body. Update exhaustive matches; the job keeps
   its checkpoint and readmits once space frees or on explicit Retry.
+- `marmot_account::AccountDeviceRuntime::run_due_maintenance_holding` takes
+  `&[(GroupId, SelfUpdateHold)]` instead of `&[GroupId]`. Each held group names
+  why it is held, recorded as the held obligation's failure code
+  (`epoch_gap_hold` or `upload_hold`), and `SelfUpdateHold::applies_to` decides
+  which triggers the hold defers. Callers that held groups for epoch-gap
+  recovery pass `SelfUpdateHold::EpochGap`, which still holds every trigger
+  (#2158).
 
 ### Changed
 
@@ -202,6 +209,19 @@
   withheld events, the pass's own budget, or a local error. `relays_failed`
   and `relays_incomplete` now count distinct relays; before, they were summed
   per compared route and could exceed `relays_required` (#2265).
+- An attachment upload no longer loses all its bytes to this device's own
+  periodic key rotation. While an upload for a group is in flight, from the
+  moment its media key is bound to the group's epoch until it is sent or
+  dropped, this device holds its own due periodic self-update for that group,
+  recorded as `upload_hold`. An upload sent in a separate command, as token
+  admission does, keeps the hold for a minute after it finishes. The rotation
+  stays owed and runs once nothing holds the group, which is held for at most
+  two hours at a time however many uploads overlap. The post-join rotation, a
+  self-update the user asks for and a commit this device already staged are
+  not held; a self-update requested while a periodic one is owed joins it and
+  waits with it. Another member's commit, or a group change this device makes
+  itself, can still move the epoch; that send now fails with a typed error the
+  host can recover from by uploading again (#2158).
 
 ### Maintenance
 

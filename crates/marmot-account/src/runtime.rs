@@ -88,6 +88,42 @@ const FROZEN_FANOUT_AMBIGUOUS_RETRY_MAX_MS: u64 = 60 * 60 * 1_000;
 /// connectivity does not leave a user send behind the ambiguity backoff.
 const FROZEN_FANOUT_UNAVAILABLE_RETRY_DELAY_MS: u64 = 5 * 1_000;
 
+/// Why the caller holds a group's due self-update: recorded as the held
+/// obligation's failure code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelfUpdateHold {
+    /// The group moved past this device's local epoch; a commit from that epoch
+    /// forks the group (mdk#2258).
+    EpochGap,
+    /// An attachment upload for the group is in flight. Its media key is bound
+    /// to the epoch it was encrypted under, so a periodic rotation would make
+    /// the finished upload unsendable (mdk#2158). Only periodic rotations are
+    /// held: the post-join rotation replaces key material the welcome exposed,
+    /// and a self-update the user asked for changes the group now. A manual
+    /// request made while a periodic rotation is already owed joins it, so it
+    /// waits with it.
+    Upload,
+}
+
+impl SelfUpdateHold {
+    /// The failure code a held obligation records.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::EpochGap => "epoch_gap_hold",
+            Self::Upload => "upload_hold",
+        }
+    }
+
+    /// Whether this hold defers a due self-update started by `trigger`: an
+    /// epoch gap holds every rotation, an upload only periodic ones.
+    pub fn applies_to(self, trigger: MaintenanceTrigger) -> bool {
+        match self {
+            Self::EpochGap => true,
+            Self::Upload => trigger == MaintenanceTrigger::Periodic,
+        }
+    }
+}
+
 /// Local scheduling windows for own-leaf maintenance rotations.
 ///
 /// These are anti-contention and catch-up delays, not protocol policy. A
@@ -1563,13 +1599,13 @@ where
     }
 
     /// [`Self::run_due_maintenance`], but no new self-update commit is
-    /// authored for a `held` group. The caller holds a group it knows has
-    /// moved past this device's local epoch: a commit from that epoch forks the
-    /// group (mdk#2258). A held obligation stays owed and retries on a later
-    /// sweep; publication of an already-staged commit is not held.
+    /// authored for a `held` group whose hold applies to the obligation's
+    /// trigger ([`SelfUpdateHold::applies_to`]); each hold names why, as the
+    /// obligation's failure code. A held obligation stays owed and retries on a
+    /// later sweep; publication of an already-staged commit is not held.
     pub async fn run_due_maintenance_holding(
         &mut self,
-        held: &[GroupId],
+        held: &[(GroupId, SelfUpdateHold)],
     ) -> AccountResult<AccountDeviceEffects> {
         use sha2::{Digest, Sha256};
 
@@ -2067,9 +2103,11 @@ where
                 self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
                 continue;
             }
-            if held.contains(&obligation.group_id) {
+            if let Some((_, hold)) = held.iter().find(|(group, hold)| {
+                group == &obligation.group_id && hold.applies_to(obligation.trigger)
+            }) {
                 obligation.phase = MaintenancePhase::Retry;
-                obligation.last_failure_code = Some("epoch_gap_hold".into());
+                obligation.last_failure_code = Some(hold.code().into());
                 self.put_maintenance_obligation_if_changed(&original_obligation, &obligation)?;
                 continue;
             }
