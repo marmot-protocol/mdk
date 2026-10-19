@@ -1143,6 +1143,70 @@ async fn neg_sessions_after_pass(fx: &Fixture) -> usize {
     fx.limit.stats().neg_active_now()
 }
 
+/// A healthy relay may need longer than the former 500 ms first reply and
+/// two-second route ceilings to compare and serve its exact-ID history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delayed_relay_returns_history() {
+    const STORED: usize = 10;
+    let (fx, url) = connected_fixture(LimitConfig::default(), 0).await;
+    let keys = Keys::generate();
+    let mut expected = HashSet::new();
+    for index in 0..STORED {
+        let event = EventBuilder::new(Kind::MlsGroupMessage, format!("history-{index}"))
+            .tags([Tag::custom("h", [hex::encode(route(0))])])
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
+                1_700_000_000 + index as u64,
+            ))
+            .finalize(&keys)
+            .unwrap();
+        expected.insert((event.id.to_hex(), event.content.clone()));
+        fx.database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+    }
+    fx.limit.set_client_delay(Duration::from_millis(1_200));
+    let result = fx
+        .sdk
+        .reconcile_subscription(
+            reconciliation_route(&url, &fx.account),
+            &[],
+            SINCE,
+            UNTIL,
+            &Cursor::default(),
+            tokio::time::Instant::now() + SETTLE_TIMEOUT,
+        )
+        .await;
+    // Do not delay cleanup frames or fixture teardown, even on a failed pass.
+    fx.limit.set_client_delay(Duration::ZERO);
+    let lingering = neg_sessions_after_pass(&fx).await;
+    let stats = fx.limit.stats();
+    fx.shutdown().await;
+
+    let (summary, events) = result.unwrap();
+    assert_eq!(summary.relays_succeeded, 1);
+    assert_eq!(summary.relays_failed, 0);
+    assert!(summary.failed_endpoints.is_empty());
+    assert!(summary.incomplete_endpoints.is_empty());
+    assert!(summary.endpoint_failures.is_empty());
+    assert!(!summary.order_unproven);
+    assert_eq!(summary.remote_items, STORED);
+    assert_eq!(summary.received_items, STORED);
+    assert_eq!(events.len(), STORED);
+    let returned = events
+        .into_iter()
+        .map(|event| (event.event.id, event.event.content))
+        .collect::<HashSet<_>>();
+    assert!(
+        returned == expected,
+        "every expected ID and payload is returned"
+    );
+    assert!(stats.neg_opens > 0);
+    assert!(stats.total_reqs > 0, "history uses an exact-ID fetch");
+    assert_eq!(stats.rejections_total(), 0);
+    assert_eq!(lingering, 0);
+}
+
 /// Hundreds of completed passes on one connection: the NEG session count
 /// returns to zero after every pass and never approaches the 200 cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1278,7 +1342,7 @@ fn all_failed(results: &[(u128, String)], endpoints: usize) -> bool {
 
 /// The relay answers NEG-OPEN with strfry's NEG-cap NOTICE (no session id).
 /// nostr-sdk's first-reply check ignores that NOTICE, so the pass waits out
-/// the 500 ms first-reply timeout and the endpoint counts as failed.
+/// the first-reply timeout and the endpoint counts as failed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn neg_cap_notice_fails_after_the_first_reply_timeout() {
     let config = LimitConfig {
@@ -1305,8 +1369,10 @@ async fn neg_cap_notice_fails_after_the_first_reply_timeout() {
         stats.summary()
     );
     assert!(all_failed(&results, 2), "{results:?}");
+    // The five-second first-reply timeout ends each pass, not the caller's
+    // longer deadline.
     assert!(
-        results.iter().all(|(ms, _)| (450..1_500).contains(ms)),
+        results.iter().all(|(ms, _)| (4_900..6_500).contains(ms)),
         "{results:?}"
     );
     assert!(stats.neg_cap_notices >= 3);

@@ -119,8 +119,8 @@ admission preserve the pre-pass cursor.
 Pass budgets:
 
 - The NIP-77 remote-only selection holds at most 512 IDs from a 16,384-ID reconciliation set.
-- The first NIP-77 reply gets up to 500 ms. A pass uses the earlier of its caller's absolute
-  cutoff and a two-second SDK allowance. MarmotApp runs a pass's routes one after another inside
+- The first NIP-77 reply gets up to five seconds. A pass uses the earlier of its caller's absolute
+  cutoff and a twenty-second SDK allowance. MarmotApp runs a pass's routes one after another inside
   its ten-second account-wide budget and gives each an equal share of what is left, keeping time
   for partial-result handoff and epoch-gap window fetches.
 - Each pass sends at most 16 request-local exact-ID acquisitions within that deadline and the

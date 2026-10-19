@@ -77,8 +77,9 @@ const SDK_PUBLISH_RELAY_IDLE_WAIT: Duration = Duration::from_secs(60);
 /// One route gets a strict pass-wide budget, including set comparison, replay
 /// fetch, decoding, and materialization. The app can impose a shorter
 /// account-wide deadline for background work.
-const SDK_RECONCILIATION_WAIT: Duration = Duration::from_secs(2);
-const SDK_RECONCILIATION_NEGOTIATION_WAIT: Duration = Duration::from_millis(500);
+const SDK_RECONCILIATION_WAIT: Duration = Duration::from_secs(20);
+/// Allow relay-side inventory work and a WAN round trip before the first reply.
+const SDK_RECONCILIATION_NEGOTIATION_WAIT: Duration = Duration::from_secs(5);
 /// Fetch a bounded rotating portion of the remote-only set. Durable admission
 /// removes accepted ids; rotation reaches dependencies beyond refused ids.
 const SDK_RECONCILIATION_REPLAY_BATCH: usize = 512;

@@ -1291,7 +1291,8 @@ async fn a_relay_that_misses_the_probes_cannot_make_newer_history_look_oldest() 
         .collect::<HashSet<_>>();
     // However many passes the route waits, none returns newer history while
     // the older relay's history is unseen; the route stays quiet instead, and
-    // recovery parks it with its notice.
+    // recovery parks it with its notice. Each pass gets a background route's
+    // share of the app's pass: the unanswered probes run to its deadline.
     for pass in 1..=5 {
         let (_, events) = sdk
             .reconcile_subscription(
@@ -1300,7 +1301,7 @@ async fn a_relay_that_misses_the_probes_cannot_make_newer_history_look_oldest() 
                 SINCE,
                 UNTIL,
                 &cursor,
-                tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(2_500),
             )
             .await
             .unwrap();
@@ -2443,11 +2444,14 @@ async fn duplicated_endpoint_item_limit_keeps_partial_event_and_incomplete_summa
     right.shutdown();
 }
 
+/// The caller's deadline, not the SDK's longer route allowance, ends the
+/// silent endpoint's fetch, and the healthy endpoint's event survives it.
 #[tokio::test]
 async fn silent_endpoint_deadline_keeps_healthy_partial_event_and_incomplete_summary() {
     let (left, right, sdk, route, left_counts, right_counts, event_id) =
         one_missing_event_fixture().await;
     right_counts.drop_requests.store(true, Ordering::SeqCst);
+    let started = std::time::Instant::now();
     let (summary, events) = sdk
         .reconcile_subscription(
             route,
@@ -2455,10 +2459,15 @@ async fn silent_endpoint_deadline_keeps_healthy_partial_event_and_incomplete_sum
             0,
             u64::MAX,
             &Cursor::default(),
-            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
         )
         .await
         .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the caller's deadline ended the pass: {:?}",
+        started.elapsed()
+    );
     assert_eq!(summary.relays_succeeded, 1);
     assert_eq!(summary.relays_failed, 1);
     assert!(
