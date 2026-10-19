@@ -339,6 +339,23 @@ impl CloseableConnection {
         result
     }
 
+    /// Starts a close without waiting: admits no new operations and
+    /// interrupts a registered long statement (a compaction), which rolls
+    /// back. A later [`Self::close`] finishes the job. Lets an owner tearing
+    /// down several resources free the ones blocked behind this connection
+    /// before it waits on any of them.
+    pub fn begin_close(&self) {
+        self.closed.store(true, Ordering::Release);
+        if let Some(handle) = self
+            .interruptible
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            handle.interrupt();
+        }
+    }
+
     /// Takes the connection mutex for a close. While a registered statement
     /// (a compaction) holds it, interrupt that statement, again until it
     /// yields: an interrupt that lands before the statement starts is ignored
@@ -576,6 +593,14 @@ impl SharedConnection {
         self.inner.closed.store(true, Ordering::Release);
         self.wake_transaction_waiters();
         self.inner.connection.close()
+    }
+
+    /// [`CloseableConnection::begin_close`] for this connection, also waking
+    /// threads parked for its transaction slot.
+    pub(crate) fn begin_close(&self) {
+        self.inner.closed.store(true, Ordering::Release);
+        self.wake_transaction_waiters();
+        self.inner.connection.begin_close();
     }
 
     /// [`CloseableConnection::interrupt_on_close`] for this connection.
@@ -1352,6 +1377,23 @@ impl DatabaseCloser {
         };
         self.release.wait();
         result
+    }
+
+    /// Starts closing the database without waiting (see
+    /// [`CloseableConnection::begin_close`]); [`Self::close`] finishes it.
+    pub fn begin_close(&self) {
+        match &self.target {
+            CloserTarget::Account(inner) => {
+                if let Some(inner) = inner.upgrade() {
+                    SharedConnection { inner }.begin_close();
+                }
+            }
+            CloserTarget::Connection(connection) => {
+                if let Some(connection) = connection.upgrade() {
+                    connection.begin_close();
+                }
+            }
+        }
     }
 
     /// Whether the connection is gone, closed or dropped with its last

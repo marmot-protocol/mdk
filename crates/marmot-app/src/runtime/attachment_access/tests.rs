@@ -1515,3 +1515,39 @@ async fn bulk_removal_reclaims_pages_once_the_database_is_incremental() {
     assert_eq!(store.app_storage().database_space().unwrap().free_pages, 0);
     runtime.shutdown_and_close().await.unwrap();
 }
+
+/// Closing storage (a host about to suspend) does not wait out a compaction,
+/// even when a media sweep is blocked behind it holding its store's sweep
+/// lock, which the media store's close takes before the databases close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_storage_cuts_short_a_compaction_with_a_sweep_behind_it() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    seed_file_backed(&app, &store, &[4u8; 4096]);
+    let media = app.account_media_store("alice", &store).unwrap();
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let compacting = store.app_storage();
+    let compaction =
+        std::thread::spawn(move || compacting.hold_like_compaction_for_test(&started_tx));
+    started_rx.recv().unwrap();
+    let sweep = std::thread::spawn(move || media.sweep(256));
+    // Let the sweep take its lock and block on the held connection.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let closing_app = app.clone();
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = closed_tx.send(closing_app.close_storage());
+    });
+    let closed = closed_rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("close_storage finished without waiting out the compaction");
+    assert!(closed.is_ok());
+    compaction.join().unwrap();
+    assert!(sweep.join().unwrap().is_err(), "the sweep failed as closed");
+}

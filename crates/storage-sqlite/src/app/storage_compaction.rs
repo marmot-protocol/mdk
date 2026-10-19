@@ -177,6 +177,25 @@ impl SqliteAppStorage {
         let _ = held.send(());
         let _ = release.recv();
     }
+
+    /// Holds the account connection the way a compaction does, interruptible
+    /// by a close, until a close begins: signals `started`, then runs short
+    /// queries until the connection is closing. Test support only.
+    pub fn hold_like_compaction_for_test(&self, started: &std::sync::mpsc::Sender<()>) {
+        let conn = self.lock().expect("account connection");
+        let _interruptible = self
+            .connection
+            .interrupt_on_close(conn.get_interrupt_handle());
+        let _ = started.send(());
+        while !self.connection.is_closing() {
+            let _ = conn.query_row(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<100000)
+                 SELECT count(*) FROM c",
+                [],
+                |row| row.get::<_, i64>(0),
+            );
+        }
+    }
 }
 
 /// `wal_checkpoint(TRUNCATE)` without waiting on the busy handler: a reader
