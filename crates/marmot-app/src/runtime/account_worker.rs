@@ -3911,10 +3911,8 @@ fn schedule_avatar_acquisition(
 ) -> Result<bool, AppError> {
     let storage = client.app.account_storage(&client.state.label)?;
     let transport = client.blossom_http_transport.clone();
-    let group_image_server = client
-        .app
-        .deployment()
-        .group_image_endpoint_or_fallback(None);
+    // Unset, encrypted group images can't load; profile pictures still do.
+    let group_image_server = client.app.deployment().group_image_endpoint.clone();
     let mut dispatched = false;
     let result = dispatch_avatar_acquisition(
         &storage.app_storage(),
@@ -3925,7 +3923,8 @@ fn schedule_avatar_acquisition(
             let transport = transport.clone();
             let group_image_server = group_image_server.clone();
             async move {
-                crate::media::avatar::fetch(&descriptor, &group_image_server, &transport).await
+                crate::media::avatar::fetch(&descriptor, group_image_server.as_deref(), &transport)
+                    .await
             }
         },
     );

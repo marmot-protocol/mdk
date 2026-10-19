@@ -480,8 +480,8 @@ uploads. Without `--server`, the upload targets the ordered endpoints in the gro
 component: frozen V1 (`0x8008`) for already-joined legacy groups and V2 (`0x800b`) for current-profile groups. Upload
 JSON returns an `attachments` array with each attachment's `plaintext_sha256`, `ciphertext_sha256`, and locators.
 
-**Endpoints.** Newly created groups use MDK's built-in ciphertext-compatible endpoint list unless the application was
-compiled with `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS`. Endpoint policy is signed group state, so upgrading MDK changes
+**Endpoints.** Newly created groups use White Noise's ciphertext-compatible endpoint list, which `wn` takes from
+its White Noise deployment. Endpoint policy is signed group state, so upgrading MDK changes
 defaults for new groups only. An active group admin runs `media set-endpoints <group-hex> <url> [...]`
 (`--locator-kind` defaults to `blossom-v1`) to replace a group's default endpoints without changing its media version.
 Non-admins get `not_group_admin`; the response carries the refreshed `encrypted_media` component.

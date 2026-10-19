@@ -10,8 +10,6 @@ const COMPILED_RELAY_TELEMETRY_OTLP_ENDPOINT: Option<&str> =
     option_env!("MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT");
 const COMPILED_AUDIT_LOG_TRACKER_ENDPOINT: Option<&str> =
     option_env!("MARMOT_AUDIT_LOG_TRACKER_ENDPOINT");
-const COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS: Option<&str> =
-    option_env!("MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS");
 
 /// Policy for advancing the account's durable transport cursor
 /// (`last_transport_timestamp`) from ingested deliveries.
@@ -111,9 +109,8 @@ pub struct MarmotAppConfig {
     /// The services this deployment's users rely on: recovery relays,
     /// discovery indexers, media and image servers, Open Ranking, the
     /// KeyPackage client preference, the moderation label namespace and the
-    /// keychain service. The default is [`MarmotDeployment::white_noise`],
-    /// with a build-time `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` list laid
-    /// over its new-group media servers.
+    /// keychain service. The default is [`MarmotDeployment::neutral`]; White
+    /// Noise hosts use [`MarmotAppConfig::white_noise`].
     pub deployment: MarmotDeployment,
     pub service_endpoints: MarmotServiceEndpoints,
     /// Durable transport-cursor persistence policy. Defaults to
@@ -267,7 +264,7 @@ impl Default for MarmotAppConfig {
             usage_diagnostics_silent: false,
             directory_max_future_skew: DEFAULT_DIRECTORY_MAX_FUTURE_SKEW,
             directory_relay_urls: Vec::new(),
-            deployment: compiled_deployment(),
+            deployment: MarmotDeployment::neutral(),
             service_endpoints: MarmotServiceEndpoints::compiled(),
             cursor_persistence: CursorPersistence::Advance,
             allow_loopback_blob_endpoints: false,
@@ -293,14 +290,12 @@ impl Default for MarmotAppConfig {
 }
 
 impl MarmotAppConfig {
-    /// Today's defaults with White Noise's deployment as this build compiled
-    /// it ([`MarmotDeployment::white_noise`], with a build-time
-    /// `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` list over its new-group media
-    /// servers). White Noise hosts, and tests of White Noise behaviour, name
-    /// it explicitly so they keep it when [`Default`] turns neutral.
+    /// The default configuration with White Noise's deployment
+    /// ([`MarmotDeployment::white_noise`]). [`Default`] is neutral: it
+    /// configures no deployment service.
     pub fn white_noise() -> Self {
         Self {
-            deployment: compiled_deployment(),
+            deployment: MarmotDeployment::white_noise(),
             ..Self::default()
         }
     }
@@ -534,20 +529,6 @@ impl MarmotServiceEndpoints {
     }
 }
 
-/// White Noise's deployment, with a build-time
-/// `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` list over its new-group media
-/// servers, as `MarmotServiceEndpoints::compiled()` applied it before.
-fn compiled_deployment() -> MarmotDeployment {
-    let mut deployment = MarmotDeployment::white_noise();
-    let compiled = COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS
-        .map(split_endpoint_list)
-        .unwrap_or_default();
-    if !compiled.is_empty() {
-        deployment.new_group_media_endpoints = compiled;
-    }
-    deployment.normalize()
-}
-
 /// Default export poll/push interval. Coarse on purpose: the data is
 /// aggregate and cumulative, so a coarse window respects battery and metered
 /// networks without losing resolution.
@@ -731,15 +712,6 @@ fn trim_optional(value: Option<String>) -> Option<String> {
         let value = value.trim().to_owned();
         (!value.is_empty()).then_some(value)
     })
-}
-
-fn split_endpoint_list(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 fn trim_required(name: &str, value: String) -> Result<String, String> {
@@ -985,7 +957,8 @@ mod tests {
 
     #[test]
     fn open_ranking_provider_is_configurable_and_can_be_disabled() {
-        let default = MarmotAppConfig::default();
+        assert_eq!(MarmotAppConfig::default().deployment.open_ranking, None);
+        let default = MarmotAppConfig::white_noise();
         assert_eq!(
             default.deployment.open_ranking,
             MarmotDeployment::white_noise().open_ranking
@@ -999,19 +972,20 @@ mod tests {
     }
 
     #[test]
-    fn default_config_uses_the_white_noise_deployment() {
-        let mut expected = MarmotDeployment::white_noise();
-        if let Some(compiled) = COMPILED_ENCRYPTED_MEDIA_BLOB_ENDPOINTS
-            .map(split_endpoint_list)
-            .filter(|list| !list.is_empty())
-        {
-            expected.new_group_media_endpoints = compiled;
-        }
-        assert_eq!(MarmotAppConfig::default().deployment, expected);
+    fn the_default_config_is_neutral_and_white_noise_is_named() {
         assert_eq!(
-            MarmotAppConfig::white_noise(),
+            MarmotAppConfig::default().deployment,
+            MarmotDeployment::neutral()
+        );
+        let white_noise = MarmotAppConfig::white_noise();
+        assert_eq!(white_noise.deployment, MarmotDeployment::white_noise());
+        assert_eq!(
+            MarmotAppConfig {
+                deployment: MarmotDeployment::neutral(),
+                ..white_noise
+            },
             MarmotAppConfig::default(),
-            "until the neutral default lands, the default is White Noise's"
+            "white_noise() differs from the default only in its deployment"
         );
     }
 

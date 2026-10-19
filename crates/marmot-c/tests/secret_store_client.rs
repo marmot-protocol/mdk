@@ -109,6 +109,7 @@ fn a_host_store_opens_a_client_without_the_platform_keychain() {
             relays.as_ptr(),
             1,
             &raw const store,
+            marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
             &raw mut client,
         )
     };
@@ -158,6 +159,7 @@ fn a_failure_after_the_vtable_is_accepted_leaves_user_data_to_the_host() {
             relays.as_ptr(),
             1,
             &raw const store,
+            marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
             &raw mut client,
         )
     };
@@ -182,6 +184,7 @@ fn a_null_store_is_rejected_before_the_client_is_built() {
             std::ptr::null(),
             0,
             std::ptr::null(),
+            marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
             &raw mut client,
         )
     };
@@ -201,6 +204,7 @@ fn client_name_constructor_validates_arguments_without_taking_store_ownership() 
             name.as_ptr(),
             u32::MAX,
             std::ptr::null(),
+            marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
             &raw mut client,
         )
     };
@@ -246,6 +250,7 @@ fn combined_options_validate_before_transferring_store_ownership() {
                 relays.as_ptr(),
                 1,
                 &options,
+                marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
                 &raw mut client,
             )
         };
@@ -262,6 +267,7 @@ fn combined_options_validate_before_transferring_store_ownership() {
             relays.as_ptr(),
             1,
             &options,
+            marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
             &raw mut client,
         )
     };
@@ -278,6 +284,7 @@ fn combined_options_validate_before_transferring_store_ownership() {
             relays.as_ptr(),
             1,
             &options,
+            marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
             &raw mut client,
         )
     };
@@ -321,7 +328,7 @@ fn a_deployment_constructor_opens_with_a_host_store() {
     );
     let mut client = std::ptr::null_mut();
     let status = unsafe {
-        marmot_c::marmot_client_new_with_deployment(
+        marmot_c::marmot_client_new_with_configuration(
             path.as_ptr(),
             relays.as_ptr(),
             1,
@@ -335,4 +342,47 @@ fn a_deployment_constructor_opens_with_a_host_store() {
     assert_eq!(status, MarmotStatus::Ok);
     unsafe { marmot_client_free(client) };
     assert!(destroyed.load(Ordering::SeqCst));
+}
+
+#[test]
+fn a_null_deployment_is_rejected_before_the_store_is_taken() {
+    unsafe extern "C" fn mark_destroyed(data: *mut c_void) {
+        unsafe { &*(data as *const AtomicBool) }.store(true, Ordering::SeqCst);
+    }
+    let destroyed = AtomicBool::new(false);
+    let store = MarmotSecretStore {
+        user_data: (&destroyed as *const AtomicBool).cast_mut().cast(),
+        has_secret_for_label: Some(has),
+        has_secret_for_account_id: Some(has),
+        write_secret: Some(write_secret),
+        load_secret: Some(load_secret),
+        remove_secret: Some(remove_secret),
+        free_secret: Some(free_secret),
+        destroy: Some(mark_destroyed),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let path = CString::new(root.path().to_str().unwrap()).unwrap();
+    let relay = CString::new("ws://127.0.0.1:1").unwrap();
+    let relays = [relay.as_ptr()];
+    let mut client = std::ptr::dangling_mut();
+    let status = unsafe {
+        marmot_client_new_with_secret_store(
+            path.as_ptr(),
+            relays.as_ptr(),
+            1,
+            &store,
+            std::ptr::null(),
+            &raw mut client,
+        )
+    };
+    assert_eq!(status, MarmotStatus::NullPointer);
+    assert!(client.is_null());
+    assert!(
+        !destroyed.load(Ordering::SeqCst),
+        "a refused construction leaves the store with its owner"
+    );
+    assert!(
+        std::fs::read_dir(root.path()).unwrap().next().is_none(),
+        "nothing opens without a deployment"
+    );
 }

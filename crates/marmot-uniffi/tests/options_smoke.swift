@@ -11,17 +11,21 @@ private final class OptionsStore: SecretStore, @unchecked Sendable {
 @main
 struct OptionsSmoke {
     static func main() throws {
-        let defaults = MarmotOptions()
+        // The deployment is the one required field.
+        let defaults = MarmotOptions(deployment: marmotDeploymentNeutral())
         precondition(defaults.relayPolicy == nil && defaults.cursorPersistence == nil)
         precondition(defaults.clientName == nil && defaults.secretStore == nil)
+        precondition(defaults.deployment.keychainService == "org.marmot-protocol.mdk")
         let options = MarmotOptions(
             relayPolicy: .allowLoopbackRelaysAndBlobs,
             cursorPersistence: .frozen,
-            clientName: "whitenoise"
+            clientName: "whitenoise",
+            deployment: marmotDeploymentWhiteNoise()
         )
         var copy = try FfiConverterTypeMarmotOptions.lift(FfiConverterTypeMarmotOptions.lower(options))
         precondition(copy.relayPolicy == .allowLoopbackRelaysAndBlobs)
         precondition(copy.cursorPersistence == .frozen && copy.clientName == "whitenoise")
+        precondition(copy.deployment.keychainService == "com.marmot.whitenoise")
         // Foreign callback handles must cross into Rust; local lower/lift is
         // only valid here while the callback field is nil.
         copy.secretStore = OptionsStore()

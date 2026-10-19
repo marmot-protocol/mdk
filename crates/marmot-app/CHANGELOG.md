@@ -12,8 +12,8 @@
   recovery-operated relays, discovery indexers, new-group media servers,
   group- and profile-image servers, Open Ranking, the KeyPackage client
   preference, the moderation label namespace and the keychain service name.
-  `MarmotDeployment::white_noise()` holds White Noise's values, unchanged, and
-  is still the default; `MarmotDeployment::neutral()` configures none.
+  `MarmotDeployment::white_noise()` holds White Noise's values, unchanged;
+  `MarmotDeployment::neutral()` configures none.
   `MarmotAppConfig::recovery_operated_relays` and the `MarmotServiceEndpoints`
   fields `encrypted_media_blob_endpoints`, `profile_image_blob_endpoint`,
   `open_ranking_search_endpoint` and `open_ranking_profile_relays` are gone;
@@ -23,11 +23,23 @@
   `MODERATION_REPORT_LABEL_NAMESPACE` are removed: use
   `MarmotApp::discovery_indexer_relays()` or the preset's fields. A
   moderation report destination is now refused when the deployment sets no
-  label namespace. `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` still replaces the
-  default new-group media servers at build time. `with_service_endpoints` now
-  sets only the collector routes, so passing `..Default::default()` no longer
-  turns Open Ranking off or clears a build-time media list; call
-  `with_open_ranking_provider(None, Vec::new())` to turn search off.
+  label namespace. `with_service_endpoints` now sets only the collector
+  routes, so passing `..Default::default()` no longer turns Open Ranking off;
+  call `with_open_ranking_provider(None, Vec::new())` to turn search off.
+- `MarmotAppConfig::default()` and `MarmotDeployment::default()` are now
+  neutral (host-configuration brief, PR 3). A host that relied on the default
+  for White Noise's services must start from `MarmotAppConfig::white_noise()`
+  or pass `MarmotDeployment::white_noise()` to `with_deployment`, or it loses
+  them, including its keychain service. Unset values no longer fall back to
+  White Noise's servers: with no `new_group_media_endpoints` a new group
+  carries no encrypted-media component and stays text-only, and with no
+  `group_image_endpoint` setting or fetching an encrypted group image returns
+  `AppError::BlobStore`, as does a profile-image upload with neither an
+  explicit server nor `profile_image_endpoint`. The build-time
+  `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` override is gone; set the list on
+  the deployment. `marmot_account::DEFAULT_KEYCHAIN_SERVICE_NAME` and
+  `AccountHome::open_with_default_keychain` are removed: call
+  `open_with_keychain` with the deployment's `keychain_service`.
 - `AppError` adds `GroupCatchingUp` and `GroupCommitUndelivered`; update exhaustive matches.
 - `AppError` adds `InvalidEditTarget`; update exhaustive matches.
 - `AppError` adds `DirectoryLookupIncomplete(account)` (mdk#2302). Invite member resolution,
@@ -87,7 +99,7 @@
 
 ### Added
 
-- `MarmotAppConfig::white_noise()` is today's default configuration with White Noise's deployment as this build compiled it. The CLI, `wn-agent`, the conformance simulator, the dev/test constructors and the tests now name it explicitly, so they keep White Noise's behaviour when `MarmotAppConfig::default()` turns neutral (host-configuration brief, PR 2). The CLI's default keychain service comes from `MarmotDeployment::white_noise()`; the name is unchanged.
+- `MarmotAppConfig::white_noise()` is the default configuration with White Noise's deployment. The CLI, `wn-agent`, the conformance simulator, the dev/test constructors and the tests name it explicitly, so they keep White Noise's behaviour now that `MarmotAppConfig::default()` is neutral (host-configuration brief, PRs 2 and 3). The CLI's default keychain service comes from `MarmotDeployment::white_noise()`; the name is unchanged.
 
 - Legacy attachment bodies move into the encrypted media store in the
   background (mdk#2314 step 6): one small batch per maintenance tick, after

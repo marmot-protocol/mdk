@@ -93,19 +93,19 @@ impl From<MarmotDeploymentFfi> for MarmotDeployment {
     }
 }
 
-/// White Noise's deployment as this build compiled it: the preset, with a
-/// build-time `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` list over its new-group
-/// media servers when one was set. A host that passes no deployment gets
-/// these values until the neutral default lands.
+/// White Noise's deployment: its recovery relays, discovery indexers, media
+/// and image servers, Vertex Open Ranking, KeyPackage client preference,
+/// moderation label namespace and keychain service `com.marmot.whitenoise`.
+/// White Noise apps pass it to every constructor.
 #[uniffi::export]
 pub fn marmot_deployment_white_noise() -> MarmotDeploymentFfi {
-    marmot_app::MarmotAppConfig::white_noise().deployment.into()
+    MarmotDeployment::white_noise().into()
 }
 
 /// No deployment services: every list empty, every option unset, and the
-/// neutral keychain service `org.marmot-protocol.mdk`. Until the neutral
-/// default lands, an empty new-group media list or an unset group-image or
-/// profile-image server still falls back to White Noise's.
+/// neutral keychain service `org.marmot-protocol.mdk`. With no media servers
+/// new groups are text-only; with no image servers group images can't load
+/// and profile images can't be uploaded.
 #[uniffi::export]
 pub fn marmot_deployment_neutral() -> MarmotDeploymentFfi {
     MarmotDeployment::neutral().into()
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn presets_round_trip_through_the_record() {
-        let white_noise = marmot_app::MarmotAppConfig::white_noise().deployment;
+        let white_noise = MarmotDeployment::white_noise();
         assert_eq!(
             MarmotDeployment::from(marmot_deployment_white_noise()),
             white_noise
@@ -129,10 +129,11 @@ mod tests {
     }
 
     #[test]
-    fn the_white_noise_record_keeps_the_default_keychain() {
+    fn the_white_noise_record_keeps_white_noise_keychain_service() {
+        // Changing this name would strand every existing install's secrets.
         assert_eq!(
             marmot_deployment_white_noise().keychain_service,
-            marmot_account::DEFAULT_KEYCHAIN_SERVICE_NAME
+            "com.marmot.whitenoise"
         );
     }
 

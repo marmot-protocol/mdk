@@ -402,7 +402,13 @@ mod tests {
             let relays = [c"wss://relay.example".as_ptr()];
             let mut client = ptr::null_mut();
             assert_eq!(
-                crate::marmot_client_new(root.as_ptr(), relays.as_ptr(), 1, &mut client),
+                crate::marmot_client_new(
+                    root.as_ptr(),
+                    relays.as_ptr(),
+                    1,
+                    crate::deployment::OwnedDeployment::white_noise().as_ptr(),
+                    &mut client,
+                ),
                 MarmotStatus::Ok
             );
             assert_ne!(

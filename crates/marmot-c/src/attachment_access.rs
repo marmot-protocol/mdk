@@ -185,7 +185,13 @@ mod tests {
         unsafe {
             let mut client = ptr::null_mut();
             assert_eq!(
-                crate::marmot_client_new(root.as_ptr(), relays.as_ptr(), 1, &mut client),
+                crate::marmot_client_new(
+                    root.as_ptr(),
+                    relays.as_ptr(),
+                    1,
+                    crate::deployment::OwnedDeployment::white_noise().as_ptr(),
+                    &mut client
+                ),
                 MarmotStatus::Ok
             );
             let message = std::ffi::CString::new("aa".repeat(32)).unwrap();

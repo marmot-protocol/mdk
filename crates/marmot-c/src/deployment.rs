@@ -1,6 +1,7 @@
 //! The deployment record a C host passes at construction, as an opaque
-//! handle: start from a preset, change what differs, then pass it to
-//! `marmot_client_new_with_deployment`. Mirrors UniFFI's `MarmotDeploymentFfi`.
+//! handle: start from a preset, change what differs, then pass it to any
+//! `marmot_client_new*` constructor, which requires one. Mirrors UniFFI's
+//! `MarmotDeploymentFfi`.
 
 use std::ffi::c_char;
 
@@ -46,9 +47,9 @@ unsafe fn edit(
     })
 }
 
-/// White Noise's deployment as this build compiled it, the values every
-/// constructor uses without a deployment until the neutral default lands.
-/// Free with marmot_deployment_free.
+/// White Noise's deployment, the one White Noise's clients pass to every
+/// constructor. Free with marmot_deployment_free; a client constructed with
+/// it keeps its own copy.
 /// # Safety
 /// out must be writable.
 #[unsafe(no_mangle)]
@@ -59,10 +60,9 @@ pub unsafe extern "C" fn marmot_deployment_white_noise(
 }
 
 /// No deployment services: every list empty, every option unset, and the
-/// neutral keychain service org.marmot-protocol.mdk. Until the neutral
-/// default lands, an empty new-group media list or an unset group-image or
-/// profile-image server still falls back to White Noise's. Free with
-/// marmot_deployment_free.
+/// neutral keychain service org.marmot-protocol.mdk. With no media servers
+/// new groups are text-only; with no image servers group images can't load
+/// and profile images can't be uploaded. Free with marmot_deployment_free.
 /// # Safety
 /// out must be writable.
 #[unsafe(no_mangle)]
@@ -245,6 +245,35 @@ pub unsafe extern "C" fn marmot_deployment_set_keychain_service(
             inner.keychain_service = required_str(name)?;
             Ok(())
         })
+    }
+}
+
+/// Rust test support: a White Noise deployment handle freed on drop. Pass
+/// `OwnedDeployment::white_noise().as_ptr()` to a constructor; the temporary
+/// is freed at the end of that statement, after the client copied it.
+#[doc(hidden)]
+pub struct OwnedDeployment(*mut MarmotDeployment);
+
+impl OwnedDeployment {
+    #[doc(hidden)]
+    pub fn white_noise() -> Self {
+        let mut out = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { marmot_deployment_white_noise(&mut out) },
+            MarmotStatus::Ok
+        );
+        Self(out)
+    }
+
+    #[doc(hidden)]
+    pub fn as_ptr(&self) -> *const MarmotDeployment {
+        self.0
+    }
+}
+
+impl Drop for OwnedDeployment {
+    fn drop(&mut self) {
+        unsafe { marmot_deployment_free(self.0) };
     }
 }
 

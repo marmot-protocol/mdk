@@ -1795,7 +1795,7 @@ impl AppClient {
                 server: self
                     .app
                     .deployment()
-                    .group_image_endpoint_or_fallback(server.as_deref()),
+                    .group_image_endpoint_for(server.as_deref())?,
                 allow_loopback_http,
                 transport: self.blossom_http_transport.clone(),
             },
@@ -2022,8 +2022,9 @@ impl AppClient {
                 .to_app_component_data()
                 .map_err(|err| AppError::InvalidAgentTextStreamPolicy(err.to_string()))?,
         );
-        let encrypted_media = self.encrypted_media_component_for_new_group()?;
-        app_components.push(encrypted_media);
+        if let Some(encrypted_media) = self.encrypted_media_component_for_new_group()? {
+            app_components.push(encrypted_media);
+        }
         if disappearing_message_secs != 0 {
             app_components.push(
                 AppGroupMessageRetentionComponent::new(disappearing_message_secs)
@@ -2118,7 +2119,7 @@ impl AppClient {
                                 let upload = upload_group_image(
                                     &image.plaintext,
                                     &image.media_type,
-                                    &self.app.deployment().group_image_endpoint_or_fallback(None),
+                                    &self.app.deployment().group_image_endpoint_for(None)?,
                                     &self.blossom_http_transport,
                                 )
                                 .await?;
@@ -5553,7 +5554,7 @@ impl AppClient {
             let upload = upload_group_image(
                 &plaintext,
                 media_type,
-                &self.app.deployment().group_image_endpoint_or_fallback(None),
+                &self.app.deployment().group_image_endpoint_for(None)?,
                 &self.blossom_http_transport,
             )
             .await?;
@@ -5611,7 +5612,7 @@ impl AppClient {
             image_key_hex: input.image_key_hex,
             image_nonce_hex: input.image_nonce_hex,
             media_type: input.media_type.unwrap_or_default(),
-            server: self.app.deployment().group_image_endpoint_or_fallback(None),
+            server: self.app.deployment().group_image_endpoint_for(None)?,
             transport: self.blossom_http_transport.clone(),
         })
     }
@@ -6616,12 +6617,18 @@ impl AppClient {
             )?)
     }
 
-    fn encrypted_media_component_for_new_group(&self) -> Result<AppComponentData, AppError> {
-        let endpoints = self
-            .app
-            .deployment()
-            .new_group_media_endpoints_or_fallback();
-        match self.runtime.new_protocol_profile() {
+    /// The encrypted-media component for a new group, or `None` when the
+    /// deployment sets no media servers: the group is then text-only for
+    /// life, since `replace_encrypted_media_blob_endpoints` can't add the
+    /// component later.
+    fn encrypted_media_component_for_new_group(
+        &self,
+    ) -> Result<Option<AppComponentData>, AppError> {
+        let endpoints = self.app.deployment().new_group_media_endpoints.clone();
+        if endpoints.is_empty() {
+            return Ok(None);
+        }
+        let component = match self.runtime.new_protocol_profile() {
             ProtocolProfile::Legacy => {
                 let policy = EncryptedMediaPolicyV1::blossom_default(endpoints, true)
                     .map_err(AppError::InvalidEncryptedMedia)?;
@@ -6632,7 +6639,8 @@ impl AppClient {
                     .map_err(AppError::InvalidEncryptedMedia)?;
                 AppGroupEncryptedMediaComponent::new_v2(policy)?.to_app_component_data()
             }
-        }
+        }?;
+        Ok(Some(component))
     }
 
     /// Reconcile every group's current and still-live prior transport

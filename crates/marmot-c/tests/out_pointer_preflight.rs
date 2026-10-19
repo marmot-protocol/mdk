@@ -27,7 +27,15 @@ fn client(root: &tempfile::TempDir) -> Option<*mut MarmotClient> {
     let relays = [relay.as_ptr()];
     let mut client: *mut MarmotClient = std::ptr::null_mut();
 
-    match unsafe { marmot_client_new(root_path.as_ptr(), relays.as_ptr(), 1, &raw mut client) } {
+    match unsafe {
+        marmot_client_new(
+            root_path.as_ptr(),
+            relays.as_ptr(),
+            1,
+            marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
+            &raw mut client,
+        )
+    } {
         MarmotStatus::Ok => Some(client),
         MarmotStatus::KeystoreUnavailable => None,
         status => panic!("client_new failed: {status:?}"),

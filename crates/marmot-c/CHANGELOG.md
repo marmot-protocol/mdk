@@ -7,6 +7,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- Every `marmot_client_new*` constructor takes a required `const MarmotDeployment *deployment` just before `out_client` (host-configuration brief, PRs 2 and 3). The opaque `MarmotDeployment` (`marmot_deployment_white_noise`, `marmot_deployment_neutral`, the `marmot_deployment_set_*` setters, `marmot_deployment_free`) carries the recovery relays, discovery indexers, media and image servers, Open Ranking, KeyPackage client preference, moderation label namespace and keychain service; the client copies it. A NULL deployment returns `MARMOT_STATUS_NULL_POINTER` before anything opens. White Noise hosts pass `marmot_deployment_white_noise()`, which keeps their behaviour and keychain unchanged; unset values fall back to nothing. `MarmotClientOptions` is unchanged. Use matching regenerated headers and libraries.
+
 ### Added
 
 - `MarmotAttachmentStorageUsage` adds `migration`
@@ -23,7 +27,6 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   (page cursors are borrowed from their page). Use matching regenerated headers
   and libraries.
 
-- Add `marmot_client_new_with_deployment` and the opaque `MarmotDeployment` (`marmot_deployment_white_noise`, `marmot_deployment_neutral`, the `marmot_deployment_set_*` setters, `marmot_deployment_free`): a host passes its recovery relays, discovery indexers, media and image servers, Open Ranking, KeyPackage client preference, moderation label namespace and keychain service at construction. A NULL deployment, and every other constructor, still uses White Noise's until the neutral default lands (host-configuration brief, PR 2). `MarmotClientOptions` is unchanged. Use matching regenerated headers and libraries.
 - Add `marmot_open_attachment_handoff` and `marmot_release_attachment_handoff`
   (record `MarmotAttachmentHandoff`, freed with `marmot_attachment_handoff_free`,
   which does not release the lease) for handoff copies of retained attachments

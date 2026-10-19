@@ -9679,9 +9679,7 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
         .iter()
         .map(|endpoint| endpoint.base_url.as_str())
         .collect::<Vec<_>>();
-    // Host builds may compile in MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS, which
-    // the default configuration lays over the White Noise servers, so expect
-    // whichever list the client actually embeds.
+    // The White Noise configuration signs its media servers into new groups.
     let expected_endpoints = marmot_app::MarmotAppConfig::white_noise()
         .deployment
         .new_group_media_endpoints;
@@ -9736,6 +9734,63 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
         // WHATWG normalization (group-encrypted-media-v1.md) serializes an empty
         // path as `/`, so the stored canonical endpoint URL carries the slash.
         "https://media.example/"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_neutral_deployment_creates_text_only_groups_and_refuses_group_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let (_relay, url) = mock_relay().await;
+    // The default deployment is neutral: no media or group-image servers, and
+    // nothing falls back to White Noise's.
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url,
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("text only", &["bob"]).await.unwrap();
+    let group = app
+        .group("alice", &hex::encode(group_id.as_slice()))
+        .unwrap()
+        .unwrap();
+    assert!(
+        group.encrypted_media.data_hex.is_empty()
+            && group.encrypted_media.default_blob_endpoints.is_empty(),
+        "a neutral deployment must sign no encrypted-media component into a new group"
+    );
+    alice.send(&group_id, b"text still sends").await.unwrap();
+
+    let endpoint_error = alice
+        .replace_encrypted_media_blob_endpoints(
+            &group_id,
+            vec![marmot_app::AppBlobEndpoint {
+                locator_kind: "blossom-v1".to_owned(),
+                base_url: "https://media.example".to_owned(),
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        endpoint_error
+            .to_string()
+            .contains("no encrypted-media servers"),
+        "{endpoint_error}"
+    );
+    let image_error = alice
+        .update_group_image(&group_id, b"image bytes".to_vec(), "image/png")
+        .await
+        .unwrap_err();
+    assert!(
+        image_error.to_string().contains("no group-image server"),
+        "{image_error}"
     );
 }
 
