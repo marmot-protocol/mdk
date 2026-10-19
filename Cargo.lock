@@ -3884,7 +3884,7 @@ dependencies = [
 
 [[package]]
 name = "marmot-uniffi-macros"
-version = "0.13.0"
+version = "0.14.0-dev"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6939,7 +6939,7 @@ dependencies = [
 
 [[package]]
 name = "transport-nostr"
-version = "0.13.0"
+version = "0.14.0-dev"
 dependencies = [
  "async-trait",
  "cgka-traits",
