@@ -106,8 +106,10 @@ impl LegacyMigrationBatch {
 
 enum BodyOutcome {
     Moved,
-    /// The rows changed underneath the move (a removal); nothing was kept.
-    Superseded,
+    /// Nothing moved this time: the rows changed underneath the move (a
+    /// removal), or the stored file it would rely on failed verification and
+    /// the next batch writes a fresh one.
+    Skipped,
     Corrupt,
     Paused(u64),
     Deferred,
@@ -150,7 +152,7 @@ pub(crate) fn migrate_batch(
                 moved += 1;
                 moved_bytes = moved_bytes.saturating_add(body.byte_len());
             }
-            BodyOutcome::Superseded => {}
+            BodyOutcome::Skipped => {}
             BodyOutcome::Corrupt => {
                 if storage.drop_corrupt_legacy_body(body).is_err() {
                     return LegacyMigrationBatch::Deferred {
@@ -191,19 +193,20 @@ fn migrate_body(
     now: u64,
     body: &LegacyAttachmentBody,
 ) -> BodyOutcome {
-    // An earlier move published the file and stopped before deleting the
-    // rows. Drop them only while the file is really there; a missing or
-    // corrupt file is marked lost by the open, and the body moves again.
-    if let Some(id) = body.media_file() {
-        match media.open_reader(&id) {
-            Ok(Some(_)) => return dropped(storage.drop_migrated_legacy_body(body)),
-            Ok(None) | Err(MediaError::Corruption(_)) => {}
-            Err(_) => return BodyOutcome::Deferred,
-        }
-    }
     let Some(digest) = body.digest() else {
         return BodyOutcome::Corrupt;
     };
+    // An earlier move published the file and stopped before deleting the
+    // rows. Drop them only once the whole file authenticates and hashes to
+    // the slot's digest; a file that fails is marked lost, and the body
+    // moves again.
+    if let Some(id) = body.media_file() {
+        match media.verify(&id, &digest) {
+            Ok(true) => return dropped(storage.drop_migrated_legacy_body(body)),
+            Ok(false) => {}
+            Err(_) => return BodyOutcome::Deferred,
+        }
+    }
     let need = DiskPolicy::migration_need(body.byte_len());
     let shortfall = |free: u64| {
         let short = policy
@@ -230,10 +233,17 @@ fn migrate_body(
         &|| false,
     );
     match published {
-        Ok(PublishOutcome::Published(_) | PublishOutcome::Existing(_)) => {
-            dropped(storage.drop_migrated_legacy_body(body))
-        }
-        Ok(PublishOutcome::Superseded) => BodyOutcome::Superseded,
+        // Written and hashed just now, from these very rows.
+        Ok(PublishOutcome::Published(_)) => dropped(storage.drop_migrated_legacy_body(body)),
+        // A stored twin was only checked for presence and length: read it all
+        // before giving up the database copy. One that fails is now lost, so
+        // the next batch writes a fresh file from the rows.
+        Ok(PublishOutcome::Existing(twin)) => match media.verify(&twin, &digest) {
+            Ok(true) => dropped(storage.drop_migrated_legacy_body(body)),
+            Ok(false) => BodyOutcome::Skipped,
+            Err(_) => BodyOutcome::Deferred,
+        },
+        Ok(PublishOutcome::Superseded) => BodyOutcome::Skipped,
         Err(MediaError::InvalidBody(_)) => BodyOutcome::Corrupt,
         Err(MediaError::Io(_)) if reader.body_invalid() => BodyOutcome::Corrupt,
         Err(MediaError::Capacity) => BodyOutcome::Paused(shortfall(free().unwrap_or(0))),
@@ -244,7 +254,7 @@ fn migrate_body(
 fn dropped(result: cgka_traits::StorageResult<bool>) -> BodyOutcome {
     match result {
         Ok(true) => BodyOutcome::Moved,
-        Ok(false) => BodyOutcome::Superseded,
+        Ok(false) => BodyOutcome::Skipped,
         Err(_) => BodyOutcome::Deferred,
     }
 }

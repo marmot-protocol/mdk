@@ -375,6 +375,32 @@ fn a_corrupted_file_fails_verification_instead_of_returning_bytes() {
 }
 
 #[test]
+fn verify_authenticates_the_whole_file_and_loses_one_that_fails() {
+    let (harness, store) = fixture();
+    let body: Vec<u8> = (0..200_000_u32).map(|i| i as u8).collect();
+    let id = published(&harness, &store, &body);
+    assert!(store.verify(&id, &digest(&body)).unwrap());
+    assert!(
+        !store.verify(&id, &[0; 32]).unwrap(),
+        "a digest mismatch fails"
+    );
+    assert_eq!(store.file_state(&id).unwrap(), Some(FileState::Lost));
+
+    // Damaged ciphertext past the header keeps the length, so the file still
+    // opens; only reading it all finds the damage.
+    let id = published(&harness, &store, &body);
+    let path = store.path(&id);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(store.open_reader(&id).unwrap().is_some());
+    assert!(!store.verify(&id, &digest(&body)).unwrap());
+    assert_eq!(store.file_state(&id).unwrap(), Some(FileState::Lost));
+    assert!(!store.verify(&id, &digest(&body)).unwrap(), "no ready file");
+}
+
+#[test]
 fn consecutive_reads_reuse_one_cached_reader_and_key() {
     let (harness, store) = fixture();
     let content: Vec<u8> = (0..3_000_000_u32).map(|i| (i % 253) as u8).collect();

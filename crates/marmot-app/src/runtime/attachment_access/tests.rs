@@ -1294,3 +1294,86 @@ async fn an_interrupted_move_is_finished_without_a_second_copy() {
     assert_eq!(read_whole(&runtime, legacy_slot(0x41)).await.unwrap(), body);
     runtime.shutdown_and_close().await.unwrap();
 }
+
+/// Flips the last byte of every media file: the length, header and
+/// therefore an open still succeed, but the last segment no longer
+/// authenticates.
+fn damage_media_files(app: &MarmotApp) {
+    let root = app.account_dir("alice").join(media_store::MEDIA_DIRECTORY);
+    for shard in std::fs::read_dir(root).unwrap() {
+        for file in std::fs::read_dir(shard.unwrap().path()).unwrap() {
+            let path = file.unwrap().path();
+            let mut bytes = std::fs::read(&path).unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 1;
+            std::fs::write(&path, bytes).unwrap();
+        }
+    }
+}
+
+/// An interrupted move whose file was damaged afterwards keeps the database
+/// copy: the file is read in full before the rows go, and a fresh file is
+/// written from them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interrupted_move_with_a_damaged_file_moves_again_from_the_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    let body = vec![9u8; 150_000];
+    seed_at(&store.app_storage(), legacy_slot(0x51), &body);
+    let media = app.account_media_store("alice", &store).unwrap();
+    let app_storage = store.app_storage();
+    let legacy = app_storage.legacy_attachment_bodies(8).unwrap().remove(0);
+    media
+        .publish(
+            &app_storage.legacy_attachment_publication(&legacy),
+            media_store::Category::Retained,
+            &mut app_storage.legacy_attachment_reader(&legacy),
+            legacy.byte_len(),
+            legacy.digest().unwrap(),
+            crate::unix_now_seconds(),
+            &|| false,
+        )
+        .unwrap();
+    damage_media_files(&app);
+
+    assert!(migrate_legacy(&app, &store, u64::MAX / 2));
+    assert_eq!(app_storage.legacy_attachment_bytes().unwrap(), 0);
+    let runtime = app.runtime();
+    assert_eq!(read_whole(&runtime, legacy_slot(0x51)).await.unwrap(), body);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A stored twin that does not read back is never trusted in place of the
+/// database copy: the batch keeps the rows, and the next one writes a fresh
+/// file from them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_damaged_stored_twin_does_not_replace_the_database_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    let body = vec![10u8; 150_000];
+    seed_file_backed(&app, &store, &body);
+    seed_at(&store.app_storage(), legacy_slot(0x52), &body);
+    damage_media_files(&app);
+    let runtime = app.runtime();
+
+    migrate_legacy(&app, &store, u64::MAX / 2);
+    assert_eq!(
+        store.app_storage().legacy_attachment_bytes().unwrap(),
+        body.len() as u64,
+        "the rows stay while the twin fails"
+    );
+    assert_eq!(read_whole(&runtime, legacy_slot(0x52)).await.unwrap(), body);
+
+    assert!(migrate_legacy(&app, &store, u64::MAX / 2));
+    assert_eq!(store.app_storage().legacy_attachment_bytes().unwrap(), 0);
+    assert_eq!(read_whole(&runtime, legacy_slot(0x52)).await.unwrap(), body);
+    runtime.shutdown_and_close().await.unwrap();
+}
