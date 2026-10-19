@@ -481,6 +481,10 @@ struct SharedConnectionInner {
     /// Bumped before every write to `openmls_values` and on every rollback;
     /// see `StorageProvider::mls_write_generation`.
     openmls_writes: AtomicU64,
+    /// A WAL truncate after a compaction or page reclaim found a reader on
+    /// another connection and did not finish. Only changed with this
+    /// connection locked, by the attempt it describes.
+    wal_truncate_pending: AtomicBool,
 }
 
 impl fmt::Debug for SharedConnection {
@@ -506,6 +510,7 @@ impl SharedConnection {
                 transaction_released: Condvar::new(),
                 post_commit: Mutex::new(Vec::new()),
                 openmls_writes: AtomicU64::new(0),
+                wal_truncate_pending: AtomicBool::new(false),
             }),
         }
     }
@@ -609,6 +614,20 @@ impl SharedConnection {
         handle: rusqlite::InterruptHandle,
     ) -> InterruptOnClose<'_> {
         self.inner.connection.interrupt_on_close(handle)
+    }
+
+    /// Whether an earlier WAL truncate is still owed. Nonblocking.
+    pub(crate) fn wal_truncate_pending(&self) -> bool {
+        self.inner.wal_truncate_pending.load(Ordering::Acquire)
+    }
+
+    /// Records a truncate attempt's result. Call only with this connection
+    /// locked, from the attempt itself, so a stale result never overwrites a
+    /// newer one.
+    pub(crate) fn record_wal_truncate(&self, truncated: bool) {
+        self.inner
+            .wal_truncate_pending
+            .store(!truncated, Ordering::Release);
     }
 
     /// Whether a close has started. Nonblocking.

@@ -55,19 +55,16 @@ pub(crate) fn compaction_due(space: &DatabaseSpace, reserve: u64, free: u64) -> 
 /// incremental, and finishes any WAL truncate a reader blocked earlier, so
 /// the pages leave the file; a no-op before compaction. Best effort.
 /// Blocking.
-pub(crate) fn reclaim(storage: &SqliteAppStorage, progress: &SharedLegacyMigration) {
-    let mut pending = truncate_pending(progress);
+pub(crate) fn reclaim(storage: &SqliteAppStorage) {
     match storage.database_space() {
         Ok(space) if space.incremental && space.free_pages > 0 => {
             match storage.reclaim_free_pages(RECLAIM_MAX_BYTES / space.page_size.max(1)) {
-                Ok(reclaim) => {
-                    if reclaim.pages > 0 {
-                        pending = !reclaim.truncated;
-                        tracing::debug!(target: TRACE_TARGET, method = "reclaim_free_pages",
-                            freed = reclaim.pages, truncated = reclaim.truncated,
-                            "returned free database pages to the filesystem");
-                    }
+                Ok(reclaim) if reclaim.pages > 0 => {
+                    tracing::debug!(target: TRACE_TARGET, method = "reclaim_free_pages",
+                        freed = reclaim.pages, truncated = reclaim.truncated,
+                        "returned free database pages to the filesystem");
                 }
+                Ok(_) => {}
                 Err(_) => {
                     tracing::warn!(target: TRACE_TARGET, method = "reclaim_free_pages",
                         "database page reclaim deferred");
@@ -80,10 +77,11 @@ pub(crate) fn reclaim(storage: &SqliteAppStorage, progress: &SharedLegacyMigrati
                 "database page reclaim deferred");
         }
     }
-    if pending {
-        pending = !storage.truncate_wal().unwrap_or(false);
+    // The storage records every truncate's result under the connection
+    // lock, so this reads the latest attempt; repeating a truncate is safe.
+    if storage.wal_truncate_pending() {
+        let _ = storage.truncate_wal();
     }
-    set_truncate_pending(progress, pending);
 }
 
 /// What [`compact_if_due`] did.
@@ -137,7 +135,6 @@ pub(crate) fn compact_if_due(
     let duration_ms = started.elapsed().as_millis() as u64;
     match result {
         Ok(truncated) => {
-            set_truncate_pending(progress, !truncated);
             let file_bytes = storage
                 .database_space()
                 .map_or(space.file_bytes(), |after| after.file_bytes());
@@ -157,20 +154,6 @@ pub(crate) fn compact_if_due(
             CompactionAttempt::Done
         }
     }
-}
-
-fn truncate_pending(progress: &SharedLegacyMigration) -> bool {
-    progress
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .wal_truncate_pending
-}
-
-fn set_truncate_pending(progress: &SharedLegacyMigration, pending: bool) {
-    progress
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .wal_truncate_pending = pending;
 }
 
 fn set_compacting(

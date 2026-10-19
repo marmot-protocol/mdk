@@ -222,6 +222,7 @@ fn a_reader_blocks_the_truncate_and_a_later_one_finishes_it() {
         !app.compact_database().unwrap(),
         "the reader blocked the truncate"
     );
+    assert!(app.wal_truncate_pending());
     assert!(
         fixture.space().incremental,
         "the compaction itself committed"
@@ -234,8 +235,10 @@ fn a_reader_blocks_the_truncate_and_a_later_one_finishes_it() {
     assert!(wal() > 0);
     assert!(!app.truncate_wal().unwrap(), "still held");
 
+    assert!(app.wal_truncate_pending());
     reader.execute_batch("COMMIT").unwrap();
     assert!(app.truncate_wal().unwrap());
+    assert!(!app.wal_truncate_pending());
     assert_eq!(wal(), 0);
     assert!(fixture.file_len() + 6_000_000 < file_before);
     assert_eq!(fixture.marker(), "kept");

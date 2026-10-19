@@ -168,7 +168,7 @@ pub(super) fn spawn_legacy_migration(
         if changed {
             updates.send_modify(|_| {});
         }
-        crate::media::storage_compaction::reclaim(&app_storage, &progress);
+        crate::media::storage_compaction::reclaim(&app_storage);
     }));
 }
 

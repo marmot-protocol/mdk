@@ -117,7 +117,7 @@ impl SqliteAppStorage {
         }
         vacuumed?;
         // The WAL now holds the whole copy; fold it back and truncate it.
-        truncate_wal_in(&conn)
+        self.truncate_wal_locked(&conn)
     }
 
     /// Returns up to `max_pages` free pages once the database is
@@ -141,7 +141,7 @@ impl SqliteAppStorage {
         let after = database_space_in(&conn)?;
         Ok(PageReclaim {
             pages: before.free_pages.saturating_sub(after.free_pages),
-            truncated: truncate_wal_in(&conn)?,
+            truncated: self.truncate_wal_locked(&conn)?,
         })
     }
 
@@ -150,7 +150,21 @@ impl SqliteAppStorage {
     /// older snapshot: nothing is lost, and a later call finishes the job.
     pub fn truncate_wal(&self) -> StorageResult<bool> {
         let conn = self.lock()?;
-        truncate_wal_in(&conn)
+        self.truncate_wal_locked(&conn)
+    }
+
+    /// Whether a compaction's or reclaim's WAL truncate was blocked by a
+    /// reader and is still owed; [`Self::truncate_wal`] settles it.
+    pub fn wal_truncate_pending(&self) -> bool {
+        self.connection.wal_truncate_pending()
+    }
+
+    /// [`truncate_wal_in`] on the locked connection, recording the result
+    /// before the lock is released.
+    fn truncate_wal_locked(&self, conn: &Connection) -> StorageResult<bool> {
+        let truncated = truncate_wal_in(conn)?;
+        self.connection.record_wal_truncate(truncated);
+        Ok(truncated)
     }
 }
 

@@ -85,8 +85,10 @@
   interrupted one changes nothing; closing the storage interrupts a running
   one instead of waiting for it), and `reclaim_free_pages` returns freed
   pages in bounded steps afterwards (`PageReclaim`). Both truncate the WAL
-  without waiting on readers and report whether they did; `truncate_wal`
-  retries one a reader on another connection blocked.
+  without waiting on readers and report whether they did;
+  `wal_truncate_pending` says one a reader on another connection blocked is
+  still owed (recorded with the connection locked), and `truncate_wal`
+  retries it.
   `DatabaseCloser::begin_close` (and `CloseableConnection::begin_close`)
   latches a database closed and interrupts a running compaction without
   waiting, so an owner can free work blocked behind it before closing. `AttachmentMigrationState` adds
