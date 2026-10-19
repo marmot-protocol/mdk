@@ -14,7 +14,7 @@ use cgka_traits::{
     TransportEndpointFailureKind, TransportEndpointRejectionCategory, TransportGroupSubscription,
     TransportGroupSync, TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
 };
-use futures::{Stream, StreamExt, stream::FuturesUnordered};
+use futures::{FutureExt, Stream, StreamExt, stream::FuturesUnordered};
 use nostr_sdk::NotificationUpdate;
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, ClientNotification, Filter, Kind, PublicKey, RelayMessage, RelayUrl,
@@ -3845,6 +3845,19 @@ impl MarmotRelayPlaneAccountAdapter {
     /// it is spilled rather than queued.
     #[doc(hidden)]
     pub fn seal_transport_cursor(&self, candidate: Option<u64>) -> Option<u64> {
+        // Staged replay is not under the router's placement lock yet. A
+        // synchronous checkpoint must not pass it. Contention conservatively
+        // defers the cursor; never block an account worker to read coverage.
+        let replay = self
+            .relay_plane
+            .inner
+            .transport
+            .adapter
+            .account_subscription_eose(&self.account_id)
+            .now_or_never()?;
+        if !replay.complete() {
+            return None;
+        }
         self.delivery_overflow.seal_cursor(
             self.delivery_epoch,
             self.cursor_lookback_secs(),

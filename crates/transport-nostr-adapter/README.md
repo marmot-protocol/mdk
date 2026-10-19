@@ -75,6 +75,31 @@ Direct and account-adapter sends share these counters. Endpoint fanout and authe
 remain one logical attempt; dropping an in-flight publication records one cancellation.
 Account, endpoint-safety, and envelope validation stay outside this accounting boundary.
 
+## Ordered subscription replay
+
+Initial activation, group-subscription sync, and recovery maintenance stage group deliveries through stored replay
+and any backward pages, then release each group's batch in `(created_at, event id)` order. Live arrivals during
+release queue behind that batch. Every observed relay stream must finish before release; an endpoint that sends
+nothing does not freeze available relay data, but strict account replay coverage remains incomplete until every
+required endpoint completes. This does not establish ordering across unavailable relay history.
+
+Each account's pending group ciphertext is bounded by `REPLAY_BUFFER_MAX_ITEMS` (32,000 items, the 500-event page
+limit times 64 pages) and `REPLAY_BUFFER_MAX_BYTES` (32 MiB of payload). One serialized draining batch can retain
+another batch's allowance concurrently. Pending event IDs are discarded with each batch, freeing the allowance
+for its live suffix. Delivery
+metadata and the SDK notification queue are outside the payload cap, which is not a process, wire-byte, or RSS limit.
+Overflow withholds that group's admission and coverage rather than emitting a partial newer suffix. A saturated
+one-second paging boundary withholds that route while sibling routes continue independently. Account replacement
+cancels staged and releasing work.
+
+Timestamp sorting leaves the existing 100-generation sender-ratchet tolerance unchanged: more than 100 messages
+from one sender in the same second can still exceed it because event-id order is not sender-generation order.
+Trusted cursor floors retain their configured rewind. With no durable cursor, the app requests full retained
+history instead of substituting the recent live tail, including when the relay refuses NIP-77. Recovery maintenance
+also pages from its Welcome-anchored floor. Cursor checkpoints retain
+their previous floor while replay is incomplete or still being released to the delivery queue. Ordinary comparison
+acquisition is unchanged.
+
 ## Recovery maintenance sessions
 
 `install_group_maintenance_recovery_subscription` accepts the account recovery owner's durable attempt serial and

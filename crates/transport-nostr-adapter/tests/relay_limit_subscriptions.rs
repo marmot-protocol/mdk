@@ -1790,6 +1790,157 @@ async fn reconciliation_names_why_each_relay_failed() {
 // (h) The 500-event REQ clamp (#2263)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
+enum OrderedReplay {
+    Activation,
+    Sync,
+    Maintenance,
+}
+
+/// Multiple newest-first relay pages must become one ascending replay, not
+/// individually sorted pages. Ties exercise the event-id secondary key.
+async fn assert_replay_before_live(mode: OrderedReplay) {
+    const STORED: usize = 2_200;
+    const START: u64 = 1_700_000_000;
+    let fx = Fixture::new(LimitConfig::default(), false).await;
+    let keys = Keys::generate();
+    let mut expected = Vec::with_capacity(STORED + 1);
+    for index in 0..STORED {
+        let timestamp = START + index as u64 / 3;
+        let event = EventBuilder::new(Kind::MlsGroupMessage, format!("ordered-{index}"))
+            .tags([Tag::custom("h", [hex::encode(route(0))])])
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(timestamp))
+            .finalize(&keys)
+            .unwrap();
+        expected.push((timestamp, event.id.to_bytes()));
+        fx.database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+    }
+    expected.sort_unstable();
+    let url = fx.limit.url();
+    let group = groups(1, &url).remove(0);
+    let publisher = Client::default();
+    publisher.add_relay(fx.upstream_url.as_str()).await.unwrap();
+    publisher.connect().await;
+    fx.adapter
+        .activate_account(fx.activation(
+            std::slice::from_ref(&url),
+            if matches!(mode, OrderedReplay::Activation) {
+                vec![group.clone()]
+            } else {
+                Vec::new()
+            },
+        ))
+        .await
+        .unwrap();
+    let maintenance_id = match mode {
+        OrderedReplay::Activation => None,
+        OrderedReplay::Sync => {
+            fx.adapter
+                .sync_account_groups(group_sync(&fx, vec![group.clone()]))
+                .await
+                .unwrap();
+            None
+        }
+        OrderedReplay::Maintenance => Some(
+            fx.adapter
+                .install_group_maintenance_recovery_subscription(&fx.account, &group, 1, None)
+                .await
+                .unwrap(),
+        ),
+    };
+
+    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+    let first = tokio::time::timeout_at(deadline, fx.adapter.receive())
+        .await
+        .expect("replay starts within the deadline")
+        .unwrap()
+        .unwrap();
+    // History exceeds the delivery queue: while this consumer is stopped,
+    // release must block and the post-EOSE live notification cannot overtake it.
+    let live_timestamp = START + STORED as u64;
+    let live = EventBuilder::new(Kind::MlsGroupMessage, "live during replay release")
+        .tags([Tag::custom("h", [hex::encode(route(0))])])
+        .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(live_timestamp))
+        .finalize(&keys)
+        .unwrap();
+    publisher.send_event(&live).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    expected.push((live_timestamp, live.id.to_bytes()));
+    let mut delivery = first;
+    for (position, (timestamp, id)) in expected.into_iter().enumerate() {
+        if position != 0 {
+            delivery = tokio::time::timeout_at(deadline, fx.adapter.receive())
+                .await
+                .expect("all history and the live tail arrive within the deadline")
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            delivery.message.timestamp.0, timestamp,
+            "position {position}"
+        );
+        assert!(
+            delivery.message.id == cgka_traits::MessageId::new(id.to_vec()),
+            "unexpected event or event-id tie order at position {position}"
+        );
+        assert!(delivery.account_id == fx.account);
+        assert!(delivery.group_id_hint.as_ref() == Some(&group.group_id));
+    }
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            let complete = if let Some(id) = &maintenance_id {
+                fx.adapter
+                    .subscription_endpoint_eose(id, &TransportEndpoint(url.clone()))
+                    .await
+                    == Some(true)
+            } else {
+                fx.adapter
+                    .account_subscription_eose(&fx.account)
+                    .await
+                    .complete()
+            };
+            if complete {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("coverage completes after the ordered replay is queued");
+    let stats = fx.limit.stats();
+    assert!(stats.clamped_filters > 0);
+    assert!(
+        stats.total_reqs >= 6,
+        "multiple backward pages were fetched"
+    );
+    assert_eq!(stats.neg_opens, 0, "replay does not require NIP-77");
+    assert!(
+        tokio::time::timeout(QUIET, fx.adapter.receive())
+            .await
+            .is_err()
+    );
+    publisher.shutdown().await;
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn activation_replay_is_ordered() {
+    assert_replay_before_live(OrderedReplay::Activation).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn synced_replay_is_ordered() {
+    assert_replay_before_live(OrderedReplay::Sync).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maintenance_replay_is_ordered() {
+    assert_replay_before_live(OrderedReplay::Maintenance).await;
+}
+
 /// Distinct messages delivered until the adapter goes quiet.
 async fn distinct_deliveries(adapter: &NostrTransportAdapter, wait: Duration) -> usize {
     const IDLE: Duration = Duration::from_millis(1_500);
@@ -2078,7 +2229,11 @@ async fn a_route_that_saturates_alone_does_not_stop_the_others_paging() {
         "[h] one saturated route delivered={delivered}/{stored} complete={complete} {}",
         fx.limit.stats().summary()
     );
-    assert_eq!(delivered, stored, "every route's history arrives");
+    assert_eq!(
+        delivered,
+        stored - RELAY_REPLAY_PAGE_LIMIT,
+        "complete routes deliver, but the saturated route withholds its partial replay"
+    );
     assert!(!complete, "the saturated route keeps the batch incomplete");
     fx.shutdown().await;
 }
@@ -2221,7 +2376,8 @@ async fn stored_replay_beyond_500_is_paged_before_counting_complete() {
 /// More than a page of events sharing one second saturates the inclusive
 /// `until` bound: the backward page cannot move past that second, so the rest
 /// of it and everything older stay unfetched. Coverage must stay incomplete
-/// rather than count that relay's EOSE.
+/// rather than count that relay's EOSE, and the newer partial history must
+/// remain withheld rather than advancing a ratchet past inaccessible history.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn saturated_boundary_second_keeps_replay_incomplete() {
     const BOUNDARY: u64 = 1_700_100_000;
@@ -2229,7 +2385,10 @@ async fn saturated_boundary_second_keeps_replay_incomplete() {
     let boundary = std::iter::repeat_n(BOUNDARY, 600);
     let (delivered, complete, _) =
         replay_one_group_at(older.chain(boundary), Some(limit_relay::REQ_LIMIT_CLAMP)).await;
-    assert!(delivered < 700, "the clamp hides part of the window");
+    assert_eq!(
+        delivered, 0,
+        "an incomplete replay cannot release its newer tail"
+    );
     assert!(!complete, "a saturated boundary must not count as coverage");
 }
 

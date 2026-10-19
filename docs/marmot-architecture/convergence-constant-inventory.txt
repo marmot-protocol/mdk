@@ -74,3 +74,6 @@ A16|crates/marmot-app/src/client/sync/comparison_job.rs|EPOCH_GAP_WINDOW_MAX_BOU
 A16|crates/marmot-app/src/client/sync/comparison_job.rs|EPOCH_GAP_WINDOW_MAX_EVENTS_PER_RELAY
 A16|crates/marmot-app/src/client/sync/comparison_job.rs|EPOCH_GAP_WINDOW_MAX_BYTES_PER_RELAY
 A16|crates/marmot-app/src/client/sync/comparison_job.rs|EPOCH_GAP_WINDOW_MAX_DURATION
+# A17 bounds ordered subscription replay before group admission.
+A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_BUFFER_MAX_ITEMS
+A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_BUFFER_MAX_BYTES

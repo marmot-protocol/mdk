@@ -16901,3 +16901,6 @@ async fn offline_member_recovers_dismissal_label_after_admin_demotion() {
 
 #[path = "relay_runtime/attachment_retention.rs"]
 mod attachment_retention;
+
+#[path = "relay_runtime/offline_replay.rs"]
+mod offline_replay;

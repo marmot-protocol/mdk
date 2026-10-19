@@ -1165,12 +1165,12 @@ impl AppClient {
         let since = self
             .relay_plane
             .subscription_rebuild_since(self.checkpointed_transport_timestamp);
-        if since.is_some() {
+        // Without a durable cursor there is no settled replay floor. A relay
+        // without NIP-77 must still return history older than the live tail.
+        if since.is_some() || self.checkpointed_transport_timestamp.is_none() {
             return Ok(since);
         }
-        // Owner construction joins missing-cursor history before exposing the
-        // client. Restoring a live tail must remain possible during storage
-        // compensation and never perform another demand write or acquisition.
+        // A rejected future-dated cursor must not become a future REQ floor.
         let lookback = self
             .relay_plane
             .subscription_rebuild_lookback_secs()

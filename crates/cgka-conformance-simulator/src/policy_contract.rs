@@ -40,7 +40,7 @@ pub struct ConstantDecision {
     pub versioning: VersioningRule,
 }
 
-pub const CONSTANT_DECISIONS: [ConstantDecision; 39] = [
+pub const CONSTANT_DECISIONS: [ConstantDecision; 40] = [
     decision(
         "P1",
         ConstantInfluence::SelectedStateSemantic,
@@ -240,6 +240,11 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 39] = [
     // so it changes which history arrives, never what counts as covered.
     decision(
         "A16",
+        ConstantInfluence::InputAcquisition,
+        VersioningRule::OperationalNonInterference,
+    ),
+    decision(
+        "A17",
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),

@@ -458,6 +458,10 @@ async fn sdk_account_worker_keeps_serving_through_notification_lag() {
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let storage = app.account_storage(&alice.label).unwrap().app_storage();
+    // Model a returning account with a settled cursor, not first-load history.
+    let mut state = app.load_state(&alice.label).unwrap();
+    state.last_transport_timestamp = Some(crate::unix_now_seconds());
+    app.save_state(&state).unwrap();
     let runtime = crate::MarmotAppRuntime::new(app);
     runtime.reconcile_accounts().await.unwrap();
     timeout(Duration::from_secs(30), runtime.catch_up_accounts())
@@ -551,6 +555,10 @@ async fn notification_lag_while_post_join_maintenance_is_live_stays_bounded() {
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let storage = app.account_storage(&alice.label).unwrap();
+    // Other live REQs have a settled floor newer than the Welcome below.
+    let mut state = app.load_state(&alice.label).unwrap();
+    state.last_transport_timestamp = Some(crate::unix_now_seconds());
+    app.save_state(&state).unwrap();
     let mut client = crate::tests::client_on_app_relay_plane(&app, &alice.label).await;
     client.prepare_transport().await.unwrap();
     let group = client
@@ -646,6 +654,11 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
     // Before the upgrade: a group whose retained route has no switch time.
     {
         let app = crate::MarmotApp::with_relay_and_config(dir.path(), url.clone(), config());
+        // The current route resumes a settled cursor; only the retained route
+        // is missing its old switch-time floor.
+        let mut state = app.load_state(&alice.label).unwrap();
+        state.last_transport_timestamp = Some(crate::unix_now_seconds());
+        app.save_state(&state).unwrap();
         let mut client = crate::tests::client_on_app_relay_plane(&app, &alice.label).await;
         client.prepare_transport().await.unwrap();
         client

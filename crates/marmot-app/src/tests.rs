@@ -13110,6 +13110,49 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
     });
 }
 
+#[test]
+fn replay_fences_cursor_on_save() {
+    run_composed_app_runtime_test("unfinished-replay-checkpoint", || async {
+        let mut fixture = LiveCursorFixture::open().await;
+        fixture._eose.0.abort();
+        let _ = (&mut fixture._eose.0).await;
+        fixture
+            .client
+            .runtime
+            .activate_transport(None)
+            .await
+            .unwrap();
+        assert!(
+            !fixture
+                .client
+                .adapter
+                .account_subscription_eose()
+                .await
+                .complete()
+        );
+
+        // An independent inbox delivery may have advanced the in-memory
+        // candidate while group ciphertext is still held outside the router.
+        fixture.client.state.last_transport_timestamp = Some(fixture.cursor_before + 4_000);
+        let sealed = fixture.client.seal_transport_cursor();
+        fixture
+            .client
+            .save_state_with_pending_local_group_deletion_frontier_clears()
+            .unwrap();
+        fixture.client.settle_transport_cursor(
+            sealed,
+            marmot_forensics::TransportCursorTrigger::DrainCheckpoint,
+        );
+        assert_eq!(fixture.persisted(), Some(fixture.cursor_before));
+
+        let reopened = fixture.reopen().await;
+        assert_eq!(
+            reopened.client.checkpointed_transport_timestamp,
+            Some(reopened.cursor_before)
+        );
+    });
+}
+
 /// One account that opened with `cursor_before` persisted (unless opened
 /// without a cursor), owns a group, and has every subscription past
 /// end-of-stored-events, so live ingests may promote its transport cursor.
