@@ -25,6 +25,7 @@ use marmot_uniffi::Marmot;
 pub mod account_attachment_history;
 pub mod attachment_access;
 pub mod attachment_history;
+pub mod attachment_storage;
 pub mod commands;
 pub mod deployment;
 pub mod file_media;

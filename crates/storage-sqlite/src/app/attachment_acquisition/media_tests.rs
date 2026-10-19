@@ -723,3 +723,30 @@ fn a_chat_counts_each_stored_file_once() {
         chats[0].bytes
     );
 }
+
+/// An age bound past SQLite's integer range removes every received time,
+/// including the largest storable one; a bound at that value does not.
+#[test]
+fn an_age_bound_past_the_integer_range_removes_everything() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let content = sized(4_000, 13);
+    let job = fixture.claimed_in(GROUP, &"9".repeat(64), &content, i64::MAX as u64);
+    assert!(matches!(
+        fixture.publish(&job, &content),
+        PublishOutcome::Published(_)
+    ));
+    assert_eq!(
+        app.remove_retained_attachments(NOW, None, Some(i64::MAX as u64))
+            .unwrap()
+            .removed,
+        0,
+        "received at the bound is not before it"
+    );
+    assert_eq!(
+        app.remove_retained_attachments(NOW, None, Some(u64::MAX))
+            .unwrap()
+            .removed,
+        1
+    );
+}

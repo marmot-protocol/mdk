@@ -115,6 +115,11 @@
 
 ### Fixed
 
+- `control_attachment` Remove opens the account's media store before the
+  removal commits, so a store that cannot open (for example while storage
+  closes) fails the call before anything is removed instead of reporting an
+  error for a removal that already happened.
+
 - A device woken mostly by notifications now detects that it is stuck behind
   its group. Notification wakes (`CursorPersistence::Frozen`) retain
   undecryptable traffic without tracking stalls, and the main app later sees

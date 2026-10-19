@@ -120,6 +120,35 @@ waiting for still completes. C hosts use
 `marmot_open_attachment_handoff`, `marmot_release_attachment_handoff`, and
 `marmot_attachment_handoff_free` (which frees the record only, not the lease).
 
+## Manage storage
+
+A Manage storage screen reads what retained attachments hold on the device and removes them
+in bulk. It works across both body layouts: media-store files, and older bodies still in the
+account database.
+
+- **Usage.** `attachmentStorageUsage` returns media-store bytes (a file shared by several
+  attachments counted once), legacy database bytes, the retained attachment count, and the
+  database's size and free pages. It reads no bodies.
+- **Largest first.** `attachmentStorageByChat` lists chats and `largestRetainedAttachments`
+  lists attachments (account-wide or within one chat), each with `limit` 1..=256 per page.
+  Continue with the page's `nextCursor` until it is absent; the last page may be empty.
+  Cursors are opaque: never persist them, and start over after removing anything. A stored
+  file counts once per chat, while content shared between chats counts in each, so chat
+  totals can add up to more than the account total.
+- **Removing.** `removeChatAttachments` and `removeAttachmentsOlderThan` (by the message's
+  received time, account-wide or within one chat) remove in bulk; a single attachment goes
+  through `controlAttachment` Remove, with the reference from `attachmentLocalAssets` for a
+  listing entry's `target`. Every removal is that same Remove: the attachment shows as
+  removed and download-again stays allowed.
+- **When space returns.** Media-store files a removal releases are deleted before the call
+  returns. Legacy database bodies free pages inside the database, which return to the
+  filesystem when the database is compacted, so refresh usage after removing rather than
+  subtracting.
+
+C hosts use `marmot_attachment_storage_usage`, `marmot_attachment_storage_by_chat`,
+`marmot_largest_retained_attachments`, `marmot_remove_chat_attachments` and
+`marmot_remove_attachments_older_than`, freeing results with the matching `*_free` functions.
+
 ## Transfer progress and controls (C8-D2)
 
 `attachmentTransferSnapshot` and `subscribeAttachmentTransfers` accept the same bounded

@@ -1307,6 +1307,11 @@ typedef struct MarmotChatListSubscription MarmotChatListSubscription;
 typedef struct MarmotChatListWindowSubscription MarmotChatListWindowSubscription;
 
 /**
+ * Where the next page of chats starts. Borrowed from its page.
+ */
+typedef struct MarmotChatStorageCursor MarmotChatStorageCursor;
+
+/**
  * Opaque handle to one account's chats list: an initial snapshot of
  * every group projection, then one record per projection change.
  */
@@ -1382,6 +1387,11 @@ typedef struct MarmotOnboardingSubscription MarmotOnboardingSubscription;
  * This fallible stream uses blocking next so storage errors retain their typed status.
  */
 typedef struct MarmotPresentedChatListSubscription MarmotPresentedChatListSubscription;
+
+/**
+ * Where the next page of attachments starts. Borrowed from its page.
+ */
+typedef struct MarmotRetainedAttachmentsCursor MarmotRetainedAttachmentsCursor;
 
 /**
  * Opaque handle to one conversation's materialized timeline window.
@@ -1715,6 +1725,62 @@ typedef struct MarmotAttachmentPageRead {
     MarmotAttachmentPageRead_Page_Body PAGE;
   };
 } MarmotAttachmentPageRead;
+
+/**
+ * Account-wide attachment storage across both body layouts.
+ */
+typedef struct MarmotAttachmentStorageUsage {
+  uint64_t media_bytes;
+  uint64_t legacy_bytes;
+  uint64_t attachment_count;
+  uint64_t database_bytes;
+  uint64_t database_free_bytes;
+} MarmotAttachmentStorageUsage;
+
+/**
+ * One chat's retained attachment storage; a stored file counts once.
+ */
+typedef struct MarmotChatAttachmentUsage {
+  char *group_id_hex;
+  uint64_t bytes;
+  uint64_t attachment_count;
+} MarmotChatAttachmentUsage;
+
+/**
+ * Chats by storage, largest first. Continue with next_cursor while it is not
+ * NULL; it is borrowed from this page.
+ */
+typedef struct MarmotChatStoragePage {
+  struct MarmotChatAttachmentUsage *chats;
+  uintptr_t chats_len;
+  struct MarmotChatStorageCursor *next_cursor;
+} MarmotChatStoragePage;
+
+/**
+ * One retained attachment. message_id_hex, source_message_id_hex and
+ * attachment_index form the target for marmot_attachment_local_assets,
+ * marmot_open_attachment_handoff and removal.
+ */
+typedef struct MarmotRetainedAttachmentSummary {
+  char *group_id_hex;
+  char *message_id_hex;
+  char *source_message_id_hex;
+  uint32_t attachment_index;
+  uint64_t byte_count;
+  char *media_type;
+  char *file_name;
+  uint64_t received_at;
+} MarmotRetainedAttachmentSummary;
+
+/**
+ * Retained attachments, largest first. Continue with next_cursor while it is
+ * not NULL; it is borrowed from this page.
+ */
+typedef struct MarmotRetainedAttachmentsPage {
+  struct MarmotRetainedAttachmentSummary *attachments;
+  uintptr_t attachments_len;
+  struct MarmotRetainedAttachmentsCursor *next_cursor;
+} MarmotRetainedAttachmentsPage;
 
 /**
  * One individual authenticated reaction.
@@ -6197,6 +6263,93 @@ MarmotStatus marmot_attachment_history_version(const struct MarmotClient *client
 MarmotStatus marmot_attachment_history_version_change_since(const struct MarmotAttachmentHistoryVersion *current,
                                                             const struct MarmotAttachmentHistoryVersion *previous,
                                                             uint32_t *out);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_attachment_storage_usage_free(struct MarmotAttachmentStorageUsage *ptr);
+
+/**
+ * Deep-free a chat storage page, including its cursor. NULL is a no-op.
+ * # Safety
+ * Value must be NULL or an owned, unfreed page with no outstanding borrows.
+ */
+void marmot_chat_storage_page_free(struct MarmotChatStoragePage *value);
+
+/**
+ * Deep-free a retained attachments page, including its cursor. NULL is a
+ * no-op.
+ * # Safety
+ * Value must be NULL or an owned, unfreed page with no outstanding borrows.
+ */
+void marmot_retained_attachments_page_free(struct MarmotRetainedAttachmentsPage *value);
+
+/**
+ * Account-wide attachment storage. Blocking local read; reads no bodies.
+ * # Safety
+ * Client and string must be live; out must be writable.
+ */
+MarmotStatus marmot_attachment_storage_usage(const struct MarmotClient *client,
+                                             const char *account_ref,
+                                             struct MarmotAttachmentStorageUsage **out);
+
+/**
+ * Chats by retained attachment bytes, largest first; limit is 1..=256.
+ * Cursor is NULL for the first page, else a page's borrowed next_cursor
+ * (keep that page alive for the call). Blocking local read.
+ * # Safety
+ * Client and string must be live, cursor NULL or live, out writable.
+ */
+MarmotStatus marmot_attachment_storage_by_chat(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               uint32_t limit,
+                                               const struct MarmotChatStorageCursor *cursor,
+                                               struct MarmotChatStoragePage **out);
+
+/**
+ * Retained attachments, largest first; limit is 1..=256. group_id_hex NULL
+ * lists the whole account. Cursor as for marmot_attachment_storage_by_chat.
+ * Blocking local read.
+ * # Safety
+ * Client and strings must be live (group may be NULL), cursor NULL or live,
+ * out writable.
+ */
+MarmotStatus marmot_largest_retained_attachments(const struct MarmotClient *client,
+                                                 const char *account_ref,
+                                                 const char *group_id_hex,
+                                                 uint32_t limit,
+                                                 const struct MarmotRetainedAttachmentsCursor *cursor,
+                                                 struct MarmotRetainedAttachmentsPage **out);
+
+/**
+ * Removes every retained attachment in one chat, as Remove does, writing
+ * how many it removed. Media-store space is freed before this returns.
+ * Blocking.
+ * # Safety
+ * Client and strings must be live; out must be writable.
+ */
+MarmotStatus marmot_remove_chat_attachments(const struct MarmotClient *client,
+                                            const char *account_ref,
+                                            const char *group_id_hex,
+                                            uint64_t *out_removed);
+
+/**
+ * Removes retained attachments of messages received before
+ * received_before (Unix seconds), across the account (group_id_hex NULL) or
+ * within one chat, as Remove does, writing how many it removed. Blocking.
+ * # Safety
+ * Client and strings must be live (group may be NULL); out must be writable.
+ */
+MarmotStatus marmot_remove_attachments_older_than(const struct MarmotClient *client,
+                                                  const char *account_ref,
+                                                  uint64_t received_before,
+                                                  const char *group_id_hex,
+                                                  uint64_t *out_removed);
 
 /**
  * Read every effective sender/emoji pair for one visible message, off the UI thread.

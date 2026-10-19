@@ -17,7 +17,8 @@ per feature.
 - [Onboarding relay repair](#onboarding-relay-repair)
 - [NIP-46 accounts](#nip-46-accounts)
 - Feature notes: [runtime construction](#runtime-construction), [local sends](#local-sends),
-  [attachment handoff leases](#attachment-handoff-leases), [file-backed media upload](#file-backed-media-upload),
+  [attachment handoff leases](#attachment-handoff-leases), [attachment storage](#attachment-storage),
+  [file-backed media upload](#file-backed-media-upload),
   [account attachment history](#account-attachment-history),
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
   [Markdown rendering](#markdown-rendering), [identity references and pseudonyms](#identity-references-and-pseudonyms),
@@ -206,6 +207,16 @@ lease. Both calls block, and the open holds the calling thread for the whole cop
 run them off the UI thread. See the
 [shared contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#handoff-leases).
 
+
+## Attachment storage
+
+`marmot_attachment_storage_usage`, `marmot_attachment_storage_by_chat` and
+`marmot_largest_retained_attachments` read a Manage storage screen's usage and
+largest-first pages; `marmot_remove_chat_attachments` and
+`marmot_remove_attachments_older_than` remove in bulk, each removal being an
+ordinary Remove. Page cursors are borrowed from their page: keep the page alive
+while passing its `next_cursor`, then free the page. Calls block. See the
+[shared contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#manage-storage).
 ## File-backed media upload
 
 `marmot_upload_media_files` and its token-aware twin take borrowed

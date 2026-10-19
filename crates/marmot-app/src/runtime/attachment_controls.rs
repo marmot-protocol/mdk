@@ -17,6 +17,31 @@ pub enum AttachmentControl {
     Remove,
 }
 
+/// Explicit Remove. The released media files are unlinked now, not at the
+/// next sweep, so removal frees file-backed space at once. The store is
+/// opened first: a store that cannot open fails the call before anything is
+/// removed.
+pub(super) fn remove_now(
+    app: &crate::MarmotApp,
+    label: &str,
+    storage: &storage_sqlite::SqliteAccountStorage,
+    reference: &AttachmentAssetRef,
+) -> Result<bool, AppError> {
+    let media = app.account_media_store(label, storage)?;
+    Ok(
+        match storage
+            .app_storage()
+            .remove_attachment_reference_releasing(reference)?
+        {
+            Some(released) => {
+                media.unlink_released(&released);
+                true
+            }
+            None => false,
+        },
+    )
+}
+
 /// Derive the shared admission/retention defaults for receive and upload paths.
 pub(crate) fn default_policy(config: &MarmotAppConfig) -> AttachmentDownloadPolicy {
     let p = config.attachment_acquisition.clone().unwrap_or_default();
@@ -83,23 +108,7 @@ impl MarmotAppRuntime {
                     AttachmentControl::Retry => s
                         .app_storage()
                         .explicitly_retry_attachment(&reference, crate::unix_now_seconds())?,
-                    // The released media files are unlinked now, not at the
-                    // next sweep, so removal frees file-backed space at once.
-                    AttachmentControl::Remove => {
-                        match s
-                            .app_storage()
-                            .remove_attachment_reference_releasing(&reference)?
-                        {
-                            Some(released) => {
-                                if !released.is_empty() {
-                                    app.account_media_store(label, &s)?
-                                        .unlink_released(&released);
-                                }
-                                true
-                            }
-                            None => false,
-                        }
-                    }
+                    AttachmentControl::Remove => remove_now(app, label, &s, &reference)?,
                 })
             })
             .await?;
