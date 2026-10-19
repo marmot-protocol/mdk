@@ -1044,3 +1044,44 @@ fn a_legacy_body_with_a_stored_twin_attaches_it() {
     assert_eq!(fixture.media_files_on_disk(), 1);
     assert_eq!(fixture.read(&legacy).unwrap(), content);
 }
+
+/// A chunked import still in progress and a legacy outgoing upload are not
+/// legacy bodies to move: they are neither listed nor counted, and stay.
+#[test]
+fn unfinished_imports_and_legacy_uploads_are_left_alone() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let content = sized(1_000, 8);
+    let importing = fixture.claimed(&"4".repeat(64), &content);
+    {
+        let conn = fixture.store.lock().unwrap();
+        conn.execute_batch("INSERT INTO attachment_chunk_bodies(nonce) VALUES(x'0102030405060708090a0b0c0d0e0f10')")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO retained_attachment_bytes(token,byte_len,bytes) VALUES(?1,0,x'')",
+            [&importing.reference.token],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO retained_attachment_files(token,nonce,attempt,byte_len)
+             VALUES(?1,x'0102030405060708090a0b0c0d0e0f10',zeroblob(16),500000)",
+            [&importing.reference.token],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO outgoing_attachment_uploads(token,group_id_hex,source_epoch,plaintext_digest,bytes,expires_at)
+             VALUES(zeroblob(16),?1,1,?2,?3,?4)",
+            params![GROUP, digest(&content).as_slice(), content, i64::MAX],
+        )
+        .unwrap();
+    }
+    assert!(app.retained_attachment_byte_count().unwrap() > 0);
+    assert!(fixture.legacy_bodies().is_empty());
+    assert_eq!(app.legacy_attachment_bytes().unwrap(), 0);
+    assert_eq!(
+        app.attachment_storage_usage(NOW).unwrap().migration,
+        AttachmentMigrationState::NotNeeded
+    );
+    assert_eq!(fixture.count("retained_attachment_files"), 1);
+    assert_eq!(fixture.count("outgoing_attachment_uploads"), 1);
+}

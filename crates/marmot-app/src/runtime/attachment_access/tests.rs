@@ -1143,8 +1143,9 @@ async fn a_tight_disk_pauses_the_move_until_the_user_prunes() {
     seed_at(&store.app_storage(), legacy_slot(0x22), &large);
     let runtime = app.runtime();
 
-    // Room for the reserve and the small body, 10 bytes short of the large.
-    let free = 1024 + 100_000 - 10;
+    // Room for the reserve and the small body's store file, 10 bytes short
+    // of the large one's.
+    let free = 1024 + media_store::DiskPolicy::migration_need(100_000) - 10;
     assert!(migrate_legacy(&app, &store, free), "the pause is news");
     assert_eq!(
         runtime

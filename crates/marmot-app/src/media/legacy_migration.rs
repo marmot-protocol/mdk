@@ -208,12 +208,14 @@ fn migrate_body(
         }
     }
     let need = DiskPolicy::migration_need(body.byte_len());
+    // The need is the whole store file, never zero, so the shortfall the
+    // pause reports is always enough to clear it.
     let shortfall = |free: u64| {
         let short = policy
             .reserve_bytes
             .saturating_add(need)
             .saturating_sub(free);
-        if short == 0 { need.max(1) } else { short }
+        if short == 0 { need } else { short }
     };
     let Ok(available) = free() else {
         // Unknown free space admits nothing, as for downloads.
@@ -246,7 +248,12 @@ fn migrate_body(
         Ok(PublishOutcome::Superseded) => BodyOutcome::Skipped,
         Err(MediaError::InvalidBody(_)) => BodyOutcome::Corrupt,
         Err(MediaError::Io(_)) if reader.body_invalid() => BodyOutcome::Corrupt,
-        Err(MediaError::Capacity) => BodyOutcome::Paused(shortfall(free().unwrap_or(0))),
+        // The volume filled during the write: pause with what it lacks now.
+        // The next tick measures again before writing anything.
+        Err(MediaError::Capacity) => match free() {
+            Ok(available) => BodyOutcome::Paused(shortfall(available)),
+            Err(_) => BodyOutcome::Deferred,
+        },
         Err(_) => BodyOutcome::Deferred,
     }
 }
@@ -307,10 +314,8 @@ pub(crate) fn run_batch(
             false
         }
     };
-    if matches!(
-        batch,
-        LegacyMigrationBatch::Complete | LegacyMigrationBatch::Progress { .. }
-    ) {
+    // A pause is reported only while the latest batch saw one.
+    if !matches!(batch, LegacyMigrationBatch::Paused { .. }) {
         progress.paused = None;
     }
     let mut wake = dropped_corrupt > 0;
