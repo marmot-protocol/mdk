@@ -103,11 +103,11 @@ fn the_scan_sees_each_kind_of_crossing() {
                 let _ = &self.relay_plane;
                 let _ = crate::ProductFamily::Directory;
                 let _ = super::super::unix_now_seconds();
-                tracing::warn!("{}", self.shared_storage().is_ok());
+                let _ = format!("{}", self.shared_storage().is_ok());
             }
             fn through_paths(&self) {
                 let _ = Self::relay_endpoints(self);
-                tracing::debug!("{:?}", Self::outbox_endpoints(self));
+                assert!(Self::outbox_endpoints(self).is_empty());
             }
             #[cfg(test)]
             fn only_in_tests(&self) {
