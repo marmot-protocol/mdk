@@ -25,6 +25,10 @@ pub struct AttachmentStorageUsage {
     /// The account database file, and the part of it that is free pages.
     pub database_bytes: u64,
     pub database_free_bytes: u64,
+    /// The avatar and group-image cache: images still in the database plus
+    /// each cache file once, however many owners share it. Unlike retained
+    /// media it can be cleared and fetched again.
+    pub cache_bytes: u64,
     /// Moving legacy bodies into the media store. From the database this is
     /// `NotNeeded` or `Running`; the app runtime adds what its batches saw.
     pub migration: AttachmentMigrationState,
@@ -225,6 +229,7 @@ impl SqliteAppStorage {
                 |r| r.get(0),
             )
             .storage()?;
+        let cache_bytes = crate::app::avatar_cache::usage(&conn)?.byte_count;
         let space = crate::app::storage_compaction::database_space_in(&conn)?;
         let remaining = super::legacy_migration::legacy_attachment_bytes_in(&conn)?;
         let unsigned = |value: i64| u64::try_from(value).unwrap_or(0);
@@ -234,6 +239,7 @@ impl SqliteAppStorage {
             attachment_count: unsigned(attachment_count),
             database_bytes: space.file_bytes(),
             database_free_bytes: space.free_bytes(),
+            cache_bytes,
             migration: if remaining == 0 {
                 AttachmentMigrationState::NotNeeded
             } else {

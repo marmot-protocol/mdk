@@ -72,9 +72,9 @@ pub use app::attachment_history::{
 pub use app::avatar_cache::{
     AVATAR_IDENTITY_BATCH_LIMIT, AvatarAcquisition, AvatarAcquisitionState,
     AvatarAssetPresentation, AvatarAssetRead, AvatarAssetRef, AvatarAssetStatus, AvatarAssetTarget,
-    AvatarAvailability, AvatarCacheUsage, AvatarIdentityDemand, AvatarImage, AvatarImageFormat,
-    AvatarPublishResult, MAX_AVATAR_BYTES, MAX_AVATAR_CACHE_BYTES, MAX_AVATAR_CACHE_ENTRIES,
-    MAX_AVATAR_DIMENSION,
+    AvatarAvailability, AvatarCacheUsage, AvatarFileImage, AvatarIdentityDemand, AvatarImage,
+    AvatarImageFormat, AvatarPublication, AvatarPublishResult, AvatarStoredFile, MAX_AVATAR_BYTES,
+    MAX_AVATAR_CACHE_BYTES, MAX_AVATAR_CACHE_ENTRIES, MAX_AVATAR_DIMENSION,
 };
 pub use app::chat_list::{
     AccountAttentionTotal, AccountUnreadTotal, ChatConversationKind, ChatListAttachmentKind,
