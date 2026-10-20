@@ -39,6 +39,9 @@ pub(crate) struct LegacyMigrationProgress {
     /// While the database compacts: the usage measured just before, which
     /// usage reads return instead of waiting for the busy database.
     pub(crate) compacting: Option<storage_sqlite::AttachmentStorageUsage>,
+    /// The live-size cap holding compaction back was logged for this
+    /// account in this process.
+    pub(crate) compaction_cap_logged: bool,
 }
 
 pub(crate) type SharedLegacyMigration = Arc<Mutex<LegacyMigrationProgress>>;

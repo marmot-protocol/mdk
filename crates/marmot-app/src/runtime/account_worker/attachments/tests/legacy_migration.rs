@@ -60,6 +60,10 @@ async fn the_maintenance_batch_moves_a_legacy_body_and_wakes_observers() {
 async fn the_maintenance_tick_compacts_the_database_once() {
     let (dir, client, storage, _reference) = offline_fixture().await;
     test_free_space::set(dir.path(), 1 << 40);
+    storage
+        .app_storage()
+        .make_non_incremental_for_test()
+        .unwrap();
     {
         // Free pages inside the database, as moved or removed bodies leave.
         let conn = super::retention_fault_connection(&client.app);
@@ -94,6 +98,10 @@ async fn the_maintenance_tick_compacts_the_database_once() {
 async fn a_rolled_back_compaction_is_tried_again_later() {
     let (dir, client, storage, _reference) = offline_fixture().await;
     test_free_space::set(dir.path(), 1 << 40);
+    storage
+        .app_storage()
+        .make_non_incremental_for_test()
+        .unwrap();
     let writer = super::retention_fault_connection(&client.app);
     writer
         .execute_batch(

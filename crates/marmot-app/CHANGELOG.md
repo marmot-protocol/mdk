@@ -89,8 +89,13 @@
 
 - The account database returns freed space to the filesystem (mdk#2314 step
   6). Once a quarter of it is free pages, the volume has room for two copies
-  of the live data and that data is at most 256 MiB (the copy is built in
-  memory), the account worker compacts it once per worker ownership;
+  of the live data and that data is at most 64 MiB (the copy is built in
+  memory, and its final write-back cannot be interrupted, so the cap bounds
+  how long a suspend's close can wait), the account worker compacts it once;
+  a rolled-back attempt is retried. Attachment bodies moved out by the
+  migration are free pages, not live data. An account still over the cap
+  once nothing is left to move is logged once per process with its live
+  size as a coarse bucket;
   `attachment_storage_usage().migration` reads `Compacting` meanwhile, from a
   snapshot taken just before, and attachment observers wake when it starts
   and ends. Afterwards each maintenance tick and each bulk removal returns

@@ -139,11 +139,13 @@ account database.
   damaged is dropped, and its attachment shows as previously acquired and unavailable, with
   download-again allowed.
 - **Compaction.** Moving or removing database bodies frees pages inside the database, not on
-  the disk. Once a quarter of the database is free, the disk has room and the live database
-  is at most 256 MiB, the account worker compacts it once; `migration` reads `Compacting`
-  meanwhile, with the other figures from just before, and observers wake when it starts and
-  ends. Other account reads and writes wait for it, typically seconds. After that, freed
-  pages return to the disk as each batch or bulk removal runs.
+  the disk. Accounts created from this release on return freed pages as they go. An older
+  account's database is compacted once: when a quarter of it is free, the disk has room and
+  its live data (not counting attachment bodies already moved out) is at most 64 MiB.
+  `migration` reads `Compacting` meanwhile, with the other figures from just before, and
+  observers wake when it starts and ends. Other account reads and writes wait for it,
+  typically about a second; a close for suspension may wait for its last part. After that,
+  freed pages return to the disk as each batch or bulk removal runs.
 - **Largest first.** `attachmentStorageByChat` lists chats and `largestRetainedAttachments`
   lists attachments (account-wide or within one chat), each with `limit` 1..=256 per page.
   Continue with the page's `nextCursor` until it is absent; the last page may be empty.

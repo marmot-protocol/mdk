@@ -77,9 +77,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   as stored is dropped so its slot shows as unavailable with download-again allowed. The per-account
   `LegacyMigrationProgress` lives in `MarmotApp` and is dropped with the account's media store.
 - `media/storage_compaction.rs` returns the account database's freed pages to the filesystem (mdk#2314 step 6) on the
-  blocking pool: the one-time compaction runs only through `compaction_due` (a quarter of the file free, the reserve
-  plus two live copies free on the volume, and a live database of at most 256 MiB, since the `VACUUM` copy is built in
-  memory), at most once per worker ownership (a rolled-back one is retried, at most three times), never while a
+  blocking pool: the one-time compaction runs only through `compaction_gate` (a quarter of the file free, the reserve
+  plus two live copies free on the volume, and a live database of at most 64 MiB: the `VACUUM` copy is built in
+  memory, and its final write-back cannot be interrupted, so the cap bounds how long a close can wait for it; an
+  account over the cap with no legacy bodies left is logged once per process, as a power-of-two MiB bucket), at most once per worker ownership (a rolled-back one is retried, at most three times), never while a
   migration batch runs. The account worker awaits it from
   its maintenance tick, so none of its synchronous storage calls park an async thread on the held connection, and
   `Compacting` is served from a usage snapshot so hosts never wait on it. Afterwards `reclaim` runs after every

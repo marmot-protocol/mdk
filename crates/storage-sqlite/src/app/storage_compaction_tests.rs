@@ -15,6 +15,8 @@ impl Fixture {
         let key = SqlCipherKey::new(hex::encode([0x5c; 32])).unwrap();
         let store =
             SqliteAccountStorage::open_encrypted(dir.path().join("session.sqlite"), &key).unwrap();
+        // The layout accounts created before incremental mode have.
+        store.app_storage().make_non_incremental_for_test().unwrap();
         store
             .lock()
             .unwrap()
@@ -211,4 +213,25 @@ fn a_reader_blocks_the_truncate_and_a_later_one_finishes_it() {
     assert_eq!(wal(), 0);
     assert!(fixture.file_len() + 6_000_000 < file_before);
     assert_eq!(fixture.marker(), "kept");
+}
+
+/// A new account database starts incremental: it never needs the one-time
+/// compaction, and freed pages return without it.
+#[test]
+fn a_new_database_starts_incremental() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new(hex::encode([0x5c; 32])).unwrap();
+    let path = dir.path().join("session.sqlite");
+    let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    assert!(store.app_storage().database_space().unwrap().incremental);
+    store.close().unwrap();
+    // Reopening an existing database keeps its mode and never rewrites it.
+    let reopened = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    reopened
+        .app_storage()
+        .make_non_incremental_for_test()
+        .unwrap();
+    reopened.close().unwrap();
+    let again = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    assert!(!again.app_storage().database_space().unwrap().incremental);
 }

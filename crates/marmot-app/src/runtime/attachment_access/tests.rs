@@ -1411,6 +1411,8 @@ async fn moved_legacy_bodies_are_compacted_out_of_the_database() {
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let store = app.account_storage("alice").unwrap();
+    // An account created before new databases started incremental.
+    store.app_storage().make_non_incremental_for_test().unwrap();
     let body = vec![11u8; 6_000_000];
     seed_at(&store.app_storage(), legacy_slot(0x61), &body);
     assert!(migrate_legacy(&app, &store, u64::MAX / 2));

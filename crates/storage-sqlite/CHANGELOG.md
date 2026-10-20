@@ -78,6 +78,10 @@
 
 ### Added
 
+- New account databases are created with `auto_vacuum=INCREMENTAL`, so
+  freed pages return to the filesystem without the one-time compaction
+  older databases need (mdk#2314 step 6). Existing databases keep their mode
+  until compacted.
 - Database compaction (mdk#2314 step 6): `database_space` reports the account
   database's pages (`DatabaseSpace`: size, free pages, live bytes, whether it
   is incremental), `compact_database` switches it to

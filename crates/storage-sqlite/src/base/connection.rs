@@ -1250,6 +1250,23 @@ pub(crate) fn finish_account_open(
         observer,
         crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::OperationalPragmas),
     );
+    // A database with no schema yet starts in incremental auto-vacuum mode,
+    // so freed pages can go back to the filesystem without the one-time
+    // compaction older databases need (mdk#2314 step 6). The mode can only
+    // be chosen before the first table exists, and before WAL mode writes
+    // the file header: so ahead of the operational pragmas.
+    let fresh: bool = connection
+        .query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master)",
+            [],
+            |row| row.get(0),
+        )
+        .storage()?;
+    if fresh {
+        connection
+            .execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")
+            .storage()?;
+    }
     apply_operational_pragmas(&connection, &options)?;
     connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
     let migration_started = std::time::Instant::now();

@@ -25,30 +25,58 @@ use super::legacy_migration::SharedLegacyMigration;
 const MIB: u64 = 1024 * 1024;
 /// Compact once free pages are at least this percentage of the file.
 const COMPACTION_MIN_FREE_PERCENT: u64 = 25;
-/// The `VACUUM` builds its copy in memory (`temp_store=MEMORY`), so a larger
-/// live database is not compacted: the memory spike would risk the process.
-/// Under this cap, "256 MiB free" already means at least half the file is
-/// free, so the 25% rule alone decides.
-const COMPACTION_MAX_LIVE_BYTES: u64 = 256 * MIB;
+/// The `VACUUM` builds its copy in memory (`temp_store=MEMORY`), and its
+/// final write-back of that copy cannot be interrupted, so a close (a host
+/// about to suspend) that lands there waits for it. A larger live database
+/// is not compacted: this bounds both the memory spike and that wait (about
+/// a second on a recent iPhone). Attachment bodies moved out by the
+/// migration are free pages, not live data, so heavy attachment accounts
+/// fall under it once their bodies have moved.
+const COMPACTION_MAX_LIVE_BYTES: u64 = 64 * MIB;
 /// Free pages one reclaim step returns at most, bounding how long it holds
 /// the account connection.
 const RECLAIM_MAX_BYTES: u64 = 64 * MIB;
 const TRACE_TARGET: &str = "marmot_app::storage_maintenance";
 
-/// Whether the one-time compaction should run now, with `free` bytes free
-/// on the volume and `reserve` to keep. A `VACUUM` in WAL mode writes the
-/// live database twice before the old pages go: its copy into the WAL, then
-/// the checkpoint.
-pub(crate) fn compaction_due(space: &DatabaseSpace, reserve: u64, free: u64) -> bool {
+/// Whether the one-time compaction should run now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompactionGate {
+    Due,
+    /// Already incremental, or too little of the file is free.
+    NotWorthwhile,
+    /// Worth doing, but the live database is over [`COMPACTION_MAX_LIVE_BYTES`].
+    LiveTooLarge,
+    /// Worth doing, but the volume cannot hold the copy.
+    DiskTooTight,
+}
+
+/// The gates for the one-time compaction, with `free` bytes free on the
+/// volume and `reserve` to keep. A `VACUUM` in WAL mode writes the live
+/// database twice before the old pages go: its copy into the WAL, then the
+/// checkpoint.
+pub(crate) fn compaction_gate(space: &DatabaseSpace, reserve: u64, free: u64) -> CompactionGate {
     let live = space.live_bytes();
-    !space.incremental
+    let worthwhile = !space.incremental
         && space.free_pages > 0
         && space.free_bytes().saturating_mul(100)
             >= space
                 .file_bytes()
-                .saturating_mul(COMPACTION_MIN_FREE_PERCENT)
-        && live <= COMPACTION_MAX_LIVE_BYTES
-        && free >= reserve.saturating_add(live.saturating_mul(2))
+                .saturating_mul(COMPACTION_MIN_FREE_PERCENT);
+    if !worthwhile {
+        CompactionGate::NotWorthwhile
+    } else if live > COMPACTION_MAX_LIVE_BYTES {
+        CompactionGate::LiveTooLarge
+    } else if free < reserve.saturating_add(live.saturating_mul(2)) {
+        CompactionGate::DiskTooTight
+    } else {
+        CompactionGate::Due
+    }
+}
+
+/// Live database size rounded up to a power-of-two number of MiB: an
+/// aggregate that shows how far over the cap accounts sit, nothing more.
+fn live_mib_bucket(space: &DatabaseSpace) -> u64 {
+    space.live_bytes().div_ceil(MIB).max(1).next_power_of_two()
 }
 
 /// Returns up to [`RECLAIM_MAX_BYTES`] of free pages once the database is
@@ -136,8 +164,38 @@ pub(crate) fn compact_if_due(
     let Ok(available) = free() else {
         return CompactionAttempt::NotDue;
     };
-    if !compaction_due(&space, reserve, available) {
-        return CompactionAttempt::NotDue;
+    match compaction_gate(&space, reserve, available) {
+        CompactionGate::Due => {}
+        CompactionGate::LiveTooLarge => {
+            // While legacy bodies remain, the migration is still shrinking
+            // the live database: only an account over the cap with nothing
+            // left to move stays there. Log those once per account per
+            // process: they keep their freed pages inside the file, and this
+            // is how we learn how many there are and by how much they miss.
+            if storage
+                .legacy_attachment_bytes()
+                .map_or(true, |bytes| bytes > 0)
+            {
+                return CompactionAttempt::NotDue;
+            }
+            let first = !std::mem::replace(
+                &mut progress
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .compaction_cap_logged,
+                true,
+            );
+            if first {
+                tracing::info!(target: TRACE_TARGET, method = "compact_database",
+                    live_mib_bucket = live_mib_bucket(&space),
+                    cap_mib = COMPACTION_MAX_LIVE_BYTES / MIB,
+                    "database compaction held back by the live-size cap");
+            }
+            return CompactionAttempt::NotDue;
+        }
+        CompactionGate::NotWorthwhile | CompactionGate::DiskTooTight => {
+            return CompactionAttempt::NotDue;
+        }
     }
     let Ok(snapshot) = storage.attachment_storage_usage(crate::unix_now_seconds()) else {
         return CompactionAttempt::NotDue;

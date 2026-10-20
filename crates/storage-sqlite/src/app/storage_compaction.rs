@@ -2,18 +2,22 @@
 //! step 6).
 //!
 //! Deleting rows (a moved legacy attachment body, a removal) only frees pages
-//! inside the file. Account databases were created without `auto_vacuum`,
-//! and that cannot be switched on without one full `VACUUM`, so compaction is
-//! a one-time switch: checkpoint the WAL, set `auto_vacuum=INCREMENTAL`,
+//! inside the file. New account databases are created incremental (see
+//! `finish_account_open`), but older ones were created without `auto_vacuum`,
+//! which cannot be switched on without one full `VACUUM`, so for them
+//! compaction is a one-time switch: checkpoint the WAL, set `auto_vacuum=INCREMENTAL`,
 //! `VACUUM` (SQLCipher re-encrypts the copy; an interrupted `VACUUM` rolls
 //! back and leaves the database as it was), and checkpoint again so the WAL
 //! that held the copy shrinks. From then on [`SqliteAppStorage::reclaim_free_pages`]
 //! returns freed pages in bounded steps.
 //!
 //! The `VACUUM` holds the account connection for its whole run, and with
-//! `temp_store=MEMORY` it builds the copy in memory: callers decide when the
-//! live database is small enough and the volume has room (the app runtime's
-//! gates), and run it on the blocking pool.
+//! `temp_store=MEMORY` it builds the copy in memory. A close stops the build
+//! (the statement polls the close latch), but not the final write-back of the
+//! copy into the file, which SQLite runs as one uninterruptible page copy:
+//! callers decide when the live database is small enough to bound both and
+//! the volume has room (the app runtime's gates), and run it on the blocking
+//! pool.
 use cgka_traits::storage::{StorageError, StorageResult};
 use rusqlite::Connection;
 
@@ -100,6 +104,15 @@ impl SqliteAppStorage {
     #[cfg(any(test, feature = "test-support"))]
     pub fn compact_database_pausing_for_test(&self, pause: &dyn Fn()) -> StorageResult<bool> {
         self.compact_database_pausing(pause)
+    }
+
+    /// Rewrites the database in the layout accounts created before mdk#2314
+    /// step 6 have: no auto-vacuum. Test support only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn make_non_incremental_for_test(&self) -> StorageResult<()> {
+        self.lock()?
+            .execute_batch("PRAGMA auto_vacuum=NONE; VACUUM;")
+            .storage()
     }
 
     /// Whether a close of the account database has begun. Test support only.
