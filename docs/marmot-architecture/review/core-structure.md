@@ -1,7 +1,7 @@
 ---
 title: "Review — Core Crate Structure"
 created: 2026-10-15
-updated: 2026-10-17
+updated: 2026-10-20
 tags: [marmot, architecture, review, structure, crates]
 status: draft for discussion
 ---
@@ -92,8 +92,8 @@ modules. Forty `_unobserved` functions exist only to pair each public operation 
 
 **Seams that already exist in state but not in code.**
 - The relay plane depends on almost nothing else in the crate: 10% of its lines are methods on the hub objects.
-- The directory makes no account-storage calls and has its own databases, yet it is written as 67 methods on
-  `MarmotApp`.
+- The directory makes no account-storage calls and has its own per-account cache, yet it is written as 86 methods on
+  `MarmotApp` ([directory brief](brief-directory.md#corrections-to-the-plan)).
 
 Sync and history recovery are one subsystem split across two files: they share about 10 `AppClient` fields, and sync
 references 48 recovery symbols.
@@ -326,7 +326,7 @@ Foundation:   cgka-traits (contracts only)   marmot-components (app component an
 | `marmot-session` (new) | `cgka-session`, `marmot-account` runtime | One layer that owns the engine and its own account-record store handle: publish pipeline, maintenance, KeyPackage lifecycle, one routing implementation, one Welcome path. It re-exports the config types callers need. |
 | `marmot-account` | itself | Identity, files, secret stores: what the bindings, CLI and agent already use. |
 | `transport-nostr` (new) | `marmot-app` `relay_plane/` | The relay plane, routing derivation, coverage evidence (EOSE and paging), and the KeyPackage event format, built on `transport-nostr-adapter`, which stays its own crate. This is where Pass 1 E's size handling and coverage surface belong. Folding the adapter's SDK client in later is an option, not part of step 2 ([brief](brief-relay-plane.md#decision-a-new-crate-on-top-of-the-adapter)). |
-| `directory` (new) | `marmot-app` `directory/`, relay-plane directory code, previews | Discovery, profiles, KeyPackage lookup and search, with the databases it already owns. |
+| `marmot-directory` (new, [brief](brief-directory.md)) | `marmot-app` `directory/`, previews, the directory half of `key_package_records.rs` | Discovery, profiles, KeyPackage lookup and search, with the per-account cache it already owns. The relay plane's directory fetching stays in `transport-nostr`. |
 | `media-store` and media transfer | #2314; `marmot-app` `media/` | The encrypted file store (in progress), plus Blossom transfer, crypto and resume. |
 | `marmot-observability` (new) | `marmot-app` `relay_telemetry_export`, `product_analytics`, `audit_otlp_sender`, audit upload, `collector_host_safety` | The code that ships diagnostics off the device: relay telemetry over OTLP, Aptabase product analytics, audit-log upload and OTLP delivery, and the collector dial-safety checks. The recording points stay in `marmot-app` and report through one observer interface, replacing the 40 `_unobserved` pairs over time. Decided 2026-10-15: move it as it is first, and generalize later (§2.9). |
 | `marmot-app` | itself | Composition root and per-account product core, organized by role (writer lane, read path, I/O lanes; [Pass 1 B](b-runtime-concurrency.md)). `AppClient` stops being a public type; only `wn sync` uses it today. |
@@ -347,7 +347,7 @@ Each step can ship on its own.
 | --- | --- | --- | --- |
 | 1 | `media-store` crate (#2314) | In progress, and the template for the rest | — |
 | 2 | Relay plane into `transport-nostr` ([brief](brief-relay-plane.md)) | The most separable seam; gives Pass 1 E's fixes a home | about 5.1k lines move |
-| 3 | Directory crate | Already owns its state; makes no account-storage calls | about 11–13k |
+| 3 | Directory crate ([brief](brief-directory.md)) | Already owns its state; makes no account-storage calls | about 9k |
 | 4 | `storage-sqlite` internal boundaries by table ownership: `protocol/`, `app/` and a `cross/` module, with tests that fail on any detected crossing missing from a shrinking allow-list ([brief](brief-storage-boundaries.md)) | Makes the split reviewable before any crate moves; no behaviour change | Moves, then the `SqliteAppStorage` handle: `marmot-app`'s calls to about 318 app methods (a name-match count) |
 | 5 | Lower stack: merge the session into `marmot-session`, split off `marmot-account`, move the engine's storage proxy and audit ownership up, re-export config types | The two fixes that touch this code have landed: #2338 and #2341, which closed #2323 | Touches about 10 `marmot-app` files and `marmot-account` |
 | 6 | `marmot-observability` for the exporters, plus an observer interface | Removes the largest `marmot-app` domain | about 7–8k |
