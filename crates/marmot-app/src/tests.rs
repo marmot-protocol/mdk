@@ -11592,22 +11592,7 @@ fn received_message_sender_is_admitted_to_directory_cache() {
             .unwrap()
             .is_none()
     );
-    app.remember_directory_message_sender(&ReceivedMessage {
-        authority: None,
-        message_id_hex: "message-id".to_owned(),
-        source_message_id_hex: "source-message-id".to_owned(),
-        sender: sender.clone(),
-        sender_display_name: None,
-        group_id: GroupId::new(vec![0x01]),
-        source_epoch: 0,
-        retention: None,
-        plaintext: "hello".to_owned(),
-        kind: MARMOT_APP_EVENT_KIND_CHAT,
-        tags: Vec::new(),
-        recorded_at: 0,
-        received_at: 0,
-    })
-    .unwrap();
+    app.remember_directory_message_sender(&sender).unwrap();
 
     let entry = app
         .directory_entry_for_account_id(&sender)

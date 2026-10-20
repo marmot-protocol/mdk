@@ -99,6 +99,7 @@ mod conversions;
 mod directory;
 #[cfg(test)]
 mod directory_crossings_tests;
+mod directory_resources;
 mod drafts;
 mod local_submissions;
 pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
@@ -128,6 +129,7 @@ pub use moderation_reports::{
 mod nostr_secret;
 mod nostr_verification;
 mod notifications;
+mod profile_publication;
 mod projection;
 mod publisher_sequences;
 mod relay_telemetry_export;
@@ -1539,6 +1541,23 @@ impl MarmotApp {
     /// relay plane.
     pub async fn relay_telemetry(&self) -> RelayTelemetrySnapshot {
         self.relay_plane.relay_telemetry().await
+    }
+
+    /// Narrow network-sourced relay-list endpoints to the ones this device is
+    /// willing to dial, whether the list belongs to this device's local account
+    /// or to another account. Published data remains untrusted in both cases;
+    /// filtering affects only the operation's route and never rewrites the list.
+    ///
+    /// Routes to the same host-safety rule configured endpoints face; see
+    /// [`RelaySafetyPolicy::retain_safe_endpoints`] for why a published list
+    /// filters rather than fails.
+    pub(crate) fn retain_safe_discovered_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        context: &str,
+    ) -> Vec<TransportEndpoint> {
+        self.relay_plane
+            .retain_safe_discovered_endpoints(endpoints, context)
     }
 
     /// Effective settings for this app instance, including its active consent permit.

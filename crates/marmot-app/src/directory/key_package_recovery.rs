@@ -70,7 +70,7 @@ impl MarmotApp {
         }
         // Primary routes already crossed the maintained 16-endpoint admission
         // gate. Recovery only adds eight distinct safe configured routes.
-        let searched = self.retain_safe_discovered_endpoints(
+        let searched = self.relay_plane.retain_safe_discovered_endpoints(
             searched.to_vec(),
             "KeyPackage recovery searched routes",
         );
@@ -82,6 +82,7 @@ impl MarmotApp {
             .filter_map(|endpoint| RelayUrl::parse(endpoint.as_str()).ok())
             .collect::<BTreeSet<_>>();
         let supplementary = self
+            .relay_plane
             .retain_safe_discovered_endpoints(discovery.to_vec(), "KeyPackage discovery recovery")
             .into_iter()
             .filter(|endpoint| {

@@ -5988,7 +5988,7 @@ impl AppClient {
         }
         let retains_encrypted_media = message.kind == MARMOT_APP_EVENT_KIND_CHAT
             && media_imeta_tags_are_valid(&message.tags, self.app.allow_loopback_blob_endpoints());
-        if let Err(error) = self.app.remember_directory_message_sender(&message) {
+        if let Err(error) = self.app.remember_directory_message_sender(&message.sender) {
             tracing::warn!(
                 target: "marmot_app::client",
                 method = "project_received_message",

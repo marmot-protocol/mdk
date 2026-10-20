@@ -2,16 +2,15 @@
 //!
 //! Split `impl MarmotApp` block covering the user-directory cache/sync surface:
 //! relay-list and profile/key-package/follow-list fetches, the public
-//! `directory_*`/`*_user_directory` API, directory-cache lifecycle, and
-//! in-memory directory-record hydration. The stateless record types and helpers
-//! these build on live in [`crate::directory::records`].
+//! `directory_*`/`*_user_directory` API, and in-memory directory-record
+//! hydration. The stateless record types and helpers these build on live in
+//! [`crate::directory::records`]. The cache lifecycle is in
+//! [`crate::directory_resources`], and publishing the account's own profile and
+//! follow list is in [`crate::profile_publication`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
-use std::path::PathBuf;
 
-use cgka_traits::{MemberId, TransportEndpoint};
-use marmot_account::AccountSummary;
+use cgka_traits::TransportEndpoint;
 use nostr_sdk::prelude::PublicKey;
 #[cfg(test)]
 use storage_sqlite::PublicDirectoryUserRecord;
@@ -19,17 +18,15 @@ use storage_sqlite::SqliteSharedStorage;
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
 };
-use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::directory::records::{
     CachedIdentityProjection, DirectoryKeyPackage, FetchedFollowList, LocalAccountNames,
     MAX_CACHED_IDENTITY_PAGE_SIZE, UserDirectoryLocalAccount, UserDirectoryRecord,
     UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
     cached_identity_projection, display_name_for_profile, follow_list_from_record,
-    latest_follow_list_from_records, latest_fresh_profiles_from_records, profile_content_json,
-    profile_from_record, public_directory_user_record, select_newer_directory_entry,
-    source_relays_from_record, upsert_newer_directory_entry, user_directory_record_from_public,
-    user_record_match,
+    latest_follow_list_from_records, latest_fresh_profiles_from_records, profile_from_record,
+    public_directory_user_record, select_newer_directory_entry, source_relays_from_record,
+    upsert_newer_directory_entry, user_directory_record_from_public, user_record_match,
 };
 use crate::directory::{
     DirectoryCache, DirectorySyncHandle, plan_directory_sync, sort_user_search_results,
@@ -39,15 +36,13 @@ use crate::ids::{
 };
 use crate::key_package_records::{
     fresh_or_cached_key_package, fresh_relay_list_status_from_records, key_package_from_record,
-    latest_fresh_key_package_from_records, merge_relay_list_status,
-    publish_endpoints_from_bootstrap, relay_list_queries,
+    latest_fresh_key_package_from_records, merge_relay_list_status, relay_list_queries,
 };
 use crate::{
-    APP_CACHE_DB_FILE, AccountRelayListBootstrap, AccountRelayListStatus, AppError,
-    DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER, DirectoryFreshness, FetchedKeyPackage,
-    KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, MissingRelayListKind, ReceivedMessage,
-    SqlcipherDatabaseKind, USER_DIRECTORY_SEARCH_MAX_FRONTIER, USER_DIRECTORY_SEARCH_MAX_VISITED,
-    blocking_app_task, push_unique_strings, relay_list_state_from_event, remove_sqlite_file_set,
+    AccountRelayListStatus, AppError, DirectoryFreshness, FetchedKeyPackage,
+    KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, MissingRelayListKind,
+    USER_DIRECTORY_SEARCH_MAX_FRONTIER, USER_DIRECTORY_SEARCH_MAX_VISITED, blocking_app_task,
+    push_unique_strings, relay_list_state_from_event,
 };
 use transport_nostr::DirectorySyncPlan;
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
@@ -133,38 +128,6 @@ impl MarmotApp {
         Ok(local)
     }
 
-    pub fn warm_directory_storage(&self) -> Result<(), AppError> {
-        let _span = tracing::debug_span!(
-            target: "marmot_app::directory",
-            "directory_storage_warm",
-            method = "warm_directory_storage"
-        )
-        .entered();
-        let _shared = self.shared_storage()?;
-        let _caches = self.directory_caches()?;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn directory_cache_open_count_for_test(&self) -> usize {
-        self.directory_cache_open_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn directory_handle_acquire_count_for_test(&self) -> usize {
-        self.directory_handle_acquire_count
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn directory_cache_cached_for_test(&self, label: &str) -> bool {
-        self.directory_caches
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(label)
-    }
-
     pub async fn fetch_account_relay_list_status_for_account_id(
         &self,
         account_id_hex: &str,
@@ -247,7 +210,7 @@ impl MarmotApp {
             fresh_relay_list_status_from_records(&account_id_hex, records.clone(), freshness).value;
         let observed_outboxes = first_observed.nip65.created_at > 0;
         let first_hop = merge_relay_list_status(cached.clone(), first_observed);
-        let outbox_relays = self.retain_safe_discovered_endpoints(
+        let outbox_relays = self.relay_plane.retain_safe_discovered_endpoints(
             first_hop
                 .nip65
                 .relays
@@ -599,7 +562,7 @@ impl MarmotApp {
             blocking_app_task(move || app.remember_directory_relay_lists(&account_id, &remembered))
                 .await?;
         }
-        let mut source_relays = self.retain_safe_discovered_endpoints(
+        let mut source_relays = self.relay_plane.retain_safe_discovered_endpoints(
             relay_lists
                 .nip65
                 .relays
@@ -823,229 +786,6 @@ impl MarmotApp {
         })
     }
 
-    pub async fn publish_user_profile(
-        &self,
-        label: &str,
-        profile: UserProfileMetadata,
-        bootstrap: AccountRelayListBootstrap,
-    ) -> Result<(), AppError> {
-        let account = self.account_home().account(label)?;
-        let endpoints = self.outbox_endpoints(
-            &account.account_id_hex,
-            publish_endpoints_from_bootstrap(&bootstrap),
-        );
-        self.publish_user_profile_to_endpoints_and_indexers(
-            &account.label,
-            profile,
-            endpoints,
-            bootstrap.indexer_relays,
-            bootstrap
-                .default_relays
-                .into_iter()
-                .chain(bootstrap.bootstrap_relays)
-                .collect(),
-        )
-        .await
-        .map(|_| ())
-    }
-
-    /// Publish kind-0 metadata to an already-selected, account-scoped route,
-    /// returning the authored event's `created_at` for the local cache.
-    ///
-    /// This is the action boundary used when the runtime has captured one
-    /// coherent relay-list snapshot and must not re-read it before publishing.
-    pub(crate) async fn publish_user_profile_to_endpoints_and_indexers(
-        &self,
-        label: &str,
-        profile: UserProfileMetadata,
-        endpoints: Vec<TransportEndpoint>,
-        indexer_relays: Vec<TransportEndpoint>,
-        declared_relays: Vec<TransportEndpoint>,
-    ) -> Result<u64, AppError> {
-        let observation = self.product_analytics.begin(
-            crate::ProductFamily::Directory,
-            "publish",
-            crate::ProductUnit::Attempt,
-        );
-        let result = self
-            .publish_user_profile_to_endpoints_unobserved(
-                label,
-                profile,
-                endpoints,
-                indexer_relays,
-                declared_relays,
-            )
-            .await;
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
-
-    async fn publish_user_profile_to_endpoints_unobserved(
-        &self,
-        label: &str,
-        profile: UserProfileMetadata,
-        endpoints: Vec<TransportEndpoint>,
-        indexer_relays: Vec<TransportEndpoint>,
-        declared_relays: Vec<TransportEndpoint>,
-    ) -> Result<u64, AppError> {
-        let account = self.account_home().account(label)?;
-        let signer = self.account_signer_for_summary(&account)?;
-        let content = serde_json::to_string(&profile_content_json(&profile))?;
-        let mut event = NostrTransportEvent::new_unsigned(
-            account.account_id_hex.clone(),
-            KIND_NOSTR_METADATA,
-            Vec::new(),
-            content,
-        );
-        let indexers = self.public_indexer_publish_endpoints(
-            &indexer_relays,
-            &endpoints,
-            &endpoints,
-            &declared_relays,
-        );
-        let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
-        let nostr_signer = signer.as_nostr_signer();
-        // Sign before sending so indexer copies and quorum completion carry
-        // the exact event the account relays acknowledged.
-        event = self
-            .sign_replaceable_identity_event(label, nostr_signer.clone(), &event)
-            .await?;
-        let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
-        let outcome = relay_client
-            .publish_event_for_account(&account_id, &endpoints, &event, 1)
-            .await?;
-        if outcome.accepted.is_empty() {
-            return Err(AppError::Publish(
-                "no account relay acknowledged profile metadata".into(),
-            ));
-        }
-        let mut completion =
-            crate::QuorumCancelledDelivery::new(relay_client.clone(), account_id.clone());
-        completion.add(&event, &endpoints, &outcome);
-        self.spawn_quorum_cancelled_delivery(completion);
-        let created_at = event.created_at;
-        if let Some(copy) =
-            crate::PublicIndexerCopy::new(relay_client, account_id, vec![event], indexers)
-        {
-            self.spawn_public_indexer_copy(copy);
-        }
-        Ok(created_at)
-    }
-
-    /// Select profile publication endpoints from one account relay-list
-    /// snapshot. Prefer the account's published NIP-65 write relays, then its
-    /// remembered bootstrap relays. A missing bootstrap list falls back to the
-    /// snapshot's compatibility default/publish list.
-    ///
-    /// Every tier is filtered through the discovered-endpoint safety policy.
-    /// If a tier contains only invalid, unsafe, or retired endpoints, selection
-    /// continues to the next tier; no unusable endpoint reaches the dialer.
-    pub(crate) fn account_profile_publish_endpoints(
-        &self,
-        relay_lists: &AccountRelayListStatus,
-    ) -> Result<Vec<TransportEndpoint>, AppError> {
-        let published = self.retain_safe_discovered_endpoints(
-            relay_lists
-                .nip65
-                .relays
-                .iter()
-                .cloned()
-                .map(TransportEndpoint)
-                .collect(),
-            "account-owned profile publish relays",
-        );
-        if !published.is_empty() {
-            return Ok(published);
-        }
-
-        let bootstrap = if relay_lists.bootstrap_relays.is_empty() {
-            &relay_lists.default_relays
-        } else {
-            &relay_lists.bootstrap_relays
-        };
-        let bootstrap = self.retain_safe_discovered_endpoints(
-            bootstrap.iter().cloned().map(TransportEndpoint).collect(),
-            "account-owned profile bootstrap relays",
-        );
-        if bootstrap.is_empty() {
-            return Err(AppError::RelayDirectory(
-                "account relay configuration has no usable profile publication endpoints".into(),
-            ));
-        }
-        Ok(bootstrap)
-    }
-
-    pub async fn publish_account_follow_list(
-        &self,
-        label: &str,
-        follows: &[&str],
-        bootstrap: AccountRelayListBootstrap,
-    ) -> Result<(), AppError> {
-        let account = self.account_home().account(label)?;
-        let signer = self.account_signer_for_summary(&account)?;
-        let endpoints = self.outbox_endpoints(
-            &account.account_id_hex,
-            publish_endpoints_from_bootstrap(&bootstrap),
-        );
-        let cached_follows =
-            normalize_account_ids(follows.iter().map(|follow| (*follow).to_owned()).collect())?;
-        let tags = cached_follows
-            .iter()
-            .map(|account_id| vec!["p".to_owned(), account_id.clone()])
-            .collect();
-        let nostr_signer = signer.as_nostr_signer();
-        // Sign before sending so quorum completion resends the exact event.
-        let event = self
-            .sign_replaceable_identity_event(
-                label,
-                nostr_signer.clone(),
-                &NostrTransportEvent::new_unsigned(
-                    account.account_id_hex.clone(),
-                    KIND_NOSTR_CONTACT_LIST,
-                    tags,
-                    String::new(),
-                ),
-            )
-            .await?;
-        let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
-        let outcome = relay_client.publish_event(&endpoints, &event, 1).await?;
-        let mut completion = crate::QuorumCancelledDelivery::new(
-            relay_client,
-            MemberId::new(hex::decode(&account.account_id_hex)?),
-        );
-        completion.add(&event, &endpoints, &outcome);
-        self.spawn_quorum_cancelled_delivery(completion);
-        // Publishing a local kind-3 list must make its own cached edge set
-        // immediately available to the bindings, without admitting every
-        // followed account as a watched directory entry.
-        {
-            let app = self.clone();
-            let account_id = account.account_id_hex.clone();
-            let follow_list = FetchedFollowList {
-                follows: cached_follows,
-                source_relays: endpoints
-                    .iter()
-                    .map(|endpoint| endpoint.0.clone())
-                    .collect(),
-            };
-            if let Err(error) = blocking_app_task(move || {
-                app.remember_directory_follow_edges_for_search(&account_id, &follow_list)
-            })
-            .await
-            {
-                tracing::warn!(
-                    target: "marmot_app::directory",
-                    method = "publish_account_follow_list",
-                    error_kind = error.privacy_safe_kind(),
-                    "follow list published but local cache update failed"
-                );
-            }
-        }
-        Ok(())
-    }
-
     pub fn search_user_directory(
         &self,
         search: UserDirectorySearch,
@@ -1084,14 +824,6 @@ impl MarmotApp {
             results.truncate(limit);
         }
         Ok(results)
-    }
-
-    pub fn account_relay_list_status(
-        &self,
-        label: &str,
-    ) -> Result<AccountRelayListStatus, AppError> {
-        let account = self.account_home().account(label)?;
-        self.account_relay_list_status_for_account_id(&account.account_id_hex)
     }
 
     pub fn account_relay_list_status_for_account_id(
@@ -1302,23 +1034,6 @@ impl MarmotApp {
     /// See [`MarmotAppConfig::directory_search_fallback_seeds`].
     pub(crate) fn directory_search_fallback_seeds(&self) -> &[String] {
         &self.config.directory_search_fallback_seeds
-    }
-
-    /// Narrow network-sourced relay-list endpoints to the ones this device is
-    /// willing to dial, whether the list belongs to this device's local account
-    /// or to another account. Published data remains untrusted in both cases;
-    /// filtering affects only the operation's route and never rewrites the list.
-    ///
-    /// Routes to the same host-safety rule configured endpoints face; see
-    /// [`RelaySafetyPolicy::retain_safe_endpoints`] for why a published list
-    /// filters rather than fails.
-    pub(crate) fn retain_safe_discovered_endpoints(
-        &self,
-        endpoints: Vec<TransportEndpoint>,
-        context: &str,
-    ) -> Vec<TransportEndpoint> {
-        self.relay_plane
-            .retain_safe_discovered_endpoints(endpoints, context)
     }
 
     pub(crate) fn directory_source_relays(
@@ -1536,9 +1251,9 @@ impl MarmotApp {
 
     pub(crate) fn remember_directory_message_sender(
         &self,
-        message: &ReceivedMessage,
+        sender_account_id_hex: &str,
     ) -> Result<(), AppError> {
-        self.remember_directory_user_with_reason(&message.sender, "message")
+        self.remember_directory_user_with_reason(sender_account_id_hex, "message")
     }
 
     fn remember_directory_follow_list(
@@ -1787,192 +1502,6 @@ impl MarmotApp {
         }
     }
 
-    pub(crate) fn directory_cache_path(&self, label: &str) -> PathBuf {
-        self.account_dir(label).join(APP_CACHE_DB_FILE)
-    }
-
-    fn legacy_directory_cache_path(&self) -> PathBuf {
-        self.root.join(APP_CACHE_DB_FILE)
-    }
-
-    pub(crate) fn directory_cache_for_account(
-        &self,
-        account: &AccountSummary,
-    ) -> Result<DirectoryCache, AppError> {
-        self.ensure_storage_open("directory cache")?;
-        self.clean_future_dated_directory_caches_for_all_accounts_once()?;
-        if let Some(cache) = self
-            .directory_caches
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&account.label)
-            .cloned()
-        {
-            return Ok(cache);
-        }
-        let lifecycle = self.begin_storage_open("directory cache")?;
-        let _span = tracing::debug_span!(
-            target: "marmot_app::directory",
-            "directory_cache_handle_open",
-            method = "directory_cache_for_account"
-        )
-        .entered();
-        let path = self.directory_cache_path(&account.label);
-        let lock = crate::sqlcipher::database_open_lock(&path);
-        let database = lock.lock();
-        if let Some(cache) = self
-            .directory_caches
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&account.label)
-            .cloned()
-        {
-            return Ok(cache);
-        }
-        let key = if account.local_signing {
-            let keys = self.account_home().load_signing_keys(&account.label)?;
-            self.sqlcipher_key_locked(
-                &account.label,
-                &keys,
-                &database,
-                SqlcipherDatabaseKind::DirectoryCache,
-            )?
-        } else {
-            self.external_sqlcipher_key(
-                &account.label,
-                &account.account_id_hex,
-                &database,
-                SqlcipherDatabaseKind::DirectoryCache,
-            )?
-        };
-        let cache = DirectoryCache::open(path, &key)?;
-        #[cfg(test)]
-        self.directory_cache_open_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Registering under `lifecycle` is what keeps this cache reachable by
-        // a later `close_storage`; see `MarmotApp::begin_storage_open`.
-        self.root_closers.register(&lifecycle, cache.closer());
-        let mut caches = self
-            .directory_caches
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Ok(caches
-            .entry(account.label.clone())
-            .or_insert_with(|| cache.clone())
-            .clone())
-    }
-
-    pub(crate) fn directory_caches(&self) -> Result<Vec<DirectoryCache>, AppError> {
-        #[cfg(test)]
-        self.directory_handle_acquire_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let accounts = self
-            .account_home()
-            .accounts()?
-            .into_iter()
-            .filter(|account| account.is_active_signing())
-            .collect::<Vec<_>>();
-        self.clean_future_dated_directory_caches_once(&accounts)?;
-
-        let mut caches = Vec::with_capacity(accounts.len());
-        for account in accounts {
-            caches.push(self.directory_cache_for_account(&account)?);
-        }
-
-        self.migrate_legacy_directory_cache_once(&caches)?;
-        Ok(caches)
-    }
-
-    pub(crate) fn migrate_legacy_directory_cache_once(
-        &self,
-        caches: &[DirectoryCache],
-    ) -> Result<(), AppError> {
-        let mut checked = self
-            .legacy_directory_cache_checked
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *checked {
-            return Ok(());
-        }
-        let legacy_path = self.legacy_directory_cache_path();
-        let legacy_entries = DirectoryCache::open_legacy_plaintext(legacy_path.clone())?
-            .map(|cache| cache.entries())
-            .transpose()?;
-
-        let Some(entries) = legacy_entries else {
-            *checked = true;
-            return Ok(());
-        };
-
-        let local_accounts = self.local_accounts_by_id()?;
-        let entries = entries
-            .into_iter()
-            .map(|entry| Self::hydrate_directory_record(entry, &local_accounts))
-            .collect::<Result<Vec<_>, _>>()?;
-        let shared_storage = self.shared_storage()?;
-        for entry in &entries {
-            shared_storage.put_public_directory_user(&public_directory_user_record(entry)?)?;
-            // Each row commits independently; a later import error must not hide this work.
-            let _ = self
-                .presentation_signals
-                .profile_updates
-                .send(entry.account_id_hex.clone());
-            self.presentation_signals.wake();
-        }
-        for cache in caches {
-            for entry in &entries {
-                cache.put(entry)?;
-            }
-        }
-        for entry in &entries {
-            if shared_storage
-                .public_directory_user(&entry.account_id_hex)?
-                .is_none()
-            {
-                return Err(AppError::MissingDirectoryEntry(
-                    entry.account_id_hex.clone(),
-                ));
-            }
-            for cache in caches {
-                if cache.entry(&entry.account_id_hex)?.is_none() {
-                    return Err(AppError::MissingDirectoryEntry(
-                        entry.account_id_hex.clone(),
-                    ));
-                }
-            }
-        }
-        remove_sqlite_file_set(&legacy_path)?;
-        *checked = true;
-        Ok(())
-    }
-
-    fn clean_future_dated_directory_caches_once(
-        &self,
-        accounts: &[AccountSummary],
-    ) -> Result<(), AppError> {
-        let marker_path = self.root.join(DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER);
-        if marker_path.exists() {
-            return Ok(());
-        }
-        fs::create_dir_all(&self.root)?;
-        remove_sqlite_file_set(&self.legacy_directory_cache_path())?;
-        for account in accounts {
-            remove_sqlite_file_set(&self.directory_cache_path(&account.label))?;
-        }
-        fs_private::write_private(&marker_path, b"done\n")?;
-        Ok(())
-    }
-
-    fn clean_future_dated_directory_caches_for_all_accounts_once(&self) -> Result<(), AppError> {
-        let accounts = self
-            .account_home()
-            .accounts()?
-            .into_iter()
-            .filter(|account| account.is_active_signing())
-            .collect::<Vec<_>>();
-        self.clean_future_dated_directory_caches_once(&accounts)
-    }
-
     pub(crate) fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
         UserDirectoryRecord {
             account_id_hex: account_id_hex.to_owned(),
@@ -1986,7 +1515,7 @@ impl MarmotApp {
         }
     }
 
-    fn hydrate_directory_record(
+    pub(crate) fn hydrate_directory_record(
         mut entry: UserDirectoryRecord,
         local_accounts: &HashMap<String, LocalAccountNames>,
     ) -> Result<UserDirectoryRecord, AppError> {

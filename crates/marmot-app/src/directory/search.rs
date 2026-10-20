@@ -847,7 +847,7 @@ fn write_relays_from_record(
 ) -> Option<(String, Vec<String>)> {
     let account_id_hex = record.event.pubkey.clone();
     let relay_list = relay_list_state_from_event(&record.event)?;
-    let safe = app.retain_safe_discovered_endpoints(
+    let safe = app.relay_plane.retain_safe_discovered_endpoints(
         relay_list
             .write_relays
             .into_iter()

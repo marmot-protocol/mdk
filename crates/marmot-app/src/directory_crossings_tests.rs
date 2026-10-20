@@ -17,7 +17,8 @@
 //!   (`MarmotApp::account_home()`), or a read of a `MarmotApp` field
 //!   (`MarmotApp.relay_plane`), through `self` in a `MarmotApp` impl or through
 //!   a binding with an `app` word in its name (`app`, `app_for_plan`, `cached_app`).
-//!   `Self::name` in a `MarmotApp` impl and `MarmotApp::name` count as calls;
+//!   `self` and `Self::name` inside any `MarmotApp` impl, inherent or trait, and
+//!   `MarmotApp::name` anywhere count as the hub;
 //! - any path into `marmot_account` or `marmot_app`, which the new crate must
 //!   not depend on. Today's are listed like any other crossing, so they must be
 //!   gone before the move.
@@ -114,6 +115,12 @@ fn the_scan_sees_each_kind_of_crossing() {
                 let _ = self.deployment();
             }
         }
+        impl SomeTrait for MarmotApp {
+            fn t(&self) {
+                let _ = Self::sign_event(self);
+                let _ = &self.root_closers;
+            }
+        }
         fn h(app: &MarmotApp) {
             let _ = MarmotApp::account_dir(app, "label");
         }
@@ -136,7 +143,9 @@ fn the_scan_sees_each_kind_of_crossing() {
         ast: syn::parse_file(source).unwrap(),
     };
     let hub = Hub {
-        fields: ["relay_plane", "root"].map(str::to_owned).into(),
+        fields: ["relay_plane", "root", "root_closers"]
+            .map(str::to_owned)
+            .into(),
         methods: [
             "account_home",
             "shared_storage",
@@ -145,6 +154,7 @@ fn the_scan_sees_each_kind_of_crossing() {
             "relay_endpoints",
             "outbox_endpoints",
             "account_dir",
+            "sign_event",
         ]
         .map(str::to_owned)
         .into(),
@@ -156,12 +166,14 @@ fn the_scan_sees_each_kind_of_crossing() {
         [
             "MarmotApp.relay_plane",
             "MarmotApp.root",
+            "MarmotApp.root_closers",
             "MarmotApp::account_dir()",
             "MarmotApp::account_home()",
             "MarmotApp::deployment()",
             "MarmotApp::outbox_endpoints()",
             "MarmotApp::relay_endpoints()",
             "MarmotApp::shared_storage()",
+            "MarmotApp::sign_event()",
             "crate::AppError",
             "crate::ProductFamily",
             "crate::push_unique_strings",
@@ -324,6 +336,14 @@ fn starts_test_only(tokens: TokenStream) -> bool {
     is_test_only(&syn::parse::Parser::parse2(parser, tokens).unwrap_or_default())
 }
 
+/// Any impl whose self type is `MarmotApp`, inherent or trait: inside it,
+/// `self` and `Self` are the hub.
+fn is_hub_self_type(item: &syn::ItemImpl) -> bool {
+    matches!(&*item.self_ty, syn::Type::Path(p)
+        if p.path.segments.last().is_some_and(|s| s.ident == "MarmotApp"))
+}
+
+/// An inherent `MarmotApp` impl, whose methods are the hub's own.
 fn is_hub_impl(item: &syn::ItemImpl) -> bool {
     item.trait_.is_none()
         && matches!(&*item.self_ty, syn::Type::Path(p)
@@ -653,7 +673,7 @@ impl<'ast> Visit<'ast> for Scan<'_> {
 
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
         let outer = self.in_hub_impl;
-        self.in_hub_impl = is_hub_impl(item);
+        self.in_hub_impl = is_hub_self_type(item);
         visit::visit_item_impl(self, item);
         self.in_hub_impl = outer;
     }
