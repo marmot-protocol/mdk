@@ -300,31 +300,39 @@ async fn fetch_epoch_gap_window(
     events
 }
 
-/// The turn of a route starting `now`, with `routes_left` routes (this one
-/// included) still to run before the pass ends at `deadline`: when its
+/// How many equal units of the pass a route's turn takes: one to compare, and
+/// one more for an epoch-gap route's newest `window`.
+fn turn_units(window: Option<[u8; 32]>) -> u32 {
+    1 + u32::from(window.is_some())
+}
+
+/// The turn of a route starting `now`, with `units_left` turn units (this
+/// route's included) still to run before the pass ends at `deadline`: when its
 /// comparison must finish, and when the turn ends.
 ///
 /// Routes run one after another, and the rotation claimed every one of them
-/// when the grant froze. Each turn is an equal share of what is left, so a
-/// slow relay on one route cannot spend the turns of the routes after it;
+/// when the grant froze. Each comparison gets an equal unit of what is left,
+/// so a slow relay on one route cannot spend the turns of the routes after it;
 /// time a fast route leaves unused carries over to the rest. An epoch-gap
-/// route keeps part of its turn for the newest `window` of relays that could
-/// not compare. Any other route leaves a margin for the hard guard to receive
-/// the SDK's partial result instead of cancelling it, which only binds on the
-/// last route. Neither is the SDK's own reserve inside the comparison
-/// deadline, which picks what a cut-short oldest-first window may return.
+/// route's turn adds a unit, at most the window fetch's own limit, for the
+/// newest `window` of relays that could not compare: a relay that ignores
+/// NEG-OPEN runs its comparison to the end, and the window must still fit.
+/// Any other route leaves a margin for the hard guard to receive the SDK's
+/// partial result instead of cancelling it, which only binds on the last
+/// route. Neither is the SDK's own reserve inside the comparison deadline,
+/// which picks what a cut-short oldest-first window may return.
 fn route_turn(
     now: tokio::time::Instant,
     deadline: tokio::time::Instant,
-    routes_left: usize,
+    units_left: u32,
     window: Option<[u8; 32]>,
 ) -> (tokio::time::Instant, tokio::time::Instant) {
     let remaining = deadline.saturating_duration_since(now);
-    let share = remaining / u32::try_from(routes_left.max(1)).unwrap_or(u32::MAX);
-    let turn_ends = now + share;
+    let unit = remaining / units_left.max(1);
+    let turn_ends = now + unit * turn_units(window);
     let compare_until = match window {
-        Some(_) => turn_ends - (share / 2).min(EPOCH_GAP_WINDOW_MAX_DURATION),
-        None => turn_ends.min(deadline - (share / 5).min(Duration::from_millis(400))),
+        Some(_) => turn_ends - unit.min(EPOCH_GAP_WINDOW_MAX_DURATION),
+        None => turn_ends.min(deadline - (unit / 5).min(Duration::from_millis(400))),
     };
     (compare_until, turn_ends)
 }
@@ -396,14 +404,19 @@ impl ComparisonNetworkJob {
                     .store(attempt_serial, Ordering::SeqCst);
                 ActiveCounter::new(witness.active_jobs.clone())
             });
-            let route_count = routes.len();
-            let mut results = Vec::with_capacity(route_count);
-            for (index, frozen) in routes.into_iter().enumerate() {
+            let mut results = Vec::with_capacity(routes.len());
+            let mut units_left = routes
+                .iter()
+                .map(|route| turn_units(route.window))
+                .sum::<u32>();
+            for frozen in routes {
                 let FrozenRoute {
                     inventory,
                     initial_cursor,
                     window,
                 } = frozen;
+                let units = units_left;
+                units_left -= turn_units(window);
                 let now = tokio::time::Instant::now();
                 if now >= deadline {
                     results.push(ComparisonRouteResult {
@@ -420,8 +433,7 @@ impl ComparisonNetworkJob {
                 let progress = Arc::new(MemoryProgress {
                     cursor: Mutex::new(initial_cursor),
                 });
-                let (comparison_deadline, turn_ends) =
-                    route_turn(now, deadline, route_count - index, window);
+                let (comparison_deadline, turn_ends) = route_turn(now, deadline, units, window);
                 let run = async {
                     #[cfg(test)]
                     let _request_active = witness
@@ -1749,15 +1761,14 @@ mod tests {
         let deadline = now + Duration::from_secs(10);
         let window = Some([7; 32]);
         assert_eq!(
-            route_turn(now, deadline, 1, window),
+            route_turn(now, deadline, turn_units(window), window),
             (deadline - EPOCH_GAP_WINDOW_MAX_DURATION, deadline),
             "alone in the pass, a whole window fetch fits after the comparison"
         );
-        let quarter = now + Duration::from_millis(2_500);
         assert_eq!(
-            route_turn(now, deadline, 4, window),
-            (now + Duration::from_millis(1_250), quarter),
-            "beside three routes, the comparison and window split a quarter"
+            route_turn(now, deadline, turn_units(window) + 3, window),
+            (now + Duration::from_secs(2), now + Duration::from_secs(4)),
+            "beside three routes, the comparison gets a unit and the window one more"
         );
     }
 
