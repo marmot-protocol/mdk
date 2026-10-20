@@ -322,6 +322,7 @@ pub(crate) fn settle_recovery_for_test(
                     first_boundary: false,
                 }],
                 retained_known_event: false,
+                replay_admitted: false,
             }],
             if covered {
                 RecoveryEligibility::Retry

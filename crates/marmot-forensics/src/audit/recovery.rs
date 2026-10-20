@@ -1,8 +1,7 @@
 //! Closed vocabularies for the account-recovery owner rows
 //! (`recovery_need_changed`, `recovery_attempt_started`,
 //! `recovery_attempt_finished`, `recovery_obligation_reassessed`) and the
-//! transport-cursor row (`transport_cursor_advanced`) and the lag-lost EOSE
-//! recovery row (`relay_replay_recovery`) and historical wire-reissue row
+//! transport-cursor row (`transport_cursor_advanced`) and historical wire-reissue row
 //! (`subscription_eose_repaired`). These kinds exist only
 //! in audit v5; a v4 recorder drops them (see `AuditEventKind::is_v5_only`).
 //!
@@ -36,6 +35,9 @@ pub enum RecoveryObligationCause {
     KnownEvent,
     /// Cold-start or incremental history over the retained window.
     IncrementalHistory,
+    /// Complete-range admission of an issued native subscription window.
+    /// This is not exhaustive history or acknowledgment of delivery loss.
+    SubscriptionReplay,
 }
 
 /// A meaningful change to recovery need. Unchanged scheduler evaluations
@@ -139,8 +141,9 @@ pub enum RecoveryScopeProgress {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryObligationVerdict {
-    /// Qualified completion: certified coverage and durable admission, or
-    /// the retained known event.
+    /// The obligation's own predicate completed: qualified history, a retained
+    /// known event, or limited native replay admission. Native admission does
+    /// not certify history or acknowledge delivery loss.
     Satisfied,
     /// Still pending; a later paced pass retries it.
     Deferred,
@@ -327,6 +330,64 @@ mod tests {
         (dir, lines)
     }
 
+    #[test]
+    fn subscription_replay_uses_existing_owner_rows_and_sorted_causes() {
+        let mut native = started(1, 1, false);
+        if let AuditEventKind::RecoveryAttemptStarted { causes, .. } = &mut native {
+            *causes = vec![RecoveryObligationCause::SubscriptionReplay];
+        }
+        let mut mixed = native.clone();
+        if let AuditEventKind::RecoveryAttemptStarted { causes, .. } = &mut mixed {
+            *causes = vec![
+                RecoveryObligationCause::NotificationLoss,
+                RecoveryObligationCause::SubscriptionReplay,
+            ];
+        }
+        let mut unsorted = mixed.clone();
+        if let AuditEventKind::RecoveryAttemptStarted { causes, .. } = &mut unsorted {
+            causes.reverse();
+        }
+        let mut duplicate = native.clone();
+        if let AuditEventKind::RecoveryAttemptStarted { causes, .. } = &mut duplicate {
+            causes.push(RecoveryObligationCause::SubscriptionReplay);
+        }
+        let need = AuditEventKind::RecoveryNeedChanged {
+            cause: RecoveryObligationCause::SubscriptionReplay,
+            change: RecoveryNeedChange::Recorded,
+            obligation_id: "0a".repeat(16),
+            obligation_revision: 1,
+            bound: None,
+            floor_secs: None,
+            charged: None,
+        };
+        let mut charged_native = need.clone();
+        if let AuditEventKind::RecoveryNeedChanged { charged, .. } = &mut charged_native {
+            *charged = Some(1);
+        }
+        let (_dir, lines) = v5_lines(vec![
+            need,
+            native,
+            mixed,
+            unsorted,
+            duplicate,
+            charged_native,
+        ]);
+        assert_eq!(lines.len(), 3);
+        let schema: serde_json::Value = serde_json::from_str(v5::JSON_SCHEMA).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for line in lines {
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert!(validator.is_valid(&value));
+            let record = v5::Record::from_json(line.as_bytes()).unwrap();
+            assert_eq!(
+                v5::Record::from_json(&record.to_json().unwrap()).unwrap(),
+                record
+            );
+            assert!(!line.contains("wss://"));
+            assert!(!line.contains(&"0a".repeat(16)));
+        }
+    }
+
     fn outcome(relay: &str, failure: RecoveryRelayFailure) -> RecoveryRelayOutcome {
         RecoveryRelayOutcome {
             relay_url: format!("wss://{relay}.secret.example"),
@@ -441,6 +502,11 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let recorder = JsonlRecorder::open_with_account_ref(&path, "e".repeat(32), None).unwrap();
         recorder.record(AuditRecord::new(None, started(1, 1, false)));
+        let mut native = started(1, 1, false);
+        if let AuditEventKind::RecoveryAttemptStarted { causes, .. } = &mut native {
+            *causes = vec![RecoveryObligationCause::SubscriptionReplay];
+        }
+        recorder.record(AuditRecord::new(None, native));
         recorder.record(AuditRecord::new(
             None,
             AuditEventKind::SyncDrain {
@@ -568,50 +634,6 @@ mod tests {
     }
 
     #[test]
-    fn replay_writer_checks_pending() {
-        let recovery = AuditEventKind::RelayReplayRecovery {
-            receiver: EoseRepairReceiver::Account,
-            trigger: EoseRepairTrigger::FollowUp,
-            lags: 0,
-            pending_relays: 3,
-            started_relays: 0,
-            active_relays: 3,
-            follow_up_scheduled: true,
-            dropped_before: 2,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let path = crate::audit::default_v5_jsonl_path(dir.path(), &"11".repeat(16));
-        let recorder =
-            JsonlRecorder::open_v5_with_account_ref(&path, "11".repeat(16), None, producer())
-                .unwrap();
-        recorder.record(AuditRecord::new(None, recovery.clone()));
-        let mut unaccounted = recovery.clone();
-        if let AuditEventKind::RelayReplayRecovery { pending_relays, .. } = &mut unaccounted {
-            *pending_relays = 4;
-        }
-        let mut folded_lag = recovery;
-        if let AuditEventKind::RelayReplayRecovery { lags, .. } = &mut folded_lag {
-            *lags = 1;
-        }
-        for invalid in [unaccounted, folded_lag] {
-            recorder.record(AuditRecord::new(None, invalid));
-        }
-        let written = std::fs::read_to_string(&path).unwrap();
-        let rows = written
-            .lines()
-            .filter(|line| line.contains("relay_replay_recovery"))
-            .collect::<Vec<_>>();
-        assert_eq!(rows.len(), 1, "only the honest pending report is written");
-        let schema: serde_json::Value = serde_json::from_str(v5::JSON_SCHEMA).unwrap();
-        assert!(
-            jsonschema::validator_for(&schema)
-                .unwrap()
-                .is_valid(&serde_json::from_str(rows[0]).unwrap())
-        );
-        assert!(v5::Record::from_json(rows[0].as_bytes()).is_ok());
-    }
-
-    #[test]
     fn v5_schema_tracks_the_recovery_enum_catalogs() {
         fn names<T: Serialize>(values: &[T]) -> std::collections::BTreeSet<String> {
             values
@@ -643,7 +665,8 @@ mod tests {
                 C::Maintenance,
                 C::ExplicitHistory,
                 C::KnownEvent,
-                C::IncrementalHistory
+                C::IncrementalHistory,
+                C::SubscriptionReplay
             ]),
             defined("Operational_recoveryObligationCause")
         );

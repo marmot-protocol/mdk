@@ -573,6 +573,7 @@ async fn notification_lag_while_post_join_maintenance_is_live_stays_bounded() {
             None,
             marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
         )
+        .await
         .unwrap()
         .unwrap();
     client.run_recovery_grant_for_test(grant).await.unwrap();
@@ -810,6 +811,7 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
             None,
             marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
         )
+        .await
         .unwrap()
         .unwrap();
     bob_client.run_recovery_grant_for_test(grant).await.unwrap();

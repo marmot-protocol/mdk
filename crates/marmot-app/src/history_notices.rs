@@ -22,8 +22,8 @@ pub enum HistoryNoticeCause {
     NotificationLoss,
     /// A group's missing epoch could not be fetched from its relays.
     EpochGap,
-    /// History since this device's last checkpoint could not be proven
-    /// complete by comparing the retained window with the relays.
+    /// The device's requested input range or retained history could not
+    /// be completed.
     IncrementalHistory,
     /// An explicit full-history repair ended without proof of completeness.
     ExplicitRepair,
@@ -52,7 +52,9 @@ impl HistoryNoticeCause {
             RecoveryCause::QueueLoss => Self::DeliveryLoss,
             RecoveryCause::NotificationLoss => Self::NotificationLoss,
             RecoveryCause::EpochGap => Self::EpochGap,
-            RecoveryCause::IncrementalHistory => Self::IncrementalHistory,
+            RecoveryCause::IncrementalHistory | RecoveryCause::SubscriptionReplay => {
+                Self::IncrementalHistory
+            }
             RecoveryCause::ExplicitHistory => Self::ExplicitRepair,
             RecoveryCause::KnownEvent => Self::KnownEvent,
             RecoveryCause::Maintenance => Self::MaintenanceBoundary,

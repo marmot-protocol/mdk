@@ -42,6 +42,9 @@ use crate::config::CursorPersistence;
 
 pub(super) mod comparison_job;
 #[cfg(test)]
+mod native_comparison_tests;
+mod native_ingress;
+#[cfg(test)]
 pub(crate) use comparison_job::TestComparisonActivityWitness;
 pub(crate) use comparison_job::{ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob};
 
@@ -1155,6 +1158,7 @@ impl AppClient {
         rebuild_since: Option<cgka_traits::transport::Timestamp>,
     ) -> Result<(), AppError> {
         self.runtime.sync_transport_groups(rebuild_since).await?;
+        self.synchronize_native_replay().await?;
         self.warm_encrypted_media_epoch_secrets("post_subscription_sync");
         Ok(())
     }
@@ -1165,6 +1169,33 @@ impl AppClient {
         let since = self
             .relay_plane
             .subscription_rebuild_since(self.checkpointed_transport_timestamp);
+        let storage = self.app.account_storage(&self.state.label)?;
+        for demand in storage
+            .app_storage()
+            .pending_recovery_demands()?
+            .into_iter()
+            .filter(|demand| demand.cause == storage_sqlite::RecoveryCause::SubscriptionReplay)
+        {
+            let scopes = storage
+                .app_storage()
+                .recovery_scope_snapshots(demand.ticket.id)?
+                .into_iter()
+                .filter(|scope| !scope.replay_admitted)
+                .collect::<Vec<_>>();
+            if scopes
+                .iter()
+                .any(|scope| scope.plan.since_seconds.is_none())
+            {
+                return Ok(None);
+            }
+            if let Some(floor) = scopes
+                .iter()
+                .filter_map(|scope| scope.plan.since_seconds)
+                .min()
+            {
+                return Ok(since.map(|since| cgka_traits::transport::Timestamp(since.0.min(floor))));
+            }
+        }
         // Without a durable cursor there is no settled replay floor. A relay
         // without NIP-77 must still return history older than the live tail.
         if since.is_some() || self.checkpointed_transport_timestamp.is_none() {
@@ -1186,8 +1217,8 @@ impl AppClient {
 
     /// Whether a live ingest may promote the transport cursor with its own
     /// save: the cursor advances, restarts rebuild from it, no loss is
-    /// pending, the account has a settled cursor floor, and every account
-    /// subscription finished replaying stored history. Relays replay
+    /// pending, the account has a settled cursor floor, and the owner observed
+    /// current-generation native input admission for every issued source. Relays replay
     /// newest-first, so a promotion mid-replay would leave the rest of the
     /// replay below the restart floor, and all of it would go to the spill.
     ///
@@ -1196,15 +1227,18 @@ impl AppClient {
     /// checkpoint, such as the whole history of each group it joins. It holds
     /// no history a restart would re-download, so it waits for that
     /// checkpoint instead, as it did before live promotion existed.
-    async fn live_cursor_promotion_ready(&self) -> bool {
-        self.app.cursor_persistence() == CursorPersistence::Advance
+    async fn live_cursor_promotion_ready(&mut self) -> Result<bool, AppError> {
+        self.synchronize_native_replay().await?;
+        Ok(self.app.cursor_persistence() == CursorPersistence::Advance
             && self
                 .relay_plane
                 .subscription_rebuild_lookback_secs()
                 .is_some()
             && !self.delivery_loss_blocks_cursor()
             && self.adapter.transport_cursor_settled()
-            && self.adapter.account_subscription_eose().await.complete()
+            && self
+                .recovery_owner
+                .native_replay_authorizes(self.adapter.replay_admission().await.generation()))
     }
 
     /// Choose the cursor the next save persists: what this client ingested,
@@ -1223,9 +1257,12 @@ impl AppClient {
         #[cfg(test)]
         self.probe_cursor_seal(super::CursorSeal::Before);
         let previous = self.checkpointed_transport_timestamp;
-        let reached = self
-            .adapter
-            .seal_transport_cursor(self.state.last_transport_timestamp);
+        let reached =
+            self.adapter
+                .seal_transport_cursor(self.state.last_transport_timestamp, |status| {
+                    self.recovery_owner
+                        .native_replay_authorizes(status.generation())
+                });
         self.checkpointed_transport_timestamp = previous.max(reached);
         #[cfg(test)]
         self.probe_cursor_seal(super::CursorSeal::After);
@@ -1400,14 +1437,22 @@ impl AppClient {
             };
             let until = goals
                 .iter()
-                .flat_map(|(_, scopes)| scopes)
+                .flat_map(|(id, scopes)| {
+                    scopes
+                        .iter()
+                        .filter(move |scope| !uncompared.contains(&(*id, scope.scope_id)))
+                })
                 .filter(|scope| matches(scope))
                 .map(|scope| scope.until_seconds)
                 .max()
                 .unwrap_or_default();
             let mut required = goals
                 .iter()
-                .flat_map(|(_, scopes)| scopes)
+                .flat_map(|(id, scopes)| {
+                    scopes
+                        .iter()
+                        .filter(move |scope| !uncompared.contains(&(*id, scope.scope_id)))
+                })
                 .filter(|scope| matches(scope))
                 .flat_map(|scope| scope.required_endpoints.iter().cloned())
                 .collect::<Vec<_>>();
@@ -1416,7 +1461,11 @@ impl AppClient {
             let inventory = receipts.inventory(&route, until)?;
             for scope in goals
                 .iter_mut()
-                .flat_map(|(_, scopes)| scopes)
+                .flat_map(|(id, scopes)| {
+                    scopes
+                        .iter_mut()
+                        .filter(move |scope| !uncompared.contains(&(*id, scope.scope_id)))
+                })
                 .filter(|scope| matches(scope))
             {
                 // This describes the local comparison floor, never a claim that
@@ -1545,6 +1594,9 @@ impl AppClient {
         // Before any subscription goes out: auth-gated relays (NIP-42)
         // withhold gift-wrapped welcomes from unauthenticated subscribers.
         let activation_started = Instant::now();
+        self.open_native_ingress()
+            .await
+            .map_err(|error| (SyncFailureStage::TransportActivation, error))?;
         self.relay_plane
             .set_transport_signer(self.adapter.account_id(), self.transport_signer.clone())
             .await
@@ -1562,6 +1614,9 @@ impl AppClient {
         }
         activation
             .map_err(|error| (SyncFailureStage::TransportActivation, AppError::from(error)))?;
+        self.synchronize_native_replay()
+            .await
+            .map_err(|error| (SyncFailureStage::TransportActivation, error))?;
 
         let registration_started = Instant::now();
         let registration = self.sync_runtime_groups().await;
@@ -1716,7 +1771,7 @@ impl AppClient {
                     return Err(failure);
                 }
             }
-            match self.select_sync_grant(telemetry, explicit) {
+            match self.select_sync_grant(telemetry, explicit).await {
                 Ok(grant) => grant,
                 Err(error) => return Err(state_persist(summary, error)),
             }
@@ -1792,7 +1847,7 @@ impl AppClient {
     /// Record a startup or explicit comparison request, then select one grant.
     /// Without a process credit nothing is selected: the durable demand waits
     /// for the worker's next recovery job instead of spending a reservation.
-    pub(crate) fn prepare_sync_grant(
+    pub(crate) async fn prepare_sync_grant(
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
         explicit: bool,
@@ -1802,7 +1857,7 @@ impl AppClient {
         if !credit_available {
             return Ok(None);
         }
-        self.select_sync_grant(telemetry, explicit)
+        self.select_sync_grant(telemetry, explicit).await
     }
 
     /// Record a startup or explicit caller's comparison request.
@@ -1823,7 +1878,7 @@ impl AppClient {
     }
 
     /// Select the grant a sync's job runs, under the credit it holds.
-    fn select_sync_grant(
+    async fn select_sync_grant(
         &mut self,
         telemetry: Option<&AppPerformanceTelemetry>,
         explicit: bool,
@@ -1839,6 +1894,7 @@ impl AppClient {
                 EpochBackfillExecutionSeam::Maintenance
             },
         )
+        .await
     }
 
     /// Install the session's live subscriptions, floored at the cursor. This
@@ -2691,6 +2747,16 @@ impl AppClient {
 
     pub async fn next_event(&mut self) -> Result<SyncSummary, AppError> {
         loop {
+            let mut native_changes = self.adapter.replay_changes().await;
+            if self.admit_native_turn().await? {
+                self.retry_pending_runtime_group_subscription_refresh()
+                    .await?;
+                let summary = self.take_pending_applied_sync_summary();
+                if summary != SyncSummary::default() {
+                    return Ok(summary);
+                }
+                continue;
+            }
             let repaired = self
                 .observe_drained_session_events(&Default::default())
                 .await?;
@@ -2715,7 +2781,11 @@ impl AppClient {
                 self.pending_applied_sync_summary.merge(checkpointed);
                 return Ok(self.take_pending_applied_sync_summary());
             }
-            let summary = match self.receive_next_delivery().await? {
+            let received = tokio::select! {
+                received = self.receive_next_delivery() => received?,
+                () = native_ingress::wait_native_change(&mut native_changes) => continue,
+            };
+            let summary = match received {
                 transport_nostr::AccountDeliveryReceive::Delivery(delivery) => {
                     self.ingest_received_delivery(*delivery).await?
                 }
@@ -2900,21 +2970,21 @@ impl AppClient {
         delivery: cgka_traits::TransportDelivery,
     ) -> Result<SyncSummary, (SyncSummary, bool, bool, AppError, SyncFailureStage)> {
         // A spilled delivery gets exactly the live path's one ingest attempt.
-        let result = self.ingest_received_delivery_once(delivery, true).await;
+        let result = self.ingest_received_delivery_once(&delivery, true).await;
         self.settle_spilled_delivery();
         result.map(|(summary, _)| summary)
     }
 
     /// Admit one delivery a comparison fetched through the ordinary ingest
     /// path, without the live queue. An event the account already holds needs
-    /// no ingest.
+    /// no ingest. Borrow the frame so its replay owner retains it until acknowledgement.
     pub(crate) async fn admit_recovered_delivery(
         &mut self,
-        delivery: cgka_traits::TransportDelivery,
+        delivery: &cgka_traits::TransportDelivery,
     ) -> Result<(SyncSummary, RecoveredDelivery), AppError> {
         let event_id = hex::encode(delivery.message.id.as_slice());
         if self.transport_receipts()?.contains(&event_id) {
-            self.record_durable_transport_reconciliation_delivery(&delivery);
+            self.record_durable_transport_reconciliation_delivery(delivery);
             self.adapter.release_account_delivery(&delivery.message.id);
             return Ok((SyncSummary::default(), RecoveredDelivery::AlreadyHeld));
         }
@@ -2931,7 +3001,7 @@ impl AppClient {
     /// [`Self::seal_transport_cursor`].
     async fn ingest_received_delivery_once(
         &mut self,
-        delivery: cgka_traits::TransportDelivery,
+        delivery: &cgka_traits::TransportDelivery,
         live_cursor: bool,
     ) -> Result<
         (SyncSummary, RecoveredDelivery),
@@ -2989,7 +3059,19 @@ impl AppClient {
             self.remember_seen_event(event_id);
         }
         let routes_dirty = ingested.routes_dirty;
-        let promote = live_cursor && self.live_cursor_promotion_ready().await;
+        let promote = if live_cursor {
+            self.live_cursor_promotion_ready().await.map_err(|error| {
+                (
+                    summary.clone(),
+                    routes_dirty,
+                    false,
+                    error,
+                    SyncFailureStage::StatePersist,
+                )
+            })?
+        } else {
+            false
+        };
         // A membership-changing ingest is already durable. Persist its app
         // projection before route reconciliation or subscription refresh can
         // fail, matching the catch-up checkpoint below.
@@ -3118,6 +3200,24 @@ impl AppClient {
         let cursor_before_secs = self.state.last_transport_timestamp;
         let mut routes_dirty = false;
         let overflowed = loop {
+            let mut native_changes = self.adapter.replay_changes().await;
+            let native_progress = match self.admit_native_turn().await {
+                Ok(progress) => progress,
+                Err(error) => {
+                    summary.merge(self.take_pending_applied_sync_summary());
+                    return Err(self
+                        .finish_failed_sync_drain(
+                            summary,
+                            routes_dirty,
+                            counts,
+                            StagedSyncError::new(error, SyncFailureStage::Unknown),
+                            drain_started,
+                            cursor_before_secs,
+                        )
+                        .await);
+                }
+            };
+            summary.merge(self.take_pending_applied_sync_summary());
             let wait = if first_wait {
                 SDK_FIRST_SYNC_WAIT
             } else {
@@ -3142,13 +3242,21 @@ impl AppClient {
                     }
                 }
             };
-            let received = timeout(wait, receive).await;
+            let received = timeout(wait, async {
+                tokio::select! {
+                    biased;
+                    received = receive => Some(received),
+                    () = native_ingress::wait_native_change(&mut native_changes) => None,
+                    () = tokio::task::yield_now(), if native_progress => None,
+                }
+            })
+            .await;
             self.prepend_pending_applied_summary(&mut summary);
             let delivery = match received {
-                Ok(Ok(Some(transport_nostr::AccountDeliveryReceive::Delivery(delivery)))) => {
+                Ok(Some(Ok(Some(transport_nostr::AccountDeliveryReceive::Delivery(delivery))))) => {
                     delivery
                 }
-                Ok(Ok(Some(transport_nostr::AccountDeliveryReceive::Overflow(overflow)))) => {
+                Ok(Some(Ok(Some(transport_nostr::AccountDeliveryReceive::Overflow(overflow))))) => {
                     if let Err(error) = self.observe_delivery_overflow(overflow) {
                         // Never checkpoint a cursor learned from the incomplete
                         // prefix unless the durable recovery marker landed
@@ -3169,8 +3277,9 @@ impl AppClient {
                     break true;
                 }
                 // A quiet relay is a finished drain.
-                Ok(Ok(None)) | Err(_) => break false,
-                Ok(Err(error)) => {
+                Ok(None) => continue,
+                Ok(Some(Ok(None))) | Err(_) => break false,
+                Ok(Some(Err(error))) => {
                     return Err(self
                         .finish_failed_sync_drain(
                             summary,
@@ -3234,7 +3343,7 @@ impl AppClient {
             }
             let mut delivery_summary = SyncSummary::default();
             let message_id = delivery.message.id.clone();
-            let ingest = Self::ingest_delivery(receipts, *delivery, &mut delivery_summary).await;
+            let ingest = Self::ingest_delivery(receipts, &delivery, &mut delivery_summary).await;
             self.prepend_pending_applied_summary(&mut summary);
             let ingested = match ingest {
                 Ok(ingested) => ingested,
@@ -3398,6 +3507,9 @@ impl AppClient {
         routes_dirty: bool,
         deliveries: u64,
     ) -> Result<(), SyncCheckpointError> {
+        self.synchronize_native_replay()
+            .await
+            .map_err(SyncCheckpointError::BeforePersistence)?;
         // The checkpoint re-runs `refresh_group_routes` only when the drained
         // prefix could have changed routing: deliveries advance epochs (which
         // gate prior-route pruning) and can mark groups disbanded. With zero
@@ -3529,7 +3641,7 @@ impl AppClient {
     /// shares it with its duplicate decision, while direct ingestion opens one.
     async fn ingest_delivery(
         receipts: super::receipts::SynchronizedTransportReceipts<'_>,
-        delivery: cgka_traits::TransportDelivery,
+        delivery: &cgka_traits::TransportDelivery,
         summary: &mut SyncSummary,
     ) -> Result<DeliveryIngest, AppError> {
         let client = receipts.into_client();
@@ -3546,7 +3658,7 @@ impl AppClient {
         let source_received_at = delivery.received_at.0;
         let group_id_hint = delivery.group_id_hint.clone();
         let reconciliation_record =
-            transport_reconciliation_record(client.adapter.account_id(), &delivery);
+            transport_reconciliation_record(client.adapter.account_id(), delivery);
         let welcome = matches!(
             &delivery.message.envelope,
             TransportEnvelope::Welcome { .. }
@@ -4745,7 +4857,7 @@ impl AppClient {
             &self.recovery_credits,
         )
         .await;
-        match self.select_pending_epoch_backfill(seam)? {
+        match self.select_pending_epoch_backfill(seam).await? {
             PendingRecoverySelection::NotPending => Ok(EpochBackfillRunOutcome::NotPending),
             PendingRecoverySelection::Deferred => Ok(EpochBackfillRunOutcome::Deferred),
             PendingRecoverySelection::Grant(grant) => {
@@ -4756,7 +4868,7 @@ impl AppClient {
 
     /// Select one grant for the recovery job. Every caller runs the exact
     /// frozen grant it selected; nothing spends a second reservation.
-    pub(crate) fn select_pending_epoch_backfill(
+    pub(crate) async fn select_pending_epoch_backfill(
         &mut self,
         seam: EpochBackfillExecutionSeam,
     ) -> Result<PendingRecoverySelection, AppError> {
@@ -4766,7 +4878,7 @@ impl AppClient {
         }
         let mut explicit = ExplicitRecoveryPermit::default();
         let permit = (seam == EpochBackfillExecutionSeam::ExplicitCatchUp).then_some(&mut explicit);
-        let Some(grant) = self.authorize_account_recovery(permit, seam)? else {
+        let Some(grant) = self.authorize_account_recovery(permit, seam).await? else {
             return Ok(PendingRecoverySelection::Deferred);
         };
         #[cfg(test)]
@@ -4980,6 +5092,9 @@ impl AppClient {
         mut summary: SyncSummary,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         tally.observe_routes(&comparison_outcomes);
+        self.synchronize_native_replay().await.map_err(|error| {
+            ClassifiedSyncFailure::at_stage(summary.clone(), error, SyncFailureStage::StatePersist)
+        })?;
         let local = self.drain_pending_session_events().await.map_err(|error| {
             ClassifiedSyncFailure::at_stage(summary.clone(), error, SyncFailureStage::Unknown)
         })?;
@@ -5073,6 +5188,53 @@ impl AppClient {
             let mut explicit_window_certified = false;
             let mut reassessed = Vec::new();
             for obligation in grant.plan().expect("validated executor grant") {
+                if obligation.cause == storage_sqlite::RecoveryCause::SubscriptionReplay {
+                    let stored = app.recovery_scope_snapshots(obligation.id)?;
+                    let checkpoints = obligation
+                        .scopes
+                        .iter()
+                        .map(|scope| storage_sqlite::RecoveryScopeCheckpoint {
+                            token: scope.token.clone(),
+                            endpoints: Vec::new(),
+                            retained_known_event: false,
+                            replay_admitted: stored.iter().any(|old| {
+                                old.plan.scope_id == scope.goal.scope_id && old.replay_admitted
+                            }),
+                        })
+                        .collect::<Vec<_>>();
+                    let progress = obligation
+                        .scopes
+                        .iter()
+                        .filter(|scope| {
+                            !stored.iter().any(|old| {
+                                old.plan.scope_id == scope.goal.scope_id && old.replay_admitted
+                            })
+                        })
+                        .map(|scope| {
+                            (
+                                scope.goal.scope_id,
+                                storage_sqlite::RecoveryPassProgress::Unserved,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    app.checkpoint_recovery_comparison(
+                        &grant.fence,
+                        grant.reservation.attempt_serial,
+                        obligation.id,
+                        &checkpoints,
+                        storage_sqlite::RecoveryEligibility::Retry,
+                        &progress,
+                    )?;
+                    reassessed.push(super::audit_recovery::ReassessedObligation {
+                        id: obligation.id,
+                        progress: (!progress.is_empty())
+                            .then_some(marmot_forensics::RecoveryScopeProgress::Unserved),
+                        scopes_certified: 0,
+                        comparison_owned: false,
+                        closed_below_window: false,
+                    });
+                    continue;
+                }
                 // A selected group can lack any executable route even though
                 // another obligation made the account ready. Preserve that
                 // debt until capability/policy changes instead of probing it
@@ -5287,6 +5449,7 @@ impl AppClient {
                     checkpoints.push(storage_sqlite::RecoveryScopeCheckpoint {
                         token: scope.token.clone(),
                         retained_known_event,
+                        replay_admitted: false,
                         endpoints,
                     });
                 }
@@ -5470,6 +5633,7 @@ impl AppClient {
                 Some(&mut caller),
                 EpochBackfillExecutionSeam::ExplicitCatchUp,
             )
+            .await
             .map_err(|error| state_persist(SyncSummary::default(), error))?;
         self.explicit_history_window_certified = false;
         self.recovery_job_network_cut = false;
@@ -6881,7 +7045,7 @@ mod live_cursor_checkpoint_tests {
             "the restart's subscriptions start at or below it"
         );
         inject_epoch_gap_probe(&fixture.app, failed.clone()).await;
-        assert_eq!(fixture.ingest_next_live_delivery().await, failed.id);
+        fixture.client.sync().await.unwrap();
         assert!(
             fixture
                 .client
@@ -6904,6 +7068,54 @@ mod live_cursor_checkpoint_tests {
         fixture.wait_for_queue_depth(queued).await;
     }
 
+    // A nonblocking seal may defer. Retry ordinary live ingest with already-held
+    // input, without settling the raised floor as a drain checkpoint would.
+    async fn retry_live_cursor(
+        fixture: &mut LiveCursorFixture,
+        event: &transport_nostr_peeler::NostrTransportEvent,
+        expected: u64,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while fixture.persisted() != Some(expected) {
+                tokio::task::yield_now().await;
+                let delivery = fixture.delivery(event.clone()).await;
+                fixture
+                    .client
+                    .ingest_received_delivery(delivery)
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .expect("the unfenced live promotion becomes durable");
+    }
+
+    // A retry may persist the old cursor, but the first advance must be exact.
+    // Checkpointing itself never releases an outstanding delivery pin.
+    async fn retry_drain_cursor(fixture: &mut LiveCursorFixture, expected: u64) {
+        let before = fixture.persisted();
+        if before == Some(expected) {
+            return;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                fixture
+                    .client
+                    .checkpoint_sync_prefix(&mut SyncSummary::default(), false, 0)
+                    .await
+                    .unwrap_or_else(|_| panic!("the checkpoint saves"));
+                let current = fixture.persisted();
+                if current != before {
+                    assert_eq!(current, Some(expected));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the unfenced drain checkpoint becomes durable");
+    }
+
     /// A delivery stops capping the cursor once its ingest is durable, or
     /// once it is skipped because the account already holds it, in a drain
     /// and on the live path alike, so the cursor still reaches what the
@@ -6916,6 +7128,7 @@ mod live_cursor_checkpoint_tests {
             let held = fixture.probe(cursor_before + 1_000, "held");
             queue_in_order(&fixture, [held.clone()]).await;
             fixture.ingest_next_live_delivery().await;
+            retry_live_cursor(&mut fixture, &held, cursor_before + 1_000).await;
             assert_eq!(fixture.persisted(), Some(cursor_before + 1_000));
 
             // A drain: newest first, then an older new event, then the held
@@ -6935,6 +7148,7 @@ mod live_cursor_checkpoint_tests {
                 .sync_sdk_relay()
                 .await
                 .unwrap_or_else(|_| panic!("the drain completes"));
+            retry_drain_cursor(&mut fixture, cursor_before + 4_000).await;
             assert_eq!(
                 fixture.persisted(),
                 Some(cursor_before + 4_000),
@@ -6942,12 +7156,10 @@ mod live_cursor_checkpoint_tests {
             );
 
             // Live: the newest one served again, ahead of a newer arrival.
-            queue_in_order(
-                &fixture,
-                [newest, fixture.probe(cursor_before + 5_000, "live")],
-            )
-            .await;
+            let live = fixture.probe(cursor_before + 5_000, "live");
+            queue_in_order(&fixture, [newest, live.clone()]).await;
             fixture.ingest_next_live_delivery().await;
+            retry_live_cursor(&mut fixture, &live, cursor_before + 5_000).await;
             assert_eq!(
                 fixture.persisted(),
                 Some(cursor_before + 5_000),
@@ -7019,13 +7231,11 @@ mod live_cursor_checkpoint_tests {
         run_composed_app_runtime_test("live-cursor-fenced-drain", || async {
             let mut fixture = LiveCursorFixture::open().await;
             let cursor_before = fixture.cursor_before;
-            crate::tests::inject_epoch_gap_probe(
-                &fixture.app,
-                fixture.probe(cursor_before + 4_000, "promoting"),
-            )
-            .await;
+            let promoting = fixture.probe(cursor_before + 4_000, "promoting");
+            crate::tests::inject_epoch_gap_probe(&fixture.app, promoting.clone()).await;
             fixture.wait_for_queue_depth(1).await;
             fixture.ingest_next_live_delivery().await;
+            retry_live_cursor(&mut fixture, &promoting, cursor_before + 4_000).await;
             assert_eq!(fixture.persisted(), Some(cursor_before + 4_000));
 
             let first = fixture
@@ -7095,7 +7305,7 @@ mod live_cursor_checkpoint_tests {
                 .await;
             fixture
                 .client
-                .admit_recovered_delivery(drained)
+                .admit_recovered_delivery(&drained)
                 .await
                 .unwrap();
             assert_eq!(
@@ -7152,7 +7362,7 @@ mod live_cursor_checkpoint_tests {
                 .await;
             fixture
                 .client
-                .admit_recovered_delivery(drained)
+                .admit_recovered_delivery(&drained)
                 .await
                 .unwrap();
             assert_eq!(fixture.persisted(), None);
@@ -7217,32 +7427,13 @@ mod live_cursor_checkpoint_tests {
             );
 
             // Queued before the first seal, below any floor, it caps it.
-            crate::tests::inject_epoch_gap_probe(
-                &fixture.app,
-                fixture.probe(cursor_before + 1_000, "queued"),
-            )
-            .await;
+            let queued = fixture.probe(cursor_before + 1_000, "queued");
+            crate::tests::inject_epoch_gap_probe(&fixture.app, queued.clone()).await;
             fixture.wait_for_queue_depth(1).await;
-            // A nonblocking seal may defer while admission is locked. The first
-            // persisted checkpoint must still stop at the queued older delivery.
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    fixture
-                        .client
-                        .checkpoint_sync_prefix(&mut SyncSummary::default(), false, 0)
-                        .await
-                        .unwrap_or_else(|_| panic!("the checkpoint saves"));
-                    if let Some(cursor) = fixture.persisted() {
-                        assert_eq!(cursor, cursor_before + 1_000 + 120);
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("the unfenced checkpoint becomes durable");
+            retry_drain_cursor(&mut fixture, cursor_before + 1_000 + 120).await;
 
             fixture.ingest_next_live_delivery().await;
+            retry_live_cursor(&mut fixture, &queued, cursor_before + 4_000).await;
             assert_eq!(
                 fixture.persisted(),
                 Some(cursor_before + 4_000),
@@ -8223,6 +8414,7 @@ mod tests {
             .map(|scope| RecoveryScopeCheckpoint {
                 token: scope.token.clone(),
                 retained_known_event: false,
+                replay_admitted: false,
                 endpoints: scope
                     .goal
                     .required_endpoints
@@ -8292,6 +8484,7 @@ mod tests {
         );
         let grant = client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         let retry = storage.recovery_retry_state().unwrap();
@@ -8309,6 +8502,7 @@ mod tests {
         assert!(
             client
                 .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+                .await
                 .unwrap()
                 .is_none()
         );
@@ -8619,6 +8813,7 @@ mod tests {
             .unwrap();
         let grant = client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         drop(grant);
@@ -8642,6 +8837,7 @@ mod tests {
         assert!(
             client
                 .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+                .await
                 .unwrap()
                 .is_none()
         );
@@ -8781,6 +8977,7 @@ mod tests {
                 .unwrap();
             let grant = client
                 .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+                .await
                 .unwrap()
                 .unwrap();
             let raw = MessageRecord {
@@ -8822,6 +9019,7 @@ mod tests {
                     Some(&mut permit),
                     EpochBackfillExecutionSeam::ExplicitCatchUp,
                 )
+                .await
                 .unwrap()
                 .unwrap();
             assert!(qualify_epoch_obligation(
@@ -8872,6 +9070,7 @@ mod tests {
             .unwrap();
         let grant = client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         storage
@@ -8953,6 +9152,7 @@ mod tests {
         client.persist_epoch_backfill_intent(&queued).unwrap();
         let grant = client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         drop(grant);
@@ -9061,6 +9261,7 @@ mod tests {
             .unwrap();
         let grant = client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         drop(grant);
@@ -9225,6 +9426,7 @@ mod tests {
             assert_eq!(storage.epoch_stall_evidence().unwrap().len(), 1);
             let grant = client
                 .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+                .await
                 .unwrap()
                 .unwrap();
             let admitted_id = if admit_prefix {
@@ -9666,84 +9868,11 @@ mod tests {
         let progress = client.adapter.account_subscription_eose().await;
         assert!(progress.settled());
         assert!(!progress.complete());
-        assert!(!client.live_cursor_promotion_ready().await);
+        assert!(!client.live_cursor_promotion_ready().await.unwrap());
         let started = tokio::time::Instant::now();
         client.sync_sdk_relay().await.unwrap();
         assert!(started.elapsed() >= super::EOSE_QUIET_WAIT);
         assert!(started.elapsed() <= super::EOSE_QUIET_WAIT + Duration::from_millis(1));
-    }
-
-    /// Owned acquisition restores the quiet drain's boundary after lag without
-    /// resending live REQs or waiting for their lost wire EOSE. Once loss has
-    /// entered recovery, a drain can end at its first quiet wait again.
-    // Pauses the clock, which needs the current-thread runtime.
-    #[tokio::test(flavor = "current_thread")]
-    async fn lag_recovery_quiets_drain() {
-        use transport_nostr_adapter::{
-            NostrAcquisitionEnd, NostrAcquisitionEndpoint, NostrAcquisitionResult,
-        };
-
-        let dir = tempfile::tempdir().unwrap();
-        let alice = AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let account = cgka_traits::MemberId::new(hex::decode(&alice.account_id_hex).unwrap());
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone());
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        client.prepare_transport().await.unwrap();
-        let subscriptions = relay.accepted_subscriptions();
-        let live = subscriptions.last().expect("the live inbox REQ");
-        *relay.acquisition_result.lock().unwrap() = Some(NostrAcquisitionResult {
-            endpoints: live
-                .endpoints()
-                .iter()
-                .cloned()
-                .map(|endpoint| NostrAcquisitionEndpoint {
-                    endpoint,
-                    session_generation: None,
-                    events: Vec::new(),
-                    end: NostrAcquisitionEnd::RequestPolicySatisfied,
-                    stats: Default::default(),
-                })
-                .collect(),
-        });
-
-        // No relay's answer reached the account: the lag lost them all.
-        app.relay_plane
-            .set_eose_repair_settle_for_test(Duration::from_millis(10));
-        app.relay_plane.simulate_notification_lag_for_test(
-            &account,
-            1,
-            transport_nostr_adapter::NostrNotificationLossFloor::Unbounded,
-        );
-        let Some(transport_nostr::AccountDeliveryReceive::Overflow(overflow)) =
-            client.adapter.try_receive_account_delivery()
-        else {
-            panic!("the lag queued its control record");
-        };
-        client.adapter.notification_loss_persisted(overflow);
-        let _recovery = client
-            .adapter
-            .start_delivery_overflow_recovery(overflow.marker_token);
-
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !client.adapter.account_subscription_eose().await.complete() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("owned history recovery restores the replay boundary");
-        assert_eq!(relay.accepted_subscriptions(), subscriptions);
-
-        tokio::time::pause();
-        let started = tokio::time::Instant::now();
-        client.sync_sdk_relay().await.unwrap();
-        assert!(
-            started.elapsed() <= super::EOSE_QUIET_WAIT + Duration::from_millis(1),
-            "the drain ends at its first quiet wait instead of its full first wait"
-        );
     }
 
     // Pauses the clock, which needs the current-thread runtime.

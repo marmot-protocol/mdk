@@ -89,11 +89,10 @@ for reconnect/backoff and relay status mechanics.
 - Transport consumers use `NostrSdkRelayClient::notifications`, the ordered per-relay SDK frontier, and
   `dispatch_sdk_replay`. Capture connection and receiver-loss boundaries with the payloads; never poll SDK
   state to infer their generation. Authentication alone must not advance a connection epoch or restart a
-  capture. Reader epochs are process-monotonic and survive queued frontend work. Receiver loss forces an owned
-  full-window capture through the same lease as settled lag recovery. Newer loss during a capture remains
-  explicit demand for an automatic pass at the next successful boundary, not a new serial or deadline for the
-  active one. Charge every fresh receiver gap even after earlier loss was consumed; timer checks cannot mint
-  loss. Only recorded transport REQ payloads enter the frontier; acquisition replies stay with their
+  capture. Reader epochs are process-monotonic and survive queued frontend work. Receiver loss fences the
+  source without starting IO; AccountRecoveryOwner alone grants original-window recovery and retry. Real
+  SDK/frontend gaps enter the existing plane loss fence. Empty waiting or cancelled empty IO never fabricates
+  discarded-input evidence. Only recorded transport REQ payloads enter the frontier; acquisition replies stay with their
   collectors. Forced paging is not physical EOSE; late stored copies cannot become live by that transition.
 - Bound pending replay by `REPLAY_BUFFER_MAX_ITEMS` and `REPLAY_BUFFER_MAX_BYTES`, with one additional
   draining batch; include inbox and ready-delivery backpressure. A per-account supervisor owns capture tickets
@@ -105,8 +104,9 @@ for reconnect/backoff and relay status mechanics.
   retain its floor as loss until `take_replay_status` imports it. Later live input must not stay permanently
   stalled. Silence or a terminal refusal alone must not stall a completed peer or turn incomplete coverage
   into a certificate.
-  An empty inbox wait beside a completed inbox peer must not mint loss. Keep late stored copies countable for
-  backward paging; observed partial history and captures still retain their original loss floor.
+  An empty wait must not mint loss. Keep late stored copies countable for backward paging; only actually
+  discarded ciphertext retains a loss floor. Same-epoch capture takeover preserves held bodies. Interrupted
+  multi-tag history discards the affected source's whole MLS-group unit, never releases its newer suffix.
 - Keep admission and all-relay EOSE separate. `take_replay_status` holds a read guard through a synchronous
   cursor seal; import its loss before another await, then drop it. Notify only wakes the router; it never
   consumes evidence. `ack_replay_delivery` follows actual pinned queue/spill placement or recorded loss, never
@@ -116,15 +116,14 @@ for reconnect/backoff and relay status mechanics.
   content-keyed, and a closed REQ's buffered or in-flight notifications have no deadline, so they can still be
   lost in a lag. Do not add a time-based expiry. Read `notification_loss_floor` at the lag; an unfloored REQ
   or missing evidence is `Unbounded`, never "no loss".
-- Recover lag-lost replay through `recover_pending_replay`: select only current REQ/relay scopes issued by the
-  lag's `NotificationLagMark` and still awaiting complete admission. Acquire each scope's full original window
-  under a bounded, request-owned capture; join an unexpired capture rather than restarting it. Report pending,
-  newly started and already active scopes in `ReplayRecoverySummary`. Leave live REQs, filters and the SDK
-  registry untouched. Never infer EOSE from a lag or the SDK's out-of-band EOSE flag, resend the live REQ, or
-  reopen a closed REQ. The caller paces settled-lag demand checks; accepted captures and fresh in-flight
-  demand belong to the supervisor. Failed source generations retain loss once and park until a newer
-  connection; polling must not restart or recharge them. Dropped refusals stay terminal because the SDK
-  removed their live REQ from its reconnect registry.
+- Expose allocation-free guarded source views and a coalescing change watch. Membership, query windows and
+  ordered epochs change a process-monotonic generation; paging/ACK progress does not. Generation identity
+  must survive activation replacement. Only an account-bound frozen ReplayCapturePlan grants recovery IO;
+  retain its Arc credit through queued work and actual IO cleanup after caller cancellation. Refetch its full
+  original query, not a truncated continuation. Mechanical native clamp paging remains automatic. No adapter
+  or plane quiet-period retry controller. Keep live REQs and the SDK registry unchanged, never poll SDK EOSE
+  to certify admission, and never revive terminal refusals with private fetches. Native admission is neither
+  exhaustive coverage nor loss acknowledgment; the account owner alone persists/qualifies it.
 
 - Hand every relay `CLOSED` on a live REQ to `handle_relay_closed` in `dispatch_sdk_notification`, the one dispatch
   both notification consumers share (the relay plane's in `transport-nostr`, and this crate's test forwarder); change

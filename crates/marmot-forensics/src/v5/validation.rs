@@ -480,11 +480,22 @@ fn validate_operational(kind: &crate::audit::AuditEventKind) -> Result<(), Contr
     };
     match kind {
         AuditEventKind::RecoveryNeedChanged {
-            bound, floor_secs, ..
-        } => require(
-            floor_secs.is_some() == (*bound == Some(RecoveryGoalBound::Floor)),
-            "recovery goal floor must accompany a floor bound",
-        ),
+            cause,
+            charged,
+            bound,
+            floor_secs,
+            ..
+        } => {
+            require(
+                *cause != crate::audit::RecoveryObligationCause::SubscriptionReplay
+                    || charged.is_none(),
+                "native replay admission cannot charge notification or delivery loss",
+            )?;
+            require(
+                floor_secs.is_some() == (*bound == Some(RecoveryGoalBound::Floor)),
+                "recovery goal floor must accompany a floor bound",
+            )
+        }
         AuditEventKind::RecoveryAttemptStarted {
             causes,
             obligation_count,
@@ -575,13 +586,26 @@ fn validate_operational(kind: &crate::audit::AuditEventKind) -> Result<(), Contr
             )
         }
         AuditEventKind::RecoveryObligationReassessed {
+            cause,
+            verdict,
+            progress,
             scopes_total,
             scopes_certified,
             ..
-        } => require(
-            scopes_certified <= scopes_total,
-            "certified scopes cannot exceed the obligation's scopes",
-        ),
+        } => {
+            if *cause == crate::audit::RecoveryObligationCause::SubscriptionReplay {
+                require(
+                    *scopes_certified == 0
+                        && *verdict != crate::audit::RecoveryObligationVerdict::ClosedBelowWindow
+                        && *progress != Some(crate::audit::RecoveryScopeProgress::WindowCertified),
+                    "native replay admission cannot certify history or a retained window",
+                )?;
+            }
+            require(
+                scopes_certified <= scopes_total,
+                "certified scopes cannot exceed the obligation's scopes",
+            )
+        }
         AuditEventKind::SubscriptionEoseRepaired {
             awaiting_relays,
             complete_relays,
@@ -614,28 +638,7 @@ fn validate_operational(kind: &crate::audit::AuditEventKind) -> Result<(), Contr
                 "a follow-up repair needs a failed relay",
             )
         }
-        AuditEventKind::RelayReplayRecovery {
-            trigger,
-            lags,
-            pending_relays,
-            started_relays,
-            active_relays,
-            follow_up_scheduled,
-            ..
-        } => {
-            require(
-                (*trigger == crate::audit::EoseRepairTrigger::FollowUp) == (*lags == 0),
-                "a follow-up pass folds in no lag, and a lag pass folds in at least one",
-            )?;
-            require(
-                started_relays.checked_add(*active_relays) == Some(*pending_relays),
-                "pending replay scopes are exactly newly started and already active scopes",
-            )?;
-            require(
-                !*follow_up_scheduled || *pending_relays > 0,
-                "a scheduled follow-up needs pending replay; shutdown may stop scheduling",
-            )
-        }
+
         AuditEventKind::SubscriptionRefused { refusals, dropped } => {
             let limit = crate::audit::SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES;
             require(

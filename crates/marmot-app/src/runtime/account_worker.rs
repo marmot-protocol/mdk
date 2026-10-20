@@ -75,7 +75,7 @@ struct ComparisonRecoveryJob {
     admission: Option<ComparisonAdmission>,
     /// The process credit the network task released, held through admission
     /// and checkpoint.
-    credit: Option<OwnedSemaphorePermit>,
+    credit: Option<Arc<OwnedSemaphorePermit>>,
     observation: Option<crate::product_analytics::ProductObservation>,
     backfill_armed: bool,
     phase: Option<Observation>,
@@ -1263,6 +1263,7 @@ async fn run_app_runtime_account_worker(
                 recovery_credits::try_acquire_recovery_credit(&shared.recovery_credit_pool());
             let grant = client
                 .prepare_sync_grant(Some(&startup_stage_telemetry), false, credit.is_some())
+                .await
                 .map_err(state_persist)?;
             #[cfg(test)]
             let activity_witness = shared
@@ -1352,7 +1353,33 @@ async fn run_app_runtime_account_worker(
                     execution,
                     mut network,
                 }) => {
+                    let mut startup_replay_changes = client.adapter.replay_changes().await;
                     let completed = loop {
+                        let native_progress = match client.admit_native_turn().await {
+                            Ok(progress) => progress,
+                            Err(error) => {
+                                network.abort_and_wait().await;
+                                break Err(ClassifiedSyncFailure::at_stage(
+                                    client.take_pending_applied_sync_summary(),
+                                    error,
+                                    SyncFailureStage::Unknown,
+                                ));
+                            }
+                        };
+                        publish_client_pending_applied_summary(
+                            &mut client,
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                        );
+                        scheduled_runtime_group_subscription_refresh.observe_pending(
+                            client.has_pending_runtime_group_subscription_refresh(),
+                            &command_tx,
+                        );
+                        schedule_pending_convergence_groups(
+                            &mut scheduled_convergence,
+                            &mut client,
+                        );
                         tokio::select! {
                             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
                                 network.abort_and_wait().await;
@@ -1497,6 +1524,12 @@ async fn run_app_runtime_account_worker(
                             _ = local_submission_wakeups.changed() => {
                                 local_submission_due = true;
                             }
+                            changed = wait_for_replay_change(&mut startup_replay_changes) => {
+                                if !changed {
+                                    startup_replay_changes = None;
+                                }
+                            }
+                            () = tokio::task::yield_now(), if native_progress => {}
                             _ = tokio::time::sleep_until(local_submission_retry_at),
                                 if local_submission_due && deferred.is_empty() && !lifecycle.is_stopping() => {
                                 let retry = publish_next_local_submission(
@@ -1800,7 +1833,38 @@ async fn run_app_runtime_account_worker(
     let mut yield_to_convergence = false;
     let mut local_submission_service_owed = false;
     let mut comparison_recovery: Option<ComparisonRecoveryJob> = None;
+    let mut replay_changes = client.adapter.replay_changes().await;
     'worker: loop {
+        // Activation may replace the source watch. Reacquire only a live
+        // receiver; a closed activation must not turn this into a busy loop.
+        if replay_changes.is_none() {
+            replay_changes = client
+                .adapter
+                .replay_changes()
+                .await
+                .filter(|changes| changes.has_changed().is_ok());
+        }
+        // Once comparison input is known, its turn arbitrates both sources.
+        // Native-only admission is still required while network capture waits.
+        let native_progress = match if comparison_recovery
+            .as_ref()
+            .is_some_and(|job| job.network.is_none())
+        {
+            Ok(false)
+        } else {
+            client.admit_native_turn().await
+        } {
+            Ok(progress) => progress,
+            Err(error) => {
+                publish_app_runtime_account_error(
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    account_error_message("native replay admission failed", &error),
+                );
+                false
+            }
+        };
         // A pass whose network wait ended admits its owned batch a few events
         // per turn. The select below then serves commands and live input
         // before the next turn.
@@ -1901,6 +1965,19 @@ async fn run_app_runtime_account_worker(
         }
         let ready_command =
             ready_command_index(&pending, &media_http, comparison_recovery.is_some());
+        // Unified admission may have advanced native frames as well as the
+        // comparison prefix. Publish their committed effects before live input.
+        publish_client_pending_applied_summary(
+            &mut client,
+            &events,
+            &account_id_hex,
+            &account_label,
+        );
+        scheduled_runtime_group_subscription_refresh.observe_pending(
+            client.has_pending_runtime_group_subscription_refresh(),
+            &command_tx,
+        );
+        schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
         #[cfg(test)]
         tests::secondary_retry_scheduler_tests::record_turn(
             &account_id_hex,
@@ -2317,6 +2394,23 @@ async fn run_app_runtime_account_worker(
                     phase.finish(TelemetryOutcome::Success);
                 }
             }
+            changed = wait_for_replay_change(&mut replay_changes) => {
+                if !changed {
+                    replay_changes = None;
+                    continue 'worker;
+                }
+                if let Err(error) = client.synchronize_native_replay().await {
+                    publish_app_runtime_account_error(
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        account_error_message("native replay synchronization failed", &error),
+                    );
+                }
+                publish_history_notice_changes(
+                    &mut client, &events, &account_id_hex, &account_label,
+                );
+            }
             received = client.receive_next_delivery(), if !client.has_pending_effect_projections() => {
                 #[cfg(test)]
                 if let Ok(transport_nostr::AccountDeliveryReceive::Delivery(delivery)) = &received
@@ -2699,6 +2793,7 @@ async fn run_app_runtime_account_worker(
                                 }
                             }
                         };
+                        replay_changes = client.adapter.replay_changes().await;
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -2765,7 +2860,7 @@ async fn run_app_runtime_account_worker(
             // A comparison batch still being admitted takes its next turn as
             // soon as commands and live input have had theirs, instead of
             // waiting for unrelated input while it holds its recovery credit.
-            _ = tokio::task::yield_now(), if comparison_recovery.as_ref().is_some_and(|job| job.network.is_none()) => {
+            _ = tokio::task::yield_now(), if native_progress || comparison_recovery.as_ref().is_some_and(|job| job.network.is_none() && job.admission.as_ref().is_some_and(|admission| admission.progressed)) => {
                 continue 'worker;
             }
             _ = maintenance_tick.tick() => {
@@ -2946,6 +3041,15 @@ async fn run_app_runtime_account_worker(
     }
 }
 
+/// Wait for coalesced source changes, including same-generation progress.
+/// No active source watch leaves the select branch dormant.
+async fn wait_for_replay_change(changes: &mut Option<watch::Receiver<u64>>) -> bool {
+    match changes {
+        Some(changes) => changes.changed().await.is_ok(),
+        None => std::future::pending().await,
+    }
+}
+
 /// Select one owner grant and start its job: begin on the worker, then its
 /// immutable SDK request off the worker. Without a process credit nothing is
 /// selected, so the durable demand waits without spending a reservation.
@@ -2969,7 +3073,7 @@ async fn start_pending_recovery_job(
             }
         }));
     };
-    let grant = match client.select_pending_epoch_backfill(seam) {
+    let grant = match client.select_pending_epoch_backfill(seam).await {
         Ok(crate::client::PendingRecoverySelection::Grant(grant)) => *grant,
         Ok(crate::client::PendingRecoverySelection::Deferred) => {
             #[cfg(test)]
@@ -7455,9 +7559,7 @@ fn publish_history_notice_changes(
     account_id_hex: &str,
     account_label: &str,
 ) {
-    // The relay plane's lag-lost EOSE repairs and the adapter's subscription
-    // refusals queue their reports; this seam records them, off relay paths.
-    client.record_eose_repair_reports();
+    // Record queued subscription refusals off relay paths.
     client.record_subscription_refusals();
     let Some(groups) = client.take_history_notice_changes() else {
         return;
@@ -7605,6 +7707,40 @@ mod tests {
     mod worker_wait_attribution_tests;
 
     static BOUNDED_WORKER_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn native_replay_watch_coalesces_and_observes_same_generation_progress() {
+        let (source, changes) = watch::channel(1_u64);
+        let mut changes = Some(changes);
+        source.send_replace(2);
+        source.send_replace(3);
+        assert!(wait_for_replay_change(&mut changes).await);
+        assert_eq!(*changes.as_ref().unwrap().borrow(), 3);
+
+        // Placement progress wakes the owner without revising source identity.
+        source.send_replace(3);
+        assert!(wait_for_replay_change(&mut changes).await);
+        assert_eq!(*changes.as_ref().unwrap().borrow(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_replay_watch_closed_activation_can_be_replaced_without_polling() {
+        let (source, changes) = watch::channel(1_u64);
+        let mut changes = Some(changes);
+        drop(source);
+        assert!(!wait_for_replay_change(&mut changes).await);
+        changes = None;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), wait_for_replay_change(&mut changes),)
+                .await
+                .is_err()
+        );
+
+        let (replacement, receiver) = watch::channel(2_u64);
+        changes = Some(receiver);
+        replacement.send_replace(3);
+        assert!(wait_for_replay_change(&mut changes).await);
+    }
 
     use marmot_account::AccountHome;
 
@@ -9091,6 +9227,7 @@ mod tests {
                 Some(&mut permit),
                 EpochBackfillExecutionSeam::ExplicitCatchUp,
             )
+            .await
             .unwrap()
             .expect("the armed gap is granted");
         client.released_backfill_reload_pending = true;
@@ -9790,6 +9927,7 @@ mod tests {
         );
         let grant = client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         client.apply_backfill_decision(

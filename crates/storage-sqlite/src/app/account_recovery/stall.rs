@@ -249,6 +249,7 @@ mod tests {
                     &[RecoveryScopeCheckpoint {
                         token,
                         retained_known_event: false,
+                        replay_admitted: false,
                         endpoints: vec![RecoveryEndpointCheckpoint {
                             endpoint: "relay".into(),
                             outcome: RecoveryScopeOutcome::Covered,

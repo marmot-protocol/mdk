@@ -942,6 +942,7 @@ async fn owner_passes_close_a_certified_explicit_request_without_a_notice() {
         }
         let grant = client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .expect("the pending explicit request is selected");
         assert!(grant.inventory.len() <= TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS);

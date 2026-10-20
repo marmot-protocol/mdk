@@ -1065,16 +1065,6 @@ fn sample_v5_only_kinds() -> Vec<AuditEventKind> {
             follow_up_scheduled: true,
             dropped_before: 0,
         },
-        AuditEventKind::RelayReplayRecovery {
-            receiver: EoseRepairReceiver::Account,
-            trigger: EoseRepairTrigger::NotificationLag,
-            lags: 2,
-            pending_relays: 3,
-            started_relays: 2,
-            active_relays: 1,
-            follow_up_scheduled: true,
-            dropped_before: 0,
-        },
         AuditEventKind::SubscriptionRefused {
             refusals: vec![SubscriptionRefusalEntry {
                 route_kind: SubscriptionRefusalRoute::Inbox,

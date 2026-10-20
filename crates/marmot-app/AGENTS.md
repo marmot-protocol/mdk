@@ -141,9 +141,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the checkpoint commits, the notice publication seam and dismissal, and cursor commits after their save succeeds.
   Never add a row per scheduler evaluation, per live ingest, or on the router path; the router only counts
   placements. Rows are best effort: an audit-only read that fails skips the row, never the recovery step. The
-  relay plane's owned lag recovery only queues a bounded `EoseRepairReport`; the worker's
-  `publish_history_notice_changes` seam records its pending/started/active scopes as `relay_replay_recovery`.
-  `subscription_eose_repaired` remains readable historical evidence, not a new write. The same seam drains the
+  account owner's native input goal uses cause `subscription_replay` in those existing rows, without loss
+  charges or history certificates. `subscription_eose_repaired` remains historical decoding only. The publication seam drains the
   adapter's queued subscription refusals (`take_subscription_refusals`) into one `subscription_refused` row. Scenario
   tests live in
   `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
@@ -286,28 +285,37 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   loss with the REQ floor its SDK context reported at the lag, and enqueue the generation's control record. Only an
   unexpected consumer exit closes the route and sends the worker through reconnect (mdk#2070). The worker persists
   notification loss before waiting for its control record.
-- A lag may also lose end-of-stored-events. Never mark EOSE complete at a lag: live cursor promotion
-  would advance the cursor while a relay was still sending history. Schedule `recover_pending_replay` for the
-  receiver's scope, marked at the lag, after `NOTIFICATION_LAG_EOSE_REPAIR_SETTLE` without another lag. A later lag
-  postpones it. Recovery acquires full original windows without changing live REQs. Pace follow-ups at the same
-  interval while `ReplayRecoverySummary::pending_relays` is nonzero: join active captures and service coalesced newer
-  demand, retaining the same lag mark. Failed source generations park until a newer connection and are excluded
-  from pending counts; a timer must not manufacture more loss. Shutdown may stop follow-ups with work pending.
+- AccountRecoveryOwner owns the SubscriptionReplay goal, original unresolved windows, retry and completion.
+  Synchronize borrowed source observations at lifecycle, grant, checkpoint and worker-watch seams. Preserve
+  unresolved floors across cancellation/reopen; an unfloored query must not become a recent tail. Capture only
+  current sources authorized by the frozen selected grant, through the existing credited comparison job.
+  Passive replay_admitted needs current-epoch full-range placement and no pending bytes/nondurable spill;
+  it spends no retry credit and never qualifies history, maintenance, known-event or real loss predicates.
+  Empty silence is not notification loss. No adapter/relay-plane quiet repair scheduler or alternate owner.
+- Register `ReplayIngress` before activation, seeding durable group spill rows before native source release.
+  Admit complete group batches through the owner's ordinary recovered-ingest path, sharing four actual
+  ingests per turn with comparison input, never through live/spill alternation. Select the oldest known
+  same-group frame across both sources; a pending native range fences that group, not independent groups.
+  Borrow each frame until ACK; cancellation or loan revocation leaves the frame
+  retained. Native batches keep holding the cursor, but acquired ranges spend no new network retry credit
+  while draining. Keep retained spill receipt settlement and independent-group turns.
 - Move `checkpointed_transport_timestamp` only through `AppClient::seal_transport_cursor`, never straight to
   `state.last_transport_timestamp`. The seal holds adapter admission stable through the router's placement lock,
   importing any discarded replay into the existing loss fence before deciding. It returns nothing while staged,
   releasing or not-yet-placed replay, loss, or a spill hand-off is pending, and caps the commit at the
   lowest delivery a restart still fetches that is queued or taken and not yet released, and raises the restart floor
   before the save, so the router spills a delivery that arrives during the save and falls below it; before the
-  account's first settled floor that is every older delivery. A live ingest promotes with its own save only after every
-  account subscription reported EOSE and once the account has a settled floor, and leaves the floor raised. A drain
+  account's first settled floor that is every older delivery. A live ingest promotes with its own save only when
+  the owner's completed/explicitly retired native goal matches the guarded source generation and the account
+  has a settled floor, and leaves the floor raised. A drain
   checkpoint, settled loss or retired notice confirms what its seal reached with `settle_transport_cursor` once its save
   succeeds, which ends the spilling. Every failed save undoes its seal with `abandon_transport_cursor`. Keep every
   condition cursor safety relies on inside the seal: anything read before an `.await` or a save is stale by the time
   that save commits. See `docs/marmot-architecture/further-context/account-recovery.md` section 6.
 - With no durable transport cursor, activation requests retained history rather than inventing a recent-tail floor.
-  A trusted cursor keeps its configured rewind. All-relay EOSE still gates live promotion; a silent peer alone must
-  not prevent a drain's cursor seal once available replay has reached pinned delivery or explicit recovery loss.
+  A trusted cursor keeps its configured rewind, bounded by unresolved original native windows. All-relay EOSE
+  remains separate from the owner's limited native admission; a silent peer alone must not prevent a seal once
+  available replay is placed and the matching native goal is completed or explicitly retired.
 - Every path that takes a delivery from the account queue calls `release_account_delivery` once its ingest returns
   `Ok`, or when it skips the delivery as already held, and before the save that follows. Never release on an ingest
   error: the key must keep capping the checkpoint that failure runs, because newest-first replay has usually remembered

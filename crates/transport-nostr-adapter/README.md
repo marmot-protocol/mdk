@@ -97,46 +97,61 @@ equivalent or narrower repack; a wider request still stages history. Group deliv
 copies, so SDK duplicate suppression cannot consume the only copy of ciphertext discarded by a cancelled
 attempt. Retired subscription copies cannot bypass admission.
 
-An empty inbox endpoint's waiting deadline does not create loss when another inbox endpoint completed.
-Observed partial history and active captures still retain their loss. Late inbox copies remain countable so a
-late clamped replay still triggers backward paging.
+An empty waiting endpoint or cancelled empty acquisition does not create notification loss. Discarded
+ciphertext retains its original floor. Late inbox copies remain countable so a clamped replay still triggers
+backward paging.
 
 Transport receivers use each relay's ordered SDK notifications, including connection and receiver-loss
 boundaries. Every queued payload carries reader/connection epochs. A warm reconnect resets admission before
 the SDK restores the same REQ IDs; old queued EOSE cannot satisfy the new generation. Authentication alone
-does not change the connection epoch or restart an active capture. Receiver loss starts a bounded full-window
-refetch rather than waiting for another EOSE on an unchanged live request. Forced paging is not a physical
+does not change the connection epoch or restart an active capture. Receiver loss fences the source until the
+account recovery owner grants a full-window capture. Forced paging is not a physical
 EOSE: late stored copies remain historical until their stream ends. Only transport-owned REQ payloads enter
 this frontier; acquisition replies stay with their request-local collectors. Direct SDK subscribers and the
 directory client keep their independent Client streams.
 
-After a notification lag settles, `recover_pending_replay` acquires the full original windows of current
-REQ/relay scopes issued by its `NotificationLagMark` that still owe admission. Receiver loss and settled lag
-use the same capture lease. An active capture is joined, not restarted; newer loss stays explicit until a
-subsequent capture covers it. Each fresh receiver gap records loss even if earlier evidence was already
-consumed. Failure parks the source until a newer connection; timer checks neither retry it nor mint another
-loss. `ReplayRecoverySummary` counts eligible pending, newly started and already active scopes, not parked
-scopes. The caller paces settled-lag demand checks. Live REQs and the SDK registry stay unchanged; terminally
-refused REQs are not restored by a private fetch. SDK EOSE flags cannot bypass queued history.
+`AccountRecoveryOwner` persists unresolved original windows as a `SubscriptionReplay` goal. Borrowed
+`ReplayAdmissionStatus` source views describe issued requests and current-epoch admission without allocating.
+Source membership, query windows and ordered epochs change its generation; page progress and ACKs do not.
+The generation remains distinct across account activation replacement.
+
+The app registers `ReplayIngress` before activation, including durable group spill rows as retained input.
+Each complete group range moves into a `ReplayBatch`, bypassing live-queue/spill alternation. The owner
+borrows the oldest frame through ordinary ingest and acknowledges it afterwards. Cancellation before ACK
+returns that frame and its suffix without copying ciphertext. A leased group holds its newer arrivals;
+other ready groups take turns. Retained spill input joins remote pages before any of that range decrypts,
+even when the current relay no longer holds those local copies.
+New distinct historical input revokes an outstanding loan: `delivery()` returns `None`, and dropping the
+batch returns its suffix for merging after the new range completes. `take_batch(Some(group))` distinguishes
+that pending boundary from empty input. A metadata-only source restart does not revoke already-owned input.
+
+Only the owner's frozen `ReplayCapturePlan` starts recovery IO. It binds the account, source generation,
+issued REQ and endpoint, and retains the existing process recovery credit through accepted IO cleanup.
+Explicit captures refetch the original window, not a recent tail or an existing truncated continuation.
+Taking over capture in the same wire epoch preserves held ciphertext. Mechanical continuation of a physically
+clamped native reply remains automatic. Live REQs and the SDK registry stay unchanged; a private fetch cannot
+restore a terminally refused REQ. SDK EOSE flags cannot bypass queued history.
 
 A per-account supervisor owns queued capture tickets, paging and delivery draining independently of
 notification workers. Ticket installation and ready-channel placement commit synchronously under the admission
-lock. Cancelling a notification worker cannot strand a queued capture or an accepted delivery. Fresh loss
-during a capture schedules another full-window pass at the next successful boundary. A failed unit parks
-future passes while healthy siblings finish. Account retirement cancels its owned work and retains unresolved
-loss.
+lock. Cancelling a notification worker cannot strand a queued capture or an accepted delivery. Dropping an
+owner capture cancels its IO without releasing its credit before cleanup. The account owner alone decides
+retry, completion and retirement; the adapter and relay plane have no quiet-period recovery scheduler.
+Account retirement cancels accepted work and reports only ciphertext actually discarded.
 
-Each account's pending ciphertext, including inbox and ready-delivery backpressure, is bounded by
+Each account's pending ciphertext, including retained supplements, leased native batches, inbox and
+ready-delivery backpressure, is bounded by
 `REPLAY_BUFFER_MAX_ITEMS` (32,000 copies, the 500-event page limit times 64 pages) and
-`REPLAY_BUFFER_MAX_BYTES` (32 MiB of payload). One serialized draining batch can retain another batch's
-allowance concurrently. Pending event IDs are discarded with each batch, freeing the allowance for its live
-suffix. A separate 32,000-ID released-event window suppresses repeated live copies, not historical refetches.
+`REPLAY_BUFFER_MAX_BYTES` (32 MiB of payload). Native leases stay charged until ACK. One serialized legacy
+delivery-channel draining batch can retain another batch's allowance concurrently. Each native ACK frees
+its frame's allowance for subsequent input. A separate 32,000-ID released-event window suppresses repeated
+live copies, not historical refetches.
 Delivery metadata, router-placement pins and the SDK notification queue are outside the payload cap; it does
 not bound RSS or wire bytes. Interrupted pages get one fresh request at the same boundary within the page
 bound. Overflow, failed paging, a saturated second, deadline expiry and cancellation discard the affected
-owner's partial history and report its floor as recovery loss; they never certify it or release its newest
-partial page. The rest of that stored page is withheld, but later live input remains available. Sibling routes
-continue independently.
+owner's partial history and report its floor when ciphertext was discarded; they never certify it or release
+its newest partial page. Failure of one transport tag discards the source's whole affected MLS-group unit,
+not a newer suffix from another tag of that group. Healthy peer claims and independent groups survive.
 
 `dispatch_sdk_replay` is the SDK entry point; its private payload dispatcher cannot bypass generation checks.
 `take_replay_status` transfers retained loss to the consumer's existing recovery fence and holds a read guard
@@ -144,15 +159,23 @@ through its synchronous cursor seal. Drop the status before awaiting again. `rep
 router without consuming evidence. Loss survives replacement until imported. Buffered and releasing ciphertext
 holds the cursor, but a dead relay alone does not: all-relay EOSE is a separate certificate. The router calls
 `ack_replay_delivery` only after installing its queue/spill pin or recording loss, closing the
-adapter-to-router gap.
+adapter-to-router gap. The account owner persists limited native admission only after pending bytes and
+nondurable spill handoffs are clear, including every native batch ACK. A source whose range is already
+queued to the owner needs no additional acquisition while those bytes drain. Limited native admission never
+certifies exhaustive history or acknowledges queue/notification loss. Its cached permission must match the
+guarded source generation at cursor seal.
+Borrowed endpoint facts include active wire/capture leases and ended original ranges. The account owner
+does not duplicate that IO for a native-only goal while an issued peer is still serving the range; actual
+notification-loss grants keep their separate capture authority.
 
 Timestamp sorting leaves the existing 100-generation sender-ratchet tolerance unchanged: more than 100
 messages from one sender in the same second can still exceed it because event-id order is not
-sender-generation order. Trusted cursor floors retain their configured rewind. With no durable cursor, the app
+sender-generation order; backdated events can also disagree with sender generations. Trusted cursor floors
+retain their configured rewind. With no durable cursor, the app
 requests full retained history instead of substituting the recent live tail, including when the relay refuses
 NIP-77. Recovery maintenance also pages from its Welcome-anchored floor. Cursor checkpoints retain their
-previous floor while replay is staged or not yet placed by the delivery router. Ordinary comparison
-acquisition is unchanged.
+previous floor while replay is staged, leased to the owner or not yet placed by the delivery router.
+Ordinary comparison acquisition is unchanged.
 
 ## Recovery maintenance sessions
 

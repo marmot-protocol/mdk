@@ -10,6 +10,8 @@ mod loss;
 mod notice;
 mod observe;
 mod plan;
+#[cfg(test)]
+mod replay_tests;
 mod stall;
 pub use loss::{RecoveryLossCause, RecoveryLossSnapshot, RecoveryLossWatermark};
 pub use notice::ParkedRecoveryObligation;
@@ -659,7 +661,12 @@ impl SqliteAppStorage {
             if attempt_serial == 0
                 || prior.attempt_serial != attempt_serial
                 || prior.ordinal <= 1
-                || !selected_fence_matches(&revision_fence(&conn)?, expected)
+                || expected.obligations.is_empty()
+                || !comparison::completed_work_fence_matches(
+                    &conn,
+                    &revision_fence(&conn)?,
+                    expected,
+                )?
                 || !plan::no_unimported_loss(&conn)?
             {
                 return Ok(false);

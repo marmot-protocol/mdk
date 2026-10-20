@@ -1379,8 +1379,7 @@ pub enum AuditEventKind {
         spill_already_seen: u64,
         queue_dropped: u64,
     },
-    /// Historical wire-reissue repair format. New runtime writes use
-    /// [`AuditEventKind::RelayReplayRecovery`] instead.
+    /// Historical wire-reissue repair format; retained for decoding only.
     ///
     /// One pass of the relay plane's lag-lost end-of-stored-events repair,
     /// which re-issues the REQs a notification lag may have cost their EOSE.
@@ -1413,26 +1412,7 @@ pub enum AuditEventKind {
         follow_up_scheduled: bool,
         dropped_before: u64,
     },
-    /// A lag-settled pass scheduling bounded, owned retained-history recovery
-    /// without changing live REQs. Counts are current REQ/relay scopes, not
-    /// physical history pages: `pending_relays = started_relays + active_relays`.
-    /// Started work is newly scheduled; active work belongs to an unexpired
-    /// acquisition already running. Neither count certifies completion.
-    ///
-    /// The existing audit envelope binds the account. `follow_up_scheduled`
-    /// observes pending owned work, not a wire-send failure. `lags` counts
-    /// folded notification lags (zero only for a follow-up); `dropped_before`
-    /// counts reports shed at the in-memory bound. v5 only.
-    RelayReplayRecovery {
-        receiver: EoseRepairReceiver,
-        trigger: EoseRepairTrigger,
-        lags: u64,
-        pending_relays: u64,
-        started_relays: u64,
-        active_relays: u64,
-        follow_up_scheduled: bool,
-        dropped_before: u64,
-    },
+
     /// Relays ended live subscriptions of this account with `CLOSED`. The Nostr
     /// adapter queues each refusal as it arrives; the account worker records
     /// what it holds at its next publication seam, so recording never delays
@@ -1515,7 +1495,6 @@ impl AuditEventKind {
             AuditEventKind::RecoveryObligationReassessed { .. } => "recovery_obligation_reassessed",
             AuditEventKind::TransportCursorAdvanced { .. } => "transport_cursor_advanced",
             AuditEventKind::SubscriptionEoseRepaired { .. } => "subscription_eose_repaired",
-            AuditEventKind::RelayReplayRecovery { .. } => "relay_replay_recovery",
             AuditEventKind::SubscriptionRefused { .. } => "subscription_refused",
         }
     }
@@ -1562,7 +1541,6 @@ impl AuditEventKind {
                 | AuditEventKind::RecoveryObligationReassessed { .. }
                 | AuditEventKind::TransportCursorAdvanced { .. }
                 | AuditEventKind::SubscriptionEoseRepaired { .. }
-                | AuditEventKind::RelayReplayRecovery { .. }
                 | AuditEventKind::SubscriptionRefused { .. }
         )
     }

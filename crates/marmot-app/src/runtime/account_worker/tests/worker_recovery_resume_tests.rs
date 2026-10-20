@@ -195,7 +195,7 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
     let deliveries = client.adapter.recovered_deliveries(event).await.unwrap();
     assert_eq!(deliveries.len(), 1, "the event routes to this account once");
     for delivery in deliveries {
-        client.admit_recovered_delivery(delivery).await.unwrap();
+        client.admit_recovered_delivery(&delivery).await.unwrap();
     }
     assert!(
         storage

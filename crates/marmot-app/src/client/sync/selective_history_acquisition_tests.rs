@@ -26,6 +26,7 @@ async fn unfinished_selected_id_suffix_stays_pending_and_owner_paced() {
     assert!(before.pending());
     let grant = client
         .authorize_account_recovery(None, EpochBackfillExecutionSeam::Startup)
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(grant.inventory.len(), 2);
@@ -79,6 +80,7 @@ async fn unfinished_selected_id_suffix_stays_pending_and_owner_paced() {
     assert!(
         client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .is_none(),
         "an incomplete comparison cannot bypass owner pacing"
@@ -87,6 +89,7 @@ async fn unfinished_selected_id_suffix_stays_pending_and_owner_paced() {
     client.recovery_owner.test_advance_to_retry(&storage);
     let retry = client
         .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(retry.inventory.len(), 1);

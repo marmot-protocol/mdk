@@ -5,8 +5,8 @@ the [relay-plane brief](../../docs/marmot-architecture/review/brief-relay-plane.
 
 ## Scope
 
-The shared, process-wide relay plane: relay sessions, per-account delivery and overflow, notification forwarding and
-lag repair, publish accounting, relay telemetry, directory fetches and subscriptions, and the relay host-safety
+The shared, process-wide relay plane: relay sessions, per-account delivery and overflow, notification forwarding,
+guarded native replay facts, publish accounting, relay telemetry, directory fetches and subscriptions, and the relay host-safety
 chokepoint. It depends on `transport-nostr-adapter`, `transport-nostr-peeler`, `cgka-traits` and `nostr-sdk`; it must
 not depend on `marmot-app` or `storage-sqlite`. The app supplies storage and policy through callbacks and traits
 (`AccountDeliverySpillStore`, `AccountDeliveryRecoveryMarker`, `RelayExportGate`).
@@ -15,7 +15,7 @@ not depend on `marmot-app` or `storage-sqlite`. The app supplies storage and pol
 
 | Path | Owns |
 | --- | --- |
-| `src/lib.rs` | `MarmotRelayPlane`: relay sessions, per-account delivery queues and publish clients, notification forwarding, lag repair, publish accounting, `nostr_builder()`. |
+| `src/lib.rs` | `MarmotRelayPlane`: relay sessions, per-account delivery queues and publish clients, notification forwarding, native replay admission bridge, publish accounting, `nostr_builder()`. |
 | `src/delivery_spill.rs` | The plane's side of the durable overflow tail: when a full queue spills and how it reports the disposition. |
 | `src/directory.rs`, `src/directory_wire.rs` | Directory fetches and subscriptions, and their relay wire handling. |
 | `src/safety.rs` | `RelaySafetyPolicy`: the host-safety chokepoint every relay endpoint passes before a connect. |
@@ -32,6 +32,9 @@ not depend on `marmot-app` or `storage-sqlite`. The app supplies storage and pol
 - Transport consumers enter `transport_nostr_adapter::dispatch_sdk_replay` with the SDK's ordered reader/connection
   metadata. Handle payload variants in its private `dispatch_sdk_notification`; do not add a second dispatcher here.
   Keep metadata through worker queueing and fence receiver loss before resuming. Directory Client input stays separate.
+- Recovery debt, retry selection and native input qualification belong to the app's AccountRecoveryOwner.
+  Bridge frozen capture plans and borrowed source guards; never schedule quiet-period repair here. Import
+  actual loss before cursor authorization and retain placement/spill locking through the owner's callback.
 - Test hooks and accessors (`*_for_test`, `test_support`) are `cfg(any(test, feature = "test-support"))`.
   `marmot-app` enables `test-support` only through its dev-dependency; never enable it in app artifacts.
 - Widen an item to `pub` only when another crate names it. `marmot-app` re-exports `MarmotRelayPlane` and

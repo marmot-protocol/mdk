@@ -61,6 +61,15 @@
   publication reserve for the body. Update exhaustive matches; the job keeps
   its checkpoint and readmits once space frees or on explicit Retry.
 
+- Rust recovery models add `RecoveryCause::SubscriptionReplay`,
+  `RecoveryPredicate::ReplayAdmission` and `RecoveryScopeCheckpoint::replay_admitted`.
+  Native input admission is separate from history certification and loss acknowledgment.
+  The C and UniFFI surfaces are unchanged.
+- Rust audited engine ingestion, session delivery ingestion and account delivery
+  ingestion borrow their transport input. `ReplayIngress` and `ReplayBatch` retain
+  native frames until ordered admission acknowledges them. C and UniFFI calls
+  are unchanged.
+
 ### Changed
 
 - Avatars and group images are stored as encrypted media-store cache files
@@ -173,6 +182,17 @@
   instead of repeatedly fetching only its newest 256 events (mdk#2257).
   Bounded advisory hints resume across pass cuts. Held-only traversal does
   not reset backoff or the durable park count, including after reopening.
+
+- Offline catch-up stages each group's complete range before MLS processing and
+  pages every route of a clamped reply backwards (#2375, #2381). Without a
+  durable cursor it requests retained history, not the recent live tail, even
+  when the relay refuses NIP-77. The account recovery owner preserves unresolved
+  original windows across cancellation and reopen. Historical batches bypass
+  live-queue/spill alternation, and retained spill rows join the ordered range
+  before decryption. Already-held copies adopt durable spill ownership before
+  source replacement, without copying the ciphertext. Empty or silent peers do not
+  create notification loss. Sender-ratchet tolerance remains 100; timestamp/id
+  ordering does not establish sender-generation order within a single second.
 
 - `control_attachment` Remove opens the account's media store before the
   removal commits, so a store that cannot open (for example while storage

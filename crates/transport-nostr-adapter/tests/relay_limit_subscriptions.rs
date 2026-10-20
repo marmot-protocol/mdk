@@ -33,9 +33,11 @@ use nostr_sdk::prelude::{
 };
 use tokio::task::JoinHandle;
 use transport_nostr_adapter::{
-    GROUP_BATCH_ROUTES, NostrReconciliationFailure, NostrReconciliationProgress, NostrRelayClient,
+    GROUP_BATCH_ROUTES, NostrAcquisitionCancellation, NostrNotificationLossFloor,
+    NostrReconciliationFailure, NostrReconciliationProgress, NostrRelayClient,
     NostrSdkNotification, NostrSdkRelayClient, NostrSubscription, NostrTransportAdapter,
-    RELAY_REPLAY_PAGE_LIMIT, SubscriptionAttempt, SubscriptionRouteKind, dispatch_sdk_replay,
+    RELAY_REPLAY_PAGE_LIMIT, ReplayCaptureOutcome, ReplayCapturePlan, ReplayRestart,
+    SubscriptionAttempt, SubscriptionRouteKind, dispatch_sdk_replay,
 };
 
 const QUIET: Duration = Duration::from_millis(600);
@@ -1166,7 +1168,7 @@ async fn queued_eose_after_reconnect() {
 }
 
 /// Replacing a reader cannot wait for another EOSE on unchanged live REQs.
-/// The SDK has already seen every lost copy, so only an owned refetch can heal it.
+/// The owner must grant a refetch of SDK-seen history across the new epoch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reader_loss_refetches_seen() {
     const STORED: usize = 200;
@@ -1197,6 +1199,8 @@ async fn reader_loss_refetches_seen() {
     let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
     let mut eose = 0;
     let mut cached = HashSet::new();
+    let mut held_eose = Vec::new();
+    let mut held_raw = None;
     while eose < live_reqs(1) {
         let update = tokio::time::timeout_at(deadline, source.next())
             .await
@@ -1222,12 +1226,37 @@ async fn reader_loss_refetches_seen() {
                     cached.insert(event.id.to_bytes());
                 }
             }
-            NostrSdkNotification::Payload {
-                notification: ClientNotification::Message { message, .. },
+            payload @ NostrSdkNotification::Payload {
+                notification: ClientNotification::Message { .. },
                 ..
             } => {
-                if matches!(*message, RelayMessage::EndOfStoredEvents(_)) {
-                    eose += 1;
+                let NostrSdkNotification::Payload {
+                    notification: ClientNotification::Message { message, .. },
+                    ..
+                } = &payload
+                else {
+                    unreachable!();
+                };
+                match message.as_ref() {
+                    RelayMessage::EndOfStoredEvents(_) => {
+                        eose += 1;
+                        held_eose.push(payload);
+                    }
+                    RelayMessage::Event { event, .. }
+                        if event.id.to_bytes() == expected.last().unwrap().1 =>
+                    {
+                        // Retain real ciphertext for the cutover to discard;
+                        // empty input alone must never manufacture core loss.
+                        assert!(held_raw.is_none());
+                        assert!(
+                            !dispatch_sdk_replay(payload.clone(), &fx.adapter, None, &|reason| fx
+                                .sdk
+                                .subscription_refusal(reason))
+                            .await
+                        );
+                        held_raw = Some(payload);
+                    }
+                    _ => {}
                 }
             }
             NostrSdkNotification::Payload { .. } | NostrSdkNotification::Shutdown => {
@@ -1239,6 +1268,33 @@ async fn reader_loss_refetches_seen() {
         cached == expected.iter().map(|(_, id)| *id).collect::<HashSet<_>>(),
         "the SDK saw exactly the history deliberately withheld from the adapter"
     );
+    let held_raw = held_raw.expect("the newest real raw copy is staged before the gap");
+    let NostrSdkNotification::Payload {
+        epoch: old_epoch, ..
+    } = &held_raw
+    else {
+        unreachable!();
+    };
+    let old_epoch = *old_epoch;
+    let (old_generation, stale_sources, original_floors) = {
+        let status = fx.adapter.take_replay_status(&fx.account).await;
+        assert!(
+            status.pending,
+            "the staged newer copy must wait for the whole range"
+        );
+        assert!(status.loss.is_none());
+        let mut sources = Vec::new();
+        let mut original_floors = BTreeMap::new();
+        for source in status.sources() {
+            assert!(
+                source.since() <= SINCE,
+                "recovery cannot narrow an issued query's floor"
+            );
+            original_floors.insert(source.group_routes().next().copied(), source.since());
+            sources.extend(source.endpoints().map(|endpoint| endpoint.capture_token()));
+        }
+        (status.generation(), sources, original_floors)
+    };
     assert!(
         tokio::time::timeout(Duration::from_millis(100), fx.adapter.receive())
             .await
@@ -1251,14 +1307,130 @@ async fn reader_loss_refetches_seen() {
         .await
         .into_keys()
         .collect::<HashSet<_>>();
+    assert_eq!(original_ids.len(), live_reqs(1));
+    for id in &original_ids {
+        assert_eq!(relay.subscription_received_eose(id).await, Some(true));
+    }
     drop(source);
 
-    let forwarder = fx.sdk.spawn_notification_forwarder(fx.adapter.clone());
+    let mut source = fx.sdk.notifications();
+    let update = tokio::time::timeout(SETTLE_TIMEOUT, source.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let NotificationUpdate::Notification(boundary) = update else {
+        panic!("reader replacement emits an ordered boundary, not fabricated skipped bytes");
+    };
+    let NostrSdkNotification::Replay {
+        epoch,
+        reason: ReplayRestart::ReceiverLoss,
+        ..
+    } = &boundary
+    else {
+        panic!("reader replacement must fence the old native epoch");
+    };
+    assert!(epoch[0] > old_epoch[0]);
+    assert_eq!(epoch[1], old_epoch[1], "reader loss is not a reconnect");
+    assert!(
+        !dispatch_sdk_replay(boundary, &fx.adapter, None, &|reason| fx
+            .sdk
+            .subscription_refusal(reason))
+        .await
+    );
+    for stale in std::iter::once(held_raw).chain(held_eose) {
+        assert!(
+            !dispatch_sdk_replay(stale, &fx.adapter, None, &|reason| fx
+                .sdk
+                .subscription_refusal(reason))
+            .await
+        );
+    }
+    let coverage = fx.adapter.account_subscription_eose(&fx.account).await;
+    assert_eq!(coverage.with_eose, 0);
+    assert_eq!(coverage.relay_subscription_attempts_with_eose, 0);
+    assert!(
+        !coverage.complete(),
+        "old raw EOSE cannot certify the replacement epoch"
+    );
+    let credit = Arc::new(
+        Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        fx.adapter
+            .capture_replay(
+                &fx.account,
+                ReplayCapturePlan {
+                    attempt_serial: 1,
+                    sources: stale_sources,
+                    credit: credit.clone(),
+                },
+                NostrAcquisitionCancellation::new(),
+            )
+            .await
+            .unwrap(),
+        ReplayCaptureOutcome::Stale,
+        "the owner cannot reuse capabilities from before the reader gap"
+    );
+    let sources = {
+        let status = fx.adapter.take_replay_status(&fx.account).await;
+        assert!(status.generation() > old_generation);
+        assert!(
+            matches!(status.loss, Some(NostrNotificationLossFloor::Since(floor)) if floor <= START),
+            "actual discarded ciphertext keeps its original loss floor"
+        );
+        let mut sources = Vec::new();
+        for source in status.sources() {
+            assert_eq!(
+                source.since(),
+                original_floors[&source.group_routes().next().copied()]
+            );
+            for endpoint in source.endpoints() {
+                assert!(!endpoint.admitted());
+                sources.push(endpoint.capture_token());
+            }
+        }
+        assert_eq!(sources.len(), live_reqs(1));
+        sources
+    };
+    let waiting = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    assert_eq!(
+        waiting.total_reqs, initial.total_reqs,
+        "ReceiverLoss and a stale grant cannot start autonomous recovery IO"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), fx.adapter.receive())
+            .await
+            .is_err(),
+        "neither stale raw copies nor an ungranted fence may release history"
+    );
+    let capture = tokio::spawn({
+        let adapter = fx.adapter.clone();
+        let account = fx.account.clone();
+        async move {
+            adapter
+                .capture_replay(
+                    &account,
+                    ReplayCapturePlan {
+                        attempt_serial: 2,
+                        sources,
+                        credit,
+                    },
+                    NostrAcquisitionCancellation::new(),
+                )
+                .await
+                .unwrap()
+        }
+    });
     let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
     for (timestamp, id) in expected {
         let delivery = tokio::time::timeout_at(deadline, fx.adapter.receive())
             .await
-            .expect("receiver replacement refetches SDK-seen lost history")
+            .expect(
+                "the owner grant refetches SDK-seen lost history, including older missing copies",
+            )
             .unwrap()
             .unwrap();
         assert_eq!(delivery.message.timestamp.0, timestamp);
@@ -1269,6 +1441,13 @@ async fn reader_loss_refetches_seen() {
             .ack_replay_delivery(&fx.account, &delivery.message.id)
             .await;
     }
+    assert_eq!(
+        tokio::time::timeout_at(deadline, capture)
+            .await
+            .unwrap()
+            .unwrap(),
+        ReplayCaptureOutcome::Complete
+    );
     await_account_eose(&fx).await;
     assert!(
         tokio::time::timeout(QUIET, fx.adapter.receive())
@@ -1278,11 +1457,16 @@ async fn reader_loss_refetches_seen() {
     {
         let status = fx.adapter.take_replay_status(&fx.account).await;
         assert!(!status.pending);
+        assert!(status.sources().all(|source| source.admitted()));
         assert!(
-            matches!(status.loss, Some(transport_nostr_adapter::NostrNotificationLossFloor::Since(floor)) if floor <= START),
-            "loss fences recovery at or before the oldest discarded ciphertext"
+            status.loss.is_none(),
+            "capture does not manufacture or re-charge the already imported byte loss"
         );
     }
+    assert!(
+        tokio::time::timeout(QUIET, source.next()).await.is_err(),
+        "private capture replies cannot appear as live raw copies or EOSE"
+    );
     let restored = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
     assert_eq!(
         restored.connections.len(),
@@ -1298,9 +1482,23 @@ async fn reader_loss_refetches_seen() {
             == original_ids
     );
     assert_eq!(restored.active_now(), original_ids.len());
+    assert_eq!(restored.total_reqs - initial.total_reqs, live_reqs(1));
+    assert_eq!(restored.reqs_with_active_id, 0);
+    assert!(
+        restored
+            .req_log
+            .iter()
+            .skip(initial.req_log.len())
+            .all(|record| {
+                !original_ids
+                    .iter()
+                    .any(|id| id.as_str() == record.subscription_id)
+            })
+    );
+    for id in &original_ids {
+        assert_eq!(relay.subscription_received_eose(id).await, Some(true));
+    }
     assert_eq!(restored.neg_opens, 0);
-    forwarder.abort();
-    let _ = forwarder.await;
     fx.shutdown().await;
 }
 

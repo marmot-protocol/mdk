@@ -65,8 +65,7 @@ A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_NEGOTIAT
 A13|crates/marmot-app/src/client/sync/comparison_job.rs|MAX_COMPARISON_ADMISSION_PER_TURN
 # A14 floors the post-join maintenance and retained-route REQs at their anchors.
 A14|crates/marmot-app/src/lib.rs|HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE
-# A15 settles and paces owned full-window history recovery after notification lag.
-A15|crates/transport-nostr/src/lib.rs|NOTIFICATION_LAG_EOSE_REPAIR_SETTLE
+# A15's relay-plane quiet repair timer is retired; the account owner paces recovery.
 # A16 bounds backward epoch-gap paging and its advisory resume hints.
 A16|crates/marmot-app/src/client/sync/comparison_job.rs|EPOCH_GAP_WINDOW_PAGE_EVENTS
 A16|crates/marmot-app/src/client/sync/comparison_job.rs|EPOCH_GAP_WINDOW_MAX_HINTS

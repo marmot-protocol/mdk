@@ -366,6 +366,11 @@ async fn offline_sender_600_replay() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offline_replay_crosses_queue() {
+    offline_plaintext_replay(1, 1_600, Duration::ZERO).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn offline_150s_six_sender_replay() {
     offline_plaintext_replay(6, 100, Duration::from_secs(150)).await;
 }

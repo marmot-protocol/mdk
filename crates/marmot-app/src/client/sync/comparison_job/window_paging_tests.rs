@@ -666,7 +666,7 @@ fn hint_lru_stays_bounded() {
                 last_used: 0,
             },
             reached: true,
-            offered: HashSet::new(),
+            offered: HashMap::new(),
         })
         .collect();
     keep_window_progress(&cache, &HashSet::from([(GOAL.id, GOAL.revision)]), progress);

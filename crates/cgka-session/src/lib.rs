@@ -1087,19 +1087,21 @@ impl AccountDeviceSession {
         })
     }
 
+    /// Ingest without taking ownership of the delivery or copying its wire payload.
+    /// The transport owner may release the frame after successful acknowledgement.
     pub async fn ingest_delivery(
         &mut self,
-        delivery: TransportDelivery,
+        delivery: &TransportDelivery,
     ) -> SessionResult<IngestEffects> {
         tracing::debug!(
             target: TRACE_TARGET,
             method = "ingest_delivery",
             "ingesting transport delivery"
         );
-        let transport_context = audit_transport_context(delivery.source);
+        let transport_context = audit_transport_context(delivery.source.clone());
         let outcome = self
             .engine
-            .ingest_with_audit_context(delivery.message, Some(transport_context))
+            .ingest_with_audit_context(&delivery.message, Some(transport_context))
             .await?;
         let left_object_unpersisted = self.engine.last_ingest_left_object_unpersisted();
         tracing::debug!(

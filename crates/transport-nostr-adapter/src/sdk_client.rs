@@ -6162,7 +6162,7 @@ mod tests {
                         }
                     }
                 }
-            }).await.expect("held history and any dirty follow-up complete");
+            }).await.expect("held history and owner-granted captures complete");
             let mut expected = self
                 .events
                 .iter()
@@ -6183,6 +6183,46 @@ mod tests {
                 "history reaches the consumer once, oldest first"
             );
         }
+    }
+
+    async fn sdk_capture(
+        adapter: &NostrTransportAdapter,
+        account: &MemberId,
+        attempt_serial: u64,
+    ) -> tokio::task::JoinHandle<crate::ReplayCaptureOutcome> {
+        let status = adapter.take_replay_status(account).await;
+        let mut sources = Vec::new();
+        for source in status.sources() {
+            sources.extend(
+                source
+                    .endpoints()
+                    .filter(|endpoint| !endpoint.admitted())
+                    .map(|endpoint| endpoint.capture_token()),
+            );
+        }
+        assert!(
+            !sources.is_empty(),
+            "the owner fixture must authorize actual pending sources"
+        );
+        drop(status);
+        let plan = crate::ReplayCapturePlan {
+            attempt_serial,
+            sources,
+            credit: Arc::new(
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+            ),
+        };
+        let adapter = adapter.clone();
+        let account = account.clone();
+        tokio::spawn(async move {
+            adapter
+                .capture_replay(&account, plan, NostrAcquisitionCancellation::new())
+                .await
+                .unwrap()
+        })
     }
 
     fn stored_group_event(transport_group_id: &[u8], created_at: u64) -> Event {
@@ -6220,7 +6260,6 @@ mod tests {
             let NotificationUpdate::Lagged { skipped } = update else {
                 panic!("each real gap reaches the production stream before replacement controls");
             };
-            let lag = replay.adapter.notification_lag_mark();
             assert!(skipped > 0);
             cumulative += skipped;
             assert_eq!(
@@ -6262,25 +6301,15 @@ mod tests {
             }
             let status = replay.adapter.take_replay_status(&replay.account).await;
             assert!(
-                status.pending,
-                "old EOSE cannot certify the replacement source"
+                status.sources().all(|source| !source.admitted()),
+                "old EOSE cannot certify replacement sources"
             );
             assert_eq!(
                 status.loss,
-                Some(NostrNotificationLossFloor::Unbounded),
-                "the receiver includes an inbox whose NIP-59 rewind starts at zero"
+                (gap == 0).then_some(NostrNotificationLossFloor::Since(100)),
+                "only the first boundary discards buffered group bytes; an empty inbox cannot invent unbounded loss"
             );
             drop(status);
-            let summary = replay.adapter.recover_pending_replay(None, lag).await;
-            assert_eq!(
-                summary.started_relays, 0,
-                "the held capture keeps its owner"
-            );
-            assert_eq!(
-                summary.active_relays, 2,
-                "both the inbox and group share the lost receiver"
-            );
-            assert_eq!(summary.pending_relays, 2);
             assert!(
                 replay
                     .adapter
@@ -6288,18 +6317,52 @@ mod tests {
                     .await
                     .loss
                     .is_none(),
-                "joining recovery does not invent another gap"
+                "reading the parked owner fence does not invent another gap"
             );
             assert_eq!(replay.notice("after loss").await, previous_epoch);
-            assert!(
-                !replay
-                    .adapter
-                    .account_subscription_eose(&replay.account)
-                    .await
-                    .complete()
+            let coverage = replay
+                .adapter
+                .account_subscription_eose(&replay.account)
+                .await;
+            assert_eq!(
+                coverage.relay_subscription_attempts_with_eose, 0,
+                "stale raw EOSE cannot certify any replacement source"
             );
+            assert!(!coverage.complete());
         }
+        assert!(
+            timeout(Duration::from_millis(100), replay.wire.recv_kind("REQ"))
+                .await
+                .is_err(),
+            "receiver gaps must wait for the owner's grant"
+        );
+        let capture = sdk_capture(&replay.adapter, &replay.account, 1).await;
+        // The grant must reacquire the original group window, not join its
+        // already-running backward tail after a downstream receiver gap.
+        let mut full_group = false;
+        for _ in 0..2 {
+            let request = replay.wire.recv_kind("REQ").await;
+            if request[2]["#h"].is_array() {
+                assert_eq!(request[2]["since"].as_u64(), Some(100));
+                assert!(
+                    request[2]["until"].as_u64().unwrap()
+                        >= replay
+                            .events
+                            .iter()
+                            .map(|event| event.created_at.as_secs())
+                            .max()
+                            .unwrap()
+                );
+                full_group = true;
+            }
+            replay.answer_page(&request).await;
+        }
+        assert!(full_group);
         replay.finish().await;
+        assert_eq!(
+            capture.await.unwrap(),
+            crate::ReplayCaptureOutcome::Complete
+        );
         replay.sdk.shutdown().await;
     }
 
@@ -6619,7 +6682,7 @@ mod tests {
     /// A lost raw replay and EOSE require owned history acquisition even
     /// though the SDK has already cached the ciphertext.
     #[tokio::test]
-    async fn lag_recovery_fetches_history() {
+    async fn owner_refetches_sdk_seen() {
         let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
         let endpoint = TransportEndpoint(relay.url().await.to_string());
         let root = NostrSdkRelayClient::multi_account();
@@ -6714,19 +6777,38 @@ mod tests {
         .expect("the relay answered both REQs, and the inbox's answer is recorded");
         let coverage = adapter.account_subscription_eose(&account_id).await;
         assert_eq!(coverage.relay_subscription_attempts, 2);
+        assert_eq!(coverage.relay_subscription_attempts_with_eose, 1);
         assert!(!coverage.complete(), "the lost answer leaves coverage open");
         let floor = account.notification_loss_floor();
-
-        let lag = adapter.notification_lag_mark();
-        let repair = adapter.recover_pending_replay(Some(&account_id), lag).await;
+        let generation = {
+            let status = adapter.take_replay_status(&account_id).await;
+            assert!(
+                status.loss.is_none(),
+                "withheld input is not discarded buffered ciphertext"
+            );
+            status.generation()
+        };
+        let live_relay = account
+            .client
+            .relay(endpoint.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        let live_ids = live_relay
+            .subscriptions()
+            .await
+            .into_keys()
+            .collect::<HashSet<_>>();
+        assert_eq!(live_ids.len(), 2);
         assert_eq!(
-            repair,
-            crate::ReplayRecoverySummary {
-                pending_relays: 1,
-                started_relays: 1,
-                active_relays: 0,
-            }
+            live_relay
+                .subscription_received_eose(&SubscriptionId::new(group_req.clone()))
+                .await,
+            Some(true),
+            "SDK raw EOSE state is not adapter admission of the withheld range"
         );
+
+        let capture = sdk_capture(&adapter, &account_id, 1).await;
         let delivery = timeout(Duration::from_secs(5), adapter.receive())
             .await
             .expect("owned history releases the SDK-cached ciphertext")
@@ -6755,12 +6837,23 @@ mod tests {
         .await
         .expect("owned history completes coverage");
         assert_eq!(
-            adapter
-                .recover_pending_replay(Some(&account_id), lag)
-                .await
-                .pending_relays,
-            0
+            capture.await.unwrap(),
+            crate::ReplayCaptureOutcome::Complete
         );
+        {
+            let status = adapter.take_replay_status(&account_id).await;
+            assert_eq!(
+                status.generation(),
+                generation,
+                "private IO does not change live REQ identity"
+            );
+            assert!(status.sources().all(|source| source.admitted()));
+            assert!(!status.pending);
+            assert!(
+                status.loss.is_none(),
+                "native admission cannot manufacture loss acknowledgment"
+            );
+        }
         assert!(
             timeout(Duration::from_millis(100), adapter.receive())
                 .await
@@ -6773,6 +6866,15 @@ mod tests {
             "the live REQ was not resent"
         );
         assert_eq!(account.notification_loss_floor(), floor);
+        assert!(
+            live_relay
+                .subscriptions()
+                .await
+                .into_keys()
+                .collect::<HashSet<_>>()
+                == live_ids,
+            "private capture cannot replace or pollute the SDK live REQ registry"
+        );
         consumer.abort();
         root.shutdown_accounts().await;
         relay.shutdown();

@@ -2575,9 +2575,6 @@
           "$ref": "#/$defs/OperationalEvent_subscription_eose_repaired"
         },
         {
-          "$ref": "#/$defs/OperationalEvent_relay_replay_recovery"
-        },
-        {
           "$ref": "#/$defs/OperationalEvent_subscription_refused"
         }
       ]
@@ -3164,7 +3161,8 @@
         "maintenance",
         "explicit_history",
         "known_event",
-        "incremental_history"
+        "incremental_history",
+        "subscription_replay"
       ]
     },
     "Operational_recoveryNeedChange": {
@@ -5130,53 +5128,7 @@
         }
       }
     },
-    "OperationalEvent_relay_replay_recovery": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "type",
-        "receiver",
-        "trigger",
-        "lags",
-        "pending_relays",
-        "started_relays",
-        "active_relays",
-        "follow_up_scheduled",
-        "dropped_before"
-      ],
-      "properties": {
-        "type": {
-          "const": "relay_replay_recovery"
-        },
-        "receiver": {
-          "$ref": "#/$defs/Operational_eoseRepairReceiver"
-        },
-        "trigger": {
-          "$ref": "#/$defs/Operational_eoseRepairTrigger"
-        },
-        "lags": {
-          "$ref": "#/$defs/Operational_u64"
-        },
-        "pending_relays": {
-          "$ref": "#/$defs/Operational_u64"
-        },
-        "started_relays": {
-          "$ref": "#/$defs/Operational_u64"
-        },
-        "active_relays": {
-          "$ref": "#/$defs/Operational_u64"
-        },
-        "follow_up_scheduled": {
-          "type": "boolean"
-        },
-        "dropped_before": {
-          "$ref": "#/$defs/Operational_u64"
-        },
-        "record_context": {
-          "$ref": "#/$defs/Operational_auditEventContext"
-        }
-      }
-    },
+
     "OperationalEvent_subscription_refused": {
       "type": "object",
       "additionalProperties": false,

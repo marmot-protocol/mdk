@@ -660,6 +660,7 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
     client.recovery_owner.test_advance_to_retry(&storage);
     let grant = client
         .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+        .await
         .unwrap()
         .unwrap();
     let execution = client.begin_comparison_grant(&grant).await.unwrap();

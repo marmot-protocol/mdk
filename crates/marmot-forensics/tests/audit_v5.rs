@@ -14,39 +14,9 @@ fn decode(v: &Value) -> Result<Record, ContractError> {
     Record::from_json(&serde_json::to_vec(v).unwrap())
 }
 
-fn replay_row() -> Value {
+fn historical_eose_row() -> Value {
     let mut row = fixture("recording_started");
     row["event"] = json!({
-        "type": "relay_replay_recovery",
-        "receiver": "account",
-        "trigger": "notification_lag",
-        "lags": 2,
-        "pending_relays": 3,
-        "started_relays": 2,
-        "active_relays": 1,
-        "follow_up_scheduled": true,
-        "dropped_before": 4
-    });
-    row
-}
-
-#[test]
-fn replay_recovery_round_trips() {
-    let mut follow_up = replay_row();
-    follow_up["event"]["trigger"] = json!("follow_up");
-    follow_up["event"]["lags"] = json!(0);
-    follow_up["event"]["started_relays"] = json!(0);
-    follow_up["event"]["active_relays"] = json!(3);
-    let mut settled = follow_up.clone();
-    settled["event"]["receiver"] = json!("shared");
-    settled["event"]["pending_relays"] = json!(0);
-    settled["event"]["active_relays"] = json!(0);
-    settled["event"]["follow_up_scheduled"] = json!(false);
-    let mut stopped = replay_row();
-    // Shutdown can begin after a capture starts but before its follow-up is queued.
-    stopped["event"]["follow_up_scheduled"] = json!(false);
-    let mut historical = replay_row();
-    historical["event"] = json!({
         "type": "subscription_eose_repaired",
         "receiver": "account",
         "trigger": "notification_lag",
@@ -59,58 +29,79 @@ fn replay_recovery_round_trips() {
         "follow_up_scheduled": true,
         "dropped_before": 0
     });
-    let schema = validator();
-    for row in [replay_row(), follow_up, settled, stopped, historical] {
-        assert!(schema.is_valid(&row));
-        let record = decode(&row).unwrap();
-        let encoded = record.to_json().unwrap();
-        assert_eq!(serde_json::from_slice::<Value>(&encoded).unwrap(), row);
-        assert_eq!(Record::from_json(&encoded).unwrap(), record);
-    }
+    row
 }
 
 #[test]
-fn replay_recovery_rejects_lies() {
+fn historical_eose_round_trips() {
+    let row = historical_eose_row();
+    assert!(validator().is_valid(&row));
+    let record = decode(&row).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&record.to_json().unwrap()).unwrap(),
+        row
+    );
+    for (field, value) in [("lags", json!(0)), ("failed_relays", json!(2))] {
+        let mut invalid = row.clone();
+        invalid["event"][field] = value;
+        assert!(validator().is_valid(&invalid));
+        assert!(decode(&invalid).is_err());
+    }
+}
+
+fn native_reassessment_row() -> Value {
+    let mut row = fixture("recording_started");
+    row["event"] = json!({
+        "type": "recovery_obligation_reassessed",
+        "attempt_serial": 4,
+        "cause": "subscription_replay",
+        "obligation_ref": "0000000000000000000000000000000000000000000000000000000000000000",
+        "obligation_revision": 2,
+        "verdict": "satisfied",
+        "next_attempt": "not_needed",
+        "progress": "progressed",
+        "scopes_total": 1,
+        "scopes_certified": 0,
+        "park_after_quiet_passes": 3
+    });
+    row
+}
+
+#[test]
+fn native_replay_cause_round_trips_without_history_certification() {
     let schema = validator();
+    for (verdict, next_attempt, progress) in [
+        ("satisfied", "not_needed", "progressed"),
+        ("deferred", "paced_retry", "unserved"),
+        ("retired", "not_needed", "quiet"),
+    ] {
+        let mut row = native_reassessment_row();
+        row["event"]["verdict"] = json!(verdict);
+        row["event"]["next_attempt"] = json!(next_attempt);
+        row["event"]["progress"] = json!(progress);
+        assert!(schema.is_valid(&row));
+        let record = decode(&row).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&record.to_json().unwrap()).unwrap(),
+            row
+        );
+    }
     for (field, value) in [
-        ("pending_relays", json!(4)),
-        ("started_relays", json!(3)),
-        ("active_relays", json!(2)),
-        ("trigger", json!("follow_up")),
-        ("lags", json!(0)),
+        ("scopes_certified", json!(1)),
+        ("verdict", json!("closed_below_window")),
+        ("progress", json!("window_certified")),
     ] {
-        let mut row = replay_row();
+        let mut row = native_reassessment_row();
         row["event"][field] = value;
-        assert!(schema.is_valid(&row), "schema alone accepts {field}");
-        assert!(decode(&row).is_err(), "semantic decoder rejects {field}");
-    }
-    let mut overflow = replay_row();
-    overflow["event"]["pending_relays"] = json!(0);
-    overflow["event"]["started_relays"] = json!(u64::MAX);
-    assert!(decode(&overflow).is_err());
-    let mut settled_follow_up = replay_row();
-    for field in ["pending_relays", "started_relays", "active_relays"] {
-        settled_follow_up["event"][field] = json!(0);
-    }
-    assert!(decode(&settled_follow_up).is_err());
-    for field in [
-        "awaiting_relays",
-        "complete_relays",
-        "reissued_relays",
-        "reissued_earlier_relays",
-        "failed_relays",
-    ] {
-        let mut row = replay_row();
-        row["event"][field] = json!(0);
-        assert!(!schema.is_valid(&row));
+        assert!(schema.is_valid(&row));
         assert!(decode(&row).is_err());
     }
-    for field in ["pending_relays", "started_relays", "active_relays"] {
-        let mut row = replay_row();
-        row["event"].as_object_mut().unwrap().remove(field);
-        assert!(!schema.is_valid(&row));
-        assert!(decode(&row).is_err());
-    }
+    // Existing history predicates retain their historical v5 interpretation.
+    let mut history = native_reassessment_row();
+    history["event"]["cause"] = json!("incremental_history");
+    history["event"]["scopes_certified"] = json!(1);
+    assert!(schema.is_valid(&history));
+    assert!(decode(&history).is_ok());
 }
 
 #[test]

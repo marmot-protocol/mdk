@@ -8,8 +8,10 @@ publishes, and below [`marmot-app`](../marmot-app/README.md), which drives it pe
 
 - Runs the relay client the process's accounts share and a delivery queue per account, with a durable overflow tail
   (`delivery_spill.rs`) when an account's queue is full.
-- Forwards relay notifications to the right account, re-issues subscriptions after notification lag, and reports the
-  losses it could not repair.
+- Forwards ordered relay notifications and actual loss to the right account. It exposes guarded replay facts
+  and executes the account recovery owner's frozen capture plans without re-issuing live subscriptions.
+- Hands complete historical group batches to the account owner's ordered admission path. Those batches do
+  not enter live-queue/spill alternation; unacknowledged frames keep holding the cursor.
 - Builds and caches each account's signer-bound publish client, so setup publishes and the account worker share one
   relay pool.
 - Counts each account's publishes, and keeps relay telemetry snapshots and the export rollup (`telemetry.rs`).
@@ -21,6 +23,7 @@ publishes, and below [`marmot-app`](../marmot-app/README.md), which drives it pe
 
 - No account or group state: the app owns storage, recovery decisions and the delivery spill's storage, and hands the
   plane callbacks for them.
+- No quiet-period recovery timer or independent retry authority.
 - No MLS peeling (`transport-nostr-peeler`) and no relay socket mechanics (`transport-nostr-adapter`, `nostr-sdk`).
 
 `marmot-app` drives it through `transport_nostr::`. See the

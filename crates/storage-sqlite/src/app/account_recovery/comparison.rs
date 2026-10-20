@@ -141,6 +141,48 @@ pub(super) fn selection_matches(
         && (explicit || slot.blocked_route_revision.is_none_or(|r| r != route)))
 }
 
+// A passive native admission can finish while its mixed grant's comparison is
+// still running. Only that exact terminal native selection may disappear from
+// the pending fence; no other completed, retired, replaced or missing demand
+// can validate the comparison's old grant. Reservation remains pending-only.
+pub(super) fn completed_work_fence_matches(
+    conn: &Connection,
+    current: &RecoveryRevisionFence,
+    expected: &RecoveryRevisionFence,
+) -> StorageResult<bool> {
+    if current.loss_revision != expected.loss_revision
+        || current.route_revision != expected.route_revision
+        || current.inventory_revision != expected.inventory_revision
+        || expected
+            .obligations
+            .windows(2)
+            .any(|pair| pair[0].0 >= pair[1].0)
+    {
+        return Ok(false);
+    }
+    for (id, revision) in &expected.obligations {
+        if current
+            .obligations
+            .binary_search_by_key(id, |(candidate, _)| *candidate)
+            .is_ok_and(|index| current.obligations[index].1 == *revision)
+        {
+            continue;
+        }
+        let terminal_native: bool = conn
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations
+             WHERE id=?1 AND revision=?2 AND cause=7 AND predicate=3 AND state IN (1,2))",
+                params![id.as_slice(), sqlite_integer(*revision)?],
+                |row| row.get(0),
+            )
+            .storage()?;
+        if !terminal_native {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 impl SqliteAppStorage {
     pub fn recovery_comparison(&self) -> StorageResult<RecoveryComparison> {
         {
@@ -312,7 +354,7 @@ impl SqliteAppStorage {
                 || retry.attempt_serial != attempt
                 || retry.ordinal <= 1
                 || slot.plan.as_ref().is_none_or(|p| p.fence != *expected)
-                || !work_fence_matches(&revision_fence(&conn)?, expected, true)
+                || !completed_work_fence_matches(&conn, &revision_fence(&conn)?, expected)?
                 || !plan::no_unimported_loss(&conn)?
             {
                 return Ok(false);
@@ -348,7 +390,7 @@ impl SqliteAppStorage {
             let Some(mut frozen) = slot.plan else { return Ok(false); };
             if slot.settled_revision >= revision || attempt == 0 || slot.attempt_serial != attempt || slot.frozen_revision != revision
                 || retry_state(&conn)?.attempt_serial != attempt
-                || !work_fence_matches(&revision_fence(&conn)?, &frozen.fence, true)
+                || !completed_work_fence_matches(&conn, &revision_fence(&conn)?, &frozen.fence)?
                 || !plan::no_unimported_loss(&conn)? { return Ok(false); }
             if outcomes.len() != frozen.routes.len() || outcomes.windows(2).any(|x| x[0].0 >= x[1].0)
                 || outcomes.iter().zip(&frozen.routes).any(|((id,_),r)| *id != r.scope_id)

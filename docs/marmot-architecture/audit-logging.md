@@ -954,7 +954,7 @@ Metadata notes:
 ### Account recovery owner rows (v5 only)
 
 The account recovery owner ([`account-recovery.md`](./further-context/account-recovery.md)) records its decisions in
-kinds that exist only in audit v5, alongside the transport-cursor and lag-lost EOSE repair rows. A v4 recorder drops them, so v4 files stay valid against the frozen v4 schema.
+kinds that exist only in audit v5, alongside the transport-cursor row and historical EOSE repair decoding. A v4 recorder drops them, so v4 files stay valid against the frozen v4 schema.
 They follow the recovery evidence model agreed for v5: need and eligibility changes, attempt start, acquisition and
 processing outcomes, and the owner's reassessment. Rows are transitions at the seam that made them durable, never
 scheduler polls, and recording never blocks or fails a recovery step: an audit-only storage read that fails skips the
@@ -984,7 +984,7 @@ Recovery need changed for one obligation.
 
 | Field | Meaning |
 | --- | --- |
-| `cause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, or `incremental_history` (the code's `RecoveryCause`). |
+| `cause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, or `subscription_replay` (the code's `RecoveryCause`). |
 | `change` | `recorded` (new debt), `joined` (charged to pending work), `resumed` (new evidence reopened a parked or retired obligation), `notice_shown` (it parked; its "history may be incomplete" notice is now shown), `notice_dismissed` (the user retired it), `closed` (a parked obligation completed with qualified coverage), or `closed_below_window` (an explicit full-history request closed because its whole retained window was certified and what remains lies below it; neither coverage nor a dismissal). |
 | `obligation_ref` | Hashed obligation id. |
 | `obligation_revision` | Revision the change left. |
@@ -1000,6 +1000,8 @@ Where it is recorded:
   Each notification lag mints its own generation with the floor read at the lag, so a lag that lowers the floor
   shows as a lower `floor_secs`; a lag with an unknown floor makes the goal `unbounded`.
 - Startup incremental history (`retained_window`) and explicit full-history repair (`unbounded`, by design) requests.
+- Native source observation (`subscription_replay`) records original-window input need without a loss charge.
+  Limited native admission never reports certified history, `window_certified`, or loss acknowledgment.
 - The notice publication seam (`take_history_notice_changes`): `notice_shown` for each newly parked occurrence, and
   `closed` for a withdrawn occurrence whose obligation is now satisfied. Parked obligations get no automatic retries,
   so `closed` means an explicit deep repair completed it. The first call after open only takes the baseline.
@@ -1159,32 +1161,11 @@ Notes:
   records a row; it only counts.
 - `sync_drain` keeps its own before/after cursor per drain; this row names what committed each advance.
 
-#### `relay_replay_recovery`
-
-One bounded owned-history recovery pass after notification lag. It selects current REQ/relay scopes issued by the
-lag mark that still owe admission, acquires their full original windows, and leaves live REQs unchanged. The account
-worker records the queued report at `publish_history_notice_changes`; the recovery task never waits for audit I/O.
-
-`receiver`, `trigger`, `lags` and `dropped_before` have the same meanings as the historical repair row below.
-The scope counts are REQ/relay pairs, not distinct relays:
-
-| Field | Meaning |
-| --- | --- |
-| `pending_relays` | Eligible scopes requiring this pass's capture or an already active capture. |
-| `started_relays` | Scopes for which this pass started bounded full-window acquisition. |
-| `active_relays` | Scopes whose unexpired capture this pass joined without restarting it. |
-| `follow_up_scheduled` | Another paced pass will check pending scopes. Shutdown can leave pending scopes without scheduling one. |
-
-`pending_relays` equals `started_relays + active_relays`. Parked failed generations are excluded until a newer
-connection makes them eligible; one failed source must not create endless timer-driven loss. A scheduled follow-up
-requires pending scopes. These counts describe acquisition, not completed replay, router placement or durable coverage. No subscription ids, relay URLs,
-filters or lag marks are recorded. New sessions write this row; v4 recorders omit it.
-
 #### `subscription_eose_repaired` (historical)
 
 Historical evidence from the relay plane's same-REQ end-of-stored-events repair (#2076), retained for decoding old
-sessions. That implementation re-issued unanswered REQs after notification lag settled. New sessions use
-`relay_replay_recovery` instead. Account-scoped; one row per pass.
+sessions. That implementation re-issued unanswered REQs after notification lag settled. New sessions record
+native input through the account recovery owner's existing rows, not this historical row.
 
 | Field | Meaning |
 | --- | --- |
@@ -1700,7 +1681,7 @@ let server-side tooling collate multiple devices into group-level analytics.
 | Why did recovery stop, retry, wait or park, and is another attempt permitted? | `recovery_obligation_reassessed` per settled obligation: `verdict`, `next_attempt`, progress, certified scopes and the quiet streak against the parking budget. |
 | When was "history may be incomplete" shown, dismissed or resolved? | `recovery_need_changed` with `notice_shown`, `notice_dismissed`, `resumed`, or `closed`, joined by `obligation_ref`. |
 | Why did the transport cursor move, and did live promotion push arrivals into the spill? | `transport_cursor_advanced`: trigger, before/after cursor, lookback, and spill and queue-loss placement counts. `sync_drain` keeps per-drain cursors. |
-| Did a notification lag cost subscriptions their end-of-stored-events, and were they repaired? | `subscription_eose_repaired` per repair pass: relays awaiting EOSE, completed without traffic, re-issued, re-issued earlier and failed, and whether a follow-up was scheduled. |
+| Did a notification gap or incomplete native replay require recovery? | Current sessions use owner rows with `notification_loss` or `subscription_replay`; limited native admission is not a history certificate or loss acknowledgment. `subscription_eose_repaired` describes historical repair passes only. |
 | Did a relay refuse this account's inbox or group subscriptions, and why? | `subscription_refused`: per relay and route kind, the refusal category, whether the relay client kept or dropped the REQ, and how often. |
 | Can a dashboard correlate the same member across client files? | `group_state_changed.actor_member_ref` and `subject_member_ref` are stable 16-byte hashes of member identity bytes. A producing engine's optional `source_context.local_member_ref` uses that same member-ref domain so a removal/leave subject can be joined to the producer. Absence is not a removal. This is not a membership interval or Goggles classification. |
 

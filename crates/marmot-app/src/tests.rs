@@ -1919,6 +1919,7 @@ fn failed_epoch_backfill_attempt_retains_one_correlated_retry() {
                 None,
                 marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             )
+            .await
             .unwrap()
             .expect("the armed gap is granted");
         client.released_backfill_reload_pending = true;
@@ -2124,6 +2125,7 @@ fn recovery_warning_requires_qualified_local_observations_and_survives_local_com
                 Some(&mut permit),
                 marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
             )
+            .await
             .unwrap()
             .unwrap();
         // The job fails while it takes ownership of its network result.
@@ -2148,6 +2150,7 @@ fn recovery_warning_requires_qualified_local_observations_and_survives_local_com
                 Some(&mut permit),
                 marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
             )
+            .await
             .unwrap()
             .unwrap();
         assert!(qualify_group_recovery_for_test(&storage, &grant, &group_id));
@@ -2342,6 +2345,7 @@ fn qualify_group_recovery_for_test(
         .map(|scope| RecoveryScopeCheckpoint {
             token: scope.token.clone(),
             retained_known_event: false,
+            replay_admitted: false,
             endpoints: scope
                 .goal
                 .required_endpoints
@@ -2779,6 +2783,7 @@ fn a_failed_epoch_backfill_execution_paces_the_next_automatic_seam() {
                 Some(&mut permit),
                 marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
             )
+            .await
             .unwrap()
             .expect("the armed gap is granted");
         client.released_backfill_reload_pending = true;
@@ -3134,6 +3139,7 @@ fn local_epoch_progress_does_not_clear_history_or_suppress_independent_gaps() {
                 None,
                 marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             )
+            .await
             .unwrap()
             .unwrap();
         // The app refuses group changes while this gap is armed (mdk#2258),
@@ -3383,6 +3389,7 @@ fn in_flight_epoch_backfill_arm_preserves_both_demands_on_failure() {
                 None,
                 marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             )
+            .await
             .unwrap()
             .unwrap();
         let epoch = client.group_mls_state(&group_b).unwrap().epoch;
@@ -3398,6 +3405,7 @@ fn in_flight_epoch_backfill_arm_preserves_both_demands_on_failure() {
                     None,
                     marmot_forensics::EpochBackfillExecutionSeam::Receive
                 )
+                .await
                 .unwrap()
                 .is_none()
         );
@@ -3425,6 +3433,7 @@ fn in_flight_epoch_backfill_arm_preserves_both_demands_on_failure() {
                     None,
                     marmot_forensics::EpochBackfillExecutionSeam::Receive
                 )
+                .await
                 .unwrap()
                 .is_none()
         );
@@ -3434,6 +3443,7 @@ fn in_flight_epoch_backfill_arm_preserves_both_demands_on_failure() {
                 None,
                 marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             )
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(retry.reservation.attempt_serial, 2);
@@ -3467,6 +3477,7 @@ fn repeated_epoch_backfill_deferral_does_not_multiply_identical_evidence() {
                 None,
                 marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             )
+            .await
             .unwrap()
             .unwrap();
         let retry = storage.recovery_retry_state().unwrap();
@@ -3484,6 +3495,7 @@ fn repeated_epoch_backfill_deferral_does_not_multiply_identical_evidence() {
                         None,
                         marmot_forensics::EpochBackfillExecutionSeam::Receive
                     )
+                    .await
                     .unwrap()
                     .is_none()
             );
@@ -3497,6 +3509,7 @@ fn repeated_epoch_backfill_deferral_does_not_multiply_identical_evidence() {
                     None,
                     marmot_forensics::EpochBackfillExecutionSeam::Maintenance
                 )
+                .await
                 .unwrap()
                 .is_none()
         );
@@ -3554,6 +3567,7 @@ fn owner_deferral_deduplicates_identical_observations_but_keeps_epoch_changes() 
                         None,
                         marmot_forensics::EpochBackfillExecutionSeam::Receive,
                     )
+                    .await
                     .unwrap(),
             );
         }
@@ -3573,6 +3587,7 @@ fn owner_deferral_deduplicates_identical_observations_but_keeps_epoch_changes() 
                         None,
                         marmot_forensics::EpochBackfillExecutionSeam::Receive
                     )
+                    .await
                     .unwrap()
                     .is_none()
             );
@@ -3617,6 +3632,7 @@ fn unresolved_epoch_backfill_scope_does_not_starve_another_group() {
                 None,
                 marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             )
+            .await
             .unwrap()
             .unwrap();
         assert!(grant.plan().unwrap().iter().any(|obligation| {
@@ -13061,6 +13077,7 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         // needed to prove cursor safety across this handoff and reopen.
         let grant = client
             .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Receive)
+            .await
             .unwrap();
         drop(grant);
         assert!(
@@ -13223,6 +13240,7 @@ impl LiveCursorFixture {
         })
         .await
         .expect("every subscription finishes replaying stored history");
+        client.synchronize_native_replay().await.unwrap();
         Self {
             app,
             client,
@@ -13340,7 +13358,7 @@ impl LiveCursorFixture {
     /// longer asks relays for it.
     pub(crate) async fn reopen_and_admit_spilled(self, event_id: &str) -> Self {
         let mut fixture = self.reopen().await;
-        assert_eq!(fixture.ingest_next_live_delivery().await, event_id);
+        fixture.client.sync().await.unwrap();
         assert!(
             fixture
                 .client
@@ -20274,7 +20292,9 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
     assert_eq!(event_id, relay_event.id);
     let later_cursor = delivery.message.timestamp.0 + 10_000;
     let probe_cursor = |client: &AppClient| {
-        let sealed = client.adapter.seal_transport_cursor(Some(later_cursor));
+        let sealed = client
+            .adapter
+            .seal_transport_cursor(Some(later_cursor), |_| true);
         client
             .adapter
             .unseal_transport_cursor(client.state.last_transport_timestamp);
@@ -24121,11 +24141,7 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
         }
         delivery.message.timestamp = cgka_traits::Timestamp(cutoff.0 + 3600);
         delivery.received_at = cgka_traits::Timestamp(cutoff.0 + 3600);
-        let effects = bob_client
-            .runtime
-            .ingest_delivery(delivery.clone())
-            .await
-            .unwrap();
+        let effects = bob_client.runtime.ingest_delivery(&delivery).await.unwrap();
         assert!(matches!(
             effects.outcome,
             cgka_traits::IngestOutcome::Ignored { .. }
@@ -24141,11 +24157,7 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
             .client_with_relay_plane("bob", &plane, None)
             .await
             .unwrap();
-        let effects = reopened
-            .runtime
-            .ingest_delivery(delivery.clone())
-            .await
-            .unwrap();
+        let effects = reopened.runtime.ingest_delivery(&delivery).await.unwrap();
         assert!(matches!(
             effects.outcome,
             cgka_traits::IngestOutcome::Ignored { .. }
@@ -24225,7 +24237,7 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
         old_delivery.message = old_group_event;
         let ignored = reopened
             .runtime
-            .ingest_delivery(old_delivery)
+            .ingest_delivery(&old_delivery)
             .await
             .unwrap();
         assert!(!matches!(
@@ -24234,7 +24246,7 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
         ));
         assert!(ignored.effects.events.is_empty());
         assert!(app.messages("bob").unwrap().is_empty());
-        let old = reopened.runtime.ingest_delivery(delivery).await.unwrap();
+        let old = reopened.runtime.ingest_delivery(&delivery).await.unwrap();
         assert!(matches!(
             old.outcome,
             cgka_traits::IngestOutcome::Ignored { .. }

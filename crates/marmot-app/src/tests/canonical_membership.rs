@@ -116,7 +116,7 @@ async fn collect_new_deliveries(
         };
         let ingested = client
             .runtime
-            .ingest_delivery(cgka_traits::TransportDelivery {
+            .ingest_delivery(&cgka_traits::TransportDelivery {
                 account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
                 group_id_hint: None,
                 message: event.to_transport_message().unwrap(),

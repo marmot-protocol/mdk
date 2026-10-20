@@ -1001,9 +1001,11 @@ impl<S: StorageProvider> Engine<S> {
         self.last_ingest_left_object_unpersisted
     }
 
+    /// Ingest a borrowed transport message with its audit provenance.
+    /// The caller retains the original wire payload across the entire operation.
     pub async fn ingest_with_audit_context(
         &mut self,
-        msg: TransportMessage,
+        msg: &TransportMessage,
         transport_context: Option<marmot_forensics::AuditTransportContext>,
     ) -> Result<IngestOutcome, EngineError> {
         let operation_id = self.next_audit_operation_id();
@@ -1029,13 +1031,13 @@ impl<S: StorageProvider> Engine<S> {
             self.audit_with_context(
                 None,
                 Some(context.clone()),
-                crate::audit_helpers::transport_received_event(&msg, wire),
+                crate::audit_helpers::transport_received_event(msg, wire),
             );
         }
         self.audit_with_context(
             None,
             Some(context.clone()),
-            crate::audit_helpers::ingest_entry_event(&msg),
+            crate::audit_helpers::ingest_entry_event(msg),
         );
         let result = self.do_ingest(msg).await;
         match &result {
@@ -3459,7 +3461,7 @@ impl<S: StorageProvider> Engine<S> {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     async fn ingest(&mut self, msg: TransportMessage) -> Result<IngestOutcome, EngineError> {
-        self.ingest_with_audit_context(msg, None).await
+        self.ingest_with_audit_context(&msg, None).await
     }
 
     fn drain_events(&mut self) -> Vec<GroupEvent> {

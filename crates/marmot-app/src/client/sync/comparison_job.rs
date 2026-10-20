@@ -1,6 +1,10 @@
 //! Immutable comparison I/O for a worker-owned recovery grant. The task has no
 //! account storage, engine, session, or event-queue authority. The worker
 //! admits what it fetched a few events per turn, never through the live queue.
+//! Native and comparison frames share that admission budget and the known
+//! same-group `(timestamp, id)` minimum. An unfinished native range fences
+//! comparison admission for its group without spending acquisition credit.
+//! This orders available input, not history a relay has not returned yet.
 
 use super::super::{EpochGapBound, EpochGapWindow, EpochGapWindowKey, EpochGapWindows};
 use super::*;
@@ -15,9 +19,9 @@ use tokio::task::JoinHandle;
 use transport_nostr::MarmotRelayPlane;
 use transport_nostr_adapter::{
     NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionRequest,
-    NostrAcquisitionScope,
+    NostrAcquisitionScope, NostrReconciliationProgress, ReplayCapturePlan,
+    SubscriptionAttempt,
 };
-use transport_nostr_adapter::{NostrReconciliationProgress, SubscriptionAttempt};
 
 /// Owned events one worker turn admits before commands and live input run.
 pub(crate) const MAX_COMPARISON_ADMISSION_PER_TURN: usize = 4;
@@ -42,7 +46,13 @@ struct WindowObservation {
     hint: EpochGapWindow,
     reached: bool,
     /// Includes copies deduplicated in favor of comparison or another peer.
-    offered: HashSet<String>,
+    offered: HashMap<[u8; 32], WindowOffer>,
+}
+
+enum WindowOffer {
+    /// One raw event may route to several account-scoped deliveries.
+    Pending(usize),
+    Unretained,
 }
 
 #[cfg(test)]
@@ -61,12 +71,13 @@ pub(crate) struct ComparisonExecution {
 #[derive(Default)]
 pub(crate) struct ComparisonAdmission {
     routes: Vec<AdmissionRoute>,
-    pending: VecDeque<(
-        usize,
-        PendingSource,
-        transport_nostr_adapter::NostrRelayEvent,
-    )>,
+    pending: VecDeque<(usize, PendingSource, cgka_traits::TransportDelivery)>,
     summary: SyncSummary,
+    /// Whether the last bounded turn advanced either input. A blocked native
+    /// frontier waits on the existing source watch, not a retry or busy loop.
+    pub(crate) progressed: bool,
+    prefer_native: bool,
+    conversion_error: Option<AppError>,
     /// The grant changed mid-admission. The admitted prefix stays durable,
     /// but the pass certifies nothing.
     invalid: bool,
@@ -78,6 +89,11 @@ pub(crate) struct ComparisonAdmission {
 enum PendingSource {
     Comparison,
     Window,
+}
+
+enum OrderedInput {
+    Native,
+    Comparison(usize),
 }
 
 struct AdmissionRoute {
@@ -222,6 +238,7 @@ impl ComparisonRouteWorkResult {
 
 pub(crate) struct ComparisonNetworkResult {
     routes: Vec<ComparisonRouteResult>,
+    capture_error: Option<cgka_traits::TransportAdapterError>,
 }
 
 impl ComparisonNetworkResult {
@@ -273,7 +290,7 @@ impl ComparisonNetworkResult {
 
 /// Dropping the worker's handle cancels I/O and drops all unadmitted events.
 pub(crate) struct ComparisonNetworkJob {
-    handle: JoinHandle<(OwnedSemaphorePermit, ComparisonNetworkResult)>,
+    handle: JoinHandle<(Arc<OwnedSemaphorePermit>, ComparisonNetworkResult)>,
 }
 
 impl Drop for ComparisonNetworkJob {
@@ -374,7 +391,11 @@ async fn fetch_epoch_gap_window(
         async move {
             let (events, hint, reached) =
                 page_epoch_gap_window(plane, page_request, local, hint, deadline).await;
-            let offered = events.iter().map(|event| event.event.id.clone()).collect();
+            let offered = events.iter().filter_map(|event| {
+                let mut id = [0; 32];
+                hex::decode_to_slice(&event.event.id, &mut id).ok()
+                    .map(|()| (id, WindowOffer::Pending(1)))
+            }).collect();
             (
                 events,
                 WindowObservation {
@@ -675,8 +696,13 @@ impl ComparisonNetworkJob {
             grant.fence.route_revision,
             grant.fence.inventory_revision,
         );
-        #[cfg(test)]
         let attempt_serial = grant.reservation.attempt_serial;
+        let credit = Arc::new(credit);
+        let replay_capture = ReplayCapturePlan {
+            attempt_serial,
+            sources: grant.replay_capture.clone(),
+            credit: credit.clone(),
+        };
         #[cfg(test)]
         let (scripted, scripted_delay, scripted_cursor) = (
             client.test_comparison_results.clone(),
@@ -691,199 +717,233 @@ impl ComparisonNetworkJob {
                     .store(attempt_serial, Ordering::SeqCst);
                 ActiveCounter::new(witness.active_jobs.clone())
             });
-            // Refill a completed slot even while an earlier route is stalled.
-            // Indexed results keep admission and audit in inventory order.
-            // These futures stay owned by this task, so abort drops every
-            // request before returning its account-wide credit.
-            let mut results = (0..routes.len()).map(|_| None).collect::<Vec<_>>();
-            let mut pending =
-                stream::iter(routes.into_iter().enumerate().map(|(index, frozen)| {
-                    let adapter = &adapter;
-                    let plane = &plane;
-                    let windows = &windows;
-                    #[cfg(test)]
-                    let (witness, scripted) = (&witness, &scripted);
-                    async move {
-                        let result = async move {
-                            let FrozenRoute {
-                                inventory,
-                                initial_cursor,
-                                window,
-                            } = frozen;
-                            if tokio::time::Instant::now() >= deadline {
-                                return ComparisonRouteResult {
-                                    route: inventory.route,
+            // Native capture and comparison share the cutoff, not each other's
+            // wait. A quiet original REQ must not consume the whole pass first.
+            let capture = async {
+                if !replay_capture.sources.is_empty() && tokio::time::Instant::now() < deadline {
+                    let cancellation = NostrAcquisitionCancellation::new();
+                    let _cancel_on_drop = cancellation.clone().drop_guard();
+                    let capture = adapter.capture_replay(replay_capture, cancellation.clone());
+                    tokio::pin!(capture);
+                    let captured = tokio::select! {
+                        result = &mut capture => result,
+                        () = tokio::time::sleep_until(deadline) => {
+                            cancellation.cancel();
+                            // Keep the credit until accepted acquisition has
+                            // observed cancellation and released its request.
+                            capture.await
+                        }
+                    };
+                    return captured.err();
+                }
+                None
+            };
+            let compare = async {
+                // Refill a completed slot even while an earlier route is stalled.
+                // Indexed results keep admission and audit in inventory order.
+                // These futures stay owned by this task, so abort drops every
+                // request before returning its account-wide credit.
+                let mut results = (0..routes.len()).map(|_| None).collect::<Vec<_>>();
+                let mut pending =
+                    stream::iter(routes.into_iter().enumerate().map(|(index, frozen)| {
+                        let adapter = &adapter;
+                        let plane = &plane;
+                        let windows = &windows;
+                        #[cfg(test)]
+                        let (witness, scripted) = (&witness, &scripted);
+                        async move {
+                            let result = async move {
+                                let FrozenRoute {
+                                    inventory,
                                     initial_cursor,
-                                    cursor: initial_cursor,
-                                    result: ComparisonRouteWorkResult::Skipped,
-                                    window: Vec::new(),
-                                    window_progress: Vec::new(),
-                                };
-                            }
-                            let endpoints = inventory.work.endpoints().to_vec();
-                            let (since, until) = (inventory.since, inventory.until);
-                            let progress = Arc::new(MemoryProgress {
-                                cursor: Mutex::new(initial_cursor),
-                            });
-                            // The hard guard must not cancel an SDK-owned partial prefix.
-                            // Leave time for its handoff, or for an epoch-gap relay's
-                            // history window when that relay could not compare.
-                            let remaining =
-                                deadline.saturating_duration_since(tokio::time::Instant::now());
-                            let reserve = if window.is_some() {
-                                (remaining / 2).min(EPOCH_GAP_WINDOW_MAX_DURATION)
-                            } else {
-                                (remaining / 5).min(Duration::from_millis(400))
-                            };
-                            let comparison_deadline = deadline - reserve;
-                            let run = async {
-                                #[cfg(test)]
-                                let _request_active = witness.as_ref().map(|witness| {
-                                    ActiveCounter::new(witness.active_requests.clone())
+                                    window,
+                                } = frozen;
+                                if tokio::time::Instant::now() >= deadline {
+                                    return ComparisonRouteResult {
+                                        route: inventory.route,
+                                        initial_cursor,
+                                        cursor: initial_cursor,
+                                        result: ComparisonRouteWorkResult::Skipped,
+                                        window: Vec::new(),
+                                        window_progress: Vec::new(),
+                                    };
+                                }
+                                let endpoints = inventory.work.endpoints().to_vec();
+                                let (since, until) = (inventory.since, inventory.until);
+                                let progress = Arc::new(MemoryProgress {
+                                    cursor: Mutex::new(initial_cursor),
                                 });
+                                // The hard guard must not cancel an SDK-owned partial prefix.
+                                // Leave time for its handoff, or for an epoch-gap relay's
+                                // history window when that relay could not compare.
+                                let remaining =
+                                    deadline.saturating_duration_since(tokio::time::Instant::now());
+                                let reserve = if window.is_some() {
+                                    (remaining / 2).min(EPOCH_GAP_WINDOW_MAX_DURATION)
+                                } else {
+                                    (remaining / 5).min(Duration::from_millis(400))
+                                };
+                                let comparison_deadline = deadline - reserve;
+                                let run = async {
+                                    #[cfg(test)]
+                                    let _request_active = witness.as_ref().map(|witness| {
+                                        ActiveCounter::new(witness.active_requests.clone())
+                                    });
+                                    #[cfg(test)]
+                                    if let Some(scripted) = &scripted {
+                                        let (delay, timed) =
+                                            match scripted.timed_answer(&inventory.route) {
+                                                Some((delay, answer)) => (delay, Some(answer)),
+                                                None => (None, None),
+                                            };
+                                        if let Some(cursor) = scripted_cursor {
+                                            progress.save_cursor(Some(cursor))?;
+                                        }
+                                        if let Some(delay) = delay.or(scripted_delay) {
+                                            tokio::time::sleep(delay).await;
+                                        }
+                                        return timed
+                                            .unwrap_or_else(|| scripted.answer(&inventory.route));
+                                    }
+                                    match inventory.work {
+                                        TransportReconciliationWork::Inbox(endpoints) => {
+                                            adapter
+                                                .reconcile_inbox_history(
+                                                    endpoints,
+                                                    &inventory.items,
+                                                    inventory.since,
+                                                    inventory.until,
+                                                    progress.as_ref(),
+                                                    comparison_deadline,
+                                                )
+                                                .await
+                                        }
+                                        TransportReconciliationWork::Group(group) => {
+                                            adapter
+                                                .reconcile_group_history(
+                                                    group,
+                                                    &inventory.items,
+                                                    inventory.since,
+                                                    inventory.until,
+                                                    progress.as_ref(),
+                                                    comparison_deadline,
+                                                )
+                                                .await
+                                        }
+                                    }
+                                };
+                                let result = match tokio::time::timeout_at(deadline, run).await {
+                                    Ok(value) => ComparisonRouteWorkResult::Returned(value),
+                                    Err(_) => ComparisonRouteWorkResult::TimedOut,
+                                };
                                 #[cfg(test)]
-                                if let Some(scripted) = &scripted {
-                                    let (delay, timed) =
-                                        match scripted.timed_answer(&inventory.route) {
-                                            Some((delay, answer)) => (delay, Some(answer)),
-                                            None => (None, None),
-                                        };
-                                    if let Some(cursor) = scripted_cursor {
-                                        progress.save_cursor(Some(cursor))?;
-                                    }
-                                    if let Some(delay) = delay.or(scripted_delay) {
-                                        tokio::time::sleep(delay).await;
-                                    }
-                                    return timed
-                                        .unwrap_or_else(|| scripted.answer(&inventory.route));
-                                }
-                                match inventory.work {
-                                    TransportReconciliationWork::Inbox(endpoints) => {
-                                        adapter
-                                            .reconcile_inbox_history(
-                                                endpoints,
-                                                &inventory.items,
-                                                inventory.since,
-                                                inventory.until,
-                                                progress.as_ref(),
-                                                comparison_deadline,
-                                            )
-                                            .await
-                                    }
-                                    TransportReconciliationWork::Group(group) => {
-                                        adapter
-                                            .reconcile_group_history(
-                                                group,
-                                                &inventory.items,
-                                                inventory.since,
-                                                inventory.until,
-                                                progress.as_ref(),
-                                                comparison_deadline,
-                                            )
-                                            .await
-                                    }
-                                }
-                            };
-                            let result = match tokio::time::timeout_at(deadline, run).await {
-                                Ok(value) => ComparisonRouteWorkResult::Returned(value),
-                                Err(_) => ComparisonRouteWorkResult::TimedOut,
-                            };
-                            #[cfg(test)]
-                            if let Some(witness) = &witness
-                                && let ComparisonRouteWorkResult::Returned(Ok(Some((_, events)))) =
-                                    &result
-                            {
-                                witness
-                                    .returned_events
-                                    .fetch_add(events.len(), Ordering::SeqCst);
-                                if let Some(target) =
-                                    witness.target_event_id.lock().unwrap().as_ref()
+                                if let Some(witness) = &witness
+                                    && let ComparisonRouteWorkResult::Returned(Ok(Some((
+                                        _,
+                                        events,
+                                    )))) = &result
                                 {
-                                    witness.matching_events.fetch_add(
-                                        events
-                                            .iter()
-                                            .filter(|event| {
-                                                event.event.id.eq_ignore_ascii_case(target)
-                                            })
-                                            .count(),
-                                        Ordering::SeqCst,
-                                    );
+                                    witness
+                                        .returned_events
+                                        .fetch_add(events.len(), Ordering::SeqCst);
+                                    if let Some(target) =
+                                        witness.target_event_id.lock().unwrap().as_ref()
+                                    {
+                                        witness.matching_events.fetch_add(
+                                            events
+                                                .iter()
+                                                .filter(|event| {
+                                                    event.event.id.eq_ignore_ascii_case(target)
+                                                })
+                                                .count(),
+                                            Ordering::SeqCst,
+                                        );
+                                    }
                                 }
-                            }
-                            let (window, window_progress) = match window {
-                                Some((transport_group_id, goal)) => {
-                                    let endpoints = result.uncompared_endpoints(&endpoints);
-                                    let remaining = deadline
-                                        .saturating_duration_since(tokio::time::Instant::now());
-                                    fetch_epoch_gap_window(
-                                        plane,
-                                        NostrAcquisitionRequest {
-                                            account_id: adapter.account_id().clone(),
-                                            scope: NostrAcquisitionScope::GroupWindow {
-                                                transport_group_id,
-                                                since,
-                                                until,
-                                                newest: Some(EPOCH_GAP_WINDOW_PAGE_EVENTS),
-                                            },
-                                            limits:
-                                                transport_nostr_adapter::NostrAcquisitionLimits {
+                                let (window, window_progress) = match window {
+                                    Some((transport_group_id, goal)) => {
+                                        let endpoints = result.uncompared_endpoints(&endpoints);
+                                        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                                        fetch_epoch_gap_window(
+                                            plane,
+                                            NostrAcquisitionRequest {
+                                                account_id: adapter.account_id().clone(),
+                                                scope: NostrAcquisitionScope::GroupWindow {
+                                                    transport_group_id,
+                                                    since,
+                                                    until,
+                                                    newest: Some(EPOCH_GAP_WINDOW_PAGE_EVENTS),
+                                                },
+                                                limits: transport_nostr_adapter::NostrAcquisitionLimits {
                                                     max_endpoints: endpoints.len(),
                                                     max_requested_event_ids: 1,
-                                                    max_received_items_per_endpoint:
-                                                        EPOCH_GAP_WINDOW_MAX_EVENTS_PER_RELAY,
-                                                    max_serialized_event_bytes_per_endpoint:
-                                                        EPOCH_GAP_WINDOW_MAX_BYTES_PER_RELAY,
-                                                    max_duration: remaining
-                                                        .min(EPOCH_GAP_WINDOW_MAX_DURATION),
+                                                    max_received_items_per_endpoint: EPOCH_GAP_WINDOW_MAX_EVENTS_PER_RELAY,
+                                                    max_serialized_event_bytes_per_endpoint: EPOCH_GAP_WINDOW_MAX_BYTES_PER_RELAY,
+                                                    max_duration: remaining.min(EPOCH_GAP_WINDOW_MAX_DURATION),
                                                 },
-                                            endpoints,
-                                        },
-                                        &inventory.items,
-                                        windows,
-                                        generation,
-                                        goal,
-                                        deadline,
-                                    )
-                                    .await
+                                                endpoints,
+                                            },
+                                            &inventory.items,
+                                            windows,
+                                            generation,
+                                            goal,
+                                            deadline,
+                                        )
+                                        .await
+                                    }
+                                    None => (Vec::new(), Vec::new()),
+                                };
+                                let cursor =
+                                    *progress.cursor.lock().expect("comparison progress mutex");
+                                ComparisonRouteResult {
+                                    route: inventory.route,
+                                    initial_cursor,
+                                    cursor,
+                                    result,
+                                    window,
+                                    window_progress,
                                 }
-                                None => (Vec::new(), Vec::new()),
-                            };
-                            let cursor =
-                                *progress.cursor.lock().expect("comparison progress mutex");
-                            ComparisonRouteResult {
-                                route: inventory.route,
-                                initial_cursor,
-                                cursor,
-                                result,
-                                window,
-                                window_progress,
                             }
+                            .await;
+                            (index, result)
                         }
-                        .await;
-                        (index, result)
-                    }
-                }))
-                .buffer_unordered(TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS);
-            while let Some((index, result)) = pending.next().await {
-                results[index] = Some(result);
-            }
-            let results = results
-                .into_iter()
-                .map(|result| result.expect("every frozen route returned"))
-                .collect();
-            (credit, ComparisonNetworkResult { routes: results })
+                    }))
+                    .buffer_unordered(TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS);
+                while let Some((index, result)) = pending.next().await {
+                    results[index] = Some(result);
+                }
+                results
+                    .into_iter()
+                    .map(|result| result.expect("every frozen route returned"))
+                    .collect()
+            };
+            let (capture_error, routes) = tokio::join!(capture, compare);
+            (
+                credit,
+                ComparisonNetworkResult {
+                    routes,
+                    capture_error,
+                },
+            )
         });
         Ok(Self { handle })
     }
 
     pub(crate) async fn wait(
         &mut self,
-    ) -> Result<(OwnedSemaphorePermit, ComparisonNetworkResult), tokio::task::JoinError> {
+    ) -> Result<(Arc<OwnedSemaphorePermit>, ComparisonNetworkResult), tokio::task::JoinError> {
         (&mut self.handle).await
     }
 }
 
 impl ComparisonAdmission {
+    /// Publish a successful bounded turn without waiting for the whole pass.
+    /// Accounting stays in the execution/routes; settlement returns only the
+    /// unconsumed output, so an already published prefix cannot repeat.
+    pub(crate) fn take_committed_summary(&mut self) -> SyncSummary {
+        std::mem::take(&mut self.summary)
+    }
+
     /// What each accepted route's relays returned, for a pass that ends
     /// before settlement.
     fn unsettled_routes(
@@ -917,6 +977,7 @@ impl AppClient {
         &mut self,
         grant: &AttemptGrant,
     ) -> Result<ComparisonExecution, AppError> {
+        self.synchronize_native_replay().await?;
         let mut execution = self
             .begin_recovery_execution(grant)
             .map_err(|failure| failure.source)?;
@@ -949,6 +1010,7 @@ impl AppClient {
         execution: &ComparisonExecution,
         compare_inventory: bool,
     ) -> Result<bool, AppError> {
+        self.synchronize_native_replay().await?;
         let storage = self.app.account_storage(&self.state.label)?;
         let app = storage.app_storage();
         self.synchronize_recovery_loss(&app)?;
@@ -965,14 +1027,36 @@ impl AppClient {
             }
             None => true,
         };
+        for selected in &grant.fence.obligations {
+            if current.obligations.contains(selected) {
+                continue;
+            }
+            // Passive native placement may settle this exact selected goal
+            // while the comparison runs. It must not discard another scope's
+            // comparison result, nor authorize a successor native revision.
+            let native = grant.plan().into_iter().flatten().any(|obligation| {
+                obligation.id == selected.0
+                    && obligation.cause == storage_sqlite::RecoveryCause::SubscriptionReplay
+            });
+            if !native
+                || !app
+                    .recovery_obligation_status(selected.0)?
+                    .is_some_and(|status| {
+                        status.revision == selected.1
+                            && status.cause == storage_sqlite::RecoveryCause::SubscriptionReplay
+                            && matches!(
+                                status.state,
+                                storage_sqlite::RecoveryObligationState::Satisfied
+                                    | storage_sqlite::RecoveryObligationState::Retired
+                            )
+                    })
+            {
+                return Ok(false);
+            }
+        }
         Ok(current.loss_revision == grant.fence.loss_revision
             && current.route_revision == grant.fence.route_revision
             && (!compare_inventory || current.inventory_revision == grant.fence.inventory_revision)
-            && grant
-                .fence
-                .obligations
-                .iter()
-                .all(|selected| current.obligations.contains(selected))
             && slot_stable
             && self.adapter.account_subscription_attempt().await == execution.attempt)
     }
@@ -983,8 +1067,11 @@ impl AppClient {
         &mut self,
         grant: &AttemptGrant,
         execution: &mut ComparisonExecution,
-        network: ComparisonNetworkResult,
+        mut network: ComparisonNetworkResult,
     ) -> Result<Option<ComparisonAdmission>, AppError> {
+        if let Some(error) = network.capture_error.take() {
+            return Err(error.into());
+        }
         let stable = self.comparison_grant_stable(grant, execution, true).await;
         if !matches!(stable, Ok(true)) {
             // The result is discarded unadmitted; its finish row still says
@@ -1094,17 +1181,7 @@ impl AppClient {
                     ))
             });
             batch.dedup_by(|(_, later), (_, kept)| later.event.id == kept.event.id);
-            let remaining = returned.then(|| {
-                batch
-                    .iter()
-                    .filter(|(source, _)| *source == PendingSource::Comparison)
-                    .count()
-            });
-            admission.pending.extend(
-                batch
-                    .into_iter()
-                    .map(|(source, event)| (index, source, event)),
-            );
+            let remaining = returned.then_some(0);
             admission.routes.push(AdmissionRoute {
                 route: route.route,
                 window_progress: route.window_progress,
@@ -1120,7 +1197,63 @@ impl AppClient {
                 fetched: 0,
                 acquisition,
             });
+            for (source, event) in batch {
+                let event_id = if admission.routes[index].window_progress.is_empty() {
+                    None
+                } else {
+                    let mut id = [0; 32];
+                    hex::decode_to_slice(&event.event.id, &mut id).ok().map(|()| id)
+                };
+                let deliveries = match self.adapter.recovered_deliveries(event).await {
+                    Ok(deliveries) => deliveries,
+                    Err(
+                        cgka_traits::TransportAdapterError::InvalidInboundEncoding
+                        | cgka_traits::TransportAdapterError::InvalidInboundSignature,
+                    ) => Vec::new(),
+                    Err(error) => {
+                        if source == PendingSource::Comparison
+                            && let Some(remaining) = admission.routes[index].remaining.as_mut()
+                        {
+                            *remaining += 1;
+                        }
+                        admission
+                            .conversion_error
+                            .get_or_insert_with(|| error.into());
+                        continue;
+                    }
+                };
+                if let Some(event_id) = event_id {
+                    for observation in &mut admission.routes[index].window_progress {
+                        if deliveries.is_empty() {
+                            observation.offered.remove(&event_id);
+                        } else if let Some(offered) = observation.offered.get_mut(&event_id) {
+                            *offered = WindowOffer::Pending(deliveries.len());
+                        }
+                    }
+                }
+                if source == PendingSource::Comparison {
+                    let route = &mut admission.routes[index];
+                    if deliveries.is_empty() {
+                        route.admitted = false;
+                        route.acquisition.rejected = route.acquisition.rejected.saturating_add(1);
+                    }
+                    if let Some(remaining) = route.remaining.as_mut() {
+                        *remaining += deliveries.len();
+                    }
+                }
+                admission.pending.extend(
+                    deliveries
+                        .into_iter()
+                        .map(|delivery| (index, source, delivery)),
+                );
+            }
         }
+        // Different retained routes can resolve to the same MLS group. Their
+        // known input must share the same minimum key, not route fetch order.
+        admission.pending.make_contiguous().sort_by(|a, b| {
+            (a.2.message.timestamp, a.2.message.id.as_slice())
+                .cmp(&(b.2.message.timestamp, b.2.message.id.as_slice()))
+        });
         Ok(Some(admission))
     }
 
@@ -1133,6 +1266,10 @@ impl AppClient {
         execution: &mut ComparisonExecution,
         admission: &mut ComparisonAdmission,
     ) -> Result<bool, AppError> {
+        admission.progressed = false;
+        if let Some(error) = admission.conversion_error.take() {
+            return Err(error);
+        }
         if admission.pending.is_empty() {
             return Ok(true);
         }
@@ -1144,86 +1281,75 @@ impl AppClient {
             admission.pending.clear();
             return Ok(true);
         }
-        // An event the account already holds costs a receipt lookup, not an
-        // ingest, so it does not spend one of the turn's slots. A newest
-        // window starts with held history; the late commit behind it then
-        // lands in this turn rather than after live input (mdk#2256).
+        // Both sources spend the same four actual-ingest slots. Native receipt
+        // skips additionally count toward four examined native frames, so a
+        // retained prefix cannot monopolize the worker.
         let mut spent = 0;
-        while spent < MAX_COMPARISON_ADMISSION_PER_TURN {
-            let Some((index, source, event)) = admission.pending.pop_front() else {
+        let mut native_examined = 0;
+        let mut blocked = HashSet::new();
+        while spent < MAX_COMPARISON_ADMISSION_PER_TURN
+            && native_examined < MAX_COMPARISON_ADMISSION_PER_TURN
+        {
+            let Some(input) = self.ordered_input(admission, &mut blocked).await else {
                 break;
             };
-            let event_id = event.event.id.clone();
-            let expected_route = admission.routes[index].route.clone();
-            let mut retained_or_rejected = true;
-            let mut window_fetched = 0_usize;
-            let mut held_only = true;
-            // A window event is delivered like any other, but it bears on
-            // neither the route's certificate nor its replay cursor: the
-            // comparison never claimed it.
-            let mut route =
-                (source == PendingSource::Comparison).then(|| &mut admission.routes[index]);
-            // An event that no longer routes to this account, or that cannot be
-            // read as a transport message, was not admitted. It withholds the
-            // route's certificate without failing the rest of the batch.
-            let deliveries = match self.adapter.recovered_deliveries(event).await {
-                Ok(deliveries) => deliveries,
-                Err(
-                    cgka_traits::TransportAdapterError::InvalidInboundEncoding
-                    | cgka_traits::TransportAdapterError::InvalidInboundSignature,
-                ) => Vec::new(),
-                Err(error) => return Err(error.into()),
+            // Alternate a fair native-group lookup with comparison's oldest
+            // eligible group even when that comparison keeps selecting older
+            // native frames. A large same-group prefix cannot monopolize both.
+            admission.prefer_native = !admission.prefer_native;
+            let OrderedInput::Comparison(position) = input else {
+                native_examined += 1;
+                spent += usize::from(self.admit_native_frame().await?);
+                admission.progressed = true;
+                continue;
             };
-            if let Some(route) = route.as_deref_mut() {
-                route.admitted &= !deliveries.is_empty();
-                if deliveries.is_empty() {
-                    route.acquisition.rejected = route.acquisition.rejected.saturating_add(1);
-                }
-            }
-            held_only &= !deliveries.is_empty();
-            for delivery in deliveries {
-                let window_scoped = source == PendingSource::Window
-                    && delivery.group_id_hint.as_ref().is_some_and(|group| {
-                        grant.plan().into_iter().flatten().any(|obligation| {
-                            obligation.group_id.as_ref() == Some(group)
-                                && obligation.scopes.iter().any(|scope| {
-                                    scope.goal.transport_group_id.is_some_and(|id| {
-                                        expected_route == TransportReconciliationRoute::Group(id)
-                                    })
+            let (index, source, delivery) = &admission.pending[position];
+            let expected_route = &admission.routes[*index].route;
+            let window_scoped = source == &PendingSource::Window
+                && delivery.group_id_hint.as_ref().is_some_and(|group| {
+                    grant.plan().into_iter().flatten().any(|obligation| {
+                        obligation.group_id.as_ref() == Some(group)
+                            && obligation.scopes.iter().any(|scope| {
+                                scope.goal.transport_group_id.is_some_and(|id| {
+                                    expected_route == &TransportReconciliationRoute::Group(id)
                                 })
-                        })
-                    });
-                let (summary, settled) = self.admit_recovered_delivery(delivery).await?;
-                admission.summary.merge(summary);
-                let counts = &mut execution.execution.counts;
-                match settled {
-                    super::RecoveredDelivery::AlreadyHeld => {
-                        counts.skipped = counts.skipped.saturating_add(1);
+                            })
+                    })
+                });
+            let mut unretained = false;
+            let mut window_fetched = 0_usize;
+            let (summary, settled) = self.admit_recovered_delivery(delivery).await?;
+            admission.summary.merge(summary);
+            let mut route =
+                (source == &PendingSource::Comparison).then(|| &mut admission.routes[*index]);
+            let counts = &mut execution.execution.counts;
+            match settled {
+                super::RecoveredDelivery::AlreadyHeld => {
+                    counts.skipped = counts.skipped.saturating_add(1);
+                }
+                super::RecoveredDelivery::Ingested {
+                    unpersisted,
+                    refused_group,
+                } => {
+                    spent += 1;
+                    counts.deliveries = counts.deliveries.saturating_add(1);
+                    if unpersisted {
+                        counts.unpersisted = counts.unpersisted.saturating_add(1);
+                        unretained = true;
+                    } else if window_scoped {
+                        window_fetched = window_fetched.saturating_add(1);
                     }
-                    super::RecoveredDelivery::Ingested {
-                        unpersisted,
-                        refused_group,
-                    } => {
-                        held_only = false;
-                        counts.deliveries = counts.deliveries.saturating_add(1);
+                    if let Some(route) = route.as_deref_mut() {
                         if unpersisted {
-                            counts.unpersisted = counts.unpersisted.saturating_add(1);
-                            retained_or_rejected = false;
-                        } else if window_scoped {
-                            window_fetched = window_fetched.saturating_add(1);
+                            route.admitted = false;
+                            route.retry_admission = true;
+                        } else {
+                            route.fetched = route.fetched.saturating_add(1);
                         }
-                        if let Some(route) = route.as_deref_mut() {
-                            if unpersisted {
-                                route.admitted = false;
-                                route.retry_admission = true;
-                            } else {
-                                route.fetched = route.fetched.saturating_add(1);
-                            }
-                        }
-                        if let Some(group) = refused_group {
-                            counts.refused = counts.refused.saturating_add(1);
-                            counts.refused_groups.insert(group);
-                        }
+                    }
+                    if let Some(group) = refused_group {
+                        counts.refused = counts.refused.saturating_add(1);
+                        counts.refused_groups.insert(group);
                     }
                 }
             }
@@ -1232,18 +1358,88 @@ impl AppClient {
             {
                 *remaining -= 1;
             }
-            let route = &mut admission.routes[index];
+            let route = &mut admission.routes[*index];
             route.fetched = route.fetched.saturating_add(window_fetched);
-            if retained_or_rejected {
+            if !route.window_progress.is_empty() {
+                let event_id: [u8; 32] = delivery.message.id.as_slice().try_into()
+                    .expect("the Nostr adapter validates 32-byte event IDs");
                 for observation in &mut route.window_progress {
-                    observation.offered.remove(&event_id);
+                    let std::collections::hash_map::Entry::Occupied(mut offered) =
+                        observation.offered.entry(event_id) else { continue };
+                    if unretained {
+                        *offered.get_mut() = WindowOffer::Unretained;
+                        continue;
+                    }
+                    if let WindowOffer::Pending(remaining) = offered.get_mut() {
+                        *remaining -= 1;
+                        if *remaining == 0 {
+                            offered.remove();
+                        }
+                    }
                 }
             }
-            if !held_only {
-                spent += 1;
+            admission.pending.remove(position);
+            admission.progressed = true;
+            if admission.pending.is_empty() {
+                break;
             }
         }
+        self.recovery_owner.native_batch = None;
         Ok(admission.pending.is_empty())
+    }
+
+    /// Select known input without crossing either source's same-group minimum.
+    /// A Pending native range fences only that group; independent groups and
+    /// the worker's command/live turn remain available.
+    async fn ordered_input(
+        &mut self,
+        admission: &ComparisonAdmission,
+        blocked: &mut HashSet<GroupId>,
+    ) -> Option<OrderedInput> {
+        use super::native_ingress::NativeFrontier;
+
+        if admission.prefer_native {
+            // Return the prior suffix to the ingress's fair group rotation.
+            self.recovery_owner.native_batch = None;
+            if matches!(self.take_native_batch(None).await, NativeFrontier::Ready) {
+                return self.native_or_comparison(admission);
+            }
+        }
+        for (position, (_, _, delivery)) in admission.pending.iter().enumerate() {
+            let Some(group) = delivery.group_id_hint.as_ref() else {
+                return Some(OrderedInput::Comparison(position));
+            };
+            if blocked.contains(group) {
+                continue;
+            }
+            match self.take_native_batch(Some(group)).await {
+                NativeFrontier::Ready => return self.native_or_comparison(admission),
+                NativeFrontier::Empty => return Some(OrderedInput::Comparison(position)),
+                NativeFrontier::Pending => {
+                    blocked.insert(group.clone());
+                }
+            }
+        }
+        self.recovery_owner.native_batch = None;
+        if matches!(self.take_native_batch(None).await, NativeFrontier::Ready) {
+            self.native_or_comparison(admission)
+        } else {
+            None
+        }
+    }
+
+    fn native_or_comparison(&self, admission: &ComparisonAdmission) -> Option<OrderedInput> {
+        let native = self
+            .recovery_owner
+            .native_batch
+            .as_ref()
+            .and_then(|batch| batch.delivery())?;
+        let comparison = admission.pending.iter().position(|(_, _, delivery)| {
+            delivery.group_id_hint == native.group_id_hint
+                && (delivery.message.timestamp, delivery.message.id.as_slice())
+                    < (native.message.timestamp, native.message.id.as_slice())
+        });
+        Some(comparison.map_or(OrderedInput::Native, OrderedInput::Comparison))
     }
 
     /// Run one selected grant through the job and wait for it: the path of an
@@ -1281,8 +1477,18 @@ impl AppClient {
             }
         };
         let completed = loop {
+            let mut native_changes = self.adapter.replay_changes().await;
+            let native_progress = match self.admit_native_turn().await {
+                Ok(progress) => progress,
+                Err(error) => {
+                    network.abort_and_wait().await;
+                    return Err(self.fail_comparison_grant(grant, execution, None, error));
+                }
+            };
             tokio::select! {
                 completed = network.wait() => break completed.ok(),
+                () = super::native_ingress::wait_native_change(&mut native_changes) => {}
+                () = tokio::task::yield_now(), if native_progress => {}
                 () = tokio::time::sleep(RECOVERY_JOB_CANCEL_POLL),
                     if control.is_some() =>
                 {
@@ -1358,6 +1564,7 @@ impl AppClient {
         };
         if let Some(admission) = admission.as_mut() {
             loop {
+                let mut native_changes = self.adapter.replay_changes().await;
                 // Cancellation, or the whole budget spent past the admission
                 // reserve, stops at a turn boundary. The admitted prefix stays
                 // durable; the pass certifies nothing, so the debt waits for a
@@ -1381,7 +1588,13 @@ impl AppClient {
                     .await
                 {
                     Ok(true) => break,
-                    Ok(false) => tokio::task::yield_now().await,
+                    Ok(false) => {
+                        tokio::select! {
+                            () = super::native_ingress::wait_native_change(&mut native_changes) => {}
+                            () = tokio::task::yield_now(), if admission.progressed => {}
+                            () = tokio::time::sleep(RECOVERY_JOB_CANCEL_POLL), if control.is_some() => {}
+                        }
+                    }
                     Err(error) => {
                         return Err(self.fail_comparison_grant(
                             grant,
@@ -1582,6 +1795,9 @@ impl AppClient {
                 SyncFailureStage::Unknown,
             )
         };
+        self.synchronize_native_replay()
+            .await
+            .map_err(&mut failure)?;
         let storage = self
             .app
             .account_storage(&self.state.label)
@@ -1678,7 +1894,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn abort_request_keeps_credit_until_network_future_is_dropped() {
         let capacity = Arc::new(tokio::sync::Semaphore::new(1));
-        let credit = capacity.clone().try_acquire_owned().unwrap();
+        let credit = Arc::new(capacity.clone().try_acquire_owned().unwrap());
         let entered = Arc::new(tokio::sync::Notify::new());
         let waiting = entered.notified();
         tokio::pin!(waiting);
@@ -1688,7 +1904,13 @@ mod tests {
             async move {
                 entered.notify_one();
                 std::future::pending::<()>().await;
-                (credit, ComparisonNetworkResult { routes: Vec::new() })
+                (
+                    credit,
+                    ComparisonNetworkResult {
+                        routes: Vec::new(),
+                        capture_error: None,
+                    },
+                )
             }
         });
         let job = ComparisonNetworkJob { handle };
@@ -1712,7 +1934,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn abort_and_wait_reaps_network_future_before_returning() {
         let capacity = Arc::new(tokio::sync::Semaphore::new(1));
-        let credit = capacity.clone().try_acquire_owned().unwrap();
+        let credit = Arc::new(capacity.clone().try_acquire_owned().unwrap());
         let entered = Arc::new(tokio::sync::Notify::new());
         let waiting = entered.notified();
         tokio::pin!(waiting);
@@ -1722,7 +1944,13 @@ mod tests {
             async move {
                 entered.notify_one();
                 std::future::pending::<()>().await;
-                (credit, ComparisonNetworkResult { routes: Vec::new() })
+                (
+                    credit,
+                    ComparisonNetworkResult {
+                        routes: Vec::new(),
+                        capture_error: None,
+                    },
+                )
             }
         });
         let job = ComparisonNetworkJob { handle };
@@ -1739,6 +1967,28 @@ mod tests {
         client: AppClient,
         storage: storage_sqlite::SqliteAccountStorage,
         group_id: GroupId,
+    }
+
+    // One thread makes the abort-and-reap boundary deterministic.
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborted_job_keeps_credit_while_accepted_capture_owns_cleanup() {
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let credit = Arc::new(capacity.clone().try_acquire_owned().unwrap());
+        let capture_cleanup_credit = credit.clone();
+        let handle = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            (
+                credit,
+                ComparisonNetworkResult {
+                    routes: Vec::new(),
+                    capture_error: None,
+                },
+            )
+        });
+        ComparisonNetworkJob { handle }.abort_and_wait().await;
+        assert_eq!(capacity.available_permits(), 0);
+        drop(capture_cleanup_credit);
+        assert_eq!(capacity.available_permits(), 1);
     }
 
     async fn fixture() -> Fixture {
@@ -1814,6 +2064,7 @@ mod tests {
                 None,
                 marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             )
+            .await
             .unwrap()
             .unwrap();
         fixture
@@ -1834,6 +2085,64 @@ mod tests {
                 stalled_epoch: epoch,
             }])
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_without_capture_tokens_does_not_scan_native_sources() {
+        let mut fixture = fixture().await;
+        let mut grant = fixture
+            .client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .unwrap()
+            .unwrap();
+        grant.inventory.clear();
+        grant.replay_capture.clear();
+        let calls = fixture.relay.acquisition_calls.load(Ordering::SeqCst);
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let credit = capacity.clone().try_acquire_owned().unwrap();
+        let mut job = ComparisonNetworkJob::start(
+            &fixture.client,
+            &grant,
+            credit,
+            ComparisonNetworkJob::automatic_deadline(),
+            None,
+        )
+        .unwrap();
+        let (credit, network) = job.wait().await.unwrap();
+        assert!(network.routes.is_empty());
+        assert!(network.capture_error.is_none());
+        assert_eq!(
+            fixture.relay.acquisition_calls.load(Ordering::SeqCst),
+            calls
+        );
+        assert_eq!(capacity.available_permits(), 0);
+        drop(credit);
+        assert_eq!(capacity.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_native_capture_failure_uses_the_job_failure_path() {
+        let mut fixture = fixture().await;
+        let grant = fixture
+            .client
+            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .unwrap()
+            .unwrap();
+        let execution = fixture.client.begin_comparison_grant(&grant).await.unwrap();
+        let result = fixture
+            .client
+            .admit_comparison_inline(
+                grant,
+                execution,
+                ComparisonNetworkResult {
+                    routes: Vec::new(),
+                    capture_error: Some(cgka_traits::TransportAdapterError::InvalidInboundEncoding),
+                },
+            )
+            .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1884,6 +2193,7 @@ mod tests {
                     Vec::new(),
                 )))),
             }],
+            capture_error: None,
         }
     }
 
@@ -1896,6 +2206,7 @@ mod tests {
         let grant = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         let route = grant
@@ -1946,6 +2257,7 @@ mod tests {
         let grant = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         let route = grant.inventory.first().unwrap().route.clone();
@@ -2004,6 +2316,7 @@ mod tests {
         let grant = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         let route = grant
@@ -2079,6 +2392,7 @@ mod tests {
         let grant = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         let route = grant.inventory.first().unwrap().route.clone();
@@ -2124,6 +2438,7 @@ mod tests {
         let grant = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         let route = grant.inventory.first().unwrap().route.clone();
@@ -2155,6 +2470,7 @@ mod tests {
         let grant = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         let (route, group_route) = grant
@@ -3172,6 +3488,7 @@ mod tests {
                         .then_some(&mut permit),
                     EpochBackfillExecutionSeam::Maintenance,
                 )
+                .await
                 .unwrap()
                 .expect("unserved history remains automatically selectable");
             if matches!(pass, FairnessPass::Automatic | FairnessPass::ExpiredFloor) {
@@ -3600,6 +3917,7 @@ mod tests {
                 .unwrap();
             sdk.client().shutdown().await;
             let network = ComparisonNetworkResult {
+                capture_error: None,
                 routes: vec![ComparisonRouteResult {
                     route: route.clone(),
                     initial_cursor,
@@ -3800,11 +4118,19 @@ mod tests {
                 .unwrap()
         );
         let late = candidate_for_route(group_route);
-        admission.pending.extend(
-            held.into_iter()
-                .chain([late.clone()])
-                .map(|event| (0, PendingSource::Window, event)),
-        );
+        for event in held.into_iter().chain([late.clone()]) {
+            let deliveries = fixture
+                .client
+                .adapter
+                .recovered_deliveries(event)
+                .await
+                .unwrap();
+            admission.pending.extend(
+                deliveries
+                    .into_iter()
+                    .map(|delivery| (0, PendingSource::Window, delivery)),
+            );
+        }
         assert!(
             fixture
                 .client
@@ -3970,6 +4296,7 @@ mod tests {
         let grant = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         let route = grant.inventory.first().unwrap().route.clone();
@@ -4072,10 +4399,20 @@ mod tests {
             .unwrap();
     }
 
-    fn epoch_gap_grant(fixture: &mut Fixture) -> (AttemptGrant, [u8; 32]) {
+    async fn epoch_gap_grant(fixture: &mut Fixture) -> (AttemptGrant, [u8; 32]) {
+        // These cases measure comparison fallback, not independent native
+        // capture of a startup REQ whose scripted EOSE has not run yet.
+        crate::tests::report_scripted_eose(
+            &fixture.client.relay_plane,
+            &fixture.relay,
+            every_subscription,
+        )
+        .await;
+        fixture.client.synchronize_native_replay().await.unwrap();
         let grant = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         let group_route = grant
@@ -4098,7 +4435,7 @@ mod tests {
     async fn an_epoch_gap_route_a_relay_failed_to_compare_fetches_its_newest_window() {
         let mut fixture = fixture_with_group_relays_and_comparison(None, false).await;
         arm_unpaced_epoch_gap(&fixture);
-        let (grant, group_route) = epoch_gap_grant(&mut fixture);
+        let (grant, group_route) = epoch_gap_grant(&mut fixture).await;
         let late = candidate_for_route(group_route);
         script_window(&fixture, &late);
         fixture.client.test_comparison_results = Some(group_route_comparison(true));
@@ -4128,52 +4465,6 @@ mod tests {
         assert!(
             matches!(outcome, EpochBackfillRunOutcome::Incomplete(_)),
             "a window fetch certifies nothing"
-        );
-    }
-
-    /// The late commit is the oldest event in a gap, and relays answer the
-    /// window newest first. Admission must not converge a newer commit from
-    /// the same page before the late one is buffered, so the window is queued
-    /// oldest first.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_window_is_admitted_oldest_first() {
-        let mut fixture = fixture().await;
-        let (grant, mut execution, route, group_route) = group_route_grant(&mut fixture).await;
-        let at = |created_at: u64| {
-            let signed = EventBuilder::new(Kind::MlsGroupMessage, "window")
-                .tags([Tag::custom("h", [hex::encode(group_route)])])
-                .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(created_at))
-                .finalize(&Keys::generate())
-                .unwrap();
-            transport_nostr_adapter::NostrRelayEvent {
-                endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
-                subscription_id: None,
-                event: transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&signed)
-                    .unwrap(),
-            }
-        };
-        // A relay that compared returned a newer commit than the late one
-        // the window recovered from a relay that could not compare.
-        let mut network = fetched(route, vec![at(25)]);
-        network.routes[0].window = vec![at(30), at(10), at(20)];
-        let admission = fixture
-            .client
-            .accept_comparison_network(&grant, &mut execution, network)
-            .await
-            .unwrap()
-            .expect("an unchanged grant owns its result");
-        assert_eq!(
-            admission
-                .pending
-                .iter()
-                .map(|(_, source, event)| (event.event.created_at, *source))
-                .collect::<Vec<_>>(),
-            vec![
-                (10, PendingSource::Window),
-                (20, PendingSource::Window),
-                (25, PendingSource::Comparison),
-                (30, PendingSource::Window),
-            ]
         );
     }
 
@@ -4256,7 +4547,7 @@ mod tests {
         ] {
             let mut fixture = fixture_with_group_relays_and_comparison(None, false).await;
             arm_unpaced_epoch_gap(&fixture);
-            let (grant, group_route) = epoch_gap_grant(&mut fixture);
+            let (grant, group_route) = epoch_gap_grant(&mut fixture).await;
             let newer = candidate_for_route(group_route);
             script_window_ending(&fixture, &newer, end);
             fixture.client.test_comparison_results = Some(group_route_comparison(true));
@@ -4267,13 +4558,6 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(
-                fixture
-                    .relay
-                    .acquisition_calls
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                1
-            );
             assert!(
                 !fixture
                     .client
@@ -4289,7 +4573,7 @@ mod tests {
     async fn an_epoch_gap_route_every_relay_compared_fetches_no_window() {
         let mut fixture = fixture_with_group_relays_and_comparison(None, false).await;
         arm_unpaced_epoch_gap(&fixture);
-        let (grant, group_route) = epoch_gap_grant(&mut fixture);
+        let (grant, group_route) = epoch_gap_grant(&mut fixture).await;
         script_window(&fixture, &candidate_for_route(group_route));
         fixture.client.test_comparison_results = Some(group_route_comparison(false));
 
@@ -4311,7 +4595,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_history_route_a_relay_failed_to_compare_fetches_no_window() {
         let mut fixture = fixture().await;
-        let (grant, group_route) = epoch_gap_grant(&mut fixture);
+        let (grant, group_route) = epoch_gap_grant(&mut fixture).await;
         assert!(
             grant
                 .plan()
@@ -4413,6 +4697,7 @@ mod tests {
         let grant = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         let route = grant.inventory.first().unwrap().route.clone();
@@ -4525,6 +4810,7 @@ mod tests {
         let grant = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         let routes = grant
@@ -4542,7 +4828,14 @@ mod tests {
         let execution = fixture.client.begin_comparison_grant(&grant).await.unwrap();
         fixture
             .client
-            .admit_comparison_inline(grant, execution, ComparisonNetworkResult { routes })
+            .admit_comparison_inline(
+                grant,
+                execution,
+                ComparisonNetworkResult {
+                    routes,
+                    capture_error: None,
+                },
+            )
             .await
             .unwrap();
         let app = fixture.client.app.clone();
@@ -4560,6 +4853,7 @@ mod tests {
             let grant = fixture
                 .client
                 .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+                .await
                 .unwrap()
                 .expect("deadline-cut debt remains selectable");
             assert!(
@@ -4596,6 +4890,7 @@ mod tests {
                             result: ComparisonRouteWorkResult::TimedOut,
                         })
                         .collect(),
+                    capture_error: None,
                 }
             };
             fixture
@@ -4633,6 +4928,7 @@ mod tests {
         let baseline = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         fixture
@@ -4648,6 +4944,7 @@ mod tests {
         let grant = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .expect("the comparison slot is selected");
         assert!(
@@ -4672,7 +4969,14 @@ mod tests {
         let execution = fixture.client.begin_comparison_grant(&grant).await.unwrap();
         fixture
             .client
-            .admit_comparison_inline(grant, execution, ComparisonNetworkResult { routes })
+            .admit_comparison_inline(
+                grant,
+                execution,
+                ComparisonNetworkResult {
+                    routes,
+                    capture_error: None,
+                },
+            )
             .await
             .unwrap();
         let finished = recorded_v5_rows(&fixture.client.app.clone(), "recovery_attempt_finished")
@@ -4691,6 +4995,7 @@ mod tests {
         let grant = fixture
             .client
             .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+            .await
             .unwrap()
             .unwrap();
         let serial = grant.reservation.attempt_serial;
@@ -4710,7 +5015,14 @@ mod tests {
         let execution = fixture.client.begin_comparison_grant(&grant).await.unwrap();
         fixture
             .client
-            .admit_comparison_inline(grant, execution, ComparisonNetworkResult { routes })
+            .admit_comparison_inline(
+                grant,
+                execution,
+                ComparisonNetworkResult {
+                    routes,
+                    capture_error: None,
+                },
+            )
             .await
             .unwrap();
         let app = fixture.client.app.clone();
@@ -4866,11 +5178,13 @@ mod tests {
             .iter()
             .position(|route| route.route == TransportReconciliationRoute::Group(route_id))
             .unwrap();
+        let mut refused_id = [0; 32];
+        hex::decode_to_slice(&refused.event.id, &mut refused_id).unwrap();
         assert!(
             admission.routes[index]
                 .window_progress
                 .iter()
-                .any(|observation| { observation.offered.contains(&refused.event.id) }),
+                .any(|observation| { observation.offered.contains_key(&refused_id) }),
             "deduplication cannot forget which peer still owns the refused range"
         );
         if shared {

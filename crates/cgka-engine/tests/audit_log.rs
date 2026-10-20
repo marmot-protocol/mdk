@@ -360,7 +360,7 @@ async fn audit_log_records_transport_received_before_ingest_entry() {
         wire: Some(wire),
     };
     engine
-        .ingest_with_audit_context(msg, Some(transport_context))
+        .ingest_with_audit_context(&msg, Some(transport_context))
         .await
         .expect("ingest");
     drop(engine);

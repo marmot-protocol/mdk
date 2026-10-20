@@ -44,6 +44,22 @@ async fn fixture() -> Fixture {
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     client.create_group("recovery audit", &[]).await.unwrap();
     let storage = app.account_storage("alice").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            client.synchronize_native_replay().await.unwrap();
+            let observation = client.adapter.replay_admission().await;
+            if client
+                .recovery_owner
+                .native_replay_authorizes(observation.generation())
+            {
+                break;
+            }
+            drop(observation);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the scripted native windows reach owner admission");
     Fixture {
         _dir: dir,
         _pump: pump,
@@ -54,12 +70,13 @@ async fn fixture() -> Fixture {
     }
 }
 
-fn authorize(client: &mut AppClient) -> Option<AttemptGrant> {
+async fn authorize(client: &mut AppClient) -> Option<AttemptGrant> {
     client
         .authorize_account_recovery(
             None,
             marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
         )
+        .await
         .unwrap()
 }
 
@@ -88,6 +105,42 @@ fn queue_loss_id(storage: &storage_sqlite::SqliteAccountStorage) -> [u8; 16] {
         .id
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_need_is_not_loss() {
+    let fixture = fixture().await;
+    let rows = recorded_v5_rows(&fixture.app, "recovery_need_changed");
+    let native = rows
+        .iter()
+        .filter(|row| row["event"]["cause"] == "subscription_replay")
+        .collect::<Vec<_>>();
+    assert!(!native.is_empty(), "native input is owned recovery need");
+    for row in native {
+        assert!(row["group_ref"].is_null());
+        assert!(row["event"].get("charged").is_none());
+        assert!(row["event"].get("snapshot").is_none());
+    }
+    assert!(rows.iter().all(|row| !matches!(
+        row["event"]["cause"].as_str(),
+        Some("queue_loss" | "notification_loss")
+    )));
+    assert!(
+        fixture
+            .storage
+            .app_storage()
+            .pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .all(|demand| demand.cause != RecoveryCause::SubscriptionReplay)
+    );
+    for row in recorded_v5_rows(&fixture.app, "recovery_obligation_reassessed")
+        .iter()
+        .filter(|row| row["event"]["cause"] == "subscription_replay")
+    {
+        assert_eq!(row["event"]["scopes_certified"], 0);
+        assert_ne!(row["event"]["progress"], "window_certified");
+    }
+}
+
 fn of_obligation<'rows>(rows: &'rows [Value], reference: &Value) -> Vec<&'rows Value> {
     rows.iter()
         .filter(|row| &row["event"]["obligation_ref"] == reference)
@@ -104,14 +157,14 @@ async fn loss_charged_at_authorization_records_its_cause_bound_and_count() {
         .app_storage()
         .record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
         .unwrap();
-    drop(authorize(&mut fixture.client));
+    drop(authorize(&mut fixture.client).await);
     // The same generation grows: charged to the pending obligation.
     fixture
         .storage
         .app_storage()
         .record_account_delivery_loss_bounded("alice", 41, 5, unix_now_seconds(), Some(floor))
         .unwrap();
-    drop(authorize(&mut fixture.client));
+    drop(authorize(&mut fixture.client).await);
     // A notification lag whose REQ floor was unknown.
     fixture
         .storage
@@ -125,7 +178,7 @@ async fn loss_charged_at_authorization_records_its_cause_bound_and_count() {
             None,
         )
         .unwrap();
-    drop(authorize(&mut fixture.client));
+    drop(authorize(&mut fixture.client).await);
 
     let rows = recorded_v5_rows(&fixture.app, "recovery_need_changed");
     let queue = rows
@@ -176,7 +229,9 @@ async fn quiet_passes_record_attempts_verdicts_parking_notice_and_dismissal() {
     let passes = storage_sqlite::RECOVERY_PARK_AFTER_QUIET_PASSES;
     let mut serials = Vec::new();
     for _ in 0..passes {
-        let grant = authorize(&mut fixture.client).expect("a retryable pass is selected");
+        let grant = authorize(&mut fixture.client)
+            .await
+            .expect("a retryable pass is selected");
         serials.push(grant.reservation.attempt_serial);
         fixture.client.test_comparison_results = Some(quiet_routes());
         fixture
@@ -318,7 +373,7 @@ async fn quiet_passes_record_attempts_verdicts_parking_notice_and_dismissal() {
         .app_storage()
         .record_account_delivery_loss_bounded("alice", 42, 1, unix_now_seconds(), None)
         .unwrap();
-    drop(authorize(&mut fixture.client));
+    drop(authorize(&mut fixture.client).await);
     let resumed = recorded_v5_rows(&fixture.app, "recovery_need_changed")
         .into_iter()
         .filter(|row| row["event"]["change"] == "resumed")
@@ -367,7 +422,9 @@ async fn new_loss_during_a_pass_supersedes_it() {
         .app_storage()
         .record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), None)
         .unwrap();
-    let grant = authorize(&mut fixture.client).expect("loss selects a grant");
+    let grant = authorize(&mut fixture.client)
+        .await
+        .expect("loss selects a grant");
     fixture.client.test_comparison_results = Some(quiet_routes());
     // New loss while the pass runs moves the obligation to a newer revision.
     fixture
@@ -531,125 +588,6 @@ async fn explicit_repair_below_the_window_records_a_searched_pass_and_its_close(
             .iter()
             .all(|row| row["event"]["change"] != "closed_below_window")
     );
-}
-
-/// A notification lag schedules the relay plane's lost-EOSE repair. The pass
-/// schedules owned acquisition and only queues its report; the worker's
-/// publication seam records it, including still-active work on a follow-up.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replay_pass_at_worker_seam() {
-    let dir = tempfile::tempdir().unwrap();
-    crate::AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
-        .unwrap();
-    let mut state = app.load_state("alice").unwrap();
-    state.last_transport_timestamp = Some(unix_now_seconds().saturating_sub(60));
-    app.save_state(&state).unwrap();
-    // No EOSE pump: the inbox owns an unfinished replay window at the lag.
-    let client = client_on_app_relay_plane(&app, "alice").await;
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while relay.accepted_subscriptions().is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the live inbox is installed before the lag");
-    let endpoint = relay.accepted_subscriptions()[0].endpoints()[0].clone();
-    *relay.acquisition_result.lock().unwrap() =
-        Some(transport_nostr_adapter::NostrAcquisitionResult {
-            endpoints: vec![transport_nostr_adapter::NostrAcquisitionEndpoint {
-                endpoint,
-                session_generation: None,
-                events: Vec::new(),
-                end: transport_nostr_adapter::NostrAcquisitionEnd::RequestPolicySatisfied,
-                stats: Default::default(),
-            }],
-        });
-    relay
-        .acquisition_block
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let plane = app.relay_plane.clone();
-    plane.set_eose_repair_settle_for_test(std::time::Duration::from_millis(20));
-    let account = client.adapter.account_id().clone();
-    plane.simulate_notification_lag_for_test(
-        &account,
-        1,
-        transport_nostr_adapter::NostrNotificationLossFloor::Since(unix_now_seconds() - 60),
-    );
-    let rows = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            client.record_eose_repair_reports();
-            let rows = recorded_v5_rows(&app, "relay_replay_recovery");
-            if rows
-                .iter()
-                .any(|row| row["event"]["active_relays"].as_u64().unwrap() > 0)
-            {
-                break rows;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the owned acquisition stays pending through a paced follow-up");
-    let event = &rows
-        .iter()
-        .find(|row| row["event"]["trigger"] == "notification_lag")
-        .unwrap()["event"];
-    assert_eq!(event["receiver"], "account");
-    assert_eq!(event["trigger"], "notification_lag");
-    assert_eq!(event["lags"], 1);
-    assert_eq!(event["dropped_before"], 0);
-    assert!(event["started_relays"].as_u64().unwrap() > 0);
-    for row in &rows {
-        let event = &row["event"];
-        let pending = event["pending_relays"].as_u64().unwrap();
-        assert!(pending > 0);
-        assert_eq!(
-            pending,
-            event["started_relays"].as_u64().unwrap() + event["active_relays"].as_u64().unwrap()
-        );
-        assert_eq!(event["follow_up_scheduled"], true);
-        assert!(event.get("failed_relays").is_none());
-        assert!(event.get("reissued_relays").is_none());
-        assert!(row["group_ref"].is_null());
-        let encoded = serde_json::to_string(row).unwrap();
-        assert!(!encoded.contains("alice"));
-        assert!(!encoded.contains("wss://"));
-        assert!(!encoded.contains(&hex::encode(account.as_slice())));
-    }
-    assert!(
-        relay
-            .acquisition_calls
-            .load(std::sync::atomic::Ordering::SeqCst)
-            > 0
-    );
-    relay
-        .acquisition_block
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    relay.acquisition_release.notify_one();
-    let settled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            client.record_eose_repair_reports();
-            if let Some(row) = recorded_v5_rows(&app, "relay_replay_recovery")
-                .into_iter()
-                .find(|row| row["event"]["pending_relays"] == 0)
-            {
-                break row;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("a follow-up observes the completed owned window");
-    assert_eq!(settled["event"]["trigger"], "follow_up");
-    assert_eq!(settled["event"]["lags"], 0);
-    assert_eq!(settled["event"]["follow_up_scheduled"], false);
-    assert!(recorded_v5_rows(&app, "subscription_eose_repaired").is_empty());
 }
 
 /// A relay's `CLOSED` of a live subscription is queued by the adapter and

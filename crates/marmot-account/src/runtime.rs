@@ -3139,9 +3139,11 @@ where
         Ok(output)
     }
 
+    /// Ingest a borrowed delivery through the ordinary engine and publication path.
+    /// Its transport owner retains the frame until the operation is acknowledged.
     pub async fn ingest_delivery(
         &mut self,
-        delivery: TransportDelivery,
+        delivery: &TransportDelivery,
     ) -> AccountResult<AccountIngestEffects> {
         self.ingest_delivery_with_observer(delivery, |_, _, _| {})
             .await
@@ -3149,9 +3151,10 @@ where
 
     /// Observe completed phase timings without changing ingest/publication ordering.
     /// Cancellation does not emit a completed phase; callers own whole-operation tracking.
+    /// The delivery and its wire payload remain borrowed through every phase.
     pub async fn ingest_delivery_with_observer(
         &mut self,
-        delivery: TransportDelivery,
+        delivery: &TransportDelivery,
         mut observe: impl FnMut(AccountIngestPhase, Duration, bool) + Send,
     ) -> AccountResult<AccountIngestEffects> {
         if delivery.account_id != self.session.self_id() {

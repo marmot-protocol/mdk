@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use cgka_traits::MessageId;
 use cgka_traits::TransportEndpoint;
@@ -72,7 +73,8 @@ pub struct RelayIndex(pub u32);
 /// Device-local assignment of stable opaque indices to relay endpoints.
 #[derive(Clone, Debug, Default)]
 pub struct RelayIndexRegistry {
-    indices: HashMap<TransportEndpoint, RelayIndex>,
+    indices: HashMap<Arc<TransportEndpoint>, RelayIndex>,
+    endpoints: Vec<Arc<TransportEndpoint>>,
     next: u32,
 }
 
@@ -90,6 +92,8 @@ impl RelayIndexRegistry {
         }
         let index = RelayIndex(self.next);
         self.next += 1;
+        let key = Arc::new(key);
+        self.endpoints.push(Arc::clone(&key));
         self.indices.insert(key, index);
         index
     }
@@ -100,25 +104,19 @@ impl RelayIndexRegistry {
 
     /// Resolve an opaque index back to its relay endpoint, if one is assigned.
     ///
-    /// This is the only reverse mapping in the module. It exists solely for the
-    /// opt-in export label boundary; the adapter gates access behind
-    /// [`RelayExportConsent`], so callers cannot reach a populated registry
-    /// without one.
+    /// Account-bound recovery borrows this mapping locally. Diagnostic export
+    /// still requires [`RelayExportConsent`] at the adapter's export boundary.
     pub fn resolve(&self, index: RelayIndex) -> Option<&TransportEndpoint> {
-        self.indices
-            .iter()
-            .find_map(|(endpoint, candidate)| (*candidate == index).then_some(endpoint))
+        self.endpoints.get(index.0 as usize).map(Arc::as_ref)
     }
 
     /// Every assigned `(index, endpoint)` pair, ascending by index.
     pub fn resolutions(&self) -> Vec<(RelayIndex, TransportEndpoint)> {
-        let mut pairs: Vec<(RelayIndex, TransportEndpoint)> = self
-            .indices
+        self.endpoints
             .iter()
-            .map(|(endpoint, index)| (*index, endpoint.clone()))
-            .collect();
-        pairs.sort_by_key(|(index, _)| index.0);
-        pairs
+            .enumerate()
+            .map(|(index, endpoint)| (RelayIndex(index as u32), endpoint.as_ref().clone()))
+            .collect()
     }
 }
 
@@ -499,8 +497,7 @@ struct StagedSubscriptionProgress {
     rollback_eose: HashMap<(String, RelayIndex), u64>,
 }
 
-/// Local recorder for subscription sync timing and the initial-sync gate. It
-/// also records which relays a notification-lag repair re-issued a REQ to.
+/// Local recorder for subscription sync timing and the initial-sync gate.
 ///
 /// Diagnostic only; must never feed convergence or branch selection.
 #[derive(Clone, Debug, Default)]
@@ -718,20 +715,6 @@ impl RelaySyncTelemetry {
             .or_else(|| self.staged.subscriptions.get(subscription_id))
             .and_then(|subscription| subscription.relays.get(&relay))
             .map(|progress| progress.eose_seen)
-    }
-
-    /// Whether this relay belongs to the current committed subscription
-    /// started at or before the lag mark, regardless of physical EOSE.
-    pub(crate) fn subscription_started_by(
-        &self,
-        subscription_id: &str,
-        relay: RelayIndex,
-        started_by_ms: u64,
-    ) -> bool {
-        self.subscriptions
-            .get(subscription_id)
-            .and_then(|subscription| subscription.relays.get(&relay))
-            .is_some_and(|progress| progress.started_ms <= started_by_ms)
     }
 
     /// Aggregate, privacy-safe snapshot of subscription sync timing.
@@ -1246,34 +1229,6 @@ mod tests {
         // Reissued: the prior EOSE no longer counts.
         telem.record_subscription_start("sub", &[A], 100);
         assert_eq!(telem.subscription_synced("sub"), Some(false));
-    }
-
-    #[test]
-    fn started_by_tracks_membership() {
-        let mut telem = RelaySyncTelemetry::default();
-        telem.record_subscription_start("sub", &[A, B], 100);
-        telem.record_eose("sub", A, 110);
-
-        assert!(telem.subscription_started_by("sub", A, 100));
-        assert!(telem.subscription_started_by("sub", B, 100));
-        assert!(!telem.subscription_started_by("sub", B, 99));
-        assert!(!telem.subscription_started_by("sub", C, 200));
-        assert!(!telem.subscription_started_by("unknown", A, 200));
-        assert_eq!(telem.subscription_endpoint_eose("sub", B), Some(false));
-
-        telem.begin_staged_subscription_starts();
-        telem.stage_subscription_start("staged", &[A], 200);
-        telem.stage_subscription_start("sub", &[C], 200);
-        assert!(!telem.subscription_started_by("staged", A, 300));
-        assert!(telem.subscription_started_by("sub", A, 100));
-        assert!(!telem.subscription_started_by("sub", C, 300));
-        telem.commit_staged_subscription_starts();
-        assert!(telem.subscription_started_by("staged", A, 200));
-        assert!(!telem.subscription_started_by("sub", A, 300));
-        assert!(!telem.subscription_started_by("sub", C, 199));
-        assert!(telem.subscription_started_by("sub", C, 200));
-        telem.forget_subscription("sub");
-        assert!(!telem.subscription_started_by("sub", C, 300));
     }
 
     #[test]
