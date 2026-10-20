@@ -301,7 +301,7 @@ impl SqliteAppStorage {
             let changed = tx
                 .execute(
                     "UPDATE avatar_assets SET bytes = ?1, digest = ?2, media_type = ?3,
-                width = ?4, height = ?5, refresh_at = ?6,
+                width = ?4, height = ?5, refresh_at = ?6, byte_len = NULL,
                 content_revision = content_revision + 1
              WHERE token = ?7 AND content_revision = ?8
                 AND (SELECT store_epoch FROM chat_presentation_meta WHERE id = 1) = ?9",
@@ -321,6 +321,13 @@ impl SqliteAppStorage {
             if changed == 0 {
                 return Ok(AvatarPublishResult::Superseded);
             }
+            // A database-held image replaces a file-backed one: its reference
+            // goes, and with the last one the file's key; the sweep unlinks it.
+            tx.execute(
+                "DELETE FROM avatar_file_refs WHERE token = ?1",
+                [&reference.token],
+            )
+            .storage()?;
             let accessed = next_access(&tx)?;
             touch_access(&tx, &reference.token, accessed)?;
             evict(&tx, &reference.token, limits)?;
@@ -446,11 +453,12 @@ impl SqliteAppStorage {
     ) -> StorageResult<(bool, Vec<media_store::FileId>)> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            crate::app::media_catalog::mark_lost_in(&conn, id)?;
+            // Only a report about this owner's current cache file counts: a
+            // stale id must not destroy a file another owner still reads.
             let current = conn
                 .query_row(
-                    "SELECT 1 FROM avatar_file_refs r JOIN avatar_assets a ON a.token = r.token
-                     WHERE r.token = ?1 AND r.file_id = ?2
+                    "SELECT 1 FROM avatar_file_refs r JOIN media_files f ON f.id = r.file_id
+                     WHERE r.token = ?1 AND r.file_id = ?2 AND f.category = 2
                         AND (SELECT store_epoch FROM chat_presentation_meta WHERE id = 1) = ?3",
                     params![
                         reference.token,
@@ -465,6 +473,7 @@ impl SqliteAppStorage {
             if !current {
                 return Ok((false, Vec::new()));
             }
+            crate::app::media_catalog::mark_lost_in(&conn, id)?;
             clear_image(&conn, &reference.token)?;
             Ok((true, released_if_gone(&conn, [id])?))
         })

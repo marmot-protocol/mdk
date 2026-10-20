@@ -4,7 +4,9 @@ use media_store::{MEDIA_DIRECTORY, MediaStore, PublishOutcome};
 use sha2::{Digest, Sha256};
 
 use super::*;
-use crate::app::avatar_cache::{AvatarAvailability, AvatarCacheUsage, AvatarImage};
+use crate::app::avatar_cache::{
+    AvatarAvailability, AvatarCacheUsage, AvatarImage, AvatarPublishResult,
+};
 use crate::{SqlCipherKey, SqliteAccountStorage, SqliteMediaCatalog};
 
 const NOW: u64 = 1_000;
@@ -295,6 +297,46 @@ fn a_legacy_image_becomes_file_backed() {
     assert_eq!(f.app().avatar_cache_usage().unwrap().byte_count, 3_000);
 }
 
+/// A database-held publication replaces a file-backed image: the reference
+/// goes and, with the last one, the file's key. A stale one changes nothing.
+#[test]
+fn a_database_held_image_replaces_a_file_backed_one() {
+    let f = Fixture::new();
+    let owner = f.bind("chat:aa");
+    let shared = f.bind("chat:bb");
+    let bytes = body(16, 3_000);
+    f.publish(&owner, 0, &bytes);
+    f.publish(&shared, 0, &bytes);
+    let legacy = AvatarImage::new(vec![2; 1_500], AvatarImageFormat::Png, 16, 16).unwrap();
+    assert_eq!(
+        f.app().publish_avatar(&owner, 0, &legacy, None).unwrap(),
+        AvatarPublishResult::Superseded,
+        "a stale completion loses"
+    );
+    assert_eq!(f.read_file(&owner), Some(bytes.clone()));
+    assert_eq!(
+        f.app().publish_avatar(&owner, 1, &legacy, None).unwrap(),
+        AvatarPublishResult::Published {
+            content_revision: 2
+        }
+    );
+    assert_eq!(
+        f.app().read_avatar(&owner, NOW).unwrap().image,
+        Some(legacy.clone())
+    );
+    assert_eq!(
+        f.count("SELECT count(*) FROM media_files"),
+        1,
+        "still shared"
+    );
+    f.app().publish_avatar(&shared, 1, &legacy, None).unwrap();
+    assert_eq!(f.count("SELECT count(*) FROM media_files"), 0);
+    assert_eq!(f.count("SELECT count(*) FROM avatar_file_refs"), 0);
+    f.sweep();
+    assert_eq!(f.files_on_disk(), 0);
+    assert_eq!(f.app().avatar_cache_usage().unwrap().byte_count, 3_000);
+}
+
 /// A missing or corrupt file is reported once: the file is marked lost, the
 /// reporting owner is cleared at once, and every other owner sharing it is
 /// cleared on its next read. Clearing schedules a refetch.
@@ -339,6 +381,37 @@ fn a_bad_file_is_discarded_and_refetched() {
         (false, Vec::new()),
         "a second report changes nothing"
     );
+}
+
+/// A report about a file the owner no longer uses changes nothing: the file
+/// another owner still reads stays ready with its key.
+#[test]
+fn a_stale_discard_leaves_a_shared_file_alone() {
+    let f = Fixture::new();
+    let alice = f.bind("identity:chat:aa:01");
+    let bob = f.bind("identity:chat:aa:02");
+    let shared = body(17, 2_000);
+    let old = file_of(f.publish(&alice, 0, &shared));
+    f.publish(&bob, 0, &shared);
+    f.publish(&alice, 1, &body(18, 2_500));
+    let key = |f: &Fixture| -> Vec<u8> {
+        f.store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT file_key FROM media_files WHERE id = ?1 AND state = 1",
+                [old.as_bytes().as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let before = key(&f);
+    assert_eq!(
+        f.app().discard_avatar_file(&alice, old).unwrap(),
+        (false, Vec::new())
+    );
+    assert_eq!(key(&f), before);
+    assert_eq!(f.read_file(&bob), Some(shared));
 }
 
 /// A store reset drops every avatar row and cache file key; the sweep then
