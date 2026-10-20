@@ -12,11 +12,12 @@
 //!   its first type-like segment (`crate::AppError`, `crate::sqlcipher::database_open_lock`).
 //!   A crate-root name that `lib.rs` re-exports from `directory::` is the
 //!   directory's own and does not count;
-//! - a `super::` path that climbs out of `directory/`;
+//! - a `super::` path that climbs out of `directory/`, counting inline modules;
 //! - a call to a `MarmotApp` method defined outside `directory/`
 //!   (`MarmotApp::account_home()`), or a read of a `MarmotApp` field
 //!   (`MarmotApp.relay_plane`), through `self` in a `MarmotApp` impl or through
-//!   a binding with an `app` word in its name (`app`, `app_for_plan`, `cached_app`);
+//!   a binding with an `app` word in its name (`app`, `app_for_plan`, `cached_app`).
+//!   `Self::name` in a `MarmotApp` impl and `MarmotApp::name` count as calls;
 //! - any path into `marmot_account` or `marmot_app`, which the new crate must
 //!   not depend on. Today's are listed like any other crossing, so they must be
 //!   gone before the move.
@@ -104,9 +105,22 @@ fn the_scan_sees_each_kind_of_crossing() {
                 let _ = super::super::unix_now_seconds();
                 tracing::warn!("{}", self.shared_storage().is_ok());
             }
+            fn through_paths(&self) {
+                let _ = Self::relay_endpoints(self);
+                tracing::debug!("{:?}", Self::outbox_endpoints(self));
+            }
             #[cfg(test)]
             fn only_in_tests(&self) {
                 let _ = self.deployment();
+            }
+        }
+        fn h(app: &MarmotApp) {
+            let _ = MarmotApp::account_dir(app, "label");
+        }
+        mod inner {
+            fn i() {
+                let _ = super::super::records::own_helper();
+                let _ = super::super::super::push_unique_strings();
             }
         }
         fn g(app_for_accounts: MarmotApp, cached_app: MarmotApp) {
@@ -123,9 +137,17 @@ fn the_scan_sees_each_kind_of_crossing() {
     };
     let hub = Hub {
         fields: ["relay_plane", "root"].map(str::to_owned).into(),
-        methods: ["account_home", "shared_storage", "deployment", "status"]
-            .map(str::to_owned)
-            .into(),
+        methods: [
+            "account_home",
+            "shared_storage",
+            "deployment",
+            "status",
+            "relay_endpoints",
+            "outbox_endpoints",
+            "account_dir",
+        ]
+        .map(str::to_owned)
+        .into(),
         directory_reexports: ["UserDirectoryRecord"].map(str::to_owned).into(),
     };
     let found: Vec<String> = crossings(&file, &hub).into_iter().collect();
@@ -134,11 +156,15 @@ fn the_scan_sees_each_kind_of_crossing() {
         [
             "MarmotApp.relay_plane",
             "MarmotApp.root",
+            "MarmotApp::account_dir()",
             "MarmotApp::account_home()",
             "MarmotApp::deployment()",
+            "MarmotApp::outbox_endpoints()",
+            "MarmotApp::relay_endpoints()",
             "MarmotApp::shared_storage()",
             "crate::AppError",
             "crate::ProductFamily",
+            "crate::push_unique_strings",
             "crate::sqlcipher::database_open_lock",
             "crate::unix_now_seconds",
             "marmot_account::AccountSummary",
@@ -444,6 +470,15 @@ impl Scan<'_> {
         let Some(first) = segments.first() else {
             return;
         };
+        // `Self::name` in a hub impl and `MarmotApp::name` anywhere reach the
+        // hub as surely as `self.name()`.
+        if let [ty, name] = segments
+            && ((ty == "Self" && self.in_hub_impl) || ty == "MarmotApp")
+            && self.hub.methods.contains(name)
+        {
+            self.found.insert(format!("MarmotApp::{name}()"));
+            return;
+        }
         if FORBIDDEN_CRATES.contains(&first.as_str()) && segments.len() > 1 {
             self.found.insert(truncate(segments));
             return;
@@ -532,6 +567,8 @@ impl Scan<'_> {
                     let name = ident.to_string();
                     if name == "crate"
                         || name == "super"
+                        || name == "Self"
+                        || name == "MarmotApp"
                         || FORBIDDEN_CRATES.contains(&name.as_str())
                     {
                         let mut path = vec![name.clone()];
@@ -602,6 +639,13 @@ impl<'ast> Visit<'ast> for Scan<'_> {
         }
         if let syn::Item::Use(item_use) = item {
             self.use_tree(&item_use.tree, &mut Vec::new());
+            return;
+        }
+        if let syn::Item::Mod(module) = item {
+            // An inline module is one more level for `super::` to climb.
+            self.module.push(module.ident.to_string());
+            visit::visit_item(self, item);
+            self.module.pop();
             return;
         }
         visit::visit_item(self, item);
