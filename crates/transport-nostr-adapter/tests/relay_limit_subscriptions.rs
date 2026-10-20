@@ -1348,6 +1348,10 @@ async fn neg_waits_cancel_and_isolate() {
 
     let failures =
         failure_classes(&fx, std::slice::from_ref(&url), Duration::from_millis(80)).await;
+    assert!(
+        owners.iter().all(|owner| !owner.is_finished()),
+        "owners must still hold their permits (SDK first-reply timeout is 5 s)"
+    );
     assert_eq!(failures, vec![NostrReconciliationFailure::RouteTimeout]);
     assert_eq!(
         fx.limit.stats().neg_opens,
