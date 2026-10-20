@@ -77,7 +77,6 @@ pub enum RetentionSweepStatusFfi {
     Pruned,
     DeferredClockSkew,
     DeferredUnread,
-    DeferredScanExhausted,
     Failed,
 }
 
@@ -88,7 +87,6 @@ impl From<RetentionSweepStatus> for RetentionSweepStatusFfi {
             RetentionSweepStatus::Pruned => Self::Pruned,
             RetentionSweepStatus::DeferredClockSkew => Self::DeferredClockSkew,
             RetentionSweepStatus::DeferredUnread => Self::DeferredUnread,
-            RetentionSweepStatus::DeferredScanExhausted => Self::DeferredScanExhausted,
             RetentionSweepStatus::Failed => Self::Failed,
         }
     }

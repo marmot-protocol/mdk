@@ -58,6 +58,22 @@ SAME_SHELL_SURFACES = (
     "integrations/opencode/marmot/README.md",
     "integrations/pi/marmot/README.md",
 )
+STABLE_VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+def documented_release_version(root: Path, workspace_version: str) -> str | None:
+    """Return the published release that install guidance pins.
+
+    A stable workspace version is the release being documented. Between releases master carries an
+    `X.Y.0-dev` version with no published assets, so guidance keeps pinning the newest release that
+    has `docs/release/<version>.md` notes.
+    """
+    if STABLE_VERSION.fullmatch(workspace_version):
+        return workspace_version
+    released = [tuple(int(part) for part in match.groups())
+                for path in (root / "docs/release").glob("*.md")
+                if (match := STABLE_VERSION.fullmatch(path.stem))]
+    return ".".join(str(part) for part in max(released)) if released else None
 
 
 def release_resolver_source(text: str) -> str | None:
@@ -257,8 +273,11 @@ def repository_errors(root: Path) -> list[str]:
                               (root / "Cargo.toml").read_text(encoding="utf-8"), re.MULTILINE)
     if version_match is None:
         return errors + ["Cargo.toml: missing workspace version"]
+    release_version = documented_release_version(root, version_match.group(1))
+    if release_version is None:
+        return errors + ["docs/release: no published release notes for a pre-release workspace version"]
     pinned = ('base_url="https://github.com/marmot-protocol/mdk/releases/download/'
-              f'wn-agent-v{version_match.group(1)}"')
+              f'wn-agent-v{release_version}"')
     for relative, installers in DOCUMENTED_INSTALL_CALLS.items():
         text = (root / relative).read_text(encoding="utf-8")
         if text.count(pinned) != 1 or len(re.findall(r'^base_url="https?://', text, re.MULTILINE)) != 1:

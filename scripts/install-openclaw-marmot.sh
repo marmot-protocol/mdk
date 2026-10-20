@@ -16,6 +16,18 @@ if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../Cargo.toml" ]; then
         sed -n 's/^version = "\(.*\)"/\1/p' "$SCRIPT_DIR/../Cargo.toml" 2>/dev/null |
             head -n 1 || true
     )"
+    case "$workspace_version_default" in
+        *-*)
+            # Between releases master carries X.Y.0-dev, which has no published
+            # assets; default to the newest release that has docs/release notes.
+            workspace_version_default="$(
+                for notes in "$SCRIPT_DIR"/../docs/release/*.md; do
+                    basename "$notes" .md
+                done | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' |
+                    sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1 || true
+            )"
+            ;;
+    esac
     workspace_version_default="${workspace_version_default:-latest}"
 fi
 

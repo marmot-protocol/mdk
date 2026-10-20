@@ -4,6 +4,9 @@
 
 ### Breaking changes
 
+- `RetentionSweepStatus::DeferredScanExhausted` is removed (mdk#2425): the
+  retention sweep no longer pages wall-clock history, so there is no page
+  cap to exhaust. Remove exhaustive handling of the variant.
 - Deployment services move onto `MarmotDeployment`, carried as
   `MarmotAppConfig::deployment` (host-configuration brief, PR 1). It holds the
   recovery-operated relays, discovery indexers, new-group media servers,
@@ -141,6 +144,14 @@
   closes) fails the call before anything is removed instead of reporting an
   error for a removal that already happened.
 
+- The retention sweep no longer prunes a message the unread projection still
+  counts unread (mdk#2425). The sweep used to compare only wall-clock
+  `timeline_at` against the read marker, so it deleted a received message
+  that shared the marker's second with a higher id, or one that arrived in a
+  later epoch while the sender's clock ran behind the marker. Storage now
+  answers the sweep with the projection's own cursor comparison over the rows
+  whose pinned expiry has passed, the same rows the prune deletes; the page
+  scan, its 20-page cap and the per-page classifier are gone.
 - A device woken mostly by notifications now detects that it is stuck behind
   its group. Notification wakes (`CursorPersistence::Frozen`) retain
   undecryptable traffic without tracking stalls, and the main app later sees

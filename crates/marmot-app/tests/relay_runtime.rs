@@ -9507,6 +9507,152 @@ async fn retained_media_rehydrates_a_retired_current_epoch_before_the_group_adva
     assert_eq!(download.plaintext, retained_plaintext);
 }
 
+/// mdk#2425: the sweep and the unread projection must agree on the full read
+/// cursor. Two received messages in one wall-clock second are separated only
+/// by message id; classifying the sweep by time alone pruned the one above
+/// the marker even while the projection still counted it unread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sweep_keeps_unread_message_in_read_marker_wall_second() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice
+        .create_group("read cursor retention", &["bob"])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    bob.sync().await.unwrap();
+    alice
+        .update_message_retention(&group_id, 24 * 60 * 60)
+        .await
+        .unwrap();
+    sync_to_epoch(
+        &mut bob,
+        &group_id,
+        alice.group_mls_state(&group_id).unwrap().epoch,
+    )
+    .await;
+
+    let bob_timeline = |app: &MarmotApp| {
+        app.timeline_messages_with_query(
+            "bob",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+    };
+
+    // Two chat messages inside one wall-clock second. Sends land away from a
+    // second boundary; retry if one slipped between the pair anyway.
+    let mut same_second_pair = None;
+    for _attempt in 0..10 {
+        loop {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            if (200..=700).contains(&(now_ms % 1_000)) {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        let first = alice
+            .send(&group_id, b"cursor pair first")
+            .await
+            .unwrap()
+            .message_ids;
+        let second = alice
+            .send(&group_id, b"cursor pair second")
+            .await
+            .unwrap()
+            .message_ids;
+        let first_id = first.into_iter().next().expect("send accepted");
+        let second_id = second.into_iter().next().expect("send accepted");
+        bob.sync().await.unwrap();
+        let messages = bob_timeline(&app);
+        let first_at = messages
+            .iter()
+            .find(|message| message.message_id_hex == first_id)
+            .map(|message| message.timeline_at);
+        let second_at = messages
+            .iter()
+            .find(|message| message.message_id_hex == second_id)
+            .map(|message| message.timeline_at);
+        if first_at.is_some() && first_at == second_at {
+            same_second_pair = Some((first_id, second_id));
+            break;
+        }
+    }
+    let (first_id, second_id) =
+        same_second_pair.expect("ten mid-second send attempts land a same-second pair");
+    let (read_id, unread_id) = if first_id < second_id {
+        (first_id, second_id)
+    } else {
+        (second_id, first_id)
+    };
+
+    app.mark_timeline_message_read("bob", &group_id_hex, &read_id)
+        .unwrap();
+    let bob_row = app
+        .chat_list("bob", false)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.group_id_hex == group_id_hex)
+        .expect("bob has the chat row");
+    assert_eq!(bob_row.unread_count, 1);
+    assert_eq!(
+        bob_row.first_unread_message_id_hex.as_deref(),
+        Some(unread_id.as_str())
+    );
+
+    let sweep_now_ms = (bob_timeline(&app)
+        .iter()
+        .find(|message| message.message_id_hex == unread_id)
+        .and_then(|message| message.retention_expires_at)
+        .expect("retention decision pins an expiry")
+        + 6)
+        * 1_000;
+    let report = bob.sweep_expired_retention(sweep_now_ms).unwrap();
+    let outcome = report
+        .groups
+        .iter()
+        .find(|outcome| outcome.group_id_hex == group_id_hex)
+        .expect("sweep reports the group");
+    assert_eq!(outcome.status, RetentionSweepStatus::DeferredUnread);
+    assert!(
+        bob_timeline(&app)
+            .iter()
+            .any(|message| message.message_id_hex == unread_id),
+        "the message the projection counts unread must survive the sweep"
+    );
+
+    app.mark_timeline_message_read("bob", &group_id_hex, &unread_id)
+        .unwrap();
+    let report = bob.sweep_expired_retention(sweep_now_ms).unwrap();
+    let outcome = report
+        .groups
+        .iter()
+        .find(|outcome| outcome.group_id_hex == group_id_hex)
+        .expect("sweep reports the group");
+    assert_eq!(outcome.status, RetentionSweepStatus::Pruned);
+    assert!(outcome.pruned_messages >= 2);
+    assert!(
+        !bob_timeline(&app)
+            .iter()
+            .any(|message| message.message_id_hex == unread_id),
+        "once read, the expired pair prunes"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() {
     let dir = tempfile::tempdir().unwrap();

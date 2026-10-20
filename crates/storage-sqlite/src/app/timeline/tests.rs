@@ -2015,7 +2015,7 @@ fn group_timeline_pagination_rejects_missing_canonical_cursor() {
 }
 
 #[test]
-fn wall_clock_timeline_query_preserves_retention_scan_order() {
+fn wall_clock_timeline_query_orders_by_sender_time() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let mut system_seven = group_system("system-7", "member_added", 100);
     system_seven.source_epoch = Some(7);

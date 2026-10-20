@@ -32,6 +32,7 @@ class InstallExampleSha256GateTests(unittest.TestCase):
                 target = root / name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source / name, target)
+            shutil.copytree(source / "docs/release", root / "docs/release")
             workflow = root / ".github/workflows/fixture.yml"
             workflow.parent.mkdir(parents=True)
             workflow.write_text("name: fixture\n")
@@ -61,6 +62,52 @@ class InstallExampleSha256GateTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
                 self.assertNotIn("command not found", result.stderr)
+
+    def test_documented_release_version_skips_dev_workspace_versions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.assertEqual(gate.documented_release_version(root, "0.14.0"), "0.14.0")
+            self.assertIsNone(gate.documented_release_version(root, "0.14.0-dev"))
+            notes = root / "docs/release"
+            notes.mkdir(parents=True)
+            for name in ("0.9.4.md", "0.13.0.md", "0.10.2.md", "wn-homebrew.md", "0.14.0-rc.1.md"):
+                (notes / name).write_text("notes\n")
+            self.assertEqual(gate.documented_release_version(root, "0.14.0-dev"), "0.13.0")
+            self.assertEqual(gate.documented_release_version(root, "0.14.0"), "0.14.0")
+
+    def test_checkout_installers_default_dev_workspace_to_newest_release(self):
+        source = Path(__file__).resolve().parents[1]
+        welcomer = "ab" * 32
+        for workspace_version, expected_tag in (("0.14.0-dev", "wn-agent-v0.13.0"),
+                                                ("0.14.0", "wn-agent-v0.14.0")):
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "repo"
+                (root / "scripts").mkdir(parents=True)
+                for name in ("install-hermes-marmot.sh", "install-openclaw-marmot.sh",
+                             "install-terminal-harness-marmot.sh", "install-claude-marmot.sh"):
+                    shutil.copy2(source / "scripts" / name, root / "scripts" / name)
+                (root / "Cargo.toml").write_text(
+                    f'[workspace.package]\nversion = "{workspace_version}"\n')
+                notes = root / "docs/release"
+                notes.mkdir(parents=True)
+                for name in ("0.9.4.md", "0.13.0.md", "0.12.0.md", "wn-homebrew.md"):
+                    (notes / name).write_text("notes\n")
+                env = {key: value for key, value in os.environ.items()
+                       if not key.startswith(("WN_AGENT_", "MARMOT_"))}
+                env["HOME"] = str(Path(temp) / "home")
+                for installer, flags in (
+                    ("install-hermes-marmot.sh", ["--no-configure-hermes"]),
+                    ("install-openclaw-marmot.sh", ["--allow-welcomer", welcomer]),
+                    ("install-claude-marmot.sh", ["--allow-welcomer", welcomer]),
+                ):
+                    with self.subTest(workspace_version=workspace_version, installer=installer):
+                        result = subprocess.run(
+                            ["bash", str(root / "scripts" / installer), "--dry-run", "--yes",
+                             "--no-service", *flags],
+                            cwd=temp, env=env, capture_output=True, text=True, timeout=60,
+                        )
+                        output = result.stdout + result.stderr
+                        self.assertIn(f" tag={expected_tag} ", output, output)
 
     def resolve_fixture(self, pages: list[list[dict]]) -> tuple[str, int]:
         readme = (Path(__file__).resolve().parents[1] / "integrations/README.md").read_text()

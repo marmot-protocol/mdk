@@ -1267,7 +1267,6 @@ pub enum RetentionSweepStatus {
     Pruned,
     DeferredClockSkew,
     DeferredUnread,
-    DeferredScanExhausted,
     Failed,
 }
 
@@ -3387,16 +3386,24 @@ impl MarmotApp {
             .message_timeline(query)?)
     }
 
-    pub(crate) fn timeline_messages_by_wall_clock_with_query(
+    pub(crate) fn retention_expiry_scan(
         &self,
         label: &str,
-        query: TimelineMessageQuery,
-    ) -> Result<TimelinePage, AppError> {
-        self.ensure_account_state(label)?;
+        group_id_hex: &str,
+        now_seconds: u64,
+        skew_now_seconds: u64,
+    ) -> Result<storage_sqlite::RetentionExpiryScan, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
         Ok(self
-            .account_storage(label)?
+            .account_storage(&account.label)?
             .app_storage()
-            .message_timeline_by_wall_clock(query)?)
+            .retention_expiry_scan(
+                &account.account_id_hex,
+                group_id_hex,
+                now_seconds,
+                skew_now_seconds,
+            )?)
     }
 
     pub fn message_edit_history(

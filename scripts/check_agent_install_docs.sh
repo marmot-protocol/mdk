@@ -27,7 +27,13 @@ import re
 import subprocess
 import sys
 
-version = sys.argv[1]
+sys.path.insert(0, str(Path("scripts").resolve()))
+from check_install_example_sha256 import documented_release_version, optional_latest_release_errors
+
+# A pre-release workspace version (master's X.Y.0-dev) keeps pinning the newest published release.
+version = documented_release_version(Path("."), sys.argv[1])
+if version is None:
+    raise SystemExit(f"error: no published release notes under docs/release for workspace version {sys.argv[1]}")
 quickstart = Path("integrations/README.md").read_text(encoding="utf-8")
 release_guide = Path("release.md").read_text(encoding="utf-8")
 base_url = (
@@ -36,8 +42,6 @@ base_url = (
 )
 # Quickstarts and the release record default to the documented release.
 # Latest selection is optional and centralized; preserve checksum pairing.
-sys.path.insert(0, str(Path("scripts").resolve()))
-from check_install_example_sha256 import optional_latest_release_errors
 errors = optional_latest_release_errors(quickstart)
 if errors:
     print("error: integrations/README.md: " + "; ".join(errors), file=sys.stderr)
@@ -80,7 +84,7 @@ for path in tracked(sys.argv[2:]):
         r"wn-agent-v[0-9]+\.[0-9]+\.[0-9]+/install-(?:hermes|openclaw|claude|codex|opencode|pi|goose)-marmot\.sh", text
     ):
         if not match.group().startswith(f"wn-agent-v{version}/"):
-            raise SystemExit(f"error: {path}: agent install guidance does not match workspace version {version}")
+            raise SystemExit(f"error: {path}: agent install guidance does not match documented release {version}")
 for path in tracked([".github/workflows"]):
     if "wn-agent-latest" in path.read_text(encoding="utf-8", errors="replace"):
         raise SystemExit(f"error: {path}: release workflows advertise a mutable WN Agent alias")

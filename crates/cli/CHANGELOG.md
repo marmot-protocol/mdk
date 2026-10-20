@@ -11,6 +11,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- The retention sweep status `deferred_scan_exhausted` no longer exists
+  (mdk#2425); the sweep has no page cap to hit.
 - An invite built from a KeyPackage the invitee had just replaced is no longer silently ignored (mdk#2344). After a
   Welcome consumes a KeyPackage, its private key now stays usable for 24 hours after the replacement is published
   (or until the KeyPackage expires, if sooner), so a Welcome an inviter built from the old publication can still be

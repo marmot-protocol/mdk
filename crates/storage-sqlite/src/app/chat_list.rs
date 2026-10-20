@@ -387,6 +387,29 @@ pub struct ChatListRow {
     pub leave_requested_at_ms: Option<u64>,
 }
 
+/// One-group facts the marmot-app retention sweep prunes on (mdk#2425). The
+/// unread leg is computed in storage so the sweep and the unread projection
+/// share one read-cursor definition; a wall-clock page scan cannot rank a
+/// later-epoch row against the marker correctly.
+///
+/// Every leg reads the pinned `app_events.retention_expires_at` that the
+/// prune deletes on, not `timeline_at` against the group's current policy:
+/// a row keeps the expiry of its source epoch's policy, so the two can
+/// disagree after a policy change. Rows with NULL expiry never prune and
+/// never count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetentionExpiryScan {
+    /// A row's expiry sits inside the clock-skew window
+    /// `(skew_now_seconds, now_seconds]`: due by the raw clock, not provably
+    /// due under the skew tolerance.
+    pub skew_boundary_rows: bool,
+    /// A received row due at `now_seconds` is still unread under the
+    /// projection's read-cursor comparison.
+    pub expired_unread: bool,
+    /// A row is due at `skew_now_seconds`: provably expired.
+    pub expired_rows: bool,
+}
+
 #[derive(Clone, Debug)]
 struct AccountGroupRow {
     group_id_hex: String,
@@ -420,6 +443,12 @@ impl ConversationReadState {
             self.last_read_order_at?,
             self.last_read_message_id_hex.as_deref()?,
         ))
+    }
+
+    /// True while the state holds a cursor row to compare against. A state
+    /// holding only the first-open `initialized_at` stamp has no marker yet.
+    fn has_read_marker(&self) -> bool {
+        self.canonical_order_key().is_some() || self.last_read_timeline_at.is_some()
     }
 }
 
@@ -455,6 +484,27 @@ impl SqliteAppStorage {
     pub fn chat_list_row(&self, group_id_hex: &str) -> StorageResult<Option<ChatListRow>> {
         let conn = self.lock()?;
         chat_list_row_tx(&conn, group_id_hex)
+    }
+
+    /// One-group scan of the facts the marmot-app retention sweep prunes on
+    /// (mdk#2425). `now_seconds` is the time the prune runs at;
+    /// `skew_now_seconds` is the same time shifted back by the clock-skew
+    /// tolerance. See [`RetentionExpiryScan`] for the returned legs.
+    pub fn retention_expiry_scan(
+        &self,
+        local_account_id_hex: &str,
+        group_id_hex: &str,
+        now_seconds: u64,
+        skew_now_seconds: u64,
+    ) -> StorageResult<RetentionExpiryScan> {
+        let conn = self.lock()?;
+        retention_expiry_scan_tx(
+            &conn,
+            local_account_id_hex,
+            group_id_hex,
+            now_seconds,
+            skew_now_seconds,
+        )
     }
 
     /// Direct-conversation candidates for a peer-keyed reuse lookup.
@@ -1815,6 +1865,60 @@ fn reconcile_unread_messages_tx(
 // Edits affect presentation, while mention eligibility stays on the original message.
 const ORIGINAL_PLAINTEXT_SQL: &str = "COALESCE((SELECT original.plaintext FROM app_events AS original WHERE original.group_id_hex=message_timeline.group_id_hex AND original.message_id_hex=message_timeline.message_id_hex), plaintext)";
 
+/// WHERE clause + parameters selecting rows that sort after a conversation's
+/// read cursor: the single definition of "unread" shared by the projection
+/// and the retention sweep (mdk#2425). Placeholders are numbered from
+/// `first_param`. Canonical order-key markers compare the five-column
+/// accepted-history key; legacy markers without one fall back to the
+/// `(timeline_at, message_id_hex)` pair; a marker-less state counts rows
+/// newer than its first-open initialization stamp.
+fn unread_cursor_clause(
+    read_state: &ConversationReadState,
+    first_param: usize,
+) -> StorageResult<(String, Vec<rusqlite::types::Value>)> {
+    if let Some((class, primary, phase, at, id)) = read_state.canonical_order_key() {
+        Ok((
+            format!(
+                "(timeline_order_class, timeline_order_primary,
+                  timeline_order_phase, timeline_order_at, message_id_hex)
+                    > (?{}, ?{}, ?{}, ?{}, ?{})",
+                first_param,
+                first_param + 1,
+                first_param + 2,
+                first_param + 3,
+                first_param + 4
+            ),
+            vec![
+                rusqlite::types::Value::Integer(i64::from(class)),
+                rusqlite::types::Value::Integer(u64_to_i64(primary)?),
+                rusqlite::types::Value::Integer(i64::from(phase)),
+                rusqlite::types::Value::Integer(u64_to_i64(at)?),
+                rusqlite::types::Value::Text(id.to_owned()),
+            ],
+        ))
+    } else if let Some(last_read_at) = read_state.last_read_timeline_at {
+        let marker_id = read_state.last_read_message_id_hex.as_deref().unwrap_or("");
+        Ok((
+            format!(
+                "(timeline_at > ?{0} OR (timeline_at = ?{0} AND message_id_hex > ?{1}))",
+                first_param,
+                first_param + 1
+            ),
+            vec![
+                rusqlite::types::Value::Integer(u64_to_i64(last_read_at)?),
+                rusqlite::types::Value::Text(marker_id.to_owned()),
+            ],
+        ))
+    } else {
+        Ok((
+            format!("timeline_at > ?{first_param}"),
+            vec![rusqlite::types::Value::Integer(u64_to_i64(
+                read_state.initialized_at,
+            )?)],
+        ))
+    }
+}
+
 fn unread_membership_for_message_tx(
     tx: &Connection,
     local_account_id_hex: &str,
@@ -1826,42 +1930,7 @@ fn unread_membership_for_message_tx(
     let Some(read_state) = read_state else {
         return Ok(None);
     };
-    let (where_sql, marker_params) =
-        if let Some((class, primary, phase, at, id)) = read_state.canonical_order_key() {
-            (
-                "(timeline_order_class, timeline_order_primary,
-                  timeline_order_phase, timeline_order_at, message_id_hex)
-                    > (?4, ?5, ?6, ?7, ?8)",
-                vec![
-                    rusqlite::types::Value::Integer(i64::from(class)),
-                    rusqlite::types::Value::Integer(u64_to_i64(primary)?),
-                    rusqlite::types::Value::Integer(i64::from(phase)),
-                    rusqlite::types::Value::Integer(u64_to_i64(at)?),
-                    rusqlite::types::Value::Text(id.to_owned()),
-                ],
-            )
-        } else if let Some(last_read_at) = read_state.last_read_timeline_at {
-            (
-                "(timeline_at > ?4 OR (timeline_at = ?4 AND message_id_hex > ?5))",
-                vec![
-                    rusqlite::types::Value::Integer(u64_to_i64(last_read_at)?),
-                    rusqlite::types::Value::Text(
-                        read_state
-                            .last_read_message_id_hex
-                            .as_deref()
-                            .unwrap_or("")
-                            .to_owned(),
-                    ),
-                ],
-            )
-        } else {
-            (
-                "timeline_at > ?4",
-                vec![rusqlite::types::Value::Integer(u64_to_i64(
-                    read_state.initialized_at,
-                )?)],
-            )
-        };
+    let (where_sql, marker_params) = unread_cursor_clause(read_state, 4)?;
     let activity_filter = chat_list_activity_filter_sql("");
     let sql = format!(
         "SELECT {ORIGINAL_PLAINTEXT_SQL}, tags_json, kind, timeline_order_class,
@@ -1914,61 +1983,18 @@ fn rebuild_unread_membership_tx(
             first_message_id: None,
         });
     };
-    let (where_sql, marker_params, order_sql) =
-        if let Some((class, primary, phase, at, id)) = read_state.canonical_order_key() {
-            (
-                "(timeline_order_class,
-              timeline_order_primary,
-              timeline_order_phase,
-              timeline_order_at,
-              message_id_hex) > (?3, ?4, ?5, ?6, ?7)",
-                vec![
-                    rusqlite::types::Value::Integer(i64::from(class)),
-                    rusqlite::types::Value::Integer(u64_to_i64(primary)?),
-                    rusqlite::types::Value::Integer(i64::from(phase)),
-                    rusqlite::types::Value::Integer(u64_to_i64(at)?),
-                    rusqlite::types::Value::Text(id.to_owned()),
-                ],
-                "timeline_order_class ASC,
-              timeline_order_primary ASC,
-              timeline_order_phase ASC,
-              timeline_order_at ASC,
-              message_id_hex ASC",
-            )
-        } else if let Some(last_read_at) = read_state.last_read_timeline_at {
-            let marker_id = read_state.last_read_message_id_hex.as_deref().unwrap_or("");
-            (
-                "(timeline_at > ?3 OR (timeline_at = ?3 AND message_id_hex > ?4))",
-                vec![
-                    rusqlite::types::Value::Integer(u64_to_i64(last_read_at)?),
-                    rusqlite::types::Value::Text(marker_id.to_owned()),
-                ],
-                "timeline_order_class ASC,
-              timeline_order_primary ASC,
-              timeline_order_phase ASC,
-              timeline_order_at ASC,
-              message_id_hex ASC",
-            )
-        } else {
-            (
-                "timeline_at > ?3 AND (?4 = ?4)",
-                vec![
-                    rusqlite::types::Value::Integer(u64_to_i64(read_state.initialized_at)?),
-                    rusqlite::types::Value::Text(String::new()),
-                ],
-                "timeline_order_class ASC,
-              timeline_order_primary ASC,
-              timeline_order_phase ASC,
-              timeline_order_at ASC,
-              message_id_hex ASC",
-            )
-        };
+    let (where_sql, marker_params) = unread_cursor_clause(read_state, 3)?;
     // Derive count + first-unread id + mention_count from one ordered scan over
     // the unread window. Persisted canonical anchors use the same accepted-history
     // key as timeline pagination even after retention prunes the marker row.
     // Legacy states without a canonical anchor retain their wall-clock unread
     // predicate, then use the canonical tuple to order that unread set just as
     // incremental reconciliation does.
+    let order_sql = "timeline_order_class ASC,
+              timeline_order_primary ASC,
+              timeline_order_phase ASC,
+              timeline_order_at ASC,
+              message_id_hex ASC";
     let activity_filter = chat_list_activity_filter_sql("");
     let scan_sql = format!(
         "SELECT message_id_hex, {ORIGINAL_PLAINTEXT_SQL}, tags_json, kind,
@@ -2036,6 +2062,94 @@ fn rebuild_unread_membership_tx(
         count,
         mention_count,
         first_message_id,
+    })
+}
+
+fn timeline_exists_tx(
+    tx: &Connection,
+    sql: &str,
+    params: &[rusqlite::types::Value],
+) -> StorageResult<bool> {
+    tx.query_row_cached(sql, rusqlite::params_from_iter(params.iter()), |row| {
+        row.get::<_, i64>(0)
+    })
+    .storage()
+    .map(|value| value != 0)
+}
+
+/// Read-side facts for the marmot-app retention sweep (mdk#2425). The unread
+/// leg reuses [`unread_cursor_clause`] under the projection's exact row
+/// universe, so the sweep cannot classify a row as read that the projection
+/// counts as unread.
+fn retention_expiry_scan_tx(
+    tx: &Connection,
+    local_account_id_hex: &str,
+    group_id_hex: &str,
+    now_seconds: u64,
+    skew_now_seconds: u64,
+) -> StorageResult<RetentionExpiryScan> {
+    let group = rusqlite::types::Value::Text(group_id_hex.to_owned());
+    let now = rusqlite::types::Value::Integer(u64_to_i64(now_seconds)?);
+    let skew_now = rusqlite::types::Value::Integer(u64_to_i64(skew_now_seconds)?);
+
+    // Comparisons against a NULL expiry are never true, so rows without a
+    // finite retention decision drop out of every leg, as they do in the prune.
+    let skew_boundary_rows = timeline_exists_tx(
+        tx,
+        "SELECT EXISTS(SELECT 1 FROM app_events
+                  WHERE group_id_hex = ?1
+                    AND retention_expires_at > ?2 AND retention_expires_at <= ?3)",
+        &[group.clone(), skew_now.clone(), now.clone()],
+    )?;
+    let expired_rows = timeline_exists_tx(
+        tx,
+        "SELECT EXISTS(SELECT 1 FROM app_events
+                  WHERE group_id_hex = ?1 AND retention_expires_at <= ?2)",
+        &[group.clone(), skew_now],
+    )?;
+
+    let expired_unread = match read_state_tx(tx, group_id_hex)? {
+        Some(read_state) if read_state.has_read_marker() => {
+            let (cursor_sql, cursor_params) = unread_cursor_clause(&read_state, 4)?;
+            let activity_filter = chat_list_activity_filter_sql("");
+            let sql = format!(
+                "SELECT EXISTS(SELECT 1 FROM message_timeline
+                  WHERE group_id_hex = ?1
+                    AND {activity_filter}
+                    AND deleted = 0
+                    AND invalidation_status IS NULL
+                    AND sender NOT IN (SELECT public_key FROM user_blocks)
+                    AND sender != ?2
+                    AND message_id_hex IN (
+                        SELECT message_id_hex FROM app_events
+                        WHERE group_id_hex = ?1 AND retention_expires_at <= ?3)
+                    AND {cursor_sql})"
+            );
+            let mut params = vec![
+                group,
+                rusqlite::types::Value::Text(local_account_id_hex.to_owned()),
+                now,
+            ];
+            params.extend(cursor_params);
+            timeline_exists_tx(tx, &sql, &params)?
+        }
+        // No read cursor yet: stay conservative, as the replaced page scan
+        // did, and treat every expired received row as unread rather than
+        // guessing what the account has seen.
+        _ => timeline_exists_tx(
+            tx,
+            "SELECT EXISTS(SELECT 1 FROM app_events
+                      WHERE group_id_hex = ?1
+                        AND direction = 'received'
+                        AND retention_expires_at <= ?2)",
+            &[group, now],
+        )?,
+    };
+
+    Ok(RetentionExpiryScan {
+        skew_boundary_rows,
+        expired_unread,
+        expired_rows,
     })
 }
 

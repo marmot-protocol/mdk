@@ -830,7 +830,6 @@ typedef enum MarmotRetentionSweepStatus {
    * Expired messages are still unread; pruning waits.
    */
   MARMOT_RETENTION_SWEEP_STATUS_DEFERRED_UNREAD,
-  MARMOT_RETENTION_SWEEP_STATUS_DEFERRED_SCAN_EXHAUSTED,
   MARMOT_RETENTION_SWEEP_STATUS_FAILED,
 } MarmotRetentionSweepStatus;
 

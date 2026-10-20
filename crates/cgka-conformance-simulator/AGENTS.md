@@ -246,7 +246,8 @@ Look at `three_client_happy_path_via_harness` for the canonical shape.
 
 1. Encode the runnable input as `ScenarioSpec` JSON in `vectors/*.json`.
 2. Include `scenario_name`, `vector_version`, `conformance_version`, `seed`, `scenario`, and either `expected_trace` or
-   `expected_outcomes`. Do not bump `conformance_version` outside a release.
+   `expected_outcomes`. Set `conformance_version` to the current workspace version (master's `X.Y.0-dev` between
+   releases); do not bump existing fixtures outside a release or the post-release `-dev` bump.
 3. Keep `ScenarioTrace` free of MLS bytes and Rust-only internals.
 4. Make fork-resolution behavior observable through a settled `convergence_decision` expectation, not just final
    membership.
