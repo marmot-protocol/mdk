@@ -2444,7 +2444,7 @@ mod tests {
                                             }
                                             filter.get("#h").is_some()
                                                 && filter.get("limit").and_then(Value::as_u64)
-                                                    != Some(EPOCH_GAP_WINDOW_MAX_EVENTS_PER_RELAY as u64)
+                                                    != Some(EPOCH_GAP_WINDOW_PAGE_EVENTS as u64)
                                         });
                                         if blocked {
                                             if frame.iter().skip(2).any(|filter| filter.get("ids").is_some()) {
