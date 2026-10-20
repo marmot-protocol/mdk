@@ -1380,6 +1380,12 @@ async fn neg_waits_cancel_and_isolate() {
     for owner in owners {
         assert!(owner.await.unwrap_err().is_cancelled());
     }
+    // Cancellation queues wire cleanup; observe it before reusing the relay cap.
+    assert!(
+        fx.limit
+            .wait_for(Duration::from_secs(2), |s| s.neg_active_now() == 0)
+            .await
+    );
     fx.limit.set_neg_fault(NegFault::None);
     let (summary, recovered) = fx
         .sdk

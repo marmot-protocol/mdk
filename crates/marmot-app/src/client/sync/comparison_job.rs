@@ -262,7 +262,7 @@ impl Drop for ComparisonNetworkJob {
 
 /// Ask the relays that failed an epoch-gap route's comparison for the route's
 /// newest events, inside the comparison window and what remains of the
-/// route's turn.
+/// pass.
 async fn fetch_epoch_gap_window(
     adapter: &transport_nostr::MarmotRelayPlaneAccountAdapter,
     transport_group_id: [u8; 32],
