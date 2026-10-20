@@ -1207,6 +1207,60 @@ async fn delayed_relay_returns_history() {
     assert_eq!(lingering, 0);
 }
 
+/// One relay answers its first NEG round and then goes silent; the other
+/// compares at once. The silent one is cut short of the pass deadline, so the
+/// history the healthy relay claimed is still fetched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_relay_leaves_time_to_fetch_the_others_history() {
+    const STORED: usize = 10;
+    let (fx, stalled) = connected_fixture(LimitConfig::default(), STORED).await;
+    let healthy = LimitRelay::start(fx.upstream_url.clone(), LimitConfig::default()).await;
+    fx.sdk
+        .client()
+        .add_relay(healthy.url())
+        .opts(fast_retry_options())
+        .await
+        .unwrap();
+    fx.sdk.client().connect().await;
+    assert!(
+        healthy
+            .wait_for(SETTLE_TIMEOUT, |s| s.open_connections() == 1)
+            .await
+    );
+    fx.limit.set_neg_fault(NegFault::StallAfterReply);
+    let rounds_before = fx.limit.stats().neg_fingerprint_rounds;
+    let (summary, events) = fx
+        .sdk
+        .reconcile_subscription(
+            route_on(&[stalled, healthy.url()], &fx.account),
+            &[],
+            SINCE,
+            UNTIL,
+            &Cursor::default(),
+            tokio::time::Instant::now() + STORM_WINDOW,
+        )
+        .await
+        .unwrap();
+    let stalled_rounds = fx.limit.stats().neg_fingerprint_rounds - rounds_before;
+    fx.limit.set_neg_fault(NegFault::None);
+    fx.shutdown().await;
+
+    assert!(
+        stalled_rounds > 0,
+        "the relay stalled after its first reply"
+    );
+    assert_eq!(events.len(), STORED, "{summary:?}");
+    assert_eq!(summary.relays_succeeded, 1, "{summary:?}");
+    assert_eq!(
+        summary
+            .endpoint_failures
+            .iter()
+            .map(|failure| failure.failure)
+            .collect::<Vec<_>>(),
+        [NostrReconciliationFailure::RouteTimeout]
+    );
+}
+
 /// Hundreds of completed passes on one connection: the NEG session count
 /// returns to zero after every pass and never approaches the 200 cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

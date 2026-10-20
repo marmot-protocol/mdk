@@ -1473,7 +1473,38 @@ impl NostrSdkRelayClient {
                 (endpoint, result)
             }
         });
-        let outcomes = futures::future::join_all(syncs).await;
+        // Once one endpoint has compared, the rest get until half of what was
+        // left of the pass. A relay that answered once and then stalled must
+        // not hold the pass to its deadline and leave no time to fetch what
+        // the healthy endpoints claimed. Until an endpoint succeeds, a slow
+        // one keeps the whole deadline: there is nothing to fetch without it.
+        let started = tokio::time::Instant::now();
+        let compare_cutoff = started + deadline.saturating_duration_since(started) / 2;
+        let mut pending = syncs.collect::<futures::stream::FuturesUnordered<_>>();
+        let mut outcomes = Vec::with_capacity(endpoints.len());
+        let mut cutoff = None;
+        loop {
+            let next = match cutoff {
+                None => pending.next().await,
+                Some(cutoff) => timeout_at(cutoff, pending.next()).await.unwrap_or(None),
+            };
+            let Some((endpoint, result)) = next else {
+                break;
+            };
+            if result.is_ok() {
+                cutoff = Some(compare_cutoff);
+            }
+            outcomes.push((endpoint, result));
+        }
+        drop(pending);
+        for endpoint in &endpoints {
+            if !outcomes.iter().any(|(compared, _)| compared == endpoint) {
+                outcomes.push((
+                    endpoint.clone(),
+                    Err(NostrReconciliationFailure::RouteTimeout),
+                ));
+            }
+        }
         let mut remote = HashSet::new();
         let mut remote_by_endpoint = HashMap::new();
         let mut failed_endpoints = HashSet::new();

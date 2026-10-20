@@ -138,7 +138,9 @@ Pass budgets:
 - These are returned-result and SDK-received budgets, not complete wire or memory ceilings.
 
 Each exact-ID request goes only to the endpoints whose comparison claimed that ID, and
-each endpoint's comparison has its own deadline. Fast endpoint failures leave that endpoint
+each endpoint's comparison has its own deadline. Once one endpoint has compared, the others get
+until half of what was left of the pass, so a relay that answers once and then stalls cannot use
+up the time to fetch what the others claimed. Fast endpoint failures leave that endpoint
 incomplete while healthy IDs continue within the same pass budgets; a silent endpoint can still
 consume most of the remaining deadline for the IDs it claimed. A byte/item/deadline exit
 retains partial events but leaves incomplete every endpoint whose claimed IDs the pass did not
