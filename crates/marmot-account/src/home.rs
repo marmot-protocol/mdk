@@ -28,7 +28,6 @@ const ACCOUNT_KEY_SECURITY_FILE: &str = "key-security.json";
 pub(crate) const ACCOUNT_SECRET_FILE: &str = "secret.json";
 pub const EXTERNAL_SQLCIPHER_SECRET_FILE: &str = ".external-sqlcipher-secret";
 pub(crate) const LOCAL_FILE_SECRET_BACKEND: &str = "local-dev-file";
-pub const DEFAULT_KEYCHAIN_SERVICE_NAME: &str = "com.marmot.whitenoise";
 const TRACE_TARGET: &str = "marmot_account::home";
 /// Subdirectory of the home root that holds account directories that have been
 /// atomically renamed out of the live `accounts/` namespace by
@@ -218,10 +217,6 @@ impl AccountHome {
     ) -> AccountHomeResult<Self> {
         let secret_store = Arc::new(KeychainSecretStore::new(service_name)?);
         Ok(Self::open_with_secret_store(root, secret_store))
-    }
-
-    pub fn open_with_default_keychain(root: impl AsRef<Path>) -> AccountHomeResult<Self> {
-        Self::open_with_keychain(root, DEFAULT_KEYCHAIN_SERVICE_NAME)
     }
 
     pub fn open_with_secret_store(

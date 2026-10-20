@@ -524,6 +524,7 @@ mod tests {
                     1,
                     MarmotRelayPolicy::AllowLoopback as u32,
                     ptr::null(),
+                    crate::deployment::OwnedDeployment::white_noise().as_ptr(),
                     &mut client
                 ),
                 MarmotStatus::Ok

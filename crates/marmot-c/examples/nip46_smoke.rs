@@ -170,6 +170,7 @@ impl Handle {
                     1,
                     MarmotRelayPolicy::AllowLoopback as u32,
                     &store,
+                    marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
                     &mut client,
                 )
             },

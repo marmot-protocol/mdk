@@ -4585,7 +4585,7 @@ impl MarmotAppRuntime {
             .accounts
             .app
             .deployment()
-            .profile_image_endpoint_or_fallback(blossom_server);
+            .profile_image_endpoint_for(blossom_server)?;
         crate::media::upload_profile_image_with_policy(
             &data,
             media_type,

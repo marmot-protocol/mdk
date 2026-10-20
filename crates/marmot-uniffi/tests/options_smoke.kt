@@ -11,17 +11,21 @@ private class OptionsStore : SecretStore {
 }
 
 fun main() {
-    val defaults = MarmotOptions()
+    // The deployment is the one required field.
+    val defaults = MarmotOptions(deployment = marmotDeploymentNeutral())
     check(defaults.relayPolicy == null && defaults.cursorPersistence == null)
     check(defaults.clientName == null && defaults.secretStore == null)
+    check(defaults.deployment.keychainService == "org.marmot-protocol.mdk")
     val options = MarmotOptions(
         relayPolicy = RelayPolicyFfi.ALLOW_LOOPBACK_RELAYS_AND_BLOBS,
         cursorPersistence = CursorPersistenceFfi.FROZEN,
         clientName = "whitenoise",
+        deployment = marmotDeploymentWhiteNoise(),
     )
     val copy = FfiConverterTypeMarmotOptions.lift(FfiConverterTypeMarmotOptions.lower(options))
     check(copy.relayPolicy == options.relayPolicy && copy.cursorPersistence == options.cursorPersistence)
     check(copy.clientName == "whitenoise")
+    check(copy.deployment.keychainService == "com.marmot.whitenoise")
     // Foreign callbacks are lowered into Rust by the constructor, not locally lifted.
     copy.secretStore = OptionsStore()
     val root = Files.createTempDirectory("marmot-options-").toFile()

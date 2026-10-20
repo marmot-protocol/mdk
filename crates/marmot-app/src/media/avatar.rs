@@ -27,11 +27,12 @@ pub(crate) fn validate(bytes: Vec<u8>, declared: Option<&str>) -> Result<AvatarI
     )?)
 }
 
-/// `group_image_server` serves encrypted group images; a profile picture loads
-/// from the URL its signed kind-0 metadata names.
+/// `group_image_server` serves encrypted group images, which can't load when
+/// the deployment sets none; a profile picture loads from the URL its signed
+/// kind-0 metadata names.
 pub(crate) async fn fetch(
     selected: &SelectedAvatar,
-    group_image_server: &str,
+    group_image_server: Option<&str>,
     transport: &BlossomHttpTransport,
 ) -> Result<AvatarImage, AppError> {
     tokio::time::timeout(
@@ -44,7 +45,7 @@ pub(crate) async fn fetch(
 
 async fn fetch_inner(
     selected: &SelectedAvatar,
-    group_image_server: &str,
+    group_image_server: Option<&str>,
     transport: &BlossomHttpTransport,
 ) -> Result<AvatarImage, AppError> {
     match selected {
@@ -53,6 +54,9 @@ async fn fetch_inner(
             validate(bytes, None)
         }
         SelectedAvatar::EncryptedGroupImage { image, .. } => {
+            let group_image_server = group_image_server.ok_or_else(|| {
+                AppError::BlobStore("this deployment sets no group-image server".into())
+            })?;
             let declared = image.media_type.as_deref().unwrap_or_default();
             let bytes = group_image::fetch_group_image_with_transport(
                 &image.image_hash_hex,
@@ -122,7 +126,7 @@ mod tests {
         };
         let error = fetch(
             &selected,
-            "https://blossom.example",
+            Some("https://blossom.example"),
             &BlossomHttpTransport::new(false),
         )
         .await

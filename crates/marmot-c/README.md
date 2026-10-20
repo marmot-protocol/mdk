@@ -98,8 +98,15 @@ static void report(const char *what) {
 
 int main(void) {
     MarmotClient *client = NULL;
+    MarmotDeployment *deployment = NULL;
     const char *relays[] = {"wss://relay.example.org"};
-    if (marmot_client_new("/path/to/home", relays, 1, &client) != MARMOT_STATUS_OK) {
+    if (marmot_deployment_white_noise(&deployment) != MARMOT_STATUS_OK) {
+        report("deployment_white_noise");
+        return 1;
+    }
+    MarmotStatus status = marmot_client_new("/path/to/home", relays, 1, deployment, &client);
+    marmot_deployment_free(deployment); /* the client keeps its own copy */
+    if (status != MARMOT_STATUS_OK) {
         report("client_new");
         return 1;
     }
@@ -179,12 +186,13 @@ the same defaults as the Swift/Kotlin `MarmotOptions` (see the
 [shared contract](../marmot-uniffi/README.md#runtime-options-and-client-label)). Use the matching header and library
 for that struct's layout. `marmot_client_new_with_client_name` is the older label-only constructor.
 
-`marmot_client_new_with_deployment` takes the same options plus a `MarmotDeployment`: the deployment's recovery
-relays, discovery indexers, media and image servers, Open Ranking, KeyPackage client preference, moderation label
-namespace and keychain service. Create one with `marmot_deployment_white_noise` or `marmot_deployment_neutral`,
-adjust it with the `marmot_deployment_set_*` functions, construct, then free it with `marmot_deployment_free`; the
-client keeps its own copy. A NULL deployment, like every other constructor, uses White Noise's until the default
-turns neutral. The [shared contract](../marmot-uniffi/README.md#deployment) covers the keychain caveat.
+Every `marmot_client_new*` constructor takes a required `MarmotDeployment` just before `out_client`: the
+deployment's recovery relays, discovery indexers, media and image servers, Open Ranking, KeyPackage client
+preference, moderation label namespace and keychain service. Create one with `marmot_deployment_white_noise` or
+`marmot_deployment_neutral`, adjust it with the `marmot_deployment_set_*` functions, construct, then free it with
+`marmot_deployment_free`; the client keeps its own copy. A NULL deployment returns `MARMOT_STATUS_NULL_POINTER`
+before anything opens. White Noise hosts pass `marmot_deployment_white_noise()`. The
+[shared contract](../marmot-uniffi/README.md#deployment) covers what neutral means and the keychain caveat.
 
 For private integration fixtures, `marmot_client_new_with_options` accepts
 an explicit loopback relay policy and an optional host secret-store vtable.

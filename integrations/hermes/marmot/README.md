@@ -790,9 +790,9 @@ selection or server size limits.
 MDK already has persistent admin-authorized group endpoint replacement through
 [`wn media set-endpoints`](../../../crates/cli/README.md#media) and the shared
 runtime/bindings. It changes signed group policy, not a Hermes preference, and
-is not currently an agent-control endpoint-setting request. Build-time
-`MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` sets defaults for new groups; exporting
-it when starting an installed binary does not reconfigure existing groups.
+is not currently an agent-control endpoint-setting request. New groups
+get White Noise's media servers from the connector's deployment; a later change
+to that list does not reconfigure existing groups.
 Do not promise that installing the connector imports an account's kind-10063
 Blossom server list. Keep the endpoint-selection feature separate from
 [voice-note intent](https://github.com/marmot-protocol/mdk/issues/1252) and

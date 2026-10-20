@@ -19,7 +19,7 @@ import io.crates.keyring.Keyring
  *     override fun onCreate() {
  *         super.onCreate()
  *         MarmotAndroid.initialize(this)
- *         // ... Marmot(rootPath, relayUrls) is now safe to construct
+ *         // ... Marmot(rootPath, relayUrls, marmotDeploymentWhiteNoise()) is now safe to construct
  *     }
  * }
  * ```
