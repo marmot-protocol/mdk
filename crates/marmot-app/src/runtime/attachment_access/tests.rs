@@ -1583,9 +1583,15 @@ async fn the_first_maintenance_pass_settles_a_leftover_wal() {
     assert!(wal() > 0);
     assert!(!store.app_storage().wal_truncate_pending());
 
-    crate::media::storage_compaction::reclaim(&store.app_storage(), false);
+    assert!(crate::media::storage_compaction::reclaim(
+        &store.app_storage(),
+        false
+    ));
     assert!(wal() > 0, "nothing owed, nothing truncated");
-    crate::media::storage_compaction::reclaim(&store.app_storage(), true);
+    assert!(
+        crate::media::storage_compaction::reclaim(&store.app_storage(), true),
+        "settled"
+    );
     assert_eq!(wal(), 0, "the first pass truncated");
     let runtime = app.runtime();
     runtime.shutdown_and_close().await.unwrap();

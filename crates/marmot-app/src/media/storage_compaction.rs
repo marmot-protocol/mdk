@@ -56,8 +56,10 @@ pub(crate) fn compaction_due(space: &DatabaseSpace, reserve: u64, free: u64) -> 
 /// the pages leave the file; a no-op before compaction. `startup` (the
 /// first pass of a worker ownership) also truncates once on an incremental
 /// database: a truncate owed when an earlier process ended is not recorded
-/// anywhere. Best effort. Blocking.
-pub(crate) fn reclaim(storage: &SqliteAppStorage, startup: bool) {
+/// anywhere. Best effort. Blocking. Returns whether that startup truncate
+/// is settled: tried, or not needed because the database is not
+/// incremental. A failed read leaves it for the next pass.
+pub(crate) fn reclaim(storage: &SqliteAppStorage, startup: bool) -> bool {
     match storage.database_space() {
         Ok(space) if space.incremental && space.free_pages > 0 => {
             match storage.reclaim_free_pages(RECLAIM_MAX_BYTES / space.page_size.max(1)) {
@@ -81,14 +83,20 @@ pub(crate) fn reclaim(storage: &SqliteAppStorage, startup: bool) {
     }
     // The storage records every truncate's result under the connection
     // lock, so this reads the latest attempt; repeating a truncate is safe.
-    let owed = storage.wal_truncate_pending()
-        || (startup
-            && storage
-                .database_space()
-                .is_ok_and(|space| space.incremental));
-    if owed {
+    let incremental = if startup {
+        match storage.database_space() {
+            Ok(space) => space.incremental,
+            Err(_) => return false,
+        }
+    } else {
+        false
+    };
+    if incremental || storage.wal_truncate_pending() {
+        // A busy or failed truncate is recorded as owed by the storage, so
+        // later passes retry it.
         let _ = storage.truncate_wal();
     }
+    true
 }
 
 /// What [`compact_if_due`] did.

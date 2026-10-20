@@ -50,9 +50,10 @@ pub(super) struct Admission {
     /// worker ownership, so a failure that repeats cannot rebuild the
     /// in-memory copy every tick.
     compaction_rollbacks: u32,
-    /// This worker's first maintenance pass ran (it settles a WAL truncate
-    /// an earlier process may have left owed).
-    maintenance_started: bool,
+    /// This worker settled the WAL truncate an earlier process may have left
+    /// owed (recorded nowhere): set only once a maintenance pass tried it,
+    /// so a pass that failed before that leaves it for the next one.
+    startup_wal_settled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Starts a media sweep on the blocking pool unless one is still running:
@@ -146,7 +147,7 @@ pub(super) fn spawn_legacy_migration(
     let app = client.app.clone();
     let label = client.state.label.clone();
     let updates = shared.attachment_updates.clone();
-    let startup = !std::mem::replace(&mut admission.maintenance_started, true);
+    let startup_wal_settled = admission.startup_wal_settled.clone();
     admission.legacy_migration = Some(tokio::task::spawn_blocking(move || {
         let started = (|| {
             let storage = app.account_storage(&label)?;
@@ -179,7 +180,10 @@ pub(super) fn spawn_legacy_migration(
         if changed {
             updates.send_modify(|_| {});
         }
-        crate::media::storage_compaction::reclaim(&app_storage, startup);
+        let startup = !startup_wal_settled.load(std::sync::atomic::Ordering::Acquire);
+        if crate::media::storage_compaction::reclaim(&app_storage, startup) && startup {
+            startup_wal_settled.store(true, std::sync::atomic::Ordering::Release);
+        }
     }));
 }
 

@@ -190,7 +190,10 @@ impl MarmotAppRuntime {
                     if !batch.more || batch.removed == 0 {
                         // Legacy bodies freed database pages: return them
                         // once the database is incremental.
-                        crate::media::storage_compaction::reclaim(&storage.app_storage(), false);
+                        let _ = crate::media::storage_compaction::reclaim(
+                            &storage.app_storage(),
+                            false,
+                        );
                         return Ok(removed);
                     }
                 }
