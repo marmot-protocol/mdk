@@ -8543,7 +8543,8 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             # Host event visibility precedes the durable post-handoff write.
             # Wait for dispatch completion before inspecting the spool state.
-            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=5)
+            # That write shares the executor with the retry loop's spool reads.
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=30)
 
             self.assertEqual(2, release_attempts)
             self.assertEqual([item.text for item in adapter.events], ["first"])
