@@ -1882,6 +1882,20 @@ async fn run_app_runtime_account_worker(
                 }
                 None => Ok(true),
             };
+            if turn.is_ok()
+                && let Some(admission) = job.admission.as_mut()
+            {
+                // Each recovered delivery has committed its projection. Do not
+                // withhold this turn's plaintext until the whole batch settles.
+                let summary = admission.take_committed_summary();
+                publish_app_runtime_summary_with_v5(
+                    &client,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                    &summary,
+                );
+            }
             if turn.is_err() {
                 // Mixed admission can fail on a native frame too. Pace its
                 // retained input even after the failed comparison is settled.
@@ -7335,8 +7349,7 @@ struct EpochBackfillReportContext<'a> {
     shared: &'a RuntimeSharedServices,
 }
 
-/// A suspended comparison reports through the same product/runtime boundary
-/// after the worker has admitted its owned result and checkpointed the grant.
+/// Report the completed comparison without repeating its published turn prefixes.
 fn report_pending_epoch_backfill_result(
     client: &AppClient,
     backfill_result: Result<EpochBackfillRunOutcome, AppError>,

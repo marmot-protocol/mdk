@@ -313,16 +313,6 @@ async fn offline_plaintext_replay(senders: usize, per_sender: usize, offline: Du
         }
     })
     .await;
-    assert!(
-        complete.is_ok(),
-        "decrypted {} of {} offline messages",
-        observed.len(),
-        expected.len()
-    );
-    assert_eq!(
-        observed, expected,
-        "every exact MLS plaintext reaches the permanent consumer"
-    );
     let stored: BTreeSet<_> = receiver_app
         .messages_with_query(
             receiver_account,
@@ -336,6 +326,17 @@ async fn offline_plaintext_replay(senders: usize, per_sender: usize, offline: Du
         .into_iter()
         .map(|message| message.plaintext)
         .collect();
+    assert!(
+        complete.is_ok(),
+        "permanent consumer saw {} of {} texts; durable projection holds {}",
+        observed.len(),
+        expected.len(),
+        stored.len()
+    );
+    assert_eq!(
+        observed, expected,
+        "every exact MLS plaintext reaches the permanent consumer"
+    );
     assert_eq!(
         stored, expected,
         "all plaintexts remain available after catch-up"

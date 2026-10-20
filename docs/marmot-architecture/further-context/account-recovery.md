@@ -265,7 +265,9 @@ Every cause runs the same job:
    repair. This paging change does not activate an independent known-event retry tier.
 3. **Admit** (worker, bounded turns). A few events per turn go straight into the normal
    ingest path, never through the live queue. The worker yields between turns, so commands
-   and live input interleave. A turn admits at most four events.
+   and live input interleave. A turn admits at most four events. Each successful turn publishes
+   its committed message and projection updates; consumers do not wait for the whole batch.
+   Published prefixes leave the pending summary, not the pass's accounting or coverage evidence.
 4. **Settle** (worker, short turn). Checkpoint, then complete, retry or park according to
    the tier rules, using the existing revision checks. Old attempts still cannot clear newer
    demand.

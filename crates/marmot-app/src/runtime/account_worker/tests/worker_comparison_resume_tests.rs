@@ -6,7 +6,7 @@ use nostr_relay_builder::prelude::{
     BoxedFuture, Filter as RelayFilter, MemoryDatabase, MemoryDatabaseOptions, NostrDatabase,
     PolicyResult, QueryPolicy,
 };
-use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
+use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
 use std::net::SocketAddr;
 use std::sync::{
@@ -573,7 +573,12 @@ async fn comparison_credit_exhaustion_does_not_spend_reservation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
-    let relay = MockRelay::run().await.unwrap();
+    let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+        events: true,
+        max_events: Some(64),
+    });
+    let relay = LocalRelay::new(RelayBuilder::default().database(database.clone()));
+    relay.run().await.unwrap();
     let url = relay.url().await.to_string();
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -584,6 +589,8 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         url.clone(),
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &url);
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     let pool = runtime
@@ -627,10 +634,6 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         .unwrap()
         .shutdown()
         .await;
-    runtime
-        .send_message(&bob.label, &group, b"offworker admission target".to_vec())
-        .await
-        .unwrap();
     let mut client = app.client(&alice.label).await.unwrap();
     client.prepare_transport().await.unwrap();
     timeout(Duration::from_secs(10), async {
@@ -644,17 +647,56 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         timeout(Duration::from_millis(100), client.receive_next_delivery()).await,
         Ok(Ok(_))
     ) {}
-    let route: [u8; 32] = hex::decode(
-        app.group(&alice.label, &hex::encode(&group))
+    client.synchronize_native_replay().await.unwrap();
+    runtime
+        .accounts()
+        .workers
+        .lock()
+        .await
+        .remove(&bob.account_id_hex)
+        .unwrap()
+        .shutdown()
+        .await;
+    let mut sender = app.client(&bob.label).await.unwrap();
+    let expected = (0..9)
+        .map(|index| format!("offworker admission target {index}"))
+        .collect::<std::collections::BTreeSet<_>>();
+    // Save real encrypted MLS envelopes into relay history without notifying
+    // live subscriptions. Only the owned comparison result can supply them.
+    for text in &expected {
+        let inner = crate::messages::build_inner_event(
+            &AppMessageIntent::Chat {
+                content: text.clone(),
+            },
+            &bob.account_id_hex,
+            crate::unix_now_seconds(),
+        )
+        .unwrap();
+        let effects = sender
+            .runtime
+            .session_mut()
+            .send(cgka_traits::engine::SendIntent::AppMessage {
+                group_id: group.clone(),
+                payload: crate::messages::encode_inner_event(&inner).unwrap(),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap();
+        let Some(cgka_session::PublishWork::ApplicationMessage { msg, .. }) =
+            effects.publish.into_iter().next()
+        else {
+            panic!("a real MLS send produces its encrypted envelope");
+        };
+        let event = transport_nostr_peeler::NostrTransportEvent::from_transport_message(&msg)
             .unwrap()
-            .unwrap()
-            .nostr_routing
-            .nostr_group_id_hex,
-    )
-    .unwrap()
-    .try_into()
-    .unwrap();
-    let recovery_route = storage_sqlite::TransportReconciliationRoute::Group(route);
+            .to_verified_nostr_event()
+            .unwrap();
+        database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+    }
+    drop(sender);
     let storage = app.account_storage(&alice.label).unwrap();
     client.request_bounded_comparison().unwrap();
     client.recovery_owner.test_advance_to_retry(&storage);
@@ -663,7 +705,8 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         .await
         .unwrap()
         .unwrap();
-    let execution = client.begin_comparison_grant(&grant).await.unwrap();
+    let attempt_serial = grant.reservation.attempt_serial;
+    let mut execution = client.begin_comparison_grant(&grant).await.unwrap();
     let credit = recovery_credits::try_acquire_recovery_credit(&pool).unwrap();
     let mut job = ComparisonNetworkJob::start(
         &client,
@@ -677,37 +720,139 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         .await
         .unwrap()
         .unwrap();
-    let inventory = storage
-        .app_storage()
-        .transport_reconciliation_inventory(&recovery_route, crate::unix_now_seconds())
-        .unwrap();
-    let before = inventory
-        .items
-        .iter()
-        .map(|item| item.event_id)
-        .collect::<std::collections::HashSet<_>>();
     assert!(
         timeout(Duration::from_millis(100), client.receive_next_delivery())
             .await
             .is_err()
     );
+    let mut admission = client
+        .accept_comparison_network(&grant, &mut execution, network)
+        .await
+        .unwrap()
+        .unwrap();
+    let (events, mut consumer) = broadcast::channel(128);
+    assert!(
+        !client
+            .admit_comparison_turn(&grant, &mut execution, &mut admission)
+            .await
+            .unwrap(),
+        "nine actual ingests require more than one bounded worker turn"
+    );
+    let first = admission.take_committed_summary();
+    let durable_prefix = app
+        .messages(&alice.label)
+        .unwrap()
+        .into_iter()
+        .map(|message| message.plaintext)
+        .filter(|text| expected.contains(text))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(durable_prefix.len(), 4);
+    assert_eq!(
+        first
+            .messages
+            .iter()
+            .map(|message| message.plaintext.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        durable_prefix,
+        "only the checkpointed first four plaintexts are publishable"
+    );
+    publish_app_runtime_summary_with_v5(
+        &client,
+        &events,
+        &alice.account_id_hex,
+        &alice.label,
+        &first,
+    );
+    let mut received = std::collections::BTreeSet::new();
+    while let Ok(event) = consumer.try_recv() {
+        if let MarmotAppEvent::MessageReceived(update) = event {
+            assert!(received.insert(update.message.plaintext));
+        }
+    }
+    assert_eq!(
+        received.len(),
+        4,
+        "the permanent consumer sees the committed first turn before settlement"
+    );
+    assert_eq!(received, durable_prefix);
+    loop {
+        let complete = client
+            .admit_comparison_turn(&grant, &mut execution, &mut admission)
+            .await
+            .unwrap();
+        let prefix = admission.take_committed_summary();
+        publish_app_runtime_summary_with_v5(
+            &client,
+            &events,
+            &alice.account_id_hex,
+            &alice.label,
+            &prefix,
+        );
+        if complete {
+            break;
+        }
+    }
     let result = client
-        .admit_comparison_inline(grant, execution, network)
+        .finish_comparison_grant(grant, execution, Some(admission))
         .await
         .unwrap();
     drop(credit);
-    assert!(matches!(result, EpochBackfillRunOutcome::Incomplete(_)));
-    let after = storage
-        .app_storage()
-        .transport_reconciliation_inventory(&recovery_route, crate::unix_now_seconds())
-        .unwrap();
-    assert!(
-        after
-            .items
-            .iter()
-            .any(|item| !before.contains(&item.event_id)),
-        "one valid owned comparison event enters durable route inventory only after owner join"
+    let shared = RuntimeSharedServices::default();
+    report_pending_epoch_backfill_result(
+        &client,
+        Ok(result),
+        false,
+        None,
+        EpochBackfillReportContext {
+            events: &events,
+            account_id_hex: &alice.account_id_hex,
+            account_label: &alice.label,
+            shared: &shared,
+        },
+    )
+    .unwrap();
+    while let Ok(event) = consumer.try_recv() {
+        if let MarmotAppEvent::MessageReceived(update) = event {
+            assert!(
+                received.insert(update.message.plaintext),
+                "settlement must not repeat an already published turn"
+            );
+        }
+    }
+    assert_eq!(received, expected);
+    assert_eq!(
+        app.messages(&alice.label)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.plaintext)
+            .filter(|text| expected.contains(text))
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected,
+        "every published plaintext has its permanent public projection"
+    );
+    let mut retained = None;
+    for file in app.audit_log_files().unwrap() {
+        let contents = std::fs::read_to_string(file.path).unwrap();
+        for line in contents.lines() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            if row["event"]["type"] != "recovery_attempt_finished"
+                || row["event"]["attempt_serial"] != attempt_serial
+            {
+                continue;
+            }
+            assert_eq!(
+                retained.replace(row["event"]["events_retained"].as_u64().unwrap()),
+                None,
+                "the pass has one terminal accounting row"
+            );
+        }
+    }
+    assert_eq!(
+        retained,
+        Some(expected.len() as u64),
+        "progressive publication must retain whole-pass admission accounting"
     );
     drop(client);
     runtime.shutdown_and_close().await.unwrap();
+    relay.shutdown();
 }
