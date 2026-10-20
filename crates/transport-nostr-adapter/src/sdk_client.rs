@@ -23,7 +23,7 @@ use nostr_sdk::prelude::{
     SubscriptionId, SyncDirection, SyncOptions, Tag, Timestamp as NostrTimestamp,
 };
 use nostr_sdk::relay::EventSendStatus;
-use tokio::sync::{Mutex, RwLock, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, timeout_at};
 use transport_nostr_peeler::{
@@ -781,6 +781,9 @@ pub struct NostrSdkRelayClient {
     /// Advisory per-route hints for oldest-first acquisition. A std lock,
     /// never held across an await.
     acquisition_memory: Arc<StdMutex<AcquisitionMemory>>,
+    /// Clones share a pool's per-canonical-relay NEG allowance. Independently
+    /// built account pools get their own credits, just like their sockets.
+    neg_credits: Arc<StdMutex<HashMap<RelayUrl, Arc<Semaphore>>>>,
     /// Test-only: select every route in ID order, to exercise the cursor alone.
     #[cfg(test)]
     id_order_only: bool,
@@ -1124,6 +1127,7 @@ impl NostrSdkRelayClient {
             publish_relay_pin_failure_stage: Arc::new(AtomicU8::new(0)),
             registration_log: Arc::new(Mutex::new(HashMap::new())),
             acquisition_memory: Arc::default(),
+            neg_credits: Arc::default(),
             #[cfg(test)]
             id_order_only: false,
         }
@@ -1451,6 +1455,7 @@ impl NostrSdkRelayClient {
             .dry_run();
         let syncs = endpoints.iter().cloned().map(|endpoint| {
             let client = self.client.clone();
+            let credits = self.neg_credit(&endpoint);
             let filter = plan.filter.clone();
             let items = items.clone();
             let options = options.clone();
@@ -1466,7 +1471,7 @@ impl NostrSdkRelayClient {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(NostrReconciliationFailure::RouteTimeout);
                     }
-                    sync_watching_neg_cap(&relay, filter, items, options).await
+                    sync_watching_neg_cap(&relay, filter, items, options, credits, deadline).await
                 })
                 .await
                 .unwrap_or(Err(NostrReconciliationFailure::RouteTimeout));
@@ -2552,6 +2557,7 @@ impl NostrSdkRelayClient {
             .collect::<Vec<_>>();
         let syncs = endpoints.iter().cloned().map(|endpoint| {
             let client = self.client.clone();
+            let credits = self.neg_credit(&endpoint);
             let filter = filter.clone();
             let items = items.clone();
             let options = options.clone();
@@ -2565,7 +2571,7 @@ impl NostrSdkRelayClient {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(NostrReconciliationFailure::RouteTimeout);
                     }
-                    sync_watching_neg_cap(&relay, filter, items, options).await
+                    sync_watching_neg_cap(&relay, filter, items, options, credits, deadline).await
                 })
                 .await
                 .unwrap_or(Err(NostrReconciliationFailure::RouteTimeout));
@@ -2587,6 +2593,19 @@ impl NostrSdkRelayClient {
             ids.extend(summary.remote);
         }
         (answered > 0).then_some((ids, answered == endpoints.len()))
+    }
+
+    fn neg_credit(&self, endpoint: &RelayUrl) -> Arc<Semaphore> {
+        let mut credits = self
+            .neg_credits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(credit) = credits.get(endpoint) {
+            return credit.clone();
+        }
+        let credit = Arc::new(Semaphore::new(SDK_RECONCILIATION_WINDOW_PROBES));
+        credits.insert(endpoint.clone(), credit.clone());
+        credit
     }
 
     /// Summarize SDK-owned relay health without exposing relay URLs.
@@ -4583,7 +4602,20 @@ async fn sync_watching_neg_cap(
     filter: Filter,
     items: Vec<(EventId, NostrTimestamp)>,
     options: SyncOptions,
+    credits: Arc<Semaphore>,
+    deadline: tokio::time::Instant,
 ) -> Result<nostr_sdk::relay::SyncSummary, NostrReconciliationFailure> {
+    let _permit = timeout_at(deadline, credits.acquire_owned())
+        .await
+        .map_err(|_| NostrReconciliationFailure::RouteTimeout)?
+        .map_err(|_| NostrReconciliationFailure::LocalError)?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(NostrReconciliationFailure::RouteTimeout);
+    }
+    // Declare the SDK future after the permit: on cancellation it drops first,
+    // spawning SyncCleanup's async close task before releasing the credit.
+    // The SDK exposes no completion handle for that task; unlike success, this
+    // does not guarantee NEG-CLOSE reaches the socket queue before credit reuse.
     // Subscribe before the NEG-OPEN goes out, so the answer cannot be missed.
     let mut notifications = relay.notifications();
     let sync = relay.sync(filter).items(items).opts(options).into_future();

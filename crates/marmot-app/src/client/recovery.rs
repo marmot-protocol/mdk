@@ -273,6 +273,12 @@ struct GrantedLoss {
     watermarks: storage_sqlite::RecoveryLossSnapshot,
 }
 
+pub(super) struct FrozenRecoveryPass {
+    pub(super) inventory: Vec<FrozenRecoveryInventory>,
+    pub(super) rotation_claim: Option<storage_sqlite::TransportReconciliationRoute>,
+    pub(super) excluded_routes: Vec<storage_sqlite::TransportReconciliationRoute>,
+}
+
 /// Private input snapshot; identities are deliberately not Debug-printable.
 #[derive(Clone)]
 pub(super) struct FrozenRecoveryInventory {
@@ -1590,20 +1596,31 @@ impl AppClient {
             && !prior.retry_routes.is_empty()
             && !comparison_goals.is_empty()
         {
-            let retrying = comparison_goals
+            let retry_scopes = prior
+                .retry_routes
                 .iter()
-                .filter(|goal| {
-                    prior.routes.iter().any(|old| {
-                        prior.retry_routes.contains(&old.scope_id)
-                            && old.route_kind == goal.route_kind
-                            && old.transport_group_id == goal.transport_group_id
-                            && old.group_id == goal.group_id
-                    })
+                .collect::<std::collections::HashSet<_>>();
+            let retry_routes = prior
+                .routes
+                .iter()
+                .filter(|old| retry_scopes.contains(&old.scope_id))
+                .map(|old| {
+                    (
+                        old.route_kind,
+                        old.transport_group_id.as_ref(),
+                        old.group_id.as_ref(),
+                    )
                 })
-                .cloned()
-                .collect::<Vec<_>>();
-            if !retrying.is_empty() {
-                comparison_goals = retrying;
+                .collect::<std::collections::HashSet<_>>();
+            let retrying = |goal: &RecoveryScopePlan| {
+                retry_routes.contains(&(
+                    goal.route_kind,
+                    goal.transport_group_id.as_ref(),
+                    goal.group_id.as_ref(),
+                ))
+            };
+            if comparison_goals.iter().any(&retrying) {
+                comparison_goals.retain(retrying);
             }
         }
         // An explicit full-history repair awaits one pass, so that pass
@@ -1611,7 +1628,11 @@ impl AppClient {
         let every_route = explicit
             .as_ref()
             .is_some_and(|permit| permit.full_history_requested);
-        let (inventory, rotation_claim) = if grant.comparison_revision.is_some() {
+        let FrozenRecoveryPass {
+            inventory,
+            rotation_claim,
+            excluded_routes: excluded,
+        } = if grant.comparison_revision.is_some() {
             self.freeze_recovery_inventory(
                 &mut [([0; 16], comparison_goals.clone())],
                 &std::collections::HashSet::new(),
@@ -1635,25 +1656,57 @@ impl AppClient {
         };
         grant.rotation_claim = rotation_claim;
         if grant.comparison_revision.is_some() {
-            let mut routes = Vec::new();
-            for item in &inventory {
-                if let Some(goal) = comparison_goals.iter().find(|goal| match item.route {
-                    storage_sqlite::TransportReconciliationRoute::Inbox => goal.route_kind == 0,
-                    storage_sqlite::TransportReconciliationRoute::Group(id) => {
-                        goal.transport_group_id == Some(id)
-                    }
-                }) {
+            // Freeze every executable operational goal, not only this batch's
+            // inventory. An unselected goal has not been serviced: settlement
+            // keeps its retry ID so a failed leader cannot hide rotation work.
+            let mut routes = comparison_goals;
+            let excluded = excluded
+                .iter()
+                .map(|route| match route {
+                    storage_sqlite::TransportReconciliationRoute::Inbox => (0, None),
+                    storage_sqlite::TransportReconciliationRoute::Group(id) => (1, Some(id)),
+                })
+                .collect::<std::collections::HashSet<_>>();
+            routes.retain(|goal| {
+                goal.route_kind <= 1
+                    && !goal.admitted_endpoints.is_empty()
+                    && !excluded.contains(&(goal.route_kind, goal.transport_group_id.as_ref()))
+            });
+            let windows = inventory
+                .iter()
+                .map(|item| {
+                    let route = match &item.route {
+                        storage_sqlite::TransportReconciliationRoute::Inbox => None,
+                        storage_sqlite::TransportReconciliationRoute::Group(id) => Some(id),
+                    };
+                    (route, (item.since, item.until))
+                })
+                .collect::<std::collections::HashMap<_, _>>();
+            for goal in &mut routes {
+                let route = if goal.route_kind == 0 {
+                    None
+                } else {
+                    Some(
+                        goal.transport_group_id
+                            .as_ref()
+                            .expect("executable comparison group"),
+                    )
+                };
+                if let Some(&(since, until)) = windows.get(&route) {
                     // The pass compares the local inventory from its floor; the
                     // plan records the part of that window this debt covers.
                     // A route discovered after the join has a narrower goal.
+                    goal.since_seconds =
+                        Some(goal.since_seconds.map_or(since, |old| old.max(since)));
+                    goal.until_seconds = until;
+                    goal.inventory_floor = Some(since);
+                } else {
+                    // Unselected legacy debt can omit its lower bound. Its
+                    // retained goal needs no local inventory or claimed floor.
                     let since = goal
-                        .since_seconds
-                        .map_or(item.since, |since| since.max(item.since));
-                    let mut goal = goal.clone();
-                    goal.since_seconds = Some(since);
-                    goal.until_seconds = item.until;
-                    goal.inventory_floor = Some(item.since);
-                    routes.push(goal);
+                        .until_seconds
+                        .saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS);
+                    goal.since_seconds.get_or_insert(since);
                 }
             }
             routes.sort_by_key(|r| r.scope_id);
@@ -5265,83 +5318,6 @@ mod tests {
         }
         assert_eq!(storage.recovery_retry_state().unwrap(), cost);
         assert!(storage.recovery_comparison().unwrap().pending());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn comparison_quantum_keeps_interrupted_route_retryable_and_unattempted_coverage_pending()
-    {
-        use crate::tests::{
-            ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
-            scripted_eose_pump,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        crate::AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        client.create_group("comparison budget", &[]).await.unwrap();
-        client.request_bounded_comparison().unwrap();
-        let storage = app.account_storage("alice").unwrap().app_storage();
-        let grant = client
-            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Startup)
-            .unwrap()
-            .unwrap();
-        assert_eq!(grant.inventory.len(), 2);
-        let first = grant.inventory[0].route.clone();
-        client.test_comparison_results = Some(
-            [
-                Ok(Some((Default::default(), Vec::new()))),
-                Ok(Some((Default::default(), Vec::new()))),
-            ]
-            .into(),
-        );
-        client.test_comparison_delay = Some(Duration::from_secs(60));
-        tokio::time::timeout(
-            Duration::from_secs(15),
-            client.run_recovery_grant_for_test(grant),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let slot = storage.recovery_comparison().unwrap();
-        assert!(slot.pending());
-        let plan = slot.plan.unwrap();
-        assert_eq!(plan.retry_routes.len(), 1);
-        let retry = plan
-            .routes
-            .iter()
-            .find(|r| r.scope_id == plan.retry_routes[0])
-            .unwrap();
-        assert!(match first {
-            storage_sqlite::TransportReconciliationRoute::Inbox => retry.route_kind == 0,
-            storage_sqlite::TransportReconciliationRoute::Group(id) =>
-                retry.transport_group_id == Some(id),
-        });
-        assert_eq!(
-            client.test_comparison_results.as_ref().unwrap().len(),
-            2,
-            "the second route was never started"
-        );
-        let debt = storage
-            .pending_recovery_demands()
-            .unwrap()
-            .into_iter()
-            .find(|d| d.cause == storage_sqlite::RecoveryCause::IncrementalHistory)
-            .unwrap();
-        assert_eq!(
-            storage
-                .recovery_scope_snapshots(debt.ticket.id)
-                .unwrap()
-                .len(),
-            2,
-            "unattempted route coverage cannot disappear"
-        );
-        // One quiet pass is below the parking budget.
-        assert_eq!(debt.eligibility, storage_sqlite::RecoveryEligibility::Retry);
     }
 
     #[test]

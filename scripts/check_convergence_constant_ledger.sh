@@ -131,7 +131,7 @@ discover_constants \
     "(MAX_COMPARISON_[A-Z0-9_]+|EPOCH_GAP_WINDOW_MAX_[A-Z0-9_]+)"
 discover_constants \
     "crates/transport-nostr-adapter/src/sdk_client.rs" \
-    "SDK_RECONCILIATION_(MAX_[A-Z0-9_]+|WAIT|NEGOTIATION_WAIT)"
+    "SDK_RECONCILIATION_(MAX_[A-Z0-9_]+|WAIT|NEGOTIATION_WAIT|WINDOW_PROBES)"
 discover_constants "crates/marmot-app/src/client/epoch_stall.rs" "EPOCH_STALL_[A-Z0-9_]+"
 discover_constants \
     "crates/marmot-app/src/lib.rs" \

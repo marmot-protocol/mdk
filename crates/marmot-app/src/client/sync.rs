@@ -72,9 +72,8 @@ pub(crate) enum SyncMode {
 /// account worker indefinitely and the next sync can resume from a smaller
 /// difference.
 pub(super) const TRANSPORT_RECONCILIATION_QUANTUM: Duration = Duration::from_secs(10);
-/// Four routes share the account-wide quantum. The network job gives each an
-/// equal share of what is left of it, so a slow route cannot spend the time of
-/// the routes after it.
+/// The network job owns up to four concurrent routes under the account-wide
+/// cutoff and refills slots as routes finish.
 /// The durable cursor starts the next pass after the rotation prefix the last
 /// pass covered, so it must hold at least two routes: see
 /// [`order_reconciliation_pass`].
@@ -337,8 +336,8 @@ fn reconciliation_start_after_cursor(
 /// own leading routes for as long as it stays armed.
 ///
 /// The first rotated route is scheduled for every `max_routes` of 2 or more:
-/// the armed half never fills the pass, so the rotation always keeps the slot
-/// its own leading route needs. A one-route pass has no armed slot at all, and
+/// the armed prefix never fills the starting batch, so the rotation keeps the
+/// slot its own leading route needs. A one-route pass has no armed slot at all, and
 /// then an armed leading route is simply not covered and not claimed.
 fn order_reconciliation_pass(
     work: &mut Vec<TransportReconciliationWork>,
@@ -364,17 +363,23 @@ fn order_reconciliation_pass(
     let (mut armed, rest): (Vec<_>, Vec<_>) = work
         .drain(..)
         .partition(|item| item.repairs_group_in(repairing));
-    // Leave the rotation one slot. A device wedged in more groups than the pass
-    // holds stays armed for as long as it is wedged, and would otherwise strip
-    // every other route — the local inbox included — of its by-id backstop.
-    armed.truncate(max_routes.saturating_sub(1));
-    work.extend(armed);
+    // Leave the starting batch's rotation one slot, including explicit passes
+    // whose frozen inventory is larger than the concurrent network batch.
+    // Their tail may never start before the cutoff and must not be claimed.
+    let starting_cap = max_routes.min(TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS);
+    let armed_prefix = armed.len().min(starting_cap.saturating_sub(1));
+    work.extend(armed.drain(..armed_prefix));
     work.extend(rest);
+    if max_routes > starting_cap {
+        work.extend(armed);
+    }
     work.truncate(max_routes);
 
-    // At most `max_routes` long, so a slice lookup beats hashing.
+    // Only the initial bounded batch is guaranteed to start. The durable
+    // claim remains pre-I/O, independent of which requests later finish.
     let scheduled = work
         .iter()
+        .take(starting_cap)
         .filter_map(TransportReconciliationWork::route)
         .collect::<Vec<_>>();
     rotation
@@ -598,6 +603,9 @@ pub(crate) struct RouteComparison {
     /// certified nor admitted anything is quiet. A failed or timed-out relay,
     /// or a route this pass skipped, did not answer.
     pub(crate) answered: bool,
+    /// Local unadmitted work still needs acquisition, even if every relay
+    /// answered. Invalid events and unknown remote coverage do not set this.
+    retry_admission: bool,
     /// Queried relays that answered, including incomplete comparisons.
     pub(crate) reached_endpoints: Vec<String>,
     /// What the route's relays returned, for the attempt's audit row only.
@@ -1329,13 +1337,7 @@ impl AppClient {
         goals: &mut [([u8; 16], Vec<storage_sqlite::RecoveryScopePlan>)],
         uncompared: &HashSet<([u8; 16], u64)>,
         every_route: bool,
-    ) -> Result<
-        (
-            Vec<super::recovery::FrozenRecoveryInventory>,
-            Option<TransportReconciliationRoute>,
-        ),
-        AppError,
-    > {
+    ) -> Result<super::recovery::FrozenRecoveryPass, AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
         let mut work = Vec::new();
         // Certified scopes keep their coverage; passes rotate to the rest.
@@ -1387,6 +1389,7 @@ impl AppClient {
         );
         let receipts = self.transport_receipts()?;
         let mut frozen = Vec::new();
+        let mut excluded = Vec::new();
         for work in work {
             let route = work.route().expect("validated recovery route");
             let matches = |scope: &storage_sqlite::RecoveryScopePlan| match route {
@@ -1434,9 +1437,17 @@ impl AppClient {
                         .map(nostr_reconciliation_item)
                         .collect(),
                 });
+            } else {
+                // This route was inspected, not merely left for rotation.
+                // Its old goal is below the account's retained inventory.
+                excluded.push(route);
             }
         }
-        Ok((frozen, rotation_claim))
+        Ok(super::recovery::FrozenRecoveryPass {
+            inventory: frozen,
+            rotation_claim,
+            excluded_routes: excluded,
+        })
     }
 
     /// One-shot native effects must keep their engine-owning client until projected.
@@ -4995,40 +5006,62 @@ impl AppClient {
                 (grant.comparison_revision, &grant.comparison_plan)
             {
                 use storage_sqlite::RecoveryComparisonOutcome as Comparison;
-                let outcomes = plan
+                let route_results = comparison_outcomes
+                    .iter()
+                    .map(|compared| {
+                        let route = match &compared.route {
+                            TransportReconciliationRoute::Inbox => None,
+                            TransportReconciliationRoute::Group(id) => Some(id),
+                        };
+                        (route, compared)
+                    })
+                    .collect::<HashMap<_, _>>();
+                let mut outcomes = plan
                     .routes
                     .iter()
                     .map(|scope| {
                         let route = if scope.route_kind == 0 {
-                            TransportReconciliationRoute::Inbox
+                            None
                         } else {
-                            TransportReconciliationRoute::Group(
-                                scope.transport_group_id.expect("frozen comparison route"),
+                            Some(
+                                scope
+                                    .transport_group_id
+                                    .as_ref()
+                                    .expect("frozen comparison route"),
                             )
                         };
-                        // The slot retries only a route whose required relays did
-                        // not answer. An answered route that could not certify, or
-                        // whose admission was incomplete or refused, is serviced:
-                        // its obligation's own quiet streak retries it until the
-                        // obligation parks, and parking ends automatic passes.
-                        let observed = comparison_outcomes
-                            .iter()
-                            .find(|compared| compared.route == route)
-                            .map_or(Comparison::ServicedPartial, |compared| {
+                        // Unknown remote coverage is serviced once the relays
+                        // answer. Locally unadmitted work must retain acquisition
+                        // retries even after its obligation's quiet streak parks.
+                        let observed = route_results.get(&route).map_or(
+                            Comparison::TransientFailure,
+                            |compared| {
                                 if compared.answered
+                                    && !compared.retry_admission
                                     && compared.outcome == Comparison::TransientFailure
                                 {
                                     Comparison::ServicedUnknown
                                 } else {
                                     compared.outcome
                                 }
-                            });
+                            },
+                        );
                         (scope.scope_id, observed)
                     })
                     .collect::<Vec<_>>();
                 let unsupported = (!outcomes.is_empty()
                     && outcomes.iter().all(|(_, o)| *o == Comparison::Unsupported))
                 .then_some(self.adapter.recovery_comparison_capability_key());
+                if unsupported.is_none() {
+                    // Capability blocking is backend-wide, never inferred for
+                    // an unstarted suffix. The selected unsupported scopes were
+                    // serviced without coverage; their audit facts stay intact.
+                    for (_, outcome) in &mut outcomes {
+                        if *outcome == Comparison::Unsupported {
+                            *outcome = Comparison::ServicedUnknown;
+                        }
+                    }
+                }
                 app.settle_recovery_comparison(
                     revision,
                     grant.reservation.attempt_serial,
