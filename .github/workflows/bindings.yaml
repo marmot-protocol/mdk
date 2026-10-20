@@ -115,6 +115,7 @@ jobs:
           source_sha="$(git rev-parse 'HEAD^{commit}')"
           workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           is_nightly=false
+          NIGHTLY_VERSION="${NIGHTLY_VERSION:-}"
 
           # Called by nightly-releases.yml: the caller's event is schedule or
           # workflow_dispatch, so check the nightly input before the event.
