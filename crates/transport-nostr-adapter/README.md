@@ -164,9 +164,7 @@ nondurable spill handoffs are clear, including every native batch ACK. A source 
 queued to the owner needs no additional acquisition while those bytes drain. Limited native admission never
 certifies exhaustive history or acknowledges queue/notification loss. Its cached permission must match the
 guarded source generation at cursor seal.
-Borrowed endpoint facts include active wire/capture leases and ended original ranges. The account owner
-does not duplicate that IO for a native-only goal while an issued peer is still serving the range; actual
-notification-loss grants keep their separate capture authority.
+A pending owner observation does not authorize the cursor, but already-acquired bytes need no new IO.
 
 Timestamp sorting leaves the existing 100-generation sender-ratchet tolerance unchanged: more than 100
 messages from one sender in the same second can still exceed it because event-id order is not

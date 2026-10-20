@@ -121,20 +121,6 @@ impl ReplayEndpointView<'_> {
             .is_some_and(|endpoint| endpoint.boundary_admitted)
     }
 
-    /// This endpoint still has an issued waiting or capture lease.
-    pub fn acquiring(&self) -> bool {
-        self.coverage
-            .endpoint_deadlines
-            .get(self.id)
-            .and_then(|relays| relays.get(&self.relay))
-            .is_some_and(|lease| lease.capturing || lease.deadline.is_some())
-    }
-
-    /// Original-range IO ended, possibly before local body placement.
-    pub fn range_ended(&self) -> bool {
-        self.coverage.subscriptions[self.id].get(&self.relay) == Some(&RelayReplay::Eose)
-    }
-
     /// Freeze this source, not an arbitrary account/endpoint/window request.
     pub fn capture_token(&self) -> ReplayCaptureToken {
         ReplayCaptureToken {

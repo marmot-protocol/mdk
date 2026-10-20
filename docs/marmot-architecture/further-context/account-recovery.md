@@ -148,9 +148,7 @@ Passive admission spends no network retry credit. Cursor seal consults the owner
 explicit retirement while holding the source guard through router placement locking; a changed generation
 defers the seal until the owner synchronizes. No source or endpoint identifier enters audit output.
 A range already queued to the owner spends no further acquisition attempts while its bytes drain.
-An issued peer's active waiting/capture lease also needs no duplicate native-only acquisition. The owner
-uses borrowed lease and range-end facts; the adapter's existing finite service lease still drives expiry.
-Actual-loss work retains its separate authority to recapture the original range.
+That pending observation is not cursor permission: retry eligibility and qualified completion remain separate.
 
 ### 1. Overflow becomes a durable tail, not a loss
 

@@ -842,10 +842,7 @@ impl AppClient {
             // but draining them must not capture an unrelated quiet peer.
             // Actual-loss work retains every issued token above.
             let acquired = source.admitted();
-            let native_active = source
-                .endpoints()
-                .any(|endpoint| endpoint.acquiring() || endpoint.range_ended());
-            let acquisition = if acquired || native_active {
+            let acquisition = if acquired {
                 Arc::new(Vec::new())
             } else {
                 tokens.clone()
@@ -2297,12 +2294,10 @@ mod tests {
         assert!(client.recovery_owner.native_replay_authorizes(generation));
     }
 
-    // Source lease expiry is driven with a paused clock.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_deadline_is_not_loss() {
         let (_dir, app, relay, mut client) = native_fixture().await;
         client.prepare_transport().await.unwrap();
-        tokio::time::advance(Duration::from_secs(31)).await;
         let endpoints = relay
             .accepted_subscriptions()
             .into_iter()
@@ -6058,6 +6053,8 @@ mod tests {
                 .await
                 .unwrap();
             client.prepare_transport().await.unwrap();
+            crate::tests::report_scripted_eose(&client.relay_plane, &relay, every_subscription)
+                .await;
             client
                 .run_pending_epoch_backfill(
                     marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
