@@ -130,8 +130,24 @@ defines and `marmot-app` implements.
   primitives:
   - the current caches, and the cache for one account;
   - shared storage;
-  - local accounts with their signing flags, in account-home order;
+  - local accounts, as a directory account view;
+  - the current account id for a label;
   - "entry changed", for presentation.
+
+  **The account view** carries `account_id_hex`, `label`, `local_signing` and the active-signing flag. That flag is
+  `(local_signing || external_signing) && !signed_out` (`marmot-account/src/home.rs:174-176`). The source lists every
+  local account, signed-out ones included, in account-home order.
+  - The moving code uses the two predicates for different things. Records copy `local_signing` for every account
+    (`methods.rs:120-131`, `:2015-2024`), while the sync plan and the searcher's caches keep only active-signing
+    accounts (`methods.rs:1366-1370`, `cached_search.rs:131`).
+  - The crate keeps today's rule for duplicate ids: the first account's directory link and the last label
+    (`methods.rs:121-131`).
+  - The moving preview reads take this view instead of `marmot_account::AccountSummary`
+    (`public_event_preview.rs:619`, `:676`). The lifecycle functions that stay in the app keep `AccountSummary`.
+
+  **The label lookup** is the preview write's replacement-account check. After a fetch, it refuses to store the
+  preview if the label now belongs to a different account (`public_event_preview.rs:757-763`). Asking for the
+  current cache is a separate check, the eviction one.
 
   The directory fetches caches at the moment it writes, after a network step, and must keep doing so. A snapshot
   taken before the fetch would keep writing to a cache evicted mid-fetch. So refreshes, member resolution, previews,
@@ -164,6 +180,9 @@ PR 1 adds a test in `marmot-app`, modelled on `storage-sqlite`'s boundary test
   - `crate::` paths and `use crate::` leaves outside `directory/`;
   - `MarmotApp` fields and methods not defined under `directory/`;
   - names reached through `super::` from the module root.
+
+  It also fails, with no allow-list, when production `directory/` code names `marmot_account::` or `marmot_app::`.
+  The new crate depends on neither, and a path into another crate never shows up as a `marmot-app` crossing.
 - **The allow-list.** The crossings found are written to a generated list,
   `crates/marmot-app/src/directory/crossings.txt`. A crossing missing from the list fails, and so does a listed one
   that no longer occurs, so the list only shrinks.

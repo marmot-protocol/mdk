@@ -347,7 +347,7 @@ Each step can ship on its own.
 | --- | --- | --- | --- |
 | 1 | `media-store` crate (#2314) | In progress, and the template for the rest | — |
 | 2 | Relay plane into `transport-nostr` ([brief](brief-relay-plane.md)) | The most separable seam; gives Pass 1 E's fixes a home | about 5.1k lines move |
-| 3 | Directory crate ([brief](brief-directory.md)) | Already owns its state; makes no account-storage calls | about 9k |
+| 3 | Directory crate ([brief](brief-directory.md)) | Owns its data and logic and makes no account-storage calls; its cache lifecycle stays in `marmot-app` | about 9k |
 | 4 | `storage-sqlite` internal boundaries by table ownership: `protocol/`, `app/` and a `cross/` module, with tests that fail on any detected crossing missing from a shrinking allow-list ([brief](brief-storage-boundaries.md)) | Makes the split reviewable before any crate moves; no behaviour change | Moves, then the `SqliteAppStorage` handle: `marmot-app`'s calls to about 318 app methods (a name-match count) |
 | 5 | Lower stack: merge the session into `marmot-session`, split off `marmot-account`, move the engine's storage proxy and audit ownership up, re-export config types | The two fixes that touch this code have landed: #2338 and #2341, which closed #2323 | Touches about 10 `marmot-app` files and `marmot-account` |
 | 6 | `marmot-observability` for the exporters, plus an observer interface | Removes the largest `marmot-app` domain | about 7–8k |
