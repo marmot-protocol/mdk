@@ -19,6 +19,13 @@ from pathlib import Path
 PLUGIN_DIR = Path(__file__).resolve().parents[2] / "marmot"
 ADAPTER_PATH = PLUGIN_DIR / "adapter.py"
 UNIX_SOCKET_PATH_MAX = 104
+# Bound for test waits that only guard against a hang: inbound-queue drains and
+# the events and tasks a stalled dispatch never finishes. A regression then
+# fails at the stalled wait with a traceback, instead of hanging until CI's
+# 120 s faulthandler watchdog ends the whole run with a dump that shows only
+# the event loop. It is twice the 30 s spool-backed waits, so slow SQLite I/O
+# never trips it.
+HANG_TIMEOUT_S = 60
 
 
 def _unix_tempdir(suffix: str, prefix: str = "hs"):
@@ -2641,7 +2648,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
                     break
                 await asyncio.sleep(0.005)
             fake_client._release.set()
-            await adapter._inbound_queue.join()
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
 
         self.assertEqual(fake_client.lookup_calls, 1, "concurrent groups must share one profile lookup")
         # Exactly one prompt was sent (the claim winner); the loser did NOT also prompt.
@@ -4254,9 +4261,9 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         # Duplicate arrives while the first turn is still in-flight.
         await adapter._handle_control_event(wire_event(event))
         gate.set()
-        await first
+        await asyncio.wait_for(first, timeout=HANG_TIMEOUT_S)
         # Drain the per-group queue so the dispatched turn(s) complete before asserting.
-        await adapter._inbound_queue.join()
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
 
         self.assertEqual(len(dispatched), 1)
 
@@ -4286,9 +4293,9 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(event["message_id_hex"], adapter._recent_inbound_ids)
 
         release_blocker.set()
-        await adapter._inbound_queue.join()
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
         await adapter._handle_control_event(wire_event(event))
-        await adapter._inbound_queue.join()
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
 
         self.assertEqual([message.text for message in adapter.events], ["retry me"])
 
@@ -4334,13 +4341,13 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(source["message_id_hex"], adapter._pending_inbound_ids)
 
         release_blocker.set()
-        await adapter._inbound_queue.join()
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
         # Connector replay finds the durable deferred batch and admits its
         # representative directly; it must not rebuild an in-memory debounce
         # timer or duplicate either source id.
         await adapter._handle_control_event(wire_event(event))
         await adapter._handle_control_event(wire_event(sibling))
-        await adapter._inbound_queue.join()
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
 
         self.assertEqual(len(adapter.events), 1)
         self.assertIn("retry batch", adapter.events[0].text)
@@ -4868,7 +4875,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             task = asyncio.create_task(restarted._dispatch_inbound_message(eligible))
-            await started.wait()
+            await asyncio.wait_for(started.wait(), timeout=HANG_TIMEOUT_S)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
@@ -4990,11 +4997,11 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             )
 
         first = asyncio.create_task(adapter._dispatch_inbound_message(inbound("41" * 32, "first")))
-        await first_started.wait()
+        await asyncio.wait_for(first_started.wait(), timeout=HANG_TIMEOUT_S)
         second = asyncio.create_task(adapter._dispatch_inbound_message(inbound("42" * 32, "second")))
-        await second
+        await asyncio.wait_for(second, timeout=HANG_TIMEOUT_S)
         release_first.set()
-        await first
+        await asyncio.wait_for(first, timeout=HANG_TIMEOUT_S)
 
         attached = [value for value in contexts if value and '"type":"message_deleted"' in value]
         self.assertEqual(len(attached), 1)
@@ -5157,8 +5164,8 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         await adapter._consume_inbound_once()
         # Wait for the debounce flush task to fire, then drain the per-group queue
         # (the flush enqueues the coalesced turn onto it).
-        await asyncio.gather(*list(adapter._debounce_tasks.values()))
-        await adapter._inbound_queue.join()
+        await asyncio.wait_for(asyncio.gather(*list(adapter._debounce_tasks.values())), timeout=HANG_TIMEOUT_S)
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
 
         self.assertEqual(len(adapter.events), 1)
         merged = adapter.events[0]
@@ -5282,7 +5289,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             # poll window: the spool's SQLite writes can outlast one on a loaded
             # runner. The timeout only bounds a real regression.
             await asyncio.wait_for(resubscribed.wait(), timeout=30)
-            await adapter._inbound_queue.join()
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
         finally:
             self.adapter_module.reconnect_backoff_ms = real_backoff
             loop_task.cancel()
@@ -7467,7 +7474,7 @@ class GroupInviteOnboardingTests(unittest.IsolatedAsyncioTestCase):
                     "group_id_hex": "22" * 32,
                 }
             )
-            await adapter._inbound_queue.join()
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
 
             self.assertIn("Marvin", fake_client.last[2])
             self.assertIsNone(fake_client.last[3])
@@ -7942,6 +7949,8 @@ class KeyedAsyncQueueDepthTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(task.done())
         self.assertIn(task, queue._pending)
 
+        # No wait_for: the regression this catches is a join() that spins without
+        # yielding, which a timeout could not interrupt.
         await queue.join()
         self.assertFalse(queue._pending)
         self.assertFalse(queue._tails)
@@ -7962,7 +7971,7 @@ class KeyedAsyncQueueDepthTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(shed)
 
         release.set()
-        await queue.join()
+        await asyncio.wait_for(queue.join(), timeout=HANG_TIMEOUT_S)
 
 
 class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -8053,7 +8062,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
         try:
             with unittest.mock.patch.object(store, "commit", side_effect=OSError("unavailable")):
                 await adapter._handle_control_event(self.make_event())
-                await adapter._inbound_queue.join()
+                await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
             self.assertEqual(len(adapter.events), 1)
             self.assertEqual(await call(store.pending, group), [])
             self.assertEqual(adapter._ambient_outcomes, {})
@@ -8072,7 +8081,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             with unittest.mock.patch.object(store, "commit", side_effect=OSError("unavailable")), \
                  unittest.mock.patch.object(store, "acknowledge", side_effect=OSError("unavailable")):
                 await adapter._handle_control_event(self.make_event())
-                await adapter._inbound_queue.join()
+                await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
                 self.assertEqual(len(adapter._ambient_outcomes), 1)
                 self.assertEqual((await call(store.claim, group)).facts, ())
                 await call(store.record, group, "new-fact", "message_edited")
@@ -8097,7 +8106,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     with unittest.mock.patch.object(store, operation, side_effect=OSError("unavailable")):
                         await adapter._handle_control_event(self.make_event())
-                        await adapter._inbound_queue.join()
+                        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
                     self.assertEqual(len(adapter._ambient_outcomes), 1)
                     settled = asyncio.Event()
                     original_retry = adapter._retry_ambient_outcomes
@@ -8127,7 +8136,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             await adapter._handle_control_event(change("aa" * 32))
             self.assertEqual(adapter.events, [])
             await adapter._handle_control_event(self.make_event())
-            await adapter._inbound_queue.join()
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
             await adapter._ambient_context_call(adapter._ambient_context.close)
             await adapter._handle_control_event(change("aa" * 32))
             await adapter._handle_control_event(change("bb" * 32))
@@ -8167,7 +8176,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
                                                 "22" * 32, "deletion", "message_deleted")
             await adapter._ambient_context_call(adapter._ambient_context.close)
             await adapter._handle_control_event(self.make_event())
-            await adapter._inbound_queue.join()
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
             self.assertEqual(len(adapter.events), 1)
             self.assertIn('"type":"message_deleted"', adapter.events[0].channel_context)
             client.timeline_list.assert_awaited_once()
@@ -8187,7 +8196,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         adapter._inbound_queue.enqueue = checked_enqueue
         await adapter._handle_control_event(self.make_event())
-        await adapter._inbound_queue.join()
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
         self.assertEqual(["claimed"], observed)
         record = adapter._inbound_spool.get(message_id)
         self.assertEqual("unresolved", record.state)
@@ -8206,17 +8215,17 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             await release.wait()
 
         adapter._inbound_queue.enqueue("22" * 32, blocker)
-        await started.wait()
+        await asyncio.wait_for(started.wait(), timeout=HANG_TIMEOUT_S)
         await adapter._handle_control_event(self.make_event())
         deferred = adapter._inbound_spool.get("33" * 32)
         self.assertEqual("pending", deferred.state)
         self.assertEqual("queue_full", deferred.disposition)
         attempts = deferred.attempts
         release.set()
-        await adapter._inbound_queue.join()
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
         await asyncio.sleep(self.adapter_module.INBOUND_SPOOL_RETRY_BACKOFF_S[0] + 0.02)
         await adapter._admit_due_spooled()
-        await adapter._inbound_queue.join()
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
         delivered = adapter._inbound_spool.get("33" * 32)
         self.assertEqual("unresolved", delivered.state)
         self.assertEqual(attempts, delivered.attempts)
@@ -8237,12 +8246,12 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
                     await call(store.defer, event["message_id_hex"], delay_s=0.01, reason=reason)
             adapter._should_run_turn = unittest.mock.AsyncMock(side_effect=OSError("temporary RPC failure"))
             await adapter._try_admit_spooled(event["message_id_hex"], ignore_backoff=True)
-            await adapter._inbound_queue.join()
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
             record = await call(store.get, event["message_id_hex"])
             self.assertEqual("pending", record.state)
             adapter._should_run_turn = unittest.mock.AsyncMock(return_value=True)
             await adapter._try_admit_spooled(event["message_id_hex"], ignore_backoff=True)
-            await adapter._inbound_queue.join()
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
             self.assertEqual(["durable"], [message.text for message in adapter.events])
         finally:
             await adapter.disconnect()
@@ -8326,14 +8335,14 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 store.transition = fault
                 try:
                     await adapter._handle_control_event(self.make_event())
-                    await adapter._inbound_queue.join()
+                    await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
                     self.assertEqual(["durable"], [message.text for message in adapter.events])
                     self.assertEqual(await adapter._ambient_context_call(
                         adapter._ambient_context.pending, "22" * 32), [])
                     unavailable = False
                     await adapter._retry_inbound_dispatch_dispositions()
                     await adapter._admit_due_spooled()
-                    await adapter._inbound_queue.join()
+                    await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
                     record = await adapter._inbound_spool_call(store.get, "33" * 32)
                     self.assertEqual("unresolved", record.state)
                     self.assertEqual({}, adapter._inbound_dispatch_dispositions)
@@ -8351,7 +8360,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             extra={"group_activation": "mention"}, client=MultiPartyClient()
         )
         await adapter._handle_control_event(self.make_event(mentions_self=False))
-        await adapter._inbound_queue.join()
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
         record = adapter._inbound_spool.get("33" * 32)
         self.assertEqual("intentionally_skipped", record.state)
         self.assertEqual("mention_policy_skip", record.disposition)
@@ -8983,7 +8992,7 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             # fault, then performs durable admission and ambient lookup. Wait
             # for the actual handoff instead of a 1.5-second polling budget.
             await asyncio.wait_for(handed_off.wait(), timeout=30)
-            await adapter._inbound_queue.join()
+            await asyncio.wait_for(adapter._inbound_queue.join(), timeout=HANG_TIMEOUT_S)
             self.assertEqual([item.text for item in adapter.events], ["durable"])
             self.assertFalse(retry.done())
         finally:
