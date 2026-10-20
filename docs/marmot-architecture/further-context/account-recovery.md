@@ -202,6 +202,8 @@ Every cause runs the same job:
    oldest first. Window events never certify a route, move its replay cursor or withhold
    its certificate. Original comparison stability and SQL fences remain unchanged.
    Inventory revisions invalidate held-span hints, so released input is not skipped on reuse.
+   Hints follow every pending epoch-gap ticket, including capacity-waiting tickets
+   omitted from another grant's selection.
    Traversing already-held input is not recovery progress: it cannot reset backoff or the
    durable unserved-pass count. Reconstruction or hint eviction may repeat traversal but
    cannot renew that budget. A sufficiently deep prefix may exhaust it and park for explicit

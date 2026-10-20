@@ -21,6 +21,7 @@ const GOAL: storage_sqlite::RecoveryDemandTicket = storage_sqlite::RecoveryDeman
 #[derive(Clone, Default, Debug)]
 struct HoldOlderPage {
     entered: Arc<AtomicBool>,
+    released: Arc<AtomicBool>,
     hold: bool,
     requests: Arc<AtomicUsize>,
     release: Arc<tokio::sync::Notify>,
@@ -39,8 +40,13 @@ impl QueryPolicy for HoldOlderPage {
                     .until
                     .is_some_and(|until| until.as_secs() <= HISTORY_START + 1_000)
             {
+                let released = self.release.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
                 self.entered.store(true, Ordering::SeqCst);
-                self.release.notified().await;
+                if !self.released.load(Ordering::SeqCst) {
+                    released.await;
+                }
             }
             PolicyResult::Accept
         })
@@ -51,6 +57,7 @@ struct ReleaseGate(HoldOlderPage);
 
 impl Drop for ReleaseGate {
     fn drop(&mut self) {
+        self.0.released.store(true, Ordering::SeqCst);
         self.0.release.notify_waiters();
     }
 }
@@ -185,7 +192,11 @@ impl WindowFixture {
         for observation in &mut progress {
             observation.offered.clear();
         }
-        keep_window_progress(&self.cache, &[(self.goal.id, self.goal.revision)], progress);
+        keep_window_progress(
+            &self.cache,
+            &HashSet::from([(self.goal.id, self.goal.revision)]),
+            progress,
+        );
     }
 
     async fn recover(&self, limits: NostrAcquisitionLimits) -> Vec<String> {
@@ -439,7 +450,14 @@ async fn relay_cut_keeps_other_page() {
         "completed relays must not duplicate one another's deliveries"
     );
     healthy.acknowledge(&mut Vec::new(), &events, progress);
+    gate.released.store(true, Ordering::SeqCst);
     gate.release.notify_waiters();
+    let (retried, _) = stalled.fetch(&[], production_limits()).await;
+    assert_eq!(
+        retried.first().map(|event| &event.event.id),
+        stalled.ids.first(),
+        "requests that arrive after release must reach the oldest input"
+    );
     healthy.shutdown().await;
     duplicate.shutdown().await;
     stalled.shutdown().await;
@@ -612,7 +630,11 @@ async fn refused_page_is_refetched() {
     let (events, progress) = fixture.fetch(&[], production_limits()).await;
     assert!(!events.is_empty());
     // The peer offered a page, but none of its candidates was retained.
-    keep_window_progress(&fixture.cache, &[(GOAL.id, GOAL.revision)], progress);
+    keep_window_progress(
+        &fixture.cache,
+        &HashSet::from([(GOAL.id, GOAL.revision)]),
+        progress,
+    );
     assert!(fixture.cache.lock().unwrap().entries.is_empty());
     let (retried, _) = fixture.fetch(&[], production_limits()).await;
     assert_eq!(
@@ -647,7 +669,7 @@ fn hint_lru_stays_bounded() {
             offered: HashSet::new(),
         })
         .collect();
-    keep_window_progress(&cache, &[(GOAL.id, GOAL.revision)], progress);
+    keep_window_progress(&cache, &HashSet::from([(GOAL.id, GOAL.revision)]), progress);
     let cache = cache.lock().unwrap();
     assert_eq!(cache.entries.len(), EPOCH_GAP_WINDOW_MAX_HINTS);
     assert!(

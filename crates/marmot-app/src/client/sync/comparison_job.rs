@@ -566,7 +566,7 @@ fn event_is_held(id: &str, local: &HashSet<[u8; 32]>) -> bool {
 
 fn keep_window_progress(
     cache: &EpochGapWindows,
-    live: &[([u8; 16], u64)],
+    live: &HashSet<([u8; 16], u64)>,
     progress: WindowProgress,
 ) {
     let mut cache = cache
@@ -1421,6 +1421,33 @@ impl AppClient {
                 }
             };
             if stable {
+                // Waiting tickets still own their hints; eligibility only
+                // decides which tickets this grant may service.
+                let live = self
+                    .app
+                    .account_storage(&self.state.label)
+                    .and_then(|storage| {
+                        Ok(storage
+                            .app_storage()
+                            .pending_recovery_demands()?
+                            .into_iter()
+                            .filter(|demand| {
+                                demand.cause == storage_sqlite::RecoveryCause::EpochGap
+                            })
+                            .map(|demand| (demand.ticket.id, demand.ticket.revision))
+                            .collect::<HashSet<_>>())
+                    });
+                let live = match live {
+                    Ok(live) => live,
+                    Err(error) => {
+                        return Err(self.fail_comparison_grant(
+                            grant,
+                            execution,
+                            Some(admission),
+                            error,
+                        ));
+                    }
+                };
                 let progress = admission
                     .routes
                     .iter_mut()
@@ -1439,7 +1466,7 @@ impl AppClient {
                         std::mem::take(&mut route.window_progress)
                     })
                     .collect();
-                keep_window_progress(&self.epoch_gap_windows, &grant.fence.obligations, progress);
+                keep_window_progress(&self.epoch_gap_windows, &live, progress);
             }
         }
         let mut execution = *execution.execution;
@@ -3768,6 +3795,166 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|demand| demand.cause == storage_sqlite::RecoveryCause::KnownEvent)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_gap_keeps_frontier() {
+        let mut fixture = fixture_with_group_relays_and_comparison(None, false).await;
+        let other = fixture
+            .client
+            .create_group("unrelated gap", &[])
+            .await
+            .unwrap();
+        arm_unpaced_epoch_gap(&fixture);
+        let (grant, _) = epoch_gap_grant(&mut fixture);
+        let route = grant
+            .plan()
+            .unwrap()
+            .iter()
+            .find(|obligation| obligation.cause == storage_sqlite::RecoveryCause::EpochGap)
+            .unwrap()
+            .scopes
+            .iter()
+            .find_map(|scope| scope.goal.transport_group_id)
+            .unwrap();
+        let goal = fixture
+            .storage
+            .app_storage()
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::EpochGap)
+            .unwrap()
+            .ticket;
+        let start = crate::unix_now_seconds() - 1_000;
+        let body = "old".repeat(3_000);
+        let history = (0..512)
+            .map(|index| crate::tests::epoch_gap_probe(&hex::encode(route), start + index, &body))
+            .collect::<Vec<_>>();
+        let oldest = history[0].id.clone();
+        script_window(
+            &fixture,
+            &transport_nostr_adapter::NostrRelayEvent {
+                endpoint: endpoint("relay"),
+                subscription_id: None,
+                event: history[0].clone(),
+            },
+        );
+        fixture
+            .relay
+            .acquisition_result
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .endpoints[0]
+            .events = history;
+        fixture.client.test_comparison_results = Some(group_route_comparison(true));
+        fixture
+            .client
+            .run_recovery_grant_for_test(grant)
+            .await
+            .unwrap();
+        assert!(
+            !fixture
+                .client
+                .transport_receipts()
+                .unwrap()
+                .contains(&oldest)
+        );
+        let key = (route, endpoint("relay").0);
+        let before = fixture.client.epoch_gap_windows.lock().unwrap().entries[&key]
+            .bounds
+            .clone();
+        assert!(
+            !before.is_empty(),
+            "the byte-limited scan needs another pass"
+        );
+        assert!(
+            before.iter().any(|bound| bound.until < start + 511),
+            "the first scan must advance below the newest raw page"
+        );
+
+        let epoch = fixture
+            .client
+            .group_mls_state(&fixture.group_id)
+            .unwrap()
+            .epoch;
+        let due = fixture
+            .storage
+            .app_storage()
+            .recovery_retry_state()
+            .unwrap()
+            .not_before_ms;
+        fixture
+            .storage
+            .app_storage()
+            .record_recovery_capacity_pressure(fixture.group_id.as_slice(), epoch, due)
+            .unwrap();
+        fixture
+            .storage
+            .app_storage()
+            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(other.as_slice()),
+                stalled_epoch: fixture.client.group_mls_state(&other).unwrap().epoch,
+            }])
+            .unwrap();
+        fixture
+            .client
+            .recovery_owner
+            .test_advance_to_retry(&fixture.storage);
+        let (grant, _) = epoch_gap_grant(&mut fixture);
+        assert!(!grant.fence.obligations.contains(&(goal.id, goal.revision)));
+        fixture
+            .client
+            .run_recovery_grant_for_test(grant)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .client
+                .epoch_gap_windows
+                .lock()
+                .unwrap()
+                .entries
+                .get(&key)
+                .map(|hint| hint
+                    .bounds
+                    .iter()
+                    .map(|bound| (bound.until, bound.resume_since))
+                    .collect::<Vec<_>>()),
+            Some(
+                before
+                    .iter()
+                    .map(|bound| (bound.until, bound.resume_since))
+                    .collect()
+            ),
+            "an unrelated grant must not erase a waiting ticket's frontier",
+        );
+
+        fixture
+            .client
+            .recovery_owner
+            .test_advance_to_retry(&fixture.storage);
+        fixture
+            .client
+            .recovery_owner
+            .test_advance_clock(Duration::from_secs(60));
+        let (grant, _) = epoch_gap_grant(&mut fixture);
+        assert!(grant.fence.obligations.contains(&(goal.id, goal.revision)));
+        fixture
+            .client
+            .run_recovery_grant_for_test(grant)
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .client
+                .transport_receipts()
+                .unwrap()
+                .contains(&oldest),
+            "capacity relief must resume below the saved frontier and reach the oldest input"
         );
     }
 

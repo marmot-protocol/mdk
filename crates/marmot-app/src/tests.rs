@@ -1099,12 +1099,13 @@ impl NostrRelayClient for ScriptedPushRelayClient {
             .as_ref()
             .ok_or(transport_nostr_adapter::NostrAcquisitionError::Unsupported)?;
         if let transport_nostr_adapter::NostrAcquisitionScope::GroupWindow {
+            transport_group_id,
             since,
             until,
             newest,
-            ..
         } = request.scope
         {
+            let group = hex::encode(transport_group_id);
             let mut endpoints = Vec::with_capacity(request.endpoints.len());
             for page in &scripted.endpoints {
                 if !request.endpoints.iter().any(|endpoint| {
@@ -1116,6 +1117,12 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                     .events
                     .iter()
                     .filter(|event| event.created_at >= since && event.created_at <= until)
+                    .filter(|event| {
+                        event.kind == u64::from(nostr_sdk::prelude::Kind::MlsGroupMessage.as_u16())
+                            && event.tags.iter().any(|tag| {
+                                matches!(tag.as_slice(), [name, value, ..] if name == "h" && value == &group)
+                            })
+                    })
                     .collect::<Vec<_>>();
                 selected.sort_by(|a, b| (b.created_at, &b.id).cmp(&(a.created_at, &a.id)));
                 selected.truncate(newest.unwrap_or(usize::MAX));
