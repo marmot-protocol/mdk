@@ -1,15 +1,15 @@
 ---
-title: "Extraction Brief — Directory into marmot-directory"
+title: "Extraction Brief — Directory into nostr-directory"
 created: 2026-10-20
 updated: 2026-10-20
 tags: [marmot, architecture, review, extraction-brief, directory, nostr]
-status: proposed, needs approval before implementation
+status: proposed; product-owner decisions made 2026-10-20
 ---
 
-# Extraction Brief — Directory into `marmot-directory`
+# Extraction Brief — Directory into `nostr-directory`
 
 Step 3 of the [core structure plan](core-structure.md#5-sequencing). It moves the directory out of `marmot-app` into
-a new `marmot-directory` crate without changing behaviour. The directory is the app's cache and lookup service for
+a new `nostr-directory` crate without changing behaviour. The directory is the app's cache and lookup service for
 other people's public Nostr data: profiles, follow lists, relay lists, KeyPackages, user search and public event
 previews. `path:line` citations are at `3fc77b82c` (master after #2493). Production line counts exclude
 `#[cfg(test)]` modules. Following the [review's evidence rules](README.md#evidence-rules), statements are observed in
@@ -81,7 +81,7 @@ It uses, but does not own, `<root>/shared.sqlite3`. That database is plain SQLit
 
 ## Decision: a new crate above the transport and storage
 
-Create `crates/marmot-directory`. It depends on `transport-nostr`, `transport-nostr-adapter` (event kinds and the
+Create `crates/nostr-directory`. It depends on `transport-nostr`, `transport-nostr-adapter` (event kinds and the
 process proxy), `transport-nostr-peeler`, `storage-sqlite`, `cgka-traits`, `cgka-engine` (KeyPackage metadata
 checks) and `fs-private`. It depends on neither `marmot-app` nor `marmot-account`, nor on `cgka-session`, which step 5
 merges into `marmot-session`. Whatever it needs from the app comes through the host interface below.
@@ -212,7 +212,7 @@ Each PR keeps behaviour unchanged and ships alone.
    - `MarmotApp` gets one `directory` field and keeps delegates.
    - This is the large PR, so it lands in two slices: 4a moves the state, cache lifecycle and host, and 4b moves the
      remaining methods.
-5. **Create `crates/marmot-directory` and move `directory/` into it.**
+5. **Create `crates/nostr-directory` and move `directory/` into it.**
    - The move is `git mv` plus import paths.
    - `marmot-app` depends on the crate and re-exports.
    - Unit tests move with their modules. `marmot-app` tests that reach internals use a `test-support` feature, or
@@ -221,7 +221,7 @@ Each PR keeps behaviour unchanged and ships alone.
 6. **Repoint and delete delegates.** `marmot-uniffi`, `cli`, `agent-connector`, `marmot-app` and tests call
    `app.directory()`.
 7. **Tracing targets.**
-   - `marmot_app::directory` becomes `marmot_directory::<module>`, as storage-boundaries PR 5 did (#2402).
+   - `marmot_app::directory` becomes `nostr_directory::<module>`, as storage-boundaries PR 5 did (#2402).
    - The observability docs are updated with it.
 
 PRs 1–3 are small and independent of each other's internals. Run them in order anyway, so each one's diff stays
@@ -282,20 +282,18 @@ reviewable.
 
 ## Done when
 
-- `crates/marmot-directory` owns the directory, previews and KeyPackage lookup code with their caches. It depends on
+- `crates/nostr-directory` owns the directory, previews and KeyPackage lookup code with their caches. It depends on
   neither `marmot-app` nor `marmot-account`.
 - `MarmotApp` has one `directory` field and no directory methods. The sync handle has one owner.
 - Bindings and the CLI behave as before. Every listed suite is green.
 - Core structure, this brief and #2360 record the step as done.
 
-## Decisions for the product owner
+## Product-owner decisions (2026-10-20)
 
-1. **Crate name.** Recommended: `marmot-directory`, matching the other app-layer crates. The alternative,
-   `nostr-directory`, says what it caches, but every `marmot-*` service is Nostr-backed today.
-2. **Previews move with the directory.** Recommended: yes. They share its database, key and migration ledger. Keeping
-   them in `marmot-app` would mean splitting that ledger, which changes persisted state.
-3. **Downstream callers use `app.directory()` (PR 6).** Recommended: yes, so the directory has one surface and
-   `MarmotApp` keeps no directory methods. The alternative keeps the delegates and skips PR 6.
-4. **Analytics through a small observer trait now.** Recommended: yes, keeping the step order. The alternative is to
-   do step 6 (`marmot-observability`) first so the crate can depend on it, but step 6 is larger and depends on
-   nothing here.
+1. **The crate is `nostr-directory`.** The name says what it caches: other people's public Nostr data.
+2. **Previews move with the directory.** They share its database, key and migration ledger, so keeping them in
+   `marmot-app` would mean splitting that ledger.
+3. **Downstream callers use `app.directory()` (PR 6).** The directory gets one surface, and `MarmotApp` keeps no
+   directory methods.
+4. **Analytics go through a small observer trait now.** The step order stays, and step 6 (`marmot-observability`)
+   can supply the observer later.

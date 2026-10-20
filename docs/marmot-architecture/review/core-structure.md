@@ -326,7 +326,7 @@ Foundation:   cgka-traits (contracts only)   marmot-components (app component an
 | `marmot-session` (new) | `cgka-session`, `marmot-account` runtime | One layer that owns the engine and its own account-record store handle: publish pipeline, maintenance, KeyPackage lifecycle, one routing implementation, one Welcome path. It re-exports the config types callers need. |
 | `marmot-account` | itself | Identity, files, secret stores: what the bindings, CLI and agent already use. |
 | `transport-nostr` (new) | `marmot-app` `relay_plane/` | The relay plane, routing derivation, coverage evidence (EOSE and paging), and the KeyPackage event format, built on `transport-nostr-adapter`, which stays its own crate. This is where Pass 1 E's size handling and coverage surface belong. Folding the adapter's SDK client in later is an option, not part of step 2 ([brief](brief-relay-plane.md#decision-a-new-crate-on-top-of-the-adapter)). |
-| `marmot-directory` (new, [brief](brief-directory.md)) | `marmot-app` `directory/` except profile and follow publication, previews, the directory half of `key_package_records.rs` | Discovery, profiles, KeyPackage lookup and search, with the per-account cache it already owns. The relay plane's directory fetching stays in `transport-nostr`. |
+| `nostr-directory` (new, [brief](brief-directory.md)) | `marmot-app` `directory/` except profile and follow publication, previews, the directory half of `key_package_records.rs` | Discovery, profiles, KeyPackage lookup and search, with the per-account cache it already owns. The relay plane's directory fetching stays in `transport-nostr`. |
 | `media-store` and media transfer | #2314; `marmot-app` `media/` | The encrypted file store (in progress), plus Blossom transfer, crypto and resume. |
 | `marmot-observability` (new) | `marmot-app` `relay_telemetry_export`, `product_analytics`, `audit_otlp_sender`, audit upload, `collector_host_safety` | The code that ships diagnostics off the device: relay telemetry over OTLP, Aptabase product analytics, audit-log upload and OTLP delivery, and the collector dial-safety checks. The recording points stay in `marmot-app` and report through one observer interface, replacing the 40 `_unobserved` pairs over time. Decided 2026-10-15: move it as it is first, and generalize later (§2.9). |
 | `marmot-app` | itself | Composition root and per-account product core, organized by role (writer lane, read path, I/O lanes; [Pass 1 B](b-runtime-concurrency.md)). `AppClient` stops being a public type; only `wn sync` uses it today. |
@@ -365,10 +365,11 @@ Answered 2026-10-17:
    couplings in §2.2 therefore stay inside one file; [step 4's brief](brief-storage-boundaries.md) makes them
    explicit.
 3. **`AppClient` stops being public**, unless a strong reason appears.
-4. **Names:** `transport-nostr`, `marmot-components` and `marmot-observability` are agreed. The per-account runtime
-   crate is `marmot-session`, not `marmot-device-runtime`: `marmot-account` keeps identity, files and secrets, which
-   the bindings, CLI and agent use, and a plain `marmot-runtime` would sit beside `MarmotAppRuntime`, the Tokio
-   runtimes and MarmotKit's runtime.
+4. **Names:** `transport-nostr`, `marmot-components` and `marmot-observability` are agreed, and the directory crate is
+   `nostr-directory` (2026-10-20, [directory brief](brief-directory.md#product-owner-decisions-2026-10-20)). The
+   per-account runtime crate is `marmot-session`, not `marmot-device-runtime`: `marmot-account` keeps identity, files
+   and secrets, which the bindings, CLI and agent use, and a plain `marmot-runtime` would sit beside
+   `MarmotAppRuntime`, the Tokio runtimes and MarmotKit's runtime.
 5. **White Noise's deployment defaults move into configuration that hosts pass in**, and
    `MarmotAppConfig::default()` becomes neutral: the recovery-operated relays, discovery indexer relays, Blossom
    servers, Vertex endpoints, the keychain service name and the moderation label namespace. This needs its own brief,
