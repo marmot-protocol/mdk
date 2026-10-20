@@ -838,16 +838,14 @@ async fn notification_lag_keeps_account_delivery_open_and_bounds_the_loss() {
     );
     assert!(other_adapter.pending_delivery_overflow().is_none());
 
-    // Later inbound still reaches the same adapter.
+    // A later router delivery still reaches the same adapter. Source replay
+    // admission is independent of the account queue's loss generation.
     let later = group_event("delivered-after-lag", &transport_group_id);
-    relay_plane
-        .handle_relay_event_for_test(NostrRelayEvent {
-            endpoint: endpoint.clone(),
-            subscription_id: Some("group-sub".into()),
-            event: later.clone(),
-        })
-        .await
-        .unwrap();
+    relay_plane.route_account_delivery_for_test(router_group_delivery(
+        &account,
+        GroupId::new(vec![0xC3; 32]),
+        later.clone(),
+    ));
     let Some(AccountDeliveryReceive::Delivery(delivery)) =
         timeout(Duration::from_secs(1), adapter.receive_account_delivery())
             .await
@@ -3053,24 +3051,49 @@ async fn shared_group_event_is_delivered_to_each_matching_account_receiver() {
         .await
         .unwrap();
 
-    let delivered = relay_plane
-        .handle_relay_event_for_test(NostrRelayEvent {
-            endpoint,
-            subscription_id: Some("group-sub".into()),
-            event: group_event("11", &transport_group_id),
-        })
-        .await
-        .unwrap();
-    assert_eq!(delivered, 2);
+    let event = group_event("11", &transport_group_id);
+    let message_id = event.to_transport_message().unwrap().id;
+    let subscriptions = relay.subscriptions.lock().unwrap().clone();
+    for subscription in subscriptions
+        .iter()
+        .filter(|request| request.is_group_route())
+    {
+        let copy = NostrRelayEvent {
+            endpoint: endpoint.clone(),
+            subscription_id: Some(subscription.subscription_id()),
+            event: event.clone(),
+        };
+        relay_plane
+            .inner
+            .transport
+            .adapter
+            .observe_relay_event(&copy)
+            .await;
+        assert_eq!(
+            relay_plane.handle_relay_event_for_test(copy).await.unwrap(),
+            2
+        );
+    }
+    assert!(alice_adapter.try_receive_account_delivery().is_none());
+    assert!(bob_adapter.try_receive_account_delivery().is_none());
+    for subscription in subscriptions {
+        relay_plane
+            .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
+            .await;
+    }
 
     let alice_delivery = alice_adapter.receive().await.unwrap().unwrap();
     let bob_delivery = bob_adapter.receive().await.unwrap().unwrap();
+    assert_eq!(alice_delivery.message.id, message_id);
+    assert_eq!(bob_delivery.message.id, message_id);
     assert_eq!(alice_delivery.account_id, alice);
     assert_eq!(bob_delivery.account_id, bob);
     assert_eq!(alice_delivery.group_id_hint, Some(group_id.clone()));
     assert_eq!(bob_delivery.group_id_hint, Some(group_id));
     assert_eq!(alice_delivery.source.plane, TransportDeliveryPlane::Group);
     assert_eq!(bob_delivery.source.plane, TransportDeliveryPlane::Group);
+    assert!(alice_adapter.try_receive_account_delivery().is_none());
+    assert!(bob_adapter.try_receive_account_delivery().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3122,14 +3145,11 @@ async fn full_account_queue_spills_before_it_omits() {
         let mut event = group_event(&format!("alice-{index}"), &transport_group_id);
         event.created_at = 1_700_100_000_u64.saturating_sub(index as u64);
         event.id = event.computed_id();
-        relay_plane
-            .handle_relay_event_for_test(NostrRelayEvent {
-                endpoint: endpoint.clone(),
-                subscription_id: Some("alice-group".into()),
-                event,
-            })
-            .await
-            .unwrap();
+        relay_plane.route_account_delivery_for_test(router_group_delivery(
+            &alice,
+            GroupId::new(vec![0xC3; 32]),
+            event,
+        ));
     }
 
     let settled = timeout(Duration::from_secs(5), async {
@@ -3156,11 +3176,42 @@ async fn full_account_queue_spills_before_it_omits() {
         }
     };
     assert_eq!(health.account_delivery_spill_already_seen, 0);
-    assert_eq!(kept.lock().unwrap().len(), 2);
+    assert_eq!(
+        kept.lock()
+            .unwrap()
+            .iter()
+            .map(|delivery| delivery.message.timestamp.0)
+            .collect::<Vec<_>>(),
+        [
+            1_700_100_000 - ACCOUNT_DELIVERY_BUFFER as u64,
+            1_700_100_000 - (ACCOUNT_DELIVERY_BUFFER as u64 + 1),
+        ],
+        "the durable spill retains the next two deliveries after the queued prefix"
+    );
     assert!(
         adapter.delivery_loss_blocks_cursor(),
         "only the delivery the full spill could not keep becomes loss"
     );
+}
+
+fn router_group_delivery(
+    account: &MemberId,
+    group_id: GroupId,
+    event: NostrTransportEvent,
+) -> TransportDelivery {
+    TransportDelivery {
+        account_id: account.clone(),
+        group_id_hint: Some(group_id),
+        received_at: Timestamp(event.created_at),
+        message: event.to_transport_message().unwrap(),
+        source: TransportDeliverySource {
+            transport: TransportSource(NOSTR_SOURCE.to_owned()),
+            plane: TransportDeliveryPlane::Group,
+            endpoint: None,
+            subscription_id: None,
+            wire: None,
+        },
+    }
 }
 
 async fn fill_account_queue(
@@ -3189,14 +3240,11 @@ async fn fill_account_queue(
         let mut event = group_event(&format!("fill-{index}"), &transport_group_id);
         event.created_at = 1_700_100_000_u64.saturating_sub(index as u64);
         event.id = event.computed_id();
-        relay_plane
-            .handle_relay_event_for_test(NostrRelayEvent {
-                endpoint: endpoint.clone(),
-                subscription_id: Some("fill-group".into()),
-                event,
-            })
-            .await
-            .unwrap();
+        relay_plane.route_account_delivery_for_test(router_group_delivery(
+            account,
+            GroupId::new(vec![0xC3; 32]),
+            event,
+        ));
     }
 }
 
@@ -3777,12 +3825,17 @@ async fn owner_authorizes_empty_boundary_without_phantom_loss_after_deadline() {
     plane.shutdown().await;
 }
 
-/// Replay admission, not a certificate from every configured endpoint,
-/// fences a checkpoint. An endpoint that never starts replaying must not
-/// prevent a drained available endpoint from making its cursor durable.
+/// A valid waiting peer fences both payload and cursor until its finite empty
+/// lease expires. Expiry admits the available replay without inventing loss;
+/// an actual refusal still requires durable loss recovery.
 #[tokio::test(start_paused = true)]
-async fn seal_ignores_silent_peer() {
-    for refused in [false, true] {
+async fn silent_peer_lease_fences() {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Peer {
+        Silent,
+        Refused,
+    }
+    for peer in [Peer::Silent, Peer::Refused] {
         let relay = Arc::new(RecordingRelayClient::default());
         let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
         let account = MemberId::new(vec![0xA1; 32]);
@@ -3830,7 +3883,7 @@ async fn seal_ignores_silent_peer() {
         let issued = relay.subscriptions.lock().unwrap().clone();
         for subscription in issued {
             let id = subscription.subscription_id();
-            if refused {
+            if peer == Peer::Refused {
                 plane
                     .handle_relay_closed_for_test(
                         unavailable.clone(),
@@ -3847,12 +3900,28 @@ async fn seal_ignores_silent_peer() {
                 .handle_relay_eose_for_test(available.clone(), id)
                 .await;
         }
+        if peer == Peer::Silent {
+            tokio::task::yield_now().await;
+            assert!(
+                adapter.try_receive_account_delivery().is_none(),
+                "the current waiting peer fences the available peer's buffered payload"
+            );
+            assert_eq!(adapter.seal_transport_cursor(candidate, |_| true), None);
+            assert!(adapter.pending_delivery_overflow().is_none());
+            tokio::time::advance(Duration::from_secs(29)).await;
+            assert!(adapter.try_receive_account_delivery().is_none());
+            assert_eq!(adapter.seal_transport_cursor(candidate, |_| true), None);
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
         let mut refused_loss = None;
         let delivery = timeout(Duration::from_secs(1), async {
             loop {
                 match adapter.receive_account_delivery().await.unwrap().unwrap() {
                     AccountDeliveryReceive::Overflow(loss) => {
-                        assert!(refused, "a silent peer alone is not an observed failure");
+                        assert!(
+                            peer == Peer::Refused,
+                            "a silent peer alone is not an observed failure"
+                        );
                         assert_eq!(loss.notification_floor, Some(OPENED_CURSOR - 1_000));
                         assert_eq!(adapter.seal_transport_cursor(candidate, |_| true), None);
                         adapter.notification_loss_persisted(loss);
@@ -3863,7 +3932,8 @@ async fn seal_ignores_silent_peer() {
             }
         })
         .await
-        .expect("the available endpoint's replay is admitted");
+        .expect("peer refusal or finite empty lease expiry admits the available replay");
+        assert_eq!(delivery.message.timestamp, Timestamp(OPENED_CURSOR + 500));
         adapter.release_account_delivery(&delivery.message.id);
         assert!(!adapter.account_subscription_eose().await.complete());
         if let Some(loss) = refused_loss {
@@ -3877,7 +3947,7 @@ async fn seal_ignores_silent_peer() {
             }
         })
         .await
-        .expect("an unavailable peer alone must not fence a drained cursor");
+        .expect("the drained cursor is admitted after peer expiry or loss recovery");
         assert!(adapter.pending_delivery_overflow().is_none());
         tokio::time::advance(Duration::from_secs(31)).await;
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -4744,7 +4814,7 @@ async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts
         (
             &alice_adapter,
             alice.clone(),
-            alice_group_id,
+            alice_group_id.clone(),
             alice_transport_group_id.clone(),
         ),
         (
@@ -4777,24 +4847,18 @@ async fn account_queue_overflow_invalidates_eose_without_blocking_other_accounts
         let mut event = group_event(&format!("alice-{index}"), &alice_transport_group_id);
         event.created_at = 1_700_100_000_u64.saturating_sub(index as u64);
         event.id = event.computed_id();
-        relay_plane
-            .handle_relay_event_for_test(NostrRelayEvent {
-                endpoint: endpoint.clone(),
-                subscription_id: Some("alice-group".into()),
-                event,
-            })
-            .await
-            .unwrap();
+        relay_plane.route_account_delivery_for_test(router_group_delivery(
+            &alice,
+            alice_group_id.clone(),
+            event,
+        ));
     }
 
-    relay_plane
-        .handle_relay_event_for_test(NostrRelayEvent {
-            endpoint: endpoint.clone(),
-            subscription_id: Some("bob-group".into()),
-            event: group_event("bob-after-alice-overflow", &bob_transport_group_id),
-        })
-        .await
-        .unwrap();
+    relay_plane.route_account_delivery_for_test(router_group_delivery(
+        &bob,
+        bob_group_id.clone(),
+        group_event("bob-after-alice-overflow", &bob_transport_group_id),
+    ));
     let bob_delivery = timeout(Duration::from_secs(1), bob_adapter.receive())
         .await
         .expect("Alice's full queue must not block Bob")
@@ -5717,6 +5781,16 @@ async fn supervised_notification_lag_delivers_later_inbound_exactly_once() {
         .to_transport_message()
         .unwrap()
         .id;
+    // Recording the injected lag does not mean its surviving preload notice
+    // has left the one-slot source. Do not overwrite that notice with the
+    // later event and accidentally create another real notification loss.
+    timeout(Duration::from_secs(1), async {
+        while !source.sender.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the resumed consumer takes the surviving preload notice");
     source.send(RelayPoolNotification::Message {
         relay_url: RelayUrl::parse("wss://relay.example").unwrap(),
         message: Box::new(RelayMessage::Event {
@@ -5724,16 +5798,18 @@ async fn supervised_notification_lag_delivers_later_inbound_exactly_once() {
             event: std::borrow::Cow::Owned(later),
         }),
     });
-    // This source has one slot to reproduce the original lag. Let the raw
-    // event reach staging before sending EOSE instead of causing a second lag.
+    // Waiting replay sources already make admission pending before this event
+    // arrives. Wait for actual inbound admission, not that pre-existing fence,
+    // before putting EOSE into the one-slot source.
     timeout(Duration::from_secs(1), async {
-        while !relay_plane
+        while relay_plane
             .inner
             .transport
             .adapter
-            .take_replay_status(&account)
+            .metrics()
             .await
-            .pending
+            .inbound_events_delivered
+            == 0
         {
             tokio::task::yield_now().await;
         }
@@ -5771,6 +5847,16 @@ async fn supervised_notification_lag_delivers_later_inbound_exactly_once() {
     );
     assert_eq!(matching[0].account_id, account);
     assert_eq!(matching[0].group_id_hint, Some(group_id));
+    assert_eq!(
+        relay_plane
+            .inner
+            .transport
+            .notification_forwarder_health
+            .snapshot()
+            .lag_incidents,
+        1,
+        "only the deliberately injected notification loss occurs"
+    );
     assert_eq!(
         relay.subscriptions.lock().unwrap().len(),
         subscriptions,

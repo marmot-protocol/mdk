@@ -355,11 +355,10 @@ impl ReplayIngress {
                 return ReplayBatchTake::Empty;
             }
             let allowed = |data: &ReplayBatchData| {
-                data.gate.load(Ordering::Acquire)
-                    || coverage
-                        .groups
-                        .get(&data.group)
-                        .is_none_or(|group| coverage.group_ready(group))
+                coverage
+                    .groups
+                    .get(&data.group)
+                    .is_none_or(|group| coverage.group_ready(group))
             };
             let serial = match group {
                 Some(group) => queue
@@ -551,8 +550,16 @@ impl NostrTransportAdapter {
                 .sum::<usize>();
             let buffered_items = current.map_or(0, |coverage| coverage.buffered_items);
             let buffered_bytes = current.map_or(0, |coverage| coverage.buffered_bytes);
+            let releasing_items = current.map_or(0, |coverage| coverage.releasing_items);
+            let releasing_bytes = current.map_or(0, |coverage| coverage.releasing_bytes);
             if retained.len() > REPLAY_BUFFER_MAX_ITEMS.saturating_sub(queue.items + buffered_items)
                 || bytes > REPLAY_BUFFER_MAX_BYTES.saturating_sub(queue.bytes + buffered_bytes)
+                || retained.len()
+                    > (2 * REPLAY_BUFFER_MAX_ITEMS)
+                        .saturating_sub(queue.items + buffered_items + releasing_items)
+                || bytes
+                    > (2 * REPLAY_BUFFER_MAX_BYTES)
+                        .saturating_sub(queue.bytes + buffered_bytes + releasing_bytes)
             {
                 return Err(TransportAdapterError::Other(
                     "retained replay exceeds native input bounds".to_owned(),
@@ -747,7 +754,6 @@ impl AccountReplayCoverage {
                     },
                 });
             }
-            self.remember_ready(&group_id);
             deliveries.sort_unstable_by(|a, b| {
                 (
                     a.delivery.message.timestamp,
@@ -1195,19 +1201,262 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_source_revokes_loan() {
+        let (state, mut ingress, _) = fixture(&[]);
+        let old = ready(&mut ingress).await;
+        let group = GroupId::new(vec![0; 16]);
+        let source = NostrSubscription::Group {
+            account_id: ingress.account.clone(),
+            group_id: group.clone(),
+            transport_group_id: vec![1; 32],
+            endpoints: vec![TransportEndpoint("wss://native.example".into())],
+            since: None,
+            attempt: SubscriptionAttempt::INITIAL,
+        };
+        let id = source.subscription_id();
+        state
+            .write()
+            .await
+            .account_replay_coverage
+            .get_mut(&ingress.account)
+            .unwrap()
+            .add_subscription(
+                id.clone(),
+                &source,
+                HashMap::from([(RelayIndex(0), RelayReplay::Awaiting)]),
+            );
+        assert!(
+            old.delivery().is_none(),
+            "new route metadata must revoke the old frontier before any payload"
+        );
+        drop(old);
+        assert!(matches!(
+            ingress.take_batch(Some(&group)).await,
+            ReplayBatchTake::Pending
+        ));
+        state
+            .write()
+            .await
+            .account_replay_coverage
+            .get_mut(&ingress.account)
+            .unwrap()
+            .record_eose(&id, RelayIndex(0), 0);
+        let mut batch = ready(&mut ingress).await;
+        for at in [10, 20] {
+            assert_eq!(batch.delivery().unwrap().message.timestamp, Timestamp(at));
+            batch.acknowledge().await;
+        }
+        assert!(
+            state
+                .read()
+                .await
+                .replay_losses
+                .pending
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_pending_revokes_loan() {
+        let (state, mut ingress, id) = fixture(&[]);
+        let old = ready(&mut ingress).await;
+        reopen_history(&state, &ingress, &id, &[]).await;
+        assert!(
+            old.delivery().is_none(),
+            "a pending source fences an unstarted loan before its first payload"
+        );
+        drop(old);
+        let group = GroupId::new(vec![0; 16]);
+        assert!(matches!(
+            ingress.take_batch(Some(&group)).await,
+            ReplayBatchTake::Pending
+        ));
+        reopen_history(&state, &ingress, &id, &[5]).await;
+        state
+            .write()
+            .await
+            .account_replay_coverage
+            .get_mut(&ingress.account)
+            .unwrap()
+            .record_eose(&id, RelayIndex(0), 0);
+        let mut merged = ready(&mut ingress).await;
+        for at in [5, 10, 20] {
+            assert_eq!(merged.delivery().unwrap().message.timestamp, Timestamp(at));
+            merged.acknowledge().await;
+        }
+        assert!(
+            state
+                .read()
+                .await
+                .replay_losses
+                .pending
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_live_restart_orders() {
+        let mut state = AdapterState::default();
+        let (mut coverage, id) = coverage(&state, Arc::default());
+        coverage.ingress = None;
+        let account = delivery(10, &id).account_id;
+        let (tx, mut rx) = mpsc::channel(1);
+        for at in [30, 20, 10] {
+            coverage.record_stored_event(&id, RelayIndex(0), u64::from(at));
+            coverage
+                .stage_delivery(
+                    delivery(at, &id),
+                    Some(RelayIndex(0)),
+                    ReplayInput::History,
+                    &tx,
+                )
+                .unwrap();
+        }
+        coverage.record_eose(&id, RelayIndex(0), 0);
+        coverage.flushing = true;
+        let cancellation = coverage.cancellation.clone();
+        let wake = coverage.wake.clone();
+        state
+            .account_replay_coverage
+            .insert(account.clone(), coverage);
+        let state = Arc::new(RwLock::new(state));
+        let supervisor = Arc::new(ReplaySupervisor {
+            state: Arc::downgrade(&state),
+            relay_client: Arc::new(NoNetwork),
+            delivery_tx: tx.clone(),
+            account_id: account.clone(),
+            cancellation,
+            wake,
+            monotonic_start: Instant::now(),
+        });
+        let drain = supervisor.clone();
+        let task = tokio::spawn(async move { drain.drain_deliveries().await });
+        loop {
+            if state.read().await.account_replay_coverage[&account].releasing_items == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        {
+            let mut guard = state.write().await;
+            let coverage = guard.account_replay_coverage.get_mut(&account).unwrap();
+            coverage
+                .restart_request(&id, RelayIndex(0), ReplayStart::Connection)
+                .unwrap();
+            let first = rx
+                .try_recv()
+                .expect("the first handoff preceded the restart");
+            assert_eq!(first.message.timestamp, Timestamp(10));
+            coverage.ack_placement(&first.message.id);
+            coverage.record_stored_event(&id, RelayIndex(0), 5);
+            coverage
+                .stage_delivery(
+                    delivery(5, &id),
+                    Some(RelayIndex(0)),
+                    ReplayInput::History,
+                    &tx,
+                )
+                .unwrap();
+        }
+        task.await.unwrap();
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "a cached live suffix must not cross newly pending source metadata"
+        );
+        {
+            let mut guard = state.write().await;
+            let coverage = guard.account_replay_coverage.get_mut(&account).unwrap();
+            assert_eq!((coverage.buffered_items, coverage.releasing_items), (3, 0));
+            coverage.record_eose(&id, RelayIndex(0), 0);
+        }
+        let drain = supervisor.clone();
+        let task = tokio::spawn(async move { drain.drain_deliveries().await });
+        for at in [5, 20, 30] {
+            let frame = rx.recv().await.unwrap();
+            assert_eq!(frame.message.timestamp, Timestamp(at));
+            state
+                .write()
+                .await
+                .account_replay_coverage
+                .get_mut(&account)
+                .unwrap()
+                .ack_placement(&frame.message.id);
+        }
+        task.await.unwrap();
+        let guard = state.read().await;
+        let coverage = &guard.account_replay_coverage[&account];
+        assert_eq!((coverage.buffered_items, coverage.releasing_items), (0, 0));
+        assert!(!coverage.admission_pending());
+        assert!(guard.replay_losses.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_lease_expires_no_loss() {
+        let (state, mut ingress, id) = fixture(&[]);
+        drop(ready(&mut ingress).await);
+        reopen_history(&state, &ingress, &id, &[]).await;
+        let group = GroupId::new(vec![0; 16]);
+        assert!(matches!(
+            ingress.take_batch(Some(&group)).await,
+            ReplayBatchTake::Pending
+        ));
+        tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration).await;
+        {
+            let mut state = state.write().await;
+            let coverage = state
+                .account_replay_coverage
+                .get_mut(&ingress.account)
+                .unwrap();
+            coverage.expire_replay(tokio::time::Instant::now());
+            assert!(
+                !coverage.snapshot().complete(),
+                "expiry is not history certification"
+            );
+        }
+        let mut batch = ready(&mut ingress).await;
+        for at in [10, 20] {
+            assert_eq!(batch.delivery().unwrap().message.timestamp, Timestamp(at));
+            batch.acknowledge().await;
+        }
+        assert!(
+            state
+                .read()
+                .await
+                .replay_losses
+                .pending
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn alias_ack_precedes_eose() {
         let (state, mut ingress, id) = fixture(&[]);
         let mut batch = ready(&mut ingress).await;
-        reopen_history(&state, &ingress, &id, &[10]).await;
         assert_eq!(batch.delivery().unwrap().message.timestamp, Timestamp(10));
+        // The first frame has already been durably ingested when metadata
+        // revokes unstarted input. Withholding its ACK cannot undo MLS state.
+        reopen_history(&state, &ingress, &id, &[10]).await;
+        assert!(batch.delivery().is_none());
         batch.acknowledge().await;
-        batch.acknowledge().await;
-        let mut state = state.write().await;
-        let coverage = state
+        drop(batch);
+        let mut guard = state.write().await;
+        let coverage = guard
             .account_replay_coverage
             .get_mut(&ingress.account)
             .unwrap();
         coverage.record_eose(&id, RelayIndex(0), 0);
+        drop(guard);
+        let mut batch = ready(&mut ingress).await;
+        assert_eq!(batch.delivery().unwrap().message.timestamp, Timestamp(20));
+        batch.acknowledge().await;
+        let state = state.read().await;
+        let coverage = &state.account_replay_coverage[&ingress.account];
         assert!(coverage.request_admitted(&id, Some(RelayIndex(0))));
         assert!(!coverage.admission_pending());
     }
@@ -1239,6 +1488,134 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "durable supplement copies were not lost"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_tail_keeps_native_scope() {
+        let (state, mut ingress, id) = fixture(&[]);
+        let mut retained = ready(&mut ingress).await;
+        retained.acknowledge().await;
+        retained.acknowledge().await;
+        drop(retained);
+        let (tx, mut rx) = mpsc::channel(2);
+        {
+            let mut guard = state.write().await;
+            let coverage = guard
+                .account_replay_coverage
+                .get_mut(&ingress.account)
+                .unwrap();
+            coverage
+                .stage_delivery(
+                    delivery(5, &id),
+                    Some(RelayIndex(0)),
+                    ReplayInput::Live,
+                    &tx,
+                )
+                .unwrap();
+            coverage
+                .stage_delivery(delivery(15, &id), None, ReplayInput::Untracked, &tx)
+                .unwrap();
+            coverage.queue_owner_batches();
+        }
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "post-EOSE and untracked group copies stay out of the ordinary queue"
+        );
+        let batch = ready(&mut ingress).await;
+        assert_eq!(batch.delivery().unwrap().message.timestamp, Timestamp(5));
+        reopen_history(&state, &ingress, &id, &[]).await;
+        assert!(batch.delivery().is_none());
+        drop(batch);
+        state
+            .write()
+            .await
+            .account_replay_coverage
+            .get_mut(&ingress.account)
+            .unwrap()
+            .record_eose(&id, RelayIndex(0), 0);
+        let batch = ready(&mut ingress).await;
+        assert_eq!(
+            batch.delivery().unwrap().message.timestamp,
+            Timestamp(5),
+            "same-account source replacement preserves the remote live prefix"
+        );
+        assert_eq!(ingress.shared.held(), (2, 2));
+        assert!(
+            state
+                .read()
+                .await
+                .replay_losses
+                .pending
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        drop(batch);
+        state
+            .write()
+            .await
+            .account_replay_coverage
+            .remove(&ingress.account);
+        assert_eq!(ingress.shared.held(), (0, 0));
+        assert_eq!(
+            state
+                .read()
+                .await
+                .replay_losses
+                .pending
+                .lock()
+                .unwrap()
+                .get(&ingress.account),
+            Some(&NostrNotificationLossFloor::Unbounded),
+            "actual account closure still charges discarded remote live bodies"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_spill_upgrades_lease() {
+        let (state, mut ingress, id) = fixture(&[5]);
+        drop(ready(&mut ingress).await);
+        let account = ingress.account.clone();
+        drop(ingress);
+        let mut adapter = NostrTransportAdapter::new(Arc::new(NoNetwork));
+        adapter.state = state.clone();
+        let mut reopened = adapter
+            .open_replay_ingress(&account, vec![delivery(5, &id)])
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.shared.held(),
+            (3, 3),
+            "a spill duplicate does not copy the ciphertext"
+        );
+        {
+            let mut state = state.write().await;
+            state.account_replay_coverage.remove(&account);
+            let (mut coverage, id) = coverage(&state, reopened.shared.clone());
+            coverage.admit_retained();
+            coverage.record_eose(&id, RelayIndex(0), 0);
+            state.account_replay_coverage.insert(account, coverage);
+        }
+        let mut batch = ready(&mut reopened).await;
+        for at in [5, 10, 20] {
+            assert_eq!(
+                batch.delivery().unwrap().message.timestamp,
+                Timestamp(at),
+                "a newly durable copy survives source replacement"
+            );
+            batch.acknowledge().await;
+        }
+        assert!(
+            state
+                .read()
+                .await
+                .replay_losses
+                .pending
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "retained spill was not lost"
         );
     }
 

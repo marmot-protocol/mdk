@@ -1834,6 +1834,7 @@ async fn run_app_runtime_account_worker(
     let mut local_submission_service_owed = false;
     let mut comparison_recovery: Option<ComparisonRecoveryJob> = None;
     let mut replay_changes = client.adapter.replay_changes().await;
+    let mut admission_retry = ReplayAdmissionRetry::default();
     'worker: loop {
         // Activation may replace the source watch. Reacquire only a live
         // receiver; a closed activation must not turn this into a busy loop.
@@ -1849,10 +1850,11 @@ async fn run_app_runtime_account_worker(
         let native_progress = match if comparison_recovery
             .as_ref()
             .is_some_and(|job| job.network.is_none())
+            || !admission_retry.ready()
         {
             Ok(false)
         } else {
-            client.admit_native_turn().await
+            admission_retry.admit_native_turn(&mut client).await
         } {
             Ok(progress) => progress,
             Err(error) => {
@@ -1870,6 +1872,7 @@ async fn run_app_runtime_account_worker(
         // before the next turn.
         if let Some(job) = comparison_recovery.as_mut()
             && job.network.is_none()
+            && admission_retry.ready()
         {
             let turn = match job.admission.as_mut() {
                 Some(admission) => {
@@ -1879,6 +1882,18 @@ async fn run_app_runtime_account_worker(
                 }
                 None => Ok(true),
             };
+            if turn.is_err() {
+                // Mixed admission can fail on a native frame too. Pace its
+                // retained input even after the failed comparison is settled.
+                admission_retry.failed();
+                client.yield_failed_native_turn();
+            } else if job
+                .admission
+                .as_ref()
+                .is_some_and(|admission| admission.progressed)
+            {
+                admission_retry.reset();
+            }
             if !matches!(turn, Ok(false)) {
                 let mut job = comparison_recovery
                     .take()
@@ -1967,12 +1982,44 @@ async fn run_app_runtime_account_worker(
             ready_command_index(&pending, &media_http, comparison_recovery.is_some());
         // Unified admission may have advanced native frames as well as the
         // comparison prefix. Publish their committed effects before live input.
-        publish_client_pending_applied_summary(
-            &mut client,
+        let admitted = client.take_pending_applied_sync_summary();
+        publish_app_runtime_summary_with_v5(
+            &client,
             &events,
             &account_id_hex,
             &account_label,
+            &admitted,
         );
+        if admitted != SyncSummary::default() {
+            publish_client_pending_projection_updates(
+                &mut client,
+                &events,
+                &account_id_hex,
+                &account_label,
+            );
+            start_post_join_history_after_visibility(
+                &mut client,
+                &admitted,
+                &events,
+                &account_id_hex,
+                &account_label,
+            )
+            .await;
+            finish_receive_after_recovery(
+                &mut client,
+                ReceiveTailContext {
+                    events: &events,
+                    account_id_hex: &account_id_hex,
+                    account_label: &account_label,
+                    shared: &shared,
+                    scheduled_push_retry: &mut scheduled_push_retry,
+                    command_tx: &command_tx,
+                },
+                sync_summary_triggers_audit_tracker_update(&admitted),
+                !admitted.joined_groups.is_empty(),
+            )
+            .await;
+        }
         scheduled_runtime_group_subscription_refresh.observe_pending(
             client.has_pending_runtime_group_subscription_refresh(),
             &command_tx,
@@ -2860,7 +2907,8 @@ async fn run_app_runtime_account_worker(
             // A comparison batch still being admitted takes its next turn as
             // soon as commands and live input have had theirs, instead of
             // waiting for unrelated input while it holds its recovery credit.
-            _ = tokio::task::yield_now(), if native_progress || comparison_recovery.as_ref().is_some_and(|job| job.network.is_none() && job.admission.as_ref().is_some_and(|admission| admission.progressed)) => {
+            () = admission_retry.wait() => { continue 'worker; }
+            _ = tokio::task::yield_now(), if admission_retry.ready() && (native_progress || comparison_recovery.as_ref().is_some_and(|job| job.network.is_none() && job.admission.as_ref().is_some_and(|admission| admission.progressed))) => {
                 continue 'worker;
             }
             _ = maintenance_tick.tick() => {
@@ -7062,6 +7110,59 @@ fn retry_delay_for_attempt(attempt: u32) -> Duration {
         .min(CONVERGENCE_RETRY_MAX_DELAY)
 }
 
+/// Only automatic admission is paced. Explicit sync/next_event callers still
+/// attempt retained input and observe the original storage/backend error.
+/// This timer never reconnects or acquires recovery credit.
+#[derive(Default)]
+struct ReplayAdmissionRetry {
+    attempts: u32,
+    deadline: Option<TokioInstant>,
+}
+
+impl ReplayAdmissionRetry {
+    async fn admit_native_turn(&mut self, client: &mut AppClient) -> Result<bool, AppError> {
+        if !self.ready() {
+            return Ok(false);
+        }
+        match client.admit_native_turn().await {
+            Ok(progress) => {
+                if progress {
+                    self.reset();
+                }
+                Ok(progress)
+            }
+            Err(error) => {
+                self.failed();
+                client.yield_failed_native_turn();
+                Err(error)
+            }
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.deadline
+            .is_none_or(|deadline| deadline <= TokioInstant::now())
+    }
+
+    fn failed(&mut self) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.deadline = Some(TokioInstant::now() + retry_delay_for_attempt(self.attempts));
+    }
+
+    fn reset(&mut self) {
+        self.attempts = 0;
+        self.deadline = None;
+    }
+
+    async fn wait(&mut self) {
+        match self.deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending::<()>().await,
+        }
+        self.deadline = None;
+    }
+}
+
 /// Finish the original Receive arm after its recovery outcome is reported.
 /// The same tail runs immediately for inline/deferred work or when the owned
 /// comparison joins; automatic push work schedules from the current durable
@@ -7707,6 +7808,40 @@ mod tests {
     mod worker_wait_attribution_tests;
 
     static BOUNDED_WORKER_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    // Paused time pins the production retry deadlines without wall-clock sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn native_admission_backoff() {
+        let mut retry = ReplayAdmissionRetry::default();
+        for expected in [1, 2, 4, 8, 16, 32, 60, 60] {
+            assert!(retry.ready());
+            retry.failed();
+            assert!(!retry.ready());
+            let deadline = retry.deadline.unwrap();
+            assert_eq!(
+                deadline - TokioInstant::now(),
+                Duration::from_secs(expected)
+            );
+            tokio::time::advance(Duration::from_secs(expected) - Duration::from_millis(1)).await;
+            assert!(
+                !retry.ready(),
+                "unrelated worker wakes cannot shorten failure backoff"
+            );
+            retry.wait().await;
+            assert!(retry.ready());
+            assert!(
+                retry.deadline.is_none(),
+                "a consumed retry deadline cannot hot-loop"
+            );
+        }
+        retry.reset();
+        assert_eq!(retry.attempts, 0);
+        retry.failed();
+        assert_eq!(
+            retry.deadline.unwrap() - TokioInstant::now(),
+            Duration::from_secs(1)
+        );
+    }
 
     #[tokio::test]
     async fn native_replay_watch_coalesces_and_observes_same_generation_progress() {

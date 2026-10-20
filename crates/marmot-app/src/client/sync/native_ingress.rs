@@ -75,23 +75,66 @@ impl AppClient {
         Ok(())
     }
 
-    /// Process at most one ordinary admission turn, buffering its committed
+    /// Examine at most four frames (including receipt skips) per turn, buffering its committed
     /// summary before an acknowledgement can suspend. Dropping this future
     /// returns its unacknowledged suffix in the original per-group order.
     pub(crate) async fn admit_native_turn(&mut self) -> Result<bool, AppError> {
         let mut progressed = false;
-        let mut spent = 0;
-        while spent < MAX_COMPARISON_ADMISSION_PER_TURN {
+        for _ in 0..MAX_COMPARISON_ADMISSION_PER_TURN {
             if !matches!(self.take_native_batch(None).await, NativeFrontier::Ready) {
                 break;
             }
-            spent += usize::from(self.admit_native_frame().await?);
+            self.admit_native_frame().await?;
             progressed = true;
         }
         // The source returns this suffix behind independent ready groups;
         // its one-outstanding-batch rule still prevents same-group overtaking.
         self.recovery_owner.native_batch = None;
+        if self.recovery_owner.native_cursor_target <= self.checkpointed_transport_timestamp {
+            self.recovery_owner.native_cursor_target = None;
+        }
+        if self.recovery_owner.native_cursor_target.is_some() && !self.delivery_loss_blocks_cursor()
+        {
+            let observation = self.adapter.replay_admission().await;
+            let drained = !observation.pending && !observation.spill_pending;
+            let generation = observation.generation();
+            drop(observation);
+            if drained {
+                self.synchronize_native_replay().await?;
+                if !self.recovery_owner.native_replay_authorizes(generation) {
+                    return Ok(progressed);
+                }
+                // Native-owned live tails do not pass through the ordinary
+                // queue. Promote the fully acknowledged prefix, retaining the
+                // save intent on error. Ordinary drain later settles its floor;
+                // the existing large-promotion rule avoids per-message audit rows.
+                let previous = self.checkpointed_transport_timestamp;
+                let sealed = self.seal_transport_cursor();
+                if let Err(error) =
+                    self.save_state_with_pending_local_group_deletion_frontier_clears()
+                {
+                    self.abandon_transport_cursor(sealed);
+                    return Err(error);
+                }
+                self.record_transport_cursor_advanced(
+                    marmot_forensics::TransportCursorTrigger::LivePromotion,
+                    &sealed,
+                );
+                if self.recovery_owner.native_cursor_target <= self.checkpointed_transport_timestamp
+                {
+                    self.recovery_owner.native_cursor_target = None;
+                }
+                progressed |= self.checkpointed_transport_timestamp != previous;
+            }
+        }
         Ok(progressed)
+    }
+
+    /// Return a failed loan behind independent groups only after the worker
+    /// has armed its admission backoff. Its source wake cannot bypass that
+    /// deadline, and the next eligible turn can service another group first.
+    pub(crate) fn yield_failed_native_turn(&mut self) {
+        self.recovery_owner.native_batch = None;
     }
 
     /// Keep the selected lease on the existing owner. A group-specific lookup
@@ -133,20 +176,53 @@ impl AppClient {
         let Some(delivery) = batch.delivery() else {
             return Ok(false);
         };
-        let (summary, settled) = self.admit_recovered_delivery(delivery).await?;
-        self.pending_applied_sync_summary.merge(summary);
-        if let Some(seq) = self
-            .recovery_owner
-            .retained_spill
-            .remove(&delivery.message.id)
-        {
-            let event_id = hex::encode(delivery.message.id.as_slice());
-            self.settle_spill_row(seq, &event_id);
+        let timestamp = delivery.message.timestamp.0;
+        let result = async {
+            let (summary, settled) = self.admit_recovered_delivery(delivery).await?;
+            self.pending_applied_sync_summary.merge(summary);
+            if let Some(&seq) = self.recovery_owner.retained_spill.get(&delivery.message.id) {
+                let event_id = hex::encode(delivery.message.id.as_slice());
+                self.try_settle_spill_row(seq, &event_id)?;
+                self.recovery_owner
+                    .retained_spill
+                    .remove(&delivery.message.id);
+            }
+            Ok((
+                matches!(settled, super::RecoveredDelivery::Ingested { .. }),
+                matches!(
+                    settled,
+                    super::RecoveredDelivery::AlreadyHeld
+                        | super::RecoveredDelivery::Ingested {
+                            unpersisted: false,
+                            ..
+                        }
+                ),
+            ))
         }
+        .await;
+        let (ingested, durable) = match result {
+            Ok(settled) => settled,
+            Err(error) => {
+                // Explicit callers keep the failed frame pinned and observe
+                // this error. The worker arms backoff before returning its
+                // loan to the ingress's fair group rotation.
+                self.recovery_owner.native_batch = Some(batch);
+                return Err(error);
+            }
+        };
         batch.acknowledge().await;
+        if durable {
+            if !ingested {
+                self.remember_transport_cursor(timestamp);
+            }
+            self.recovery_owner.native_cursor_target = self
+                .recovery_owner
+                .native_cursor_target
+                .max(self.state.last_transport_timestamp);
+        }
         if batch.delivery().is_some() {
             self.recovery_owner.native_batch = Some(batch);
         }
-        Ok(matches!(settled, super::RecoveredDelivery::Ingested { .. }))
+        Ok(ingested)
     }
 }

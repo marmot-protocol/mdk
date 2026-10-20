@@ -453,7 +453,9 @@ async fn new_loss_during_a_pass_supersedes_it() {
         .clone();
     let joined = recorded_v5_rows(&fixture.app, "recovery_need_changed")
         .into_iter()
-        .filter(|row| row["event"]["change"] == "joined")
+        .filter(|row| {
+            row["event"]["change"] == "joined" && row["event"]["obligation_ref"] == loss_ref
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         joined.len(),
@@ -470,22 +472,23 @@ fn cursor_rows_record_settled_advances_and_only_large_live_promotions() {
         let mut fixture = crate::tests::LiveCursorFixture::open_audited().await;
         let cursor_before = fixture.cursor_before;
         // A live promotion within the rebuild lookback writes no row.
-        crate::tests::inject_epoch_gap_probe(
-            &fixture.app,
-            fixture.probe(cursor_before + 60, "near"),
-        )
-        .await;
+        let near = fixture
+            .delivery(fixture.probe(cursor_before + 60, "near"))
+            .await;
+        fixture
+            .app
+            .relay_plane
+            .route_account_delivery_for_test(near);
         fixture.wait_for_queue_depth(1).await;
         fixture.ingest_next_live_delivery().await;
         assert_eq!(fixture.persisted(), Some(cursor_before + 60));
         assert!(recorded_v5_rows(&fixture.app, "transport_cursor_advanced").is_empty());
 
         // One past the lookback does.
-        crate::tests::inject_epoch_gap_probe(
-            &fixture.app,
-            fixture.probe(cursor_before + 4_000, "far"),
-        )
-        .await;
+        let far = fixture
+            .delivery(fixture.probe(cursor_before + 4_000, "far"))
+            .await;
+        fixture.app.relay_plane.route_account_delivery_for_test(far);
         fixture.wait_for_queue_depth(1).await;
         fixture.ingest_next_live_delivery().await;
         assert_eq!(fixture.persisted(), Some(cursor_before + 4_000));

@@ -75,8 +75,10 @@ for reconnect/backoff and relay status mechanics.
   - A failed, unsupported or over-long paging stays incomplete for the next activation and recovery. So does a full page that
     cannot move past its oldest second, because that second may hide more events and everything older.
 - Stage each group's complete replay range before timestamp/id-ordered release, including backward pages. Keep
-  live arrivals behind the draining batch. Preserve ready route floors across equivalent/narrower repacks, not
-  wider requests. Verified raw SDK group copies feed admission; deduplicated `Event` copies must not bypass
+  live arrivals behind the draining batch. Every replacement REQ establishes its own current-peer boundary,
+  including equivalent or narrower repacks; never inherit another REQ's ready floor. In-deadline peers fence
+  payload release until EOSE or their finite lease settles. Verified raw SDK group copies feed admission;
+  deduplicated `Event` copies must not bypass
   it, and retired REQs must never admit late copies. SDK seen-state is not account admission.
 - Admission belongs to each REQ/relay/transport-route, never a sticky group-wide failure flag. Share
   ciphertext bodies with separate source claims; retiring or failing one source must not discard a healthy

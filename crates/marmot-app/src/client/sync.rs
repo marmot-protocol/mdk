@@ -1196,19 +1196,7 @@ impl AppClient {
                 return Ok(since.map(|since| cgka_traits::transport::Timestamp(since.0.min(floor))));
             }
         }
-        // Without a durable cursor there is no settled replay floor. A relay
-        // without NIP-77 must still return history older than the live tail.
-        if since.is_some() || self.checkpointed_transport_timestamp.is_none() {
-            return Ok(since);
-        }
-        // A rejected future-dated cursor must not become a future REQ floor.
-        let lookback = self
-            .relay_plane
-            .subscription_rebuild_lookback_secs()
-            .unwrap_or(120);
-        Ok(Some(cgka_traits::transport::Timestamp(
-            unix_now_seconds().saturating_sub(lookback),
-        )))
+        Ok(since)
     }
 
     pub(crate) fn delivery_loss_blocks_cursor(&self) -> bool {
@@ -7055,14 +7043,19 @@ mod live_cursor_checkpoint_tests {
         );
     }
 
-    /// Inject `events` in order and wait until the account queue holds them.
+    /// Exercise ordinary queue/taken pins at the router boundary. Native group
+    /// producer ordering has its own real-MLS coverage.
     async fn queue_in_order(
         fixture: &LiveCursorFixture,
         events: impl IntoIterator<Item = transport_nostr_peeler::NostrTransportEvent>,
     ) {
         let mut queued = 0;
         for event in events {
-            inject_epoch_gap_probe(&fixture.app, event).await;
+            let delivery = fixture.delivery(event).await;
+            fixture
+                .app
+                .relay_plane
+                .route_account_delivery_for_test(delivery);
             queued += 1;
         }
         fixture.wait_for_queue_depth(queued).await;
@@ -7232,8 +7225,7 @@ mod live_cursor_checkpoint_tests {
             let mut fixture = LiveCursorFixture::open().await;
             let cursor_before = fixture.cursor_before;
             let promoting = fixture.probe(cursor_before + 4_000, "promoting");
-            crate::tests::inject_epoch_gap_probe(&fixture.app, promoting.clone()).await;
-            fixture.wait_for_queue_depth(1).await;
+            queue_in_order(&fixture, [promoting.clone()]).await;
             fixture.ingest_next_live_delivery().await;
             retry_live_cursor(&mut fixture, &promoting, cursor_before + 4_000).await;
             assert_eq!(fixture.persisted(), Some(cursor_before + 4_000));
@@ -7409,12 +7401,7 @@ mod live_cursor_checkpoint_tests {
         run_composed_app_runtime_test("first-cursor-live-waits", || async {
             let mut fixture = LiveCursorFixture::open_without_cursor().await;
             let cursor_before = fixture.cursor_before;
-            crate::tests::inject_epoch_gap_probe(
-                &fixture.app,
-                fixture.probe(cursor_before + 4_000, "live"),
-            )
-            .await;
-            fixture.wait_for_queue_depth(1).await;
+            queue_in_order(&fixture, [fixture.probe(cursor_before + 4_000, "live")]).await;
             fixture.ingest_next_live_delivery().await;
             assert_eq!(
                 fixture.client.state.last_transport_timestamp,
@@ -7428,8 +7415,7 @@ mod live_cursor_checkpoint_tests {
 
             // Queued before the first seal, below any floor, it caps it.
             let queued = fixture.probe(cursor_before + 1_000, "queued");
-            crate::tests::inject_epoch_gap_probe(&fixture.app, queued.clone()).await;
-            fixture.wait_for_queue_depth(1).await;
+            queue_in_order(&fixture, [queued.clone()]).await;
             retry_drain_cursor(&mut fixture, cursor_before + 1_000 + 120).await;
 
             fixture.ingest_next_live_delivery().await;

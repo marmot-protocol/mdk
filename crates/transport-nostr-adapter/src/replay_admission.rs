@@ -91,6 +91,56 @@ impl ReplayRequestView<'_> {
     pub fn admitted(&self) -> bool {
         self.endpoints().any(|endpoint| endpoint.admitted())
     }
+
+    /// This request's inbox or MLS-group input has reached durable placement
+    /// and ordinary native admission. Unrelated requests' waiting peers do not
+    /// revoke a completed range; the account cursor independently retains its
+    /// strict all-current-source pending and loss fence.
+    pub fn placed(&self) -> bool {
+        match &self.window.scope {
+            ReplayScope::Inbox => {
+                self.coverage.inbox_placements == 0
+                    && !self
+                        .coverage
+                        .outbox
+                        .iter()
+                        .any(|delivery| delivery.group_id_hint.is_none())
+            }
+            ReplayScope::Groups(_) => {
+                self.coverage
+                    .request_groups
+                    .get(self.id)
+                    .is_some_and(|groups| {
+                        !groups.is_empty()
+                            && groups.iter().all(|id| {
+                                self.coverage.groups.get(id).is_some_and(|group| {
+                                    self.coverage.group_ready(group)
+                                        && group.events.is_empty()
+                                        && group.placements == 0
+                                        && !self.coverage.native_group_pending(id)
+                                        && !self.coverage.outbox.iter().any(|delivery| {
+                                            delivery.group_id_hint.as_ref() == Some(id)
+                                        })
+                                })
+                            })
+                    })
+            }
+        }
+    }
+
+    /// Every issued peer terminally refused this live request. Such a source
+    /// remains observable debt, but supplies no private-capture capability.
+    pub fn terminally_refused(&self) -> bool {
+        self.coverage
+            .subscriptions
+            .get(self.id)
+            .is_some_and(|relays| {
+                !relays.is_empty()
+                    && relays
+                        .values()
+                        .all(|replay| *replay == RelayReplay::Refused)
+            })
+    }
 }
 
 /// One issued endpoint, borrowed under the admission read guard.
@@ -133,6 +183,12 @@ impl ReplayEndpointView<'_> {
 }
 
 impl ReplayAdmissionStatus<'_> {
+    /// Whether the account has an installed route set. A deactivated account's
+    /// absent sources are temporary absence, not terminal replay evidence.
+    pub fn active(&self) -> bool {
+        self._guard.accounts.contains_key(self.account_id)
+    }
+
     /// Wire membership/epoch changes invalidate an owner's cached permission.
     pub fn generation(&self) -> u64 {
         self._guard
@@ -154,11 +210,7 @@ impl ReplayAdmissionStatus<'_> {
                     .iter()
                     .filter(|(id, _)| {
                         !coverage.maintenance.contains(*id)
-                            && coverage.subscriptions.get(*id).is_some_and(|relays| {
-                                relays
-                                    .values()
-                                    .any(|replay| *replay != RelayReplay::Refused)
-                            })
+                            && coverage.subscriptions.contains_key(*id)
                     })
                     .map(move |(id, window)| ReplayRequestView {
                         state,

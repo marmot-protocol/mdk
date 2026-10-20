@@ -100,6 +100,17 @@ pub struct RecoveryScopeCheckpoint {
 /// needs, for its unchanged goal, before the obligation parks.
 pub const RECOVERY_PARK_AFTER_QUIET_PASSES: u64 = 3;
 
+/// Account-wide placement fence copied alongside scoped native source facts.
+/// Scoped proofs may be retained while unrelated input still blocks final
+/// completion; neither case establishes history coverage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryReplayPlacement {
+    /// Current account input still blocks aggregate native completion.
+    Pending,
+    /// All copied account input reached its native placement boundary.
+    Placed,
+}
+
 /// Unserved comparisons in a row, for an unchanged goal and its required
 /// relays, after which a scope counts toward parking like a quiet one. A
 /// required relay that never answers otherwise keeps the obligation retrying
@@ -358,6 +369,49 @@ fn scopes_qualify_where(
         } else {
             all_qualified
         })
+}
+
+fn native_observation_matches(
+    conn: &Connection,
+    fence: &RecoveryRevisionFence,
+    ticket: RecoveryDemandTicket,
+    tokens: &[RecoveryScopeToken],
+) -> StorageResult<bool> {
+    if !fence.obligations.contains(&(ticket.id, ticket.revision)) {
+        return Ok(false);
+    }
+    let mut selected = fence.clone();
+    selected.obligations.retain(|(id, _)| *id == ticket.id);
+    let native: bool = conn
+        .query_row_cached(
+            "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations
+         WHERE id=?1 AND revision=?2 AND cause=7 AND predicate=3 AND state=0)",
+            params![ticket.id.as_slice(), sqlite_integer(ticket.revision)?],
+            |row| row.get(0),
+        )
+        .storage()?;
+    if !native || !selected_fence_matches(&revision_fence(conn)?, &selected) {
+        return Ok(false);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for token in tokens {
+        if token.obligation_id != ticket.id || !seen.insert(token.scope_id) {
+            return Err(invalid_scope());
+        }
+        let current: Option<i64> = conn
+            .query_row_cached(
+                "SELECT scope_revision FROM account_recovery_scopes
+             WHERE obligation_id=?1 AND scope_id=?2 AND snapshot_state=1",
+                params![ticket.id.as_slice(), sqlite_integer(token.scope_id)?],
+                |row| row.get(0),
+            )
+            .optional()
+            .storage()?;
+        if current.map(i64_to_u64).transpose()? != Some(token.revision) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// One route an obligation could not certify, with the relays it requires.
@@ -796,15 +850,89 @@ impl SqliteAppStorage {
         })
     }
 
+    /// Retire only the native scopes the owner proved no longer required by
+    /// authoritative group/route lifecycle state. Loss and history scopes are
+    /// never touched. Bumping above every old token prevents a recreated source
+    /// from accepting a delayed observation after retirement.
+    pub fn retire_native_replay_scopes(
+        &self,
+        fence: &RecoveryRevisionFence,
+        ticket: RecoveryDemandTicket,
+        tokens: &[RecoveryScopeToken],
+    ) -> StorageResult<bool> {
+        if tokens.is_empty() {
+            return Ok(true);
+        }
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !native_observation_matches(&conn, fence, ticket, tokens)? {
+                return Ok(false);
+            }
+            let high_water: i64 = conn.query_row_cached(
+                "SELECT MAX(scope_revision) FROM account_recovery_scopes WHERE obligation_id=?1",
+                [ticket.id.as_slice()], |row| row.get(0),
+            ).storage()?;
+            for token in tokens {
+                conn.execute_cached(
+                    "DELETE FROM account_recovery_scopes WHERE obligation_id=?1 AND scope_id=?2",
+                    params![ticket.id.as_slice(), sqlite_integer(token.scope_id)?],
+                ).storage()?;
+            }
+            conn.execute_cached(
+                "UPDATE account_recovery_obligations SET revision=MAX(revision,?2)+1,
+                 state=CASE WHEN EXISTS(SELECT 1 FROM account_recovery_scopes WHERE obligation_id=?1)
+                     THEN 0 ELSE 2 END,eligibility=0,parked_at_ms=NULL
+                 WHERE id=?1 AND cause=7 AND predicate=3",
+                params![ticket.id.as_slice(), high_water],
+            ).storage()?;
+            Ok(true)
+        })
+    }
+
+    /// A wanted native range has no serving source in an installed route set.
+    /// Park it visibly without reserving a no-I/O attempt or manufacturing loss,
+    /// admission or history coverage. Temporary account absence is not evidence
+    /// for this owner-supplied observation.
+    pub fn park_unserved_native_replay(
+        &self,
+        fence: &RecoveryRevisionFence,
+        ticket: RecoveryDemandTicket,
+        tokens: &[RecoveryScopeToken],
+    ) -> StorageResult<bool> {
+        if tokens.is_empty() {
+            return Ok(false);
+        }
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !native_observation_matches(&conn, fence, ticket, tokens)? {
+                return Ok(false);
+            }
+            conn.execute_cached(
+                "UPDATE account_recovery_obligations SET eligibility=4,
+                 parked_at_ms=COALESCE(parked_at_ms,?3)
+                 WHERE id=?1 AND revision=?2 AND state=0 AND cause=7 AND predicate=3",
+                params![
+                    ticket.id.as_slice(),
+                    sqlite_integer(ticket.revision)?,
+                    crate::base::codec::unix_now_ms().max(0)
+                ],
+            )
+            .storage()?;
+            Ok(true)
+        })
+    }
+
     /// Persist already observed native replay admission without reserving I/O.
     /// Only the native fact is recorded: endpoint history/maintenance facts,
     /// retained-event facts, loss watermarks and retry pacing are untouched.
     /// Every token and frozen source/route revision must still match. Returns
-    /// whether every scope of this exact native goal is now admitted.
+    /// whether every scope of this exact native goal is now admitted and the
+    /// owner's copied account-wide placement fence permits final completion.
     pub fn checkpoint_replay_admission(
         &self,
         fence: &RecoveryRevisionFence,
         ticket: RecoveryDemandTicket,
+        placement: RecoveryReplayPlacement,
         checkpoints: &[RecoveryScopeCheckpoint],
     ) -> StorageResult<bool> {
         if !fence.obligations.contains(&(ticket.id, ticket.revision)) {
@@ -862,7 +990,8 @@ impl SqliteAppStorage {
                     params![ticket.id.as_slice(), sqlite_integer(scope_id)?, payload],
                 ).storage()?;
             }
-            let qualified = scopes_qualify(&conn, fence, None, ticket.id, RecoveryPredicate::ReplayAdmission as i64)?;
+            let qualified = placement == RecoveryReplayPlacement::Placed
+                && scopes_qualify(&conn, fence, None, ticket.id, RecoveryPredicate::ReplayAdmission as i64)?;
             if qualified {
                 conn.execute_cached(
                     "UPDATE account_recovery_obligations SET state=1,parked_at_ms=NULL

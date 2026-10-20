@@ -2394,7 +2394,7 @@ impl ReplaySupervisor {
 
     async fn drain_deliveries(&self) {
         loop {
-            let deliveries = {
+            let mut deliveries = {
                 let Some(state) = self.state.upgrade() else {
                     return;
                 };
@@ -2412,27 +2412,49 @@ impl ReplaySupervisor {
                     coverage.wake_replay();
                     return;
                 }
-                deliveries
+                VecDeque::from(deliveries)
             };
-            for delivery in deliveries {
-                tokio::select! {
+            while let Some(delivery) = deliveries.pop_front() {
+                let permit = tokio::select! {
                     biased;
                     _ = self.cancellation.cancelled() => return,
-                    sent = self.delivery_tx.send(delivery) => {
-                        if sent.is_err() {
-                            let Some(state) = self.state.upgrade() else {
-                                return;
-                            };
-                            let mut guard = state.write().await;
-                            if !self.cancellation.is_cancelled()
-                                && let Some(coverage) = guard.account_replay_coverage.get_mut(&self.account_id)
-                            {
-                                coverage.fail_execution();
-                            }
-                            return;
-                        }
-                    }
+                    permit = self.delivery_tx.reserve() => permit,
+                };
+                let Some(state) = self.state.upgrade() else {
+                    return;
+                };
+                let mut guard = state.write().await;
+                if self.cancellation.is_cancelled() {
+                    return;
                 }
+                let Some(coverage) = guard.account_replay_coverage.get_mut(&self.account_id) else {
+                    return;
+                };
+                let Ok(permit) = permit else {
+                    coverage.fail_execution();
+                    return;
+                };
+                if coverage.releasing_items == 0 {
+                    // A failed sibling already discarded this cached range
+                    // and recorded its loss before aborting the drain task.
+                    return;
+                }
+                // Capacity waits may cross a metadata-only source restart or
+                // an older arrival. Rejoin the still-owned suffix before any
+                // unstarted handoff; the next range is sorted after all peers
+                // settle. The permit send and this check share the state lock.
+                if delivery.group_id_hint.as_ref().is_some_and(|id| {
+                    coverage.groups.get(id).is_some_and(|group| {
+                        !coverage.group_ready(group) || !group.events.is_empty()
+                    })
+                }) {
+                    deliveries.push_front(delivery);
+                    coverage.restore_draining(deliveries);
+                    break;
+                }
+                coverage.releasing_items -= 1;
+                coverage.releasing_bytes -= delivery.message.payload.len();
+                permit.send(delivery);
             }
         }
     }
@@ -3143,24 +3165,65 @@ impl NostrTransportAdapter {
                 if !seen_routes.insert(key) {
                     continue;
                 }
-                self.delivery_tx
-                    .send(TransportDelivery {
-                        account_id: route.account_id,
-                        group_id_hint: route.group_id_hint,
-                        message: message.clone(),
-                        received_at,
-                        source: TransportDeliverySource {
-                            transport: TransportSource(NOSTR_SOURCE.into()),
-                            plane: route.plane,
-                            endpoint: Some(endpoint.clone()),
-                            subscription_id: Some("local-publish".to_owned()),
-                            // Local echo of our own publish: no inbound relay
-                            // wire event to attribute.
-                            wire: None,
-                        },
-                    })
-                    .await
-                    .map_err(|_| TransportAdapterError::Closed)?;
+                let delivery = TransportDelivery {
+                    account_id: route.account_id,
+                    group_id_hint: route.group_id_hint,
+                    message: message.clone(),
+                    received_at,
+                    source: TransportDeliverySource {
+                        transport: TransportSource(NOSTR_SOURCE.into()),
+                        plane: route.plane,
+                        endpoint: Some(endpoint.clone()),
+                        subscription_id: Some("local-publish".to_owned()),
+                        // Local echo of our own publish: no inbound relay
+                        // wire event to attribute.
+                        wire: None,
+                    },
+                };
+                if matches!(
+                    &delivery.message.envelope,
+                    TransportEnvelope::GroupMessage { .. }
+                ) {
+                    let mut permit: Option<mpsc::Permit<'_, TransportDelivery>> = None;
+                    loop {
+                        let mut state = self.state.write().await;
+                        let relay = state.relay_index.existing_index_for(endpoint);
+                        if let Some(coverage) =
+                            state.account_replay_coverage.get_mut(&delivery.account_id)
+                            && coverage.ingress.is_some()
+                        {
+                            // Local publication is not a relay history boundary.
+                            // The registered group consumer still owns its order
+                            // relative to every pending current replay source.
+                            coverage.stage_delivery(
+                                delivery,
+                                relay,
+                                ReplayInput::Untracked,
+                                &self.delivery_tx,
+                            )?;
+                            break;
+                        }
+                        if let Some(permit) = permit {
+                            // A consumer may register while ordinary capacity
+                            // is unavailable. Recheck after that wait and keep
+                            // the final legacy handoff under the same lock.
+                            permit.send(delivery);
+                            break;
+                        }
+                        drop(state);
+                        permit = Some(
+                            self.delivery_tx
+                                .reserve()
+                                .await
+                                .map_err(|_| TransportAdapterError::Closed)?,
+                        );
+                    }
+                } else {
+                    self.delivery_tx
+                        .send(delivery)
+                        .await
+                        .map_err(|_| TransportAdapterError::Closed)?;
+                }
                 delivered += 1;
             }
         }
@@ -3225,6 +3288,8 @@ struct AccountReplayCoverage {
     request_groups: HashMap<String, HashSet<GroupId>>,
     buffered_bytes: usize,
     buffered_items: usize,
+    releasing_bytes: usize,
+    releasing_items: usize,
     outbox: VecDeque<TransportDelivery>,
     inbox_placements: usize,
     /// Covers retired windows and wider reconciliation bodies until scope exit.
@@ -3313,7 +3378,6 @@ struct GroupReplay {
     live: HashSet<[u8; 32]>,
     ready_history: HashSet<[u8; 32]>,
     placements: usize,
-    ready_floors: HashMap<[u8; 32], u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -3361,7 +3425,6 @@ enum ReplayAdmission {
     Paging,
     Complete,
     Abandoned,
-    Covered,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3673,27 +3736,21 @@ impl AccountReplayCoverage {
         }
     }
 
-    fn remember_ready(&mut self, group_id: &GroupId) {
-        let Some(group) = self.groups.get_mut(group_id) else {
-            return;
-        };
-        for (owner, stream) in &group.streams {
-            if stream.claims.is_empty()
-                && matches!(
-                    stream.phase,
-                    ReplayAdmission::Complete | ReplayAdmission::Covered
-                )
-            {
-                group
-                    .ready_floors
-                    .entry(owner.route)
-                    .and_modify(|floor| *floor = (*floor).min(stream.since))
-                    .or_insert(stream.since);
-            }
-        }
+    fn streams_ready<'a>(
+        &self,
+        streams: impl Iterator<Item = (&'a ReplayOwner, &'a HistoryReplay)>,
+    ) -> bool {
+        streams.into_iter().all(|(_, stream)| {
+            !matches!(
+                stream.phase,
+                ReplayAdmission::Waiting | ReplayAdmission::Queued | ReplayAdmission::Paging
+            )
+        })
     }
 
-    fn streams_ready<'a>(
+    // Empty input may qualify limited native admission from one ready peer.
+    // This is not permission to release ciphertext past a still-serving peer.
+    fn empty_streams_admitted<'a>(
         &self,
         streams: impl Iterator<Item = (&'a ReplayOwner, &'a HistoryReplay)>,
     ) -> bool {
@@ -3723,7 +3780,7 @@ impl AccountReplayCoverage {
                             .is_some_and(|stored| stored.events > 0);
                 }
                 ReplayAdmission::Queued | ReplayAdmission::Paging => return false,
-                ReplayAdmission::Complete | ReplayAdmission::Covered => complete = true,
+                ReplayAdmission::Complete => complete = true,
                 ReplayAdmission::Dormant | ReplayAdmission::Abandoned => {}
             }
         }
@@ -3732,7 +3789,7 @@ impl AccountReplayCoverage {
 
     fn request_ready(&self, group: &GroupReplay, id: &str) -> bool {
         group.routes.contains_key(id)
-            && self.streams_ready(
+            && self.empty_streams_admitted(
                 group
                     .streams
                     .iter()
@@ -3757,6 +3814,16 @@ impl AccountReplayCoverage {
             || self.buffered_items != 0
             || self.native_held().0 != 0
             || !self.unplaced.is_empty()
+            || self.groups.values().any(|group| {
+                group.streams.values().any(|stream| {
+                    matches!(
+                        stream.phase,
+                        ReplayAdmission::Waiting
+                            | ReplayAdmission::Queued
+                            | ReplayAdmission::Paging
+                    )
+                })
+            })
             || self
                 .endpoint_deadlines
                 .values()
@@ -3796,10 +3863,7 @@ impl AccountReplayCoverage {
                     return false;
                 }
                 complete |= relay.is_none_or(|relay| relay == owner.relay)
-                    && matches!(
-                        stream.phase,
-                        ReplayAdmission::Complete | ReplayAdmission::Covered
-                    );
+                    && stream.phase == ReplayAdmission::Complete;
             }
             if !complete || routes != group.routes[id].len() {
                 return false;
@@ -3859,7 +3923,6 @@ impl AccountReplayCoverage {
         let Ok(route) = <[u8; 32]>::try_from(route) else {
             return;
         };
-        self.remember_ready(group_id);
         self.request_groups
             .get_mut(id)
             .expect("registered request membership")
@@ -3920,10 +3983,6 @@ impl AccountReplayCoverage {
                 continue;
             };
             for route in routes {
-                let covered = group
-                    .ready_floors
-                    .get(route)
-                    .is_some_and(|floor| *floor <= since);
                 for (relay, replay) in &relays {
                     let owner = ReplayOwner {
                         request: request.clone(),
@@ -3935,7 +3994,6 @@ impl AccountReplayCoverage {
                         RelayReplay::Refused | RelayReplay::Incomplete => {
                             ReplayAdmission::Abandoned
                         }
-                        _ if covered => ReplayAdmission::Covered,
                         RelayReplay::Paging => ReplayAdmission::Paging,
                         RelayReplay::Awaiting => ReplayAdmission::Waiting,
                     };
@@ -3951,6 +4009,9 @@ impl AccountReplayCoverage {
                         },
                     );
                     if matches!(phase, ReplayAdmission::Waiting | ReplayAdmission::Paging) {
+                        if let Some(ingress) = &self.ingress {
+                            ingress.invalidate_group(group_id);
+                        }
                         self.deadlines
                             .entry(deadline)
                             .or_default()
@@ -4038,11 +4099,7 @@ impl AccountReplayCoverage {
             return;
         };
         if stream.phase == ReplayAdmission::Abandoned
-            || (reason == ReplayAbandon::Unfinished
-                && matches!(
-                    stream.phase,
-                    ReplayAdmission::Complete | ReplayAdmission::Covered
-                ))
+            || (reason == ReplayAbandon::Unfinished && stream.phase == ReplayAdmission::Complete)
         {
             return;
         }
@@ -4098,10 +4155,8 @@ impl AccountReplayCoverage {
             }
         }
         let bytes = delivery.message.payload.len();
-        let (native_items, native_bytes) = self.native_held();
-        if self.buffered_items + native_items >= REPLAY_BUFFER_MAX_ITEMS
-            || bytes > REPLAY_BUFFER_MAX_BYTES.saturating_sub(self.buffered_bytes + native_bytes)
-        {
+        let (items_available, bytes_available) = self.buffer_available();
+        if items_available == 0 || bytes > bytes_available {
             self.record_loss(self.retained_since.unwrap_or(0));
             return Ok(());
         }
@@ -4133,15 +4188,10 @@ impl AccountReplayCoverage {
             return Ok(());
         };
         if input == ReplayInput::Untracked
+            && self.ingress.is_none()
             && group.events.is_empty()
-            && (self.ingress.is_none()
-                || (self.group_ready(group) && !self.native_group_pending(group_id)))
-            && group.streams.values().all(|stream| {
-                !matches!(
-                    stream.phase,
-                    ReplayAdmission::Queued | ReplayAdmission::Paging
-                )
-            })
+            && self.group_ready(group)
+            && !self.native_group_pending(group_id)
         {
             return self.stage_ready(delivery, id, delivery_tx);
         }
@@ -4214,16 +4264,13 @@ impl AccountReplayCoverage {
         if !self.flushing
             && self.outbox.is_empty()
             && !self.native_group_pending(group_id)
-            && (self.ingress.is_none() || !historical)
+            && self.ingress.is_none()
             && self.group_ready(group)
             && group.events.is_empty()
             && (!historical
-                || owner.as_ref().is_some_and(|owner| {
-                    matches!(
-                        group.streams[owner].phase,
-                        ReplayAdmission::Complete | ReplayAdmission::Covered
-                    )
-                }))
+                || owner
+                    .as_ref()
+                    .is_some_and(|owner| group.streams[owner].phase == ReplayAdmission::Complete))
         {
             // No await separates the admission pin from the actual handoff.
             match delivery_tx.try_reserve() {
@@ -4242,12 +4289,8 @@ impl AccountReplayCoverage {
         }
         let fresh = !group.events.contains_key(&id);
         let bytes = delivery.message.payload.len();
-        let (native_items, native_bytes) = self.native_held();
-        if fresh
-            && (self.buffered_items + native_items >= REPLAY_BUFFER_MAX_ITEMS
-                || bytes
-                    > REPLAY_BUFFER_MAX_BYTES.saturating_sub(self.buffered_bytes + native_bytes))
-        {
+        let (items_available, bytes_available) = self.buffer_available();
+        if fresh && (items_available == 0 || bytes > bytes_available) {
             if historical {
                 if let Some(owner) = owner.as_ref() {
                     self.abandon_stream(group_id, owner, ReplayAbandon::Lost);
@@ -4294,6 +4337,22 @@ impl AccountReplayCoverage {
         Ok(())
     }
 
+    fn buffer_available(&self) -> (usize, usize) {
+        let (native_items, native_bytes) = self.native_held();
+        let items = self.buffered_items + native_items;
+        let bytes = self.buffered_bytes + native_bytes;
+        // Preserve the pending pool plus one draining allowance. Restoring a
+        // revoked suffix cannot grow that allowance on each source restart.
+        (
+            REPLAY_BUFFER_MAX_ITEMS
+                .saturating_sub(items)
+                .min((2 * REPLAY_BUFFER_MAX_ITEMS).saturating_sub(items + self.releasing_items)),
+            REPLAY_BUFFER_MAX_BYTES
+                .saturating_sub(bytes)
+                .min((2 * REPLAY_BUFFER_MAX_BYTES).saturating_sub(bytes + self.releasing_bytes)),
+        )
+    }
+
     fn take_ready_deliveries(&mut self) -> Vec<TransportDelivery> {
         self.admit_retained();
         self.queue_owner_batches();
@@ -4324,7 +4383,6 @@ impl AccountReplayCoverage {
                 self.buffered_bytes -= event.delivery.message.payload.len();
                 deliveries.push(event.delivery);
             }
-            self.remember_ready(&group_id);
         }
         deliveries[ready_count..].sort_unstable_by(|a, b| {
             (a.message.timestamp, a.message.id.as_slice())
@@ -4348,8 +4406,51 @@ impl AccountReplayCoverage {
             }
             self.pin_delivery(id, delivery.group_id_hint.as_ref());
         }
+        self.releasing_items += deliveries.len();
+        self.releasing_bytes += deliveries
+            .iter()
+            .map(|delivery| delivery.message.payload.len())
+            .sum::<usize>();
         self.wake_replay();
         deliveries
+    }
+
+    fn restore_draining(&mut self, deliveries: VecDeque<TransportDelivery>) {
+        for delivery in deliveries {
+            let bytes = delivery.message.payload.len();
+            self.releasing_items -= 1;
+            self.releasing_bytes -= bytes;
+            let Some(group_id) = delivery.group_id_hint.as_ref() else {
+                self.buffered_items += 1;
+                self.buffered_bytes += bytes;
+                self.outbox.push_back(delivery);
+                continue;
+            };
+            let id = delivery
+                .message
+                .id
+                .as_slice()
+                .try_into()
+                .expect("validated draining event id");
+            let group = self.groups.entry(group_id.clone()).or_default();
+            if group.ready_history.insert(id) {
+                match group.events.entry(id) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().owners += 1;
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(BufferedReplay {
+                            delivery,
+                            owners: 1,
+                            retained: false,
+                        });
+                        self.buffered_items += 1;
+                        self.buffered_bytes += bytes;
+                    }
+                }
+            }
+        }
+        self.wake_replay();
     }
 
     fn remove_subscription(&mut self, id: &str) {
@@ -4368,7 +4469,6 @@ impl AccountReplayCoverage {
         // Decide every unavailable peer while all completed peers still exist.
         // Hash iteration order must not invent loss for an entirely silent peer.
         for (group_id, owner) in &owners {
-            self.remember_ready(group_id);
             self.abandon_stream(group_id, owner, ReplayAbandon::Unfinished);
         }
         for (group_id, owner) in owners {
@@ -4377,16 +4477,6 @@ impl AccountReplayCoverage {
                 .get_mut(&group_id)
                 .expect("retiring owner exists");
             if let Some(stream) = group.streams.remove(&owner) {
-                if matches!(
-                    stream.phase,
-                    ReplayAdmission::Complete | ReplayAdmission::Covered
-                ) {
-                    group
-                        .ready_floors
-                        .entry(owner.route)
-                        .and_modify(|floor| *floor = (*floor).min(stream.since))
-                        .or_insert(stream.since);
-                }
                 // A fulfilled predecessor keeps its entire held range. Moving
                 // a claim changes ownership, not the ciphertext body.
                 let mut redundant = HashSet::new();
@@ -4530,13 +4620,14 @@ impl AccountReplayCoverage {
             group.events.clear();
             group.live.clear();
             group.ready_history.clear();
-            group.ready_floors.clear();
             group.placements = placements.get(id).copied().unwrap_or(0);
         }
         self.outbox.clear();
         self.deadlines.clear();
         self.buffered_items = 0;
         self.buffered_bytes = 0;
+        self.releasing_items = 0;
+        self.releasing_bytes = 0;
         self.inbox_placements = 0;
         self.flushing = false;
         self.wake_replay();
@@ -4566,12 +4657,7 @@ impl AccountReplayCoverage {
                     .streams
                     .iter()
                     .filter(|(owner, _)| owner.request.as_ref() == id && owner.relay == relay)
-                    .all(|(_, stream)| {
-                        matches!(
-                            stream.phase,
-                            ReplayAdmission::Complete | ReplayAdmission::Covered
-                        )
-                    });
+                    .all(|(_, stream)| stream.phase == ReplayAdmission::Complete);
                 group
                     .streams
                     .keys()
@@ -4625,8 +4711,9 @@ impl AccountReplayCoverage {
             };
             stream.deadline = deadline;
             stream.serial = serial;
-            // A pre-restart certificate cannot exempt this generation.
-            group.ready_floors.remove(&owner.route);
+            if let Some(ingress) = &self.ingress {
+                ingress.invalidate_group(&group_id);
+            }
             self.drop_claims(&group_id, redundant);
             if restart == ReplayStart::Connection {
                 self.deadlines
@@ -4788,9 +4875,7 @@ impl AccountReplayCoverage {
                     || owner.relay != relay
                     || !matches!(
                         stream.phase,
-                        ReplayAdmission::Waiting
-                            | ReplayAdmission::Dormant
-                            | ReplayAdmission::Covered
+                        ReplayAdmission::Waiting | ReplayAdmission::Dormant
                     )
                 {
                     continue;
@@ -4832,16 +4917,16 @@ impl AccountReplayCoverage {
             endpoint.deadline = None;
             endpoint.capturing = true;
         }
-        for group in self.groups.values_mut() {
+        for (group_id, group) in &mut self.groups {
             for (owner, stream) in &mut group.streams {
                 if owner.request.as_ref() == id
                     && owner.relay == relay
-                    && matches!(
-                        stream.phase,
-                        ReplayAdmission::Waiting | ReplayAdmission::Covered
-                    )
+                    && matches!(stream.phase, ReplayAdmission::Waiting)
                 {
                     stream.phase = ReplayAdmission::Queued;
+                    if let Some(ingress) = &self.ingress {
+                        ingress.invalidate_group(group_id);
+                    }
                 }
             }
         }
@@ -4855,10 +4940,7 @@ impl AccountReplayCoverage {
             group.streams.iter().any(|(owner, stream)| {
                 owner.request.as_ref() == id
                     && owner.relay == relay
-                    && !matches!(
-                        stream.phase,
-                        ReplayAdmission::Complete | ReplayAdmission::Covered
-                    )
+                    && stream.phase != ReplayAdmission::Complete
             })
         });
         if incomplete {
@@ -6592,6 +6674,72 @@ mod batch_tests {
                     .unwrap(),
             )),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repack_keeps_peer_fence() {
+        let (mut coverage, old, losses) = replay_coverage(1);
+        coverage.record_eose(&old, RelayIndex(1), 0);
+        let mut previous = old;
+        for serial in 1..=2 {
+            let account = MemberId::new(vec![0xA1; 32]);
+            let source = pack_group_batches(
+                &account,
+                &[route(0, "wss://a.example", Some(100))],
+                SubscriptionAttempt::INITIAL,
+                serial,
+            )
+            .remove(0);
+            let id = source.subscription_id();
+            coverage.add_subscription(
+                id.clone(),
+                &source,
+                HashMap::from([
+                    (RelayIndex(1), RelayReplay::Awaiting),
+                    (RelayIndex(2), RelayReplay::Awaiting),
+                ]),
+            );
+            coverage.remove_subscription(&previous);
+            let group = coverage.groups.values().next().unwrap();
+            assert!(
+                !coverage.group_ready(group),
+                "every replacement peer must establish its own history boundary"
+            );
+            previous = id;
+        }
+        assert!(losses.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_admission_holds_payload() {
+        let (mut coverage, id, losses) = replay_coverage(1);
+        coverage.record_eose(&id, RelayIndex(1), 0);
+        let group = coverage.groups.values().next().unwrap();
+        assert!(
+            !coverage.group_ready(group),
+            "a current peer still owes older input"
+        );
+        assert!(
+            coverage.request_admitted(&id, Some(RelayIndex(1))),
+            "empty input keeps limited one-peer native admission"
+        );
+        assert!(
+            coverage.admission_pending(),
+            "an in-deadline group peer still fences the cursor's original range"
+        );
+        assert!(
+            !coverage.snapshot().complete(),
+            "limited admission is not all-peer history certification"
+        );
+        tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration).await;
+        coverage.expire_replay(tokio::time::Instant::now());
+        assert!(coverage.group_ready(coverage.groups.values().next().unwrap()));
+        assert!(
+            !coverage.admission_pending(),
+            "finite empty expiry releases placement without inventing EOSE or loss"
+        );
+        assert!(!coverage.snapshot().complete());
+        assert!(losses.pending.lock().unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

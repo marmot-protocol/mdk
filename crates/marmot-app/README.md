@@ -386,6 +386,9 @@ bounded investigation can leave unresolved debt parked for new evidence or expli
 ## History may be incomplete notices
 
 Recovery parks an obligation after its fixed budget of fruitless attempts instead of retrying forever.
+Native replay whose original range has no serving source parks immediately, without spending that budget or
+inventing delivery loss. It uses the existing incremental-history notice; a new source generation can rearm
+the preserved range. Removing or disbanding a group retires its obsolete native scopes, not unrelated history debt.
 `MarmotAppRuntime::history_notices(account_ref)` lists each parked occurrence as a `HistoryNotice`: an opaque
 `notice_id`, a `HistoryNoticeCause` (delivery loss, notification loss, a group's epoch gap, incremental or explicit
 history), the group for a group-scoped occurrence, and when it parked. Show it as "history may be incomplete". A group's

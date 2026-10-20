@@ -125,30 +125,53 @@ Unresolved floors survive cancellation, source replacement and reopen; an unfloo
 Completed scopes can be pruned when sources change, so they do not force permanent full-history fetches.
 
 The adapter exposes borrowed source facts under its admission guard and a coalescing change watch. The owner
-combines a session nonce with the process-monotonic wire generation to identify the current goal. It freezes
-source capabilities into the existing comparison job and uses that job's recovery credit and cancellation.
+copies those facts and drops the guard before durable recovery writes. It combines a session nonce with the
+process-monotonic wire generation to identify the current goal. It freezes source capabilities into the existing
+comparison job and uses that job's recovery credit and cancellation.
 Neither the adapter nor the relay plane selects retries or runs a quiet-period repair timer.
 
-Native group input uses the owner's ordered admission path rather than the live queue and its spill tail.
+All native group input, including local publication fanout and post-EOSE live tails, uses the owner's ordered admission path rather than
+the ordinary queue and its spill tail.
 Before activation, durable group spill rows enter the native range as local supplements, including copies
-the current relay no longer holds. After every transport tag's pages finish, a bounded `ReplayBatch` leases
+the current relay no longer holds. Every in-deadline peer must finish or settle its finite lease before payload
+release; one peer's EOSE cannot release newer ciphertext ahead of another peer's older history. Replacement
+REQs establish their own boundaries, including equivalent or narrower repacks. An empty expired peer becomes
+dormant without certifying history or inventing loss. After every transport tag's pages finish, a bounded `ReplayBatch` leases
 the group's sorted frames. Ordinary ingest borrows each frame until ACK; cancellation returns its
 unacknowledged suffix. Native and comparison input share one four-ingest turn and select the oldest known
 frame of each group across both sources. An unfinished native range fences comparison only for that group;
-independent groups, commands and live input still take turns. Newly recovered historical input revokes an
-outstanding loan until its complete range can merge with the suffix. Live arrivals stay behind that range.
-Retained rows are removed only when the ordinary receipt check proves durable admission.
+independent groups, commands and inbox input still take turns. Each turn also examines at most four native
+frames, including receipt skips. Source replacement or restart revokes an unstarted loan before more ciphertext
+arrives; its suffix rejoins the complete range. Same-account repacks preserve held live bodies. A frame whose
+ingest already committed is acknowledged even if its loan was revoked in the meantime. Retained rows are removed
+only after durable admission and successful spill settlement. Backend errors remain visible to explicit callers;
+automatic worker retries use the existing 1–60-second backoff and return the failed loan to the fair ready queue.
 
 `ReplayAdmission` needs a complete original range placed from at least one issued current-epoch peer for
 every scope, with no pending ciphertext or nondurable spill handoff. Empty silence is not notification loss.
 The limited `replay_admitted` fact cannot certify retained history, retain a missing known event, satisfy a
 maintenance boundary, or acknowledge real queue/notification loss. Those predicates are unchanged.
+Scoped source placement is independent of unrelated pending groups, but same-group waiting peers withhold
+that group's proof. Final native completion separately requires account-wide placement, including spill handoffs;
+persisting a scoped proof does not release that global fence. Local publication cannot supply a relay boundary.
 
 Passive admission spends no network retry credit. Cursor seal consults the owner's cached completion or
 explicit retirement while holding the source guard through router placement locking; a changed generation
 defers the seal until the owner synchronizes. No source or endpoint identifier enters audit output.
 A range already queued to the owner spends no further acquisition attempts while its bytes drain.
 That pending observation is not cursor permission: retry eligibility and qualified completion remain separate.
+
+Terminal group removal or disband retires only that group's native scopes under revision checks. A wanted
+range with no serving source, including a sole terminally refused REQ or a narrower replacement, parks as
+`NeedsDeepRepair` with its original floor. It spends no retry credit and creates no loss evidence. The existing
+incremental-history notice exposes it; dismissal records retirement, not completion. A genuinely changed source
+generation can rearm the debt without narrowing its original range.
+
+After native ACKs drain the current sources, the owner can save the admitted cursor through the existing live
+promotion path. A failed save retains its target for the next admission turn. Replayed durable receipts restore
+their validated transport timestamps without emitting duplicate plaintext. Ordinary drain checkpoints still
+settle live-promoted floors; native promotion does not add a drain audit row for each message. Future-dated
+cursors and explicit full-history policy keep the plane's unfloored query instead of substituting a recent tail.
 
 ### 1. Overflow becomes a durable tail, not a loss
 
@@ -157,7 +180,7 @@ Today, when the 1,024-slot account queue is full, the router holds the whole
 current design follows from that choice: loss of unknown scope, broad replay, a completion
 nobody can certify, and the wait behind the queued backlog.
 
-New behavior, with each tier falling back to the next:
+Inbox and legacy delivery behavior, with each tier falling back to the next. Native group input uses section 0:
 
 ```
 router ─► account queue (1,024, memory) ─► worker ingest
@@ -189,7 +212,7 @@ NIP-77 comparison covers what remains.
   the fence is on the subscription cursor.
 - While spilled rows remain, the worker alternates them with live deliveries, and yields
   between them, so neither a busy live queue nor a large spill starves the other. Order is
-  not guaranteed; the engine already handles reordered input (deferral and retained input).
+  not guaranteed on this inbox/legacy path. Native group replay never uses this alternation.
 - A row is removed only once its event is in the seen index. A row whose ingest left no
   durable trace is retried with a doubling delay, from one minute up to an hour. After 8
   attempts it is removed and recorded as queue loss in the same transaction, so recovery

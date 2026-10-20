@@ -92,8 +92,9 @@ Arriving events and repeated loss do not extend an active lease. An empty expire
 first or newer connection can reopen waiting. Late history without that restart is discarded with its original
 loss floor, not certified by wire EOSE. Lost partial history also stays incomplete. A silent or terminally
 refused peer cannot freeze available history indefinitely. Fresh requests have fresh ownership. This does not
-establish ordering across unavailable relay history. Already-ready routes keep their admission state across an
-equivalent or narrower repack; a wider request still stages history. Group delivery uses verified raw SDK
+establish ordering across unavailable relay history. Every replacement REQ establishes its own boundary, even
+for an equivalent or narrower repack. Each valid waiting peer fences group payload release until EOSE or its
+finite lease settles; another peer's EOSE is not permission to release ciphertext early. Group delivery uses verified raw SDK
 copies, so SDK duplicate suppression cannot consume the only copy of ciphertext discarded by a cancelled
 attempt. Retired subscription copies cannot bypass admission.
 
@@ -116,14 +117,19 @@ Source membership, query windows and ordered epochs change its generation; page 
 The generation remains distinct across account activation replacement.
 
 The app registers `ReplayIngress` before activation, including durable group spill rows as retained input.
-Each complete group range moves into a `ReplayBatch`, bypassing live-queue/spill alternation. The owner
+Every group frame then uses this lane, including local publication fanout, post-EOSE and untracked live tails; none enters the ordinary
+delivery queue. Each complete group range moves into a `ReplayBatch`, bypassing live-queue/spill alternation. The owner
 borrows the oldest frame through ordinary ingest and acknowledges it afterwards. Cancellation before ACK
 returns that frame and its suffix without copying ciphertext. A leased group holds its newer arrivals;
 other ready groups take turns. Retained spill input joins remote pages before any of that range decrypts,
 even when the current relay no longer holds those local copies.
-New distinct historical input revokes an outstanding loan: `delivery()` returns `None`, and dropping the
+New source metadata, a restart or distinct historical input revokes an unstarted loan: `delivery()` returns `None`, and dropping the
 batch returns its suffix for merging after the new range completes. `take_batch(Some(group))` distinguishes
-that pending boundary from empty input. A metadata-only source restart does not revoke already-owned input.
+that pending boundary from empty input. Same-account repacks preserve held live bodies. Ingest that already
+committed still ACKs its frame: revoking a loan cannot undo durable MLS progress. Spill settlement must succeed
+before its corresponding native ACK.
+Local fanout neither records relay history nor settles an outstanding source boundary. Inbox and legacy-only
+adapter consumers retain their ordinary delivery path.
 
 Only the owner's frozen `ReplayCapturePlan` starts recovery IO. It binds the account, source generation,
 issued REQ and endpoint, and retains the existing process recovery credit through accepted IO cleanup.
@@ -165,6 +171,11 @@ queued to the owner needs no additional acquisition while those bytes drain. Lim
 certifies exhaustive history or acknowledges queue/notification loss. Its cached permission must match the
 guarded source generation at cursor seal.
 A pending owner observation does not authorize the cursor, but already-acquired bytes need no new IO.
+The owner drops borrowed source observations before SQLite writes and rechecks their generation at seal.
+Unservable original windows park visibly without capture credit or loss charges; terminal group retirement
+removes only obsolete native scope debt. Durable native ACKs can advance the cursor through the existing live
+promotion path once current sources drain. Save failures keep the target pending; replayed durable receipts
+can restore it after reopen without duplicate plaintext notifications.
 
 Timestamp sorting leaves the existing 100-generation sender-ratchet tolerance unchanged: more than 100
 messages from one sender in the same second can still exceed it because event-id order is not
@@ -173,6 +184,8 @@ retain their configured rewind. With no durable cursor, the app
 requests full retained history instead of substituting the recent live tail, including when the relay refuses
 NIP-77. Recovery maintenance also pages from its Welcome-anchored floor. Cursor checkpoints retain their
 previous floor while replay is staged, leased to the owner or not yet placed by the delivery router.
+An unfloored plane query, including one caused by an untrusted future cursor or explicit full-history policy,
+stays unfloored; the app does not replace it with a recent-tail fallback.
 Ordinary comparison acquisition is unchanged.
 
 ## Recovery maintenance sessions

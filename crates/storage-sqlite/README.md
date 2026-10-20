@@ -203,6 +203,15 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   checkpoints. History requires all designated scopes/endpoints; exclusions, EOSE, and SDK seen state are insufficient.
   Known-event retention and the limited first maintenance boundary use separate predicates. A stale scope token
   rejects a multi-scope checkpoint before any progress is written. Domain updates may share one `with_transaction`.
+- **Native replay.** `SubscriptionReplay` preserves original query floors across source changes and reopen. Its
+  `ReplayAdmission` predicate proves only current native input admission, never exhaustive history or loss recovery.
+  Request-scoped placement facts preserve qualified, unchanged sources independently of unrelated pending groups.
+  Same-group waiting peers still withhold that group's proof. `checkpoint_replay_admission` requires the separate
+  `RecoveryReplayPlacement::Placed` account-wide fence before final completion, even when every scoped proof exists.
+  Authoritative terminal-group retirement is revision-fenced and preserves unrelated floors. A wanted range with
+  no serving source parks as `NeedsDeepRepair` without retry charges or loss evidence; unchanged observations leave
+  it parked. A new source generation can rearm the original range. Retirement and source updates reject stale route
+  or scope tokens atomically. Public notice dismissal retires the occurrence; it does not mark the range satisfied.
 - **Loss acknowledgment (`account_recovery/loss.rs`).** Qualified loss completion is separate from external plane
   acknowledgment. Capture exact token/count watermarks before execution; after qualified completion, acknowledge the
   matching live generation and finish its writers before calling `acknowledge_recovery_loss`. The runtime uses

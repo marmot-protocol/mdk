@@ -1625,6 +1625,23 @@ pub(crate) async fn inject_epoch_gap_probe(app: &MarmotApp, event: NostrTranspor
     );
 }
 
+// Queue/pin contracts start at the router. Relay producers separately prove
+// their complete-range fence before handing group input to the native lane.
+async fn route_group_probe(client: &AppClient, event: NostrTransportEvent) {
+    let delivery = client
+        .adapter
+        .recovered_deliveries(NostrRelayEvent {
+            endpoint: TransportEndpoint("wss://relay.example".to_owned()),
+            subscription_id: None,
+            event,
+        })
+        .await
+        .unwrap()
+        .pop()
+        .expect("the active group route receives the probe");
+    client.relay_plane.route_account_delivery_for_test(delivery);
+}
+
 /// Script the recovery job's comparisons: every pass over the group route
 /// `nostr_group_id_hex` fetches one fresh probe from its relay, and every
 /// other route answers with nothing missing.
@@ -12500,7 +12517,7 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
                 &format!("retained-history-{index}"),
             );
             client.remember_seen_event(event.id.clone());
-            inject_epoch_gap_probe(&app, event).await;
+            route_group_probe(&client, event).await;
         }
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -12779,8 +12796,11 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
-        app.relay_plane =
-            MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay, true);
+        app.relay_plane = MarmotRelayPlane::new_with_loopback(
+            Some(Duration::from_secs(120)),
+            relay.clone(),
+            true,
+        );
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client.create_group("overflow spill", &[]).await.unwrap();
         let nostr_group_id_hex = app
@@ -12810,10 +12830,10 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
         for index in 0..transport_nostr::ACCOUNT_DELIVERY_BUFFER + NEW {
             let event = probe(index);
             expected.push(event.id.clone());
-            inject_epoch_gap_probe(&app, event).await;
+            route_group_probe(&client, event).await;
         }
         for event in known {
-            inject_epoch_gap_probe(&app, event).await;
+            route_group_probe(&client, event).await;
         }
         let health = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -12864,16 +12884,11 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
             .len();
         drop(client);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        for _ in 0..spilled_before_reopen {
-            let received =
-                tokio::time::timeout(Duration::from_secs(5), client.receive_next_delivery())
-                    .await
-                    .expect("spilled rows are admitted after reopen")
-                    .unwrap();
-            let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
-                panic!("a spill never creates a loss generation");
-            };
-            client.ingest_received_delivery(*delivery).await.unwrap();
+        report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+        for _ in 0..=spilled_before_reopen {
+            if !client.admit_native_turn().await.unwrap() {
+                break;
+            }
         }
         assert!(
             storage
@@ -12963,8 +12978,8 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         // fills its queue. Their in-memory max is above the older event that
         // will be omitted, but they must not promote the durable drain floor.
         for index in 0..3_u64 {
-            inject_epoch_gap_probe(
-                &app,
+            route_group_probe(
+                &client,
                 epoch_gap_probe(
                     &nostr_group_id_hex,
                     cursor_before + 4_000 - index,
@@ -12993,8 +13008,8 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
             if index == transport_nostr::ACCOUNT_DELIVERY_BUFFER {
                 omitted_timestamp = created_at;
             }
-            inject_epoch_gap_probe(
-                &app,
+            route_group_probe(
+                &client,
                 epoch_gap_probe(
                     &nostr_group_id_hex,
                     created_at,
@@ -13430,7 +13445,10 @@ impl LiveCursorFixture {
     ) -> (NostrTransportEvent, cgka_traits::TransportDelivery) {
         let late = self.probe(late_at, "late");
         let delivery = self.delivery(late.clone()).await;
-        inject_epoch_gap_probe(&self.app, self.probe(created_at, "promoting")).await;
+        let promoting = self.delivery(self.probe(created_at, "promoting")).await;
+        self.app
+            .relay_plane
+            .route_account_delivery_for_test(promoting);
         self.wait_for_queue_depth(1).await;
         (late, delivery)
     }
@@ -13464,8 +13482,8 @@ fn live_ingest_keeps_the_cursor_until_every_subscription_replayed_stored_history
             .nostr_routing
             .nostr_group_id_hex;
         assert!(!client.adapter.account_subscription_eose().await.complete());
-        inject_epoch_gap_probe(
-            &app,
+        route_group_probe(
+            &client,
             epoch_gap_probe(&nostr_group_id_hex, cursor_before + 4_000, "replaying"),
         )
         .await;
@@ -13495,7 +13513,11 @@ fn live_ingest_promotes_the_cursor_as_far_as_a_restart_still_fetches_the_queue()
             (cursor_before + 4_000, "newer"),
             (cursor_before + 1_000, "older"),
         ] {
-            inject_epoch_gap_probe(&fixture.app, fixture.probe(created_at, marker)).await;
+            let delivery = fixture.delivery(fixture.probe(created_at, marker)).await;
+            fixture
+                .app
+                .relay_plane
+                .route_account_delivery_for_test(delivery);
         }
         fixture.wait_for_queue_depth(2).await;
 
@@ -13629,7 +13651,13 @@ fn deliveries_older_than_the_promoted_floor_go_through_the_spill_and_are_all_adm
     run_composed_app_runtime_test("live-cursor-older-burst", || async {
         let mut fixture = LiveCursorFixture::open().await;
         let cursor_before = fixture.cursor_before;
-        inject_epoch_gap_probe(&fixture.app, fixture.probe(cursor_before + 4_000, "newest")).await;
+        let newest = fixture
+            .delivery(fixture.probe(cursor_before + 4_000, "newest"))
+            .await;
+        fixture
+            .app
+            .relay_plane
+            .route_account_delivery_for_test(newest);
         fixture.wait_for_queue_depth(1).await;
         fixture.ingest_next_live_delivery().await;
         assert_eq!(fixture.persisted(), Some(cursor_before + 4_000));
@@ -13641,7 +13669,11 @@ fn deliveries_older_than_the_promoted_floor_go_through_the_spill_and_are_all_adm
         for index in 0..OLDER {
             let event = fixture.probe(cursor_before + 2_000 + index, &format!("older-{index}"));
             older.push(event.id.clone());
-            inject_epoch_gap_probe(&fixture.app, event).await;
+            let delivery = fixture.delivery(event).await;
+            fixture
+                .app
+                .relay_plane
+                .route_account_delivery_for_test(delivery);
         }
         tokio::time::timeout(Duration::from_secs(5), async {
             while fixture
@@ -13705,8 +13737,8 @@ fn live_ingest_keeps_the_cursor_behind_a_queue_omission_after_replay() {
                 .set_account_delivery_recovery_marker_for_test(&fixture.account_id, marker)
         );
         for index in 0..=transport_nostr::ACCOUNT_DELIVERY_BUFFER {
-            inject_epoch_gap_probe(
-                &fixture.app,
+            route_group_probe(
+                &fixture.client,
                 fixture.probe(
                     cursor_before + 4_000 - index as u64,
                     &format!("burst-{index}"),
@@ -20183,28 +20215,26 @@ async fn an_escalation_recorded_during_a_received_delivery_rides_that_seam() {
 /// A delivery whose ingest fails must stay retryable on the same reused
 /// client.
 ///
-/// `receive_next_delivery` must not mark the id seen before
-/// `ingest_received_delivery` commits it: a pre-ingest mark would poison the
-/// seen-events index on failure, so the reused client would silently skip the
-/// event when the relay redelivers it.
+/// Native admission must not mark the id seen or acknowledge its loan before
+/// ingest commits it. The retained frame retries without another relay copy.
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
-    assert_failed_delivery_cursor_pin(FailedDeliveryRecovery::Redelivery).await;
+async fn native_failed_ingest_cursor() {
+    assert_failed_cursor_pin(FailedDeliveryRecovery::Redelivery).await;
 }
 
 /// Projection repair must release its taken delivery without relay redelivery.
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn quiet_projection_retry_releases_the_failed_delivery_cursor_pin() {
-    assert_failed_delivery_cursor_pin(FailedDeliveryRecovery::QuietProjectionRetry).await;
+async fn native_quiet_cursor_retry() {
+    assert_failed_cursor_pin(FailedDeliveryRecovery::QuietProjectionRetry).await;
 }
 
 /// A failure before engine admission still needs a real ingest before release.
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pre_engine_ingest_failure_keeps_the_delivery_cursor_pin() {
-    assert_failed_delivery_cursor_pin(FailedDeliveryRecovery::BeforeEngine).await;
+async fn native_pre_ingest_cursor() {
+    assert_failed_cursor_pin(FailedDeliveryRecovery::BeforeEngine).await;
 }
 
 #[cfg(feature = "test-policy-overrides")]
@@ -20215,7 +20245,7 @@ enum FailedDeliveryRecovery {
 }
 
 #[cfg(feature = "test-policy-overrides")]
-async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
+async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -20242,18 +20272,6 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
         .create_group("retryable failed ingest", &[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    let inject = |event: NostrTransportEvent| {
-        let plane = plane.clone();
-        async move {
-            plane
-                .handle_relay_event_for_test(NostrRelayEvent {
-                    endpoint: TransportEndpoint("wss://relay.example".to_owned()),
-                    subscription_id: None,
-                    event,
-                })
-                .await
-        }
-    };
     assert!(
         bob_client
             .sync()
@@ -20263,6 +20281,8 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
             .contains(&group_id),
         "bob must join before the failing application message",
     );
+    report_scripted_eose(&plane, &relay, every_subscription).await;
+    while bob_client.admit_native_turn().await.unwrap() {}
     bob_client.take_pending_projection_updates();
     bob_client.take_pending_applied_sync_summary();
 
@@ -20280,17 +20300,10 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
         .find(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
         .cloned()
         .expect("published group message backing the send");
-    let delivery = tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
-        .await
-        .expect("locally fanned-out application message")
-        .unwrap();
-    let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = delivery else {
-        panic!("the test did not overflow its account delivery queue");
-    };
-    let delivery = *delivery;
-    let event_id = hex::encode(delivery.message.id.as_slice());
+    let message = relay_event.to_transport_message().unwrap();
+    let event_id = hex::encode(message.id.as_slice());
     assert_eq!(event_id, relay_event.id);
-    let later_cursor = delivery.message.timestamp.0 + 10_000;
+    let later_cursor = message.timestamp.0 + 10_000;
     let probe_cursor = |client: &AppClient| {
         let sealed = client
             .adapter
@@ -20301,7 +20314,7 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
         sealed
     };
     if matches!(recovery, FailedDeliveryRecovery::BeforeEngine) {
-        bob_client.fail_ingest_of = Some(delivery.message.id.clone());
+        bob_client.fail_ingest_of = Some(message.id);
     } else {
         bob_client
             .app
@@ -20309,7 +20322,7 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
             .dev_fail_ingest_after_application_event_ack = true;
     }
     bob_client
-        .ingest_received_delivery(delivery)
+        .admit_native_turn()
         .await
         .expect_err("the injected ingest failure must surface");
     assert!(
@@ -20317,7 +20330,7 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
         "a failed ingest must not mark the delivery seen",
     );
     assert!(
-        probe_cursor(&bob_client).is_some_and(|cursor| cursor < later_cursor),
+        probe_cursor(&bob_client).is_none_or(|cursor| cursor < later_cursor),
         "a taken delivery must cap the cursor while its ingest remains failed",
     );
 
@@ -20333,6 +20346,8 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
             .await
             .expect("quiet retry must complete the retained projection");
         assert!(!bob_client.has_pending_effect_projections());
+        report_scripted_eose(&plane, &relay, every_subscription).await;
+        assert!(bob_client.admit_native_turn().await.unwrap());
         assert_eq!(
             probe_cursor(&bob_client),
             Some(later_cursor),
@@ -20352,28 +20367,17 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
                     .unwrap(),
             );
             assert!(
-                probe_cursor(&bob_client).is_some_and(|cursor| cursor < later_cursor),
+                probe_cursor(&bob_client).is_none_or(|cursor| cursor < later_cursor),
                 "projection retry must not release an unaccepted delivery",
             );
         }
+        report_scripted_eose(&plane, &relay, every_subscription).await;
         assert!(
-            inject(relay_event).await.expect("route the redelivery") >= 1,
-            "the group route must accept the redelivery",
-        );
-        let redelivery =
-            tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
+            bob_client
+                .admit_native_turn()
                 .await
-                .expect("redelivered application message")
-                .unwrap();
-        let transport_nostr::AccountDeliveryReceive::Delivery(redelivery) = redelivery else {
-            panic!("the test did not overflow its account delivery queue");
-        };
-        let redelivery = *redelivery;
-        assert_eq!(hex::encode(redelivery.message.id.as_slice()), event_id);
-        let summary = bob_client
-            .ingest_received_delivery(redelivery)
-            .await
-            .expect("the retry must ingest the redelivered event");
+                .expect("the retry must ingest the retained native frame")
+        );
         assert!(
             bob_client.seen_events_index.contains(&event_id),
             "a successful ingest must mark the delivery seen",
@@ -20383,7 +20387,7 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
             Some(later_cursor),
             "successful redelivery must release the original cursor pin",
         );
-        summary
+        bob_client.take_pending_applied_sync_summary()
     };
     // A post-ack failure already projected the message without returning its
     // summary; a pre-engine failure projected nothing. Either recovery path

@@ -232,13 +232,30 @@ impl AppClient {
     }
 
     pub(super) fn settle_spill_row(&mut self, seq: i64, event_id: &str) {
+        if self.try_settle_spill_row(seq, event_id).is_err() {
+            self.schedule_spill_retry(unix_now_seconds().saturating_add(SPILL_SETTLE_RETRY_SECS));
+            tracing::warn!(
+                target: "marmot_app::client::delivery_spill",
+                method = "settle_spilled_delivery",
+                error_kind = "spill_row_settlement_failed",
+                "spilled delivery row kept after ingest; it will be read again",
+            );
+        }
+    }
+
+    /// Native ingress retains its loan and sequence mapping on settlement failure.
+    pub(super) fn try_settle_spill_row(
+        &mut self,
+        seq: i64,
+        event_id: &str,
+    ) -> Result<(), AppError> {
         // An unreadable receipt view proves nothing either way. The row is
         // read again later without spending one of its attempts.
         let admitted = self
             .transport_receipts()
             .map(|receipts| receipts.contains(event_id));
         let now = unix_now_seconds();
-        let settled = (|| -> Result<(), AppError> {
+        (|| -> Result<(), AppError> {
             let admitted = admitted?;
             let storage = self.app.account_storage(&self.state.label)?.app_storage();
             if admitted {
@@ -260,16 +277,7 @@ impl AppClient {
                 "spilled delivery was never admitted; recorded as queue loss after its last retry",
             );
             Ok(())
-        })();
-        if settled.is_err() {
-            self.schedule_spill_retry(now.saturating_add(SPILL_SETTLE_RETRY_SECS));
-            tracing::warn!(
-                target: "marmot_app::client::delivery_spill",
-                method = "settle_spilled_delivery",
-                error_kind = "spill_row_settlement_failed",
-                "spilled delivery row kept after ingest; it will be read again",
-            );
-        }
+        })()
     }
 
     fn schedule_spill_retry(&mut self, at: u64) {

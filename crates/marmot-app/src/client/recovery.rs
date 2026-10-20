@@ -387,6 +387,7 @@ pub(crate) struct AccountRecoveryOwner {
     pub(super) native_batch: Option<transport_nostr_adapter::ReplayBatch>,
     pub(super) native_ingress: Option<transport_nostr_adapter::ReplayIngress>,
     pub(super) retained_spill: std::collections::HashMap<cgka_traits::MessageId, i64>,
+    pub(super) native_cursor_target: Option<u64>,
     pub(crate) maintenance_observations:
         std::collections::HashMap<cgka_traits::GroupId, MaintenanceRecoveryObservation>,
     wall_anchor_ms: u64,
@@ -446,6 +447,7 @@ impl AccountRecoveryOwner {
             native_batch: None,
             native_ingress: None,
             retained_spill: std::collections::HashMap::new(),
+            native_cursor_target: None,
             maintenance_observations: std::collections::HashMap::new(),
             wall_anchor_ms: wall_now_ms,
             monotonic_anchor: monotonic_now,
@@ -531,22 +533,36 @@ impl AccountRecoveryOwner {
             .app_storage()
             .recovery_eligible_revision_fence(immediate)?;
         let comparison = storage.app_storage().recovery_comparison()?;
-        let native_without_io = self
-            .replay_sources
-            .iter()
-            .all(|source| source.acquisition.is_empty());
         // Queued native bodies need ordinary MDK admission, not another
-        // acquisition reservation. Keep their durable demand and original
-        // floors pending while independently eligible causes still run.
-        if self.replay_complete || native_without_io {
-            let native = storage
-                .app_storage()
-                .pending_recovery_demands()?
-                .into_iter()
-                .filter(|demand| demand.cause == storage_sqlite::RecoveryCause::SubscriptionReplay)
-                .map(|demand| demand.ticket.id)
-                .collect::<Vec<_>>();
-            fence.obligations.retain(|(id, _)| !native.contains(id));
+        // acquisition reservation. Only hide a duty backed by acquired sources
+        // for every original window, never an orphan merely because all the
+        // remaining current sources have finished their own narrower windows.
+        for demand in storage
+            .app_storage()
+            .pending_recovery_demands()?
+            .into_iter()
+            .filter(|demand| demand.cause == storage_sqlite::RecoveryCause::SubscriptionReplay)
+        {
+            let native_without_io = !self.replay_sources.is_empty()
+                && storage
+                    .app_storage()
+                    .recovery_scope_snapshots(demand.ticket.id)?
+                    .iter()
+                    .all(|scope| {
+                        scope.replay_admitted
+                            || self.replay_sources.iter().any(|source| {
+                                source.acquisition.is_empty()
+                                    && source.plan.route_kind == scope.plan.route_kind
+                                    && source.plan.transport_group_id
+                                        == scope.plan.transport_group_id
+                                    && source.plan.since_seconds.unwrap_or(0)
+                                        <= scope.plan.since_seconds.unwrap_or(0)
+                                    && source.plan.until_seconds >= scope.plan.until_seconds
+                            })
+                    });
+            if self.replay_complete || native_without_io {
+                fence.obligations.retain(|(id, _)| *id != demand.ticket.id);
+            }
         }
         let comparison_revision = (comparison.pending()
             && !explicit
@@ -799,8 +815,9 @@ impl From<StorageError> for FreezeError {
 }
 
 impl AppClient {
-    /// Persist limited native admission under the adapter observation guard.
-    /// This is deliberately independent of exhaustive history and loss evidence.
+    /// Copy limited native source facts, then persist without holding the
+    /// adapter guard. The cursor seal rechecks the copied generation and current
+    /// pending/loss facts; this is never exhaustive history or loss evidence.
     pub(crate) async fn synchronize_native_replay(&mut self) -> Result<(), AppError> {
         use sha2::{Digest, Sha256};
         let adapter = self.adapter.clone();
@@ -809,11 +826,13 @@ impl AppClient {
         if self.recovery_owner.native_replay_authorizes(generation) {
             return Ok(());
         }
+        // Every failed write/CAS leaves cached authorization invalid. Copied
+        // observations can only authorize their own guarded generation.
+        self.recovery_owner.replay_generation = None;
+        self.recovery_owner.replay_complete = false;
+        self.recovery_owner.replay_sources.clear();
         let input_placed = !observation.pending && !observation.spill_pending;
-        let storage = self.app.account_storage(&self.state.label)?;
-        let app = storage.app_storage();
-        self.synchronize_recovery_loss(&app)?;
-        self.observe_recovery_route_policy()?;
+        let active = observation.active();
         let routing = self.routing.snapshot();
         let mut group_by_route =
             std::collections::HashMap::with_capacity(routing.group_routes.len());
@@ -842,6 +861,7 @@ impl AppClient {
             // but draining them must not capture an unrelated quiet peer.
             // Actual-loss work retains every issued token above.
             let acquired = source.admitted();
+            let placed = acquired && source.placed();
             let acquisition = if acquired {
                 Arc::new(Vec::new())
             } else {
@@ -870,6 +890,11 @@ impl AppClient {
                         .get(id.as_slice())
                         .map(|group| group.as_slice().to_vec())
                 });
+                if route.is_some() && group_id.is_none() {
+                    // A source being torn down is absent from current routing.
+                    // Retire its durable goal only on lifecycle evidence below.
+                    continue;
+                }
                 sources.push((
                     RecoveryScopePlan {
                         scope_id: u64::from_be_bytes(
@@ -887,12 +912,58 @@ impl AppClient {
                         admitted_endpoints: endpoints.clone(),
                     },
                     (tokens.clone(), acquisition.clone()),
-                    acquired && input_placed,
+                    placed,
                     admitted.clone(),
                 ));
             }
         }
-        if sources.is_empty() {
+        drop(observation);
+        let storage = self.app.account_storage(&self.state.label)?;
+        let app = storage.app_storage();
+        self.synchronize_recovery_loss(&app)?;
+        self.observe_recovery_route_policy()?;
+        for demand in app
+            .pending_recovery_demands()?
+            .into_iter()
+            .filter(|demand| demand.cause == storage_sqlite::RecoveryCause::SubscriptionReplay)
+        {
+            let obsolete = app
+                .recovery_scope_snapshots(demand.ticket.id)?
+                .into_iter()
+                .filter(|scope| {
+                    let Some(group) = scope.plan.group_id.as_ref() else {
+                        return false;
+                    };
+                    let group = cgka_traits::GroupId::new(group.clone());
+                    // Quarantine/unhydrated/missing metadata is not terminal.
+                    self.runtime.group_record(&group).is_ok_and(|record| {
+                        record.is_terminal()
+                            || !routing.group_routes.iter().any(|route| {
+                                route.group_id == group
+                                    && Some(route.transport_group_id.as_slice())
+                                        == scope
+                                            .plan
+                                            .transport_group_id
+                                            .as_ref()
+                                            .map(|id| id.as_slice())
+                            })
+                    })
+                })
+                .map(|scope| scope.token)
+                .collect::<Vec<_>>();
+            if !app.retire_native_replay_scopes(
+                &app.recovery_revision_fence()?,
+                demand.ticket,
+                &obsolete,
+            )? {
+                return Ok(());
+            }
+        }
+        let has_unresolved = app
+            .pending_recovery_demands()?
+            .iter()
+            .any(|demand| demand.cause == storage_sqlite::RecoveryCause::SubscriptionReplay);
+        if sources.is_empty() && (!active || !has_unresolved) {
             self.recovery_owner.replay_generation = Some(generation);
             self.recovery_owner.replay_complete = true;
             self.recovery_owner.replay_sources.clear();
@@ -1005,6 +1076,7 @@ impl AppClient {
             return Ok(());
         };
         let mut checkpoints = Vec::with_capacity(goals.len());
+        let mut unserved = Vec::new();
         for (goal, token) in goals.iter().zip(tokens) {
             let matching = source_indices
                 .get(&(goal.route_kind, goal.transport_group_id))
@@ -1020,6 +1092,14 @@ impl AppClient {
                 && matching
                     .iter()
                     .all(|(_, _, admitted, endpoints)| *admitted && !endpoints.is_empty());
+            if active
+                && (matching.is_empty()
+                    || matching
+                        .iter()
+                        .all(|(_, (tokens, _), _, _)| tokens.is_empty()))
+            {
+                unserved.push(token.clone());
+            }
             let mut actual = matching
                 .iter()
                 .flat_map(|(_, _, _, endpoints)| endpoints.iter())
@@ -1046,7 +1126,15 @@ impl AppClient {
                 replay_admitted: admitted,
             });
         }
-        let persisted = app.checkpoint_replay_admission(&fence, ticket, &checkpoints)?;
+        let placement = if input_placed {
+            storage_sqlite::RecoveryReplayPlacement::Placed
+        } else {
+            storage_sqlite::RecoveryReplayPlacement::Pending
+        };
+        let persisted = app.checkpoint_replay_admission(&fence, ticket, placement, &checkpoints)?;
+        if !unserved.is_empty() && !app.park_unserved_native_replay(&fence, ticket, &unserved)? {
+            return Ok(());
+        }
         self.recovery_owner.replay_generation = persisted.then_some(generation);
         self.recovery_owner.replay_complete = persisted
             && app
@@ -2119,8 +2207,14 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(crate::tests::ScriptedPushRelayClient::default());
-        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        let mut app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
+        app.relay_plane = crate::MarmotRelayPlane::new_with_directory_fetcher_for_test(
+            Some(Duration::from_secs(120)),
+            relay.clone(),
+            relay.clone(),
+            app.config.allow_loopback_relay_endpoints,
+        );
         let client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
         (dir, app, relay, client)
     }
@@ -2386,12 +2480,34 @@ mod tests {
             native.ticket == ticket,
             "absence creates no replacement goal or false completion"
         );
+        assert!(
+            storage.parked_recovery_obligations().unwrap().is_empty(),
+            "deactivation is not terminal refusal or unservable installed routing"
+        );
         assert_eq!(storage.recovery_retry_state().unwrap(), retry);
         client.checkpointed_transport_timestamp = Some(unix_now_seconds());
         assert!(
             client.subscription_rebuild_since().unwrap().is_none(),
             "an endpoint disappearing cannot erase unresolved full-history input"
         );
+        client.runtime.activate_transport(None).await.unwrap();
+        client.synchronize_native_replay().await.unwrap();
+        assert!(
+            storage
+                .recovery_scope_snapshots(ticket.id)
+                .unwrap()
+                .iter()
+                .any(|scope| { scope.plan.since_seconds.is_none() && !scope.replay_admitted })
+        );
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client.synchronize_native_replay().await.unwrap();
+        assert!(client.recovery_owner.replay_complete);
+        assert!(client.subscription_rebuild_since().unwrap().is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2408,7 +2524,17 @@ mod tests {
         let old_generation = client.recovery_owner.replay_generation.unwrap();
         let old_ticket = client.recovery_owner.replay_ticket.unwrap();
         assert!(client.recovery_owner.replay_complete);
-        client.checkpointed_transport_timestamp = Some(unix_now_seconds());
+        client.state.last_transport_timestamp = Some(unix_now_seconds());
+        assert!(
+            client
+                .checkpoint_sync_prefix(&mut crate::SyncSummary::default(), false, 0)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            app.load_state("alice").unwrap().last_transport_timestamp,
+            client.state.last_transport_timestamp
+        );
         client.create_group("new native source", &[]).await.unwrap();
         client.sync_runtime_groups().await.unwrap();
         assert_ne!(
@@ -2432,6 +2558,484 @@ mod tests {
                 .all(|scope| scope.plan.since_seconds.is_some()),
             "the completed original unfloored goal cannot force future sources back to full history"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_native_keeps_floor() {
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        let group = client
+            .create_group("empty peer original range", &[])
+            .await
+            .unwrap();
+        let mut routing = client.routing.snapshot();
+        for route in routing
+            .group_routes
+            .iter_mut()
+            .filter(|route| route.group_id == group)
+        {
+            route
+                .endpoints
+                .push(cgka_traits::TransportEndpoint("wss://quiet.example".into()));
+        }
+        client.routing.replace(routing);
+        client.sync_runtime_groups().await.unwrap();
+        for request in relay.accepted_subscriptions() {
+            for endpoint in request
+                .endpoints()
+                .iter()
+                .filter(|endpoint| endpoint.as_str() != "wss://quiet.example")
+            {
+                app.relay_plane
+                    .handle_relay_eose_for_test(endpoint.clone(), request.subscription_id())
+                    .await;
+            }
+        }
+        client.synchronize_native_replay().await.unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
+        let ticket = client.recovery_owner.replay_ticket.unwrap();
+        let scopes = storage.recovery_scope_snapshots(ticket.id).unwrap();
+        assert!(
+            scopes
+                .iter()
+                .filter(|scope| scope.plan.route_kind == 0)
+                .all(|scope| scope.replay_admitted),
+            "an unchanged completed inbox is independent of a different waiting group"
+        );
+        let original = scopes
+            .into_iter()
+            .filter(|scope| scope.plan.group_id.as_deref() == Some(group.as_slice()))
+            .map(|scope| {
+                assert!(
+                    !scope.replay_admitted,
+                    "a valid empty same-group waiting peer still owes older input"
+                );
+                assert!(scope.plan.since_seconds.is_none());
+                scope.plan.scope_id
+            })
+            .collect::<Vec<_>>();
+        assert!(!original.is_empty());
+        assert!(!client.recovery_owner.replay_complete);
+        assert_eq!(
+            storage
+                .recovery_obligation_status(ticket.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            storage_sqlite::RecoveryObligationState::Pending
+        );
+        client
+            .runtime
+            .activate_transport(Some(cgka_traits::Timestamp(unix_now_seconds())))
+            .await
+            .unwrap();
+        for request in relay.accepted_subscriptions() {
+            for endpoint in request
+                .endpoints()
+                .iter()
+                .filter(|endpoint| endpoint.as_str() != "wss://quiet.example")
+            {
+                app.relay_plane
+                    .handle_relay_eose_for_test(endpoint.clone(), request.subscription_id())
+                    .await;
+            }
+        }
+        client.synchronize_native_replay().await.unwrap();
+        let scopes = storage.recovery_scope_snapshots(ticket.id).unwrap();
+        assert!(
+            original.iter().all(|id| scopes.iter().any(|scope| {
+                scope.plan.scope_id == *id
+                    && scope.plan.since_seconds.is_none()
+                    && !scope.replay_admitted
+            })),
+            "a replacement must preserve the unresolved original unfloored group range"
+        );
+        assert!(
+            scopes
+                .iter()
+                .filter(|scope| scope.plan.group_id.as_deref() == Some(group.as_slice()))
+                .all(|scope| !scope.replay_admitted),
+            "a replacement REQ never inherits ready-peer admission"
+        );
+        assert!(client.subscription_rebuild_since().unwrap().is_none());
+        assert!(!client.recovery_owner.replay_complete);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_native_parks() {
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        let group = client.create_group("terminal refusal", &[]).await.unwrap();
+        client.sync_runtime_groups().await.unwrap();
+        client.synchronize_native_replay().await.unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
+        let retry = storage.recovery_retry_state().unwrap();
+        let requests = relay.accepted_subscriptions();
+        let mut refused = false;
+        for request in requests {
+            if request.carries_group(&group) {
+                assert_eq!(request.endpoints().len(), 1);
+                app.relay_plane
+                    .handle_relay_closed_for_test(
+                        request.endpoints()[0].clone(),
+                        request.subscription_id(),
+                        transport_nostr_adapter::SubscriptionRefusal {
+                            category: None,
+                            disposition:
+                                transport_nostr_adapter::SubscriptionRefusalDisposition::Dropped,
+                        },
+                    )
+                    .await;
+                refused = true;
+            }
+        }
+        assert!(refused);
+        let observation = client.adapter.replay_admission().await;
+        assert!(
+            observation
+                .sources()
+                .any(|source| source.terminally_refused() && source.endpoints().next().is_none())
+        );
+        drop(observation);
+        for _ in 0..3 {
+            client.synchronize_native_replay().await.unwrap();
+        }
+        let ticket = client.recovery_owner.replay_ticket.unwrap();
+        assert_eq!(
+            storage
+                .recovery_obligation_status(ticket.id)
+                .unwrap()
+                .unwrap()
+                .eligibility,
+            storage_sqlite::RecoveryEligibility::NeedsDeepRepair
+        );
+        assert!(
+            storage
+                .parked_recovery_obligations()
+                .unwrap()
+                .iter()
+                .any(|notice| notice.ticket == ticket)
+        );
+        assert!(
+            storage
+                .recovery_scope_snapshots(ticket.id)
+                .unwrap()
+                .iter()
+                .any(|scope| {
+                    scope.plan.group_id.as_deref() == Some(group.as_slice())
+                        && !scope.replay_admitted
+                        && scope.plan.since_seconds.is_none()
+                })
+        );
+        assert!(
+            !storage
+                .recovery_eligible_revision_fence(false)
+                .unwrap()
+                .obligations
+                .iter()
+                .any(|(id, _)| *id == ticket.id)
+        );
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        assert_eq!(
+            relay
+                .acquisition_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        client.checkpointed_transport_timestamp = Some(unix_now_seconds());
+        assert!(client.subscription_rebuild_since().unwrap().is_none());
+        client.checkpointed_transport_timestamp = Some(unix_now_seconds().saturating_sub(60));
+        let before = client.checkpointed_transport_timestamp;
+        client.state.last_transport_timestamp = Some(unix_now_seconds());
+        let _sealed = client.seal_transport_cursor();
+        assert_eq!(client.checkpointed_transport_timestamp, before);
+        let notice = client
+            .history_notices()
+            .unwrap()
+            .pop()
+            .expect("unservable native input is visible to hosts");
+        assert_eq!(notice.cause, crate::HistoryNoticeCause::IncrementalHistory);
+        assert!(client.dismiss_history_notice(&notice.notice_id).unwrap());
+        client.synchronize_native_replay().await.unwrap();
+        assert!(client.history_notices().unwrap().is_empty());
+        assert_eq!(
+            storage
+                .recovery_obligation_status(ticket.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            storage_sqlite::RecoveryObligationState::Retired
+        );
+        assert!(
+            client
+                .checkpoint_sync_prefix(&mut crate::SyncSummary::default(), false, 0)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            app.load_state("alice").unwrap().last_transport_timestamp,
+            client.state.last_transport_timestamp
+        );
+        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+    }
+
+    enum NativeTermination {
+        Removal,
+        Disband,
+    }
+
+    async fn native_terminal_backlog_case(termination: NativeTermination) {
+        let (_dir, app, relay, mut sender) = native_fixture().await;
+        let recipient = app.account_home().create_account("bob").unwrap();
+        crate::tests::remember_test_member_inbox(
+            &app,
+            &recipient.account_id_hex,
+            "wss://relay.example",
+        );
+        let pump = crate::tests::scripted_eose_pump(
+            app.relay_plane.clone(),
+            relay.clone(),
+            crate::tests::every_subscription,
+        );
+        let mut receiver = crate::tests::client_on_app_relay_plane(&app, "bob").await;
+        receiver.publish_key_package().await.unwrap();
+        receiver.prepare_transport().await.unwrap();
+        let group = sender
+            .create_group("terminal native backlog", &[&recipient.account_id_hex])
+            .await
+            .unwrap();
+        assert!(
+            receiver
+                .sync()
+                .await
+                .unwrap()
+                .joined_groups
+                .contains(&group)
+        );
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        sender.synchronize_native_replay().await.unwrap();
+        drop(pump);
+        // The terminal commit joins an unresolved native range. It cannot
+        // bypass that range through local publication's ordinary queue.
+        receiver.runtime.activate_transport(None).await.unwrap();
+        receiver.synchronize_native_replay().await.unwrap();
+        assert!(!receiver.recovery_owner.replay_complete);
+        let storage = app.account_storage("bob").unwrap().app_storage();
+        let ticket = receiver.recovery_owner.replay_ticket.unwrap();
+        assert!(
+            storage
+                .recovery_scope_snapshots(ticket.id)
+                .unwrap()
+                .iter()
+                .any(|scope| {
+                    scope.plan.group_id.as_deref() == Some(group.as_slice())
+                        && !scope.replay_admitted
+                })
+        );
+        if matches!(termination, NativeTermination::Disband) {
+            sender.disband_group(&group).await.unwrap();
+        } else {
+            sender
+                .remove_members(&group, &[&recipient.account_id_hex])
+                .await
+                .unwrap();
+        }
+        assert!(!receiver.admit_native_turn().await.unwrap());
+        assert!(!receiver.runtime.group_record(&group).unwrap().is_terminal());
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if matches!(termination, NativeTermination::Disband) {
+                    sender.retry_group_convergence(&group).await.unwrap();
+                }
+                crate::tests::report_scripted_eose(
+                    &app.relay_plane,
+                    &relay,
+                    crate::tests::every_subscription,
+                )
+                .await;
+                receiver.admit_native_turn().await.unwrap();
+                receiver
+                    .advance_convergence_after_runtime_sync(&group)
+                    .await
+                    .unwrap();
+                if receiver.runtime.group_record(&group).unwrap().is_terminal() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the real terminal backlog commit settles");
+        receiver.sync_runtime_groups().await.unwrap();
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        receiver.synchronize_native_replay().await.unwrap();
+        assert!(
+            storage
+                .recovery_scope_snapshots(ticket.id)
+                .unwrap()
+                .iter()
+                .all(|scope| { scope.plan.group_id.as_deref() != Some(group.as_slice()) }),
+            "the departed group's native floor must not survive route retirement"
+        );
+        assert!(receiver.recovery_owner.replay_complete);
+        receiver.checkpointed_transport_timestamp = None;
+        receiver.state.last_transport_timestamp = Some(unix_now_seconds());
+        let _sealed = receiver.seal_transport_cursor();
+        assert!(
+            receiver.checkpointed_transport_timestamp.is_some(),
+            "terminal native debt must not pin the account cursor forever"
+        );
+        assert!(
+            storage
+                .parked_recovery_obligations()
+                .unwrap()
+                .iter()
+                .all(|notice| {
+                    notice.cause != storage_sqlite::RecoveryCause::SubscriptionReplay
+                })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removal_retires_native_floor() {
+        native_terminal_backlog_case(NativeTermination::Removal).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disband_retires_native_floor() {
+        native_terminal_backlog_case(NativeTermination::Disband).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn narrower_native_keeps_floor() {
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        let group = client
+            .create_group("narrow replacement", &[])
+            .await
+            .unwrap();
+        client.sync_runtime_groups().await.unwrap();
+        client.synchronize_native_replay().await.unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
+        let old_ticket = client.recovery_owner.replay_ticket.unwrap();
+        let original = storage
+            .recovery_scope_snapshots(old_ticket.id)
+            .unwrap()
+            .into_iter()
+            .filter(|scope| scope.plan.group_id.as_deref() == Some(group.as_slice()))
+            .map(|scope| scope.plan)
+            .collect::<Vec<_>>();
+        assert!(!original.is_empty());
+        assert!(original.iter().all(|scope| scope.since_seconds.is_none()));
+        // Deliberately bypass the owner's rebuild floor to model a replacement
+        // that cannot cover the already issued original query.
+        client
+            .runtime
+            .activate_transport(Some(cgka_traits::Timestamp(unix_now_seconds())))
+            .await
+            .unwrap();
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client.synchronize_native_replay().await.unwrap();
+        let ticket = client.recovery_owner.replay_ticket.unwrap();
+        assert!(ticket.revision > old_ticket.revision);
+        let stored = storage.recovery_scope_snapshots(ticket.id).unwrap();
+        assert!(original.iter().all(|goal| {
+            stored.iter().any(|scope| {
+                scope.plan.scope_id == goal.scope_id
+                    && scope.plan.since_seconds == goal.since_seconds
+                    && !scope.replay_admitted
+            })
+        }));
+        assert_eq!(
+            storage
+                .recovery_obligation_status(ticket.id)
+                .unwrap()
+                .unwrap()
+                .eligibility,
+            storage_sqlite::RecoveryEligibility::NeedsDeepRepair
+        );
+        assert!(!client.recovery_owner.replay_complete);
+        assert!(client.subscription_rebuild_since().unwrap().is_none());
+        assert!(!storage.parked_recovery_obligations().unwrap().is_empty());
+        assert_eq!(
+            relay
+                .acquisition_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        // A genuine new source covering the old window resumes, without
+        // weakening that window or treating a terminal refusal as capturable.
+        client.runtime.activate_transport(None).await.unwrap();
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client.synchronize_native_replay().await.unwrap();
+        assert!(client.recovery_owner.replay_complete);
+        assert!(storage.parked_recovery_obligations().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_native_route_unpins() {
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        let group = client
+            .create_group("retired route identity", &[])
+            .await
+            .unwrap();
+        client.sync_runtime_groups().await.unwrap();
+        client.synchronize_native_replay().await.unwrap();
+        let storage = app.account_storage("alice").unwrap().app_storage();
+        let ticket = client.recovery_owner.replay_ticket.unwrap();
+        let original = storage
+            .recovery_scope_snapshots(ticket.id)
+            .unwrap()
+            .into_iter()
+            .filter(|scope| scope.plan.group_id.as_deref() == Some(group.as_slice()))
+            .map(|scope| scope.plan.transport_group_id)
+            .collect::<Vec<_>>();
+        assert!(!original.is_empty());
+        // Exercise the resolved authoritative route-set seam, independently
+        // from an ordinary REQ repack that keeps the same wanted identity.
+        let mut routing = client.routing.snapshot();
+        for route in routing
+            .group_routes
+            .iter_mut()
+            .filter(|route| route.group_id == group)
+        {
+            route.transport_group_id = vec![0x42; 32];
+        }
+        client.routing.replace(routing);
+        client.sync_runtime_groups().await.unwrap();
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client.synchronize_native_replay().await.unwrap();
+        assert!(!client.runtime.group_record(&group).unwrap().is_terminal());
+        let stored = storage.recovery_scope_snapshots(ticket.id).unwrap();
+        assert!(stored.iter().all(|scope| scope.plan.group_id.as_deref()
+            != Some(group.as_slice())
+            || !original.contains(&scope.plan.transport_group_id)));
+        assert!(client.recovery_owner.replay_complete);
+        client.checkpointed_transport_timestamp = Some(unix_now_seconds());
+        assert!(client.subscription_rebuild_since().unwrap().is_some());
+        assert!(storage.parked_recovery_obligations().unwrap().is_empty());
     }
 
     fn fixture() -> (SqliteAccountStorage, AccountRecoveryOwner, Instant) {
@@ -2558,6 +3162,59 @@ mod tests {
                 .any(|(id, _)| *id == ticket.id)
         );
         assert!(!grant.fence.obligations.is_empty());
+    }
+
+    #[test]
+    fn narrow_capture_keeps_debt() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        let ticket = app
+            .request_recovery(
+                storage_sqlite::RecoveryRequest::SubscriptionReplay { snapshot: &[8; 32] },
+                1,
+            )
+            .unwrap();
+        let original = RecoveryScopePlan {
+            scope_id: 0,
+            route_kind: 0,
+            route_role: 0,
+            group_id: None,
+            transport_group_id: None,
+            since_seconds: None,
+            until_seconds: 100,
+            known_event_id: None,
+            inventory_floor: None,
+            required_endpoints: vec!["relay".into()],
+            admitted_endpoints: vec!["relay".into()],
+        };
+        app.install_recovery_scope_plan(
+            &app.recovery_revision_fence().unwrap(),
+            0,
+            ticket.id,
+            std::slice::from_ref(&original),
+        )
+        .unwrap()
+        .unwrap();
+        let now = Instant::now();
+        let mut owner = AccountRecoveryOwner::open(&app, 1_000_000, now, policy()).unwrap();
+        owner.replay_sources.push(NativeReplaySource {
+            plan: RecoveryScopePlan {
+                since_seconds: Some(50),
+                ..original
+            },
+            tokens: Arc::new(Vec::new()),
+            acquisition: Arc::new(Vec::new()),
+        });
+        let grant = owner
+            .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+            .unwrap()
+            .expect("an unmatched original range must not be silently hidden");
+        assert!(
+            grant
+                .fence
+                .obligations
+                .contains(&(ticket.id, ticket.revision))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3686,8 +4343,13 @@ mod tests {
                 .with_cursor_persistence(crate::CursorPersistence::Frozen),
         )
         .with_test_relay_client(relay.clone());
-        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+        let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
+        // Startup source facts are passive native duty, not frozen-wake L1
+        // recovery. Settle that lifecycle before capturing the full debt fence
+        // whose preservation this test checks.
+        crate::tests::report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+        client.synchronize_native_replay().await.unwrap();
         let storage = app.account_storage("alice").unwrap().app_storage();
         storage
             .mark_account_delivery_recovery("alice", 42, 1)

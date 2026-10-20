@@ -10,9 +10,15 @@ use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 
 #[derive(Default)]
 struct ReplayRequests {
-    filters: Vec<Value>,
+    next_connection: usize,
+    filters: Vec<ReplayFilter>,
     completed_group_pages: Vec<usize>,
     refused_comparisons: usize,
+}
+
+struct ReplayFilter {
+    connection: usize,
+    filter: Value,
 }
 
 /// Keep real relay storage, signatures, newest-first replay and live fanout;
@@ -47,6 +53,12 @@ impl OfflineReplayRelay {
         let accept = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             while let Ok((socket, _)) = listener.accept().await {
+                let connection = {
+                    let mut requests = captured.lock().unwrap();
+                    let connection = requests.next_connection;
+                    requests.next_connection += 1;
+                    connection
+                };
                 let upstream_url = upstream_url.clone();
                 let requests = captured.clone();
                 connections.spawn(async move {
@@ -73,7 +85,10 @@ impl OfflineReplayRelay {
                                     Some("REQ") => {
                                         let id = frame[1].as_str().unwrap().to_owned();
                                         for filter in frame.as_array_mut().unwrap().iter_mut().skip(2) {
-                                            requests.lock().unwrap().filters.push(filter.clone());
+                                            requests.lock().unwrap().filters.push(ReplayFilter {
+                                                connection,
+                                                filter: filter.clone(),
+                                            });
                                             if filter.get("#h").is_some() {
                                                 group_pages.insert(id.clone(), 0);
                                             }
@@ -245,15 +260,27 @@ async fn offline_plaintext_replay(senders: usize, per_sender: usize, offline: Du
         // production timestamp override or weakening the actual long-gap case.
         sleep(offline).await;
     }
-    *relay.requests.lock().unwrap() = ReplayRequests::default();
+    {
+        let mut requests = relay.requests.lock().unwrap();
+        *requests = ReplayRequests {
+            next_connection: requests.next_connection,
+            ..Default::default()
+        };
+    }
     let receiver_app = replay_app(
         roots[senders].path(),
         &relay.url,
         marmot_app::CursorPersistence::Advance,
     );
+    let receiver_account = &accounts[senders];
+    let route = receiver_app
+        .group(receiver_account, &hex::encode(group.as_slice()))
+        .unwrap()
+        .unwrap()
+        .nostr_routing
+        .nostr_group_id_hex;
     let receiver = MarmotAppRuntime::new(receiver_app.clone());
     receiver.reconcile_accounts().await.unwrap();
-    let receiver_account = &accounts[senders];
     let mut subscription = receiver
         .subscribe_messages(
             receiver_account,
@@ -332,25 +359,51 @@ async fn offline_plaintext_replay(senders: usize, per_sender: usize, offline: Du
             requests
                 .filters
                 .iter()
-                .any(|filter| filter.get("#h").is_some() && filter.get("until").is_some()),
+                .any(|request| request.filter.get("#h").is_some()
+                    && request.filter.get("until").is_some()),
             "group replay issues backward until paging"
+        );
+        let receiver_connection = requests
+            .filters
+            .iter()
+            .filter(|request| {
+                request
+                    .filter
+                    .get("#p")
+                    .and_then(Value::as_array)
+                    .is_some_and(|recipients| {
+                        recipients
+                            .iter()
+                            .any(|recipient| recipient.as_str() == Some(receiver_account.as_str()))
+                    })
+            })
+            .map(|request| request.connection)
+            .min()
+            .expect("the receiver installs its own inbox on a new connection");
+        let activation = requests
+            .filters
+            .iter()
+            .find(|request| {
+                request.connection == receiver_connection
+                    && request
+                        .filter
+                        .get("#h")
+                        .and_then(Value::as_array)
+                        .is_some_and(|routes| {
+                            routes
+                                .iter()
+                                .any(|candidate| candidate.as_str() == Some(route.as_str()))
+                        })
+            })
+            .expect("the receiver activates the persisted group route");
+        assert!(
+            activation.filter.get("since").is_none() && activation.filter.get("until").is_none(),
+            "the receiver's first group REQ requests full history, before maintenance or paging"
         );
         if !offline.is_zero() {
             assert!(
                 requests.refused_comparisons > 0,
                 "the long-gap recovery encountered a relay without NIP-77"
-            );
-            let oldest = NostrTimestamp::now().as_secs().saturating_sub(120);
-            assert!(
-                requests
-                    .filters
-                    .iter()
-                    .any(|filter| filter.get("#h").is_some()
-                        && filter
-                            .get("since")
-                            .and_then(Value::as_u64)
-                            .is_none_or(|since| since < oldest)),
-                "activation requests history older than the recent tail"
             );
         }
     }

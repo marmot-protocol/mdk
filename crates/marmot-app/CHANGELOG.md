@@ -62,7 +62,9 @@
   its checkpoint and readmits once space frees or on explicit Retry.
 
 - Rust recovery models add `RecoveryCause::SubscriptionReplay`,
-  `RecoveryPredicate::ReplayAdmission` and `RecoveryScopeCheckpoint::replay_admitted`.
+  `RecoveryPredicate::ReplayAdmission`, `RecoveryScopeCheckpoint::replay_admitted`
+  and `RecoveryReplayPlacement`. Native checkpoints require separate account-wide
+  placement before completion; scoped source facts can persist earlier.
   Native input admission is separate from history certification and loss acknowledgment.
   The C and UniFFI surfaces are unchanged.
 - Rust audited engine ingestion, session delivery ingestion and account delivery
@@ -187,9 +189,13 @@
   pages every route of a clamped reply backwards (#2375, #2381). Without a
   durable cursor it requests retained history, not the recent live tail, even
   when the relay refuses NIP-77. The account recovery owner preserves unresolved
-  original windows across cancellation and reopen. Historical batches bypass
-  live-queue/spill alternation, and retained spill rows join the ordered range
-  before decryption. Already-held copies adopt durable spill ownership before
+  original windows across cancellation and reopen. All native group input,
+  including live tails and local publication fanout, bypasses live-queue/spill alternation; retained spill
+  rows join the ordered range before decryption. Current waiting peers fence
+  release, and replacement requests establish their own boundaries. Unservable
+  original ranges raise the existing history notice instead of silently blocking
+  the cursor; terminal group removal retires obsolete native scopes. Native
+  backend errors remain visible and automatic retries back off. Already-held copies adopt durable spill ownership before
   source replacement, without copying the ciphertext. Empty or silent peers do not
   create notification loss. Sender-ratchet tolerance remains 100; timestamp/id
   ordering does not establish sender-generation order within a single second.

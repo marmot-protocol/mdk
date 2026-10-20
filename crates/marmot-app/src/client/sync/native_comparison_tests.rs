@@ -9,6 +9,7 @@ use crate::tests::{
 };
 use cgka_session::PublishWork;
 use cgka_traits::engine::SendIntent;
+use cgka_traits::{TransportAccountActivation, TransportAdapter};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use transport_nostr_adapter::{NostrRelayEvent, ReplayBatchTake};
@@ -17,9 +18,14 @@ use transport_nostr_peeler::NostrTransportEvent;
 const TEXTS: usize = 212;
 const ENDPOINT: &str = "wss://relay.example";
 
+mod future_cursor_tests;
+mod live_rejoin_tests;
+mod native_failure_tests;
+
 struct CryptoFixture {
     _dir: tempfile::TempDir,
     _pump: ScriptedEosePump,
+    relay: Arc<ScriptedPushRelayClient>,
     sender: AppClient,
     receiver: AppClient,
     group: GroupId,
@@ -34,7 +40,7 @@ async fn crypto_fixture() -> CryptoFixture {
     let app =
         crate::MarmotApp::with_relay(dir.path(), ENDPOINT).with_test_relay_client(relay.clone());
     remember_test_member_inbox(&app, &recipient.account_id_hex, ENDPOINT);
-    let pump = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+    let pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut receiver = client_on_app_relay_plane(&app, "receiver").await;
     receiver.publish_key_package().await.unwrap();
     receiver.prepare_transport().await.unwrap();
@@ -60,6 +66,7 @@ async fn crypto_fixture() -> CryptoFixture {
     CryptoFixture {
         _dir: dir,
         _pump: pump,
+        relay,
         sender,
         receiver,
         group,
@@ -370,4 +377,93 @@ async fn older_comparison_keeps_text() {
     )
     .await
     .expect("bounded real MLS reverse ingress regression");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_peer_keeps_plaintext() {
+    timeout(Duration::from_secs(120), async {
+        assert_eq!(cgka_engine::wire_format::DEFAULT_OUT_OF_ORDER_TOLERANCE, 100);
+        let mut fixture = crypto_fixture().await;
+        let (events, expected) = encrypted_texts(&mut fixture.sender, &fixture.group).await;
+        let first = fixture.receiver.adapter.recovered_deliveries(events[0].clone()).await.unwrap().pop().unwrap();
+        let TransportEnvelope::GroupMessage { transport_group_id } = first.message.envelope else {
+            panic!("the fixture must produce actual MLS group ciphertext");
+        };
+        let account = first.account_id;
+        let fast = cgka_traits::TransportEndpoint(ENDPOINT.into());
+        let slow = cgka_traits::TransportEndpoint("wss://slow.example".into());
+        // Separate scripted relay streams feed the real adapter/ingress, not
+        // pre-sorted DTOs or retained local copies. The receiver still uses its
+        // ordinary recovery-owner ingest, MLS state and durable projections.
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let adapter = transport_nostr_adapter::NostrTransportAdapter::new(relay.clone());
+        fixture.receiver.recovery_owner.native_batch = None;
+        fixture.receiver.recovery_owner.native_ingress = None;
+        let ingress = adapter.open_replay_ingress(&account, Vec::new()).await.unwrap();
+        adapter.activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: Vec::new(),
+            group_subscriptions: vec![cgka_traits::TransportGroupSubscription {
+                group_id: fixture.group.clone(),
+                transport_group_id,
+                endpoints: vec![fast.clone(), slow.clone()],
+                retained_since: None,
+            }],
+            since: None,
+        }).await.unwrap();
+        let id = relay.accepted_subscriptions().into_iter().find(|subscription| subscription.carries_group(&fixture.group)).unwrap().subscription_id();
+        fixture.receiver.recovery_owner.native_ingress = Some(ingress);
+        let started = tokio::time::Instant::now();
+        for event in events[180..].iter().rev() {
+            let mut event = event.clone();
+            event.subscription_id = Some(id.clone());
+            adapter.observe_relay_event(&event).await;
+            adapter.handle_group_relay_copy(event, Some(&account)).await.unwrap();
+        }
+        adapter.handle_relay_eose(fast, id.clone()).await;
+        assert!(adapter.take_replay_status(&account).await.pending);
+        assert!(!adapter.account_subscription_eose(&account).await.complete());
+        for _ in 0..3 {
+            assert!(
+                !fixture.receiver.admit_native_turn().await.unwrap(),
+                "a complete newer subset must not advance MLS while an in-deadline peer still owes its first payload"
+            );
+        }
+        assert!(fixture.receiver.take_pending_applied_sync_summary().messages.is_empty());
+        let storage = fixture.receiver.app.account_storage("receiver").unwrap().app_storage();
+        let query = || storage_sqlite::StoredAppMessageQuery {
+            group_id_hex: Some(hex::encode(fixture.group.as_slice())),
+            kinds: Some(vec![MARMOT_APP_EVENT_KIND_CHAT]),
+            limit: None,
+        };
+        assert!(storage.app_messages(query()).unwrap().is_empty(), "no newer plaintext may be committed early");
+        // The prefix spans more than one hundred generations. Releasing even
+        // one newer frame above would evict skipped keys needed by this prefix.
+        for event in events[..180].iter().rev() {
+            let mut event = event.clone();
+            event.endpoint = slow.clone();
+            event.subscription_id = Some(id.clone());
+            adapter.observe_relay_event(&event).await;
+            adapter.handle_group_relay_copy(event, Some(&account)).await.unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_secs(30), "the older prefix arrives inside the production service lease");
+        assert!(!fixture.receiver.admit_native_turn().await.unwrap(), "payload arrival alone does not settle the older source");
+        adapter.handle_relay_eose(slow, id).await;
+        for turn in 0..=TEXTS {
+            if !fixture.receiver.admit_native_turn().await.unwrap() {
+                break;
+            }
+            assert!(turn < TEXTS, "settled replay drains in bounded native turns");
+        }
+        let summary = fixture.receiver.take_pending_applied_sync_summary();
+        assert_eq!(summary.messages.len(), TEXTS);
+        assert_eq!(summary.messages.into_iter().map(|message| (message.message_id_hex, message.plaintext)).collect::<BTreeMap<_, _>>(), expected);
+        let persisted = storage.app_messages(query()).unwrap();
+        assert_eq!(persisted.len(), TEXTS);
+        assert!(persisted.iter().all(|message| !message.invalidated));
+        assert_eq!(persisted.into_iter().map(|message| (message.message_id_hex, message.plaintext)).collect::<BTreeMap<_, _>>(), expected, "every actual MLS plaintext must survive the slow-peer boundary");
+        let status = adapter.take_replay_status(&account).await;
+        assert!(!status.pending);
+        assert!(status.loss.is_none());
+    }).await.expect("bounded real MLS slow-peer regression");
 }

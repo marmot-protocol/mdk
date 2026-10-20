@@ -20,8 +20,8 @@ pub use observe::{
 };
 pub use plan::{
     RECOVERY_PARK_AFTER_QUIET_PASSES, RecoveryEligibility, RecoveryEndpointCheckpoint,
-    RecoveryPassProgress, RecoveryScopeCheckpoint, RecoveryScopeOutcome, RecoveryScopePlan,
-    RecoveryScopeToken, StoredRecoveryScope,
+    RecoveryPassProgress, RecoveryReplayPlacement, RecoveryScopeCheckpoint, RecoveryScopeOutcome,
+    RecoveryScopePlan, RecoveryScopeToken, StoredRecoveryScope,
 };
 pub use stall::QualifiedRecoveryStallSample;
 

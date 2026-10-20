@@ -17,7 +17,12 @@ fn selected(app: &SqliteAppStorage, ticket: RecoveryDemandTicket) -> RecoveryRev
     fence
 }
 
-fn scope(id: u64, since: u64, until: u64, admitted: bool) -> RecoveryScopePlan {
+enum PeerAdmission {
+    Granted,
+    Refused,
+}
+
+fn scope(id: u64, since: u64, until: u64, admission: PeerAdmission) -> RecoveryScopePlan {
     RecoveryScopePlan {
         scope_id: id,
         route_kind: 0,
@@ -29,7 +34,7 @@ fn scope(id: u64, since: u64, until: u64, admitted: bool) -> RecoveryScopePlan {
         known_event_id: None,
         inventory_floor: None,
         required_endpoints: vec!["issued".into(), "unavailable".into()],
-        admitted_endpoints: if admitted {
+        admitted_endpoints: if matches!(admission, PeerAdmission::Granted) {
             vec!["issued".into()]
         } else {
             vec![]
@@ -64,7 +69,10 @@ fn native_plan_issued_sources() {
     let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let ticket = native(&app, 1);
     assert!(app.recovery_scope_snapshots(ticket.id).unwrap().is_empty());
-    let plans = [scope(41, 0, 10, true), scope(77, 3, 20, true)];
+    let plans = [
+        scope(41, 0, 10, PeerAdmission::Granted),
+        scope(77, 3, 20, PeerAdmission::Granted),
+    ];
     let (fence, tokens) = prepare(&app, ticket, &plans);
     let stored = app.recovery_scope_snapshots(ticket.id).unwrap();
     assert!(stored.iter().map(|scope| &scope.plan).eq(plans.iter()));
@@ -73,6 +81,7 @@ fn native_plan_issued_sources() {
         app.checkpoint_replay_admission(
             &fence,
             ticket,
+            RecoveryReplayPlacement::Placed,
             &[admission(&tokens[0]), admission(&tokens[1])]
         )
         .unwrap()
@@ -82,6 +91,195 @@ fn native_plan_issued_sources() {
             .unwrap()
     );
     assert_eq!(app.recovery_retry_state().unwrap().attempt_serial, 0);
+}
+
+#[test]
+fn native_global_placement_fence() {
+    let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let ticket = native(&app, 1);
+    let (fence, tokens) = prepare(&app, ticket, &[scope(41, 0, 20, PeerAdmission::Granted)]);
+    let cost = app.recovery_retry_state().unwrap();
+    assert!(
+        !app.checkpoint_replay_admission(
+            &fence,
+            ticket,
+            RecoveryReplayPlacement::Pending,
+            &[admission(&tokens[0])]
+        )
+        .unwrap()
+    );
+    assert!(
+        app.recovery_scope_snapshots(ticket.id).unwrap()[0].replay_admitted,
+        "the source-local proof survives unrelated account-wide pending input"
+    );
+    assert_eq!(
+        app.recovery_obligation_status(ticket.id)
+            .unwrap()
+            .unwrap()
+            .state,
+        RecoveryObligationState::Pending
+    );
+    assert!(
+        !app.recovery_obligation_is_satisfied(ticket.id, ticket.revision)
+            .unwrap()
+    );
+    assert!(
+        app.checkpoint_replay_admission(&fence, ticket, RecoveryReplayPlacement::Placed, &[])
+            .unwrap()
+    );
+    assert!(
+        app.recovery_obligation_is_satisfied(ticket.id, ticket.revision)
+            .unwrap()
+    );
+    assert_eq!(app.recovery_retry_state().unwrap(), cost);
+}
+
+#[test]
+fn native_retire_fences_tokens() {
+    let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let ticket = native(&app, 1);
+    let mut unfloored = scope(41, 0, 20, PeerAdmission::Granted);
+    unfloored.since_seconds = None;
+    let kept = scope(77, 3, 20, PeerAdmission::Granted);
+    let (fence, tokens) = prepare(&app, ticket, &[unfloored.clone(), kept.clone()]);
+    let retry = app.recovery_retry_state().unwrap();
+    assert!(
+        app.retire_native_replay_scopes(&fence, ticket, &tokens[..1])
+            .unwrap()
+    );
+    let successor = native(&app, 1);
+    assert!(successor.revision > tokens.iter().map(|token| token.revision).max().unwrap());
+    let stored = app.recovery_scope_snapshots(ticket.id).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert!(stored[0].plan == kept);
+    assert!(
+        !app.retire_native_replay_scopes(&fence, ticket, &tokens[1..])
+            .unwrap()
+    );
+    let (current, new_tokens) = prepare(&app, successor, &[unfloored, kept]);
+    assert!(
+        new_tokens
+            .iter()
+            .all(|token| token.revision > tokens[0].revision)
+    );
+    assert!(
+        !app.checkpoint_replay_admission(
+            &current,
+            successor,
+            RecoveryReplayPlacement::Placed,
+            &[admission(&tokens[0])]
+        )
+        .unwrap()
+    );
+    assert!(
+        app.retire_native_replay_scopes(&current, successor, &new_tokens)
+            .unwrap()
+    );
+    let retired = app.recovery_obligation_status(ticket.id).unwrap().unwrap();
+    assert_eq!(retired.state, RecoveryObligationState::Retired);
+    assert!(
+        !app.recovery_obligation_is_satisfied(ticket.id, retired.revision)
+            .unwrap()
+    );
+    assert!(app.recovery_scope_snapshots(ticket.id).unwrap().is_empty());
+    assert_eq!(app.recovery_retry_state().unwrap(), retry);
+}
+
+#[test]
+fn native_unserved_park_resumes() {
+    let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let ticket = native(&app, 1);
+    let mut goal = scope(41, 0, 20, PeerAdmission::Refused);
+    goal.since_seconds = None;
+    let (fence, tokens) = prepare(&app, ticket, &[goal.clone()]);
+    let retry = app.recovery_retry_state().unwrap();
+    assert!(
+        app.park_unserved_native_replay(&fence, ticket, &tokens)
+            .unwrap()
+    );
+    let parked = app.parked_recovery_obligations().unwrap();
+    assert_eq!(parked.len(), 1);
+    assert!(parked[0].ticket == ticket);
+    assert!(parked[0].parked_at_ms.is_some());
+    assert!(
+        app.recovery_eligible_revision_fence(false)
+            .unwrap()
+            .obligations
+            .is_empty()
+    );
+    assert!(
+        app.recovery_scope_snapshots(ticket.id).unwrap()[0]
+            .plan
+            .since_seconds
+            .is_none()
+    );
+    let successor = native(&app, 2);
+    assert!(app.parked_recovery_obligations().unwrap().is_empty());
+    assert!(
+        !app.park_unserved_native_replay(&fence, ticket, &tokens)
+            .unwrap()
+    );
+    goal.admitted_endpoints = vec!["issued".into()];
+    let (current, tokens) = prepare(&app, successor, &[goal]);
+    assert!(
+        app.checkpoint_replay_admission(
+            &current,
+            successor,
+            RecoveryReplayPlacement::Placed,
+            &[admission(&tokens[0])]
+        )
+        .unwrap()
+    );
+    assert_eq!(app.recovery_retry_state().unwrap(), retry);
+    for cause in [
+        RecoveryLossCause::Queue,
+        RecoveryLossCause::NotificationConsumer,
+    ] {
+        assert!(
+            app.recovery_loss_watermarks("alice", cause)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn stale_native_cas_keeps_debt() {
+    let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let ticket = native(&app, 1);
+    let plans = [
+        scope(41, 0, 20, PeerAdmission::Granted),
+        scope(77, 3, 20, PeerAdmission::Granted),
+    ];
+    let (fence, old) = prepare(&app, ticket, &plans);
+    let (_, current) = prepare(&app, ticket, &plans);
+    let mixed = [current[0].clone(), old[1].clone()];
+    assert!(
+        !app.retire_native_replay_scopes(&fence, ticket, &mixed)
+            .unwrap()
+    );
+    assert!(
+        !app.park_unserved_native_replay(&fence, ticket, &mixed)
+            .unwrap()
+    );
+    app.observe_recovery_route_snapshot([8; 32]).unwrap();
+    assert!(
+        !app.retire_native_replay_scopes(&fence, ticket, &current)
+            .unwrap()
+    );
+    assert!(
+        !app.park_unserved_native_replay(&fence, ticket, &current)
+            .unwrap()
+    );
+    assert_eq!(app.recovery_scope_snapshots(ticket.id).unwrap().len(), 2);
+    assert!(app.parked_recovery_obligations().unwrap().is_empty());
+    assert_eq!(
+        app.recovery_obligation_status(ticket.id)
+            .unwrap()
+            .unwrap()
+            .revision,
+        ticket.revision
+    );
 }
 
 struct MixedComparison {
@@ -107,12 +305,12 @@ fn mixed_comparison() -> MixedComparison {
             1_000,
         )
         .unwrap();
-    let mut route = scope(0, 0, 20, true);
+    let mut route = scope(0, 0, 20, PeerAdmission::Granted);
     route.required_endpoints = vec!["issued".into()];
     let revision = app
         .join_recovery_comparison(&[1; 16], 1_000, &[route.clone()])
         .unwrap();
-    let (_, mut tokens) = prepare(&app, native, &[scope(41, 0, 20, true)]);
+    let (_, mut tokens) = prepare(&app, native, &[scope(41, 0, 20, PeerAdmission::Granted)]);
     let native_token = tokens.remove(0);
     let fence = app.recovery_revision_fence().unwrap();
     app.reserve_recovery_attempt(&fence, 1_000, 100, false)
@@ -163,6 +361,7 @@ fn native_mixed_grant_settles() {
             app.checkpoint_replay_admission(
                 &grant.fence,
                 grant.native,
+                RecoveryReplayPlacement::Placed,
                 &[admission(&grant.native_token)]
             )
             .unwrap()
@@ -232,6 +431,7 @@ fn native_mixed_fence_is_exact() {
             app.checkpoint_replay_admission(
                 &grant.fence,
                 grant.native,
+                RecoveryReplayPlacement::Placed,
                 &[admission(&grant.native_token)]
             )
             .unwrap()
@@ -316,7 +516,10 @@ fn native_successor_keeps_debt() {
         .reserve_recovery_attempt(&fence, 1_000, 15_000, false)
         .unwrap()
         .unwrap();
-    let plans = [scope(0, 0, 10, true), scope(7, 3, 20, true)];
+    let plans = [
+        scope(0, 0, 10, PeerAdmission::Granted),
+        scope(7, 3, 20, PeerAdmission::Granted),
+    ];
     let tokens = app
         .install_recovery_scope_plan(&fence, reservation.attempt_serial, first.id, &plans)
         .unwrap()
@@ -370,6 +573,7 @@ fn native_successor_keeps_debt() {
         !app.checkpoint_replay_admission(
             &fence,
             first,
+            RecoveryReplayPlacement::Placed,
             &[admission(&tokens[0]), admission(&tokens[1])]
         )
         .unwrap()
@@ -424,11 +628,16 @@ fn native_successor_keeps_debt() {
         app.recovery_scope_snapshots(fresh.id).unwrap().is_empty(),
         "retired windows are not inherited"
     );
-    let new_plan = scope(0, 100, 200, true);
+    let new_plan = scope(0, 100, 200, PeerAdmission::Granted);
     let (fence, tokens) = prepare(&app, fresh, &[new_plan]);
     assert!(
-        app.checkpoint_replay_admission(&fence, fresh, &[admission(&tokens[0])])
-            .unwrap()
+        app.checkpoint_replay_admission(
+            &fence,
+            fresh,
+            RecoveryReplayPlacement::Placed,
+            &[admission(&tokens[0])]
+        )
+        .unwrap()
     );
     assert!(native(&app, 3) == fresh, "satisfied snapshots never rearm");
     assert!(
@@ -449,15 +658,28 @@ fn native_all_scopes_need_a_peer() {
     let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let ticket = native(&app, 1);
     let cost = app.recovery_retry_state().unwrap();
-    let plans = [scope(0, 0, 10, true), scope(1, 1, 20, false)];
+    let plans = [
+        scope(0, 0, 10, PeerAdmission::Granted),
+        scope(1, 1, 20, PeerAdmission::Refused),
+    ];
     let (fence, tokens) = prepare(&app, ticket, &plans);
     assert!(
-        !app.checkpoint_replay_admission(&fence, ticket, &[admission(&tokens[0])])
-            .unwrap()
+        !app.checkpoint_replay_admission(
+            &fence,
+            ticket,
+            RecoveryReplayPlacement::Placed,
+            &[admission(&tokens[0])]
+        )
+        .unwrap()
     );
     assert!(
-        !app.checkpoint_replay_admission(&fence, ticket, &[admission(&tokens[1])])
-            .unwrap(),
+        !app.checkpoint_replay_admission(
+            &fence,
+            ticket,
+            RecoveryReplayPlacement::Placed,
+            &[admission(&tokens[1])]
+        )
+        .unwrap(),
         "an empty admitted endpoint set is not evidence"
     );
     let stored = app.recovery_scope_snapshots(ticket.id).unwrap();
@@ -467,15 +689,20 @@ fn native_all_scopes_need_a_peer() {
             .iter()
             .all(|scope| scope.checkpoints.is_empty() && !scope.retained_known_event)
     );
-    let new_plans = [plans[0].clone(), scope(1, 1, 20, true)];
+    let new_plans = [plans[0].clone(), scope(1, 1, 20, PeerAdmission::Granted)];
     let (fence, tokens) = prepare(&app, ticket, &new_plans);
     assert!(
         !app.recovery_scope_snapshots(ticket.id).unwrap()[1].replay_admitted,
         "endpoint changes invalidate the old native fact"
     );
     assert!(
-        app.checkpoint_replay_admission(&fence, ticket, &[admission(&tokens[1])])
-            .unwrap()
+        app.checkpoint_replay_admission(
+            &fence,
+            ticket,
+            RecoveryReplayPlacement::Placed,
+            &[admission(&tokens[1])]
+        )
+        .unwrap()
     );
     assert_eq!(app.recovery_retry_state().unwrap(), cost);
     assert!(
@@ -488,13 +715,17 @@ fn native_all_scopes_need_a_peer() {
 fn native_observation_is_fenced() {
     let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let ticket = native(&app, 1);
-    let plans = [scope(0, 0, 10, true), scope(1, 1, 20, true)];
+    let plans = [
+        scope(0, 0, 10, PeerAdmission::Granted),
+        scope(1, 1, 20, PeerAdmission::Granted),
+    ];
     let (fence, old) = prepare(&app, ticket, &plans);
     let (_, current) = prepare(&app, ticket, &plans);
     assert!(
         !app.checkpoint_replay_admission(
             &fence,
             ticket,
+            RecoveryReplayPlacement::Placed,
             &[admission(&current[0]), admission(&old[1])]
         )
         .unwrap()
@@ -510,6 +741,7 @@ fn native_observation_is_fenced() {
         !app.checkpoint_replay_admission(
             &fence,
             ticket,
+            RecoveryReplayPlacement::Placed,
             &[admission(&current[0]), admission(&current[1])]
         )
         .unwrap()
@@ -520,6 +752,7 @@ fn native_observation_is_fenced() {
         !app.checkpoint_replay_admission(
             &route_fence,
             ticket,
+            RecoveryReplayPlacement::Placed,
             &[admission(&tokens[0]), admission(&tokens[1])]
         )
         .unwrap()
@@ -528,6 +761,7 @@ fn native_observation_is_fenced() {
         !app.checkpoint_replay_admission(
             &selected(&app, successor),
             successor,
+            RecoveryReplayPlacement::Placed,
             &[admission(&tokens[0]), admission(&tokens[1])]
         )
         .unwrap()
@@ -589,7 +823,7 @@ fn native_is_not_history_proof() {
         .unwrap()
         .ticket;
     for ticket in [history, known, maintenance, loss] {
-        let mut plan = scope(0, 0, 20, true);
+        let mut plan = scope(0, 0, 20, PeerAdmission::Granted);
         if ticket == known {
             plan.known_event_id = Some([7; 32]);
         }
@@ -598,8 +832,13 @@ fn native_is_not_history_proof() {
             .unwrap()
             .unwrap();
         assert!(
-            !app.checkpoint_replay_admission(&fence, ticket, &[admission(&tokens[0])])
-                .unwrap()
+            !app.checkpoint_replay_admission(
+                &fence,
+                ticket,
+                RecoveryReplayPlacement::Placed,
+                &[admission(&tokens[0])]
+            )
+            .unwrap()
         );
         assert!(
             !app.checkpoint_recovery_obligation(
@@ -616,8 +855,13 @@ fn native_is_not_history_proof() {
                 .unwrap()
         );
         assert!(
-            app.install_recovery_scope_plan(&fence, 0, ticket.id, &[scope(0, 0, 20, true)])
-                .is_err()
+            app.install_recovery_scope_plan(
+                &fence,
+                0,
+                ticket.id,
+                &[scope(0, 0, 20, PeerAdmission::Granted)]
+            )
+            .is_err()
         );
     }
     let tokens = app
@@ -625,13 +869,18 @@ fn native_is_not_history_proof() {
             &fence,
             cost.attempt_serial,
             native.id,
-            &[scope(0, 0, 20, true)],
+            &[scope(0, 0, 20, PeerAdmission::Granted)],
         )
         .unwrap()
         .unwrap();
     assert!(
-        app.checkpoint_replay_admission(&fence, native, &[admission(&tokens[0])])
-            .unwrap()
+        app.checkpoint_replay_admission(
+            &fence,
+            native,
+            RecoveryReplayPlacement::Placed,
+            &[admission(&tokens[0])]
+        )
+        .unwrap()
     );
     let loss_watermarks = app
         .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
@@ -658,7 +907,7 @@ fn native_admission_rolls_back() {
     let store = SqliteAccountStorage::in_memory().unwrap();
     let app = store.app_storage();
     let ticket = native(&app, 1);
-    let (fence, tokens) = prepare(&app, ticket, &[scope(0, 0, 10, true)]);
+    let (fence, tokens) = prepare(&app, ticket, &[scope(0, 0, 10, PeerAdmission::Granted)]);
     let cost = app.recovery_retry_state().unwrap();
     store
         .lock()
@@ -669,8 +918,13 @@ fn native_admission_rolls_back() {
         )
         .unwrap();
     assert!(
-        app.checkpoint_replay_admission(&fence, ticket, &[admission(&tokens[0])])
-            .is_err()
+        app.checkpoint_replay_admission(
+            &fence,
+            ticket,
+            RecoveryReplayPlacement::Placed,
+            &[admission(&tokens[0])]
+        )
+        .is_err()
     );
     assert!(!app.recovery_scope_snapshots(ticket.id).unwrap()[0].replay_admitted);
     assert!(
@@ -685,9 +939,9 @@ fn native_scope_tokens_stay_stale() {
     for complete in [false, true] {
         let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
         let ticket = native(&app, 1);
-        let mut plans = vec![scope(0, 0, 10, true)];
+        let mut plans = vec![scope(0, 0, 10, PeerAdmission::Granted)];
         if !complete {
-            plans.push(scope(1, 1, 20, true));
+            plans.push(scope(1, 1, 20, PeerAdmission::Granted));
         }
         // Several observations make the scope token exceed the obligation's
         // revision before its row is removed at the source-generation change.
@@ -696,16 +950,26 @@ fn native_scope_tokens_stay_stale() {
         }
         let (fence, old) = prepare(&app, ticket, &plans);
         assert_eq!(
-            app.checkpoint_replay_admission(&fence, ticket, &[admission(&old[0])])
-                .unwrap(),
+            app.checkpoint_replay_admission(
+                &fence,
+                ticket,
+                RecoveryReplayPlacement::Placed,
+                &[admission(&old[0])]
+            )
+            .unwrap(),
             complete
         );
         let successor = native(&app, 2);
         let (fence, current) = prepare(&app, successor, &plans);
         assert!(current[0].revision > old[0].revision);
         assert!(
-            !app.checkpoint_replay_admission(&fence, successor, &[admission(&old[0])])
-                .unwrap()
+            !app.checkpoint_replay_admission(
+                &fence,
+                successor,
+                RecoveryReplayPlacement::Placed,
+                &[admission(&old[0])]
+            )
+            .unwrap()
         );
         assert!(
             app.recovery_scope_snapshots(successor.id)
@@ -731,7 +995,7 @@ fn native_grant_is_limited() {
             &fence,
             cost.attempt_serial,
             ticket.id,
-            &[scope(0, 0, 20, true)],
+            &[scope(0, 0, 20, PeerAdmission::Granted)],
         )
         .unwrap()
         .unwrap();
@@ -757,7 +1021,10 @@ fn native_reopen_keeps_floor() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("native-recovery.sqlite");
     let key = crate::SqlCipherKey::new("native recovery reopen").unwrap();
-    let plans = [scope(0, 3, 10, true), scope(1, 0, 20, true)];
+    let plans = [
+        scope(0, 3, 10, PeerAdmission::Granted),
+        scope(1, 0, 20, PeerAdmission::Granted),
+    ];
     let (ticket, cost) = {
         let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
         let app = store.app_storage();
@@ -768,8 +1035,13 @@ fn native_reopen_keeps_floor() {
             .unwrap();
         let (fence, tokens) = prepare(&app, ticket, &plans);
         assert!(
-            !app.checkpoint_replay_admission(&fence, ticket, &[admission(&tokens[0])])
-                .unwrap()
+            !app.checkpoint_replay_admission(
+                &fence,
+                ticket,
+                RecoveryReplayPlacement::Placed,
+                &[admission(&tokens[0])]
+            )
+            .unwrap()
         );
         store.close().unwrap();
         (ticket, cost)

@@ -13,7 +13,8 @@ pub enum RecoveryObligationState {
     Pending,
     Satisfied,
     /// Retired by an explicit, user-authorized dismissal ("history may be
-    /// incomplete"), never by coverage.
+    /// incomplete"), or because authoritative lifecycle state no longer needs
+    /// any native input scopes. Neither outcome establishes history coverage.
     Retired,
 }
 
