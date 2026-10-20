@@ -54,31 +54,31 @@ jobs:
     name: Wait for a building nightly
     # A nightly yields to releases and snapshots before it builds; once it is
     # building, releases and snapshots wait for it to leave the macOS runners.
-    if: inputs.nightly_version == '' && !inputs.build_only
+    # The job always runs, because a skipped ancestor would skip every build
+    # job below; nightly and build-only runs skip only its steps.
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 200
     permissions:
       actions: read
       contents: read
 
     steps:
       - name: Check out workflow scripts
+        if: inputs.nightly_version == '' && !inputs.build_only
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
 
       - name: Wait for a building nightly to finish
+        if: inputs.nightly_version == '' && !inputs.build_only
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 scripts/nightly_release.py wait-lane --nightly --timeout-minutes 120 --fail-on-timeout
+        run: python3 scripts/nightly_release.py wait-lane --nightly --timeout-minutes 180 --fail-on-timeout
 
   metadata:
     name: Resolve immutable release identity
     needs: release-lane
-    if: >-
-      !cancelled() &&
-      (needs.release-lane.result == 'success' || needs.release-lane.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:

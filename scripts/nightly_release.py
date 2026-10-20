@@ -41,6 +41,7 @@ REQUIRED_CI_JOB = "Required CI"
 NIGHTLY_WORKFLOW = "nightly-releases.yml"
 # The nightly job that waits for releases and snapshots to leave the macOS lane.
 LANE_JOB = "Wait for release lane"
+LANE_STEP = "Wait for releases and snapshots to finish"
 ACTIVE_STATUSES = ("queued", "in_progress", "waiting", "requested", "pending")
 
 DEV_VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)-dev")
@@ -438,18 +439,33 @@ def command_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def nightly_is_building(jobs: list[dict]) -> bool:
+    """Whether a nightly run has finished waiting for the lane, so it is about to build or building.
+
+    The wait step's own result is checked as well as the job's, which narrows the moment when a
+    release or snapshot could start between the nightly's last check and its job completing.
+    """
+    for job in jobs:
+        if job.get("name") != LANE_JOB:
+            continue
+        if job.get("conclusion") == "success":
+            return True
+        for step in job.get("steps") or []:
+            if step.get("name") == LANE_STEP and step.get("conclusion") == "success":
+                return True
+    return False
+
+
 def building_nightlies(gh: GitHub) -> list[dict]:
-    """Return active nightly runs that are past their lane wait, so they are building.
+    """Return active nightly runs that are past their lane wait.
 
     A nightly still waiting for the lane yields to releases and snapshots; waiting on it as well
     would deadlock both sides until one timed out.
     """
-    building = []
-    for run in gh.active_runs(NIGHTLY_WORKFLOW):
-        jobs = gh.paginate(gh.repo(f"actions/runs/{run['id']}/jobs"), key="jobs")
-        if any(job["name"] == LANE_JOB and job["conclusion"] == "success" for job in jobs):
-            building.append(run)
-    return building
+    return [
+        run for run in gh.active_runs(NIGHTLY_WORKFLOW)
+        if nightly_is_building(gh.paginate(gh.repo(f"actions/runs/{run['id']}/jobs"), key="jobs"))
+    ]
 
 
 def command_wait_lane(args: argparse.Namespace) -> int:
@@ -528,8 +544,8 @@ def command_stage_draft(args: argparse.Namespace) -> int:
     return 0
 
 
-def publish_release(gh: GitHub, tag: str, title: str, source_sha: str) -> dict:
-    release = gh.release_for_tag(tag)
+def check_staged_release(gh: GitHub, release: dict | None, tag: str, title: str, source_sha: str) -> None:
+    """Raise unless `release` is this nightly's verified draft, or its already-published self on a re-run."""
     if release is None:
         raise NightlyError(f"{tag}: no staged draft found")
     if release["name"] != title or not release["prerelease"] or not release["assets"]:
@@ -537,6 +553,12 @@ def publish_release(gh: GitHub, tag: str, title: str, source_sha: str) -> dict:
     if release["draft"]:
         if release["target_commitish"] != source_sha:
             raise NightlyError(f"{tag}: draft targets {release['target_commitish']}, expected {source_sha}")
+    elif gh.tag_commit(tag) != source_sha:
+        raise NightlyError(f"{tag}: already published from a different commit")
+
+
+def publish_release(gh: GitHub, release: dict, tag: str, source_sha: str) -> dict:
+    if release["draft"]:
         gh.request("PATCH", gh.repo(f"releases/{release['id']}"),
                    {"draft": False, "prerelease": True, "make_latest": "false"})
     for _ in range(10):
@@ -580,28 +602,49 @@ def write_meta_commit(gh: GitHub, document: dict) -> str:
     return commit["sha"]
 
 
+def publish_nightly(gh: GitHub, version: str, source_sha: str, workflow_run: str) -> str | None:
+    """Publish the three staged tracks, then point latest.json at them.
+
+    Every track is checked before any is published, so a missing or wrong track publishes nothing.
+    Publication itself cannot be undone (immutable releases), so it is resumable instead: a re-run
+    accepts tracks that are already published from this source and finishes the rest. latest.json
+    moves only after all three are public, so its readers never see a partial nightly.
+    """
+    tags = nightly_tags(version)
+    titles = dict(TRACKS)
+    staged = {prefix: gh.release_for_tag(tag) for prefix, tag in tags.items()}
+    for prefix, tag in tags.items():
+        check_staged_release(gh, staged[prefix], tag, f"v{version} - {titles[prefix]}", source_sha)
+
+    published: list[str] = []
+    try:
+        releases = {}
+        for prefix, tag in tags.items():
+            releases[prefix] = publish_release(gh, staged[prefix], tag, source_sha)
+            published.append(tag)
+        document = latest_document(version, source_sha, releases, gh.repository, workflow_run)
+        if gh.read_latest() == document:
+            return None
+        return write_meta_commit(gh, document)
+    except NightlyError as error:
+        raise NightlyError(
+            f"{error}. Published so far: {', '.join(published) or 'none'}; latest.json still names the "
+            "previous nightly. Re-run this job: it resumes from the tracks already published."
+        ) from None
+
+
 def command_publish(args: argparse.Namespace) -> int:
     gh = github_from_env()
     if not FULL_SHA.fullmatch(args.source_sha):
         raise NightlyError("--source-sha must be a full 40-character commit SHA")
-    tags = nightly_tags(args.version)
-    titles = dict(TRACKS)
-    # Check every staged draft before publishing any, so a missing track publishes nothing.
-    for prefix, tag in tags.items():
-        release = gh.release_for_tag(tag)
-        if release is None or not release["assets"]:
-            raise NightlyError(f"{tag}: no staged release with assets; nothing was published")
-    releases = {
-        prefix: publish_release(gh, tag, f"v{args.version} - {titles[prefix]}", args.source_sha)
-        for prefix, tag in tags.items()
-    }
-    document = latest_document(args.version, args.source_sha, releases, gh.repository, run_url())
-    commit = write_meta_commit(gh, document)
+    commit = publish_nightly(gh, args.version, args.source_sha, run_url())
     write_summary("\n".join([
         "## Nightly published",
         "",
-        *(f"- [`{tag}`](https://github.com/{gh.repository}/releases/tag/{tag})" for tag in tags.values()),
-        f"- `{META_FILE}` on `{META_BRANCH}`: verified commit `{commit}`",
+        *(f"- [`{tag}`](https://github.com/{gh.repository}/releases/tag/{tag})"
+          for tag in nightly_tags(args.version).values()),
+        f"- `{META_FILE}` on `{META_BRANCH}`: "
+        + (f"verified commit `{commit}`" if commit else "already up to date"),
     ]))
     return 0
 

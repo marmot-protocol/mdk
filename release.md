@@ -136,8 +136,11 @@ back to an older nightly (for example across a storage migration) is not support
   `v<nightly> - MarmotKit`, `v<nightly> - Marmot C` and `v<nightly> - wn-agent`. They are immutable pre-releases on the
   main releases page and never Latest. There is no `v*` source release for a nightly. The tag-pushed release workflows
   ignore nightly tags; the nightly calls those workflows itself.
-- **All three or none.** Each track uploads and verifies its assets on a draft. The publish job checks that all three
-  drafts exist, then publishes them. A failed night publishes nothing, and the next attempt replaces its drafts.
+- **All three or none.** Each track uploads and verifies its assets on a draft. The publish job checks all three
+  drafts before it publishes any, so a failed build publishes nothing, and the next attempt replaces its drafts.
+  Published releases are immutable, so if publishing fails partway, re-run the failed publish job: it accepts the
+  tracks already published from the same commit and finishes the rest. `latest.json` moves only after all three are
+  public.
 - **WN Agent.** Nightlies carry the `wn-agent` and harness binary bundles and the Hermes and OpenClaw plugin bundles,
   but no installers: download a bundle by hand and check it against its sibling `.sha256`. Installers, install guidance
   and the install gates keep pinning the newest formal release; they never resolve to a nightly.
@@ -152,7 +155,7 @@ back to an older nightly (for example across a storage migration) is not support
   reused.
 - **Runner sharing.** A nightly waits up to three hours for running cohort releases and MarmotKit snapshots to finish,
   then skips the night. Once a nightly is building, MarmotKit tag and snapshot runs and `just release-all` wait up to
-  two hours for it. The check is best effort: a release started in the seconds while a nightly passes its wait can
+  three hours for it. The check is best effort: a release started in the seconds while a nightly passes its wait can
   still overlap it.
 
 Rehearse with a manual dispatch; a dispatch that publishes must run the workflow from `master`:

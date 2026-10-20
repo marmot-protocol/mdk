@@ -150,7 +150,7 @@ if [ "$push" -eq 1 ] && [ "$dry_run" -eq 0 ]; then
     gh auth status -h github.com >/dev/null || die "gh is not authenticated for github.com"
     # A building nightly holds the shared macOS runners; let it finish first.
     GH_TOKEN="$(gh auth token -h github.com)" GITHUB_REPOSITORY="$repo" \
-        python3 scripts/nightly_release.py wait-lane --nightly --timeout-minutes 120 --fail-on-timeout ||
+        python3 scripts/nightly_release.py wait-lane --nightly --timeout-minutes 180 --fail-on-timeout ||
         die "a nightly build is still using the release runners; retry after it finishes"
 fi
 

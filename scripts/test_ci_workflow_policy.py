@@ -13,6 +13,7 @@ import tomllib
 import datetime as dt
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 
@@ -330,6 +331,161 @@ class NightlyReleasePolicyTests(unittest.TestCase):
                 with self.subTest(overrides=overrides):
                     result = subprocess.run(command, cwd=root, env={**env, **overrides}, capture_output=True)
                     self.assertNotEqual(result.returncode, 0)
+
+
+class FakeNightlyGitHub:
+    """In-memory stand-in for the GitHub calls that publish_nightly makes."""
+
+    SHA = "a" * 40
+
+    def __init__(self, version: str, *, verified: bool = True):
+        self.repository = "o/r"
+        self.verified = verified
+        self.fail_patch: set[str] = set()
+        self.tags: dict[str, str] = {}
+        self.meta_head: str | None = None
+        self.meta: dict | None = None
+        self.commits: dict[str, dict] = {}
+        self.blobs: dict[str, str] = {}
+        self.releases = {}
+        for index, (prefix, title) in enumerate(nightly_release.TRACKS):
+            tag = f"{prefix}-v{version}"
+            self.releases[tag] = {
+                "id": index, "tag_name": tag, "name": f"v{version} - {title}", "draft": True,
+                "prerelease": True, "target_commitish": self.SHA, "immutable": False,
+                "assets": [{"name": f"{prefix}.zip", "size": 1, "digest": "sha256:" + "c" * 64}],
+            }
+
+    def repo(self, suffix):
+        return f"repos/o/r/{suffix}"
+
+    def release_for_tag(self, tag):
+        release = self.releases.get(tag)
+        return dict(release) if release else None
+
+    def tag_commit(self, tag):
+        return self.tags.get(tag)
+
+    def read_latest(self):
+        return self.meta
+
+    def get(self, path, *, allow_404=False):
+        suffix = path.removeprefix("repos/o/r/")
+        if suffix.startswith("releases/"):
+            release = next(r for r in self.releases.values() if r["id"] == int(suffix.split("/")[1]))
+            return dict(release)
+        if suffix == f"git/ref/heads/{nightly_release.META_BRANCH}":
+            return {"object": {"sha": self.meta_head}} if self.meta_head else None
+        raise AssertionError(path)
+
+    def request(self, method, path, body=None, **_):
+        suffix = path.removeprefix("repos/o/r/")
+        if method == "PATCH" and suffix.startswith("releases/"):
+            release = next(r for r in self.releases.values() if r["id"] == int(suffix.split("/")[1]))
+            if release["tag_name"] in self.fail_patch:
+                self.fail_patch.discard(release["tag_name"])
+                raise nightly_release.NightlyError(f"PATCH {path} failed with HTTP 502")
+            assert body == {"draft": False, "prerelease": True, "make_latest": "false"}
+            release.update(draft=False, immutable=True)
+            self.tags[release["tag_name"]] = release["target_commitish"]
+            return None, ""
+        if suffix == "git/blobs":
+            sha = f"blob{len(self.blobs)}"
+            self.blobs[sha] = body["content"]
+            return {"sha": sha}, ""
+        if suffix == "git/trees":
+            assert [entry["path"] for entry in body["tree"]] == [nightly_release.META_FILE]
+            return {"sha": "tree-" + body["tree"][0]["sha"]}, ""
+        if suffix == "git/commits":
+            assert "author" not in body and "committer" not in body
+            sha = f"commit{len(self.commits)}"
+            self.commits[sha] = body
+            return {"sha": sha, "verification": {"verified": self.verified, "reason": "valid"}}, ""
+        if (method, suffix) in (("PATCH", f"git/refs/heads/{nightly_release.META_BRANCH}"), ("POST", "git/refs")):
+            assert body.get("force") in (None, False)
+            self.meta_head = body["sha"]
+            tree = self.commits[body["sha"]]["tree"]
+            self.meta = json.loads(self.blobs[tree.removeprefix("tree-")])
+            return None, ""
+        raise AssertionError((method, path))
+
+
+class NightlyPublishTests(unittest.TestCase):
+    VERSION = "0.14.0-nightly.20261020"
+
+    def publish(self, gh):
+        with unittest.mock.patch.object(nightly_release.time, "sleep"):
+            return nightly_release.publish_nightly(gh, self.VERSION, FakeNightlyGitHub.SHA, "https://run")
+
+    def test_publishes_all_three_tracks_then_latest_json_on_an_orphan_branch(self):
+        gh = FakeNightlyGitHub(self.VERSION)
+        self.publish(gh)
+        self.assertTrue(all(not r["draft"] and r["immutable"] for r in gh.releases.values()))
+        self.assertEqual(gh.meta["version"], self.VERSION)
+        self.assertEqual(sorted(gh.meta["tracks"]), ["marmotc", "marmotkit", "wn-agent"])
+        self.assertEqual(gh.commits[gh.meta_head]["parents"], [])
+
+    def test_a_missing_or_wrong_track_publishes_nothing(self):
+        for breakage in ("missing", "target", "title"):
+            with self.subTest(breakage=breakage):
+                gh = FakeNightlyGitHub(self.VERSION)
+                tag = "wn-agent-v" + self.VERSION
+                if breakage == "missing":
+                    del gh.releases[tag]
+                elif breakage == "target":
+                    gh.releases[tag]["target_commitish"] = "b" * 40
+                else:
+                    gh.releases[tag]["name"] = "v0.14.0 - wn-agent"
+                with self.assertRaises(nightly_release.NightlyError):
+                    self.publish(gh)
+                self.assertTrue(all(r["draft"] for r in gh.releases.values() if r["tag_name"] != tag))
+                self.assertIsNone(gh.meta)
+
+    def test_a_failed_publication_resumes_on_rerun_without_moving_latest_early(self):
+        gh = FakeNightlyGitHub(self.VERSION)
+        gh.meta = {"version": "0.14.0-nightly.20261019"}
+        gh.fail_patch.add("marmotc-v" + self.VERSION)
+        with self.assertRaisesRegex(nightly_release.NightlyError, "Published so far: marmotkit-v"):
+            self.publish(gh)
+        self.assertEqual(gh.meta, {"version": "0.14.0-nightly.20261019"})
+        self.publish(gh)
+        self.assertTrue(all(not r["draft"] for r in gh.releases.values()))
+        self.assertEqual(gh.meta["version"], self.VERSION)
+        # A further re-run finds everything done and writes nothing.
+        commits = len(gh.commits)
+        self.assertIsNone(self.publish(gh))
+        self.assertEqual(len(gh.commits), commits)
+
+    def test_an_unverified_metadata_commit_never_moves_the_branch(self):
+        gh = FakeNightlyGitHub(self.VERSION, verified=False)
+        with self.assertRaisesRegex(nightly_release.NightlyError, "not verified"):
+            self.publish(gh)
+        self.assertIsNone(gh.meta_head)
+        gh.verified = True
+        self.publish(gh)
+        self.assertEqual(gh.meta["source_sha"], FakeNightlyGitHub.SHA)
+
+    def test_releases_and_snapshots_wait_only_for_a_nightly_past_its_lane_wait(self):
+        lane = nightly_release.LANE_JOB
+        step = nightly_release.LANE_STEP
+        building = nightly_release.nightly_is_building
+        self.assertFalse(building([{"name": "Plan nightly", "conclusion": "success"}]))
+        self.assertFalse(building([{"name": lane, "conclusion": None,
+                                    "steps": [{"name": step, "status": "in_progress", "conclusion": None}]}]))
+        self.assertTrue(building([{"name": lane, "conclusion": None,
+                                   "steps": [{"name": step, "status": "completed", "conclusion": "success"}]}]))
+        self.assertTrue(building([{"name": lane, "conclusion": "success"}]))
+        workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
+        self.assertIn(f"    name: {lane}\n", workflow)
+        self.assertIn(f"      - name: {step}\n", workflow)
+
+    def test_binding_jobs_never_inherit_a_skipped_ancestor(self):
+        # A skipped job skips every job below it that uses the implicit success(), so the
+        # lane job that nightly and build-only runs do not need must still run.
+        bindings = (ROOT / ".github/workflows/bindings.yaml").read_text()
+        lane = bindings.split("\n  release-lane:\n", 1)[1].split("\n    steps:\n", 1)[0]
+        self.assertNotIn("\n    if:", lane)
+        self.assertIn("\n    needs: release-lane\n", bindings.split("\n  metadata:\n", 1)[1].split("\n    steps:", 1)[0])
 
 
 if __name__ == "__main__":
