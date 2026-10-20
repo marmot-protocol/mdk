@@ -156,6 +156,11 @@
 
 ### Fixed
 
+- Epoch-gap fallback searches older raw pages when a relay cannot compare,
+  instead of repeatedly fetching only its newest 256 events (mdk#2257).
+  Bounded advisory hints resume across pass cuts. Held-only traversal does
+  not reset backoff or the durable park count, including after reopening.
+
 - `control_attachment` Remove opens the account's media store before the
   removal commits, so a store that cannot open (for example while storage
   closes) fails the call before anything is removed instead of reporting an

@@ -146,6 +146,8 @@ pub enum NostrAcquisitionEnd {
     Deadline,
     Disconnected,
     ReceiveLoss,
+    /// Rejected connection input prevents proving a complete request page.
+    InvalidMessage,
     ReceiverClosed,
     AuthenticationFailed,
     Rejected,
@@ -155,6 +157,12 @@ pub enum NostrAcquisitionEnd {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NostrAcquisitionStats {
+    /// Parsed EVENTs for this request before SDK event filtering, including
+    /// duplicates and the first raw item-budget overflow frame.
+    pub raw_received_items: usize,
+    /// Minimum timestamp among those raw EVENTs. Advisory paging evidence,
+    /// never proof of event validity, durable admission or history coverage.
+    pub oldest_raw_created_at: Option<u64>,
     pub received_items: usize,
     pub serialized_event_bytes: usize,
     pub duplicates: usize,

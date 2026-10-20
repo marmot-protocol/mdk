@@ -1094,11 +1094,50 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 }
             }
         }
-        self.acquisition_result
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(transport_nostr_adapter::NostrAcquisitionError::Unsupported)
+        let scripted = self.acquisition_result.lock().unwrap();
+        let scripted = scripted
+            .as_ref()
+            .ok_or(transport_nostr_adapter::NostrAcquisitionError::Unsupported)?;
+        if let transport_nostr_adapter::NostrAcquisitionScope::GroupWindow {
+            since,
+            until,
+            newest,
+            ..
+        } = request.scope
+        {
+            let mut endpoints = Vec::with_capacity(request.endpoints.len());
+            for page in &scripted.endpoints {
+                if !request.endpoints.iter().any(|endpoint| {
+                    transport_nostr::same_relay(endpoint.as_str(), page.endpoint.as_str())
+                }) {
+                    continue;
+                }
+                let mut selected = page
+                    .events
+                    .iter()
+                    .filter(|event| event.created_at >= since && event.created_at <= until)
+                    .collect::<Vec<_>>();
+                selected.sort_by(|a, b| (b.created_at, &b.id).cmp(&(a.created_at, &a.id)));
+                selected.truncate(newest.unwrap_or(usize::MAX));
+                let mut stats = page.stats;
+                stats.raw_received_items = selected.len();
+                stats.oldest_raw_created_at = selected.iter().map(|event| event.created_at).min();
+                stats.received_items = selected.len();
+                stats.serialized_event_bytes = selected
+                    .iter()
+                    .map(|event| serde_json::to_vec(event).unwrap().len())
+                    .sum();
+                endpoints.push(transport_nostr_adapter::NostrAcquisitionEndpoint {
+                    endpoint: page.endpoint.clone(),
+                    session_generation: page.session_generation,
+                    events: selected.into_iter().cloned().collect(),
+                    end: page.end,
+                    stats,
+                });
+            }
+            return Ok(transport_nostr_adapter::NostrAcquisitionResult { endpoints });
+        }
+        Ok(scripted.clone())
     }
     fn supports_scoped_subscriptions(&self) -> bool {
         true

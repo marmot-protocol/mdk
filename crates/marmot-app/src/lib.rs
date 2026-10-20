@@ -2079,6 +2079,7 @@ impl MarmotApp {
             #[cfg(test)]
             test_comparison_saved_cursor: None,
             recovery_owner,
+            epoch_gap_windows: Default::default(),
             // Unit tests run many directly owned clients in one process; each
             // gets its own pool so one test's held job cannot stall another.
             #[cfg(not(test))]

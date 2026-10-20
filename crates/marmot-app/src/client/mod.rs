@@ -655,6 +655,44 @@ pub(crate) enum CursorSeal {
 #[cfg(test)]
 pub(crate) type CursorSealProbe = Box<dyn FnMut(CursorSeal) + Send>;
 
+type EpochGapWindowKey = ([u8; 32], String);
+type EpochGapWindows = Arc<std::sync::Mutex<EpochGapWindowCache>>;
+
+#[derive(Default)]
+pub(super) struct EpochGapWindowCache {
+    entries: HashMap<EpochGapWindowKey, EpochGapWindow>,
+    tick: u64,
+}
+
+#[derive(Clone, Copy)]
+struct EpochGapBound {
+    until: u64,
+    /// Skip a held suffix only after its older prefix finishes.
+    resume_since: u64,
+}
+
+impl EpochGapBound {
+    fn new(until: u64) -> Self {
+        Self {
+            until,
+            resume_since: until.saturating_add(1),
+        }
+    }
+}
+
+/// Evictable acquisition hints, never coverage, replay or retry authority.
+#[derive(Clone)]
+pub(super) struct EpochGapWindow {
+    /// Loss, route and retained-inventory revisions for held-span reuse.
+    generation: (u64, u64, u64),
+    goal: storage_sqlite::RecoveryDemandTicket,
+    origin_since: u64,
+    until: u64,
+    since: u64,
+    bounds: Vec<EpochGapBound>,
+    last_used: u64,
+}
+
 pub struct AppClient {
     #[cfg(test)]
     pub(crate) test_recovery_selection_witness:
@@ -675,6 +713,7 @@ pub struct AppClient {
     #[cfg(test)]
     pub(crate) test_comparison_saved_cursor: Option<[u8; 32]>,
     pub(crate) recovery_owner: recovery::AccountRecoveryOwner,
+    pub(super) epoch_gap_windows: EpochGapWindows,
     /// The process credits recovery jobs share. A managed worker installs
     /// its runtime's pool; a directly owned client uses the process pool.
     pub(crate) recovery_credits:

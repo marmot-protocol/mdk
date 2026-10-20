@@ -592,6 +592,7 @@ fn project_acquisition(
         SdkAcquisitionEnd::TimedOut => (NostrAcquisitionEnd::Deadline, 0),
         SdkAcquisitionEnd::Disconnected => (NostrAcquisitionEnd::Disconnected, 0),
         SdkAcquisitionEnd::ReceiveLoss(skipped) => (NostrAcquisitionEnd::ReceiveLoss, skipped),
+        SdkAcquisitionEnd::InvalidMessage => (NostrAcquisitionEnd::InvalidMessage, 0),
         SdkAcquisitionEnd::ReceiverClosed => (NostrAcquisitionEnd::ReceiverClosed, 0),
         SdkAcquisitionEnd::AuthenticationFailed => (NostrAcquisitionEnd::AuthenticationFailed, 0),
         SdkAcquisitionEnd::Rejected(_) => (NostrAcquisitionEnd::Rejected, 0),
@@ -611,6 +612,8 @@ fn project_acquisition(
         events,
         end,
         stats: NostrAcquisitionStats {
+            raw_received_items: outcome.raw_received_items,
+            oldest_raw_created_at: outcome.oldest_raw_created_at.map(|at| at.as_secs()),
             received_items: outcome.received_items,
             serialized_event_bytes: outcome.received_event_bytes,
             duplicates: outcome.duplicates,
@@ -4655,6 +4658,7 @@ fn acquisition_failure(end: NostrAcquisitionEnd) -> NostrReconciliationFailure {
         | NostrAcquisitionEnd::UnexpectedExitLimit
         | NostrAcquisitionEnd::Cancelled
         | NostrAcquisitionEnd::ReceiveLoss
+        | NostrAcquisitionEnd::InvalidMessage
         | NostrAcquisitionEnd::ReceiverClosed
         | NostrAcquisitionEnd::SetupFailed => NostrReconciliationFailure::LocalError,
     }
