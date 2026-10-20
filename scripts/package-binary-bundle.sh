@@ -14,11 +14,26 @@ if [[ ! "$target" =~ ^[A-Za-z0-9._-]+$ ]] || [[ ! "$rust_target" =~ ^[A-Za-z0-9.
     exit 64
 fi
 
-sha_short="${GITHUB_SHA::12}"
+# Nightly builds (nightly-releases.yml) pass their source commit and version
+# explicitly, because the calling run's GITHUB_SHA is the newer workflow commit.
+source_sha="${RELEASE_SOURCE_SHA:-$GITHUB_SHA}"
+if [ -n "${RELEASE_SOURCE_SHA:-}" ] && [ "$(git rev-parse 'HEAD^{commit}')" != "$source_sha" ]; then
+    echo "error: checkout does not match RELEASE_SOURCE_SHA $source_sha" >&2
+    exit 1
+fi
+sha_short="${source_sha::12}"
 workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
 release_tag=""
 artifact_version="$sha_short"
-if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+if [ -n "${NIGHTLY_VERSION:-}" ]; then
+    if [[ ! "$NIGHTLY_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-nightly\.[0-9]{8}(\.[1-9][0-9]{0,2})?$ ]] \
+        || [ "${BASH_REMATCH[1]}-dev" != "$workspace_version" ]; then
+        echo "error: nightly ${NIGHTLY_VERSION} does not match workspace version $workspace_version" >&2
+        exit 1
+    fi
+    release_tag="wn-agent-v$NIGHTLY_VERSION"
+    artifact_version="$NIGHTLY_VERSION"
+elif [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
     release_tag="${GITHUB_REF_NAME:?GITHUB_REF_NAME is required for tag builds}"
     if [[ ! "$release_tag" =~ ^wn-agent-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
         echo "error: wn-agent releases must use a version tag like wn-agent-v0.1.0" >&2
@@ -49,7 +64,7 @@ cat > "$bundle_dir/manifest.json" <<EOF
   "rust_target": "$rust_target",
   "release_tag": "$release_tag",
   "artifact_version": "$artifact_version",
-  "source_sha": "$GITHUB_SHA",
+  "source_sha": "$source_sha",
   "workspace_version": "$workspace_version",
   "cargo_lock_sha256": "$lock_sha",
   "rustc": "$(rustc --version)",

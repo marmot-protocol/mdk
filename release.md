@@ -118,6 +118,53 @@ cherry-picked onto it and the stable version on that branch. master stays on `0.
 publishing workflows still require release commits reachable from `origin/master`, so extend those checks before
 cutting the first point release from a release branch.
 
+### Nightly builds
+
+Every day `.github/workflows/nightly-releases.yml` builds MarmotKit (iOS, macOS, Android), Marmot C and WN Agent from
+the newest `master` commit whose merge-queue `Required CI` passed. It is scheduled for 00:17 UTC, but GitHub can start
+scheduled runs hours late; nothing depends on the start time except the date in the name. If that commit is the
+previous nightly's source, the night is skipped.
+
+Nightlies are for testing. Pin a formal release for anything you ship. Each nightly is deleted after 30 days, and going
+back to an older nightly (for example across a storage migration) is not supported.
+
+- **Version.** `<X.Y.Z>-nightly.<YYYYMMDD>`, where `X.Y.Z` is master's `X.Y.Z-dev` workspace version and the date is the
+  run's UTC date. A second nightly on the same day becomes `<X.Y.Z>-nightly.<YYYYMMDD>.1`, and so on. These sort after
+  the previous release and before `X.Y.Z` in semver. No version change is committed: the nightly version appears only
+  in asset names, manifests and release metadata, and every manifest records the exact source SHA.
+- **Releases.** Tags `marmotkit-v<nightly>`, `marmotc-v<nightly>` and `wn-agent-v<nightly>` on the source commit, titled
+  `v<nightly> - MarmotKit`, `v<nightly> - Marmot C` and `v<nightly> - wn-agent`. They are immutable pre-releases on the
+  main releases page and never Latest. There is no `v*` source release for a nightly. The tag-pushed release workflows
+  ignore nightly tags; the nightly calls those workflows itself.
+- **All three or none.** Each track uploads and verifies its assets on a draft. The publish job checks that all three
+  drafts exist, then publishes them. A failed night publishes nothing, and the next attempt replaces its drafts.
+- **WN Agent.** Nightlies carry the `wn-agent` and harness binary bundles and the Hermes and OpenClaw plugin bundles,
+  but no installers: download a bundle by hand and check it against its sibling `.sha256`. Installers, install guidance
+  and the install gates keep pinning the newest formal release; they never resolve to a nightly.
+- **`latest.json`.** After publishing, the workflow commits `latest.json` to the `nightly-meta` branch, which holds only
+  that file and never reaches `master`. GitHub signs the commit; the workflow refuses to move the branch to an
+  unverified commit. The file records `version`, `source_sha`, `date`, `workflow_run`, and for each track (`marmotkit`,
+  `marmotc`, `wn-agent`) its `tag`, `release_url` and every asset's `name`, `url`, `sha256` and `size`. App repositories
+  read it to bump their own pins.
+- **Retention.** Every scheduled run deletes nightly releases and their tags more than 30 days old, by the date in the
+  tag. It matches only `<track>-vX.Y.Z-nightly.YYYYMMDD[.N]` tags, so formal releases and `marmotkit-snapshot-*`
+  snapshots are never touched, and it keeps the nightly that `latest.json` names. Deleted nightly tag names are never
+  reused.
+- **Runner sharing.** A nightly waits up to three hours for running cohort releases and MarmotKit snapshots to finish,
+  then skips the night. Once a nightly is building, MarmotKit tag and snapshot runs and `just release-all` wait up to
+  two hours for it. The check is best effort: a release started in the seconds while a nightly passes its wait can
+  still overlap it.
+
+Rehearse with a manual dispatch; a dispatch that publishes must run the workflow from `master`:
+
+```sh
+gh workflow run nightly-releases.yml --ref master -f dry_run=true     # plan and retention report only
+gh workflow run nightly-releases.yml --ref master -f build_only=true  # build every track, publish nothing
+```
+
+The plan job's summary shows the selected commit, the previous nightly, the version and the skip decision. A
+`build_only` run always builds, even when the source is unchanged; `force=true` does the same for a publishing run.
+
 Each release artifact should include a manifest recording the source commit, workspace version, release tag, artifact
 version, `Cargo.lock` hash when relevant, toolchain version, and package contents. Add explicit protocol or ABI fields
 to manifests when downstream compatibility depends on more than the workspace version.
@@ -548,7 +595,7 @@ The workflow lives at:
 It runs when a tag matching `marmotkit-v*` is pushed. The workflow validates version-like tags such as
 `marmotkit-v0.9.0`, builds the iOS, macOS, and Android binding bundles, and creates the matching immutable GitHub
 Release. It can also be dispatched with a full commit SHA reachable from `master` to create an immutable iOS, macOS,
-and Android snapshot.
+and Android snapshot. The [nightly workflow](#nightly-builds) calls it to stage each nightly's MarmotKit draft.
 
 ### Parallel builds and build-only rehearsals
 
@@ -696,7 +743,8 @@ A successful binary link alone is insufficient.
 
 App repos should pin an exact formal MarmotKit tag or SHA-addressed snapshot, verify its published checksums, and stage
 the generated source and native libraries into ignored build inputs or another repository-approved generated-artifact
-location. Never mix generated source and native libraries from different release identifiers.
+location. Never mix generated source and native libraries from different release identifiers. A [nightly](#nightly-builds)
+is fine for test builds, but it is deleted after 30 days, so never ship one.
 
 Apple SwiftPM consumers can retain the remote binary target and stage the matching generated Swift and privacy file
 in its existing wrapper target. Rename the privacy asset to `PrivacyInfo.xcprivacy`, declare

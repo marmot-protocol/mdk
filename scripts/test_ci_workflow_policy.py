@@ -10,11 +10,17 @@ import subprocess
 import tempfile
 import textwrap
 import tomllib
+import datetime as dt
+import sys
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import nightly_release  # noqa: E402
+from check_install_example_sha256 import documented_release_version  # noqa: E402
 
 
 def workflow_step(filename: str, name: str) -> str:
@@ -144,6 +150,186 @@ class MergeGatePolicyTests(unittest.TestCase):
         required = workflow.split("\n  required-ci:\n", 1)[1].split("\n    needs:\n", 1)[1]
         needs = set(re.findall(r"(?m)^      - ([a-z0-9-]+)$", required.split("\n    runs-on:", 1)[0]))
         self.assertEqual(needs, jobs - {"required-ci"})
+
+
+def semver_key(version: str):
+    """Semver 2.0 precedence key for X.Y.Z[-pre] (no build metadata)."""
+    core, _, pre = version.partition("-")
+    numbers = tuple(int(part) for part in core.split("."))
+    if not pre:
+        return numbers, (1,)
+    fields = tuple((0, int(f), "") if f.isdigit() else (1, 0, f) for f in pre.split("."))
+    return numbers, (0, fields)
+
+
+class NightlyReleasePolicyTests(unittest.TestCase):
+    DAY = dt.date(2026, 10, 20)
+
+    def test_nightly_base_comes_only_from_a_dev_workspace_version(self):
+        self.assertEqual(nightly_release.nightly_base_version("0.14.0-dev"), "0.14.0")
+        for version in ("0.14.0", "0.14.0-rc.1", "0.14.0-dev.1", "v0.14.0-dev"):
+            with self.subTest(version=version):
+                self.assertIsNone(nightly_release.nightly_base_version(version))
+
+    def test_names_are_dated_and_take_a_counter_when_any_track_used_the_day(self):
+        choose = nightly_release.choose_nightly_version
+        self.assertEqual(choose("0.14.0", self.DAY, []), "0.14.0-nightly.20261020")
+        self.assertEqual(nightly_release.nightly_tags("0.14.0-nightly.20261020"), {
+            "marmotkit": "marmotkit-v0.14.0-nightly.20261020",
+            "marmotc": "marmotc-v0.14.0-nightly.20261020",
+            "wn-agent": "wn-agent-v0.14.0-nightly.20261020",
+        })
+        taken = ["marmotc-v0.14.0-nightly.20261020"]
+        self.assertEqual(choose("0.14.0", self.DAY, taken), "0.14.0-nightly.20261020.1")
+        taken += ["wn-agent-v0.14.0-nightly.20261020.1"]
+        self.assertEqual(choose("0.14.0", self.DAY, taken), "0.14.0-nightly.20261020.2")
+
+    def test_nightly_versions_sort_between_releases_by_date_and_counter(self):
+        ordered = ["0.13.0", "0.14.0-nightly.20261019", "0.14.0-nightly.20261020",
+                   "0.14.0-nightly.20261020.1", "0.14.0-nightly.20261020.2",
+                   "0.14.0-nightly.20261021", "0.14.0", "0.15.0-nightly.20261102"]
+        self.assertEqual(sorted(reversed(ordered), key=semver_key), ordered)
+
+    def test_source_is_the_newest_green_commit_and_never_older_than_the_last_nightly(self):
+        shas = ["d", "c", "b", "a"]
+        select = nightly_release.select_source
+        self.assertEqual(select(shas, None, lambda sha: sha in {"c", "a"}), "c")
+        # Unchanged master: the previous nightly's source is the answer, so the run skips.
+        self.assertEqual(select(shas, "b", lambda sha: False), "b")
+        # A green commit older than the previous nightly is never chosen.
+        self.assertEqual(select(shas, "c", lambda sha: sha == "a"), "c")
+        self.assertIsNone(select(shas, None, lambda sha: False))
+
+    def test_retention_deletes_only_expired_unprotected_nightly_tags(self):
+        tags = [
+            "marmotkit-v0.14.0-nightly.20260919", "marmotc-v0.14.0-nightly.20260919.1",
+            "wn-agent-v0.13.0-nightly.20260901", "marmotkit-v0.14.0-nightly.20260920",
+            "marmotkit-v0.14.0-nightly.20261019", "marmotkit-v0.14.0-nightly.20260801",
+            # Formal, snapshot, other pre-releases and malformed names are never touched.
+            "v0.13.0", "marmotkit-v0.13.0", "marmotc-v0.12.0", "wn-agent-v0.13.0",
+            "marmotkit-v0.14.0-rc.1", "marmotkit-snapshot-" + "a" * 40,
+            "v0.14.0-nightly.20200101", "marmotkit-v0.14.0-nightly.20261399",
+            "marmotkit-v0.14.0-nightly.2020010", "marmotkit-v0.14.0-nightly.20200101-x",
+        ]
+        expired = nightly_release.expired_nightly_tags(
+            tags, self.DAY, protected=["marmotkit-v0.14.0-nightly.20260801"]
+        )
+        self.assertEqual(expired, [
+            "marmotc-v0.14.0-nightly.20260919.1",
+            "marmotkit-v0.14.0-nightly.20260919",
+            "wn-agent-v0.13.0-nightly.20260901",
+        ])
+
+    def test_latest_json_names_each_track_asset_with_its_url_and_checksum(self):
+        version = "0.14.0-nightly.20261020"
+        releases = {
+            prefix: {"assets": [{"name": f"{prefix}.zip", "size": 3, "digest": "sha256:" + "b" * 64}]}
+            for prefix in nightly_release.TRACK_PREFIXES
+        }
+        document = nightly_release.latest_document(version, "a" * 40, releases, "o/r", "https://run")
+        self.assertEqual((document["version"], document["source_sha"], document["date"]),
+                         (version, "a" * 40, "2026-10-20"))
+        self.assertEqual(document["tracks"]["marmotc"], {
+            "tag": "marmotc-v" + version,
+            "release_url": "https://github.com/o/r/releases/tag/marmotc-v" + version,
+            "assets": [{"name": "marmotc.zip", "sha256": "b" * 64, "size": 3,
+                        "url": f"https://github.com/o/r/releases/download/marmotc-v{version}/marmotc.zip"}],
+        })
+        releases["wn-agent"]["assets"][0]["digest"] = None
+        with self.assertRaises(nightly_release.NightlyError):
+            nightly_release.latest_document(version, "a" * 40, releases, "o/r", "https://run")
+
+    def test_only_release_and_snapshot_runs_hold_the_lane(self):
+        busy = nightly_release.busy_release_runs({
+            "bindings.yaml": [{"id": 1, "status": "in_progress", "event": "workflow_dispatch"},
+                              {"id": 2, "status": "completed", "event": "push"}],
+            "c-bindings.yml": [{"id": 3, "status": "queued", "event": "push"}],
+            "wn-agent-binaries.yml": [
+                {"id": 4, "status": "in_progress", "event": "push", "head_branch": "master"},
+                {"id": 5, "status": "waiting", "event": "push", "head_branch": "wn-agent-v0.14.0"},
+                {"id": 6, "status": "in_progress", "event": "pull_request", "head_branch": "wn-agent-v-ish"},
+            ],
+        })
+        self.assertEqual([run["id"] for run in busy], [1, 3, 5])
+
+    def test_tag_pushed_release_workflows_ignore_nightly_tags(self):
+        for workflow, prefix in [("bindings.yaml", "marmotkit"), ("c-bindings.yml", "marmotc"),
+                                 ("wn-agent-binaries.yml", "wn-agent")]:
+            with self.subTest(workflow=workflow):
+                text = (ROOT / ".github/workflows" / workflow).read_text()
+                self.assertIn(f'      - "!{prefix}-v*-nightly.*"\n', text)
+                self.assertIn("  workflow_call:\n", text)
+                self.assertIn("      nightly_version:\n", text)
+
+    def test_nightlies_are_scheduled_pre_releases_that_never_become_latest(self):
+        workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
+        self.assertIn('    - cron: "17 0 * * *"\n', workflow)
+        self.assertIn("  group: nightly-releases\n", workflow)
+        self.assertNotIn("git push", workflow)
+        script = (ROOT / "scripts/nightly_release.py").read_text()
+        self.assertEqual(script.count('"make_latest": "false"'), 2)
+        self.assertNotIn('"make_latest": "true"', script)
+        self.assertEqual(nightly_release.RETENTION_DAYS, 30)
+        bindings = (ROOT / ".github/workflows/bindings.yaml").read_text()
+        self.assertIn(
+            '          if [[ "$IS_NIGHTLY" == "true" ]]; then\n'
+            '            title="v$version - MarmotKit"\n'
+            '            release_flags=(--prerelease --latest=false --target "$SOURCE_SHA")\n',
+            bindings,
+        )
+
+    def test_install_guidance_never_resolves_to_a_nightly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            notes = Path(tmp) / "docs/release"
+            notes.mkdir(parents=True)
+            for name in ("0.13.0.md", "0.14.0-nightly.20261020.md", "wn-homebrew.md"):
+                (notes / name).write_text("notes\n")
+            self.assertEqual(documented_release_version(Path(tmp), "0.14.0-dev"), "0.13.0")
+        quickstart = (ROOT / "integrations/README.md").read_text()
+        installer_pattern = re.search(r"grep -Eq '(\^https://github\[\.\]com/marmot-protocol/mdk/[^']+)'",
+                                      quickstart).group(1)
+        resolver = re.search(r'match = re\.fullmatch\(r"([^"]+)", tag\)', quickstart).group(1)
+        nightly = "wn-agent-v0.14.0-nightly.20261020"
+        url = f"https://github.com/marmot-protocol/mdk/releases/download/{nightly}/install-hermes-marmot.sh"
+        self.assertIsNone(re.search(installer_pattern, url))
+        self.assertIsNotNone(re.search(installer_pattern, url.replace(nightly, "wn-agent-v0.13.0")))
+        self.assertIsNone(re.fullmatch(resolver, nightly))
+        self.assertIsNotNone(re.fullmatch(resolver, "wn-agent-v0.13.0"))
+
+    def test_binary_bundles_take_the_nightly_version_and_source_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src"
+            root.mkdir()
+            (root / "Cargo.toml").write_text('[workspace.package]\nversion = "0.14.0-dev"\n')
+            (root / "Cargo.lock").write_text("# lock\n")
+            git = ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@example.com",
+                   "-c", "commit.gpgsign=false"]
+            subprocess.run([*git, "init", "-q"], check=True)
+            subprocess.run([*git, "add", "."], check=True)
+            subprocess.run([*git, "commit", "-qm", "source"], check=True)
+            source_sha = subprocess.run([*git, "rev-parse", "HEAD"], check=True,
+                                        capture_output=True, text=True).stdout.strip()
+            binary = root / "target/x86_64-unknown-linux-gnu/release/wn-agent"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\n")
+            env = {**os.environ, "RUNNER_TEMP": tmp, "GITHUB_SHA": "f" * 40, "GITHUB_REF_TYPE": "branch",
+                   "RELEASE_SOURCE_SHA": source_sha, "NIGHTLY_VERSION": "0.14.0-nightly.20261020"}
+            command = ["bash", str(ROOT / "scripts/package-binary-bundle.sh"), "wn-agent", "linux-x86_64",
+                       "x86_64-unknown-linux-gnu"]
+            subprocess.run(command, cwd=root, env=env, check=True, capture_output=True)
+            asset = root / "dist/wn-agent-linux-x86_64/wn-agent-linux-x86_64-0.14.0-nightly.20261020.tar.gz"
+            manifest = json.loads(subprocess.run(
+                ["tar", "-xzOf", str(asset), "wn-agent-linux-x86_64/manifest.json"],
+                check=True, capture_output=True).stdout)
+            self.assertEqual(
+                (manifest["artifact_version"], manifest["release_tag"], manifest["source_sha"]),
+                ("0.14.0-nightly.20261020", "wn-agent-v0.14.0-nightly.20261020", source_sha))
+            for overrides in ({"NIGHTLY_VERSION": "0.15.0-nightly.20261020"},
+                              {"NIGHTLY_VERSION": "0.14.0-nightly.2026102"},
+                              {"RELEASE_SOURCE_SHA": "e" * 40}):
+                with self.subTest(overrides=overrides):
+                    result = subprocess.run(command, cwd=root, env={**env, **overrides}, capture_output=True)
+                    self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":
