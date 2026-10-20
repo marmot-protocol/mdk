@@ -1042,7 +1042,7 @@ Deep-free a chat storage page, its rows and its borrowed cursor. NULL is a no-op
 MarmotStatus marmot_client_new_with_options(const char *root_path, const char *const *relay_urls, uintptr_t relay_urls_len, uint32_t relay_policy, const struct MarmotSecretStore *store, const struct MarmotDeployment *deployment, struct MarmotClient **out_client);
 ```
 
-Create a client with an explicit relay policy and optional host secret store. `store == NULL` selects the platform keychain. Loopback opt-in does not permit private/link-local relays or plaintext public endpoints. Ownership of the store transfers only on success, as with `marmot_client_new_with_secret_store`.
+Create a client with an explicit relay policy, optional host secret store and the required deployment. `store == NULL` selects the platform keychain. Loopback opt-in does not permit private/link-local relays or plaintext public endpoints. Ownership of the store transfers only on success, as with `marmot_client_new_with_secret_store`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotnew_with_options) · [Header contract](include/marmot.h#L5907)
 
@@ -1052,7 +1052,7 @@ Create a client with an explicit relay policy and optional host secret store. `s
 MarmotStatus marmot_client_new(const char *root_path, const char *const *relay_urls, uintptr_t relay_urls_len, const struct MarmotDeployment *deployment, struct MarmotClient **out_client);
 ```
 
-Create a Marmot client rooted at `root_path`, connected to `relay_urls` (`relay_urls_len` entries). On success writes the new handle to `out_client`. Uses the platform keychain-backed account store, matching the UniFFI constructor.
+Create a Marmot client rooted at `root_path`, connected to `relay_urls` (`relay_urls_len` entries), for the required `deployment`, which is copied during the call. A NULL deployment returns `MARMOT_STATUS_NULL_POINTER` before anything opens. On success writes the new handle to `out_client`. Uses the platform keychain under the deployment's keychain service, matching the UniFFI constructor.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotnew) · [Header contract](include/marmot.h#L5930)
 
@@ -1082,7 +1082,7 @@ Create a Marmot client whose account signing keys live in caller-owned storage i
 MarmotStatus marmot_client_new_with_client_name(const char *root_path, const char *const *relay_urls, uintptr_t relay_urls_len, const char *client_name, uint32_t cursor_persistence, const struct MarmotSecretStore *store, const struct MarmotDeployment *deployment, struct MarmotClient **out_client);
 ```
 
-Open with an optional public client name for newly prepared KeyPackages. NULL or whitespace-only `client_name` omits the tag. Signed retries keep their original tags. NULL `store` selects the platform keychain. Store ownership transfers only on success, as with `marmot_client_new_with_secret_store`.
+Open with an optional public client name for newly prepared KeyPackages and the required deployment. NULL or whitespace-only `client_name` omits the tag. Signed retries keep their original tags. NULL `store` selects the platform keychain. Store ownership transfers only on success, as with `marmot_client_new_with_secret_store`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotnew_with_client_name) · [Header contract](include/marmot.h#L6003)
 
@@ -1092,7 +1092,7 @@ Open with an optional public client name for newly prepared KeyPackages. NULL or
 MarmotStatus marmot_client_new_with_configuration(const char *root_path, const char *const *relay_urls, uintptr_t relay_urls_len, const struct MarmotClientOptions *options, const struct MarmotDeployment *deployment, struct MarmotClient **out_client);
 ```
 
-Create a client with combined relay, cursor, label and secret-storage options. NULL options uses defaults. Store ownership transfers only on success, with the same callback lifetime contract as marmot_client_new_with_secret_store.
+Create a client with combined relay, cursor, label and secret-storage options and the required deployment, copied during the call. NULL options uses defaults; a NULL deployment is refused, as with `marmot_client_new`. Store ownership transfers only on success, with the same callback lifetime contract as marmot_client_new_with_secret_store.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotnew_with_configuration) · [Header contract](include/marmot.h#L6027)
 
@@ -5688,17 +5688,7 @@ Blocking relay refresh of one reference when it is missing or stale, then its lo
 <details>
 <summary>Deployment configuration</summary>
 
-Deployment services a host configures at construction: start from a preset, change what differs, pass it to `marmot_client_new_with_deployment`, then free it.
-
-### `marmot_client_new_with_deployment`
-
-```c
-MarmotStatus marmot_client_new_with_deployment(const char *root_path, const char *const *relay_urls, uintptr_t relay_urls_len, const struct MarmotClientOptions *options, const struct MarmotDeployment *deployment, struct MarmotClient **out_client);
-```
-
-Create a client with `marmot_client_new_with_configuration`'s options plus a deployment, which is copied during the call. A NULL deployment selects `marmot_deployment_white_noise()` until the neutral default lands. With no secret store, the deployment's keychain service names the platform keychain. A separate constructor keeps the `MarmotClientOptions` layout unchanged.
-
-[Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotnew_with_configuration) · [Header contract](include/marmot.h#L6024)
+Deployment services a host configures at construction: start from a preset, change what differs, pass it to any `marmot_client_new*` constructor, then free it.
 
 ### `marmot_deployment_white_noise`
 
@@ -5706,7 +5696,7 @@ Create a client with `marmot_client_new_with_configuration`'s options plus a dep
 MarmotStatus marmot_deployment_white_noise(struct MarmotDeployment **out);
 ```
 
-Create White Noise's deployment as this build compiled it, the values every constructor uses without a deployment until the neutral default lands. Free it with `marmot_deployment_free`; a client constructed with it keeps its own copy.
+Create White Noise's deployment, the one White Noise hosts pass to every constructor. Free it with `marmot_deployment_free`; a client constructed with it keeps its own copy.
 
 [Header contract](include/marmot.h#L10109)
 
@@ -5716,7 +5706,7 @@ Create White Noise's deployment as this build compiled it, the values every cons
 MarmotStatus marmot_deployment_neutral(struct MarmotDeployment **out);
 ```
 
-Create a deployment with no services and the neutral keychain service `org.marmot-protocol.mdk`, then fill in what your deployment operates with the setters. Free it with `marmot_deployment_free`. Until the neutral default lands, an empty new-group media list or an unset group-image or profile-image server still falls back to White Noise's; empty recovery and indexer lists already mean none.
+Create a deployment with no services and the neutral keychain service `org.marmot-protocol.mdk`, then fill in what your deployment operates with the setters. Free it with `marmot_deployment_free`. Unset values fall back to nothing: with no new-group media servers new groups stay text-only, and with no group-image server group images are refused.
 
 [Header contract](include/marmot.h#L10119)
 
@@ -5756,7 +5746,7 @@ Replace the public indexers that onboarding and account setup also search for an
 MarmotStatus marmot_deployment_set_new_group_media_endpoints(struct MarmotDeployment *deployment, const char *const *endpoints, uintptr_t endpoints_len);
 ```
 
-Replace the Blossom servers signed into a new group's encrypted-media component. Each must accept opaque `application/octet-stream` blobs. Existing groups keep their signed list. Until the neutral default lands, an empty list still falls back to White Noise's servers.
+Replace the Blossom servers signed into a new group's encrypted-media component. Each must accept opaque `application/octet-stream` blobs. Existing groups keep their signed list. With an empty list new groups carry no encrypted-media component and stay text-only.
 
 [Header contract](include/marmot.h#L10152)
 
@@ -5766,7 +5756,7 @@ Replace the Blossom servers signed into a new group's encrypted-media component.
 MarmotStatus marmot_deployment_set_group_image_endpoint(struct MarmotDeployment *deployment, const char *endpoint);
 ```
 
-Set the Blossom server for encrypted group images, or unset it with NULL. Group state records no server, so every client sharing a group must use the same one. Until the neutral default lands, an unset server still falls back to White Noise's.
+Set the Blossom server for encrypted group images, or unset it with NULL. Group state records no server, so every client sharing a group must use the same one. With no server, setting or fetching a group image is refused.
 
 [Header contract](include/marmot.h#L10161)
 
@@ -5776,7 +5766,7 @@ Set the Blossom server for encrypted group images, or unset it with NULL. Group 
 MarmotStatus marmot_deployment_set_profile_image_endpoint(struct MarmotDeployment *deployment, const char *endpoint);
 ```
 
-Set the public profile-image upload server, or unset it with NULL. Peers' avatars load from the URL in their profile, never from here. Until the neutral default lands, an unset server still falls back to White Noise's.
+Set the public profile-image upload server, or unset it with NULL. Peers' avatars load from the URL in their profile, never from here. With no server, a profile-image upload needs an explicit one.
 
 [Header contract](include/marmot.h#L10169)
 
