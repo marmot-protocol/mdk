@@ -69,7 +69,7 @@ It uses, but does not own, `<root>/shared.sqlite3`. That database is plain SQLit
 [Core structure](core-structure.md) estimated this step from the module tree. The source says:
 
 - **86 methods on `MarmotApp`, not 67.** 67 is `methods.rs` alone.
-- **About 9.0k production lines move, not 11–13k** (see "What moves and what stays"). 11.5k is `directory/` with
+- **About 9.1k production lines move, not 11–13k** (see "What moves and what stays"). 11.5k is `directory/` with
   its tests.
 - **The relay-plane directory code stays in `transport-nostr`.** `transport-nostr/src/directory.rs` and
   `directory_wire.rs` are relay I/O (about 640 lines) and relay-plane state (about 385 lines): request coalescing,
@@ -84,9 +84,9 @@ It uses, but does not own, `<root>/shared.sqlite3`. That database is plain SQLit
 Create `crates/nostr-directory`.
 - **Workspace dependencies:** `transport-nostr`, `transport-nostr-adapter` (event kinds), `transport-nostr-peeler`,
   `storage-sqlite`, `cgka-traits`, `cgka-engine` (KeyPackage metadata checks) and `fs-private`.
-- **External crates the code already uses:** `nostr-sdk`, `rusqlite`, `reqwest` (the Open Ranking client,
-  `open_ranking.rs:168`, `:254`), `tokio`, `futures`, `serde`, `serde_json`, `hex`, `sha2`, `url` and `tracing`.
-  The host traits add `async-trait`.
+- **External crates the code already uses:** `nostr` (previews, `public_event_preview.rs:40-42`), `nostr-sdk`,
+  `rusqlite`, `reqwest` (the Open Ranking client, `open_ranking.rs:168`, `:254`), `tokio`, `futures`, `serde`,
+  `serde_json`, `hex`, `sha2`, `url` and `tracing`. The host traits add `async-trait`.
 - **Not:** `marmot-app`, `marmot-account`, or `cgka-session`, which step 5 merges into `marmot-session`. Whatever
   it needs from the app comes through the host interface below.
 
@@ -110,8 +110,9 @@ Two more points:
 | Block lists (`user_blocks.rs`), onboarding (`runtime/onboarding.rs`), relay-list publication (`lib.rs`) | — | Stay. They are account state. They become callers of the crate. |
 | `shared.sqlite3` and `SqliteSharedStorage` | — | Stay in `storage-sqlite` (step 8 decides any split) |
 | SQLCipher key derivation (`sqlcipher.rs`) | — | Stays in `marmot-app`, with the same label. The host supplies the key. |
+| The Nostr account-id and profile-reference helpers in `ids.rs`: `parse_account_id_hex` and its private `parse_account_key`, `normalize_account_ids`, `npub_for_account_id`, `npub_for_account_id_lossy`, `nprofile_for_account_id`, `account_id_hex_from_ref`, `validate_relay_urls` | about 105 of `ids.rs`'s 128 production lines | Move, so there is still one parser and one `nprofile` rule. `parse_account_key` rejects `nprofile` for account ids, while only `account_id_hex_from_ref` accepts profiles (`ids.rs:16-23`, `:107`). `marmot-app` re-exports the four public helpers at their current paths (`lib.rs:249-251`). The group-id and admin-key helpers (`ids.rs:25-45`) stay. Non-local member refs keep using `PublicKey::parse` (`member_key_packages.rs:360`), which accepts `nprofile`. |
 
-That is about 9.0k production lines moving.
+That is about 9.1k production lines moving.
 
 ## The host interface
 
@@ -129,25 +130,34 @@ then has a single owner. `marmot-app` constructs it with three things.
 
 | Host method | Replaces |
 | --- | --- |
-| Local accounts: id, label, `local_signing` and `is_active_signing()` (`marmot-account/src/home.rs:174-176`) | `account_home()` at 13 sites in `directory/` and one in previews (`public_event_preview.rs:758`). The view must keep the active-signing filter that decides which caches open (`methods.rs:1870`, `cached_search.rs:131`) and the `local_signing` copy onto records (`methods.rs:2016`). |
+| Local accounts: id, label, `local_signing` and `is_active_signing()` (`marmot-account/src/home.rs:174-176`) | `account_home()` at 13 sites in `directory/` and one in previews (`public_event_preview.rs:758`). The view must keep the active-signing filter that decides which caches open (`methods.rs:1870`, `cached_search.rs:131`) and the `local_signing` copy onto records (`methods.rs:2016`). The four moving methods that take `marmot_account::AccountSummary` take this view instead: `directory_cache_for_account` (`methods.rs:1800`), `clean_future_dated_directory_caches_once` (`:1951`), and the two preview reads (`public_event_preview.rs:619`, `:676`; called from `runtime/mod.rs:4684`, `:4700`). |
 | Account directory path and cache key | `account_dir`, `sqlcipher_key_locked`, `external_sqlcipher_key` (`methods.rs:1790`, `:1832-1847`) |
+| Remove a SQLite file set | `remove_sqlite_file_set` (`sqlcipher.rs:646`), used by the legacy import and the future-dated cleanup (`methods.rs:1944`, `:1958`, `:1960`). It deletes the database with its `-wal` and `-shm` files and drops the in-process SQLCipher verdict for that path (`sqlcipher.rs:648`), which stays with key derivation. |
 | The storage gate, the open lock and closer registration | `ensure_storage_open`, `begin_storage_open`, `database_open_lock`, `root_closers.register` (`methods.rs:1802-1856`). The open order stays the same; only the owner of the map changes. |
 | Shared storage | `shared_storage()` at 9 sites (lifecycle stays on the hub) |
 | "Entry changed" | the two `presentation_signals` calls (`methods.rs:1760-1764`, `:1916-1920`) |
 | A proxy-configured HTTP client builder | `crate::network_proxy::http_builder` (`open_ranking.rs:178`); see below |
 | Block-list adoption and reconcile | `ingest_block_list_event`, `fetch_block_list`, `block_update_lock` (`sync.rs:360`, `:441-443`). The sync worker keeps its bounds and queueing (`sync.rs:82-102`, `:295-296`); the hook does the per-account work. |
 
-**A `DirectoryObserver` trait**, for the nine `product_analytics.begin` sites that move, with their `count`,
-`directory_sample`, `finish` and `discard` calls (`count` at `member_key_packages.rs:579`). The tenth site
-(`methods.rs:865`) is profile publication, which stays on `ProductAnalytics`. `marmot-app` implements it by forwarding to `ProductAnalytics` with the same family, operation and
-unit strings. Step 6 (`marmot-observability`) can later supply it instead.
+**A `DirectoryObserver` trait**, for the nine `product_analytics.begin` sites that move. The tenth site
+(`methods.rs:865`) is profile publication, which stays on `ProductAnalytics`.
+- The observer covers `count` (`member_key_packages.rs:579`), `directory_sample`, `finish` and `discard`.
+- It also covers `counts_only` (`product_analytics/mod.rs:1549`). That marks a ticket finished so dropping it doesn't
+  record `cancelled`. Two moving sites use it and only ever sample: directory/`key_package`
+  (`member_key_packages.rs:344-351`, sampled at `:464`) and directory/`profile` (`search.rs:291-298`, sampled at
+  `:465`).
+- `marmot-app` implements it by forwarding to `ProductAnalytics` with the same family, operation and unit strings.
+  Step 6 (`marmot-observability`) can later supply it instead.
 
 **Two lifecycle entry points the app calls**, at the points where it touches `directory_caches` today:
 - `Directory::evict_account(label)`, called from `drop_account_caches` (`lib.rs:7402-7444`). It removes only the
   label's cache handle, as today.
-  - That function runs before an account directory is deleted on removal, setup reset, sign-out and rollback
-    (`runtime/mod.rs:6609`, `:6721`, `:6811`, `:8655`, `:8679`; `onboarding/cancellation.rs:235`,
-    `onboarding/recovery.rs:221`).
+  - `drop_account_caches` runs at seven sites, and at each one it only drops the in-memory handle.
+  - Four are followed by deleting the account directory: removal, setup reset and the two rollbacks
+    (`runtime/mod.rs:6609`, `:6721`, `:8655`, `:8679`).
+  - Three keep the directory and its files: sign-out (`runtime/mod.rs:6811`), onboarding cancellation
+    (`onboarding/cancellation.rs:235`) and onboarding recovery (`onboarding/recovery.rs:221`). The next open must read
+    the same cache file.
   - Its doc says why: a handle kept across delete and re-import writes to the unlinked old database.
   - Closer registration doesn't cover this, because it only runs at terminal close.
 - `Directory::take_caches()`, called from `close_storage` (`lib.rs:6502-6508`). It drains the map so the caches drop
@@ -203,7 +213,8 @@ Each PR keeps behaviour unchanged and ships alone.
    - `retain_safe_discovered_endpoints` joins the other relay-plane wrappers.
    - Code moves only.
 2. **Pull in what moves.**
-   - The root directory types and the directory half of `key_package_records.rs` move into `directory/`.
+   - The root directory types, the directory half of `key_package_records.rs` and the account-id helpers from
+     `ids.rs` move into `directory/`.
    - `public_event_preview.rs` becomes `directory/previews.rs`.
    - `marmot-app` re-exports the same public paths.
 3. **`DirectoryError`.**
@@ -248,7 +259,7 @@ reviewable.
     cache unreadable.
 - **Errors.** The PR 3 mapping test.
 - **Analytics.** The same family, operation, unit and sample strings. A test checks that the observer adapter forwards
-  each call.
+  each call, and that the two `counts_only` operations still record no `cancelled` sample on drop.
 - **Lifecycle.**
   - `shutdown_and_close` still closes every directory cache, because the caches register through the host's closer.
   - Removing an account still evicts its cache before the directory is deleted. A regression test removes an account,
