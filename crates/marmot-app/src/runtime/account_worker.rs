@@ -1992,11 +1992,10 @@ async fn run_app_runtime_account_worker(
                 continue 'worker;
             }
         }
-        let ready_command =
-            ready_command_index(&pending, &media_http, comparison_recovery.is_some());
         // Unified admission may have advanced native frames as well as the
         // comparison prefix. Publish their committed effects before live input.
         let admitted = client.take_pending_applied_sync_summary();
+        let native_received = client.take_native_receive_need();
         publish_app_runtime_summary_with_v5(
             &client,
             &events,
@@ -2004,7 +2003,7 @@ async fn run_app_runtime_account_worker(
             &account_label,
             &admitted,
         );
-        if admitted != SyncSummary::default() {
+        if native_received || admitted != SyncSummary::default() {
             publish_client_pending_projection_updates(
                 &mut client,
                 &events,
@@ -2019,26 +2018,46 @@ async fn run_app_runtime_account_worker(
                 &account_label,
             )
             .await;
-            finish_receive_after_recovery(
+            // Native-owned live group frames have the same recovery follow-up
+            // as ordinary receives, including frames with no visible summary.
+            let recovery_started = start_receive_recovery(
                 &mut client,
-                ReceiveTailContext {
+                &mut comparison_recovery,
+                &admitted,
+                EpochBackfillReportContext {
                     events: &events,
                     account_id_hex: &account_id_hex,
                     account_label: &account_label,
                     shared: &shared,
-                    scheduled_push_retry: &mut scheduled_push_retry,
-                    command_tx: &command_tx,
                 },
-                sync_summary_triggers_audit_tracker_update(&admitted),
-                !admitted.joined_groups.is_empty(),
             )
             .await;
+            if !recovery_started {
+                let audit_tracker_update = sync_summary_triggers_audit_tracker_update(&admitted);
+                let retry_push_registration = !admitted.joined_groups.is_empty();
+                finish_receive_after_recovery(
+                    &mut client,
+                    ReceiveTailContext {
+                        events: &events,
+                        account_id_hex: &account_id_hex,
+                        account_label: &account_label,
+                        shared: &shared,
+                        scheduled_push_retry: &mut scheduled_push_retry,
+                        command_tx: &command_tx,
+                    },
+                    audit_tracker_update,
+                    retry_push_registration,
+                )
+                .await;
+            }
         }
         scheduled_runtime_group_subscription_refresh.observe_pending(
             client.has_pending_runtime_group_subscription_refresh(),
             &command_tx,
         );
         schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+        let ready_command =
+            ready_command_index(&pending, &media_http, comparison_recovery.is_some());
         #[cfg(test)]
         tests::secondary_retry_scheduler_tests::record_turn(
             &account_id_hex,
@@ -2559,55 +2578,21 @@ async fn run_app_runtime_account_worker(
                             &mut scheduled_convergence,
                             &mut client,
                         );
+                        if start_receive_recovery(
+                            &mut client,
+                            &mut comparison_recovery,
+                            &summary,
+                            EpochBackfillReportContext {
+                                events: &events,
+                                account_id_hex: &account_id_hex,
+                                account_label: &account_label,
+                                shared: &shared,
+                            },
+                        ).await {
+                            continue 'worker;
+                        }
                         let audit_tracker_update = sync_summary_triggers_audit_tracker_update(&summary);
                         let retry_push_registration = !summary.joined_groups.is_empty();
-                        {
-                        let backfill_armed = client.has_pending_epoch_backfill();
-                        let observation = backfill_armed.then(|| shared.product_analytics.begin(
-                            crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
-                        )).flatten();
-                        // A live job already owns this account's grant.
-                        // Keep this delivered message complete and let
-                        // that job settle the still-durable recovery debt.
-                        let backfill_result = if comparison_recovery.is_some() {
-                            PendingRecoveryJob::Settled(Ok(EpochBackfillRunOutcome::Deferred))
-                        } else {
-                            start_pending_recovery_job(
-                                &mut client, &shared, EpochBackfillExecutionSeam::Receive,
-                            ).await
-                        };
-                        match backfill_result {
-                            PendingRecoveryJob::Started {
-                                grant, execution, network,
-                            } => {
-                                comparison_recovery = Some(ComparisonRecoveryJob::new(
-                                    *grant,
-                                    execution,
-                                    network,
-                                    observation,
-                                    backfill_armed,
-                                    None,
-                                    ComparisonRecoveryOrigin::Receive {
-                                        audit_tracker_update,
-                                        retry_push_registration,
-                                    },
-                                ));
-                                continue 'worker;
-                            }
-                            PendingRecoveryJob::Settled(result) => {
-                                let _ = report_pending_epoch_backfill_result(
-                                    &client,
-                                    result, backfill_armed, observation,
-                                    EpochBackfillReportContext {
-                                        events: &events,
-                                        account_id_hex: &account_id_hex,
-                                        account_label: &account_label,
-                                        shared: &shared,
-                                    },
-                                );
-                            }
-                        }
-                        }
                         finish_receive_after_recovery(
                             &mut client,
                             ReceiveTailContext {
@@ -3204,6 +3189,63 @@ async fn start_pending_recovery_job(
             trace("task_start_error");
             let _ = client.abandon_comparison_grant(grant, execution);
             PendingRecoveryJob::Settled(Err(error))
+        }
+    }
+}
+
+/// Dispatch the existing Receive recovery follow-up for either ingress lane.
+/// A running job keeps the one grant; only its settlement resumes its tail.
+async fn start_receive_recovery(
+    client: &mut AppClient,
+    comparison_recovery: &mut Option<ComparisonRecoveryJob>,
+    summary: &SyncSummary,
+    context: EpochBackfillReportContext<'_>,
+) -> bool {
+    let backfill_armed = client.has_pending_epoch_backfill();
+    let observation = backfill_armed
+        .then(|| {
+            context.shared.product_analytics.begin(
+                crate::ProductFamily::Recovery,
+                "backfill",
+                crate::ProductUnit::Attempt,
+            )
+        })
+        .flatten();
+    let result = if comparison_recovery.is_some() {
+        PendingRecoveryJob::Settled(Ok(EpochBackfillRunOutcome::Deferred))
+    } else {
+        start_pending_recovery_job(client, context.shared, EpochBackfillExecutionSeam::Receive)
+            .await
+    };
+    match result {
+        PendingRecoveryJob::Started {
+            grant,
+            execution,
+            network,
+        } => {
+            *comparison_recovery = Some(ComparisonRecoveryJob::new(
+                *grant,
+                execution,
+                network,
+                observation,
+                backfill_armed,
+                None,
+                ComparisonRecoveryOrigin::Receive {
+                    audit_tracker_update: sync_summary_triggers_audit_tracker_update(summary),
+                    retry_push_registration: !summary.joined_groups.is_empty(),
+                },
+            ));
+            true
+        }
+        PendingRecoveryJob::Settled(result) => {
+            let _ = report_pending_epoch_backfill_result(
+                client,
+                result,
+                backfill_armed,
+                observation,
+                context,
+            );
+            false
         }
     }
 }

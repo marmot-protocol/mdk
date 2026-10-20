@@ -595,6 +595,7 @@ mod tests {
                             first_boundary: true,
                         }],
                         retained_known_event: false,
+                        replay_admitted: false,
                     }],
                     RecoveryEligibility::Retry,
                 )

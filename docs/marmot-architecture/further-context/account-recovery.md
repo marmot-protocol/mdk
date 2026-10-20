@@ -128,6 +128,8 @@ The adapter exposes borrowed source facts under its admission guard and a coales
 copies those facts and drops the guard before durable recovery writes. It combines a session nonce with the
 process-monotonic wire generation to identify the current goal. It freezes source capabilities into the existing
 comparison job and uses that job's recovery credit and cancellation.
+Native capture and comparison run concurrently under that grant's cutoff. A quiet native REQ cannot consume
+the whole pass before comparison starts; both remain owned until cancellation and IO cleanup finish.
 Neither the adapter nor the relay plane selects retries or runs a quiet-period repair timer.
 
 All native group input, including local publication fanout and post-EOSE live tails, uses the owner's ordered admission path rather than
@@ -146,6 +148,10 @@ arrives; its suffix rejoins the complete range. Same-account repacks preserve he
 ingest already committed is acknowledged even if its loan was revoked in the meantime. Retained rows are removed
 only after durable admission and successful spill settlement. Backend errors remain visible to explicit callers;
 automatic worker retries use the existing 1–60-second backoff and return the failed loan to the fair ready queue.
+
+Native ingests resume the same owner-controlled `Receive` recovery follow-up as ordinary deliveries, including
+undecryptable input with no visible summary. Receipt skips and cursor-save-only progress do not request this
+follow-up. The receive intent is retained before ACK can suspend; it changes neither capture authority nor credit.
 
 `ReplayAdmission` needs a complete original range placed from at least one issued current-epoch peer for
 every scope, with no pending ciphertext or nondurable spill handoff. Empty silence is not notification loss.

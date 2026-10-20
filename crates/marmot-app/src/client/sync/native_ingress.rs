@@ -130,6 +130,12 @@ impl AppClient {
         Ok(progressed)
     }
 
+    /// Receipt skips and cursor saves can advance a turn without receiving input.
+    /// Actual ingests retain this follow-up intent even if ACK has to suspend.
+    pub(crate) fn take_native_receive_need(&mut self) -> bool {
+        std::mem::take(&mut self.recovery_owner.native_receive_pending)
+    }
+
     /// Return a failed loan behind independent groups only after the worker
     /// has armed its admission backoff. Its source wake cannot bypass that
     /// deadline, and the next eligible turn can service another group first.
@@ -179,6 +185,8 @@ impl AppClient {
         let timestamp = delivery.message.timestamp.0;
         let result = async {
             let (summary, settled) = self.admit_recovered_delivery(delivery).await?;
+            let ingested = matches!(settled, super::RecoveredDelivery::Ingested { .. });
+            self.recovery_owner.native_receive_pending |= ingested;
             self.pending_applied_sync_summary.merge(summary);
             if let Some(&seq) = self.recovery_owner.retained_spill.get(&delivery.message.id) {
                 let event_id = hex::encode(delivery.message.id.as_slice());
@@ -188,7 +196,7 @@ impl AppClient {
                     .remove(&delivery.message.id);
             }
             Ok((
-                matches!(settled, super::RecoveredDelivery::Ingested { .. }),
+                ingested,
                 matches!(
                     settled,
                     super::RecoveredDelivery::AlreadyHeld

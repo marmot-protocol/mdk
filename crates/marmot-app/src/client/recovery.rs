@@ -388,6 +388,7 @@ pub(crate) struct AccountRecoveryOwner {
     pub(super) native_ingress: Option<transport_nostr_adapter::ReplayIngress>,
     pub(super) retained_spill: std::collections::HashMap<cgka_traits::MessageId, i64>,
     pub(super) native_cursor_target: Option<u64>,
+    pub(super) native_receive_pending: bool,
     pub(crate) maintenance_observations:
         std::collections::HashMap<cgka_traits::GroupId, MaintenanceRecoveryObservation>,
     wall_anchor_ms: u64,
@@ -448,6 +449,7 @@ impl AccountRecoveryOwner {
             native_ingress: None,
             retained_spill: std::collections::HashMap::new(),
             native_cursor_target: None,
+            native_receive_pending: false,
             maintenance_observations: std::collections::HashMap::new(),
             wall_anchor_ms: wall_now_ms,
             monotonic_anchor: monotonic_now,

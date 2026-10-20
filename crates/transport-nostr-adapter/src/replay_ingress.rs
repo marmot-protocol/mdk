@@ -499,7 +499,7 @@ impl NostrTransportAdapter {
             });
         shared.retain_closed();
         let mut existing = Vec::new();
-        let consumer = {
+        let (consumer, retained_ids) = {
             let mut queue = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
             if queue.consumer.is_some() {
                 return Err(TransportAdapterError::Other(
@@ -565,6 +565,22 @@ impl NostrTransportAdapter {
                     "retained replay exceeds native input bounds".to_owned(),
                 ));
             }
+            // A duplicate spill row upgrades the held copy's lifetime. Source
+            // replacement must retain it even though no second body was queued.
+            for batch in queue.ready.values_mut() {
+                for frame in &mut batch.deliveries {
+                    let id: &[u8; 32] = frame
+                        .delivery
+                        .message
+                        .id
+                        .as_slice()
+                        .try_into()
+                        .expect("native event id");
+                    if incoming.contains(id) {
+                        frame.origin = ReplayFrameOrigin::Retained;
+                    }
+                }
+            }
             queue.next_consumer = queue
                 .next_consumer
                 .checked_add(1)
@@ -574,12 +590,17 @@ impl NostrTransportAdapter {
             queue.items += retained.len();
             queue.bytes += bytes;
             queue.retained.extend(retained);
-            consumer
+            (consumer, incoming)
         };
         state
             .replay_ingresses
             .insert(account_id.clone(), shared.clone());
         if let Some(coverage) = state.account_replay_coverage.get_mut(account_id) {
+            for id in retained_ids {
+                if let Some(origin) = coverage.native_ids.get_mut(&id) {
+                    *origin = ReplayFrameOrigin::Retained;
+                }
+            }
             for (group_id, id) in existing {
                 let group = coverage
                     .groups
@@ -828,6 +849,32 @@ impl AccountReplayCoverage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoNetwork;
+
+    #[async_trait]
+    impl NostrRelayClient for NoNetwork {
+        async fn subscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
+            panic!("ingress registration must not subscribe")
+        }
+
+        async fn unsubscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
+            panic!("ingress registration must not unsubscribe")
+        }
+
+        async fn unsubscribe_account(&self, _: &MemberId) -> Result<(), TransportAdapterError> {
+            panic!("ingress registration must not replace an account")
+        }
+
+        async fn publish_event(
+            &self,
+            _: &[TransportEndpoint],
+            _: &NostrTransportEvent,
+            _: usize,
+        ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+            panic!("ingress registration must not publish")
+        }
+    }
 
     fn delivery(at: u8, subscription: &str) -> TransportDelivery {
         TransportDelivery {
