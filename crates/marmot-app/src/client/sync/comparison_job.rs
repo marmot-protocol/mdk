@@ -257,7 +257,8 @@ impl Drop for ComparisonNetworkJob {
 }
 
 /// Ask the relays that failed an epoch-gap route's comparison for the route's
-/// newest events, inside the comparison window and what remains of the pass.
+/// newest events, inside the comparison window and what remains of the
+/// route's turn.
 async fn fetch_epoch_gap_window(
     adapter: &transport_nostr::MarmotRelayPlaneAccountAdapter,
     transport_group_id: [u8; 32],
@@ -299,31 +300,33 @@ async fn fetch_epoch_gap_window(
     events
 }
 
-/// When a route starting `now` must finish comparing, with `routes_left`
-/// routes (this one included) still to run before the pass ends at `deadline`.
+/// The turn of a route starting `now`, with `routes_left` routes (this one
+/// included) still to run before the pass ends at `deadline`: when its
+/// comparison must finish, and when the turn ends.
 ///
 /// Routes run one after another, and the rotation claimed every one of them
-/// when the grant froze. Each gets an equal share of what is left, so a slow
-/// relay on one route cannot spend the turns of the routes after it; time a
-/// fast route leaves unused carries over to the rest. The comparison also
-/// leaves the time the pass needs after it: an epoch-gap route's newest
-/// `window` from relays that could not compare, or else a margin for the hard
-/// guard to receive the SDK's partial result instead of cancelling it. That
-/// margin only binds on the last route. It is not the SDK's own reserve inside
-/// this deadline, which picks what a cut-short oldest-first window may return.
-fn comparison_deadline(
+/// when the grant froze. Each turn is an equal share of what is left, so a
+/// slow relay on one route cannot spend the turns of the routes after it;
+/// time a fast route leaves unused carries over to the rest. An epoch-gap
+/// route keeps part of its turn for the newest `window` of relays that could
+/// not compare. Any other route leaves a margin for the hard guard to receive
+/// the SDK's partial result instead of cancelling it, which only binds on the
+/// last route. Neither is the SDK's own reserve inside the comparison
+/// deadline, which picks what a cut-short oldest-first window may return.
+fn route_turn(
     now: tokio::time::Instant,
     deadline: tokio::time::Instant,
     routes_left: usize,
     window: Option<[u8; 32]>,
-) -> tokio::time::Instant {
+) -> (tokio::time::Instant, tokio::time::Instant) {
     let remaining = deadline.saturating_duration_since(now);
     let share = remaining / u32::try_from(routes_left.max(1)).unwrap_or(u32::MAX);
-    let after = match window {
-        Some(_) => (remaining / 2).min(EPOCH_GAP_WINDOW_MAX_DURATION),
-        None => (remaining / 5).min(Duration::from_millis(400)),
+    let turn_ends = now + share;
+    let compare_until = match window {
+        Some(_) => turn_ends - (share / 2).min(EPOCH_GAP_WINDOW_MAX_DURATION),
+        None => turn_ends.min(deadline - (share / 5).min(Duration::from_millis(400))),
     };
-    (now + share).min(deadline - after)
+    (compare_until, turn_ends)
 }
 
 impl ComparisonNetworkJob {
@@ -417,8 +420,8 @@ impl ComparisonNetworkJob {
                 let progress = Arc::new(MemoryProgress {
                     cursor: Mutex::new(initial_cursor),
                 });
-                let comparison_deadline =
-                    comparison_deadline(now, deadline, route_count - index, window);
+                let (comparison_deadline, turn_ends) =
+                    route_turn(now, deadline, route_count - index, window);
                 let run = async {
                     #[cfg(test)]
                     let _request_active = witness
@@ -494,7 +497,7 @@ impl ComparisonNetworkJob {
                             result.uncompared_endpoints(&endpoints),
                             since,
                             until,
-                            deadline,
+                            turn_ends,
                         )
                         .await
                     }
@@ -1720,39 +1723,41 @@ mod tests {
     fn routes_split_what_is_left_of_the_pass() {
         let now = tokio::time::Instant::now();
         let deadline = now + Duration::from_secs(10);
+        let quarter = now + Duration::from_millis(2_500);
         assert_eq!(
-            comparison_deadline(now, deadline, 4, None),
-            now + Duration::from_millis(2_500),
+            route_turn(now, deadline, 4, None),
+            (quarter, quarter),
             "the first of four routes gets a quarter, not the pass"
         );
         let later = now + Duration::from_secs(7);
+        let third = later + Duration::from_secs(1);
         assert_eq!(
-            comparison_deadline(later, deadline, 3, None),
-            later + Duration::from_secs(1),
+            route_turn(later, deadline, 3, None),
+            (third, third),
             "a slow route leaves the rest equal shares of what it left"
         );
         assert_eq!(
-            comparison_deadline(now, deadline, 1, None),
-            deadline - Duration::from_millis(400),
+            route_turn(now, deadline, 1, None),
+            (deadline - Duration::from_millis(400), deadline),
             "the last route leaves the guard time to take its partial result"
         );
     }
 
     #[test]
-    fn an_epoch_gap_route_keeps_time_for_its_window() {
+    fn an_epoch_gap_window_fits_inside_its_routes_turn() {
         let now = tokio::time::Instant::now();
         let deadline = now + Duration::from_secs(10);
         let window = Some([7; 32]);
         assert_eq!(
-            comparison_deadline(now, deadline, 1, window),
-            deadline - EPOCH_GAP_WINDOW_MAX_DURATION,
-            "a whole window fetch still fits after the comparison"
+            route_turn(now, deadline, 1, window),
+            (deadline - EPOCH_GAP_WINDOW_MAX_DURATION, deadline),
+            "alone in the pass, a whole window fetch fits after the comparison"
         );
-        let late = deadline - Duration::from_secs(2);
+        let quarter = now + Duration::from_millis(2_500);
         assert_eq!(
-            comparison_deadline(late, deadline, 1, window),
-            late + Duration::from_secs(1),
-            "with little left, the comparison and window split it"
+            route_turn(now, deadline, 4, window),
+            (now + Duration::from_millis(1_250), quarter),
+            "beside three routes, the comparison and window split a quarter"
         );
     }
 
