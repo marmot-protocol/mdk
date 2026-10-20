@@ -1906,12 +1906,20 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
         adapter._ambient_context.open = unittest.mock.Mock(
             side_effect=RuntimeError("ambient open failed")
         )
+        handed_off = asyncio.Event()
+        original_handle = adapter.handle_message
+
+        async def observed_handle(message):
+            await original_handle(message)
+            handed_off.set()
+
+        adapter.handle_message = observed_handle
 
         self.assertTrue(await adapter.connect())
-        for _ in range(100):
-            if adapter.events:
-                break
-            await asyncio.sleep(0.01)
+        # Delivery runs through the spool's SQLite writes on its executor thread,
+        # which can outlast a fixed poll window on a loaded runner. Wait for the
+        # handoff itself; the timeout only bounds a real regression.
+        await asyncio.wait_for(handed_off.wait(), timeout=30)
 
         self.assertEqual([event.text for event in adapter.events], ["still delivered"])
         await adapter.disconnect()
@@ -2502,12 +2510,14 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         release_a = asyncio.Event()
         completed = []
+        turn_done = {group_a: asyncio.Event(), group_b: asyncio.Event()}
 
         async def handle_message(event):
             chat_id = event.source.chat_id
             if chat_id == group_a:
                 await release_a.wait()  # group A's turn is hung until the test releases it
             completed.append(chat_id)
+            turn_done[chat_id].set()
 
         adapter.handle_message = handle_message
 
@@ -2516,10 +2526,10 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
             # Group B must complete even though group A's turn is still hung AND a resync had to
             # reconnect the subscription in between. If the loop joined the queue on stream end,
             # the resync (and therefore group B) would be stuck behind hung group A forever.
-            for _ in range(300):
-                if group_b in completed:
-                    break
-                await asyncio.sleep(0.01)
+            # Wait for B's turn rather than a fixed window: the reconnect backoff plus the
+            # spool's SQLite writes can outlast one on a loaded runner. The timeout only bounds
+            # a real regression.
+            await asyncio.wait_for(turn_done[group_b].wait(), timeout=30)
             self.assertIn(
                 group_b,
                 completed,
@@ -2534,10 +2544,7 @@ class MarmotPlatformAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             # Releasing group A lets its turn finish too — nothing was dropped.
             release_a.set()
-            for _ in range(300):
-                if group_a in completed:
-                    break
-                await asyncio.sleep(0.01)
+            await asyncio.wait_for(turn_done[group_a].wait(), timeout=30)
             self.assertIn(group_a, completed, "group A turn must complete once released")
         finally:
             loop_task.cancel()
@@ -8467,10 +8474,12 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.make_event(message_id="33", text="first")
             )
         adapter._enqueue_debounced = original_enqueue
-        for _ in range(100):
-            if len(adapter.events) == 1:
-                break
-            await asyncio.sleep(0.01)
+        # The failed enqueue released and admitted the row before raising, and the
+        # debounce flush admits before its task ends, so each dispatch is already
+        # queued when these waits start. Dispatch writes to the spool on its
+        # executor thread, which can outlast a fixed poll window on a loaded
+        # runner; the timeouts only bound a real regression.
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=30)
         self.assertEqual([item.text for item in adapter.events], ["first"])
         await adapter._handle_control_event(
             self.make_event(message_id="55", text="second")
@@ -8479,11 +8488,8 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.make_event(message_id="55", text="second")
         )
         key = adapter._debounce_key(normalized_second)
-        await asyncio.wait_for(adapter._debounce_tasks[key], timeout=1)
-        for _ in range(100):
-            if len(adapter.events) == 2:
-                break
-            await asyncio.sleep(0.01)
+        await asyncio.wait_for(adapter._debounce_tasks[key], timeout=30)
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=30)
 
         self.assertEqual([item.text for item in adapter.events], ["first", "second"])
         self.assertEqual("unresolved", adapter._inbound_spool.get("33" * 32).state)
@@ -8512,6 +8518,14 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
                 )
             return original_release(message_ids, reason=reason)
 
+        handed_off = asyncio.Event()
+        original_handle = adapter.handle_message
+
+        async def observed_handle(message):
+            await original_handle(message)
+            handed_off.set()
+
+        adapter.handle_message = observed_handle
         adapter._enqueue_debounced = fail_after_buffering
         adapter._inbound_spool.release_debounce = fail_release_once
         retry = asyncio.create_task(adapter._run_inbound_spool_retry_loop())
@@ -8521,10 +8535,11 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
                     self.make_event(message_id="33", text="first")
                 )
             adapter._enqueue_debounced = original_enqueue
-            for _ in range(150):
-                if adapter.events:
-                    break
-                await asyncio.sleep(0.01)
+            # The retry loop releases, claims and dispatches the row through the
+            # spool's executor thread, which can outlast a fixed poll window on a
+            # loaded runner. Wait for the handoff; the timeout only bounds a real
+            # regression.
+            await asyncio.wait_for(handed_off.wait(), timeout=30)
 
             # Host event visibility precedes the durable post-handoff write.
             # Wait for dispatch completion before inspecting the spool state.
@@ -8569,10 +8584,12 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             await adapter._handle_control_event(
                 self.make_event(message_id="33", text="first")
             )
-        for _ in range(100):
-            if adapter.events:
-                break
-            await asyncio.sleep(0.01)
+        # The committed release admitted the row before the error surfaced, and
+        # the debounce flush below admits before its task ends, so each dispatch
+        # is already queued when these waits start. Dispatch writes to the spool
+        # on its executor thread, which can outlast a fixed poll window on a
+        # loaded runner; the timeouts only bound a real regression.
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=30)
         self.assertEqual([item.text for item in adapter.events], ["first"])
         self.assertIn("33" * 32, adapter._debounce_release_pending)
 
@@ -8589,11 +8606,8 @@ class InboundDurabilityAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.make_event(message_id="55", text="second")
         )
         key = adapter._debounce_key(normalized_second)
-        await asyncio.wait_for(adapter._debounce_tasks[key], timeout=1)
-        for _ in range(100):
-            if len(adapter.events) == 2:
-                break
-            await asyncio.sleep(0.01)
+        await asyncio.wait_for(adapter._debounce_tasks[key], timeout=30)
+        await asyncio.wait_for(adapter._inbound_queue.join(), timeout=30)
 
         self.assertEqual(2, release_attempts)
         self.assertEqual([item.text for item in adapter.events], ["first", "second"])
