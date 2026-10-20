@@ -86,8 +86,10 @@
   database's pages (`DatabaseSpace`: size, free pages, live bytes, whether it
   is incremental), `compact_database` switches it to
   `auto_vacuum=INCREMENTAL` with one `VACUUM` between WAL checkpoints (an
-  interrupted one changes nothing; closing the storage stops a running one,
-  which polls the close latch, instead of waiting for it), and `reclaim_free_pages` returns freed
+  interrupted one changes nothing; closing the storage stops one still
+  building its copy, which polls the close latch, but its final write-back
+  cannot be interrupted, so callers keep the live database small), and
+  `reclaim_free_pages` returns freed
   pages in bounded steps afterwards (`PageReclaim`). Both truncate the WAL
   without waiting on readers and report whether they did;
   `wal_truncate_pending` says one a reader on another connection blocked is
@@ -95,7 +97,8 @@
   retries it.
   `DatabaseCloser::begin_close` (and `CloseableConnection::begin_close`)
   latches a database closed without waiting, which also stops a
-  running compaction, so an owner can free work blocked behind it before closing. `AttachmentMigrationState` adds
+  compaction still building its copy, so an owner can free work blocked
+  behind it before closing. `AttachmentMigrationState` adds
   `Compacting`.
 
 - Moving legacy attachment bodies into the media store (mdk#2314 step 6):
