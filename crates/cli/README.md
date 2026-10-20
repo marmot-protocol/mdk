@@ -594,8 +594,9 @@ only exception, and it opens loopback only. A pinned `--server-cert-der-hex` is 
 unflagged loopback, private, link-local, and CGNAT targets are rejected; local probes therefore need
 `wn stream receive --bind 127.0.0.1:4450` plus `--insecure-local` on send. The client source bind is a family-matched
 wildcard (`0.0.0.0:0` / `[::]:0`) and does not authorize the remote destination. Use
-`quic://quic-broker.ipf.dev:4450` with platform trust for the shared production broker, and `--insecure-local` only for
-loopback development with generated self-signed certificates.
+`quic://quic-broker.ipf.dev:4450` with default trust for the shared production broker, and `--insecure-local` only for
+loopback development with generated self-signed certificates. Default trust verifies broker certificates against the
+bundled Mozilla roots (`webpki-roots`) that relays and HTTP also use, not the OS trust store.
 
 ### Sync
 

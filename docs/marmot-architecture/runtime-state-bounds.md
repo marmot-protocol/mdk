@@ -49,7 +49,7 @@ existing trigger; no timer retains an account or holds the transaction through a
 | Advisory group/peer resume hints | At most 1,024 entries per client; at most 2,048 two-word boundaries per hint (32 KiB of boundary values), plus route/peer identity and ownership metadata | LRU eviction, stale ownership and client drop discard hints. Losing a hint causes a rescan, never a reset of the durable park budget. No event bodies or scan-credit ledger persist in the cache. |
 
 Each peer's scan receives at most 16,384 raw events and 4 MiB of validated event JSON per pass, in 256-event
-pages and at most three seconds inside its route's turn. Held-only traversal is not recovery progress;
+pages and at most three seconds within the shared pass deadline. Held-only traversal is not recovery progress;
 the existing durable unserved-pass count and backoff survive client reconstruction unchanged.
 
 ### `marmot-app` runtime performance observations (`src/app_telemetry/runtime.rs`)

@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from test_adapter import load_adapter_module, wire_event
+from test_adapter import HANG_TIMEOUT_S, load_adapter_module, wire_event
 
 
 class FakeClock:
@@ -186,7 +186,7 @@ class PresenceTests(unittest.IsolatedAsyncioTestCase):
             "group_id_hex": self.GROUP, "message_id_hex": newest,
             "sender_account_id_hex": "44" * 32, "text": "more context",
         }))
-        await self.adapter._inbound_queue.join()
+        await asyncio.wait_for(self.adapter._inbound_queue.join(), HANG_TIMEOUT_S)
         await self.flush()
         self.assertEqual(self.ops()[-2:], [("remove_reaction", self.MESSAGE, "🛠️"),
                                            ("send_reaction", newest, "🛠️")])
@@ -226,7 +226,7 @@ class PresenceTests(unittest.IsolatedAsyncioTestCase):
         self.block = asyncio.Event()
         event = self.event()
         await self.adapter.on_processing_start(event)
-        await self.arrived.wait()
+        await asyncio.wait_for(self.arrived.wait(), HANG_TIMEOUT_S)
         self.adapter.set_status_text(self.GROUP, "tool")
         _, timer = await self.clock.next()
         await asyncio.wait_for(self.adapter.disconnect(), 1)
@@ -280,7 +280,7 @@ class PresenceTests(unittest.IsolatedAsyncioTestCase):
             "group_id_hex": self.GROUP, "message_id_hex": "66" * 32,
             "sender_account_id_hex": "44" * 32, "text": "ambient",
         }))
-        await self.adapter._inbound_queue.join()
+        await asyncio.wait_for(self.adapter._inbound_queue.join(), HANG_TIMEOUT_S)
         self.assertEqual(self.adapter._presence.groups[self.GROUP].target, self.MESSAGE)
         await self.adapter.disconnect()
 
@@ -345,7 +345,7 @@ class PresenceTests(unittest.IsolatedAsyncioTestCase):
                 "group_id_hex": self.GROUP, "message_id_hex": f"{index + 100:064x}",
                 "sender_account_id_hex": "55" * 32, "text": "activated but unauthorized",
             }))
-            await self.adapter._inbound_queue.join()
+            await asyncio.wait_for(self.adapter._inbound_queue.join(), HANG_TIMEOUT_S)
             await self.flush()
             check.assert_called_once_with("55" * 32, "group", self.GROUP)
             self.assertEqual(self.adapter._presence.groups[self.GROUP].target, self.MESSAGE)

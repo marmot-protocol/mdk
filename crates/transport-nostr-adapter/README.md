@@ -116,13 +116,17 @@ event has completed its ordinary ingest attempt. Capacity refusals still permit 
 remain outside inventory and cannot certify coverage. Failed network requests and interrupted
 admission preserve the pre-pass cursor.
 
+Selected-only comparison plans are validated but not reused. The next grant rebuilds its operational
+plan from existing coverage debt. Ignoring a legacy plan leaves messages, replay cursors, coverage
+evidence, retry cost and capability blocks intact. A new comparison request clears the prior
+operational plan; a duplicate request key leaves the current plan intact.
+
 Pass budgets:
 
 - The NIP-77 remote-only selection holds at most 512 IDs from a 16,384-ID reconciliation set.
 - The first NIP-77 reply gets up to five seconds. A pass uses the earlier of its caller's absolute
-  cutoff and a twenty-second SDK allowance. MarmotApp runs a pass's routes one after another inside
-  its ten-second account-wide budget and gives each an equal share of what is left, keeping time
-  for partial-result handoff and epoch-gap window fetches.
+  cutoff and a twenty-second SDK allowance. MarmotApp runs up to four routes concurrently under
+  its account-wide cutoff, keeping time for partial-result handoff and epoch-gap window fetches.
 - Each pass sends at most 16 request-local exact-ID acquisitions within that deadline and the
   aggregate 256-item / 1-MiB-serialized-event allowance. The first request names one ID; later ones name up to 64
   consecutive IDs the same endpoints claimed, sized to the byte room left at the largest event the pass has seen,
@@ -155,6 +159,14 @@ reply, the pass deadline, or an endpoint outside the account's pool. A failure i
 boundary probe is classified the same way. An incomplete endpoint is `Withheld` only when it reached
 EOSE on an exact-ID fetch without an ID it claimed; one this pass's own budget or ordering left
 unasked or cut short is `PassLimit`.
+
+Wrapper clones of one SDK pool share eight comparison permits per canonical relay. Initial comparisons,
+window searches and boundary probes take the same permits; waiting spends the caller's existing deadline.
+`SDK_RECONCILIATION_WINDOW_PROBES` sets both this per-relay permit limit and the window-search probe count.
+Different endpoints and independently built account pools have independent permits. This bounds active SDK
+sync futures, not the lifetime of remote sessions: cancellation queues the SDK's asynchronous cleanup task
+but does not confirm that NEG-CLOSE has reached the socket before a permit is reused.
+
 strfry answers a NEG-OPEN past its per-connection session cap with a session-less NOTICE (`ERROR: too
 many concurrent NEG requests`) that nostr-sdk ignores, so the comparison waits out its first-reply
 timeout. The client watches the relay while the NEG-OPEN is pending and reports that timeout as

@@ -531,9 +531,9 @@ Anchor a live agent text stream start in the encrypted group history. Host apps 
 pub async fn watch_agent_text_stream( &self, account_ref: String, group_id_hex: String, stream_id_hex: Option<String>, server_cert_der: Option<Vec<u8>>, insecure_local: bool, ) -> Result<Arc<AgentStreamSubscription>, MarmotKitError>
 ```
 
-Watch a live agent text stream over the brokered QUIC channel. Pass `stream_id_hex = None` to follow the latest stream in the group (the common case when reacting to an AgentStreamStarted event). The returned subscription yields incremental `Chunk`s then a terminal `Finished` / `Failed`. `server_cert_der` pins a self-signed broker cert (else platform trust); `insecure_local` is loopback-only for testing.
+Watch a live agent text stream over the brokered QUIC channel. Pass `stream_id_hex = None` to follow the latest stream in the group (the common case when reacting to an AgentStreamStarted event). The returned subscription yields incremental `Chunk`s then a terminal `Finished` / `Failed`. `server_cert_der` pins a self-signed broker cert (else the bundled public-CA roots, not the OS trust store); `insecure_local` is loopback-only for testing.
 
-[Source](src/commands/agent_stream.rs#L88)
+[Source](src/commands/agent_stream.rs#L89)
 
 </details>
 

@@ -2,6 +2,9 @@
 // Test fixtures dial local relays directly.
 #![allow(clippy::disallowed_methods)]
 
+#[path = "support/limit_relay.rs"]
+mod limit_relay;
+
 use cgka_traits::{GroupId, MemberId, TransportAdapterError, TransportEndpoint};
 use futures::{SinkExt, StreamExt};
 use nostr_memory::MemoryDatabase as SdkMemoryDatabase;
@@ -977,6 +980,126 @@ async fn a_gap_larger_than_one_pass_arrives_oldest_first() {
         counts.requests.load(Ordering::SeqCst),
     );
     assert!(pending.is_empty(), "every missing event arrives");
+    sdk.client().shutdown().await;
+    relay.shutdown();
+}
+
+/// Four concurrent route consumers must share one connection's eight NEG
+/// slots, including their parallel narrowing probes. All signed relay history
+/// must survive the per-pass allowance, not merely complete the comparisons.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_routes_share_neg() {
+    const ROUTES: usize = 4;
+    const PER_ROUTE: usize = 320;
+    let database = relay_database();
+    let keys = Keys::generate();
+    let mut histories = Vec::new();
+    for route_index in 0..ROUTES {
+        let route_id = [route_index as u8 + 1; 32];
+        let mut expected = HashSet::new();
+        for index in 0..PER_ROUTE {
+            let event = EventBuilder::new(
+                Kind::MlsGroupMessage,
+                format!("route-{route_index}-history-{index}"),
+            )
+            .tags([Tag::custom("h", [hex::encode(route_id)])])
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
+                1_700_100_000 + index as u64,
+            ))
+            .finalize(&keys)
+            .unwrap();
+            expected.insert((event.id.to_hex(), event.content.clone()));
+            database
+                .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+                .await
+                .unwrap();
+        }
+        histories.push((route_id, expected));
+    }
+    let relay = LocalRelay::new(RelayBuilder::default().database(database));
+    relay.run().await.unwrap();
+    let limit = limit_relay::LimitRelay::start(
+        relay.url().await.to_string(),
+        limit_relay::LimitConfig {
+            max_neg_sessions: 8,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (url, counts) = counted_proxy(limit.url()).await;
+    counts.latency_ms.store(40, Ordering::SeqCst);
+    let sdk = sdk_on(std::slice::from_ref(&url)).await;
+    let consumers =
+        histories.into_iter().map(|(route_id, mut expected)| {
+            let sdk = sdk.clone();
+            // Distinct URL spellings and wrapper clones still use one socket.
+            let endpoint = if route_id[0] % 2 == 0 {
+                format!("{url}/")
+            } else {
+                url.clone()
+            };
+            let mut route = subscription(&[endpoint]);
+            let NostrSubscription::Group {
+                transport_group_id,
+                group_id,
+                ..
+            } = &mut route
+            else {
+                unreachable!();
+            };
+            *transport_group_id = route_id.to_vec();
+            *group_id = GroupId::new(route_id.to_vec());
+            async move {
+                let cursor = Cursor::default();
+                let mut admitted = Vec::new();
+                for _ in 0..8 {
+                    let (summary, events) = sdk
+                        .reconcile_subscription(
+                            route.clone(),
+                            &admitted,
+                            0,
+                            1_700_200_000,
+                            &cursor,
+                            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
+                        )
+                        .await
+                        .unwrap();
+                    // A route's 320 IDs need more than one bounded pass; that
+                    // partial result is honest PassLimit, not a relay failure.
+                    assert!(summary.endpoint_failures.iter().all(|failure| {
+                        failure.failure == NostrReconciliationFailure::PassLimit
+                    }));
+                    assert!(events.len() <= PASS_ITEM_BUDGET);
+                    for event in events {
+                        admitted.push(NostrReconciliationItem {
+                            event_id: hex::decode(&event.event.id).unwrap().try_into().unwrap(),
+                            created_at: event.event.created_at,
+                        });
+                        assert!(
+                            expected.remove(&(event.event.id, event.event.content)),
+                            "each returned ID carries its actual relay payload exactly once"
+                        );
+                    }
+                    if expected.is_empty() {
+                        return admitted.len();
+                    }
+                }
+                panic!("a route did not recover all its history");
+            }
+        });
+    let recovered = futures::future::join_all(consumers).await;
+    assert_eq!(recovered, vec![PER_ROUTE; ROUTES]);
+    assert!(
+        limit
+            .wait_for(std::time::Duration::from_secs(2), |s| s.neg_active_now()
+                == 0)
+            .await
+    );
+    let stats = limit.stats();
+    assert_eq!(stats.connections.len(), 1);
+    assert_eq!(stats.neg_cap_notices, 0);
+    assert!(stats.connections[0].neg_peak <= 8);
+    assert_eq!(stats.neg_opens, stats.neg_closes);
     sdk.client().shutdown().await;
     relay.shutdown();
 }

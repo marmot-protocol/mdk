@@ -1261,6 +1261,167 @@ async fn a_stalled_relay_leaves_time_to_fetch_the_others_history() {
     );
 }
 
+/// A saturated silent relay must not spend another endpoint's credits. Waiting
+/// calls expire or cancel without opening NEG, and cancelling owners releases
+/// their credits so real history can be recovered on the same connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn neg_waits_cancel_and_isolate() {
+    let (fx, url) = connected_fixture(
+        LimitConfig {
+            max_neg_sessions: 8,
+            ..Default::default()
+        },
+        0,
+    )
+    .await;
+    let event = EventBuilder::new(Kind::MlsGroupMessage, "recover-after-cancel")
+        .tags([Tag::custom("h", [hex::encode(route(0))])])
+        .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(1_700_000_000))
+        .finalize(&Keys::generate())
+        .unwrap();
+    let expected = (event.id.to_hex(), event.content.clone());
+    fx.database
+        .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+        .await
+        .unwrap();
+    fx.limit.set_neg_fault(NegFault::SilentOpen);
+    let mut owners = Vec::new();
+    for index in 0..8 {
+        let sdk = fx.sdk.clone();
+        let mut subscription = reconciliation_route(&url, &fx.account);
+        if let NostrSubscription::Group {
+            transport_group_id,
+            group_id: id,
+            ..
+        } = &mut subscription
+        {
+            *transport_group_id = route(index);
+            *id = group_id(index);
+        }
+        owners.push(tokio::spawn(async move {
+            sdk.reconcile_subscription(
+                subscription,
+                &[],
+                SINCE,
+                UNTIL,
+                &Cursor::default(),
+                tokio::time::Instant::now() + SETTLE_TIMEOUT,
+            )
+            .await
+        }));
+    }
+    assert!(
+        fx.limit
+            .wait_for(Duration::from_secs(2), |s| s.neg_active_now() == 8)
+            .await
+    );
+
+    let healthy = LimitRelay::start(fx.upstream_url.clone(), LimitConfig::default()).await;
+    fx.sdk.client().add_relay(healthy.url()).await.unwrap();
+    fx.sdk.client().connect().await;
+    assert!(
+        healthy
+            .wait_for(Duration::from_secs(2), |s| s.open_connections() == 1)
+            .await
+    );
+    let (summary, recovered) = fx
+        .sdk
+        .reconcile_subscription(
+            reconciliation_route(&healthy.url(), &fx.account),
+            &[],
+            SINCE,
+            UNTIL,
+            &Cursor::default(),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.relays_failed, 0);
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(
+        (
+            recovered[0].event.id.clone(),
+            recovered[0].event.content.clone()
+        ),
+        expected
+    );
+
+    let failures =
+        failure_classes(&fx, std::slice::from_ref(&url), Duration::from_millis(80)).await;
+    assert!(
+        owners.iter().all(|owner| !owner.is_finished()),
+        "owners must still hold their permits (SDK first-reply timeout is 5 s)"
+    );
+    assert_eq!(failures, vec![NostrReconciliationFailure::RouteTimeout]);
+    assert_eq!(
+        fx.limit.stats().neg_opens,
+        8,
+        "expired wait cannot open NEG"
+    );
+    let queued = {
+        let sdk = fx.sdk.clone();
+        let subscription = reconciliation_route(&url, &fx.account);
+        tokio::spawn(async move {
+            sdk.reconcile_subscription(
+                subscription,
+                &[],
+                SINCE,
+                UNTIL,
+                &Cursor::default(),
+                tokio::time::Instant::now() + SETTLE_TIMEOUT,
+            )
+            .await
+        })
+    };
+    // Let the queued call enter its wait while all eight relay sessions remain live.
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    queued.abort();
+    assert!(queued.await.unwrap_err().is_cancelled());
+    assert_eq!(fx.limit.stats().neg_opens, 8);
+    for owner in &owners {
+        owner.abort();
+    }
+    for owner in owners {
+        assert!(owner.await.unwrap_err().is_cancelled());
+    }
+    // Cancellation queues wire cleanup; observe it before reusing the relay cap.
+    assert!(
+        fx.limit
+            .wait_for(Duration::from_secs(2), |s| s.neg_active_now() == 0)
+            .await
+    );
+    fx.limit.set_neg_fault(NegFault::None);
+    let (summary, recovered) = fx
+        .sdk
+        .reconcile_subscription(
+            reconciliation_route(&url, &fx.account),
+            &[],
+            SINCE,
+            UNTIL,
+            &Cursor::default(),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.relays_failed, 0);
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(
+        (
+            recovered[0].event.id.clone(),
+            recovered[0].event.content.clone()
+        ),
+        expected
+    );
+    assert_eq!(neg_sessions_after_pass(&fx).await, 0);
+    assert_eq!(fx.limit.stats().neg_cap_notices, 0);
+    assert_eq!(
+        fx.limit.stats().connections.len(),
+        1,
+        "credits survive without reconnect"
+    );
+    fx.shutdown().await;
+}
+
 /// Hundreds of completed passes on one connection: the NEG session count
 /// returns to zero after every pass and never approaches the 200 cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

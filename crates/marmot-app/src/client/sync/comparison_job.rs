@@ -4,6 +4,7 @@
 
 use super::super::{EpochGapBound, EpochGapWindow, EpochGapWindowKey, EpochGapWindows};
 use super::*;
+use futures::{StreamExt, stream};
 use std::collections::VecDeque;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -92,6 +93,9 @@ struct AdmissionRoute {
     reached_endpoints: Vec<String>,
     /// Every event this route fetched was durably admitted.
     admitted: bool,
+    /// Local ingest kept no durable trace, distinct from an invalid event or
+    /// unknown remote coverage. The comparison slot must retry this work.
+    retry_admission: bool,
     /// Owned comparison events still to attempt. No successful network result
     /// means no cursor progress; refusals and definitive rejections finish an
     /// attempt, but an ingest error leaves this count unchanged.
@@ -601,43 +605,6 @@ fn keep_window_progress(
     }
 }
 
-/// How many equal units of the pass a route's turn takes: one to compare, and
-/// one more for an epoch-gap route's newest `window`.
-fn turn_units(window: Option<[u8; 32]>) -> u32 {
-    1 + u32::from(window.is_some())
-}
-
-/// The turn of a route starting `now`, with `units_left` turn units (this
-/// route's included) still to run before the pass ends at `deadline`: when its
-/// comparison must finish, and when the turn ends.
-///
-/// Routes run one after another, and the rotation claimed every one of them
-/// when the grant froze. Each comparison gets an equal unit of what is left,
-/// so a slow relay on one route cannot spend the turns of the routes after it;
-/// time a fast route leaves unused carries over to the rest. An epoch-gap
-/// route's turn adds a unit, at most the window fetch's own limit, for the
-/// newest `window` of relays that could not compare: a relay that ignores
-/// NEG-OPEN runs its comparison to the end, and the window must still fit.
-/// Any other route leaves a margin for the hard guard to receive the SDK's
-/// partial result instead of cancelling it, which only binds on the last
-/// route. Neither is the SDK's own reserve inside the comparison deadline,
-/// which picks what a cut-short oldest-first window may return.
-fn route_turn(
-    now: tokio::time::Instant,
-    deadline: tokio::time::Instant,
-    units_left: u32,
-    window: Option<[u8; 32]>,
-) -> (tokio::time::Instant, tokio::time::Instant) {
-    let remaining = deadline.saturating_duration_since(now);
-    let unit = remaining / units_left.max(1);
-    let turn_ends = now + unit * turn_units(window);
-    let compare_until = match window {
-        Some(_) => turn_ends - unit.min(EPOCH_GAP_WINDOW_MAX_DURATION),
-        None => turn_ends.min(deadline - (unit / 5).min(Duration::from_millis(400))),
-    };
-    (compare_until, turn_ends)
-}
-
 impl ComparisonNetworkJob {
     /// Cancel the request and wait until its future has dropped the shared credit.
     pub(crate) async fn abort_and_wait(mut self) {
@@ -724,151 +691,186 @@ impl ComparisonNetworkJob {
                     .store(attempt_serial, Ordering::SeqCst);
                 ActiveCounter::new(witness.active_jobs.clone())
             });
-            let mut results = Vec::with_capacity(routes.len());
-            let mut units_left = routes
-                .iter()
-                .map(|route| turn_units(route.window.map(|(id, _)| id)))
-                .sum::<u32>();
-            for frozen in routes {
-                let FrozenRoute {
-                    inventory,
-                    initial_cursor,
-                    window,
-                } = frozen;
-                let units = units_left;
-                units_left -= turn_units(window.map(|(id, _)| id));
-                let now = tokio::time::Instant::now();
-                if now >= deadline {
-                    results.push(ComparisonRouteResult {
-                        route: inventory.route,
-                        initial_cursor,
-                        cursor: initial_cursor,
-                        result: ComparisonRouteWorkResult::Skipped,
-                        window: Vec::new(),
-                        window_progress: Vec::new(),
-                    });
-                    continue;
-                }
-                let endpoints = inventory.work.endpoints().to_vec();
-                let (since, until) = (inventory.since, inventory.until);
-                let progress = Arc::new(MemoryProgress {
-                    cursor: Mutex::new(initial_cursor),
-                });
-                let (comparison_deadline, turn_ends) =
-                    route_turn(now, deadline, units, window.map(|(id, _)| id));
-                let run = async {
+            // Refill a completed slot even while an earlier route is stalled.
+            // Indexed results keep admission and audit in inventory order.
+            // These futures stay owned by this task, so abort drops every
+            // request before returning its account-wide credit.
+            let mut results = (0..routes.len()).map(|_| None).collect::<Vec<_>>();
+            let mut pending =
+                stream::iter(routes.into_iter().enumerate().map(|(index, frozen)| {
+                    let adapter = &adapter;
+                    let plane = &plane;
+                    let windows = &windows;
                     #[cfg(test)]
-                    let _request_active = witness
-                        .as_ref()
-                        .map(|witness| ActiveCounter::new(witness.active_requests.clone()));
-                    #[cfg(test)]
-                    if let Some(scripted) = &scripted {
-                        let (delay, timed) = match scripted.timed_answer(&inventory.route) {
-                            Some((delay, answer)) => (delay, Some(answer)),
-                            None => (None, None),
-                        };
-                        if let Some(cursor) = scripted_cursor {
-                            progress.save_cursor(Some(cursor))?;
+                    let (witness, scripted) = (&witness, &scripted);
+                    async move {
+                        let result = async move {
+                            let FrozenRoute {
+                                inventory,
+                                initial_cursor,
+                                window,
+                            } = frozen;
+                            if tokio::time::Instant::now() >= deadline {
+                                return ComparisonRouteResult {
+                                    route: inventory.route,
+                                    initial_cursor,
+                                    cursor: initial_cursor,
+                                    result: ComparisonRouteWorkResult::Skipped,
+                                    window: Vec::new(),
+                                    window_progress: Vec::new(),
+                                };
+                            }
+                            let endpoints = inventory.work.endpoints().to_vec();
+                            let (since, until) = (inventory.since, inventory.until);
+                            let progress = Arc::new(MemoryProgress {
+                                cursor: Mutex::new(initial_cursor),
+                            });
+                            // The hard guard must not cancel an SDK-owned partial prefix.
+                            // Leave time for its handoff, or for an epoch-gap relay's
+                            // history window when that relay could not compare.
+                            let remaining =
+                                deadline.saturating_duration_since(tokio::time::Instant::now());
+                            let reserve = if window.is_some() {
+                                (remaining / 2).min(EPOCH_GAP_WINDOW_MAX_DURATION)
+                            } else {
+                                (remaining / 5).min(Duration::from_millis(400))
+                            };
+                            let comparison_deadline = deadline - reserve;
+                            let run = async {
+                                #[cfg(test)]
+                                let _request_active = witness.as_ref().map(|witness| {
+                                    ActiveCounter::new(witness.active_requests.clone())
+                                });
+                                #[cfg(test)]
+                                if let Some(scripted) = &scripted {
+                                    let (delay, timed) =
+                                        match scripted.timed_answer(&inventory.route) {
+                                            Some((delay, answer)) => (delay, Some(answer)),
+                                            None => (None, None),
+                                        };
+                                    if let Some(cursor) = scripted_cursor {
+                                        progress.save_cursor(Some(cursor))?;
+                                    }
+                                    if let Some(delay) = delay.or(scripted_delay) {
+                                        tokio::time::sleep(delay).await;
+                                    }
+                                    return timed
+                                        .unwrap_or_else(|| scripted.answer(&inventory.route));
+                                }
+                                match inventory.work {
+                                    TransportReconciliationWork::Inbox(endpoints) => {
+                                        adapter
+                                            .reconcile_inbox_history(
+                                                endpoints,
+                                                &inventory.items,
+                                                inventory.since,
+                                                inventory.until,
+                                                progress.as_ref(),
+                                                comparison_deadline,
+                                            )
+                                            .await
+                                    }
+                                    TransportReconciliationWork::Group(group) => {
+                                        adapter
+                                            .reconcile_group_history(
+                                                group,
+                                                &inventory.items,
+                                                inventory.since,
+                                                inventory.until,
+                                                progress.as_ref(),
+                                                comparison_deadline,
+                                            )
+                                            .await
+                                    }
+                                }
+                            };
+                            let result = match tokio::time::timeout_at(deadline, run).await {
+                                Ok(value) => ComparisonRouteWorkResult::Returned(value),
+                                Err(_) => ComparisonRouteWorkResult::TimedOut,
+                            };
+                            #[cfg(test)]
+                            if let Some(witness) = &witness
+                                && let ComparisonRouteWorkResult::Returned(Ok(Some((_, events)))) =
+                                    &result
+                            {
+                                witness
+                                    .returned_events
+                                    .fetch_add(events.len(), Ordering::SeqCst);
+                                if let Some(target) =
+                                    witness.target_event_id.lock().unwrap().as_ref()
+                                {
+                                    witness.matching_events.fetch_add(
+                                        events
+                                            .iter()
+                                            .filter(|event| {
+                                                event.event.id.eq_ignore_ascii_case(target)
+                                            })
+                                            .count(),
+                                        Ordering::SeqCst,
+                                    );
+                                }
+                            }
+                            let (window, window_progress) = match window {
+                                Some((transport_group_id, goal)) => {
+                                    let endpoints = result.uncompared_endpoints(&endpoints);
+                                    let remaining = deadline
+                                        .saturating_duration_since(tokio::time::Instant::now());
+                                    fetch_epoch_gap_window(
+                                        plane,
+                                        NostrAcquisitionRequest {
+                                            account_id: adapter.account_id().clone(),
+                                            scope: NostrAcquisitionScope::GroupWindow {
+                                                transport_group_id,
+                                                since,
+                                                until,
+                                                newest: Some(EPOCH_GAP_WINDOW_PAGE_EVENTS),
+                                            },
+                                            limits:
+                                                transport_nostr_adapter::NostrAcquisitionLimits {
+                                                    max_endpoints: endpoints.len(),
+                                                    max_requested_event_ids: 1,
+                                                    max_received_items_per_endpoint:
+                                                        EPOCH_GAP_WINDOW_MAX_EVENTS_PER_RELAY,
+                                                    max_serialized_event_bytes_per_endpoint:
+                                                        EPOCH_GAP_WINDOW_MAX_BYTES_PER_RELAY,
+                                                    max_duration: remaining
+                                                        .min(EPOCH_GAP_WINDOW_MAX_DURATION),
+                                                },
+                                            endpoints,
+                                        },
+                                        &inventory.items,
+                                        windows,
+                                        generation,
+                                        goal,
+                                        deadline,
+                                    )
+                                    .await
+                                }
+                                None => (Vec::new(), Vec::new()),
+                            };
+                            let cursor =
+                                *progress.cursor.lock().expect("comparison progress mutex");
+                            ComparisonRouteResult {
+                                route: inventory.route,
+                                initial_cursor,
+                                cursor,
+                                result,
+                                window,
+                                window_progress,
+                            }
                         }
-                        if let Some(delay) = delay.or(scripted_delay) {
-                            tokio::time::sleep(delay).await;
-                        }
-                        return timed.unwrap_or_else(|| scripted.answer(&inventory.route));
+                        .await;
+                        (index, result)
                     }
-                    match inventory.work {
-                        TransportReconciliationWork::Inbox(endpoints) => {
-                            adapter
-                                .reconcile_inbox_history(
-                                    endpoints,
-                                    &inventory.items,
-                                    inventory.since,
-                                    inventory.until,
-                                    progress.as_ref(),
-                                    comparison_deadline,
-                                )
-                                .await
-                        }
-                        TransportReconciliationWork::Group(group) => {
-                            adapter
-                                .reconcile_group_history(
-                                    group,
-                                    &inventory.items,
-                                    inventory.since,
-                                    inventory.until,
-                                    progress.as_ref(),
-                                    comparison_deadline,
-                                )
-                                .await
-                        }
-                    }
-                };
-                let result = match tokio::time::timeout_at(deadline, run).await {
-                    Ok(value) => ComparisonRouteWorkResult::Returned(value),
-                    Err(_) => ComparisonRouteWorkResult::TimedOut,
-                };
-                #[cfg(test)]
-                if let Some(witness) = &witness
-                    && let ComparisonRouteWorkResult::Returned(Ok(Some((_, events)))) = &result
-                {
-                    witness
-                        .returned_events
-                        .fetch_add(events.len(), Ordering::SeqCst);
-                    if let Some(target) = witness.target_event_id.lock().unwrap().as_ref() {
-                        witness.matching_events.fetch_add(
-                            events
-                                .iter()
-                                .filter(|event| event.event.id.eq_ignore_ascii_case(target))
-                                .count(),
-                            Ordering::SeqCst,
-                        );
-                    }
-                }
-                let (window, window_progress) = match window {
-                    Some((transport_group_id, goal)) => {
-                        let endpoints = result.uncompared_endpoints(&endpoints);
-                        let remaining =
-                            turn_ends.saturating_duration_since(tokio::time::Instant::now());
-                        fetch_epoch_gap_window(
-                            &plane,
-                            NostrAcquisitionRequest {
-                                account_id: adapter.account_id().clone(),
-                                scope: NostrAcquisitionScope::GroupWindow {
-                                    transport_group_id,
-                                    since,
-                                    until,
-                                    newest: Some(EPOCH_GAP_WINDOW_PAGE_EVENTS),
-                                },
-                                limits: transport_nostr_adapter::NostrAcquisitionLimits {
-                                    max_endpoints: endpoints.len(),
-                                    max_requested_event_ids: 1,
-                                    max_received_items_per_endpoint:
-                                        EPOCH_GAP_WINDOW_MAX_EVENTS_PER_RELAY,
-                                    max_serialized_event_bytes_per_endpoint:
-                                        EPOCH_GAP_WINDOW_MAX_BYTES_PER_RELAY,
-                                    max_duration: remaining.min(EPOCH_GAP_WINDOW_MAX_DURATION),
-                                },
-                                endpoints,
-                            },
-                            &inventory.items,
-                            &windows,
-                            generation,
-                            goal,
-                            turn_ends,
-                        )
-                        .await
-                    }
-                    None => (Vec::new(), Vec::new()),
-                };
-                let cursor = *progress.cursor.lock().expect("comparison progress mutex");
-                results.push(ComparisonRouteResult {
-                    route: inventory.route,
-                    initial_cursor,
-                    cursor,
-                    result,
-                    window,
-                    window_progress,
-                });
+                }))
+                .buffer_unordered(TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS);
+            while let Some((index, result)) = pending.next().await {
+                results[index] = Some(result);
             }
+            let results = results
+                .into_iter()
+                .map(|result| result.expect("every frozen route returned"))
+                .collect();
             (credit, ComparisonNetworkResult { routes: results })
         });
         Ok(Self { handle })
@@ -1015,7 +1017,7 @@ impl AppClient {
             let mut reached_endpoints = Vec::new();
             let (outcome, certified, answered, events) = match route.result {
                 ComparisonRouteWorkResult::Skipped => {
-                    (Outcome::ServicedPartial, false, false, Vec::new())
+                    (Outcome::TransientFailure, false, false, Vec::new())
                 }
                 ComparisonRouteWorkResult::TimedOut
                 | ComparisonRouteWorkResult::Returned(Err(_)) => {
@@ -1113,6 +1115,7 @@ impl AppClient {
                 answered,
                 reached_endpoints,
                 admitted,
+                retry_admission: false,
                 remaining,
                 fetched: 0,
                 acquisition,
@@ -1212,6 +1215,7 @@ impl AppClient {
                         if let Some(route) = route.as_deref_mut() {
                             if unpersisted {
                                 route.admitted = false;
+                                route.retry_admission = true;
                             } else {
                                 route.fetched = route.fetched.saturating_add(1);
                             }
@@ -1605,6 +1609,7 @@ impl AppClient {
                 // Incomplete admission withholds the certificate and retries
                 // the route, but the relays still answered.
                 answered: route.answered,
+                retry_admission: route.retry_admission,
                 reached_endpoints: route.reached_endpoints,
                 acquisition: route.acquisition,
             });
@@ -2179,45 +2184,23 @@ mod tests {
         network
     }
 
-    #[test]
-    fn routes_split_what_is_left_of_the_pass() {
-        let now = tokio::time::Instant::now();
-        let deadline = now + Duration::from_secs(10);
-        let quarter = now + Duration::from_millis(2_500);
-        assert_eq!(
-            route_turn(now, deadline, 4, None),
-            (quarter, quarter),
-            "the first of four routes gets a quarter, not the pass"
-        );
-        let later = now + Duration::from_secs(7);
-        let third = later + Duration::from_secs(1);
-        assert_eq!(
-            route_turn(later, deadline, 3, None),
-            (third, third),
-            "a slow route leaves the rest equal shares of what it left"
-        );
-        assert_eq!(
-            route_turn(now, deadline, 1, None),
-            (deadline - Duration::from_millis(400), deadline),
-            "the last route leaves the guard time to take its partial result"
-        );
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DeadlineFault {
+        HeldFetch,
+        PostReplyStall,
+        RouteStall,
     }
 
-    #[test]
-    fn an_epoch_gap_window_fits_inside_its_routes_turn() {
-        let now = tokio::time::Instant::now();
-        let deadline = now + Duration::from_secs(10);
-        let window = Some([7; 32]);
-        assert_eq!(
-            route_turn(now, deadline, turn_units(window), window),
-            (deadline - EPOCH_GAP_WINDOW_MAX_DURATION, deadline),
-            "alone in the pass, a whole window fetch fits after the comparison"
-        );
-        assert_eq!(
-            route_turn(now, deadline, turn_units(window) + 3, window),
-            (now + Duration::from_secs(2), now + Duration::from_secs(4)),
-            "beside three routes, the comparison gets a unit and the window one more"
-        );
+    /// Proxy a real relay, delaying the first NEG reply path and then either
+    /// holding a later exact-ID REQ or stalling after a valid NEG fingerprint.
+    /// Ordinary group subscriptions cannot preload the SDK cache; only the
+    /// owned comparison/window paths can recover the genuine peer traffic.
+    struct DeadlineRelay {
+        url: String,
+        held_id: Arc<Mutex<Option<String>>>,
+        stalled_groups: Arc<Mutex<Vec<String>>>,
+        stalled: Arc<AtomicUsize>,
+        task: JoinHandle<()>,
     }
 
     /// Holds every exact-ID query that names `id`, as a relay that never
@@ -2337,6 +2320,1102 @@ mod tests {
         relay.shutdown();
     }
 
+    impl Drop for DeadlineRelay {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn deadline_relay(backend: String, fault: DeadlineFault) -> DeadlineRelay {
+        use futures::{SinkExt, StreamExt};
+        use serde_json::Value;
+        use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
+
+        // Valid v1 whole-range fingerprint, matching the adapter limit relay's
+        // FingerprintLoop: the peer must negotiate again, not fail parsing.
+        const MISMATCHED_NEG_MSG: &str = "61000001ffeeddccbbaa99887766554433221100";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let held_id = Arc::new(Mutex::new(None::<String>));
+        let stalled_groups = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stalled = Arc::new(AtomicUsize::new(0));
+        let held = held_id.clone();
+        let group = stalled_groups.clone();
+        let observed = stalled.clone();
+        let first_neg = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                let (backend, held, group, observed, first_neg) = (
+                    backend.clone(),
+                    held.clone(),
+                    group.clone(),
+                    observed.clone(),
+                    first_neg.clone(),
+                );
+                connections.spawn(async move {
+                    let Ok(client) = accept_async(stream).await else { return };
+                    let Ok((upstream, _)) = connect_async(backend).await else { return };
+                    let (mut client_write, mut client_read) = client.split();
+                    let (mut upstream_write, mut upstream_read) = upstream.split();
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                    let to_upstream = async {
+                        let mut stalled_sessions = std::collections::HashSet::new();
+                        while let Some(Ok(message)) = client_read.next().await {
+                            if let Message::Text(text) = &message
+                                && let Ok(frame) = serde_json::from_str::<Vec<Value>>(text)
+                            {
+                                match frame.first().and_then(Value::as_str) {
+                                    Some("NEG-OPEN") => {
+                                        if fault == DeadlineFault::RouteStall
+                                            && frame.get(2).and_then(|filter| filter.get("#h"))
+                                                .and_then(Value::as_array).is_some_and(|routes| {
+                                                    group.lock().unwrap().iter().any(|group| {
+                                                        routes.iter().any(|route| route.as_str() == Some(group.as_str()))
+                                                    })
+                                                })
+                                        {
+                                            let Some(id) = frame.get(1).and_then(Value::as_str) else { continue };
+                                            stalled_sessions.insert(id.to_owned());
+                                            tokio::time::sleep(Duration::from_millis(250)).await;
+                                            observed.fetch_add(1, Ordering::SeqCst);
+                                            let reply = serde_json::json!(["NEG-MSG", id, MISMATCHED_NEG_MSG]);
+                                            if tx.send(Message::Text(reply.to_string().into())).is_err() { break }
+                                            continue;
+                                        }
+                                        if fault != DeadlineFault::RouteStall
+                                            && first_neg.fetch_add(1, Ordering::SeqCst) == 0 {
+                                            tokio::time::sleep(Duration::from_secs(4)).await;
+                                        }
+                                        if fault == DeadlineFault::RouteStall {
+                                            // Healthy history is not an instant empty answer:
+                                            // each useful comparison crosses a WAN-like hop.
+                                            tokio::time::sleep(Duration::from_millis(250)).await;
+                                        }
+                                        if fault == DeadlineFault::PostReplyStall {
+                                            // Whole-range mismatched fingerprint: a real
+                                            // NEG round follows, then the relay goes idle.
+                                            let reply = serde_json::json!(["NEG-MSG", frame[1],
+                                                MISMATCHED_NEG_MSG]);
+                                            if tx.send(Message::Text(reply.to_string().into())).is_err() { break }
+                                            continue;
+                                        }
+                                    }
+                                    Some("NEG-MSG") if fault == DeadlineFault::RouteStall
+                                        && frame.get(1).and_then(Value::as_str)
+                                            .is_some_and(|id| stalled_sessions.contains(id)) => {
+                                        // Keep the relevant negotiation active through both
+                                        // SDK first-reply and idle timers. Only the caller's
+                                        // existing route/pass cutoff can end this attempt.
+                                        tokio::time::sleep(Duration::from_millis(250)).await;
+                                        observed.fetch_add(1, Ordering::SeqCst);
+                                        let reply = serde_json::json!(["NEG-MSG", frame[1], MISMATCHED_NEG_MSG]);
+                                        if tx.send(Message::Text(reply.to_string().into())).is_err() { break }
+                                        continue;
+                                    }
+                                    Some("NEG-MSG") if fault == DeadlineFault::PostReplyStall => {
+                                        observed.fetch_add(1, Ordering::SeqCst);
+                                        continue;
+                                    }
+                                    Some("NEG-CLOSE") => {
+                                        if let Some(id) = frame.get(1).and_then(Value::as_str) {
+                                            stalled_sessions.remove(id);
+                                        }
+                                    }
+                                    Some("REQ") => {
+                                        let blocked = frame.iter().skip(2).any(|filter| {
+                                            if fault == DeadlineFault::RouteStall {
+                                                if filter.get("#p").is_some() {
+                                                    return true;
+                                                }
+                                                if filter.get("#h").and_then(Value::as_array).is_some_and(|routes| {
+                                                    group.lock().unwrap().iter().any(|group| {
+                                                        routes.iter().any(|route| route.as_str() == Some(group.as_str()))
+                                                    })
+                                                }) {
+                                                    return true;
+                                                }
+                                            }
+                                            if let Some(ids) = filter.get("ids").and_then(Value::as_array) {
+                                                return held.lock().unwrap().as_ref().is_some_and(|held| {
+                                                    ids.iter().any(|id| id.as_str() == Some(held.as_str()))
+                                                });
+                                            }
+                                            filter.get("#h").is_some()
+                                                && filter.get("limit").and_then(Value::as_u64)
+                                                    != Some(EPOCH_GAP_WINDOW_MAX_EVENTS_PER_RELAY as u64)
+                                        });
+                                        if blocked {
+                                            if frame.iter().skip(2).any(|filter| filter.get("ids").is_some()) {
+                                                observed.fetch_add(1, Ordering::SeqCst);
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if upstream_write.send(message).await.is_err() { break }
+                        }
+                    };
+                    let to_client = async {
+                        loop {
+                            let message = tokio::select! {
+                                message = rx.recv() => match message { Some(message) => message, None => break },
+                                message = upstream_read.next() => match message { Some(Ok(message)) => message, _ => break },
+                            };
+                            if client_write.send(message).await.is_err() { break }
+                        }
+                    };
+                    tokio::select! { _ = to_upstream => {}, _ = to_client => {} }
+                });
+            }
+        });
+        DeadlineRelay {
+            url,
+            held_id,
+            stalled_groups,
+            stalled,
+            task,
+        }
+    }
+
+    async fn settle_peer_epoch(client: &mut AppClient, group_id: &GroupId) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                client
+                    .advance_convergence_after_runtime_sync(group_id)
+                    .await
+                    .unwrap();
+                if matches!(
+                    client.group_mls_state(group_id).unwrap().lifecycle_state,
+                    crate::AppGroupLifecycleState::Stable
+                ) && !client
+                    .runtime
+                    .has_pending_convergence_inputs(group_id)
+                    .unwrap()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the real authored epoch settles before another peer operation");
+    }
+
+    /// Both regressions enter through the real app job and admit genuine MLS
+    /// traffic. Rewrapping changes only the transport timestamp/id, as when an
+    /// offline peer's already-authored traffic reaches a relay much later.
+    async fn recover_peer_at_caller_cutoff(fault: DeadlineFault) {
+        use nostr_sdk::local_relay::LocalRelay;
+        let epoch_gap = fault == DeadlineFault::PostReplyStall;
+        let relay = LocalRelay::new();
+        relay.run().await.unwrap();
+        let proxy = deadline_relay(relay.url().await.to_string(), fault).await;
+        let mut fixture = fixture_with_group_relays(Some(vec![proxy.url.clone()])).await;
+        let app = fixture.client.app.clone();
+        let bob = crate::AccountHome::open(fixture._dir.path())
+            .create_account("bob")
+            .unwrap();
+        crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+        let mut peer = client_on_app_relay_plane(&app, "bob").await;
+        peer.sync().await.unwrap();
+        fixture
+            .client
+            .invite_members(&fixture.group_id, &[bob.account_id_hex.as_str()])
+            .await
+            .unwrap();
+        peer.sync().await.unwrap();
+        if epoch_gap {
+            settle_peer_epoch(&mut fixture.client, &fixture.group_id).await;
+            settle_peer_epoch(&mut peer, &fixture.group_id).await;
+            fixture
+                .client
+                .promote_admin(&fixture.group_id, &bob.account_id_hex)
+                .await
+                .unwrap();
+            settle_peer_epoch(&mut fixture.client, &fixture.group_id).await;
+            peer.sync().await.unwrap();
+            settle_peer_epoch(&mut peer, &fixture.group_id).await;
+            assert_eq!(
+                peer.group_mls_state(&fixture.group_id).unwrap().epoch,
+                fixture
+                    .client
+                    .group_mls_state(&fixture.group_id)
+                    .unwrap()
+                    .epoch
+            );
+        }
+        let initial_epoch = fixture
+            .client
+            .group_mls_state(&fixture.group_id)
+            .unwrap()
+            .epoch;
+        let before = fixture
+            .relay
+            .attempted_events()
+            .into_iter()
+            .map(|event| event.id)
+            .collect::<HashSet<_>>();
+        let commit_id = if epoch_gap {
+            let commit = peer
+                .update_group_profile(&fixture.group_id, Some("late real commit"), None)
+                .await
+                .unwrap();
+            assert_eq!(
+                commit.published, 1,
+                "Bob publishes the genuine late MLS commit"
+            );
+            let mut commits = fixture
+                .relay
+                .attempted_events()
+                .into_iter()
+                .filter(|event| !before.contains(&event.id))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                commits.len(),
+                1,
+                "the profile change publishes exactly its genuine MLS commit"
+            );
+            let commit_id = commits.pop().unwrap().id;
+            settle_peer_epoch(&mut peer, &fixture.group_id).await;
+            Some(commit_id)
+        } else {
+            None
+        };
+        let sent = peer
+            .send(&fixture.group_id, b"peer recovered at caller cutoff")
+            .await
+            .unwrap();
+        assert_eq!(
+            sent.published, 1,
+            "Bob's first genuine message reaches the relay"
+        );
+        let later = peer
+            .send(&fixture.group_id, b"later peer held by relay")
+            .await
+            .unwrap();
+        assert_eq!(
+            later.published, 1,
+            "Bob's later genuine message reaches the relay"
+        );
+        let peer_epoch = peer.group_mls_state(&fixture.group_id).unwrap().epoch;
+        let route_hex = app
+            .group("alice", &hex::encode(fixture.group_id.as_slice()))
+            .unwrap()
+            .unwrap()
+            .nostr_routing
+            .nostr_group_id_hex;
+        let source = app
+            .account_storage("bob")
+            .unwrap()
+            .app_storage()
+            .timeline_message(
+                &hex::encode(fixture.group_id.as_slice()),
+                &sent.message_ids[0],
+            )
+            .unwrap()
+            .unwrap()
+            .source_message_id_hex
+            .unwrap();
+        let mut originals = fixture
+            .relay
+            .attempted_events()
+            .into_iter()
+            .filter(|event| !before.contains(&event.id))
+            .collect::<Vec<_>>();
+        // A commit precedes both messages. In the non-gap case the first
+        // message's smaller ID also makes it the SDK's first exact-ID fetch.
+        originals.sort_by_key(|event| {
+            if commit_id.as_ref() == Some(&event.id) {
+                0
+            } else if event.id == source {
+                1
+            } else {
+                2
+            }
+        });
+        let at = crate::unix_now_seconds() - 60;
+        let mut published = Vec::new();
+        for (index, original) in originals.into_iter().enumerate() {
+            let event = loop {
+                let event = EventBuilder::new(Kind::MlsGroupMessage, original.content.clone())
+                    .tags([Tag::custom("h", [route_hex.clone()])])
+                    .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(at + index as u64))
+                    .finalize(&Keys::generate())
+                    .unwrap();
+                if epoch_gap || (event.id.to_bytes()[0] < 128) == (index == 0) {
+                    break event;
+                }
+            };
+            relay.add_event(event.clone()).await.unwrap();
+            published.push(event);
+        }
+        assert_eq!(published.len(), if epoch_gap { 3 } else { 2 });
+        if !epoch_gap {
+            *proxy.held_id.lock().unwrap() = Some(published[1].id.to_hex());
+        }
+        drop(peer);
+        drop(fixture.client);
+        let real_app = crate::MarmotApp::with_relay_and_config(
+            fixture._dir.path(),
+            proxy.url.clone(),
+            crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+        );
+        fixture.client = client_on_app_relay_plane(&real_app, "alice").await;
+        fixture.client.test_comparison_results = None;
+        assert!(
+            !real_app
+                .messages("alice")
+                .unwrap()
+                .iter()
+                .any(|message| { sent.message_ids.contains(&message.message_id_hex) }),
+            "Alice has not consumed the genuine peer message before recovery"
+        );
+        assert_eq!(
+            fixture
+                .client
+                .group_mls_state(&fixture.group_id)
+                .unwrap()
+                .epoch,
+            initial_epoch
+        );
+        if epoch_gap {
+            // The peer's real post-commit message is undecryptable until the
+            // window recovers the missing commit, not a synthetic gap probe.
+            let event = transport_nostr_adapter::NostrRelayEvent {
+                endpoint: cgka_traits::TransportEndpoint(proxy.url.clone()),
+                subscription_id: None,
+                event: transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&published[1])
+                    .unwrap(),
+            };
+            for delivery in fixture
+                .client
+                .adapter
+                .recovered_deliveries(event)
+                .await
+                .unwrap()
+            {
+                fixture
+                    .client
+                    .ingest_received_delivery(delivery)
+                    .await
+                    .unwrap();
+            }
+            arm_unpaced_epoch_gap(&fixture);
+        } else {
+            fixture.client.request_bounded_comparison().unwrap();
+            let (grant, execution, _, _) = group_route_grant(&mut fixture).await;
+            let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+            let mut job = ComparisonNetworkJob::start(
+                &fixture.client,
+                &grant,
+                capacity.try_acquire_owned().unwrap(),
+                tokio::time::Instant::now(),
+                None,
+            )
+            .unwrap();
+            let (credit, network) = job.wait().await.unwrap();
+            assert!(
+                network
+                    .routes
+                    .iter()
+                    .all(|route| { matches!(route.result, ComparisonRouteWorkResult::Skipped) })
+            );
+            fixture
+                .client
+                .admit_comparison_inline(grant, execution, network)
+                .await
+                .unwrap();
+            drop(credit);
+            assert!(
+                fixture
+                    .storage
+                    .app_storage()
+                    .recovery_comparison()
+                    .unwrap()
+                    .pending(),
+                "never-started acquisition keeps its automatic retry, without a new request"
+            );
+            fixture
+                .client
+                .recovery_owner
+                .test_advance_to_retry(&fixture.storage);
+        }
+        let (mut grant, mut execution, route, _) = group_route_grant(&mut fixture).await;
+        // Run the real group obligation first; an unrelated inbox's first NEG
+        // must not consume the relay's deliberate WAN delay.
+        grant
+            .inventory
+            .sort_by_key(|inventory| inventory.route != route);
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut job = ComparisonNetworkJob::start(
+            &fixture.client,
+            &grant,
+            capacity.try_acquire_owned().unwrap(),
+            ComparisonNetworkJob::automatic_deadline(),
+            None,
+        )
+        .unwrap();
+        let (_credit, network) = job.wait().await.unwrap();
+        assert!(
+            proxy.stalled.load(Ordering::SeqCst) > 0,
+            "the real relay reached the stalled stage"
+        );
+        let result = &network.routes[0];
+        if epoch_gap {
+            assert!(
+                result
+                    .window
+                    .iter()
+                    .any(|event| event.event.id == published[0].id.to_hex()),
+                "the caller left enough time to recover the genuine late commit"
+            );
+        } else {
+            let ComparisonRouteWorkResult::Returned(Ok(Some((_, events)))) = &result.result else {
+                panic!("the hard app guard discarded the SDK's owned prefix");
+            };
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.event.id == published[0].id.to_hex()),
+                "the SDK returns a nonempty owned prefix despite the later stalled fetch"
+            );
+            assert!(result.window.is_empty());
+        }
+        let mut admission = fixture
+            .client
+            .accept_comparison_network(&grant, &mut execution, network)
+            .await
+            .unwrap()
+            .unwrap();
+        while !fixture
+            .client
+            .admit_comparison_turn(&grant, &mut execution, &mut admission)
+            .await
+            .unwrap()
+        {}
+        fixture
+            .client
+            .finish_comparison_grant(grant, execution, Some(admission))
+            .await
+            .unwrap();
+        if epoch_gap {
+            // Window admission retains the real commit and future traffic;
+            // the worker's ordinary convergence turns adopt that commit and
+            // retry the deferred application backlog under the new context.
+            // Drive only that retained work, without another network fetch.
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    fixture
+                        .client
+                        .advance_convergence_after_runtime_sync(&fixture.group_id)
+                        .await
+                        .unwrap();
+                    if real_app.messages("alice").unwrap().iter().any(|message| {
+                        message.sender == bob.account_id_hex
+                            && sent.message_ids.contains(&message.message_id_hex)
+                            && message.plaintext == "peer recovered at caller cutoff"
+                    }) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("ordinary convergence adopts the recovered commit and projects Bob's message");
+        }
+        assert!(
+            real_app.messages("alice").unwrap().iter().any(|message| {
+                message.sender == bob.account_id_hex
+                    && sent.message_ids.contains(&message.message_id_hex)
+                    && message.plaintext == "peer recovered at caller cutoff"
+            }),
+            "the owned result reaches Alice's authenticated timeline"
+        );
+        if epoch_gap {
+            assert!(peer_epoch > initial_epoch);
+            assert_eq!(
+                fixture
+                    .client
+                    .group_mls_state(&fixture.group_id)
+                    .unwrap()
+                    .epoch,
+                peer_epoch
+            );
+            assert_eq!(
+                real_app
+                    .group("alice", &hex::encode(fixture.group_id.as_slice()))
+                    .unwrap()
+                    .unwrap()
+                    .profile
+                    .name,
+                "late real commit"
+            );
+        }
+        relay.shutdown();
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FairnessPass {
+        Automatic,
+        Explicit,
+        RefillBoundary,
+        ExpiredFloor,
+    }
+
+    async fn recover_stalled_routes(pass: FairnessPass) {
+        use nostr_sdk::local_relay::LocalRelay;
+
+        let relay = LocalRelay::new();
+        relay.run().await.unwrap();
+        let proxy = deadline_relay(relay.url().await.to_string(), DeadlineFault::RouteStall).await;
+        let stalled_proxy = if pass == FairnessPass::RefillBoundary {
+            Some(deadline_relay(relay.url().await.to_string(), DeadlineFault::RouteStall).await)
+        } else {
+            None
+        };
+        let stalled_relay = stalled_proxy.as_ref().unwrap_or(&proxy);
+        let mut fixture =
+            fixture_with_group_relays_and_comparison(Some(vec![stalled_relay.url.clone()]), false)
+                .await;
+        let app = fixture.client.app.clone();
+        let mut stalled_groups = vec![fixture.group_id.clone()];
+        if pass == FairnessPass::Explicit {
+            for index in 0..3 {
+                stalled_groups.push(
+                    fixture
+                        .client
+                        .create_group_with_options(
+                            &format!("stalled explicit {index}"),
+                            &[],
+                            crate::AppCreateGroupOptions {
+                                relays: Some(vec![proxy.url.clone()]),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
+        }
+        let alice = hex::encode(fixture.client.runtime.session().self_id().as_slice());
+        let bob = crate::AccountHome::open(fixture._dir.path())
+            .create_account("bob")
+            .unwrap();
+        for member in [&alice, &bob.account_id_hex] {
+            crate::tests::remember_test_member_inbox(&app, member, "wss://relay.example");
+        }
+        let mut peer = client_on_app_relay_plane(&app, "bob").await;
+        peer.sync().await.unwrap();
+        let mut messages = Vec::new();
+        // Automatic work exceeds its three rotation slots. Explicit work has
+        // four armed stalls and a healthy tail. Neither test reorders grants.
+        let healthy = if matches!(pass, FairnessPass::Explicit | FairnessPass::ExpiredFloor) {
+            1
+        } else {
+            4
+        };
+        for index in 0..healthy {
+            let group = fixture
+                .client
+                .create_group_with_options(
+                    &format!("healthy rotation {index}"),
+                    &[],
+                    crate::AppCreateGroupOptions {
+                        relays: Some(vec![proxy.url.clone()]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            fixture
+                .client
+                .invite_members(&group, &[bob.account_id_hex.as_str()])
+                .await
+                .unwrap();
+            peer.sync().await.unwrap();
+            settle_peer_epoch(&mut fixture.client, &group).await;
+            settle_peer_epoch(&mut peer, &group).await;
+            let plaintext = format!("healthy peer {index} survives stalled route");
+            let sent = peer.send(&group, plaintext.as_bytes()).await.unwrap();
+            assert_eq!(sent.published, 1);
+            let source = app
+                .account_storage("bob")
+                .unwrap()
+                .app_storage()
+                .timeline_message(&hex::encode(group.as_slice()), &sent.message_ids[0])
+                .unwrap()
+                .unwrap()
+                .source_message_id_hex
+                .unwrap();
+            let original = fixture
+                .relay
+                .attempted_events()
+                .into_iter()
+                .find(|event| event.id == source)
+                .expect("Bob's actual outer transport publication");
+            let route = app
+                .group("alice", &hex::encode(group.as_slice()))
+                .unwrap()
+                .unwrap()
+                .nostr_routing
+                .nostr_group_id_hex;
+            let event = EventBuilder::new(Kind::MlsGroupMessage, original.content)
+                .tags([Tag::custom("h", [route])])
+                .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
+                    crate::unix_now_seconds() - 60 + index,
+                ))
+                .finalize(&Keys::generate())
+                .unwrap();
+            relay.add_event(event).await.unwrap();
+            messages.push((
+                hex::encode(group.as_slice()),
+                sent.message_ids[0].clone(),
+                plaintext,
+            ));
+        }
+        let inbox_group = if matches!(
+            pass,
+            FairnessPass::RefillBoundary | FairnessPass::ExpiredFloor
+        ) {
+            // Boundary modes isolate refill or retained-floor settlement. A
+            // new-group welcome changes their fence, covered by the other modes.
+            None
+        } else {
+            let inbox_group = peer
+                .create_group_with_options(
+                    "real inbox recovery",
+                    &[],
+                    crate::AppCreateGroupOptions {
+                        relays: Some(vec![proxy.url.clone()]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            peer.invite_members(&inbox_group, &[alice.as_str()])
+                .await
+                .unwrap();
+            let welcome = fixture
+                .relay
+                .attempted_events()
+                .into_iter()
+                .rev()
+                .find(|event| {
+                    event.kind == 1059
+                        && event.tags.iter().any(|tag| {
+                            tag.first().is_some_and(|key| key == "p") && tag.get(1) == Some(&alice)
+                        })
+                })
+                .expect("Bob published Alice's real encrypted welcome");
+            let welcome: nostr_sdk::prelude::Event =
+                serde_json::from_value(serde_json::to_value(welcome).unwrap()).unwrap();
+            relay.add_event(welcome).await.unwrap();
+            Some(inbox_group)
+        };
+        let stalled = stalled_groups
+            .iter()
+            .map(|group| {
+                let route = app
+                    .group("alice", &hex::encode(group.as_slice()))
+                    .unwrap()
+                    .unwrap()
+                    .nostr_routing
+                    .nostr_group_id_hex;
+                stalled_relay
+                    .stalled_groups
+                    .lock()
+                    .unwrap()
+                    .push(route.clone());
+                TransportReconciliationRoute::Group(hex::decode(route).unwrap().try_into().unwrap())
+            })
+            .collect::<Vec<_>>();
+        drop(peer);
+        drop(fixture.client);
+        let real_app = crate::MarmotApp::with_relay_and_config(
+            fixture._dir.path(),
+            proxy.url.clone(),
+            crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+        );
+        // Persist the actual inbox before opening Alice: a saved kind-10050
+        // declaration takes precedence over the app's constructor default.
+        real_app
+            .set_account_inbox_relays(
+                "alice",
+                vec![cgka_traits::TransportEndpoint(proxy.url.clone())],
+                vec![cgka_traits::TransportEndpoint(proxy.url.clone())],
+            )
+            .await
+            .unwrap();
+        fixture.client = client_on_app_relay_plane(&real_app, "alice").await;
+        fixture.client.test_comparison_results = None;
+        let intents = stalled_groups
+            .iter()
+            .map(|group| storage_sqlite::StoredEpochBackfillIntent {
+                group_id_hex: hex::encode(group.as_slice()),
+                stalled_epoch: fixture.client.group_mls_state(group).unwrap().epoch,
+            })
+            .collect::<Vec<_>>();
+        fixture
+            .storage
+            .app_storage()
+            .arm_epoch_backfill_intents(&intents)
+            .unwrap();
+        // Join once: a pending comparison revision must preserve goals outside
+        // its first batch while the failed leader keeps its retry ID.
+        let mut excluded_evidence = None;
+        if pass == FairnessPass::Automatic {
+            fixture.client.request_bounded_comparison().unwrap();
+        } else if pass == FairnessPass::ExpiredFloor {
+            fixture.client.request_bounded_comparison().unwrap();
+            let storage = fixture.storage.app_storage();
+            let history = storage
+                .pending_recovery_demands()
+                .unwrap()
+                .into_iter()
+                .find(|demand| demand.cause == storage_sqlite::RecoveryCause::IncrementalHistory)
+                .expect("the comparison joined real incremental debt");
+            let scopes = storage.recovery_scope_snapshots(history.ticket.id).unwrap();
+            let joined = scopes
+                .iter()
+                .find(|scope| match stalled[0] {
+                    TransportReconciliationRoute::Group(id) => {
+                        scope.plan.transport_group_id == Some(id)
+                    }
+                    TransportReconciliationRoute::Inbox => scope.plan.route_kind == 0,
+                })
+                .expect("the joined debt includes the stalled route");
+            // Move this route's real retained inventory past the already joined
+            // window through the retention API. Joining an older goal instead
+            // would not narrow pre-existing debt, whose bounds merge by max.
+            let retention_at = joined.plan.until_seconds
+                + storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS
+                + 1;
+            let inventory = storage
+                .transport_reconciliation_inventory(&stalled[0], retention_at)
+                .unwrap();
+            assert!(
+                inventory.since > joined.plan.until_seconds,
+                "the actual durable floor must exceed the actual stored goal before execution"
+            );
+            let before = storage
+                .recovery_scope_snapshots(history.ticket.id)
+                .unwrap()
+                .into_iter()
+                .find(|scope| match stalled[0] {
+                    TransportReconciliationRoute::Group(id) => {
+                        scope.plan.transport_group_id == Some(id)
+                    }
+                    TransportReconciliationRoute::Inbox => scope.plan.route_kind == 0,
+                })
+                .unwrap();
+            excluded_evidence = Some((
+                before.quiet_passes,
+                before.window_certified,
+                before.checkpoints,
+            ));
+        } else {
+            fixture
+                .storage
+                .app_storage()
+                .request_recovery(
+                    storage_sqlite::RecoveryRequest::ExplicitHistory {
+                        operation_id: &[44; 16],
+                    },
+                    crate::unix_now_seconds() * 1000,
+                )
+                .unwrap();
+        }
+        let revision = fixture
+            .storage
+            .app_storage()
+            .recovery_comparison()
+            .unwrap()
+            .revision;
+        assert!(messages.iter().all(|(group, id, plaintext)| {
+            !real_app.messages("alice").unwrap().iter().any(|message| {
+                &message.group_id_hex == group
+                    && &message.message_id_hex == id
+                    && message.sender == bob.account_id_hex
+                    && &message.plaintext == plaintext
+            })
+        }));
+        if let Some(group) = &inbox_group {
+            assert!(
+                real_app
+                    .group("alice", &hex::encode(group.as_slice()))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut recovered = false;
+        let max_passes = match pass {
+            FairnessPass::Automatic => 4,
+            FairnessPass::Explicit => 2,
+            FairnessPass::RefillBoundary => 1,
+            FairnessPass::ExpiredFloor => 2,
+        };
+        for _ in 0..max_passes {
+            fixture
+                .client
+                .recovery_owner
+                .test_advance_to_retry(&fixture.storage);
+            let mut permit = ExplicitRecoveryPermit::full_history();
+            let grant = fixture
+                .client
+                .authorize_account_recovery(
+                    matches!(pass, FairnessPass::Explicit | FairnessPass::RefillBoundary)
+                        .then_some(&mut permit),
+                    EpochBackfillExecutionSeam::Maintenance,
+                )
+                .unwrap()
+                .expect("unserved history remains automatically selectable");
+            if matches!(pass, FairnessPass::Automatic | FairnessPass::ExpiredFloor) {
+                assert_eq!(
+                    grant.comparison_revision,
+                    Some(revision),
+                    "the same comparison revision retries without a new request"
+                );
+            }
+            if pass == FairnessPass::ExpiredFloor {
+                let joined = grant
+                    .plan()
+                    .unwrap()
+                    .iter()
+                    .filter(|obligation| {
+                        obligation.cause == storage_sqlite::RecoveryCause::IncrementalHistory
+                    })
+                    .flat_map(|obligation| &obligation.scopes)
+                    .find(|scope| match stalled[0] {
+                        TransportReconciliationRoute::Group(id) => {
+                            scope.goal.transport_group_id == Some(id)
+                        }
+                        TransportReconciliationRoute::Inbox => scope.goal.route_kind == 0,
+                    })
+                    .expect("the frozen grant preserves excluded coverage debt");
+                let floor = fixture
+                    .client
+                    .transport_receipts()
+                    .unwrap()
+                    .inventory(&stalled[0], joined.goal.until_seconds)
+                    .unwrap()
+                    .since;
+                assert!(
+                    floor > joined.goal.until_seconds,
+                    "the real frozen goal must still be below its durable floor before I/O"
+                );
+                assert!(
+                    grant
+                        .comparison_plan
+                        .as_ref()
+                        .unwrap()
+                        .routes
+                        .iter()
+                        .all(|scope| {
+                            match stalled[0] {
+                                TransportReconciliationRoute::Group(id) => {
+                                    scope.transport_group_id != Some(id)
+                                }
+                                TransportReconciliationRoute::Inbox => scope.route_kind != 0,
+                            }
+                        }),
+                    "a goal below its observed retained floor cannot keep operational retries alive"
+                );
+            } else {
+                assert!(
+                    stalled.contains(&grant.inventory.first().unwrap().route),
+                    "the persistently armed group remains the actual scheduler's leader"
+                );
+            }
+            if matches!(pass, FairnessPass::Automatic | FairnessPass::ExpiredFloor) {
+                assert!(grant.inventory.len() <= TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS);
+            } else {
+                assert!(grant.inventory.len() > TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS);
+                let claim = fixture
+                    .storage
+                    .app_storage()
+                    .transport_reconciliation_route_cursor()
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    grant
+                        .inventory
+                        .iter()
+                        .take(TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS)
+                        .any(|item| item.route == claim),
+                    "the pre-I/O claim cannot include the unstarted explicit tail"
+                );
+            }
+            let execution = fixture.client.begin_comparison_grant(&grant).await.unwrap();
+            let control = FullHistoryRepairControl {
+                started: Instant::now(),
+                timeout: if pass == FairnessPass::RefillBoundary {
+                    Duration::from_secs(8)
+                } else {
+                    FULL_HISTORY_REPAIR_TIMEOUT
+                },
+                cancelled: &|| false,
+            };
+            let deadline = match pass {
+                FairnessPass::Automatic | FairnessPass::ExpiredFloor => {
+                    ComparisonNetworkJob::automatic_deadline()
+                }
+                FairnessPass::Explicit | FairnessPass::RefillBoundary => control.network_deadline(),
+            };
+            let mut job = ComparisonNetworkJob::start(
+                &fixture.client,
+                &grant,
+                capacity.clone().try_acquire_owned().unwrap(),
+                deadline,
+                None,
+            )
+            .unwrap();
+            let (credit, network) = job.wait().await.unwrap();
+            fixture
+                .client
+                .admit_comparison_inline(grant, execution, network)
+                .await
+                .unwrap();
+            drop(credit);
+            let projected = real_app.messages("alice").unwrap();
+            recovered = messages.iter().all(|(group, id, plaintext)| {
+                projected.iter().any(|message| {
+                    &message.group_id_hex == group
+                        && &message.message_id_hex == id
+                        && message.sender == bob.account_id_hex
+                        && &message.plaintext == plaintext
+                })
+            }) && inbox_group.as_ref().is_none_or(|group| {
+                real_app
+                    .group("alice", &hex::encode(group.as_slice()))
+                    .unwrap()
+                    .is_some()
+            });
+            let operational_complete = if pass == FairnessPass::ExpiredFloor {
+                let comparison = fixture.storage.app_storage().recovery_comparison().unwrap();
+                !comparison.pending()
+            } else {
+                true
+            };
+            if recovered && operational_complete {
+                break;
+            }
+        }
+        if pass != FairnessPass::ExpiredFloor {
+            assert!(
+                stalled_relay.stalled.load(Ordering::SeqCst) >= 2,
+                "the armed relay stayed stalled across rotation passes"
+            );
+        }
+        assert!(
+            recovered,
+            "all genuine Bob messages and his welcome arrive within {max_passes} passes"
+        );
+        if pass == FairnessPass::ExpiredFloor {
+            let comparison = fixture.storage.app_storage().recovery_comparison().unwrap();
+            let remaining = comparison.plan.as_ref().map(|plan| {
+                plan.routes
+                    .iter()
+                    .filter(|scope| plan.retry_routes.contains(&scope.scope_id))
+                    .map(|scope| {
+                        (
+                            scope.scope_id,
+                            scope.route_kind,
+                            scope.transport_group_id.map(hex::encode),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let planned_route_revision = comparison
+                .plan
+                .as_ref()
+                .map(|plan| plan.fence.route_revision);
+            let current_route_revision = fixture
+                .storage
+                .app_storage()
+                .recovery_revision_fence()
+                .unwrap()
+                .route_revision;
+            assert!(
+                !comparison.pending(),
+                "known unsearchable history cannot leave an endless operational retry: remaining={remaining:?}, planned_route_revision={planned_route_revision:?}, current_route_revision={current_route_revision}"
+            );
+            let history = fixture
+                .storage
+                .app_storage()
+                .pending_recovery_demands()
+                .unwrap()
+                .into_iter()
+                .find(|demand| demand.cause == storage_sqlite::RecoveryCause::IncrementalHistory)
+                .expect("excluded history still has coverage debt");
+            let scopes = fixture
+                .storage
+                .app_storage()
+                .recovery_scope_snapshots(history.ticket.id)
+                .unwrap();
+            let old = scopes
+                .iter()
+                .find(|scope| match stalled[0] {
+                    TransportReconciliationRoute::Group(id) => {
+                        scope.plan.transport_group_id == Some(id)
+                    }
+                    TransportReconciliationRoute::Inbox => scope.plan.route_kind == 0,
+                })
+                .unwrap();
+            assert!(
+                !old.window_certified,
+                "excluding an old window must not certify its history"
+            );
+            let (quiet_before, certified_before, checkpoints_before) = excluded_evidence.unwrap();
+            assert_eq!(
+                old.quiet_passes, quiet_before,
+                "excluding a window must not change its quiet history"
+            );
+            assert_eq!(
+                old.window_certified, certified_before,
+                "excluding a window must not change its certificate evidence"
+            );
+            assert!(
+                old.checkpoints == checkpoints_before,
+                "excluding a window must not change its endpoint evidence"
+            );
+        }
+        relay.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_route_keeps_peers() {
+        recover_stalled_routes(FairnessPass::Automatic).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_stalls_rotate_peers() {
+        recover_stalled_routes(FairnessPass::Explicit).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refill_reaches_peer_tail() {
+        recover_stalled_routes(FairnessPass::RefillBoundary).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_floor_keeps_peer() {
+        recover_stalled_routes(FairnessPass::ExpiredFloor).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn caller_keeps_peer_prefix() {
+        recover_peer_at_caller_cutoff(DeadlineFault::HeldFetch).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn caller_keeps_gap_window() {
+        recover_peer_at_caller_cutoff(DeadlineFault::PostReplyStall).await;
+    }
     /// A large refused first ID spends the SDK's request budget on a prefix.
     /// A fresh SDK must resume from SQLite, not its previous set-aside cache,
     /// to batch the small IDs first and recover Bob's genuine MLS message.
@@ -2478,7 +3557,9 @@ mod tests {
                     .recovery_owner
                     .test_advance_clock(Duration::from_secs(60));
             }
-            fixture.client.request_bounded_comparison().unwrap();
+            if pass == 0 {
+                fixture.client.request_bounded_comparison().unwrap();
+            }
             let (grant, mut execution, selected, _) = group_route_grant(&mut fixture).await;
             assert_eq!(selected, route);
             let inventory = grant
@@ -2545,6 +3626,10 @@ mod tests {
                 "refusals cannot certify coverage"
             );
             if pass == 0 {
+                assert!(
+                    admission.routes[0].answered,
+                    "the relays answered despite local refusals"
+                );
                 assert_eq!(
                     execution.execution.counts.refused, 16,
                     "the real SDK exhausted its request budget on refusals"
@@ -2572,6 +3657,14 @@ mod tests {
                 .finish_comparison_grant(grant, execution, Some(admission))
                 .await
                 .unwrap();
+            if pass == 0 {
+                let comparison = fixture.storage.app_storage().recovery_comparison().unwrap();
+                assert!(
+                    comparison.pending(),
+                    "answered but unadmitted work retains automatic acquisition"
+                );
+                assert!(!comparison.plan.unwrap().retry_routes.is_empty());
+            }
         }
         assert_eq!(
             peer_messages(),
@@ -2820,15 +3913,31 @@ mod tests {
             "an unrouted event finished its attempt, so the replay rotates past it"
         );
         // The relays answered; only admission fell short. That withholds the
-        // certificate but is a quiet comparison, not an outage, so the slot is
-        // serviced and the debt itself carries the retry.
+        // certificate but services this route's operational acquisition. The
+        // fixture returned no inbox result, so that unattempted scope retries
+        // independently; global slot completion would falsely service it.
+        let TransportReconciliationRoute::Group(group_route) = route else {
+            panic!("the fixture compares a group route");
+        };
+        let comparison = fixture.storage.app_storage().recovery_comparison().unwrap();
+        let plan = comparison.plan.unwrap();
+        let group = plan
+            .routes
+            .iter()
+            .find(|scope| scope.transport_group_id == Some(group_route))
+            .expect("the operational plan includes the compared group");
         assert!(
-            !fixture
-                .storage
-                .app_storage()
-                .recovery_comparison()
-                .unwrap()
-                .pending()
+            !plan.retry_routes.contains(&group.scope_id),
+            "a definitive unrouted event does not retry this route's acquisition"
+        );
+        let inbox = plan
+            .routes
+            .iter()
+            .find(|scope| scope.route_kind == 0)
+            .expect("the operational plan includes the unattempted inbox");
+        assert!(
+            plan.retry_routes.contains(&inbox.scope_id),
+            "the separate unattempted inbox still needs acquisition"
         );
         let history = fixture
             .storage
@@ -2840,9 +3949,6 @@ mod tests {
             .expect("the comparison debt stays pending")
             .ticket
             .id;
-        let TransportReconciliationRoute::Group(group_route) = route else {
-            panic!("the fixture compares a group route");
-        };
         let scope = fixture
             .storage
             .app_storage()
@@ -2852,6 +3958,10 @@ mod tests {
             .find(|scope| scope.plan.transport_group_id == Some(group_route))
             .expect("the group route has a scope");
         assert_eq!(scope.quiet_passes, 1);
+        assert!(
+            !scope.window_certified,
+            "unrouted bytes cannot certify the group's window"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3452,6 +4562,10 @@ mod tests {
                 .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
                 .unwrap()
                 .expect("deadline-cut debt remains selectable");
+            assert!(
+                grant.comparison_revision.is_some(),
+                "unstarted comparison work must retry without another request"
+            );
             let execution = fixture.client.begin_comparison_grant(&grant).await.unwrap();
             let network = if pass % 2 == 0 {
                 let credit = Arc::new(tokio::sync::Semaphore::new(1))
@@ -3489,6 +4603,9 @@ mod tests {
                 .admit_comparison_inline(grant, execution, network)
                 .await
                 .unwrap();
+            let comparison = fixture.storage.app_storage().recovery_comparison().unwrap();
+            assert!(comparison.pending(), "a skipped route was never serviced");
+            assert!(!comparison.plan.unwrap().retry_routes.is_empty());
             assert!(
                 fixture
                     .storage

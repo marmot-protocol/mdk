@@ -397,6 +397,7 @@ impl MarmotApp {
                 target.cached_relay_lists = target.relay_lists.clone();
                 if !target.relay_lists.nip65.relays.is_empty()
                     && !self
+                        .relay_plane
                         .retain_safe_discovered_endpoints(
                             target
                                 .relay_lists
@@ -516,7 +517,7 @@ impl MarmotApp {
                 })
             }) {
                 Ok(key_package) => {
-                    let safe_inbox = self.retain_safe_discovered_endpoints(
+                    let safe_inbox = self.relay_plane.retain_safe_discovered_endpoints(
                         targets[index]
                             .relay_lists
                             .inbox
@@ -754,7 +755,7 @@ impl MarmotApp {
         // only commit-purpose resolution persists the observed metadata.
         let mut by_outboxes = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
         for index in needs_discovery.iter().copied() {
-            let outbox_endpoints = self.retain_safe_discovered_endpoints(
+            let outbox_endpoints = self.relay_plane.retain_safe_discovered_endpoints(
                 targets[index]
                     .relay_lists
                     .nip65
@@ -793,6 +794,7 @@ impl MarmotApp {
             .into_iter()
             .filter(|index| {
                 let has_inbox = !self
+                    .relay_plane
                     .retain_safe_discovered_endpoints(
                         targets[*index]
                             .relay_lists
@@ -831,7 +833,7 @@ impl MarmotApp {
         let defaults = self.directory_source_relays(&[]);
         let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
         for index in unresolved.iter().copied() {
-            let mut endpoints = self.retain_safe_discovered_endpoints(
+            let mut endpoints = self.relay_plane.retain_safe_discovered_endpoints(
                 targets[index]
                     .relay_lists
                     .nip65
@@ -960,7 +962,7 @@ impl MarmotApp {
             .into_iter()
             .filter_map(|index| {
                 let target = targets[index].clone();
-                let mut endpoints = self.retain_safe_discovered_endpoints(
+                let mut endpoints = self.relay_plane.retain_safe_discovered_endpoints(
                     target
                         .relay_lists
                         .nip65

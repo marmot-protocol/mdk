@@ -194,12 +194,18 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `marmot-uniffi`/`cli`, plus the stateless record helpers — cached <-> shared record conversion, recency selection,
   Nostr profile/follow-list parsing, search-match ranking, and `profile_content_json` — which hold no `MarmotApp`
   state), `methods.rs` (the split `impl MarmotApp` block: relay-list/profile/key-package/follow-list fetches, the
-  public `directory_*`/`*_user_directory` API, directory-cache lifecycle, and in-memory directory-record hydration),
+  public `directory_*`/`*_user_directory` API, and in-memory directory-record hydration),
   `cache.rs` (the per-account SQLCipher directory cache, with its independent numbered migration runner in
   `cache/migrations.rs`, frozen initial schema in `cache/v1.sql`, the public event preview table in `cache/v2.sql`, and populated/interrupted-upgrade
   tests in `cache/assurance_tests.rs` using the historical `cache/fixtures/pre_ledger.sql` fixture), and `sync.rs` (the directory-subscription sync worker and
   plan). `mod.rs` re-exports the DTOs so the `marmot_app::...` paths stay stable; private items referenced across these
   files (and from `tests.rs`/sibling test modules) are widened to `pub(crate)`, never narrowed.
+- The directory is moving into the `nostr-directory` crate (`docs/marmot-architecture/review/brief-directory.md`).
+  What stays in this crate lives outside `src/directory/`: the per-account cache lifecycle and label-based account
+  resolution in `src/directory_resources.rs`, and publishing the account's own profile and follow list in
+  `src/profile_publication.rs`. `src/directory_crossings_tests.rs` lists every name `src/directory/` still resolves in
+  the rest of the crate in `src/directory/crossings.txt`; a change may shrink that list, never grow it without saying
+  why.
 - Keep stateless account relay-list and KeyPackage parsing/validation (relay-list status, KeyPackage tag/metadata
   validation, fresh-vs-cached reconciliation, record merge, publish-endpoint selection) in
   `src/key_package_records.rs`. They hold no `MarmotApp` state.

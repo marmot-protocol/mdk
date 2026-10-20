@@ -51,6 +51,7 @@ A11|crates/marmot-app/src/runtime/account_worker/recovery_credits.rs|MAX_CONCURR
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_ID_REQUESTS
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MAX_IDS_PER_REQUEST
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_WINDOW_ROUNDS
+# WINDOW_PROBES bounds both window-search probes and per-relay NEG permits.
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_WINDOW_PROBES
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_MEMORY_ROUTES
 A12|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_RECONCILIATION_SET_ASIDE_IDS

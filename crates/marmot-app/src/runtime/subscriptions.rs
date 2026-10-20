@@ -928,7 +928,8 @@ pub enum RuntimeAgentStreamUpdate {
 pub struct AgentStreamWatchOptions {
     /// Watch a specific stream id; `None` watches the latest stream in the group.
     pub stream_id_hex: Option<String>,
-    /// DER cert for a self-signed broker; `None` uses platform trust.
+    /// DER cert for a self-signed broker; `None` uses the bundled public-CA
+    /// roots, not the OS trust store.
     pub server_cert_der: Option<Vec<u8>>,
     /// Loopback-only insecure trust, for local testing.
     pub insecure_local: bool,

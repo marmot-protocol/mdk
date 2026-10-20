@@ -1,13 +1,15 @@
 //! TLS 1.3 setup for both peers: the self-signed server config, the ALPN-pinned
-//! client endpoint per trust mode, and the loopback-only insecure verifier.
+//! client endpoint per trust mode, the default-trust verifier, and the
+//! loopback-only insecure verifier.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
+use rustls::RootCertStore;
+use rustls::client::{VerifierBuilderError, WebPkiServerVerifier};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use rustls_platform_verifier::BuilderVerifierExt;
 
 use crate::error::QuicTextStreamError;
 use crate::hardening::QuicPreviewTransportProfile;
@@ -69,8 +71,10 @@ pub(crate) fn direct_rustls_client_config(
         .map_err(|err| QuicTextStreamError::ClientConfig(err.to_string()))?;
     let mut crypto = match trust {
         ServerTrust::Platform => builder
-            .with_platform_verifier()
-            .map_err(|err| QuicTextStreamError::ClientConfig(err.to_string()))?
+            .with_webpki_verifier(
+                platform_trust_verifier(Arc::clone(&provider))
+                    .map_err(|err| QuicTextStreamError::ClientConfig(err.to_string()))?,
+            )
             .with_no_client_auth(),
         ServerTrust::CertificateDer(cert_der) => {
             let mut roots = rustls::RootCertStore::empty();
@@ -93,6 +97,21 @@ pub(crate) fn direct_rustls_client_config(
     };
     crypto.alpn_protocols = vec![QUIC_STREAM_ALPN_V1.to_vec()];
     Ok(crypto)
+}
+
+/// Server verifier for default (`Platform`) trust on both preview paths: the
+/// bundled Mozilla root set from `webpki-roots`, the same anchors relay
+/// WebSockets and HTTP clients use. It never consults OS trust state, so it
+/// verifies identically on every host. The OS verifier panics on Android
+/// unless the host first sets up its JNI state, which MarmotKit hosts never
+/// do, and that panic aborts the process inside quinn's connection driver.
+pub fn platform_trust_verifier(
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<Arc<WebPkiServerVerifier>, VerifierBuilderError> {
+    let roots = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider).build()
 }
 
 pub(crate) fn client_endpoint(

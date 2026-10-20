@@ -193,7 +193,7 @@ Every cause runs the same job:
    unsupported. On an epoch-gap group route, each relay that failed without answering its
    comparison is searched backwards through the same window in 256-event raw pages. Each
    relay gets at most 16,384 raw events and 4 MiB of validated event JSON per pass, with at
-   most three seconds inside its route's turn. Raw SDK counts and oldest timestamps survive
+   most three seconds within the shared pass deadline. Raw SDK counts and oldest timestamps survive
    filtering. Full pages overlap their oldest second; a short page probes the older prefix
    before admission. An empty probe returns the buffered short page without fetching it
    twice. Only a completed oldest page is admitted; cuts and saturated seconds release no
