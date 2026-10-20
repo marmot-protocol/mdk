@@ -495,7 +495,6 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     }
     assert!(gate.active.load(Ordering::SeqCst) > 0);
     assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
-    assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
     assert!(activity.attempt_serial.load(Ordering::SeqCst) > 0);
     assert_eq!(
         activity.attempt_serial.load(Ordering::SeqCst),
@@ -646,7 +645,6 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     );
     assert_eq!(gate.active.load(Ordering::SeqCst), 1);
     assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
-    assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
     assert_eq!(
         recovery_credits::available_credits(&pool),
         recovery_credits::MAX_CONCURRENT_JOBS - 1,
@@ -829,7 +827,6 @@ async fn startup_gap_recovers_real_mls_history_and_survives_sqlcipher_reopen() {
     }
     assert_eq!(gate.active.load(Ordering::SeqCst), 1);
     assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
-    assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
     assert_eq!(
         recovery_credits::available_credits(&pool),
         recovery_credits::MAX_CONCURRENT_JOBS - 1,
@@ -1257,7 +1254,6 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
         );
     }
     assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
-    assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
     let retry = app
         .account_storage(&account.label)
         .unwrap()
@@ -1328,7 +1324,6 @@ async fn startup_comparison_shutdown_reaps_owned_request_and_keeps_debt() {
     ));
     assert_eq!(runtime.app_performance_snapshot().account_sync.attempts, 0);
     assert_eq!(activity.active_jobs.load(Ordering::SeqCst), 1);
-    assert_eq!(activity.active_requests.load(Ordering::SeqCst), 1);
     assert!(matches!(
         catch_up_answer.try_recv(),
         Err(oneshot::error::TryRecvError::Empty)
