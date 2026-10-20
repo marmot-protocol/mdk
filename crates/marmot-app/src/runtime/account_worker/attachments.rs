@@ -15,6 +15,8 @@ const DEMAND_BATCH: usize = 32;
 // Background HTTP has a two-minute whole-transfer deadline. Leave publication margin.
 const LEASE_SECONDS: u64 = 3 * 60;
 const EXPLICIT_LEASE_SECONDS: u64 = 20 * 60;
+/// Compaction attempts that may roll back under one worker ownership.
+const MAX_COMPACTION_ROLLBACKS: u32 = 3;
 /// Rows, then file names, per media sweep batch.
 const MEDIA_SWEEP_BATCH: usize = 256;
 
@@ -43,6 +45,14 @@ pub(super) struct Admission {
     /// The one-time database compaction ran under this worker; it is not
     /// attempted again until the next worker ownership.
     compaction_attempted: bool,
+    /// Compactions that rolled back under this worker. After
+    /// [`MAX_COMPACTION_ROLLBACKS`] it is not attempted again until the next
+    /// worker ownership, so a failure that repeats cannot rebuild the
+    /// in-memory copy every tick.
+    compaction_rollbacks: u32,
+    /// This worker's first maintenance pass ran (it settles a WAL truncate
+    /// an earlier process may have left owed).
+    maintenance_started: bool,
 }
 
 /// Starts a media sweep on the blocking pool unless one is still running:
@@ -136,6 +146,7 @@ pub(super) fn spawn_legacy_migration(
     let app = client.app.clone();
     let label = client.state.label.clone();
     let updates = shared.attachment_updates.clone();
+    let startup = !std::mem::replace(&mut admission.maintenance_started, true);
     admission.legacy_migration = Some(tokio::task::spawn_blocking(move || {
         let started = (|| {
             let storage = app.account_storage(&label)?;
@@ -168,7 +179,7 @@ pub(super) fn spawn_legacy_migration(
         if changed {
             updates.send_modify(|_| {});
         }
-        crate::media::storage_compaction::reclaim(&app_storage);
+        crate::media::storage_compaction::reclaim(&app_storage, startup);
     }));
 }
 
@@ -213,17 +224,30 @@ pub(super) async fn compact_if_due(
         ))
     })
     .await;
-    if matches!(
-        attempted,
-        Ok(Some(
-            crate::media::storage_compaction::CompactionAttempt::Done
-        ))
-    ) {
-        admission.compaction_attempted = true;
+    if let Ok(Some(attempt)) = attempted {
+        admission.record_compaction(attempt);
     }
 }
 
 impl Admission {
+    /// Counts a compaction attempt: one that ran is not repeated under this
+    /// worker, and rollbacks stop being retried after
+    /// [`MAX_COMPACTION_ROLLBACKS`].
+    pub(super) fn record_compaction(
+        &mut self,
+        attempt: crate::media::storage_compaction::CompactionAttempt,
+    ) {
+        use crate::media::storage_compaction::CompactionAttempt;
+        match attempt {
+            CompactionAttempt::Done => self.compaction_attempted = true,
+            CompactionAttempt::RolledBack => {
+                self.compaction_rollbacks += 1;
+                self.compaction_attempted = self.compaction_rollbacks >= MAX_COMPACTION_ROLLBACKS;
+            }
+            CompactionAttempt::NotDue => {}
+        }
+    }
+
     pub(super) fn is_waiting(&self) -> bool {
         self.waiting.is_some()
     }

@@ -86,3 +86,55 @@ async fn the_maintenance_tick_compacts_the_database_once() {
     assert!(after.file_bytes() < before.file_bytes());
     test_free_space::clear(dir.path());
 }
+
+/// A compaction that rolls back (here: another connection holds the write
+/// lock) leaves the database as it was and is tried again on a later tick,
+/// where it completes. It does not use up the worker's one attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rolled_back_compaction_is_tried_again_later() {
+    let (dir, client, storage, _reference) = offline_fixture().await;
+    test_free_space::set(dir.path(), 1 << 40);
+    let writer = super::retention_fault_connection(&client.app);
+    writer
+        .execute_batch(
+            "CREATE TABLE compaction_filler(body BLOB NOT NULL);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000)
+             INSERT INTO compaction_filler SELECT randomblob(4000) FROM n;
+             DROP TABLE compaction_filler;",
+        )
+        .unwrap();
+    let shared = RuntimeSharedServices::default();
+    let mut admission = Admission::default();
+
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    compact_if_due(&client, &shared, &mut admission).await;
+    assert!(!admission.compaction_attempted);
+    assert_eq!(admission.compaction_rollbacks, 1);
+    assert!(!storage.app_storage().database_space().unwrap().incremental);
+
+    writer.execute_batch("COMMIT").unwrap();
+    compact_if_due(&client, &shared, &mut admission).await;
+    assert!(admission.compaction_attempted);
+    assert!(storage.app_storage().database_space().unwrap().incremental);
+    test_free_space::clear(dir.path());
+}
+
+/// Repeated rollbacks stop after the cap, so a failure that keeps happening
+/// cannot rebuild the in-memory copy on every tick.
+#[test]
+fn compaction_rollbacks_are_capped_per_worker() {
+    use crate::media::storage_compaction::CompactionAttempt;
+    let mut admission = Admission::default();
+    admission.record_compaction(CompactionAttempt::NotDue);
+    for _ in 0..MAX_COMPACTION_ROLLBACKS {
+        assert!(!admission.compaction_attempted);
+        admission.record_compaction(CompactionAttempt::RolledBack);
+    }
+    assert!(admission.compaction_attempted);
+    let mut fresh = Admission::default();
+    fresh.record_compaction(CompactionAttempt::Done);
+    assert!(
+        fresh.compaction_attempted,
+        "a completed one is not repeated"
+    );
+}

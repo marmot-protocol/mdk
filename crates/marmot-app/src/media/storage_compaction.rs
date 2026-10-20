@@ -53,9 +53,11 @@ pub(crate) fn compaction_due(space: &DatabaseSpace, reserve: u64, free: u64) -> 
 
 /// Returns up to [`RECLAIM_MAX_BYTES`] of free pages once the database is
 /// incremental, and finishes any WAL truncate a reader blocked earlier, so
-/// the pages leave the file; a no-op before compaction. Best effort.
-/// Blocking.
-pub(crate) fn reclaim(storage: &SqliteAppStorage) {
+/// the pages leave the file; a no-op before compaction. `startup` (the
+/// first pass of a worker ownership) also truncates once on an incremental
+/// database: a truncate owed when an earlier process ended is not recorded
+/// anywhere. Best effort. Blocking.
+pub(crate) fn reclaim(storage: &SqliteAppStorage, startup: bool) {
     match storage.database_space() {
         Ok(space) if space.incremental && space.free_pages > 0 => {
             match storage.reclaim_free_pages(RECLAIM_MAX_BYTES / space.page_size.max(1)) {
@@ -79,7 +81,12 @@ pub(crate) fn reclaim(storage: &SqliteAppStorage) {
     }
     // The storage records every truncate's result under the connection
     // lock, so this reads the latest attempt; repeating a truncate is safe.
-    if storage.wal_truncate_pending() {
+    let owed = storage.wal_truncate_pending()
+        || (startup
+            && storage
+                .database_space()
+                .is_ok_and(|space| space.incremental));
+    if owed {
         let _ = storage.truncate_wal();
     }
 }
@@ -91,9 +98,10 @@ pub(crate) enum CompactionAttempt {
     NotDue,
     /// Ran (or failed for good): not again this worker ownership.
     Done,
-    /// Another connection held the database, so the `VACUUM` rolled back
-    /// before copying anything; the next tick may try again.
-    Busy,
+    /// The `VACUUM` rolled back (another connection held the database, the
+    /// volume filled, or it failed otherwise): the database is as it was,
+    /// and a later tick may try again.
+    RolledBack,
 }
 
 /// The one-time compaction, when it is due. `wake` tells attachment
@@ -143,14 +151,20 @@ pub(crate) fn compact_if_due(
                 wal_truncated = truncated, duration_ms, "compacted the account database");
             CompactionAttempt::Done
         }
-        Err(error) if error.is_transient() => {
-            tracing::info!(target: TRACE_TARGET, method = "compact_database", duration_ms,
-                retry_scheduled = true, "database compaction found the database busy");
-            CompactionAttempt::Busy
+        // A failed VACUUM rolls back. Unless the switch somehow committed,
+        // the database is as it was and the gates may pass again later.
+        Err(_)
+            if !storage
+                .database_space()
+                .is_ok_and(|after| after.incremental) =>
+        {
+            tracing::warn!(target: TRACE_TARGET, method = "compact_database", duration_ms,
+                retry_scheduled = true, "database compaction rolled back");
+            CompactionAttempt::RolledBack
         }
         Err(_) => {
             tracing::warn!(target: TRACE_TARGET, method = "compact_database", duration_ms,
-                "database compaction failed; it is not retried until the worker restarts");
+                "database compaction committed but its follow-up failed");
             CompactionAttempt::Done
         }
     }

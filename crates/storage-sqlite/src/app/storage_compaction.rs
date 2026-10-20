@@ -116,7 +116,7 @@ impl SqliteAppStorage {
             ));
         }
         // Best effort: the VACUUM writes into the WAL either way.
-        let _ = truncate_wal_in(&conn);
+        let _ = self.truncate_wal_locked(&conn);
         if self.connection.is_closing() {
             return Err(StorageError::Closed(
                 "database compaction cancelled by close".into(),
@@ -185,10 +185,12 @@ impl SqliteAppStorage {
 
     /// [`truncate_wal_in`] on the locked connection, recording the result
     /// before the lock is released.
+    /// A failed attempt leaves the truncate owed, as a blocked one does.
     fn truncate_wal_locked(&self, conn: &Connection) -> StorageResult<bool> {
-        let truncated = truncate_wal_in(conn)?;
-        self.connection.record_wal_truncate(truncated);
-        Ok(truncated)
+        let truncated = truncate_wal_in(conn);
+        self.connection
+            .record_wal_truncate(matches!(truncated, Ok(true)));
+        truncated
     }
 }
 

@@ -1560,3 +1560,33 @@ async fn closing_storage_cuts_short_a_compaction_with_a_sweep_behind_it() {
     assert!(compaction.join().unwrap().is_err(), "the copy stopped");
     assert!(sweep.join().unwrap().is_err(), "the sweep failed as closed");
 }
+
+/// A WAL truncate owed when an earlier process ended is recorded nowhere: the
+/// first maintenance pass of a worker truncates once on an incremental
+/// database, while later passes leave a WAL with nothing owed alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_maintenance_pass_settles_a_leftover_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    assert!(store.app_storage().compact_database().unwrap());
+    // Leave frames in the WAL, as a crash after a blocked truncate would.
+    seed_at(&store.app_storage(), legacy_slot(0x71), &[5u8; 20_000]);
+    let wal = || {
+        let mut path = app.account_storage_path("alice").into_os_string();
+        path.push("-wal");
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    };
+    assert!(wal() > 0);
+    assert!(!store.app_storage().wal_truncate_pending());
+
+    crate::media::storage_compaction::reclaim(&store.app_storage(), false);
+    assert!(wal() > 0, "nothing owed, nothing truncated");
+    crate::media::storage_compaction::reclaim(&store.app_storage(), true);
+    assert_eq!(wal(), 0, "the first pass truncated");
+    let runtime = app.runtime();
+    runtime.shutdown_and_close().await.unwrap();
+}
