@@ -181,3 +181,40 @@ async fn a_tick_with_nothing_to_compact_does_not_make_the_worker_wait() {
     assert_eq!(admission.compaction_rollbacks, 0);
     test_free_space::clear(dir.path());
 }
+
+/// The worker never compacts on its own: without the maintenance task's due
+/// flag it does not wait on the blocking pool, even for a database that
+/// would qualify. The next full tick raises the flag and compacts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_worker_compacts_only_when_the_maintenance_task_flags_it() {
+    let (dir, client, storage, _reference) = offline_fixture().await;
+    test_free_space::set(dir.path(), 1 << 40);
+    storage
+        .app_storage()
+        .make_non_incremental_for_test()
+        .unwrap();
+    {
+        let conn = super::retention_fault_connection(&client.app);
+        conn.execute_batch(
+            "CREATE TABLE compaction_filler(body BLOB NOT NULL);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000)
+             INSERT INTO compaction_filler SELECT randomblob(4000) FROM n;
+             DROP TABLE compaction_filler;",
+        )
+        .unwrap();
+    }
+    let shared = RuntimeSharedServices::default();
+    let mut admission = Admission::default();
+
+    compact_if_due(&client, &shared, &mut admission).await;
+    assert!(
+        !storage.app_storage().database_space().unwrap().incremental,
+        "no flag, no compaction"
+    );
+    assert!(!admission.compaction_attempted);
+
+    maintenance_tick(&client, &shared, &mut admission).await;
+    assert!(storage.app_storage().database_space().unwrap().incremental);
+    assert!(admission.compaction_attempted);
+    test_free_space::clear(dir.path());
+}
