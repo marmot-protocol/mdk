@@ -5227,12 +5227,17 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
         # reset the backoff attempt counter so the next failure starts at base.
         attempts = {"n": 0}
         delays = []
+        resubscribed = asyncio.Event()
 
         class FakeClient:
             async def inbound_events(self, account_id_hex=None, group_id_hex=None, on_ack=None):
                 attempts["n"] += 1
                 await asyncio.sleep(0)
                 if attempts["n"] == 1:
+                    # Never established: drops before yielding, so the attempt
+                    # counter grows and only a reset can bring it back to 0.
+                    raise RuntimeError("dropped before healthy")
+                elif attempts["n"] == 2:
                     # Healthy: yields one message, then raises -> reconnect.
                     yield wire_event({
                         "type": "inbound_message",
@@ -5245,6 +5250,7 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     })
                     raise RuntimeError("dropped after healthy")
                 else:
+                    resubscribed.set()
                     await asyncio.sleep(3600)
                     return
 
@@ -5262,11 +5268,13 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         self.adapter_module.reconnect_backoff_ms = recording_backoff
         try:
-            loop_task = asyncio.ensure_future(adapter._consume_inbound_loop(rand=lambda: 0.0))
-            for _ in range(300):
-                if attempts["n"] >= 2 and delays and adapter.events:
-                    break
-                await asyncio.sleep(0.005)
+            loop_task = asyncio.ensure_future(adapter._consume_inbound_loop(rand=lambda: 1.0))
+            # The loop admits the healthy message to the inbound queue before it
+            # resumes the stream, so by the third subscription the message is
+            # queued and both backoffs are chosen. Wait for that instead of a fixed
+            # poll window: the spool's SQLite writes can outlast one on a loaded
+            # runner. The timeout only bounds a real regression.
+            await asyncio.wait_for(resubscribed.wait(), timeout=30)
             await adapter._inbound_queue.join()
         finally:
             self.adapter_module.reconnect_backoff_ms = real_backoff
@@ -5276,11 +5284,12 @@ class ParityBehaviorTests(unittest.IsolatedAsyncioTestCase):
             except asyncio.CancelledError:
                 pass
 
-        # The subscription was healthy (delivered the message), so after its
-        # failure the backoff attempt counter resets to 0 -> base delay (1000ms).
+        # The first failure backs off at attempt 0 and advances the counter. The
+        # second subscription was healthy (delivered the message), so after its
+        # failure the counter resets to 0 -> base delay (1000ms), not (1, 2000).
         self.assertEqual(len(adapter.events), 1)
         self.assertEqual(adapter.events[0].text, "healthy")
-        self.assertEqual(delays[0], (0, 1000))
+        self.assertEqual(delays, [(0, 1000), (0, 1000)])
 
     async def test_clean_eof_subscription_backs_off_instead_of_hot_looping(self):
         # Regression guard for the adversarial finding: a connector that accepts,
