@@ -183,7 +183,7 @@ jobs:
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name marmot-c-linux --dir dist
 
       - name: Create or update release
-        if: inputs.nightly_version == ''
+        if: ${{ !inputs.nightly_version }}
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -217,7 +217,7 @@ jobs:
           fi
 
       - name: Check out workflow scripts
-        if: inputs.nightly_version != ''
+        if: ${{ !!inputs.nightly_version }}
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
@@ -225,7 +225,7 @@ jobs:
           path: builder
 
       - name: Stage nightly draft
-        if: inputs.nightly_version != ''
+        if: ${{ !!inputs.nightly_version }}
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

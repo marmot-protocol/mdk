@@ -841,7 +841,7 @@ jobs:
 
   nightly-stage:
     name: Stage wn-agent nightly
-    if: success() && inputs.nightly_version != '' && !inputs.build_only
+    if: ${{ success() && !!inputs.nightly_version && !inputs.build_only }}
     runs-on: ubuntu-latest
     needs:
       - build

@@ -288,6 +288,10 @@ class NightlyReleasePolicyTests(unittest.TestCase):
                 self.assertIn(f'      - "!{prefix}-v*-nightly.*"\n', text)
                 self.assertIn("  workflow_call:\n", text)
                 self.assertIn("      nightly_version:\n", text)
+                # Tag pushes and dispatches have no nightly_version input at all (null), so
+                # conditions must test truthiness rather than compare with ''.
+                self.assertIsNone(re.search(r"inputs\.nightly_version\s*[!=]=", text))
+                self.assertIn("inputs.nightly_version }}", text)
 
     def test_nightlies_are_scheduled_pre_releases_that_never_become_latest(self):
         workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
