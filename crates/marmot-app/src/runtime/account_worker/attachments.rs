@@ -45,6 +45,10 @@ pub(super) struct Admission {
     /// The one-time database compaction ran under this worker; it is not
     /// attempted again until the next worker ownership.
     compaction_attempted: bool,
+    /// The maintenance task found the one-time compaction due. Only then
+    /// does the worker wait on the blocking pool for it; a tick with nothing
+    /// due costs the worker nothing.
+    compaction_due: Arc<std::sync::atomic::AtomicBool>,
     /// Compactions that rolled back under this worker. After
     /// [`MAX_COMPACTION_ROLLBACKS`] it is not attempted again until the next
     /// worker ownership, so a failure that repeats cannot rebuild the
@@ -148,6 +152,8 @@ pub(super) fn spawn_legacy_migration(
     let label = client.state.label.clone();
     let updates = shared.attachment_updates.clone();
     let startup_wal_settled = admission.startup_wal_settled.clone();
+    let compaction_due = admission.compaction_due.clone();
+    let check_compaction = !admission.compaction_attempted;
     admission.legacy_migration = Some(tokio::task::spawn_blocking(move || {
         let started = (|| {
             let storage = app.account_storage(&label)?;
@@ -184,14 +190,26 @@ pub(super) fn spawn_legacy_migration(
         if crate::media::storage_compaction::reclaim(&app_storage, startup) && startup {
             startup_wal_settled.store(true, std::sync::atomic::Ordering::Release);
         }
+        if check_compaction
+            && crate::media::storage_compaction::compaction_check(
+                &app_storage,
+                reserve,
+                &free,
+                &progress,
+            )
+            .is_some()
+        {
+            compaction_due.store(true, std::sync::atomic::Ordering::Release);
+        }
     }));
 }
 
-/// The one-time database compaction (mdk#2314 step 6), when it is due and
-/// this worker has not attempted it, awaited on the blocking pool. The worker
-/// makes no storage calls while it waits, so the `VACUUM` holding the
-/// account connection never parks an async thread. Skipped while a migration
-/// batch still runs; the next tick checks again.
+/// The one-time database compaction (mdk#2314 step 6), once the maintenance
+/// task found it due and this worker has not attempted it, awaited on the
+/// blocking pool. The worker makes no storage calls while it waits, so the
+/// `VACUUM` holding the account connection never parks an async thread.
+/// Skipped while a migration batch still runs; the next tick checks again.
+/// When nothing is due the worker does not wait at all.
 pub(super) async fn compact_if_due(
     client: &AppClient,
     shared: &RuntimeSharedServices,
@@ -199,6 +217,9 @@ pub(super) async fn compact_if_due(
 ) {
     if client.app.config.cursor_persistence == crate::CursorPersistence::Frozen
         || admission.compaction_attempted
+        || !admission
+            .compaction_due
+            .load(std::sync::atomic::Ordering::Acquire)
         || admission
             .legacy_migration
             .as_ref()
@@ -206,6 +227,9 @@ pub(super) async fn compact_if_due(
     {
         return;
     }
+    admission
+        .compaction_due
+        .store(false, std::sync::atomic::Ordering::Release);
     let app = client.app.clone();
     let label = client.state.label.clone();
     let updates = shared.attachment_updates.clone();

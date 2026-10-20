@@ -82,7 +82,7 @@ async fn the_maintenance_tick_compacts_the_database_once() {
     let observer = shared.attachment_updates.subscribe();
     let mut admission = Admission::default();
 
-    compact_if_due(&client, &shared, &mut admission).await;
+    maintenance_tick(&client, &shared, &mut admission).await;
     assert!(admission.compaction_attempted);
     assert!(observer.has_changed().unwrap(), "observers hear of it");
     let after = storage.app_storage().database_space().unwrap();
@@ -115,13 +115,13 @@ async fn a_rolled_back_compaction_is_tried_again_later() {
     let mut admission = Admission::default();
 
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
-    compact_if_due(&client, &shared, &mut admission).await;
+    maintenance_tick(&client, &shared, &mut admission).await;
     assert!(!admission.compaction_attempted);
     assert_eq!(admission.compaction_rollbacks, 1);
     assert!(!storage.app_storage().database_space().unwrap().incremental);
 
     writer.execute_batch("COMMIT").unwrap();
-    compact_if_due(&client, &shared, &mut admission).await;
+    maintenance_tick(&client, &shared, &mut admission).await;
     assert!(admission.compaction_attempted);
     assert!(storage.app_storage().database_space().unwrap().incremental);
     test_free_space::clear(dir.path());
@@ -145,4 +145,39 @@ fn compaction_rollbacks_are_capped_per_worker() {
         fresh.compaction_attempted,
         "a completed one is not repeated"
     );
+}
+
+/// One maintenance tick's storage work, as the worker runs it: the
+/// maintenance task (migration batch, reclaim, compaction check), then the
+/// compaction the worker waits for only when the task found it due.
+async fn maintenance_tick(
+    client: &AppClient,
+    shared: &RuntimeSharedServices,
+    admission: &mut Admission,
+) {
+    spawn_legacy_migration(client, shared, admission);
+    if let Some(task) = admission.legacy_migration.take() {
+        task.await.unwrap();
+    }
+    compact_if_due(client, shared, admission).await;
+}
+
+/// A new account database is incremental: the maintenance task never finds
+/// a compaction due, so the worker never waits for one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tick_with_nothing_to_compact_does_not_make_the_worker_wait() {
+    let (dir, client, storage, _reference) = offline_fixture().await;
+    test_free_space::set(dir.path(), 1 << 40);
+    assert!(storage.app_storage().database_space().unwrap().incremental);
+    let shared = RuntimeSharedServices::default();
+    let mut admission = Admission::default();
+    maintenance_tick(&client, &shared, &mut admission).await;
+    assert!(
+        !admission
+            .compaction_due
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    assert!(!admission.compaction_attempted);
+    assert_eq!(admission.compaction_rollbacks, 0);
+    test_free_space::clear(dir.path());
 }

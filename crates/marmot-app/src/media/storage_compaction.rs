@@ -127,6 +127,62 @@ pub(crate) fn reclaim(storage: &SqliteAppStorage, startup: bool) -> bool {
     true
 }
 
+/// Whether the one-time compaction is due now, reading only the database's
+/// page figures and the volume's free space; it logs an account the live-size
+/// cap holds back once its migration has nothing left to move. The page
+/// figures when due. Blocking, but brief: the maintenance task runs it every
+/// tick, and only a due result makes the account worker wait for a
+/// compaction.
+pub(crate) fn compaction_check(
+    storage: &SqliteAppStorage,
+    reserve: u64,
+    free: &dyn Fn() -> std::io::Result<u64>,
+    progress: &SharedLegacyMigration,
+) -> Option<DatabaseSpace> {
+    let space = match storage.database_space() {
+        Ok(space) => space,
+        Err(_) => {
+            tracing::warn!(target: TRACE_TARGET, method = "compact_database",
+                "database compaction check deferred");
+            return None;
+        }
+    };
+    let Ok(available) = free() else {
+        return None;
+    };
+    match compaction_gate(&space, reserve, available) {
+        CompactionGate::Due => Some(space),
+        CompactionGate::LiveTooLarge => {
+            // While legacy bodies remain, the migration is still shrinking
+            // the live database: only an account over the cap with nothing
+            // left to move stays there. Log those once per account per
+            // process: they keep their freed pages inside the file, and this
+            // is how we learn how many there are and by how much they miss.
+            if storage
+                .legacy_attachment_bytes()
+                .map_or(true, |bytes| bytes > 0)
+            {
+                return None;
+            }
+            let first = !std::mem::replace(
+                &mut progress
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .compaction_cap_logged,
+                true,
+            );
+            if first {
+                tracing::info!(target: TRACE_TARGET, method = "compact_database",
+                    live_mib_bucket = live_mib_bucket(&space),
+                    cap_mib = COMPACTION_MAX_LIVE_BYTES / MIB,
+                    "database compaction held back by the live-size cap");
+            }
+            None
+        }
+        CompactionGate::NotWorthwhile | CompactionGate::DiskTooTight => None,
+    }
+}
+
 /// What [`compact_if_due`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompactionAttempt {
@@ -153,50 +209,9 @@ pub(crate) fn compact_if_due(
     progress: &SharedLegacyMigration,
     wake: &dyn Fn(),
 ) -> CompactionAttempt {
-    let space = match storage.database_space() {
-        Ok(space) => space,
-        Err(_) => {
-            tracing::warn!(target: TRACE_TARGET, method = "compact_database",
-                "database compaction check deferred");
-            return CompactionAttempt::NotDue;
-        }
-    };
-    let Ok(available) = free() else {
+    let Some(space) = compaction_check(storage, reserve, free, progress) else {
         return CompactionAttempt::NotDue;
     };
-    match compaction_gate(&space, reserve, available) {
-        CompactionGate::Due => {}
-        CompactionGate::LiveTooLarge => {
-            // While legacy bodies remain, the migration is still shrinking
-            // the live database: only an account over the cap with nothing
-            // left to move stays there. Log those once per account per
-            // process: they keep their freed pages inside the file, and this
-            // is how we learn how many there are and by how much they miss.
-            if storage
-                .legacy_attachment_bytes()
-                .map_or(true, |bytes| bytes > 0)
-            {
-                return CompactionAttempt::NotDue;
-            }
-            let first = !std::mem::replace(
-                &mut progress
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .compaction_cap_logged,
-                true,
-            );
-            if first {
-                tracing::info!(target: TRACE_TARGET, method = "compact_database",
-                    live_mib_bucket = live_mib_bucket(&space),
-                    cap_mib = COMPACTION_MAX_LIVE_BYTES / MIB,
-                    "database compaction held back by the live-size cap");
-            }
-            return CompactionAttempt::NotDue;
-        }
-        CompactionGate::NotWorthwhile | CompactionGate::DiskTooTight => {
-            return CompactionAttempt::NotDue;
-        }
-    }
     let Ok(snapshot) = storage.attachment_storage_usage(crate::unix_now_seconds()) else {
         return CompactionAttempt::NotDue;
     };

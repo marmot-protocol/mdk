@@ -81,8 +81,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   plus two live copies free on the volume, and a live database of at most 64 MiB: the `VACUUM` copy is built in
   memory, and its final write-back cannot be interrupted, so the cap bounds how long a close can wait for it; an
   account over the cap with no legacy bodies left is logged once per process, as a power-of-two MiB bucket), at most once per worker ownership (a rolled-back one is retried, at most three times), never while a
-  migration batch runs. The account worker awaits it from
-  its maintenance tick, so none of its synchronous storage calls park an async thread on the held connection, and
+  migration batch runs. The maintenance task (never awaited) checks the gates every tick and only flags a due
+  compaction; the account worker awaits it from its maintenance tick only when flagged, so a tick with nothing due
+  costs the worker nothing and none of its synchronous storage calls park an async thread on the held connection, and
   `Compacting` is served from a usage snapshot so hosts never wait on it. Afterwards `reclaim` runs after every
   migration batch and bulk removal, settling any WAL truncate the storage records as owed; the first pass of each
   worker ownership truncates once on an incremental database, since a truncate owed when a process ended is recorded
