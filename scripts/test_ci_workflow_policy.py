@@ -253,6 +253,33 @@ class NightlyReleasePolicyTests(unittest.TestCase):
         })
         self.assertEqual([run["id"] for run in busy], [1, 3, 5])
 
+    def test_required_ci_is_read_from_the_merge_queue_run_for_the_master_commit(self):
+        # Shape of run 39288024598: the merge-queue run that produced master commit 3cafb038
+        # reports that same commit as head_sha, on its gh-readonly-queue branch.
+        master = "3cafb03883832fb27f4fee178e9568be53acb1b8"
+        gh = nightly_release.GitHub("o/r", "token")
+        runs = {"workflow_runs": [{"id": 39288024598, "head_sha": master, "conclusion": "success",
+                                   "event": "merge_group",
+                                   "head_branch": "gh-readonly-queue/master/pr-2469-3188510989374e7b588717fc3d077c257f6a55ce"}]}
+        jobs = [{"name": "Rust tests", "conclusion": "success"}, {"name": "Required CI", "conclusion": "success"}]
+        with unittest.mock.patch.object(gh, "get", return_value=runs) as get, \
+                unittest.mock.patch.object(gh, "paginate", return_value=jobs):
+            self.assertTrue(gh.required_ci_passed(master))
+        self.assertIn(f"event=merge_group&head_sha={master}&status=success", get.call_args.args[0])
+        for wrong_jobs in ([{"name": "Required CI", "conclusion": "failure"}], [{"name": "Rust tests", "conclusion": "success"}]):
+            with self.subTest(jobs=wrong_jobs), unittest.mock.patch.object(gh, "get", return_value=runs), \
+                    unittest.mock.patch.object(gh, "paginate", return_value=wrong_jobs):
+                self.assertFalse(gh.required_ci_passed(master))
+
+    def test_nightly_jobs_require_their_dependencies_and_own_concurrency(self):
+        workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
+        self.assertIn("    if: success() && !inputs.build_only && !inputs.dry_run\n", workflow)
+        self.assertEqual(workflow.count("    if: success() && needs.lane.outputs.lane_free == 'true'\n"), 3)
+        bindings = (ROOT / ".github/workflows/bindings.yaml").read_text()
+        # A nightly must not share a same-SHA snapshot's group, which waits for the nightly.
+        self.assertIn("  group: marmotkit-bindings-${{ inputs.nightly_version || inputs.source_sha || github.ref }}-",
+                      bindings)
+
     def test_tag_pushed_release_workflows_ignore_nightly_tags(self):
         for workflow, prefix in [("bindings.yaml", "marmotkit"), ("c-bindings.yml", "marmotc"),
                                  ("wn-agent-binaries.yml", "wn-agent")]:

@@ -37,7 +37,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: marmotkit-bindings-${{ inputs.source_sha || github.ref }}-${{ inputs.build_only && github.sha || 'publish' }}
+  # Nightlies get their own group: sharing a snapshot's group for the same SHA
+  # would deadlock against that snapshot's wait for the building nightly.
+  group: marmotkit-bindings-${{ inputs.nightly_version || inputs.source_sha || github.ref }}-${{ inputs.build_only && github.sha || 'publish' }}
   cancel-in-progress: false
 
 env:
@@ -1093,7 +1095,7 @@ jobs:
   validate-published-ios:
     name: Validate published iOS SwiftPM consumer
     # Nightlies are still drafts here; their bytes passed the local consumer checks above.
-    if: needs.metadata.outputs.is_nightly != 'true'
+    if: success() && needs.metadata.outputs.is_nightly != 'true'
     runs-on: macos-latest
     needs:
       - metadata
@@ -1139,7 +1141,7 @@ jobs:
 
   validate-published-macos:
     name: Validate published macOS SwiftPM consumer
-    if: needs.metadata.outputs.is_nightly != 'true'
+    if: success() && needs.metadata.outputs.is_nightly != 'true'
     runs-on: macos-latest
     needs:
       - metadata

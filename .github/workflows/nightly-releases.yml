@@ -79,7 +79,7 @@ jobs:
   lane:
     name: Wait for release lane
     needs: plan
-    if: needs.plan.outputs.skip != 'true' && !inputs.dry_run
+    if: success() && needs.plan.outputs.skip != 'true' && !inputs.dry_run
     runs-on: ubuntu-latest
     # Releases and snapshots wait for a nightly only after this job succeeds.
     timeout-minutes: 200
@@ -105,7 +105,7 @@ jobs:
   marmotkit:
     name: MarmotKit
     needs: [plan, lane]
-    if: needs.lane.outputs.lane_free == 'true'
+    if: success() && needs.lane.outputs.lane_free == 'true'
     permissions:
       actions: read
       contents: write
@@ -118,7 +118,7 @@ jobs:
   marmotc:
     name: Marmot C
     needs: [plan, lane]
-    if: needs.lane.outputs.lane_free == 'true'
+    if: success() && needs.lane.outputs.lane_free == 'true'
     permissions:
       actions: read
       contents: write
@@ -131,7 +131,7 @@ jobs:
   wn-agent:
     name: wn-agent
     needs: [plan, lane]
-    if: needs.lane.outputs.lane_free == 'true'
+    if: success() && needs.lane.outputs.lane_free == 'true'
     permissions:
       actions: read
       contents: write
@@ -145,7 +145,7 @@ jobs:
     name: Publish nightly and latest.json
     needs: [plan, marmotkit, marmotc, wn-agent]
     # Runs only when all three tracks staged their drafts.
-    if: ${{ !inputs.build_only }}
+    if: success() && !inputs.build_only && !inputs.dry_run
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
