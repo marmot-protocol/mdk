@@ -81,9 +81,9 @@ It uses, but does not own, `<root>/shared.sqlite3`. That database is plain SQLit
 
 ## Decision: a new crate above the transport and storage
 
-Create `crates/nostr-directory`. It depends on `transport-nostr`, `transport-nostr-adapter` (event kinds and the
-process proxy), `transport-nostr-peeler`, `storage-sqlite`, `cgka-traits`, `cgka-engine` (KeyPackage metadata
-checks) and `fs-private`. It depends on neither `marmot-app` nor `marmot-account`, nor on `cgka-session`, which step 5
+Create `crates/nostr-directory`. It depends on `transport-nostr`, `transport-nostr-adapter` (event kinds),
+`transport-nostr-peeler`, `storage-sqlite`, `cgka-traits`, `cgka-engine` (KeyPackage metadata checks), `fs-private`
+and `reqwest` (the Open Ranking client, `open_ranking.rs:168`, `:254`). It depends on neither `marmot-app` nor `marmot-account`, nor on `cgka-session`, which step 5
 merges into `marmot-session`. Whatever it needs from the app comes through the host interface below.
 
 - It sits beside the media store as an app service, as in [core structure §4](core-structure.md#4-proposed-target-structure).
@@ -97,11 +97,11 @@ merges into `marmot-session`. Whatever it needs from the app comes through the h
 | --- | ---: | --- |
 | `directory/` except publication | about 7,330 | Moves |
 | `public_event_preview.rs` | 830 | Moves, as `previews`. It shares the cache database, its key and its migration ledger, so it can't stay behind without splitting that ledger. |
-| The directory half of `key_package_records.rs` (other accounts' relay-list status, KeyPackage ranking and selection, revocation evidence, cached-KeyPackage checks) | about 700 | Moves. It breaks today's import cycle between `directory/` and `key_package_records.rs` (`key_package_records.rs:25-31`, `directory/methods.rs:40-44`). |
+| The directory half of `key_package_records.rs` (other accounts' relay-list status, KeyPackage ranking and selection, revocation evidence, cached-KeyPackage checks, and the KeyPackage event parser with its tag matchers: `key_package_from_borrowed_record`, `require_key_package_tag`, `require_multi_value_key_package_tag_matches`, `reject_duplicate_key_package_tag`, `key_package_records.rs:554-602`, `:981-1044`) | about 700 | Moves. It breaks today's import cycle between `directory/` and `key_package_records.rs` (`key_package_records.rs:25-31`, `directory/methods.rs:40-44`). |
 | Directory types at the `marmot-app` root: `AccountRelayListStatus`, `AccountRelayListState`, `MissingRelayListKind`, `FetchedKeyPackage`, `DirectoryFreshness`, `DirectorySelection`, `sort_directory_records`, the relay-list event parsers, the search caps and kinds 0 and 3 | about 150 | Moves; `marmot-app` re-exports the public ones at the same paths |
 | Profile and follow-list publication (`methods.rs:826-1047`) | about 220 | Stays. It is the account publishing its own state, and needs the signer, publish clients, quorum delivery and indexer copies (`lib.rs:3121-3262`, `:7490`, `:7554`). It calls the directory to remember what it published. |
 | `retain_safe_discovered_endpoints` (`methods.rs:1315`) | 8 | Stays on `MarmotApp` for its 10 callers there (`lib.rs` 9, `client/push.rs` 1). It only forwards to the relay plane. The 12 call sites in code that moves (`key_package_recovery.rs` 2, `member_key_packages.rs` 6, `methods.rs:250`, `:602`, `search.rs:850`, `public_event_preview.rs:787`) call the relay plane handle directly from PR 1, as onboarding already does (`runtime/onboarding.rs:1901`). |
-| The own-account half of `key_package_records.rs` (inventory, merge, publish endpoints) | about 350 | Stays |
+| The own-account half of `key_package_records.rs` (inventory, merge, publish endpoints) | about 330 | Stays. It takes `FetchedKeyPackage` from the crate (`key_package_records.rs:643`). |
 | Block lists (`user_blocks.rs`), onboarding (`runtime/onboarding.rs`), relay-list publication (`lib.rs`) | — | Stay. They are account state. They become callers of the crate. |
 | `shared.sqlite3` and `SqliteSharedStorage` | — | Stay in `storage-sqlite` (step 8 decides any split) |
 | SQLCipher key derivation (`sqlcipher.rs`) | — | Stays in `marmot-app`, with the same label. The host supplies the key. |
@@ -132,8 +132,9 @@ then has a single owner. `marmot-app` constructs it with three things.
 | A proxy-configured HTTP client builder | `crate::network_proxy::http_builder` (`open_ranking.rs:178`); see below |
 | Block-list adoption and reconcile | `ingest_block_list_event`, `fetch_block_list`, `block_update_lock` (`sync.rs:360`, `:441-443`). The sync worker keeps its bounds and queueing (`sync.rs:82-102`, `:295-296`); the hook does the per-account work. |
 
-**A `DirectoryObserver` trait**, for the 10 `product_analytics.begin` sites with their `directory_sample`, `finish` and
-`discard` calls. `marmot-app` implements it by forwarding to `ProductAnalytics` with the same family, operation and
+**A `DirectoryObserver` trait**, for the nine `product_analytics.begin` sites that move, with their `count`,
+`directory_sample`, `finish` and `discard` calls (`count` at `member_key_packages.rs:579`). The tenth site
+(`methods.rs:865`) is profile publication, which stays on `ProductAnalytics`. `marmot-app` implements it by forwarding to `ProductAnalytics` with the same family, operation and
 unit strings. Step 6 (`marmot-observability`) can later supply it instead.
 
 **Two lifecycle entry points the app calls**, at the points where it touches `directory_caches` today:
@@ -163,6 +164,11 @@ utilities:
   its own error type with one variant for each of those, plus the `#[from]` conversions it relies on (rusqlite,
   serde_json, io, hex, `StorageError`). `From<DirectoryError> for AppError` maps each back to the variant and message
   used today, so the bindings, CLI and simulator still see the same errors.
+  - Downstream code matches these variants, for example `DirectoryLookupIncomplete` (`marmot-uniffi/src/errors.rs:561`,
+    `cli/src/error.rs:666`, `cgka-conformance-simulator/src/app_runtime.rs:2729`). The CLI also builds
+    `MissingDirectoryEntry` itself (`cli/src/commands/users.rs:57`), so `AppError` keeps every variant.
+  - `privacy_safe_kind` must give the same value on either side, because analytics uses it (`methods.rs:1041`,
+    `search.rs:349`).
   - One conversion stays on the app side. A KeyPackage that fails the requirements check becomes
     `AppError::from(cgka_session::SessionError::from(error))` (`key_package_records.rs:401`). The crate carries the
     engine's `EngineError`, and the boundary applies the `SessionError` step, so the variant doesn't change.
@@ -171,15 +177,11 @@ utilities:
   `AppError::AccountHome`, which the bindings split into `UnknownAccount`, `SecretNotFound` and
   `KeystoreUnavailable` (`marmot-uniffi/src/errors.rs:440-468`). The crate can't name that type without depending on
   `marmot-account`.
-  - Host methods return the app's own `AppError`, boxed as `Box<dyn Error + Send + Sync>`, and the crate carries it
-    as `DirectoryError::Host`.
-  - The boundary conversion downcasts it back to that exact value.
-  - A downcast that fails is a bug, so the conversion asserts it in debug builds.
-  - Downstream code matches these variants, for example `DirectoryLookupIncomplete` (`marmot-uniffi/src/errors.rs:561`,
-    `cli/src/error.rs:666`, `cgka-conformance-simulator/src/app_runtime.rs:2729`). The CLI also builds
-    `MissingDirectoryEntry` itself (`cli/src/commands/users.rs:57`), so `AppError` keeps every variant.
-  - `privacy_safe_kind` must give the same value on either side, because analytics uses it (`methods.rs:1041`,
-    `search.rs:349`).
+  - Host methods return a `HostError`, an opaque box around the app's own `AppError`. The crate carries it as
+    `DirectoryError::Host` and never builds one itself; a source check in PR 4 enforces that.
+  - The boundary conversion downcasts it back to that exact `AppError`. Because only the app builds a `HostError`, a
+    failed downcast is unreachable. The conversion `expect`s it in every build and has no fallback variant, so
+    release hosts can't see a substitute error.
 - **Re-exports.** `marmot-app` re-exports the 18 public directory types at their current paths (`lib.rs:221-227`) and
   the moved root types. UniFFI and C conversions compile unchanged, and no binding changes.
 - **Methods.** The directory's 19 public `MarmotApp` methods are called by `marmot-uniffi`, `cli`, `agent-connector`
