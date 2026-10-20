@@ -2143,6 +2143,15 @@ mod tests {
             matches!(result, Ok(EpochBackfillRunOutcome::Incomplete(_))),
             "one unreadable event must not fail the whole pass"
         );
+        assert_eq!(
+            fixture
+                .storage
+                .app_storage()
+                .transport_reconciliation_replay_cursor(&route)
+                .unwrap(),
+            Some([8; 32]),
+            "an unreadable event finished its attempt, so the replay rotates past it"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2341,6 +2350,15 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(result, EpochBackfillRunOutcome::Incomplete(_)));
+        assert_eq!(
+            fixture
+                .storage
+                .app_storage()
+                .transport_reconciliation_replay_cursor(&route)
+                .unwrap(),
+            Some([8; 32]),
+            "an unrouted event finished its attempt, so the replay rotates past it"
+        );
         // The relays answered; only admission fell short. That withholds the
         // certificate but is a quiet comparison, not an outage, so the slot is
         // serviced and the debt itself carries the retry.
