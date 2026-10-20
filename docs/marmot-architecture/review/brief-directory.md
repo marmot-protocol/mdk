@@ -81,11 +81,16 @@ It uses, but does not own, `<root>/shared.sqlite3`. That database is plain SQLit
 
 ## Decision: a new crate above the transport and storage
 
-Create `crates/nostr-directory`. It depends on `transport-nostr`, `transport-nostr-adapter` (event kinds),
-`transport-nostr-peeler`, `storage-sqlite`, `cgka-traits`, `cgka-engine` (KeyPackage metadata checks), `fs-private`
-and `reqwest` (the Open Ranking client, `open_ranking.rs:168`, `:254`). It depends on neither `marmot-app` nor `marmot-account`, nor on `cgka-session`, which step 5
-merges into `marmot-session`. Whatever it needs from the app comes through the host interface below.
+Create `crates/nostr-directory`.
+- **Workspace dependencies:** `transport-nostr`, `transport-nostr-adapter` (event kinds), `transport-nostr-peeler`,
+  `storage-sqlite`, `cgka-traits`, `cgka-engine` (KeyPackage metadata checks) and `fs-private`.
+- **External crates the code already uses:** `nostr-sdk`, `rusqlite`, `reqwest` (the Open Ranking client,
+  `open_ranking.rs:168`, `:254`), `tokio`, `futures`, `serde`, `serde_json`, `hex`, `sha2`, `url` and `tracing`.
+  The host traits add `async-trait`.
+- **Not:** `marmot-app`, `marmot-account`, or `cgka-session`, which step 5 merges into `marmot-session`. Whatever
+  it needs from the app comes through the host interface below.
 
+Two more points:
 - It sits beside the media store as an app service, as in [core structure §4](core-structure.md#4-proposed-target-structure).
 - Its relay seam is the relay plane's directory methods (`transport-nostr/src/lib.rs:1902-2159`), not the
   `DirectoryRelayFetcher` trait. The plane methods add relay-safety sanitizing, coalescing and subscription state that
@@ -184,10 +189,10 @@ utilities:
     release hosts can't see a substitute error.
 - **Re-exports.** `marmot-app` re-exports the 18 public directory types at their current paths (`lib.rs:221-227`) and
   the moved root types. UniFFI and C conversions compile unchanged, and no binding changes.
-- **Methods.** The directory's 19 public `MarmotApp` methods are called by `marmot-uniffi`, `cli`, `agent-connector`
-  and tests, for example `directory_entry_for_account_id` (14 outside callers) and `account_relay_list_status_for_account_id`
-  (13). During the move they become one-line delegates. PR 6 then repoints callers to `app.directory()` and deletes
-  the delegates, as relay-plane PR 4 did for its shim.
+- **Methods.** The directory's 18 public `MarmotApp` methods, after the two publication methods leave, are called by
+  `marmot-uniffi`, `cli`, `agent-connector` and tests. Examples are `directory_entry_for_account_id` (14 outside
+  callers) and `account_relay_list_status_for_account_id` (13). During the move they become one-line delegates. PR 6
+  then repoints callers to `app.directory()` and deletes the delegates, as relay-plane PR 4 did for its shim.
 
 ## PR sequence
 
@@ -211,6 +216,9 @@ Each PR keeps behaviour unchanged and ships alone.
    - State moves off `MarmotApp`, and `impl MarmotApp` becomes `impl Directory`.
    - `DirectoryConfig`, `DirectoryHost` and `DirectoryObserver` replace the hub calls.
    - `drop_account_caches` and `close_storage` call the two lifecycle entry points.
+   - `remember_directory_message_sender` takes the sender's account id instead of the app's `ReceivedMessage`
+     (`methods.rs:1537-1542`). It only reads `message.sender`, and it keeps the `"message"` reason. Its caller in
+     message projection passes `&message.sender` (`client/sync.rs:5956`).
    - `MarmotApp` gets one `directory` field and keeps delegates.
    - This is the large PR, so it lands in two slices: 4a moves the state, cache lifecycle and host, and 4b moves the
      remaining methods.
