@@ -246,8 +246,9 @@ Every other field is optional in generated Swift/Kotlin: omitted policies mean p
 an omitted label stays untagged, omitted storage uses the platform keychain, and an omitted
 acquisition mode keeps native automatic acquisition (see
 [host-managed acquisition](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104)).
-Existing constructors keep their signatures and delegate to this same configuration
-path. Use the options constructor when combining a label with a custom relay policy.
+Existing constructors take the deployment as their last argument and delegate to this
+same configuration path. Use the options constructor when combining a label with a
+custom relay policy.
 C hosts use `marmot_client_new_with_configuration` and a `MarmotClientOptions`
 struct; zero initialization selects the same defaults. Use the matching header
 and library for that struct's layout.

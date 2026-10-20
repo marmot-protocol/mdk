@@ -3746,7 +3746,7 @@ Host callback for NIP-44 payload decryption.
 pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, options: MarmotOptions, ) -> Result<Arc<Self>, MarmotKitError>
 ```
 
-Open with any combination of runtime options. Existing constructors are compatibility wrappers around this entry point.
+Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
 [Source](src/lib.rs#L283)
 
@@ -3770,7 +3770,7 @@ Open with an explicit relay policy and optional host-owned key storage. Existing
 pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploymentFfi, ) -> Result<Arc<Self>, MarmotKitError>
 ```
 
-Open the Marmot app at `root_path`, configured with the given default relay URLs. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) via the default keychain-backed account home — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
+Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
 [Source](src/lib.rs#L328)
 
