@@ -83,8 +83,8 @@ It uses, but does not own, `<root>/shared.sqlite3`. That database is plain SQLit
 
 Create `crates/marmot-directory`. It depends on `transport-nostr`, `transport-nostr-adapter` (event kinds and the
 process proxy), `transport-nostr-peeler`, `storage-sqlite`, `cgka-traits`, `cgka-engine` (KeyPackage metadata
-checks) and `fs-private`. It depends on neither `marmot-app` nor `marmot-account`. Whatever it needs from the app
-comes through the host interface below.
+checks) and `fs-private`. It depends on neither `marmot-app` nor `marmot-account`, nor on `cgka-session`, which step 5
+merges into `marmot-session`. Whatever it needs from the app comes through the host interface below.
 
 - It sits beside the media store as an app service, as in [core structure §4](core-structure.md#4-proposed-target-structure).
 - Its relay seam is the relay plane's directory methods (`transport-nostr/src/lib.rs:1902-2159`), not the
@@ -100,7 +100,7 @@ comes through the host interface below.
 | The directory half of `key_package_records.rs` (other accounts' relay-list status, KeyPackage ranking and selection, revocation evidence, cached-KeyPackage checks) | about 700 | Moves. It breaks today's import cycle between `directory/` and `key_package_records.rs` (`key_package_records.rs:25-31`, `directory/methods.rs:40-44`). |
 | Directory types at the `marmot-app` root: `AccountRelayListStatus`, `AccountRelayListState`, `MissingRelayListKind`, `FetchedKeyPackage`, `DirectoryFreshness`, `DirectorySelection`, `sort_directory_records`, the relay-list event parsers, the search caps and kinds 0 and 3 | about 150 | Moves; `marmot-app` re-exports the public ones at the same paths |
 | Profile and follow-list publication (`methods.rs:826-1047`) | about 220 | Stays. It is the account publishing its own state, and needs the signer, publish clients, quorum delivery and indexer copies (`lib.rs:3121-3262`, `:7490`, `:7554`). It calls the directory to remember what it published. |
-| `retain_safe_discovered_endpoints` (`methods.rs:1315`) | 8 | Stays. It only forwards to the relay plane, and its 13 callers are outside the directory. |
+| `retain_safe_discovered_endpoints` (`methods.rs:1315`) | 8 | Stays on `MarmotApp` for its 10 callers there (`lib.rs` 9, `client/push.rs` 1). It only forwards to the relay plane. The 12 call sites in code that moves (`key_package_recovery.rs` 2, `member_key_packages.rs` 6, `methods.rs:250`, `:602`, `search.rs:850`, `public_event_preview.rs:787`) call the relay plane handle directly from PR 1, as onboarding already does (`runtime/onboarding.rs:1901`). |
 | The own-account half of `key_package_records.rs` (inventory, merge, publish endpoints) | about 350 | Stays |
 | Block lists (`user_blocks.rs`), onboarding (`runtime/onboarding.rs`), relay-list publication (`lib.rs`) | — | Stay. They are account state. They become callers of the crate. |
 | `shared.sqlite3` and `SqliteSharedStorage` | — | Stay in `storage-sqlite` (step 8 decides any split) |
@@ -124,27 +124,57 @@ then has a single owner. `marmot-app` constructs it with three things.
 
 | Host method | Replaces |
 | --- | --- |
-| Local accounts (id, label, signing state) | `account_home()` at 13 sites: listing accounts (`methods.rs:116`, `sync.rs:428`) and loading signing keys for the cache key (`methods.rs:1832`) |
+| Local accounts: id, label, `local_signing` and `is_active_signing()` (`marmot-account/src/home.rs:174-176`) | `account_home()` at 13 sites in `directory/` and one in previews (`public_event_preview.rs:758`). The view must keep the active-signing filter that decides which caches open (`methods.rs:1870`, `cached_search.rs:131`) and the `local_signing` copy onto records (`methods.rs:2016`). |
 | Account directory path and cache key | `account_dir`, `sqlcipher_key_locked`, `external_sqlcipher_key` (`methods.rs:1790`, `:1832-1847`) |
 | The storage gate, the open lock and closer registration | `ensure_storage_open`, `begin_storage_open`, `database_open_lock`, `root_closers.register` (`methods.rs:1802-1856`). The open order stays the same; only the owner of the map changes. |
 | Shared storage | `shared_storage()` at 9 sites (lifecycle stays on the hub) |
 | "Entry changed" | the two `presentation_signals` calls (`methods.rs:1760-1764`, `:1916-1920`) |
+| A proxy-configured HTTP client builder | `crate::network_proxy::http_builder` (`open_ranking.rs:178`); see below |
 | Block-list adoption and reconcile | `ingest_block_list_event`, `fetch_block_list`, `block_update_lock` (`sync.rs:360`, `:441-443`). The sync worker keeps its bounds and queueing (`sync.rs:82-102`, `:295-296`); the hook does the per-account work. |
 
 **A `DirectoryObserver` trait**, for the 10 `product_analytics.begin` sites with their `directory_sample`, `finish` and
 `discard` calls. `marmot-app` implements it by forwarding to `ProductAnalytics` with the same family, operation and
 unit strings. Step 6 (`marmot-observability`) can later supply it instead.
 
-The relay plane is passed in as a cloned `MarmotRelayPlane` handle, as the hub holds it (`lib.rs:529`). The two other utilities need no host:
+**Two lifecycle entry points the app calls**, at the points where it touches `directory_caches` today:
+- `Directory::evict_account(label)`, called from `drop_account_caches` (`lib.rs:7402-7444`). It removes only the
+  label's cache handle, as today.
+  - That function runs before an account directory is deleted on removal, setup reset, sign-out and rollback
+    (`runtime/mod.rs:6609`, `:6721`, `:6811`, `:8655`, `:8679`; `onboarding/cancellation.rs:235`,
+    `onboarding/recovery.rs:221`).
+  - Its doc says why: a handle kept across delete and re-import writes to the unlinked old database.
+  - Closer registration doesn't cover this, because it only runs at terminal close.
+- `Directory::take_caches()`, called from `close_storage` (`lib.rs:6502-6508`). It drains the map so the caches drop
+  after `root_closers.close_all()`, in the same order as today.
+
+The relay plane is passed in as a cloned `MarmotRelayPlane` handle, as the hub holds it (`lib.rs:529`). Two more
+utilities:
 - `blocking_app_task` (`runtime/mod.rs:8936`) becomes the crate's own `spawn_blocking` helper.
-- The Open Ranking client calls `transport_nostr_adapter::network_proxy` directly, as `marmot-app`'s
-  `http_builder` does today (`network_proxy.rs:21`).
+- The Open Ranking client (`open_ranking.rs:178`) keeps using `marmot-app`'s `http_builder` (`network_proxy.rs:21`),
+  through a host method that returns a proxy-configured `reqwest::ClientBuilder`.
+  - That helper first removes environment proxies, so `NO_PROXY` can't bypass the process SOCKS5 proxy and
+    `ALL_PROXY` can't replace it. It then installs that proxy with its credentials.
+  - Calling the adapter's proxy settings directly would skip both steps, so one implementation stays.
+  - The media and collector clients use the same helper. Step 6 can move it to a shared home.
 
 ## Errors and public surface
 
 - **`DirectoryError`.** The directory names 15 `AppError` variants over 210 mentions (`error.rs:121`). The crate gets
-  its own error type with one variant for each of those. `From<DirectoryError> for AppError` maps each back to the
-  variant and message used today, so the bindings, CLI and simulator still see the same errors.
+  its own error type with one variant for each of those, plus the `#[from]` conversions it relies on (rusqlite,
+  serde_json, io, hex, `StorageError`). `From<DirectoryError> for AppError` maps each back to the variant and message
+  used today, so the bindings, CLI and simulator still see the same errors.
+  - One conversion stays on the app side. A KeyPackage that fails the requirements check becomes
+    `AppError::from(cgka_session::SessionError::from(error))` (`key_package_records.rs:401`). The crate carries the
+    engine's `EngineError`, and the boundary applies the `SessionError` step, so the variant doesn't change.
+- **Host errors pass through unchanged.** Some errors come from the app, not the directory. For example,
+  `account_home().account(label)?` (`methods.rs:1093`) and `load_signing_keys(...)?` (`methods.rs:1833`) become
+  `AppError::AccountHome`, which the bindings split into `UnknownAccount`, `SecretNotFound` and
+  `KeystoreUnavailable` (`marmot-uniffi/src/errors.rs:440-468`). The crate can't name that type without depending on
+  `marmot-account`.
+  - Host methods return the app's own `AppError`, boxed as `Box<dyn Error + Send + Sync>`, and the crate carries it
+    as `DirectoryError::Host`.
+  - The boundary conversion downcasts it back to that exact value.
+  - A downcast that fails is a bug, so the conversion asserts it in debug builds.
   - Downstream code matches these variants, for example `DirectoryLookupIncomplete` (`marmot-uniffi/src/errors.rs:561`,
     `cli/src/error.rs:666`, `cgka-conformance-simulator/src/app_runtime.rs:2729`). The CLI also builds
     `MissingDirectoryEntry` itself (`cli/src/commands/users.rs:57`), so `AppError` keeps every variant.
@@ -173,9 +203,12 @@ Each PR keeps behaviour unchanged and ships alone.
    - Directory code returns `DirectoryError`, and the boundary converts it.
    - A table test covers every variant: the same `AppError` variant, the same message and the same
      `privacy_safe_kind`.
+   - The test also covers host failures that pass through `Host`: an unknown account, a missing secret, an
+     unavailable keystore, and closed storage.
 4. **The `Directory` service.**
    - State moves off `MarmotApp`, and `impl MarmotApp` becomes `impl Directory`.
    - `DirectoryConfig`, `DirectoryHost` and `DirectoryObserver` replace the hub calls.
+   - `drop_account_caches` and `close_storage` call the two lifecycle entry points.
    - `MarmotApp` gets one `directory` field and keeps delegates.
    - This is the large PR, so it lands in two slices: 4a moves the state, cache lifecycle and host, and 4b moves the
      remaining methods.
@@ -208,6 +241,8 @@ reviewable.
   each call.
 - **Lifecycle.**
   - `shutdown_and_close` still closes every directory cache, because the caches register through the host's closer.
+  - Removing an account still evicts its cache before the directory is deleted. A regression test removes an account,
+    re-imports it, and checks that directory writes reach the new cache file.
   - The sync worker shuts down at the same point (`runtime/mod.rs:6046-6055`).
   - The suspension-close tests cover this, and they are load-sensitive: rerun them alone if they fail.
 - **Suites.**
