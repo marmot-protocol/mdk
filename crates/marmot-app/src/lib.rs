@@ -97,6 +97,8 @@ pub use deployment::{
 pub mod conversation_presentation;
 mod conversions;
 mod directory;
+#[cfg(test)]
+mod directory_crossings_tests;
 mod drafts;
 mod local_submissions;
 pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
