@@ -462,7 +462,7 @@ The resolved stream id this watch is following (hex). Writes an owned copy: free
 MarmotStatus marmot_attachment_transfer_subscription_next(const struct MarmotAttachmentTransferSubscription *sub, uint32_t timeout_ms, struct MarmotAttachmentTransferSnapshot **out);
 ```
 
-Initial snapshot then replacements, at most four per second. Zero timeout waits indefinitely. Timeout does not consume updates. Free results with marmot_attachment_transfer_snapshot_free. # Safety Sub must be live and out writable. Use one receiver per handle.
+Initial snapshot then replacements. A transfer state change arrives at once; progress-only replacements arrive at most four per second. Zero timeout waits indefinitely. Timeout does not consume updates. Free results with marmot_attachment_transfer_snapshot_free. # Safety Sub must be live and out writable. Use one receiver per handle.
 
 [Header contract](include/marmot.h#L11339)
 

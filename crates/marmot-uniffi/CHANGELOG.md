@@ -65,6 +65,14 @@
 
 - `Marmot::group_commit_delivery` returns the relays still owed the group's last change (`GroupCommitDeliveryFfi`), and `Marmot::acknowledge_group_commit_undelivered` lets one change through after `GroupCommitUndelivered` once the user accepts the risk. See [the delivery notes](README.md#history-may-be-incomplete-notices).
 
+### Changed
+
+- `AttachmentTransferSubscription.next()` returns a replacement that changes a
+  row's transfer state as soon as the engine reports it; progress-only
+  replacements still arrive at most four per second. A host that polled
+  `attachmentTransferSnapshot` beside the feed to see `Ready` sooner can drop
+  that poll (#2157).
+
 ### Fixed
 
 - `edit_message` returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Before, an edit of another account's message, a reaction or a deleted message was published to the group and reported as sent, then ignored by every recipient. The check uses this device's view when the edit is requested; recipients stay authoritative.

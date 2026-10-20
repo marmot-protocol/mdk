@@ -162,7 +162,9 @@ C hosts use `marmot_attachment_storage_usage`, `marmot_attachment_storage_by_cha
 
 `attachmentTransferSnapshot` and `subscribeAttachmentTransfers` accept the same bounded
 original-slot targets as local access. `next()` returns an initial snapshot then complete
-replacements in target order (maximum four per second). `cancel()` stops observation only;
+replacements in target order. A replacement that changes a row's transfer state, or adds or
+removes a row, arrives as soon as the engine reports it; progress-only replacements are coalesced
+to at most four per second. `cancel()` stops observation only;
 call it to wake pending receivers, then drop/destroy the subscription when its screen leaves. Recreate it when the visible target set
 changes. C provides blocking `next` with a timeout; call off the UI thread. A timeout does not
 consume an update. Close/error/runtime shutdown ends observation. No transfer is requested by lookup.

@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::attachment_controls::TransferWaitForTest;
 use crate::{AttachmentMigrationState, MarmotApp};
 use marmot_account::AccountHome;
 use sha2::{Digest, Sha256};
@@ -57,6 +58,29 @@ fn seed(store: &SqliteAppStorage, bytes: &[u8]) {
 
 /// A legacy database body for slot `key`, received at 10.
 fn seed_at(store: &SqliteAppStorage, key: AttachmentLocalTarget, bytes: &[u8]) {
+    let job = seed_downloading_at(store, key, bytes);
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(&job, bytes, crate::unix_now_seconds(), 10_000_000)
+            .unwrap(),
+        storage_sqlite::AttachmentPublishResult::Published
+    );
+}
+
+/// Seed one explicit transfer for `bytes` at the fixture slot and claim it, so its row is Downloading.
+fn seed_downloading(
+    store: &SqliteAppStorage,
+    bytes: &[u8],
+) -> storage_sqlite::AttachmentAcquisition {
+    seed_downloading_at(store, target(), bytes)
+}
+
+/// Seed one explicit transfer for `bytes` at slot `key`, received at 10, and claim it.
+fn seed_downloading_at(
+    store: &SqliteAppStorage,
+    key: AttachmentLocalTarget,
+    bytes: &[u8],
+) -> storage_sqlite::AttachmentAcquisition {
     store
         .save_account_projection_state(
             &StoredAccountState {
@@ -103,16 +127,10 @@ fn seed_at(store: &SqliteAppStorage, key: AttachmentLocalTarget, bytes: &[u8]) {
     else {
         panic!("demand")
     };
-    let job = store
+    store
         .claim_attachment_acquisition(&reference, now, now + 60)
         .unwrap()
-        .unwrap();
-    assert_eq!(
-        store
-            .complete_attachment_acquisition(&job, bytes, now, 10_000_000)
-            .unwrap(),
-        storage_sqlite::AttachmentPublishResult::Published
-    );
+        .unwrap()
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_local_access_is_bounded_offline_and_survives_reopen() {
@@ -1376,5 +1394,420 @@ async fn a_damaged_stored_twin_does_not_replace_the_database_copy() {
     assert!(migrate_legacy(&app, &store, u64::MAX / 2));
     assert_eq!(store.app_storage().legacy_attachment_bytes().unwrap(), 0);
     assert_eq!(read_whole(&runtime, legacy_slot(0x52)).await.unwrap(), body);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Opens a runtime over one claimed transfer and returns its subscription after the
+/// initial Downloading frame.
+async fn downloading_subscription(
+    dir: &tempfile::TempDir,
+    bytes: &[u8],
+) -> (
+    crate::MarmotAppRuntime,
+    SqliteAppStorage,
+    storage_sqlite::AttachmentAcquisition,
+    std::sync::Arc<crate::RuntimeAttachmentTransferSubscription>,
+) {
+    use crate::AttachmentTransferState;
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap().app_storage();
+    let job = seed_downloading(&store, bytes);
+    let runtime = app.runtime();
+    let group = GroupId::new(vec![0xab; 16]);
+    let stream = runtime
+        .subscribe_attachment_transfers("alice", &group, vec![target()])
+        .await
+        .unwrap();
+    let first = stream.next().await.unwrap().unwrap().remove(0).unwrap();
+    assert_eq!(first.state, AttachmentTransferState::Downloading);
+    (runtime, store, job, stream)
+}
+
+/// Writes byte progress for `job` and wakes subscribers, as the worker does.
+fn report_progress(
+    runtime: &crate::MarmotAppRuntime,
+    store: &SqliteAppStorage,
+    job: &storage_sqlite::AttachmentAcquisition,
+    received: u64,
+) {
+    assert!(
+        store
+            .update_attachment_progress(
+                job,
+                crate::unix_now_seconds(),
+                1,
+                received,
+                Some(1 << 20),
+                false
+            )
+            .unwrap()
+    );
+    runtime.shared.attachment_updates.send_modify(|_| {});
+}
+
+/// Publishes `job` and wakes subscribers, as the worker does after a download.
+fn report_ready(
+    runtime: &crate::MarmotAppRuntime,
+    store: &SqliteAppStorage,
+    job: &storage_sqlite::AttachmentAcquisition,
+    bytes: &[u8],
+) {
+    assert_eq!(
+        store
+            .complete_attachment_acquisition(job, bytes, crate::unix_now_seconds(), 10_000_000)
+            .unwrap(),
+        storage_sqlite::AttachmentPublishResult::Published
+    );
+    runtime.shared.attachment_updates.send_modify(|_| {});
+}
+
+/// Waits for the next frame of `stream` and returns its only row with the
+/// instant it arrived.
+async fn next_row(
+    stream: &crate::RuntimeAttachmentTransferSubscription,
+) -> (crate::AttachmentTransferStatus, tokio::time::Instant) {
+    let row = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .remove(0)
+        .unwrap();
+    (row, tokio::time::Instant::now())
+}
+
+/// Returns once the pending `next()` behind `waits` waits for `wait`, failing
+/// rather than hanging when it never does.
+async fn reaches(
+    waits: &mut tokio::sync::watch::Receiver<Option<TransferWaitForTest>>,
+    wait: TransferWaitForTest,
+) {
+    let reached = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        waits.wait_for(|now| *now == Some(wait)),
+    )
+    .await;
+    assert!(
+        reached.is_ok_and(|seen| seen.is_ok()),
+        "next() never waited for {wait:?}; last {:?}",
+        *waits.borrow()
+    );
+}
+
+/// Starts a `next()` on its own task and returns once it waits for `wait`, so
+/// what the test reports next lands on an established wait.
+async fn pending_next(
+    stream: &std::sync::Arc<crate::RuntimeAttachmentTransferSubscription>,
+    wait: TransferWaitForTest,
+) -> tokio::task::JoinHandle<(crate::AttachmentTransferStatus, tokio::time::Instant)> {
+    let mut waits = stream.waits_for_test();
+    let pending = tokio::spawn({
+        let stream = stream.clone();
+        async move { next_row(&stream).await }
+    });
+    reaches(&mut waits, wait).await;
+    pending
+}
+
+// These timing tests run on a paused clock: the clock stays put while a
+// database read runs on the blocking pool, so instants measure only the
+// subscription's own waits and runner load cannot move them.
+
+/// The documented spacing of progress-only frames: at most four per second.
+/// Spelled out rather than imported, so changing the constant fails the tests.
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The spacing of reads that transfer notifications trigger, spelled out for
+/// the same reason.
+const READ_FLOOR: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// mdk#2157: a transfer that becomes Ready while `next()` waits for a wake is
+/// delivered after the read floor, not up to 250 ms later.
+#[tokio::test(start_paused = true)]
+async fn attachment_transfer_state_change_skips_the_progress_window() {
+    use crate::AttachmentTransferState;
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, store, job, stream) = downloading_subscription(&dir, b"prompt").await;
+    let pending = pending_next(&stream, TransferWaitForTest::Wake).await;
+    report_ready(&runtime, &store, &job, b"prompt");
+    let reported = tokio::time::Instant::now();
+    let (ready, arrived) = pending.await.unwrap();
+    assert_eq!(ready.state, AttachmentTransferState::Ready);
+    assert!(
+        arrived <= reported + READ_FLOOR,
+        "Ready arrived {:?} after its report",
+        arrived - reported
+    );
+    stream.close();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Byte progress alone is still coalesced: with a write every 20 ms, frames
+/// that only advance progress arrive exactly the window apart.
+#[tokio::test(start_paused = true)]
+async fn attachment_progress_only_frames_stay_coalesced() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, store, job, stream) = downloading_subscription(&dir, b"progress").await;
+    let writer = {
+        let (runtime, store, job) = (runtime.clone(), store.clone(), job.clone());
+        tokio::spawn(async move {
+            for step in 1..=60u64 {
+                report_progress(&runtime, &store, &job, step * 1024);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+    };
+    let started = tokio::time::Instant::now();
+    let mut arrivals = vec![started];
+    while let Ok(frame) = tokio::time::timeout(
+        std::time::Duration::from_millis(1_300).saturating_sub(started.elapsed()),
+        stream.next(),
+    )
+    .await
+    {
+        let row = frame.unwrap().unwrap().remove(0).unwrap();
+        assert_eq!(row.state, crate::AttachmentTransferState::Downloading);
+        arrivals.push(tokio::time::Instant::now());
+    }
+    writer.await.unwrap();
+    assert!(
+        arrivals.len() >= 5,
+        "expected a progress frame each window: {arrivals:?}"
+    );
+    for pair in arrivals.windows(2) {
+        assert_eq!(pair[1] - pair[0], FRAME_INTERVAL);
+    }
+    stream.close();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A state change that lands while read progress waits out the window is
+/// delivered after the read floor, and no stale progress frame follows it.
+#[tokio::test(start_paused = true)]
+async fn attachment_terminal_frame_is_not_held_behind_progress() {
+    use crate::AttachmentTransferState;
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, store, job, stream) = downloading_subscription(&dir, b"terminal").await;
+    let mut waits = stream.waits_for_test();
+    let pending = pending_next(&stream, TransferWaitForTest::Wake).await;
+    report_progress(&runtime, &store, &job, 1024);
+    // The pending call has read this progress and holds it for the window.
+    reaches(&mut waits, TransferWaitForTest::Held).await;
+    report_ready(&runtime, &store, &job, b"terminal");
+    let reported = tokio::time::Instant::now();
+    let (next, arrived) = pending.await.unwrap();
+    assert_eq!(next.state, AttachmentTransferState::Ready);
+    assert!(
+        arrived <= reported + READ_FLOOR,
+        "Ready arrived {:?} after its report",
+        arrived - reported
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(400), stream.next())
+            .await
+            .is_err(),
+        "a frame followed the terminal one"
+    );
+    stream.close();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A state change that lands while a presentation wake waits out its spacing
+/// is read after the read floor rather than at the end of that spacing.
+#[tokio::test(start_paused = true)]
+async fn attachment_state_change_is_not_held_behind_presentation_churn() {
+    use crate::AttachmentTransferState;
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, store, job, stream) = downloading_subscription(&dir, b"churn").await;
+    let mut waits = stream.waits_for_test();
+    let pending = pending_next(&stream, TransferWaitForTest::Wake).await;
+    let _ = runtime.accounts.app.presentation_signals.updates.send(
+        crate::chat_presentation::signals::PresentationInvalidation {
+            account_label: "alice".into(),
+            version: storage_sqlite::ChatPresentationVersion {
+                store_epoch: Vec::new(),
+                revision: 1,
+            },
+        },
+    );
+    // The pending call took the presentation wake and waits out its spacing.
+    reaches(&mut waits, TransferWaitForTest::Read(FRAME_INTERVAL)).await;
+    report_ready(&runtime, &store, &job, b"churn");
+    let reported = tokio::time::Instant::now();
+    let (next, arrived) = pending.await.unwrap();
+    assert_eq!(next.state, AttachmentTransferState::Ready);
+    assert!(
+        arrived <= reported + READ_FLOOR,
+        "Ready arrived {:?} after its report",
+        arrived - reported
+    );
+    stream.close();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Caller timeouts that cancel `next()` while its database read runs leave
+/// that read in flight, and the next call awaits it rather than starting
+/// another, so short timeouts under contention never stack reads.
+#[tokio::test(start_paused = true)]
+async fn attachment_reads_survive_cancelled_next_without_stacking() {
+    use crate::AttachmentTransferState;
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, store, job, stream) = downloading_subscription(&dir, b"stacked").await;
+    let gate = stream.gate_reads_for_test();
+    report_ready(&runtime, &store, &job, b"stacked");
+    for _ in 0..6 {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), stream.next())
+                .await
+                .is_err(),
+            "a held read delivered a frame"
+        );
+    }
+    let started = || gate.starts.lock().unwrap().len();
+    assert_eq!(started(), 1, "each cancelled call started another read");
+    gate.open.send_replace(true);
+    let (ready, _) = next_row(&stream).await;
+    assert_eq!(ready.state, AttachmentTransferState::Ready);
+    assert_eq!(started(), 1);
+    stream.close();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A read a cancelled call left in flight can hold a snapshot taken before a
+/// later state change. The next call collects that read before it consumes
+/// the change's notification, so `Ready` still arrives the read floor after
+/// its report, not with the stale progress at the window's end.
+#[tokio::test(start_paused = true)]
+async fn attachment_resumed_read_never_swallows_a_later_state_change() {
+    use crate::AttachmentTransferState;
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, store, job, stream) = downloading_subscription(&dir, b"resumed").await;
+    let gate = stream.gate_read_results_for_test();
+    report_progress(&runtime, &store, &job, 1024);
+    // The call snapshots that progress, then its caller gives up while the
+    // result is held.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
+            .await
+            .is_err(),
+        "a held read delivered a frame"
+    );
+    assert_eq!(gate.starts.lock().unwrap().len(), 1);
+    report_ready(&runtime, &store, &job, b"resumed");
+    let reported = tokio::time::Instant::now();
+    gate.open.send_replace(true);
+    let (row, arrived) = next_row(&stream).await;
+    assert_eq!(row.state, AttachmentTransferState::Ready);
+    assert!(
+        arrived <= reported + READ_FLOOR,
+        "Ready arrived {:?} after its report",
+        arrived - reported
+    );
+    stream.close();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A caller timeout that cancels `next()` while progress waits out the window
+/// keeps the held rows, so the next call delivers that progress exactly when
+/// the window ends, from the read already made.
+#[tokio::test(start_paused = true)]
+async fn attachment_progress_survives_a_cancelled_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, store, job, stream) = downloading_subscription(&dir, b"cancel").await;
+    let opened = tokio::time::Instant::now();
+    let gate = stream.gate_reads_for_test();
+    gate.open.send_replace(true);
+    report_progress(&runtime, &store, &job, 1024);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
+            .await
+            .is_err(),
+        "progress skipped the window"
+    );
+    let (row, arrived) = next_row(&stream).await;
+    assert_eq!(row.received, 1024);
+    assert_eq!(arrived, opened + FRAME_INTERVAL);
+    assert_eq!(
+        gate.starts.lock().unwrap().len(),
+        1,
+        "held progress was read again"
+    );
+    stream.close();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Every account's transfers wake every subscription, so under a stream of
+/// transfer notifications a subscription still starts its reads at least the
+/// read floor apart, whether a wake or held progress prompted them.
+#[tokio::test(start_paused = true)]
+async fn attachment_reads_keep_the_floor_under_a_notification_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, store, job, stream) = downloading_subscription(&dir, b"floor").await;
+    let gate = stream.gate_reads_for_test();
+    gate.open.send_replace(true);
+    let writer = {
+        let (runtime, store, job) = (runtime.clone(), store.clone(), job.clone());
+        tokio::spawn(async move {
+            for step in 1..=120u64 {
+                report_progress(&runtime, &store, &job, step * 64);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+    };
+    let started = tokio::time::Instant::now();
+    while let Ok(frame) = tokio::time::timeout(
+        std::time::Duration::from_millis(700).saturating_sub(started.elapsed()),
+        stream.next(),
+    )
+    .await
+    {
+        frame.unwrap().unwrap();
+    }
+    writer.await.unwrap();
+    let starts = gate.starts.lock().unwrap().clone();
+    assert!(starts.len() >= 10, "expected reads throughout: {starts:?}");
+    for pair in starts.windows(2) {
+        assert!(
+            pair[1] - pair[0] >= READ_FLOOR,
+            "reads started {:?} apart",
+            pair[1] - pair[0]
+        );
+    }
+    stream.close();
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Progress that lands just before the window ends is held, and a second
+/// report before the deadline reads again no sooner than the read floor after
+/// the first read, even though the deadline itself comes sooner.
+#[tokio::test(start_paused = true)]
+async fn attachment_progress_near_the_window_end_keeps_the_read_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, store, job, stream) = downloading_subscription(&dir, b"edge").await;
+    let opened = tokio::time::Instant::now();
+    let gate = stream.gate_reads_for_test();
+    gate.open.send_replace(true);
+    let mut waits = stream.waits_for_test();
+    let pending = pending_next(&stream, TransferWaitForTest::Wake).await;
+    // 15 ms before the window ends, inside the one-second idle fallback.
+    tokio::time::sleep(FRAME_INTERVAL - std::time::Duration::from_millis(15)).await;
+    report_progress(&runtime, &store, &job, 1024);
+    reaches(&mut waits, TransferWaitForTest::Held).await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    report_progress(&runtime, &store, &job, 2048);
+    let (row, arrived) = pending.await.unwrap();
+    assert_eq!(row.received, 2048);
+    let starts = gate.starts.lock().unwrap().clone();
+    assert_eq!(starts.len(), 2, "reads: {starts:?}");
+    assert_eq!(
+        starts[0],
+        opened + FRAME_INTERVAL - std::time::Duration::from_millis(15)
+    );
+    assert_eq!(starts[1], starts[0] + READ_FLOOR);
+    assert_eq!(arrived, starts[1]);
+    stream.close();
     runtime.shutdown_and_close().await.unwrap();
 }
