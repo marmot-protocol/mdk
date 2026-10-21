@@ -91,9 +91,11 @@
   settles the attempt in the same commit (`settle_avatar_acquisition` settles
   a refused one), and `AvatarPublication::for_migration` moves a
   database-held image into a file without changing its content revision or
-  recency. `database_held_avatars`, `database_avatar_body`,
-  `drop_corrupt_database_avatar`, `evict_database_avatars` and
-  `database_avatar_bytes` are the migration's database side.
+  recency. `database_held_avatars` (smallest first), `database_avatar_body`,
+  `drop_corrupt_database_avatar`, `evict_database_avatar` and
+  `database_avatar_bytes` are the migration's database side, and
+  `ready_media_file` finds the file a publication would reuse, so the move
+  can verify it before giving up the database copy.
 
 - Avatars and group images in the media store's cache category (mdk#2314
   step 9): `AvatarPublication` is the `media_store::PublishTarget` for one

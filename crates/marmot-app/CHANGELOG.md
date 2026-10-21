@@ -69,9 +69,11 @@
   retries the fetch later. Reads take file-backed images from the store; a
   missing or corrupt file is cleared and fetched again for every chat that
   shows it. The maintenance tick moves images still held in the account
-  database into files in small batches without changing what viewers see;
-  on a disk too full for them it drops them, to be fetched again when shown,
-  and never waits for space. Compaction's live-size log waits until no
+  database into files in small batches, smallest first, without changing
+  what viewers see. An identical file already on disk is read back in full
+  and then reused at no space cost; when the disk cannot take a new file,
+  that image's owner is dropped, to be fetched again when shown, and nothing
+  waits for space. Compaction's live-size log waits until no
   avatar image remains in the database.
 
 - Downloaded attachment bodies are retained as encrypted files in the account's

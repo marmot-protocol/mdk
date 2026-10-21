@@ -323,3 +323,107 @@ fn a_full_disk_drops_database_avatars() {
         "nothing is left to drop"
     );
 }
+
+/// An identical cache file that is corrupt is never trusted with the only
+/// good copy: the move verifies it, marks it lost and writes a fresh file
+/// from the database bytes.
+#[test]
+fn a_corrupt_identical_file_is_not_reused_by_the_move() {
+    let f = Fixture::new();
+    let shared = image(9, 70_000);
+    let (_, job) = f.claim("chat:aa");
+    store_acquired(
+        &f.storage(),
+        &f.media,
+        RESERVE,
+        &plenty,
+        &job,
+        &shared,
+        None,
+    )
+    .unwrap();
+    let held = f.storage().bind_avatar_source("chat:bb", "source").unwrap();
+    f.storage().publish_avatar(&held, 0, &shared, None).unwrap();
+    // Damage a segment in the middle of the existing file; its header and
+    // length still look right.
+    let id = f
+        .storage()
+        .ready_media_file(Category::Cache, &Sha256::digest(shared.bytes()).into())
+        .unwrap()
+        .unwrap();
+    let path = f.media.path(&id);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    std::fs::write(&path, bytes).unwrap();
+
+    let batch = migrate_batch(&f.storage(), &f.media, RESERVE, &plenty);
+    assert_eq!((batch.moved, batch.deferred), (1, false));
+    assert_eq!(f.read(&held).image, Some(shared));
+    assert_ne!(
+        f.storage()
+            .read_avatar(&held, crate::unix_now_seconds())
+            .unwrap()
+            .file
+            .map(|file| file.id),
+        Some(id),
+        "the damaged file was not reused"
+    );
+}
+
+/// A copy of an image already on disk costs no space: on a disk too full for
+/// a new file the fetch still attaches it, and the move attaches a
+/// database-held copy instead of dropping it.
+#[test]
+fn a_full_disk_still_attaches_an_image_already_on_disk() {
+    let f = Fixture::new();
+    let shared = image(10, 6_000);
+    let (_, first) = f.claim("chat:aa");
+    store_acquired(
+        &f.storage(),
+        &f.media,
+        RESERVE,
+        &plenty,
+        &first,
+        &shared,
+        None,
+    )
+    .unwrap();
+    let held = f.storage().bind_avatar_source("chat:bb", "source").unwrap();
+    f.storage().publish_avatar(&held, 0, &shared, None).unwrap();
+    let other = f.storage().bind_avatar_source("chat:cc", "source").unwrap();
+    f.storage()
+        .publish_avatar(&other, 0, &image(11, 6_000), None)
+        .unwrap();
+    let tight = || Ok(RESERVE);
+
+    let batch = migrate_batch(&f.storage(), &f.media, RESERVE, &tight);
+    assert_eq!((batch.moved, batch.evicted), (1, 1));
+    assert_eq!(f.read(&held).image, Some(shared.clone()));
+    assert_eq!(f.files_on_disk(), 1);
+    assert_eq!(
+        f.storage()
+            .avatar_status(&other, crate::unix_now_seconds())
+            .unwrap()
+            .availability,
+        AvatarAvailability::Invalidated,
+        "only the image that needed a new file was dropped"
+    );
+
+    let (reference, second) = f.claim("chat:dd");
+    assert_eq!(
+        store_acquired(
+            &f.storage(),
+            &f.media,
+            RESERVE,
+            &tight,
+            &second,
+            &shared,
+            None
+        )
+        .unwrap(),
+        StoredAvatar::Stored
+    );
+    assert_eq!(f.read(&reference).image, Some(shared));
+    assert_eq!(f.files_on_disk(), 1);
+}

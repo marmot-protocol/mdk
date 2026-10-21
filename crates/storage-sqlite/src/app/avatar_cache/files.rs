@@ -355,14 +355,15 @@ pub enum DatabaseAvatarBody {
 }
 
 impl SqliteAppStorage {
-    /// Up to `limit` images still held in the database.
+    /// Up to `limit` images still held in the database, smallest first.
     pub fn database_held_avatars(&self, limit: usize) -> StorageResult<Vec<DatabaseAvatar>> {
         let conn = self.lock()?;
         let mut statement = conn
             .prepare(
                 "SELECT a.token, m.store_epoch, a.content_revision, length(a.bytes), a.refresh_at
                  FROM avatar_assets a CROSS JOIN chat_presentation_meta m
-                 WHERE m.id = 1 AND a.bytes IS NOT NULL ORDER BY a.token LIMIT ?1",
+                 WHERE m.id = 1 AND a.bytes IS NOT NULL
+                 ORDER BY length(a.bytes), a.token LIMIT ?1",
             )
             .storage()?;
         let rows = statement
@@ -458,17 +459,24 @@ impl SqliteAppStorage {
         })
     }
 
-    /// Removes up to `limit` owners whose images are still database-held, as
-    /// eviction does: a later visible request binds and fetches them again.
-    /// For a disk too full to move them into files.
-    pub fn evict_database_avatars(&self, limit: usize) -> StorageResult<usize> {
-        self.lock()?
+    /// Removes the owner of database-held image `avatar`, as eviction does:
+    /// a later visible request binds and fetches it again. For a disk too
+    /// full to move it into a file. `false` when the row changed.
+    pub fn evict_database_avatar(&self, avatar: &DatabaseAvatar) -> StorageResult<bool> {
+        Ok(self
+            .lock()?
             .execute(
-                "DELETE FROM avatar_assets WHERE token IN
-                    (SELECT token FROM avatar_assets WHERE bytes IS NOT NULL ORDER BY token LIMIT ?1)",
-                [limit as i64],
+                "DELETE FROM avatar_assets
+                 WHERE token = ?1 AND content_revision = ?2 AND bytes IS NOT NULL
+                    AND (SELECT store_epoch FROM chat_presentation_meta WHERE id = 1) = ?3",
+                params![
+                    avatar.reference.token,
+                    u64_to_i64(avatar.revision)?,
+                    avatar.reference.store_epoch
+                ],
             )
-            .storage()
+            .storage()?
+            == 1)
     }
 
     /// Bytes of images still held in the database.

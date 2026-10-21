@@ -80,8 +80,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   always on the blocking pool: a fetched image is admitted with `DiskPolicy::cache_need` and published with its
   attempt settled in the same commit (no room retries the fetch later); reads take file-backed images from the store
   and report a missing or corrupt file so every owner sharing it refetches; and the maintenance tick moves images
-  still held in the database into files after the attachment batch, dropping the rest like evictions when the disk
-  cannot take them. Cache images are re-fetchable, so nothing here waits for free space.
+  still held in the database into files after the attachment batch, smallest first. An identical ready file is
+  attached at no space cost (the move verifies it first, since its commit drops the database copy); an image that needs
+  a new file the disk cannot take has its owner dropped like an eviction. Cache images are re-fetchable, so nothing
+  here waits for free space.
 - `media/storage_compaction.rs` returns the account database's freed pages to the filesystem (mdk#2314 step 6) on the
   blocking pool: the one-time compaction runs only through `compaction_gate` (a quarter of the file free, the reserve
   plus two live copies free on the volume, and a live database of at most 64 MiB: the `VACUUM` copy is built in
