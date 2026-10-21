@@ -1,5 +1,6 @@
 pub(crate) mod attachment_resume;
 pub(crate) mod avatar;
+pub(crate) mod avatar_files;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;

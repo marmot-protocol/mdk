@@ -76,6 +76,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (reported as `Paused { needed_bytes }`, never by deleting anything), and a body that fails its digest or is malformed
   as stored is dropped so its slot shows as unavailable with download-again allowed. The per-account
   `LegacyMigrationProgress` lives in `MarmotApp` and is dropped with the account's media store.
+- `media/avatar_files.rs` keeps avatar and group-image bodies in the media store's cache category (mdk#2314 step 9),
+  always on the blocking pool: a fetched image is admitted with `DiskPolicy::cache_need` and published with its
+  attempt settled in the same commit (no room retries the fetch later); reads take file-backed images from the store
+  and report a missing or corrupt file so every owner sharing it refetches; and the maintenance tick moves images
+  still held in the database into files after the attachment batch, dropping the rest like evictions when the disk
+  cannot take them. Cache images are re-fetchable, so nothing here waits for free space.
 - `media/storage_compaction.rs` returns the account database's freed pages to the filesystem (mdk#2314 step 6) on the
   blocking pool: the one-time compaction runs only through `compaction_gate` (a quarter of the file free, the reserve
   plus two live copies free on the volume, and a live database of at most 64 MiB: the `VACUUM` copy is built in

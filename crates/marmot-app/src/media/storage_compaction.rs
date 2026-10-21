@@ -153,14 +153,18 @@ pub(crate) fn compaction_check(
     match compaction_gate(&space, reserve, available) {
         CompactionGate::Due => Some(space),
         CompactionGate::LiveTooLarge => {
-            // While legacy bodies remain, the migration is still shrinking
-            // the live database: only an account over the cap with nothing
-            // left to move stays there. Log those once per account per
-            // process: they keep their freed pages inside the file, and this
-            // is how we learn how many there are and by how much they miss.
+            // While legacy bodies or database-held avatar images remain, the
+            // migrations are still shrinking the live database: only an
+            // account over the cap with nothing left to move stays there. Log
+            // those once per account per process: they keep their freed pages
+            // inside the file, and this is how we learn how many there are
+            // and by how much they miss.
             if storage
                 .legacy_attachment_bytes()
                 .map_or(true, |bytes| bytes > 0)
+                || storage
+                    .database_avatar_bytes()
+                    .map_or(true, |bytes| bytes > 0)
             {
                 return None;
             }

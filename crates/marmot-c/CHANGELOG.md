@@ -13,6 +13,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `MarmotAttachmentStorageUsage.cache_bytes`: the avatar and group-image
+  cache, each stored image once (mdk#2314 step 9). Appended after
+  `migration_bytes`.
+
 - `MarmotAttachmentMigrationState` adds `MARMOT_ATTACHMENT_MIGRATION_STATE_COMPACTING`
   (the account database is being compacted; mdk#2314 step 6). Existing values
   keep their numbers. Use matching regenerated headers and libraries.

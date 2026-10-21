@@ -24,6 +24,10 @@ pub struct AttachmentStorageUsageFfi {
     /// With `Running`, the legacy bytes still to move; with `Paused`, how
     /// many more bytes must be free before the move resumes. Otherwise 0.
     pub migration_bytes: u64,
+    /// The avatar and group-image cache, each stored image once. Unlike
+    /// attachments it can be cleared (`clear_avatar_cache`) and is fetched
+    /// again on demand.
+    pub cache_bytes: u64,
 }
 impl From<app::AttachmentStorageUsage> for AttachmentStorageUsageFfi {
     fn from(v: app::AttachmentStorageUsage) -> Self {
@@ -48,6 +52,7 @@ impl From<app::AttachmentStorageUsage> for AttachmentStorageUsageFfi {
             database_free_bytes: v.database_free_bytes,
             migration,
             migration_bytes,
+            cache_bytes: v.cache_bytes,
         }
     }
 }

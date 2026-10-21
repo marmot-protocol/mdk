@@ -47,6 +47,10 @@
 
 ### Added
 
+- `AttachmentStorageUsageFfi::cache_bytes`: the avatar and group-image cache,
+  each stored image once (mdk#2314 step 9). Show it next to a "Clear cache"
+  action (`clear_avatar_cache`).
+
 - Manage storage (mdk#2314 step 5): `attachment_storage_usage`,
   `attachment_storage_by_chat`, `largest_retained_attachments` (paged largest
   first with opaque `ChatStorageCursor` / `RetainedAttachmentsCursor` handles),

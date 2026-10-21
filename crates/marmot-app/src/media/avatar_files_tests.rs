@@ -1,0 +1,325 @@
+use super::*;
+use crate::MarmotApp;
+use marmot_account::AccountHome;
+use storage_sqlite::{AvatarAvailability, AvatarImageFormat, SelectedAvatar, SqliteAccountStorage};
+
+const RESERVE: u64 = 1024;
+
+struct Fixture {
+    _dir: tempfile::TempDir,
+    app: MarmotApp,
+    account: SqliteAccountStorage,
+    media: AccountMediaStore,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        let account = app.account_storage("alice").unwrap();
+        let media = app.account_media_store("alice", &account).unwrap();
+        Self {
+            _dir: dir,
+            app,
+            account,
+            media,
+        }
+    }
+
+    fn storage(&self) -> SqliteAppStorage {
+        self.account.app_storage()
+    }
+
+    fn claim(&self, owner: &str) -> (AvatarAssetRef, AvatarAcquisition) {
+        let selected = SelectedAvatar::RemoteImage {
+            url: format!("https://example.com/{owner}"),
+            cache_key: owner.into(),
+        };
+        let reference = self
+            .storage()
+            .request_avatar_acquisition(owner, &selected, true)
+            .unwrap()
+            .unwrap();
+        let job = self
+            .storage()
+            .claim_avatar_acquisition(crate::unix_now_seconds())
+            .unwrap()
+            .unwrap();
+        (reference, job)
+    }
+
+    fn count(&self, query: &str) -> i64 {
+        raw_connection(&self.app)
+            .query_row(query, [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn files_on_disk(&self) -> usize {
+        fn walk(path: &std::path::Path) -> usize {
+            std::fs::read_dir(path)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|entry| {
+                            let path = entry.path();
+                            if path.is_dir() { walk(&path) } else { 1 }
+                        })
+                        .sum()
+                })
+                .unwrap_or(0)
+        }
+        walk(
+            &self
+                .app
+                .account_dir("alice")
+                .join(media_store::MEDIA_DIRECTORY),
+        )
+    }
+
+    fn read(&self, reference: &AvatarAssetRef) -> AvatarAssetRead {
+        let now = crate::unix_now_seconds();
+        let mut read = self.storage().read_avatar(reference, now).unwrap();
+        read_file_backed(&self.storage(), &self.media, reference, &mut read, now).unwrap();
+        read
+    }
+}
+
+/// A second connection to the account database, for faults and checks.
+fn raw_connection(app: &MarmotApp) -> rusqlite::Connection {
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection
+}
+
+fn image(seed: u8, len: usize) -> AvatarImage {
+    let bytes = (0..len).map(|i| (i as u8).wrapping_mul(7) ^ seed).collect();
+    AvatarImage::new(bytes, AvatarImageFormat::Png, 16, 16).unwrap()
+}
+
+fn plenty() -> std::io::Result<u64> {
+    Ok(u64::MAX / 2)
+}
+
+/// A fetched image becomes a cache file in the same commit that settles its
+/// attempt, and reads back whole.
+#[test]
+fn a_fetched_avatar_is_stored_as_a_cache_file() {
+    let f = Fixture::new();
+    let (reference, job) = f.claim("chat:aa");
+    let fetched = image(1, 20_000);
+    assert_eq!(
+        store_acquired(
+            &f.storage(),
+            &f.media,
+            RESERVE,
+            &plenty,
+            &job,
+            &fetched,
+            Some(9)
+        )
+        .unwrap(),
+        StoredAvatar::Stored
+    );
+    assert_eq!(
+        f.count("SELECT count(*) FROM media_files WHERE category = 2 AND state = 1"),
+        1
+    );
+    assert_eq!(
+        f.count("SELECT count(*) FROM avatar_acquisition WHERE state = 0 AND due = 9 AND attempt IS NULL"),
+        1,
+        "the attempt is settled with its next refresh"
+    );
+    let read = f.read(&reference);
+    assert_eq!(read.image, Some(fetched));
+    assert!(!read.repaired);
+}
+
+/// A result for an attempt that is no longer current (here a restart reset
+/// it) stores nothing.
+#[test]
+fn a_stale_attempt_stores_nothing() {
+    let f = Fixture::new();
+    let (reference, job) = f.claim("chat:aa");
+    f.storage().resume_avatar_acquisition().unwrap();
+    assert_eq!(
+        store_acquired(
+            &f.storage(),
+            &f.media,
+            RESERVE,
+            &plenty,
+            &job,
+            &image(2, 5_000),
+            None
+        )
+        .unwrap(),
+        StoredAvatar::Superseded
+    );
+    assert_eq!(f.count("SELECT count(*) FROM media_files"), 0);
+    assert_eq!(f.files_on_disk(), 0);
+    assert_eq!(
+        f.storage()
+            .avatar_status(&reference, crate::unix_now_seconds())
+            .unwrap()
+            .availability,
+        AvatarAvailability::Missing
+    );
+}
+
+/// A disk without room for the file plus the reserve stores nothing; the
+/// caller retries the fetch later.
+#[test]
+fn a_full_disk_stores_no_avatar() {
+    let f = Fixture::new();
+    let (_, job) = f.claim("chat:aa");
+    let fetched = image(3, 5_000);
+    let tight = || Ok(RESERVE + DiskPolicy::cache_need(5_000) - 1);
+    assert_eq!(
+        store_acquired(
+            &f.storage(),
+            &f.media,
+            RESERVE,
+            &tight,
+            &job,
+            &fetched,
+            None
+        )
+        .unwrap(),
+        StoredAvatar::NoRoom
+    );
+    assert_eq!(f.count("SELECT count(*) FROM media_files"), 0);
+    let unknown = || Err(std::io::Error::other("statvfs"));
+    assert_eq!(
+        store_acquired(
+            &f.storage(),
+            &f.media,
+            RESERVE,
+            &unknown,
+            &job,
+            &fetched,
+            None
+        )
+        .unwrap(),
+        StoredAvatar::NoRoom,
+        "unknown free space admits nothing"
+    );
+}
+
+/// A cache file that went missing is reported on read: the image clears and
+/// is fetched again.
+#[test]
+fn a_missing_cache_file_is_refetched() {
+    let f = Fixture::new();
+    let (reference, job) = f.claim("chat:aa");
+    store_acquired(
+        &f.storage(),
+        &f.media,
+        RESERVE,
+        &plenty,
+        &job,
+        &image(4, 3_000),
+        None,
+    )
+    .unwrap();
+    let file = f
+        .storage()
+        .read_avatar(&reference, crate::unix_now_seconds())
+        .unwrap()
+        .file
+        .unwrap();
+    std::fs::remove_file(f.media.path(&file.id)).unwrap();
+    let read = f.read(&reference);
+    assert!(read.repaired);
+    assert!(read.image.is_none());
+    assert_eq!(read.status.availability, AvatarAvailability::Missing);
+    assert_eq!(
+        f.count("SELECT count(*) FROM avatar_acquisition WHERE state = 1 AND due = 0"),
+        1,
+        "it is fetched again"
+    );
+    assert_eq!(f.count("SELECT count(*) FROM media_files"), 0);
+}
+
+/// Images still in the database move into files without changing what a
+/// viewer sees; a corrupt one is cleared for refetch.
+#[test]
+fn database_avatars_move_into_cache_files() {
+    let f = Fixture::new();
+    let mut images = Vec::new();
+    for (owner, seed) in [("chat:aa", 5), ("chat:bb", 6), ("chat:cc", 7)] {
+        let reference = f.storage().bind_avatar_source(owner, "source").unwrap();
+        let held = image(seed, 4_000 + seed as usize);
+        f.storage()
+            .publish_avatar(&reference, 0, &held, None)
+            .unwrap();
+        images.push((reference, held));
+    }
+    raw_connection(&f.app)
+        .execute(
+            "UPDATE avatar_assets SET bytes = zeroblob(10) WHERE owner_key = 'chat:cc'",
+            [],
+        )
+        .unwrap();
+    let usage_before = f.storage().avatar_cache_usage().unwrap();
+    let batch = migrate_batch(&f.storage(), &f.media, RESERVE, &plenty);
+    assert_eq!(
+        (
+            batch.moved,
+            batch.dropped_corrupt,
+            batch.evicted,
+            batch.deferred
+        ),
+        (2, 1, 0, false)
+    );
+    assert_eq!(f.storage().database_avatar_bytes().unwrap(), 0);
+    assert_eq!(f.files_on_disk(), 2);
+    for (reference, held) in &images[..2] {
+        let read = f.read(reference);
+        assert_eq!(read.image.as_ref(), Some(held));
+        assert_eq!(read.status.content_revision, 1, "viewers see no change");
+    }
+    assert_eq!(
+        f.storage().avatar_cache_usage().unwrap().byte_count,
+        usage_before.byte_count - 10,
+        "only the corrupt image's bytes went"
+    );
+    assert_eq!(
+        migrate_batch(&f.storage(), &f.media, RESERVE, &plenty),
+        AvatarMigrationBatch::default(),
+        "nothing is left to move"
+    );
+}
+
+/// On a disk too full for the files, the remaining database images are
+/// dropped like evictions instead of waiting for space.
+#[test]
+fn a_full_disk_drops_database_avatars() {
+    let f = Fixture::new();
+    for owner in ["chat:aa", "chat:bb"] {
+        let reference = f.storage().bind_avatar_source(owner, "source").unwrap();
+        f.storage()
+            .publish_avatar(&reference, 0, &image(8, 2_000), None)
+            .unwrap();
+    }
+    let tight = || Ok(RESERVE);
+    let batch = migrate_batch(&f.storage(), &f.media, RESERVE, &tight);
+    assert_eq!((batch.moved, batch.evicted), (0, 2));
+    assert_eq!(f.count("SELECT count(*) FROM avatar_assets"), 0);
+    assert_eq!(f.files_on_disk(), 0);
+    assert!(
+        !run_batch(&f.storage(), &f.media, RESERVE, &tight),
+        "nothing is left to drop"
+    );
+}
