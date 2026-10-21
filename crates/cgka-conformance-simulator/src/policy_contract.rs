@@ -40,7 +40,7 @@ pub struct ConstantDecision {
     pub versioning: VersioningRule,
 }
 
-pub const CONSTANT_DECISIONS: [ConstantDecision; 40] = [
+pub const CONSTANT_DECISIONS: [ConstantDecision; 39] = [
     decision(
         "P1",
         ConstantInfluence::SelectedStateSemantic,
@@ -226,13 +226,6 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 40] = [
     ),
     decision(
         "A14",
-        ConstantInfluence::InputAcquisition,
-        VersioningRule::OperationalNonInterference,
-    ),
-    // Paced lag recovery acquires original windows without changing live REQs;
-    // it changes available input, never selection given equal input.
-    decision(
-        "A15",
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),

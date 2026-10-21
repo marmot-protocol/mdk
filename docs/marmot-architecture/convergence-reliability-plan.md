@@ -887,7 +887,8 @@ preparation opportunity, the non-guarantee under unbounded valid self-updates, t
 pass-partition invariance, the mandatory implicit v1 values, and the rule that any future behavior-changing policy
 ships as a new required app component/capability. No additional protocol PR is needed for Milestone 4.
 
-`policy_contract::CONSTANT_DECISIONS` classifies every P/E/A ledger id exactly once. P1/P2/P6/P7/P8/P9/P10 directly
+`policy_contract::CONSTANT_DECISIONS` classifies every active P/E/A inventory id exactly once. A15 remains in the
+historical ledger as a retired timer, not an active constant or classification. P1/P2/P6/P7/P8/P9/P10 directly
 affect selected state; P4/P5 affect the bounded-pass lifecycle; P3 is coupled security-retention implementation of P2. All
 remain mandatory implicit v1 and any change requires the future required component. No component is allocated merely
 to re-encode the only valid v1 choice. E/A constants remain local only under operational non-interference: exhaustion
