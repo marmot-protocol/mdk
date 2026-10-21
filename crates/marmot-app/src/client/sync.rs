@@ -49,7 +49,18 @@ pub(crate) use comparison_job::TestComparisonActivityWitness;
 pub(crate) use comparison_job::{ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob};
 
 /// The worker consumes committed output; direct clients retain full summaries.
-pub(crate) type CommittedSyncProgress<'a> = dyn Fn(&AppClient, SyncSummary) + Send + Sync + 'a;
+pub(crate) struct CommittedSyncProgress<'a> {
+    pub(crate) publish: &'a (dyn Fn(&AppClient, &SyncSummary) + Send + Sync),
+    pub(crate) post_join_errors: &'a (dyn Fn(Option<AppError>, Option<AppError>) + Send + Sync),
+}
+
+impl CommittedSyncProgress<'_> {
+    pub(crate) async fn publish(&self, client: &mut AppClient, summary: SyncSummary) {
+        (self.publish)(client, &summary);
+        let (live_error, history_error) = client.advance_visible_join(&summary).await;
+        (self.post_join_errors)(live_error, history_error);
+    }
+}
 
 pub(crate) enum PendingRecoverySelection {
     NotPending,
@@ -1915,6 +1926,27 @@ impl AppClient {
         Ok(())
     }
 
+    /// Advance newly joined groups only after the caller publishes their
+    /// durable summary. Both attempts run even when live installation fails;
+    /// their existing bounded retry intents remain armed on failure.
+    pub(crate) async fn advance_visible_join(
+        &mut self,
+        summary: &SyncSummary,
+    ) -> (Option<AppError>, Option<AppError>) {
+        if summary.joined_groups.is_empty() {
+            return (None, None);
+        }
+        let live_error = self
+            .retry_pending_runtime_group_subscription_refresh()
+            .await
+            .err();
+        let history_error = self
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .err();
+        (live_error, history_error)
+    }
+
     /// Startup already activated the live account subscriptions. Drain them
     /// without rebuilding any subscription or replaying the account backlog.
     pub(crate) async fn finish_deferred_comparison_sync(
@@ -3219,7 +3251,7 @@ impl AppClient {
             if let Some(on_progress) = on_progress {
                 // Native admission already checkpointed these frames. Keep
                 // ordinary, not-yet-checkpointed drain output in `summary`.
-                on_progress(self, committed);
+                on_progress.publish(self, committed).await;
             } else {
                 summary.merge(committed);
             }

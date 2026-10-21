@@ -506,6 +506,169 @@ async fn run_held_comparison(
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovered_join_settles_routes() {
+    use crate::tests::{
+        ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
+        remember_test_member_inbox, report_scripted_eose, scripted_eose_pump,
+    };
+    use transport_nostr_adapter::{NostrRelayEvent, NostrSubscription};
+
+    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let endpoint = "wss://relay.example";
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), endpoint).with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, endpoint);
+    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+    let mut receiver = client_on_app_relay_plane(&app, &bob.label).await;
+    // Startup's real KeyPackage lane does not activate Bob's inbox. His first
+    // Welcome therefore cannot arrive through ordinary local publication.
+    receiver.publish_setup_key_package().await.unwrap();
+    let mut sender = client_on_app_relay_plane(&app, &alice.label).await;
+    let group = sender
+        .create_group("recovered join routing", &[&bob.account_id_hex])
+        .await
+        .unwrap();
+    let welcome = relay
+        .attempted_events()
+        .into_iter()
+        .find(|event| event.kind == transport_nostr_peeler::KIND_NIP59_GIFT_WRAP)
+        .expect("the real MLS invitation produces an encrypted Welcome");
+    let group_hex = hex::encode(&group);
+    assert!(app.group(&bob.label, &group_hex).unwrap().is_none());
+    receiver.prepare_transport().await.unwrap();
+    report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+    receiver.synchronize_native_replay().await.unwrap();
+    receiver.request_bounded_comparison().unwrap();
+    receiver
+        .recovery_owner
+        .test_advance_to_retry(&app.account_storage(&bob.label).unwrap());
+    receiver.test_comparison_results =
+        Some(crate::client::ScriptedComparisons::by_route(move |route| {
+            let events = if *route == storage_sqlite::TransportReconciliationRoute::Inbox {
+                vec![NostrRelayEvent {
+                    endpoint: cgka_traits::TransportEndpoint(endpoint.into()),
+                    subscription_id: None,
+                    event: welcome.clone(),
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(Some((
+                transport_nostr_adapter::NostrReconciliationSummary {
+                    relays_succeeded: 1,
+                    remote_items: events.len(),
+                    received_items: events.len(),
+                    ..Default::default()
+                },
+                events,
+            )))
+        }));
+    let (events, mut consumer) = broadcast::channel(32);
+    let shared = RuntimeSharedServices::default();
+    relay.block_next_subscribe();
+    {
+        // This unchanged worker entrypoint runs the real comparison ingest and
+        // settlement reporter. No hand-built SyncSummary or progress echo can
+        // manufacture the GroupJoined observed below.
+        let reporting = run_pending_epoch_backfill_reporting_arm(
+            &mut receiver,
+            &events,
+            &bob.account_id_hex,
+            &bob.label,
+            &shared,
+            EpochBackfillExecutionSeam::ExplicitCatchUp,
+        );
+        tokio::pin!(reporting);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    event = consumer.recv() => {
+                        if let MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } = event.unwrap() {
+                            assert_eq!(account_id_hex, bob.account_id_hex);
+                            assert_eq!(group_id, group);
+                            break;
+                        }
+                    }
+                    result = &mut reporting => panic!("settlement returned before visible join followup: {result:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the recovered Welcome publishes GroupJoined before subscription I/O");
+        assert!(
+            app.group(&bob.label, &group_hex)
+                .unwrap()
+                .expect("GroupJoined has a durable public group projection")
+                .pending_confirmation
+        );
+        timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                biased;
+                result = &mut reporting => panic!("settlement skipped recovered join routing: {result:?}"),
+                () = relay.wait_for_blocked_subscribe() => {}
+            }
+        })
+        .await
+        .expect("the worker starts real group-subscription I/O before continuing");
+        relay.release_subscribe();
+        timeout(Duration::from_secs(5), &mut reporting)
+            .await
+            .expect("settlement continues after the subscription barrier releases")
+            .unwrap();
+    }
+    let bob_member = cgka_traits::MemberId::new(hex::decode(&bob.account_id_hex).unwrap());
+    let subscriptions = relay.accepted_subscriptions();
+    let joined = subscriptions.iter().filter(|subscription| {
+        subscription.account_id() == &bob_member && subscription.carries_group(&group)
+    });
+    assert!(joined.clone().any(|subscription| matches!(
+        subscription,
+        NostrSubscription::Group { .. } | NostrSubscription::GroupBatch { .. }
+    )));
+    // The visible join requests history; only the recovery owner may install
+    // that temporary subscription under its next grant.
+    report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+    receiver
+        .recovery_owner
+        .test_advance_to_retry(&app.account_storage(&bob.label).unwrap());
+    let grant = receiver
+        .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+        .await
+        .unwrap()
+        .expect("the recovered join leaves a grant-owned history boundary");
+    receiver.run_recovery_grant_for_test(grant).await.unwrap();
+    assert!(relay.accepted_subscriptions().iter().any(|subscription| {
+        subscription.account_id() == &bob_member
+            && subscription.carries_group(&group)
+            && matches!(
+                subscription,
+                NostrSubscription::GroupMaintenance { since: Some(_), .. }
+            )
+    }));
+    report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+    assert!(receiver.sync().await.unwrap().joined_groups.is_empty());
+    while let Ok(event) = consumer.try_recv() {
+        if let MarmotAppEvent::GroupJoined {
+            account_id_hex,
+            group_id,
+            ..
+        } = event
+        {
+            assert!(
+                account_id_hex != bob.account_id_hex || group_id != group,
+                "settlement and repeated catch-up must not duplicate GroupJoined"
+            );
+        }
+    }
+    assert!(app.group(&bob.label, &group_hex).unwrap().is_some());
+}
+
 // Pauses the clock, which needs the current-thread runtime.
 #[tokio::test(flavor = "current_thread")]
 async fn comparison_credit_exhaustion_does_not_spend_reservation() {
@@ -799,7 +962,7 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
     drop(credit);
     let shared = RuntimeSharedServices::default();
     report_pending_epoch_backfill_result(
-        &client,
+        &mut client,
         Ok(result),
         false,
         None,
@@ -810,6 +973,7 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
             shared: &shared,
         },
     )
+    .await
     .unwrap();
     while let Ok(event) = consumer.try_recv() {
         if let MarmotAppEvent::MessageReceived(update) = event {

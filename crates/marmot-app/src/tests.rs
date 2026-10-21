@@ -883,7 +883,7 @@ impl ScriptedPushRelayClient {
         self.subscribe_started.notified().await;
     }
 
-    fn release_subscribe(&self) {
+    pub(crate) fn release_subscribe(&self) {
         self.subscribe_release.notify_waiters();
     }
 

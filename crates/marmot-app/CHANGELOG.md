@@ -200,6 +200,9 @@
   ordinary deliveries. A live cursor-check failure preserves already-durable
   delivery counts. Committed native and comparison chunks publish during startup
   and follow-up drains, rather than waiting for the whole batch to settle.
+  Recovered Welcomes publish `GroupJoined` before live-subscription I/O and
+  retain their grant-owned post-join history work in both streamed chunks and
+  final comparison results.
   Already-held copies adopt durable spill ownership before
   source replacement, without copying the ciphertext. Empty or silent peers do not
   create notification loss. Sender-ratchet tolerance remains 100; timestamp/id

@@ -1593,7 +1593,7 @@ impl AppClient {
                 {
                     let mut committed = admission.take_committed_summary();
                     committed.merge(self.take_pending_applied_sync_summary());
-                    on_progress(self, committed);
+                    on_progress.publish(self, committed).await;
                 }
                 match turn {
                     Ok(true) => break,

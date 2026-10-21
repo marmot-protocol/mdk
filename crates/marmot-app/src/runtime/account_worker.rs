@@ -36,7 +36,7 @@ use super::{
 use crate::app_telemetry::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
 use crate::client::recovery::AttemptGrant;
 use crate::client::{
-    ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob,
+    CommittedSyncProgress, ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob,
     CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish, PreparedGroupImageUploadStart,
 };
 use crate::messages::AppMessageIntent;
@@ -1231,17 +1231,30 @@ async fn run_app_runtime_account_worker(
     let sync_started_at = Instant::now();
     let startup_stage_telemetry = shared.app_performance_telemetry();
     let mut startup_explicit_shutdown = false;
-    let publish_startup_progress = |client: &AppClient, summary: SyncSummary| {
+    let publish_startup_summary = |client: &AppClient, summary: &SyncSummary| {
         publish_app_runtime_summary_with_v5(
             client,
             &events,
             &account_id_hex,
             &account_label,
-            &summary,
+            summary,
         );
-        if sync_summary_triggers_audit_tracker_update(&summary) {
+        if sync_summary_triggers_audit_tracker_update(summary) {
             shared.schedule_audit_log_tracker_update("startup_sync");
         }
+    };
+    let report_startup_join_errors = |live_error, history_error| {
+        publish_join_errors(
+            live_error,
+            history_error,
+            &events,
+            &account_id_hex,
+            &account_label,
+        );
+    };
+    let publish_startup_progress = CommittedSyncProgress {
+        publish: &publish_startup_summary,
+        post_join_errors: &report_startup_join_errors,
     };
     let startup_sync_result = {
         let mut initial_sync: Pin<
@@ -1918,6 +1931,14 @@ async fn run_app_runtime_account_worker(
                     &account_label,
                     &summary,
                 );
+                start_post_join_history_after_visibility(
+                    &mut client,
+                    &summary,
+                    &events,
+                    &account_id_hex,
+                    &account_label,
+                )
+                .await;
             }
             if turn.is_err() {
                 // Mixed admission can fail on a native frame too. Pace its
@@ -1951,7 +1972,7 @@ async fn run_app_runtime_account_worker(
                 };
                 drop(job.credit);
                 let _ = report_pending_epoch_backfill_result(
-                    &client,
+                    &mut client,
                     result,
                     job.backfill_armed,
                     job.observation,
@@ -1961,7 +1982,8 @@ async fn run_app_runtime_account_worker(
                         account_label: &account_label,
                         shared: &shared,
                     },
-                );
+                )
+                .await;
                 // A settled pass is where recovery parks or completes.
                 publish_history_notice_changes(
                     &mut client,
@@ -2436,7 +2458,7 @@ async fn run_app_runtime_account_worker(
                                             }
                                         };
                                         let _ = report_pending_epoch_backfill_result(
-                                            &client,
+                                            &mut client,
                                             backfill_result,
                                             backfill_armed,
                                             observation,
@@ -2446,7 +2468,7 @@ async fn run_app_runtime_account_worker(
                                                 account_label: &account_label,
                                                 shared: &shared,
                                             },
-                                        );
+                                        ).await;
                                         if audit_tracker_update {
                                             shared.schedule_audit_log_tracker_update("scheduled_convergence");
                                         }
@@ -3079,7 +3101,7 @@ async fn run_app_runtime_account_worker(
                     PendingRecoveryJob::Settled(result) => result,
                 };
                 let _ = report_pending_epoch_backfill_result(
-                    &client,
+                    &mut client,
                     backfill_result, backfill_armed,
                     observation,
                     EpochBackfillReportContext {
@@ -3088,7 +3110,7 @@ async fn run_app_runtime_account_worker(
                         account_label: &account_label,
                         shared: &shared,
                     },
-                );
+                ).await;
                 finish_periodic_maintenance_after_recovery(
                     &mut client,
                     &events,
@@ -3267,7 +3289,8 @@ async fn start_receive_recovery(
                 backfill_armed,
                 observation,
                 context,
-            );
+            )
+            .await;
             false
         }
     }
@@ -7301,18 +7324,24 @@ async fn start_post_join_history_after_visibility(
     account_id_hex: &str,
     account_label: &str,
 ) {
-    if summary.joined_groups.is_empty() {
-        return;
-    }
-    // Visibility is already published. Install ordinary live interest now,
-    // independently of the history owner's cooldown. Waiting for the retry
-    // timer leaves a newly joined account unrouted while another local account
-    // can already receive the SDK's single deduplicated copy of a group event.
-    // Failures retain the existing bounded registration-retry intent.
-    if let Err(error) = client
-        .retry_pending_runtime_group_subscription_refresh()
-        .await
-    {
+    let (live_error, history_error) = client.advance_visible_join(summary).await;
+    publish_join_errors(
+        live_error,
+        history_error,
+        events,
+        account_id_hex,
+        account_label,
+    );
+}
+
+fn publish_join_errors(
+    live_error: Option<AppError>,
+    history_error: Option<AppError>,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) {
+    if let Some(error) = live_error {
         publish_app_runtime_account_error(
             events,
             account_id_hex,
@@ -7320,7 +7349,7 @@ async fn start_post_join_history_after_visibility(
             account_error_message("post-join live subscription refresh failed", &error),
         );
     }
-    if let Err(error) = client.advance_post_join_maintenance_subscriptions().await {
+    if let Some(error) = history_error {
         publish_app_runtime_account_error(
             events,
             account_id_hex,
@@ -7405,6 +7434,7 @@ async fn run_pending_epoch_backfill_reporting_arm(
             shared,
         },
     )
+    .await
 }
 
 struct EpochBackfillReportContext<'a> {
@@ -7415,8 +7445,8 @@ struct EpochBackfillReportContext<'a> {
 }
 
 /// Report the completed comparison without repeating its published turn prefixes.
-fn report_pending_epoch_backfill_result(
-    client: &AppClient,
+async fn report_pending_epoch_backfill_result(
+    client: &mut AppClient,
     backfill_result: Result<EpochBackfillRunOutcome, AppError>,
     backfill_armed: bool,
     observation: Option<crate::product_analytics::ProductObservation>,
@@ -7453,6 +7483,14 @@ fn report_pending_epoch_backfill_result(
                 account_label,
                 &summary,
             );
+            start_post_join_history_after_visibility(
+                client,
+                &summary,
+                events,
+                account_id_hex,
+                account_label,
+            )
+            .await;
             Ok(())
         }
         Ok(EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending) => Ok(()),
@@ -9413,7 +9451,7 @@ mod tests {
         client.fail_next_released_backfill_reload = true;
         let result = client.run_recovery_grant_for_test(grant).await;
         let error = report_pending_epoch_backfill_result(
-            &client,
+            &mut client,
             result,
             true,
             None,
@@ -9424,6 +9462,7 @@ mod tests {
                 shared: &shared,
             },
         )
+        .await
         .expect_err("a failed job must be returned");
 
         assert_eq!(error.to_string(), "epoch-gap backfill failed: storage_busy");
