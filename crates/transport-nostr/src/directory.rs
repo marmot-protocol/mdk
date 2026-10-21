@@ -1538,19 +1538,32 @@ mod tests {
         use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
 
         let author = Keys::generate();
-        let other = Keys::generate().public_key().to_hex();
+        let author_hex = author.public_key().to_hex();
+        // Authors are sorted inside a query, so `other` must sort after
+        // `author` for `[author, other]` to sort after `[author]` and land in
+        // the second REQ.
+        let other = loop {
+            let candidate = Keys::generate().public_key().to_hex();
+            if candidate > author_hex {
+                break candidate;
+            }
+        };
         let event = EventBuilder::new(Kind::TextNote, "shared")
             .finalize(&author)
             .unwrap();
         let (endpoint, filter_counts, server) =
             spawn_filter_limited_relay(3, vec![serde_json::to_value(&event).unwrap()]).await;
-        let author = author.public_key().to_hex();
+        let author = author_hex;
         let mut queries = [10, 11, 12]
             .into_iter()
             .map(|limit| DirectoryEventQuery::new(1, vec![author.clone()], limit))
             .collect::<Vec<_>>();
         queries.push(DirectoryEventQuery::new(1, vec![author, other], 1));
         let request = DirectoryFetchRequest::new(vec![endpoint], queries).unwrap();
+        assert_eq!(
+            request.queries[3].limit, 1,
+            "the limit-1 query sorts into the second REQ"
+        );
         let outcome = timeout(
             Duration::from_secs(20),
             NostrSdkDirectoryRelayFetcher::standalone()
