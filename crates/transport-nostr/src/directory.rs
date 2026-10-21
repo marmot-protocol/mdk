@@ -1099,6 +1099,7 @@ async fn strict_fetch_endpoint(
     let mut issued = HashSet::new();
     let mut admitted_messages = 0usize;
     let mut complete = true;
+    let all_queries = &queries;
     for (queries, filters) in queries
         .chunks(DIRECTORY_MAX_FILTERS_PER_REQ)
         .zip(filters.chunks(DIRECTORY_MAX_FILTERS_PER_REQ))
@@ -1115,7 +1116,10 @@ async fn strict_fetch_endpoint(
             .await
             .is_err()
         {
-            return DirectoryFetchOutcome::default();
+            // Keep what earlier chunks returned: the fetch is incomplete,
+            // but its records are still usable.
+            complete = false;
+            continue;
         }
         issued.insert(subscription_id.clone());
 
@@ -1131,7 +1135,7 @@ async fn strict_fetch_endpoint(
                         Some(NotificationUpdate::Notification(RelayNotification::Event {
                             subscription_id: received_id,
                             event,
-                        })) if received_id == subscription_id => Some(*event),
+                        })) if received_id == subscription_id => Some((*event, false)),
                         Some(NotificationUpdate::Notification(RelayNotification::Message {
                             message,
                         })) => match *message {
@@ -1140,14 +1144,14 @@ async fn strict_fetch_endpoint(
                                 event,
                             } if received_id.as_ref() == &subscription_id => {
                                 admitted_messages += 1;
-                                Some(event.into_owned())
+                                Some((event.into_owned(), false))
                             }
                             RelayMessage::Event {
                                 subscription_id: received_id,
-                                ..
+                                event,
                             } if issued.contains(received_id.as_ref()) => {
                                 admitted_messages += 1;
-                                None
+                                Some((event.into_owned(), true))
                             }
                             RelayMessage::EndOfStoredEvents(received_id)
                                 if received_id.as_ref() == &subscription_id =>
@@ -1188,13 +1192,28 @@ async fn strict_fetch_endpoint(
                         Some(NotificationUpdate::Lagged { .. }) | None => break false,
                         _ => None,
                     };
-                    if let Some(event) = received {
+                    if let Some((event, late)) = received {
                         if event.verify().is_err() {
                             continue;
                         }
                         let Ok(event) = NostrTransportEvent::from_nostr_event(&event) else {
                             continue;
                         };
+                        if late {
+                            // An earlier chunk's subscription, after that chunk
+                            // settled: keep the record, but it says nothing about
+                            // this chunk's queries.
+                            if all_queries.iter().any(|query| query.matches(&event))
+                                && records.len() < max_records
+                                && seen_event_ids.insert(event.id.clone())
+                            {
+                                records.push(DirectoryRelayEventRecord {
+                                    endpoints: vec![endpoint.clone()],
+                                    event,
+                                });
+                            }
+                            continue;
+                        }
                         if !queries.iter().any(|query| query.matches(&event)) {
                             // A filter-ignoring relay cannot establish a complete empty
                             // scoped deletion result by filling its page with other posts.
