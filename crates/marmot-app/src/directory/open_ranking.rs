@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{sleep, timeout};
 use url::{Host, Url};
 
+use super::config::HttpClientBuilder;
 use crate::directory::ids::parse_account_id_hex;
 
 const OPEN_RANKING_TIMEOUT: Duration = Duration::from_secs(5);
@@ -57,6 +58,7 @@ struct SearchResult {
 pub(crate) async fn search_ranked_pubkeys(
     endpoint: &str,
     query: &str,
+    http_builder: HttpClientBuilder,
 ) -> Result<Vec<RankedPubkey>, String> {
     let query = query.trim();
     if query.is_empty() {
@@ -68,7 +70,7 @@ pub(crate) async fn search_ranked_pubkeys(
 
     timeout(
         OPEN_RANKING_TIMEOUT,
-        search_ranked_pubkeys_inner(endpoint, query),
+        search_ranked_pubkeys_inner(endpoint, query, http_builder),
     )
     .await
     .map_err(|_| "Open Ranking request timed out".to_owned())?
@@ -77,10 +79,11 @@ pub(crate) async fn search_ranked_pubkeys(
 async fn search_ranked_pubkeys_inner(
     endpoint: &str,
     query: &str,
+    http_builder: HttpClientBuilder,
 ) -> Result<Vec<RankedPubkey>, String> {
     let url =
         Url::parse(endpoint).map_err(|_| "Open Ranking provider URL is invalid".to_owned())?;
-    let client = open_ranking_http_client(&url).await?;
+    let client = open_ranking_http_client(&url, http_builder).await?;
     let request = SearchRequest {
         query,
         limit: OPEN_RANKING_RESULT_LIMIT,
@@ -165,7 +168,10 @@ fn validate_ranked_pubkeys(results: Vec<SearchResult>) -> Result<Vec<RankedPubke
     Ok(ranked)
 }
 
-async fn open_ranking_http_client(url: &Url) -> Result<reqwest::Client, String> {
+async fn open_ranking_http_client(
+    url: &Url,
+    http_builder: HttpClientBuilder,
+) -> Result<reqwest::Client, String> {
     if url.scheme() != "https"
         || !url.username().is_empty()
         || url.password().is_some()
@@ -175,7 +181,7 @@ async fn open_ranking_http_client(url: &Url) -> Result<reqwest::Client, String> 
     }
     #[allow(clippy::disallowed_methods)]
     let builder = reqwest::Client::builder();
-    let mut builder = crate::network_proxy::http_builder(builder)
+    let mut builder = http_builder(builder)
         .map_err(str::to_owned)?
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(OPEN_RANKING_TIMEOUT)

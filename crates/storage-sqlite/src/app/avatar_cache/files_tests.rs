@@ -7,7 +7,7 @@ use super::*;
 use crate::app::avatar_cache::{
     AvatarAvailability, AvatarCacheUsage, AvatarImage, AvatarPublishResult,
 };
-use crate::{SqlCipherKey, SqliteAccountStorage, SqliteMediaCatalog};
+use crate::{DatabaseAvatarBody, SqlCipherKey, SqliteAccountStorage, SqliteMediaCatalog};
 
 const NOW: u64 = 1_000;
 
@@ -506,4 +506,63 @@ fn an_interrupted_cache_publication_is_swept() {
         f.app().avatar_status(&owner, NOW).unwrap().availability,
         AvatarAvailability::Missing
     );
+}
+
+/// Moving a database-held image loses to a newer publication made after it
+/// was read, and leaves no file behind; one that wins keeps the revision.
+#[test]
+fn a_migration_loses_to_a_newer_image() {
+    let f = Fixture::new();
+    let owner = f.bind("chat:aa");
+    let held = AvatarImage::new(vec![3; 1_000], AvatarImageFormat::Png, 16, 16).unwrap();
+    f.app().publish_avatar(&owner, 0, &held, None).unwrap();
+    let avatar = f.app().database_held_avatars(8).unwrap().remove(0);
+    let DatabaseAvatarBody::Image(read) = f.app().database_avatar_body(&avatar).unwrap() else {
+        panic!("held image");
+    };
+    let newer = AvatarImage::new(vec![4; 1_200], AvatarImageFormat::Png, 16, 16).unwrap();
+    f.app().publish_avatar(&owner, 1, &newer, None).unwrap();
+    let target = AvatarPublication::for_migration(f.app(), &avatar, &read).unwrap();
+    let outcome = f
+        .media
+        .publish(
+            &target,
+            Category::Cache,
+            &mut Cursor::new(read.bytes()),
+            read.bytes().len() as u64,
+            Sha256::digest(read.bytes()).into(),
+            NOW,
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(outcome, PublishOutcome::Superseded);
+    assert_eq!(f.count("SELECT count(*) FROM media_files"), 0);
+    assert_eq!(f.app().read_avatar(&owner, NOW).unwrap().image, Some(newer));
+    assert!(matches!(
+        f.app().database_avatar_body(&avatar).unwrap(),
+        DatabaseAvatarBody::Changed
+    ));
+
+    let avatar = f.app().database_held_avatars(8).unwrap().remove(0);
+    let DatabaseAvatarBody::Image(read) = f.app().database_avatar_body(&avatar).unwrap() else {
+        panic!("held image");
+    };
+    let target = AvatarPublication::for_migration(f.app(), &avatar, &read).unwrap();
+    f.media
+        .publish(
+            &target,
+            Category::Cache,
+            &mut Cursor::new(read.bytes()),
+            read.bytes().len() as u64,
+            Sha256::digest(read.bytes()).into(),
+            NOW,
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(target.published_revision(), Some(2));
+    assert_eq!(
+        f.app().avatar_status(&owner, NOW).unwrap().content_revision,
+        2
+    );
+    assert_eq!(f.read_file(&owner), Some(vec![4; 1_200]));
 }

@@ -76,6 +76,14 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (reported as `Paused { needed_bytes }`, never by deleting anything), and a body that fails its digest or is malformed
   as stored is dropped so its slot shows as unavailable with download-again allowed. The per-account
   `LegacyMigrationProgress` lives in `MarmotApp` and is dropped with the account's media store.
+- `media/avatar_files.rs` keeps avatar and group-image bodies in the media store's cache category (mdk#2314 step 9),
+  always on the blocking pool: a fetched image is admitted with `DiskPolicy::cache_need` and published with its
+  attempt settled in the same commit (no room retries the fetch later); reads take file-backed images from the store
+  and report a missing or corrupt file so every owner sharing it refetches; and the maintenance tick moves images
+  still held in the database into files after the attachment batch, smallest first. An identical ready file is
+  attached at no space cost (the move verifies it first, since its commit drops the database copy). When the next
+  image needs a new file the disk cannot take, or free space cannot be measured, the batch stops and the next tick
+  tries again; never delete an owner to make room.
 - `media/storage_compaction.rs` returns the account database's freed pages to the filesystem (mdk#2314 step 6) on the
   blocking pool: the one-time compaction runs only through `compaction_gate` (a quarter of the file free, the reserve
   plus two live copies free on the volume, and a live database of at most 64 MiB: the `VACUUM` copy is built in
@@ -193,8 +201,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   seams: `records.rs` (the public `UserDirectory*`/`UserProfileMetadata`/`DirectoryKeyPackage` DTOs surfaced to
   `marmot-uniffi`/`cli`, plus the stateless record helpers — cached <-> shared record conversion, recency selection,
   Nostr profile/follow-list parsing, search-match ranking, and `profile_content_json` — which hold no `MarmotApp`
-  state), `methods.rs` (the split `impl MarmotApp` block: relay-list/profile/key-package/follow-list fetches, the
-  public `directory_*`/`*_user_directory` API, and in-memory directory-record hydration),
+  state), `methods.rs` (relay-list/profile/key-package/follow-list fetches and the `directory_*`/`*_user_directory`
+  API on `Directory`; `MarmotApp`'s public versions are delegates in `src/directory_delegates.rs`), `store.rs` (the directory store on `Directory`: entry reads, the
+  `remember_*`/`save_directory_entry*` writes across the caches and the shared tier, relay-event ingest, the
+  freshness bound and record hydration),
   `cache.rs` (the per-account SQLCipher directory cache, with its independent numbered migration runner in
   `cache/migrations.rs`, frozen initial schema in `cache/v1.sql`, the public event preview table in `cache/v2.sql`, and populated/interrupted-upgrade
   tests in `cache/assurance_tests.rs` using the historical `cache/fixtures/pre_ledger.sql` fixture), and `sync.rs` (the directory-subscription sync worker and
@@ -209,10 +219,18 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Directory code returns `DirectoryError` (`src/directory/error.rs`). Public `MarmotApp` methods are the boundary: they
   keep returning `AppError`, and `From<DirectoryError> for AppError` restores the variant, message and
   `privacy_safe_kind` the directory reported before it had its own type. An app failure that reaches directory code
-  (through `?` on an `AppError`) rides in `DirectoryError::Resource` and comes back unchanged. Directory code that matches
-  on its own failures must call the `DirectoryError` twin (`directory_entry`, `cached_relay_list_status`,
-  `fetch_relay_list_status`), never the public method, whose failures would arrive wrapped. A new variant needs a row in
-  `error::directory_error_tests`.
+  (through `?` on an `AppError`) rides in `DirectoryError::Resource` and comes back unchanged. Every method on
+  `Directory` returns `DirectoryError`; only the delegates in `src/directory_delegates.rs` return `AppError`, so
+  directory code never sees its own failures wrapped. A new variant needs a row in `error::directory_error_tests`.
+- Converted directory code is `impl<R: DirectoryResources> Directory<R>` (`src/directory/service.rs`), and reaches the
+  app only through the `DirectoryResources` trait in `src/directory/resources.rs`. Ask it for a cache when the cache is
+  about to be used, never before a network step. `MarmotApp` implements the trait and builds the service with
+  `directory()` in `src/directory_resources.rs`; its public directory methods become one-line delegates in
+  `src/directory_delegates.rs`, which PR 7 removes. Code still in `impl MarmotApp` calls converted methods through
+  `self.directory()`, listed as a crossing until that file converts too. `directory()` builds a fresh service on each
+  call, with `DirectoryConfig` read from the app's configuration at that moment. Anything the directory keeps between
+  calls belongs in `DirectoryState`, whose shared fields live on `MarmotApp` as `directory_state`; never create state
+  inside `directory()`, where it would die with the returned value.
 - Keep stateless relay-list and KeyPackage handling for other accounts (relay-list status, KeyPackage tag/metadata
   validation, fresh-vs-cached reconciliation, ranking and selection, revocation evidence) and the directory-record
   selection primitives (`DirectoryFreshness`, `DirectorySelection`, `sort_directory_records`) in
@@ -386,7 +404,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `transport_nostr::`.
 - `src/directory/`: also `cached_search.rs` (network-free cross-account search), `search.rs` (streaming web-of-trust
   search), `open_ranking.rs` (bounded Vertex Open Ranking discovery), `member_key_packages.rs` (set-oriented roster
-  KeyPackage resolution for create/invite).
+  KeyPackage resolution for create/invite), `config.rs` (`DirectoryConfig`, read from the app on each
+  `directory()` call, including the proxy-aware HTTP builder Open Ranking uses, and the deployment's
+  `OpenRankingProvider` and `KeyPackageClientPreference`, re-exported from `deployment.rs`), `observer.rs` (the
+  `DirectoryObserver` analytics interface; `MarmotApp` implements it over product analytics in
+  `src/directory_resources.rs`, keeping each family, operation and unit string). `mod.rs` holds the directory's own
+  clock, `unix_now_seconds`.
 - `src/sqlcipher/open_lock.rs`: in-process same-file open exclusion (the root lease covers cross-process).
 - Integration tests in `tests/` (with `tests/support/` and `tests/fixtures/`); media benchmarks in `benches/` (require
   `media-benchmarks`); `examples/usage_diagnostics_staging/`.

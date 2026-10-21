@@ -14,8 +14,9 @@ use media_store::{
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{
-    AvatarAssetRef, AvatarImageFormat, LIMITS, Limits, MAX_AVATAR_BYTES, evict, file_id, invalid,
-    next_access, released_if_gone, touch_access, valid_dimensions,
+    AvatarAcquisition, AvatarAssetRef, AvatarImage, AvatarImageFormat, LIMITS, Limits,
+    MAX_AVATAR_BYTES, clear_image, evict, file_id, invalid, next_access, released_if_gone,
+    touch_access, valid_dimensions,
 };
 use crate::app::media_catalog::{catalog_error, commit_existing_in, commit_ready_in};
 use crate::{SqliteAppStorage, SqliteResultExt, u64_to_i64};
@@ -65,7 +66,21 @@ pub struct AvatarPublication {
     image: AvatarFileImage,
     refresh_at: Option<i64>,
     limits: Limits,
+    mode: Mode,
     outcome: Mutex<Committed>,
+}
+
+/// What else a publication is fenced on and settles.
+enum Mode {
+    /// The revision fence only.
+    Publish,
+    /// A claimed fetch: its attempt must still be current, and the commit
+    /// settles it (schedules the next refresh) with the image.
+    Acquisition { attempt: Vec<u8> },
+    /// Moving a database-held image into a file: the row must still hold
+    /// those bytes. Nothing a viewer sees changes, so the content revision
+    /// and recency stay, and nothing is evicted.
+    Migration,
 }
 
 #[derive(Default)]
@@ -110,8 +125,57 @@ impl AvatarPublication {
             image,
             refresh_at: refresh_at.map(u64_to_i64).transpose()?,
             limits,
+            mode: Mode::Publish,
             outcome: Mutex::new(Committed::default()),
         })
+    }
+
+    /// Publication of a claimed fetch's result. It is refused if the attempt
+    /// is no longer current (restart, source change, eviction, store reset);
+    /// committing settles the attempt with the next refresh due at
+    /// `refresh_at`. Settle a refused one with
+    /// [`SqliteAppStorage::settle_avatar_acquisition`].
+    pub fn for_acquisition(
+        storage: SqliteAppStorage,
+        job: &AvatarAcquisition,
+        image: AvatarFileImage,
+        refresh_at: Option<u64>,
+    ) -> StorageResult<Self> {
+        let mut publication = Self::new(
+            storage,
+            job.reference.clone(),
+            job.revision(),
+            image,
+            refresh_at,
+        )?;
+        publication.mode = Mode::Acquisition {
+            attempt: job.attempt().to_vec(),
+        };
+        Ok(publication)
+    }
+
+    /// Moves database-held image `avatar`, whose bytes were read as `image`,
+    /// into a file.
+    pub fn for_migration(
+        storage: SqliteAppStorage,
+        avatar: &DatabaseAvatar,
+        image: &AvatarImage,
+    ) -> StorageResult<Self> {
+        let file = AvatarFileImage::new(
+            image.bytes().len() as u64,
+            image.format(),
+            image.width(),
+            image.height(),
+        )?;
+        let mut publication = Self::new(
+            storage,
+            avatar.reference.clone(),
+            avatar.revision,
+            file,
+            avatar.refresh_at,
+        )?;
+        publication.mode = Mode::Migration;
+        Ok(publication)
     }
 
     /// The new content revision once a publication committed.
@@ -132,18 +196,32 @@ impl AvatarPublication {
     }
 
     fn superseded_in(&self, conn: &Connection) -> StorageResult<bool> {
-        conn.query_row(
-            "SELECT NOT EXISTS(SELECT 1 FROM avatar_assets
+        let current: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM avatar_assets
                 WHERE token = ?1 AND content_revision = ?2
-                AND (SELECT store_epoch FROM chat_presentation_meta WHERE id = 1) = ?3)",
-            params![
-                self.reference.token,
-                self.expected_revision,
-                self.reference.store_epoch
-            ],
-            |row| row.get(0),
-        )
-        .storage()
+                AND (SELECT store_epoch FROM chat_presentation_meta WHERE id = 1) = ?3
+                AND (?4 = 0 OR bytes IS NOT NULL))",
+                params![
+                    self.reference.token,
+                    self.expected_revision,
+                    self.reference.store_epoch,
+                    matches!(self.mode, Mode::Migration)
+                ],
+                |row| row.get(0),
+            )
+            .storage()?;
+        if !current {
+            return Ok(true);
+        }
+        match &self.mode {
+            Mode::Acquisition { attempt } => Ok(!super::acquisition::attempt_current_in(
+                conn,
+                &self.reference.token,
+                attempt,
+            )?),
+            Mode::Publish | Mode::Migration => Ok(false),
+        }
     }
 
     /// Points the owner at ready file `id` and publishes its metadata.
@@ -185,10 +263,11 @@ impl AvatarPublication {
         if byte_len != self.image.byte_len as i64 {
             return Err(invalid("avatar file length does not match its image"));
         }
+        let migrating = matches!(self.mode, Mode::Migration);
         conn.execute(
             "UPDATE avatar_assets SET bytes = NULL, digest = ?1, media_type = ?2, width = ?3,
                 height = ?4, refresh_at = ?5, byte_len = ?6,
-                content_revision = content_revision + 1
+                content_revision = content_revision + (1 - ?8)
              WHERE token = ?7",
             params![
                 digest.as_slice(),
@@ -197,15 +276,21 @@ impl AvatarPublication {
                 self.image.height,
                 self.refresh_at,
                 byte_len,
-                token
+                token,
+                migrating
             ],
         )
         .storage()?;
-        let accessed = next_access(conn)?;
-        touch_access(conn, token, accessed)?;
-        released.extend(evict(conn, token, self.limits)?);
+        if !migrating {
+            let accessed = next_access(conn)?;
+            touch_access(conn, token, accessed)?;
+            released.extend(evict(conn, token, self.limits)?);
+        }
+        if let Mode::Acquisition { attempt } = &self.mode {
+            super::acquisition::settle_attempt_in(conn, token, attempt, self.refresh_at)?;
+        }
         let mut committed = committed.borrow_mut();
-        committed.revision = Some(self.expected_revision as u64 + 1);
+        committed.revision = Some(self.expected_revision as u64 + u64::from(!migrating));
         committed.released = released;
         Ok(())
     }
@@ -229,6 +314,162 @@ impl AvatarPublication {
             *self.lock_outcome() = committed;
         }
         Ok(value)
+    }
+}
+
+/// An image still held in the database, which the migration moves into a
+/// cache file.
+#[derive(Clone)]
+pub struct DatabaseAvatar {
+    reference: AvatarAssetRef,
+    revision: u64,
+    byte_len: u64,
+    refresh_at: Option<u64>,
+}
+
+impl std::fmt::Debug for DatabaseAvatar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseAvatar")
+            .field("byte_len", &self.byte_len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DatabaseAvatar {
+    pub fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+}
+
+/// `bytes`, `digest`, media type, width, height.
+type HeldImageRow = (Vec<u8>, Vec<u8>, String, u32, u32);
+
+/// A database-held image as the migration reads it.
+#[derive(Debug)]
+pub enum DatabaseAvatarBody {
+    Image(AvatarImage),
+    /// The row no longer holds these bytes (republished, evicted, reset).
+    Changed,
+    /// The bytes fail their digest or metadata.
+    Corrupt,
+}
+
+impl SqliteAppStorage {
+    /// Up to `limit` images still held in the database, smallest first.
+    pub fn database_held_avatars(&self, limit: usize) -> StorageResult<Vec<DatabaseAvatar>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT a.token, m.store_epoch, a.content_revision, length(a.bytes), a.refresh_at
+                 FROM avatar_assets a CROSS JOIN chat_presentation_meta m
+                 WHERE m.id = 1 AND a.bytes IS NOT NULL
+                 ORDER BY length(a.bytes), a.token LIMIT ?1",
+            )
+            .storage()?;
+        let rows = statement
+            .query_map([limit as i64], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })
+            .storage()?;
+        rows.map(|row| {
+            let (token, store_epoch, revision, byte_len, refresh_at) = row.storage()?;
+            let unsigned =
+                |value: i64| u64::try_from(value).map_err(|_| invalid("invalid avatar row"));
+            Ok(DatabaseAvatar {
+                reference: AvatarAssetRef { store_epoch, token },
+                revision: unsigned(revision)?,
+                byte_len: unsigned(byte_len)?,
+                refresh_at: refresh_at.map(unsigned).transpose()?,
+            })
+        })
+        .collect()
+    }
+
+    /// The bytes of `avatar`, if the row still holds them unchanged.
+    pub fn database_avatar_body(
+        &self,
+        avatar: &DatabaseAvatar,
+    ) -> StorageResult<DatabaseAvatarBody> {
+        let row: Option<HeldImageRow> = self
+            .lock()?
+            .query_row(
+                "SELECT bytes, digest, media_type, width, height FROM avatar_assets
+                 WHERE token = ?1 AND content_revision = ?2 AND bytes IS NOT NULL
+                    AND (SELECT store_epoch FROM chat_presentation_meta WHERE id = 1) = ?3",
+                params![
+                    avatar.reference.token,
+                    u64_to_i64(avatar.revision)?,
+                    avatar.reference.store_epoch
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .storage()?;
+        let Some((bytes, digest, media_type, width, height)) = row else {
+            return Ok(DatabaseAvatarBody::Changed);
+        };
+        let bytes = zeroize::Zeroizing::new(bytes);
+        let image = (|| {
+            use sha2::Digest;
+            if sha2::Sha256::digest(&bytes).as_slice() != digest {
+                return None;
+            }
+            let format = AvatarImageFormat::parse(&media_type)?;
+            AvatarImage::new(bytes.to_vec(), format, width, height).ok()
+        })();
+        Ok(image.map_or(DatabaseAvatarBody::Corrupt, DatabaseAvatarBody::Image))
+    }
+
+    /// Clears a database-held image whose bytes are corrupt; it is fetched
+    /// again, as after a corrupt read. `false` when the row changed.
+    pub fn drop_corrupt_database_avatar(&self, avatar: &DatabaseAvatar) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let current: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM avatar_assets
+                     WHERE token = ?1 AND content_revision = ?2 AND bytes IS NOT NULL
+                        AND (SELECT store_epoch FROM chat_presentation_meta WHERE id = 1) = ?3)",
+                    params![
+                        avatar.reference.token,
+                        u64_to_i64(avatar.revision)?,
+                        avatar.reference.store_epoch
+                    ],
+                    |row| row.get(0),
+                )
+                .storage()?;
+            if current {
+                clear_image(&conn, &avatar.reference.token)?;
+            }
+            Ok(current)
+        })
+    }
+
+    /// Bytes of images still held in the database.
+    pub fn database_avatar_bytes(&self) -> StorageResult<u64> {
+        let bytes: i64 = self
+            .lock()?
+            .query_row(
+                "SELECT coalesce(sum(length(bytes)), 0) FROM avatar_assets",
+                [],
+                |row| row.get(0),
+            )
+            .storage()?;
+        Ok(u64::try_from(bytes).unwrap_or(0))
     }
 }
 

@@ -27,6 +27,42 @@ pub struct AvatarAcquisition {
     revision: u64,
     attempt: Vec<u8>,
 }
+impl AvatarAcquisition {
+    pub(super) fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub(super) fn attempt(&self) -> &[u8] {
+        &self.attempt
+    }
+}
+/// The claimed attempt `attempt` is still the one fetching `token`.
+pub(super) fn attempt_current_in(
+    conn: &Connection,
+    token: &[u8],
+    attempt: &[u8],
+) -> StorageResult<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM avatar_acquisition WHERE token = ?1 AND attempt = ?2 AND state = 2)",
+        params![token, attempt],
+        |r| r.get(0),
+    )
+    .storage()
+}
+/// Ends attempt `attempt` and schedules the next refresh at `refresh_at`.
+pub(super) fn settle_attempt_in(
+    conn: &Connection,
+    token: &[u8],
+    attempt: &[u8],
+    refresh_at: Option<i64>,
+) -> StorageResult<()> {
+    conn.execute(
+        "UPDATE avatar_acquisition SET state = 0, due = ?1, failures = 0, priority = 0, attempt = NULL
+         WHERE token = ?2 AND attempt = ?3",
+        params![refresh_at, token, attempt],
+    )
+    .storage()?;
+    Ok(())
+}
 impl fmt::Debug for AvatarAcquisition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AvatarAcquisition").finish_non_exhaustive()
@@ -211,15 +247,44 @@ impl SqliteAppStorage {
         refresh_at: Option<u64>,
     ) -> StorageResult<AvatarPublishResult> {
         self.connection.with_transaction(|| {
-            if !self.avatar_attempt_current(job)? { return Ok(AvatarPublishResult::Superseded); }
+            if !self.avatar_attempt_current(job)? {
+                return Ok(AvatarPublishResult::Superseded);
+            }
             let result = self.publish_avatar(&job.reference, job.revision, image, refresh_at)?;
             // A newer content revision also releases this attempt; it must not
             // leave a permanently fetching row after losing the publication CAS.
-            self.lock()?.execute(
-                "UPDATE avatar_acquisition SET state = 0, due = ?1, failures = 0, priority = 0, attempt = NULL WHERE token = ?2",
-                params![refresh_at.map(u64_to_i64).transpose()?, job.reference.token],
-            ).storage()?;
+            settle_attempt_in(
+                &*self.lock()?,
+                &job.reference.token,
+                &job.attempt,
+                refresh_at.map(u64_to_i64).transpose()?,
+            )?;
             Ok(result)
+        })
+    }
+
+    /// Ends a claimed attempt whose file-backed publication was refused (a
+    /// newer revision won) and schedules the next refresh. A committed
+    /// `AvatarPublication::for_acquisition` settles its attempt itself, so
+    /// calling this afterwards changes nothing. `false` when the attempt is
+    /// no longer current.
+    pub fn settle_avatar_acquisition(
+        &self,
+        job: &AvatarAcquisition,
+        refresh_at: Option<u64>,
+    ) -> StorageResult<bool> {
+        let refresh_at = refresh_at.map(u64_to_i64).transpose()?;
+        self.connection.with_transaction(|| {
+            if !self.avatar_attempt_current(job)? {
+                return Ok(false);
+            }
+            settle_attempt_in(
+                &*self.lock()?,
+                &job.reference.token,
+                &job.attempt,
+                refresh_at,
+            )?;
+            Ok(true)
         })
     }
 

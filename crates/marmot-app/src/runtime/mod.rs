@@ -34,6 +34,7 @@ use crate::app_telemetry::{
     SyncFailureStage, bounded_advisory_step,
 };
 use crate::directory::DirectorySyncHandle;
+use crate::directory_resources::directory_account;
 use crate::ids::{account_id_hex_from_ref, normalize_group_id_hex_app};
 use crate::messages::AppMessageIntent;
 use crate::notifications;
@@ -1600,6 +1601,7 @@ impl MarmotAppRuntime {
         Ok(self
             .accounts
             .app
+            .directory()
             .display_names_for_account_ids(account_id_hexes)?)
     }
 
@@ -2155,6 +2157,7 @@ impl MarmotAppRuntime {
         let include_groups = params.radius_end >= 1;
         self.accounts
             .app
+            .directory()
             .search_users_with_seeds(params, async move {
                 if include_groups {
                     // The worker's error travels through the directory unchanged.
@@ -4688,7 +4691,8 @@ impl MarmotAppRuntime {
         Ok(self
             .accounts
             .app
-            .cached_public_event_previews(&account, references)?)
+            .directory()
+            .cached_public_event_previews(&directory_account(&account), references)?)
     }
 
     /// Fetch one referenced public event from relays when it is missing or
@@ -4705,7 +4709,8 @@ impl MarmotAppRuntime {
         Ok(self
             .accounts
             .app
-            .resolve_public_event_preview(&account, reference)
+            .directory()
+            .resolve_public_event_preview(&directory_account(&account), reference)
             .await?)
     }
 
@@ -4803,12 +4808,12 @@ impl MarmotAppRuntime {
             .into_iter()
             .map(TransportEndpoint)
             .collect::<Vec<_>>();
-        for endpoint in self.accounts.app.directory_source_relays(&[]) {
+        for endpoint in self.accounts.app.directory().directory_source_relays(&[]) {
             if !source_relays.contains(&endpoint) {
                 source_relays.push(endpoint);
             }
         }
-        let fallback = self.accounts.app.directory_source_relays(&[]);
+        let fallback = self.accounts.app.directory().directory_source_relays(&[]);
         self.accounts
             .app
             .update_account_follow_list(
@@ -8107,6 +8112,7 @@ impl AccountManager {
     ) -> Option<AccountRelayListStatus> {
         let status = match self
             .app
+            .directory()
             .resolve_account_relay_list_status_for_account_id(account_id_hex, discovery_relays)
             .await
         {
@@ -8332,10 +8338,12 @@ impl AccountManager {
                         &self.shared.app_performance_telemetry(),
                         ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
                         "import_relay_list_status",
-                        self.app.resolve_account_relay_list_status_for_account_id(
-                            &account.account_id_hex,
-                            directory_discovery_relays_for_setup(request),
-                        ),
+                        self.app
+                            .directory()
+                            .resolve_account_relay_list_status_for_account_id(
+                                &account.account_id_hex,
+                                directory_discovery_relays_for_setup(request),
+                            ),
                     )
                     .await
                     {
@@ -8404,6 +8412,7 @@ impl AccountManager {
             }
             Ok(self
                 .app
+                .directory()
                 .resolve_account_relay_list_status_for_account_id(
                     &account.account_id_hex,
                     bootstrap_relays,

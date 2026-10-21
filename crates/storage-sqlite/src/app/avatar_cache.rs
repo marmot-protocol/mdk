@@ -753,4 +753,4 @@ pub(crate) mod access;
 pub use access::{AvatarAssetPresentation, AvatarAssetTarget};
 
 mod files;
-pub use files::{AvatarFileImage, AvatarPublication};
+pub use files::{AvatarFileImage, AvatarPublication, DatabaseAvatar, DatabaseAvatarBody};

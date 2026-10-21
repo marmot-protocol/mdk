@@ -129,6 +129,11 @@ account database.
 - **Usage.** `attachmentStorageUsage` returns media-store bytes (a file shared by several
   attachments counted once), legacy database bytes, the retained attachment count, and the
   database's size and free pages. It reads no bodies.
+- **Cache.** `cacheBytes` is the avatar and group-image cache, each stored image once. Show it
+  apart from attachments next to a "Clear cache" action (`clearAvatarCache`): unlike attachments
+  it is fetched again on demand. Avatars still in the account database move into cache files in
+  the background with the attachment move below, and wait in the database while the disk has
+  no room for them.
 - **Moving legacy bodies.** The account worker moves bodies still in the account database into
   the media store in the background, a small batch every 15 seconds. `migration` says where
   that stands: `Running` (`migrationBytes` still to move), `Paused` (the smallest remaining

@@ -64,6 +64,7 @@ impl Fixture {
     async fn published(&self) -> (Vec<Vec<String>>, String) {
         let current = self
             .app
+            .directory()
             .fetch_current_follow_list_event_for_account_id(
                 &self.account_id_hex,
                 vec![self.endpoint.clone()],

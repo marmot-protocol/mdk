@@ -7,7 +7,6 @@
 //! evidence that a recipient still owns the private bundle. Unsupported batch
 //! queries fall back to bounded single-author relay requests.
 
-use crate::AppError;
 use crate::directory::error::{DirectoryError, MissingKeyPackageReason};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,11 +21,14 @@ use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
 };
 
+use super::Directory;
+use super::observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, ObservedUnit};
+use super::resources::DirectoryResources;
 use crate::directory::published_records::{
     fresh_relay_list_status_from_records, merge_relay_list_status,
     preferred_fresh_key_package_from_records,
 };
-use crate::{AccountRelayListStatus, FetchedKeyPackage, MarmotApp};
+use crate::{AccountRelayListStatus, FetchedKeyPackage};
 use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome};
 
 /// Maximum authors placed in one Nostr directory filter.
@@ -64,6 +66,7 @@ mod tests {
             .unwrap();
         fetcher.requests.lock().unwrap().clear();
         let result = app
+            .directory()
             .resolve_member_key_packages_for_purpose(
                 vec![accounts[0].account_id_hex.clone()],
                 MemberResolutionPurpose::CommitFresh,
@@ -104,7 +107,8 @@ mod tests {
             .await
             .unwrap();
         let original = Instant::now() - Duration::from_secs(240);
-        app.member_key_package_prewarm_cache
+        app.directory_state
+            .member_key_package_prewarm_cache
             .lock()
             .unwrap()
             .entries
@@ -119,7 +123,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let mut cache = app.member_key_package_prewarm_cache.lock().unwrap();
+        let mut cache = app
+            .directory_state
+            .member_key_package_prewarm_cache
+            .lock()
+            .unwrap();
         assert_eq!(cache.entries.get(id).unwrap().inserted_at, original);
         cache.entries.get_mut(id).unwrap().inserted_at =
             Instant::now() - MEMBER_PREWARM_CACHE_TTL - Duration::from_secs(1);
@@ -222,18 +230,12 @@ struct RelayListResolution {
     errors: Vec<(usize, DirectoryError)>,
 }
 
-#[allow(dead_code)]
-fn member_resolution_future_is_send(app: &MarmotApp) {
-    fn assert_send<T: Send>(_: T) {}
-    assert_send(app.resolve_member_key_packages(&[]));
-}
-
 pub(crate) struct ResolvedMemberKeyPackages {
     pub(crate) key_packages: Vec<KeyPackage>,
     pub(crate) stats: MemberKeyPackageResolutionStats,
 }
 
-impl MarmotApp {
+impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     /// Resolve a roster as one deterministic set.
     ///
     /// Account aliases are canonicalized and duplicate account ids collapse to
@@ -244,7 +246,7 @@ impl MarmotApp {
     pub async fn resolve_member_key_packages(
         &self,
         member_refs: &[&str],
-    ) -> Result<Vec<KeyPackage>, AppError> {
+    ) -> Result<Vec<KeyPackage>, DirectoryError> {
         let member_refs = member_refs
             .iter()
             .map(|member_ref| (*member_ref).to_owned())
@@ -270,7 +272,7 @@ impl MarmotApp {
     /// re-fetches packages and enforces the engine's membership policy.
     ///
     /// The roster must also resolve a safe Marmot inbox route for every member;
-    /// missing routes return [`AppError::MissingMemberInboxRoute`]. Successfully
+    /// missing routes return [`DirectoryError::MissingMemberInboxRoute`]. Successfully
     /// discovered routes remain cached even when another member fails readiness.
     /// A malformed current slot publication suppresses older packages here too;
     /// return an error rather than report readiness from superseded material.
@@ -281,7 +283,7 @@ impl MarmotApp {
     pub async fn prewarm_group_member_key_packages(
         &self,
         member_refs: &[&str],
-    ) -> Result<MemberKeyPackagePrewarmSummary, AppError> {
+    ) -> Result<MemberKeyPackagePrewarmSummary, DirectoryError> {
         let member_refs = member_refs
             .iter()
             .map(|member_ref| (*member_ref).to_owned())
@@ -293,7 +295,6 @@ impl MarmotApp {
         )
         .await
         .map(|resolved| resolved.stats.into())
-        .map_err(AppError::from)
     }
 
     pub(crate) async fn resolve_member_key_packages_with_stats(
@@ -314,11 +315,9 @@ impl MarmotApp {
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
     ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
-        let observation = self.product_analytics.begin(
-            crate::ProductFamily::KeyPackage,
-            "lookup",
-            crate::ProductUnit::Action,
-        );
+        let observation =
+            self.resources
+                .begin(ObservedFamily::KeyPackage, "lookup", ObservedUnit::Action);
         let deadline = tokio::time::Instant::now() + MEMBER_RESOLUTION_DEADLINE;
         let result = self
             .resolve_member_key_packages_inner(&member_refs, purpose, requirements, deadline)
@@ -345,19 +344,19 @@ impl MarmotApp {
         deadline: tokio::time::Instant,
     ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
         let directory_observation = self
-            .product_analytics
+            .resources
             .begin(
-                crate::ProductFamily::Directory,
+                ObservedFamily::Directory,
                 "key_package",
-                crate::ProductUnit::Attempt,
+                ObservedUnit::Attempt,
             )
-            .map(crate::ProductObservation::counts_only);
+            .map(DirectoryObservation::counts_only);
         let mut seen = HashSet::new();
         let mut targets = Vec::new();
         for member_ref in member_refs {
-            let local = self.account_home().account(member_ref).ok();
-            let account_id_hex = match &local {
-                Some(account) => account.account_id_hex.clone(),
+            let local = self.resources.account_id_for_label(member_ref).ok();
+            let account_id_hex = match local {
+                Some(account_id_hex) => account_id_hex,
                 None => PublicKey::parse(member_ref)
                     .map_err(|_| DirectoryError::InvalidPublicKey)?
                     .to_hex(),
@@ -390,6 +389,7 @@ impl MarmotApp {
                 continue;
             }
             let prefetched = self
+                .state
                 .member_key_package_prewarm_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -495,6 +495,7 @@ impl MarmotApp {
             }
             MemberResolutionPurpose::Prewarm => {
                 let mut cache = self
+                    .state
                     .member_key_package_prewarm_cache
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -573,14 +574,12 @@ impl MarmotApp {
         account_id_hex: &str,
         key_package: KeyPackage,
     ) -> Result<KeyPackage, DirectoryError> {
-        let observation = self.product_analytics.begin(
-            crate::ProductFamily::KeyPackage,
-            "lookup",
-            crate::ProductUnit::Attempt,
-        );
+        let observation =
+            self.resources
+                .begin(ObservedFamily::KeyPackage, "lookup", ObservedUnit::Attempt);
         let (result, outcome) = validate_current_member_key_package(account_id_hex, key_package);
         if let Some(observation) = observation {
-            observation.count(outcome, crate::ProductUnit::Attempt, 1);
+            observation.count(outcome, ObservedUnit::Attempt, 1);
             observation.discard();
         }
         result
@@ -630,9 +629,9 @@ impl MarmotApp {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let app = self.clone();
+        let directory = self.clone();
         let work = specs.into_iter().map(move |(endpoints, members)| {
-            let app = app.clone();
+            let directory = directory.clone();
             async move {
                 let authors = members.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>();
                 let queries = [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST]
@@ -645,7 +644,7 @@ impl MarmotApp {
                         )
                     })
                     .collect();
-                let result = app
+                let result = directory
                     .relay_plane
                     .fetch_directory_events_with_completion(endpoints.clone(), queries)
                     .await;
@@ -660,7 +659,7 @@ impl MarmotApp {
                 // as transport errors. Retain positive batch records even when
                 // the single-author retry also fails.
                 stream::iter(members.into_iter().map(|(index, account_id)| {
-                    let app = app.clone();
+                    let directory = directory.clone();
                     let endpoints = endpoints.clone();
                     let mut records = outcome
                         .records
@@ -679,7 +678,7 @@ impl MarmotApp {
                                 )
                             })
                             .collect();
-                        let retry = app
+                        let retry = directory
                             .relay_plane
                             .fetch_directory_events_with_completion(endpoints.clone(), queries)
                             .await
@@ -882,13 +881,13 @@ impl MarmotApp {
                 (indices, endpoints, query)
             })
             .collect::<Vec<_>>();
-        let app = self.clone();
+        let directory = self.clone();
         let requests = request_specs
             .into_iter()
             .map(move |(indices, endpoints, query)| {
-                let app = app.clone();
+                let directory = directory.clone();
                 async move {
-                    let result = app
+                    let result = directory
                         .relay_plane
                         .fetch_directory_events(endpoints, vec![query])
                         .await
@@ -926,7 +925,7 @@ impl MarmotApp {
                     &account_records,
                     self.directory_freshness(),
                     requirements,
-                    &self.deployment().key_package_client_preference,
+                    &self.config.key_package_client_preference,
                 )
                 .map(|selection| selection.value);
                 // Batch results prove no coverage; every absence or rejection
@@ -987,12 +986,12 @@ impl MarmotApp {
                 ))
             })
             .collect::<Vec<_>>();
-        let app = self.clone();
+        let directory = self.clone();
         let work =
             fallback_specs
                 .into_iter()
                 .map(move |(index, target, endpoints, observed_records)| {
-                    let app = app.clone();
+                    let directory = directory.clone();
                     async move {
                         let query = DirectoryEventQuery::new(
                             KIND_MARMOT_KEY_PACKAGE,
@@ -1000,7 +999,7 @@ impl MarmotApp {
                             KEY_PACKAGE_EVENTS_PER_AUTHOR,
                         );
                         let result = async {
-                            let (mut records, complete) = match app
+                            let (mut records, complete) = match directory
                                 .relay_plane
                                 .fetch_directory_events_with_completion(
                                     endpoints.clone(),
@@ -1015,14 +1014,14 @@ impl MarmotApp {
                             // valid package observed in this call's batch.
                             // Never load a previously cached package here.
                             records.extend(observed_records);
-                            let records = app
+                            let records = directory
                                 .recover_key_package_records(
                                     super::key_package_recovery::KeyPackageRecoveryRequest {
                                         account: &target.account_id_hex,
                                         searched: &endpoints,
                                         observed: records,
                                         primary_complete: complete,
-                                        discovery: &app.directory_source_relays(&[]),
+                                        discovery: &directory.directory_source_relays(&[]),
                                         requirements,
                                         cached_target: None,
                                     },
@@ -1033,7 +1032,7 @@ impl MarmotApp {
                                 &records.records,
                                 records.freshness,
                                 requirements,
-                                &self.deployment().key_package_client_preference,
+                                &self.config.key_package_client_preference,
                             )?
                             // Recovery returned, so lookup coverage is complete.
                             .into_value_or_missing(&target.account_id_hex)?

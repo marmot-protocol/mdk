@@ -15,11 +15,17 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+use transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT;
 use transport_nostr_peeler::{NostrTransportEvent, SdkSigner};
 
 use super::DIRECTORY_RELAY_CONNECT_WAIT;
 
 const DIRECTORY_RELAY_FETCH_WAIT: Duration = Duration::from_secs(3);
+
+/// The most filters one strict directory REQ carries. strfry allows 3 per
+/// REQ and refuses more with `CLOSED invalid:`, so a request with more
+/// queries is split into several REQs on the same connection (mdk#2269).
+const DIRECTORY_MAX_FILTERS_PER_REQ: usize = 3;
 
 /// Stable errors for a bounded, isolated relay inspection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1084,112 +1090,167 @@ async fn strict_fetch_endpoint(
     }
 
     let max_records = queries.iter().map(|query| query.limit).sum::<usize>();
-    let subscription_id = SubscriptionId::generate();
     let mut notifications = relay.notifications_with_gaps();
-    if relay
-        .subscribe(filters)
-        .with_id(subscription_id.clone())
-        .close_on(
-            SubscribeAutoCloseOptions::default()
-                .timeout(Some(DIRECTORY_RELAY_FETCH_WAIT))
-                .idle_timeout(Some(DIRECTORY_RELAY_FETCH_WAIT)),
-        )
-        .await
-        .is_err()
-    {
-        return DirectoryFetchOutcome::default();
-    }
-
     let mut records = Vec::new();
     let mut seen_event_ids = HashSet::new();
-    let mut query_counts = vec![0usize; queries.len()];
+    // Every subscription this connection has carried. The wire counter sees
+    // all EVENT frames on the connection, so a live event an earlier chunk's
+    // subscription receives after its EOSE must still count as admitted.
+    let mut issued = HashSet::new();
     let mut admitted_messages = 0usize;
-    let complete = timeout(DIRECTORY_RELAY_FETCH_WAIT, async {
-        loop {
-            let received = match notifications.next().await {
-                Some(NotificationUpdate::Notification(RelayNotification::Event {
-                    subscription_id: received_id,
-                    event,
-                })) if received_id == subscription_id => Some(*event),
-                Some(NotificationUpdate::Notification(RelayNotification::Message { message })) => {
-                    match *message {
-                        RelayMessage::Event {
+    let mut complete = true;
+    let all_queries = &queries;
+    for (queries, filters) in queries
+        .chunks(DIRECTORY_MAX_FILTERS_PER_REQ)
+        .zip(filters.chunks(DIRECTORY_MAX_FILTERS_PER_REQ))
+    {
+        let subscription_id = SubscriptionId::generate();
+        if relay
+            .subscribe(filters.to_vec())
+            .with_id(subscription_id.clone())
+            .close_on(
+                SubscribeAutoCloseOptions::default()
+                    .timeout(Some(DIRECTORY_RELAY_FETCH_WAIT))
+                    .idle_timeout(Some(DIRECTORY_RELAY_FETCH_WAIT)),
+            )
+            .await
+            .is_err()
+        {
+            // Keep what earlier chunks returned: the fetch is incomplete,
+            // but its records are still usable.
+            complete = false;
+            continue;
+        }
+        issued.insert(subscription_id.clone());
+
+        let mut query_counts = vec![0usize; queries.len()];
+        // Counted per REQ: an event an earlier chunk already returned still
+        // fills this chunk's queries toward their limits. Only the returned
+        // records are deduplicated across chunks.
+        let mut chunk_event_ids = HashSet::new();
+        let chunk_complete =
+            timeout(DIRECTORY_RELAY_FETCH_WAIT, async {
+                loop {
+                    let received = match notifications.next().await {
+                        Some(NotificationUpdate::Notification(RelayNotification::Event {
                             subscription_id: received_id,
                             event,
-                        } if received_id.as_ref() == &subscription_id => {
-                            admitted_messages += 1;
-                            Some(event.into_owned())
+                        })) if received_id == subscription_id => Some((*event, false)),
+                        Some(NotificationUpdate::Notification(RelayNotification::Message {
+                            message,
+                        })) => match *message {
+                            RelayMessage::Event {
+                                subscription_id: received_id,
+                                event,
+                            } if received_id.as_ref() == &subscription_id => {
+                                admitted_messages += 1;
+                                Some((event.into_owned(), false))
+                            }
+                            RelayMessage::Event {
+                                subscription_id: received_id,
+                                event,
+                            } if issued.contains(received_id.as_ref()) => {
+                                admitted_messages += 1;
+                                Some((event.into_owned(), true))
+                            }
+                            RelayMessage::EndOfStoredEvents(received_id)
+                                if received_id.as_ref() == &subscription_id =>
+                            {
+                                // A filter that reaches its limit cannot establish absence,
+                                // and neither can one that reaches the page a relay
+                                // silently clamps every REQ to. A frame discarded before
+                                // notifications cannot establish negative coverage, even
+                                // after EOSE.
+                                break wire.event_count() == admitted_messages
+                                    && queries.iter().zip(&query_counts).all(|(query, count)| {
+                                        *count < query.limit.min(RELAY_REPLAY_PAGE_LIMIT)
+                                    });
+                            }
+                            RelayMessage::Closed {
+                                subscription_id: received_id,
+                                ..
+                            } if received_id.as_ref() == &subscription_id => break false,
+                            _ => None,
+                        },
+                        Some(NotificationUpdate::Notification(
+                            RelayNotification::AuthenticationFailed,
+                        )) => {
+                            break false;
                         }
-                        RelayMessage::EndOfStoredEvents(received_id)
-                            if received_id.as_ref() == &subscription_id =>
-                        {
-                            // A filter that reaches its limit cannot establish absence.
-                            // A frame discarded before notifications cannot
-                            // establish negative coverage, even after EOSE.
-                            break wire.event_count() == admitted_messages
-                                && queries
-                                    .iter()
-                                    .zip(&query_counts)
-                                    .all(|(query, count)| *count < query.limit);
+                        Some(NotificationUpdate::Notification(
+                            RelayNotification::RelayStatus {
+                                status:
+                                    RelayStatus::Disconnected
+                                    | RelayStatus::Terminated
+                                    | RelayStatus::Banned,
+                            },
+                        )) => {
+                            break false;
                         }
-                        RelayMessage::Closed {
-                            subscription_id: received_id,
-                            ..
-                        } if received_id.as_ref() == &subscription_id => break false,
+                        // Lag may have dropped an inbox EVENT immediately before
+                        // EOSE. Continuing cannot establish absence safely.
+                        Some(NotificationUpdate::Lagged { .. }) | None => break false,
                         _ => None,
+                    };
+                    if let Some((event, late)) = received {
+                        if event.verify().is_err() {
+                            continue;
+                        }
+                        let Ok(event) = NostrTransportEvent::from_nostr_event(&event) else {
+                            continue;
+                        };
+                        if late {
+                            // An earlier chunk's subscription, after that chunk
+                            // settled: keep the record, but it says nothing about
+                            // this chunk's queries.
+                            if all_queries.iter().any(|query| query.matches(&event))
+                                && records.len() < max_records
+                                && seen_event_ids.insert(event.id.clone())
+                            {
+                                records.push(DirectoryRelayEventRecord {
+                                    endpoints: vec![endpoint.clone()],
+                                    event,
+                                });
+                            }
+                            continue;
+                        }
+                        if !queries.iter().any(|query| query.matches(&event)) {
+                            // A filter-ignoring relay cannot establish a complete empty
+                            // scoped deletion result by filling its page with other posts.
+                            if queries.iter().any(|query| query.reference.is_some()) {
+                                break false;
+                            }
+                            continue;
+                        }
+                        if !chunk_event_ids.insert(event.id.clone()) {
+                            continue;
+                        }
+                        for (query, count) in queries.iter().zip(&mut query_counts) {
+                            if query.matches(&event) {
+                                *count += 1;
+                            }
+                        }
+                        if !seen_event_ids.insert(event.id.clone()) {
+                            continue;
+                        }
+                        if records.len() < max_records {
+                            records.push(DirectoryRelayEventRecord {
+                                endpoints: vec![endpoint.clone()],
+                                event,
+                            });
+                        } else {
+                            break false;
+                        }
                     }
                 }
-                Some(NotificationUpdate::Notification(RelayNotification::AuthenticationFailed)) => {
-                    break false;
-                }
-                Some(NotificationUpdate::Notification(RelayNotification::RelayStatus {
-                    status:
-                        RelayStatus::Disconnected | RelayStatus::Terminated | RelayStatus::Banned,
-                })) => {
-                    break false;
-                }
-                // Lag may have dropped an inbox EVENT immediately before
-                // EOSE. Continuing cannot establish absence safely.
-                Some(NotificationUpdate::Lagged { .. }) | None => break false,
-                _ => None,
-            };
-            if let Some(event) = received {
-                if event.verify().is_err() {
-                    continue;
-                }
-                let Ok(event) = NostrTransportEvent::from_nostr_event(&event) else {
-                    continue;
-                };
-                if !queries.iter().any(|query| query.matches(&event)) {
-                    // A filter-ignoring relay cannot establish a complete empty
-                    // scoped deletion result by filling its page with other posts.
-                    if queries.iter().any(|query| query.reference.is_some()) {
-                        break false;
-                    }
-                    continue;
-                }
-                if !seen_event_ids.insert(event.id.clone()) {
-                    continue;
-                }
-                for (query, count) in queries.iter().zip(&mut query_counts) {
-                    if query.matches(&event) {
-                        *count += 1;
-                    }
-                }
-                if records.len() < max_records {
-                    records.push(DirectoryRelayEventRecord {
-                        endpoints: vec![endpoint.clone()],
-                        event,
-                    });
-                } else {
-                    break false;
-                }
-            }
-        }
-    })
-    .await
-    .unwrap_or(false);
-    let _ = relay.unsubscribe(&subscription_id).await;
+            })
+            .await
+            .unwrap_or(false);
+        let _ = relay.unsubscribe(&subscription_id).await;
+        // Later chunks still run: their records are usable even when this
+        // chunk cannot establish absence.
+        complete &= chunk_complete;
+    }
     DirectoryFetchOutcome { records, complete }
 }
 
@@ -1371,42 +1432,53 @@ mod tests {
         }
     }
 
-    /// Documents a latent limit risk: the strict directory fetch sends every
-    /// query of a request as one filter of ONE REQ, with no cap. Production
-    /// relays allow at most 3 filters per REQ and refuse the rest with
-    /// `invalid: too many filters`, which this path reports as incomplete.
-    /// Today's callers pass at most two queries; a fourth would fail closed.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn strict_directory_fetch_puts_every_query_in_one_req() {
+    /// A loopback relay that enforces strfry's REQ shape: it refuses a REQ
+    /// with more than `max_filters` filters with `CLOSED invalid:`, and
+    /// otherwise answers with `stored` and EOSE. Returns its endpoint and the
+    /// filter count of every REQ it received.
+    async fn spawn_filter_limited_relay(
+        max_filters: usize,
+        stored: Vec<serde_json::Value>,
+    ) -> (
+        TransportEndpoint,
+        std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use futures::{SinkExt, StreamExt};
         use tokio::net::TcpListener;
         use tokio_tungstenite::{accept_async, tungstenite::Message};
 
-        const MAX_FILTERS_PER_REQ: usize = 3;
-        let author = nostr::prelude::Keys::generate().public_key().to_hex();
-        for query_count in [2_usize, 4] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
-            let filter_counts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let seen = filter_counts.clone();
-            let server = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let mut socket = accept_async(stream).await.unwrap();
-                while let Some(Ok(message)) = socket.next().await {
-                    let Message::Text(text) = message else {
-                        continue;
-                    };
-                    let request: serde_json::Value = serde_json::from_str(&text).unwrap();
-                    if request[0] != "REQ" {
-                        continue;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+        let filter_counts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = filter_counts.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if request[0] != "REQ" {
+                    continue;
+                }
+                let filters = request.as_array().unwrap().len() - 2;
+                seen.lock().unwrap().push(filters);
+                let mut replies = Vec::new();
+                if filters > max_filters {
+                    replies.push(serde_json::json!([
+                        "CLOSED",
+                        request[1],
+                        "invalid: too many filters"
+                    ]));
+                } else {
+                    for event in &stored {
+                        replies.push(serde_json::json!(["EVENT", request[1], event]));
                     }
-                    let filters = request.as_array().unwrap().len() - 2;
-                    seen.lock().unwrap().push(filters);
-                    let reply = if filters > MAX_FILTERS_PER_REQ {
-                        serde_json::json!(["CLOSED", request[1], "invalid: too many filters"])
-                    } else {
-                        serde_json::json!(["EOSE", request[1]])
-                    };
+                    replies.push(serde_json::json!(["EOSE", request[1]]));
+                }
+                for reply in replies {
                     if socket
                         .send(Message::Text(reply.to_string().into()))
                         .await
@@ -1415,16 +1487,32 @@ mod tests {
                         return;
                     }
                 }
-            });
-            let queries = [0_u64, 3, 10002, 10050]
+            }
+        });
+        (endpoint, filter_counts, server)
+    }
+
+    /// Production relays allow at most 3 filters per REQ and refuse more with
+    /// `invalid: too many filters`. The strict directory fetch splits a
+    /// request's queries into REQs of at most 3 filters on one connection, so
+    /// a request with more queries still completes (mdk#2269).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_directory_fetch_splits_queries_into_reqs_of_three_filters() {
+        let author = nostr::prelude::Keys::generate().public_key().to_hex();
+        for (query_count, expected_reqs) in [
+            (2_usize, vec![2_usize]),
+            (4, vec![3, 1]),
+            (7, vec![3, 3, 1]),
+        ] {
+            let (endpoint, filter_counts, server) = spawn_filter_limited_relay(3, Vec::new()).await;
+            let queries = [0_u64, 3, 10002, 10050, 10000, 10019, 30000]
                 .into_iter()
                 .take(query_count)
                 .map(|kind| DirectoryEventQuery::new(kind, vec![author.clone()], 4))
                 .collect();
-            let request = DirectoryFetchRequest::new(vec![endpoint], queries)
-                .expect("no cap on queries per request");
+            let request = DirectoryFetchRequest::new(vec![endpoint], queries).unwrap();
             let outcome = timeout(
-                Duration::from_secs(10),
+                Duration::from_secs(20),
                 NostrSdkDirectoryRelayFetcher::standalone()
                     .fetch_directory_events_with_completion(request),
             )
@@ -1432,13 +1520,107 @@ mod tests {
             .expect("strict fetch completes")
             .unwrap();
             server.abort();
-            let filter_counts = filter_counts.lock().unwrap().clone();
-            assert_eq!(
-                filter_counts,
-                vec![query_count],
-                "one REQ carries every query"
+            assert_eq!(*filter_counts.lock().unwrap(), expected_reqs);
+            assert!(
+                outcome.complete,
+                "{query_count} queries split under the filter limit establish absence"
             );
-            assert_eq!(outcome.complete, query_count <= MAX_FILTERS_PER_REQ);
+        }
+    }
+
+    /// An event an earlier REQ already returned still counts toward a later
+    /// REQ's queries. Three `[A]` queries fill the first REQ; an `[A, X]` query
+    /// with limit 1 sorts into the second. The relay returns A's one event for
+    /// both, so the second REQ's query reaches its limit and cannot establish
+    /// absence (mdk#2269).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_directory_fetch_counts_events_shared_across_reqs_per_req() {
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
+
+        let author = Keys::generate();
+        let author_hex = author.public_key().to_hex();
+        // Authors are sorted inside a query, so `other` must sort after
+        // `author` for `[author, other]` to sort after `[author]` and land in
+        // the second REQ.
+        let other = loop {
+            let candidate = Keys::generate().public_key().to_hex();
+            if candidate > author_hex {
+                break candidate;
+            }
+        };
+        let event = EventBuilder::new(Kind::TextNote, "shared")
+            .finalize(&author)
+            .unwrap();
+        let (endpoint, filter_counts, server) =
+            spawn_filter_limited_relay(3, vec![serde_json::to_value(&event).unwrap()]).await;
+        let author = author_hex;
+        let mut queries = [10, 11, 12]
+            .into_iter()
+            .map(|limit| DirectoryEventQuery::new(1, vec![author.clone()], limit))
+            .collect::<Vec<_>>();
+        queries.push(DirectoryEventQuery::new(1, vec![author, other], 1));
+        let request = DirectoryFetchRequest::new(vec![endpoint], queries).unwrap();
+        assert_eq!(
+            request.queries[3].limit, 1,
+            "the limit-1 query sorts into the second REQ"
+        );
+        let outcome = timeout(
+            Duration::from_secs(20),
+            NostrSdkDirectoryRelayFetcher::standalone()
+                .fetch_directory_events_with_completion(request),
+        )
+        .await
+        .expect("strict fetch completes")
+        .unwrap();
+        server.abort();
+        assert_eq!(*filter_counts.lock().unwrap(), vec![3, 1]);
+        assert_eq!(outcome.records.len(), 1, "records stay deduplicated");
+        assert!(
+            !outcome.complete,
+            "the second REQ's query reached its limit"
+        );
+    }
+
+    /// strfry silently clamps every REQ to 500 stored events and then sends
+    /// EOSE. A query whose limit is above the clamp and that receives exactly
+    /// the clamp's worth of events may have been cut short, so it cannot
+    /// establish absence; one event fewer can (mdk#2269).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_directory_fetch_treats_a_clamp_sized_answer_as_incomplete() {
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
+
+        let keys = Keys::generate();
+        let events = (0..RELAY_REPLAY_PAGE_LIMIT)
+            .map(|index| {
+                let event = EventBuilder::new(Kind::TextNote, format!("note {index}"))
+                    .finalize(&keys)
+                    .unwrap();
+                serde_json::to_value(&event).unwrap()
+            })
+            .collect::<Vec<_>>();
+        for (stored, expect_complete) in [
+            (RELAY_REPLAY_PAGE_LIMIT, false),
+            (RELAY_REPLAY_PAGE_LIMIT - 1, true),
+        ] {
+            let (endpoint, _, server) =
+                spawn_filter_limited_relay(3, events[..stored].to_vec()).await;
+            let query = DirectoryEventQuery::new(
+                1,
+                vec![keys.public_key().to_hex()],
+                RELAY_REPLAY_PAGE_LIMIT + 100,
+            );
+            let request = DirectoryFetchRequest::new(vec![endpoint], vec![query]).unwrap();
+            let outcome = timeout(
+                Duration::from_secs(20),
+                NostrSdkDirectoryRelayFetcher::standalone()
+                    .fetch_directory_events_with_completion(request),
+            )
+            .await
+            .expect("strict fetch completes")
+            .unwrap();
+            server.abort();
+            assert_eq!(outcome.records.len(), stored);
+            assert_eq!(outcome.complete, expect_complete, "{stored} stored events");
         }
     }
 

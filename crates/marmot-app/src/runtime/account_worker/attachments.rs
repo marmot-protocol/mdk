@@ -186,6 +186,12 @@ pub(super) fn spawn_legacy_migration(
         if changed {
             updates.send_modify(|_| {});
         }
+        // Then images still held in the database move into cache files
+        // (mdk#2314 step 9), so compaction can return their pages.
+        if crate::media::avatar_files::run_batch(&app_storage, &media, reserve, &free) {
+            app.presentation_signals.wake();
+            let _ = app.presentation_signals.avatars.send(label.clone());
+        }
         let startup = !startup_wal_settled.load(std::sync::atomic::Ordering::Acquire);
         if crate::media::storage_compaction::reclaim(&app_storage, startup) && startup {
             startup_wal_settled.store(true, std::sync::atomic::Ordering::Release);

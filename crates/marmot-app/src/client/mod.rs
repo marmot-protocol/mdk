@@ -2086,6 +2086,7 @@ impl AppClient {
         let key_package_started_at = Instant::now();
         let key_packages = self
             .app
+            .directory()
             .resolve_compatible_member_key_packages(
                 member_refs
                     .iter()
@@ -2762,6 +2763,7 @@ impl AppClient {
             .map_err(cgka_session::SessionError::from)?;
         let key_packages = self
             .app
+            .directory()
             .resolve_compatible_member_key_packages(
                 member_refs
                     .iter()

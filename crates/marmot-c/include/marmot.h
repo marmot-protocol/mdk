@@ -1754,6 +1754,7 @@ typedef struct MarmotAttachmentStorageUsage {
   uint64_t database_free_bytes;
   enum MarmotAttachmentMigrationState migration;
   uint64_t migration_bytes;
+  uint64_t cache_bytes;
 } MarmotAttachmentStorageUsage;
 
 /**

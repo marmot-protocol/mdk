@@ -6507,7 +6507,7 @@ impl AppClient {
             })
             .collect::<Vec<_>>();
         // Enrichment must not discard effects the engine already consumed.
-        match self.app.display_names_for_account_ids(&senders) {
+        match self.app.directory().display_names_for_account_ids(&senders) {
             Ok(names) => names,
             Err(error) => {
                 tracing::warn!(
@@ -8403,7 +8403,8 @@ mod tests {
             })
             .unwrap();
         assert!(
-            app.display_names_for_account_ids(std::slice::from_ref(&account.account_id_hex))
+            app.directory()
+                .display_names_for_account_ids(std::slice::from_ref(&account.account_id_hex))
                 .is_err()
         );
         match observation {
@@ -9764,7 +9765,7 @@ mod tests {
             })
             .unwrap();
         assert!(
-            app.directory_entries().is_err(),
+            app.directory().directory_entries().is_err(),
             "unrelated profile is corrupt"
         );
         tokio::time::pause();

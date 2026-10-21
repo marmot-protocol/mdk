@@ -99,6 +99,7 @@ mod conversions;
 mod directory;
 #[cfg(test)]
 mod directory_crossings_tests;
+mod directory_delegates;
 mod directory_resources;
 mod drafts;
 mod local_submissions;
@@ -381,8 +382,8 @@ use conversions::{
     stored_app_event_from_projection, stored_push_registration_from_account,
     stored_state_from_account_state,
 };
+use directory::DirectoryCache;
 use directory::records::display_name_for_profile;
-use directory::{DirectoryCache, DirectorySyncHandle};
 use ids::parse_account_id_hex;
 use key_package_records::{
     account_key_package_record_from_fetched, account_key_package_relay_events_from_records,
@@ -541,7 +542,6 @@ pub struct MarmotApp {
     account_home: AccountHome,
     relay_plane: MarmotRelayPlane,
     config: MarmotAppConfig,
-    directory_sync: Arc<RwLock<Option<DirectorySyncHandle>>>,
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
     /// One encrypted media store per account (mdk#2314), over that account's
     /// cached storage handle. Its in-flight set and sweep cursor are per
@@ -556,12 +556,9 @@ pub struct MarmotApp {
     close_registry: Arc<close_registry::CloseRegistry>,
     account_session_owners: Arc<Mutex<HashSet<String>>>,
     directory_caches: Arc<Mutex<HashMap<String, DirectoryCache>>>,
-    /// When each `(account label, cache key)` public event refresh last
-    /// finished; see `public_event_preview`.
-    public_event_refreshes: Arc<Mutex<HashMap<String, Instant>>>,
-    /// Bounded, process-local composition prewarm. Entries are never durable
-    /// directory admission and never reserve or consume a KeyPackage.
-    member_key_package_prewarm_cache: Arc<Mutex<directory::MemberKeyPackagePrewarmCache>>,
+    /// What the directory keeps between calls; [`Self::directory`] shares it
+    /// with every service it builds.
+    directory_state: directory::DirectoryState,
     legacy_directory_cache_checked: Arc<Mutex<bool>>,
     #[cfg(test)]
     directory_test_clock: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -1611,7 +1608,6 @@ impl MarmotApp {
             relay_urls,
             relay_plane,
             config,
-            directory_sync: Arc::new(RwLock::new(None)),
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
@@ -1621,10 +1617,7 @@ impl MarmotApp {
             close_registry: Default::default(),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
-            public_event_refreshes: Arc::default(),
-            member_key_package_prewarm_cache: Arc::new(Mutex::new(
-                directory::MemberKeyPackagePrewarmCache::default(),
-            )),
+            directory_state: directory::DirectoryState::default(),
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
             directory_test_clock: None,
@@ -1712,7 +1705,6 @@ impl MarmotApp {
             account_home,
             relay_plane,
             config,
-            directory_sync: Arc::new(RwLock::new(None)),
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
@@ -1722,10 +1714,7 @@ impl MarmotApp {
             close_registry: Default::default(),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
-            public_event_refreshes: Arc::default(),
-            member_key_package_prewarm_cache: Arc::new(Mutex::new(
-                directory::MemberKeyPackagePrewarmCache::default(),
-            )),
+            directory_state: directory::DirectoryState::default(),
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
             directory_test_clock: None,
@@ -4767,7 +4756,7 @@ impl MarmotApp {
                     .collect(),
             );
         }
-        for entry in self.directory_entries()? {
+        for entry in self.directory().directory_entries()? {
             let endpoints = self.retain_safe_discovered_endpoints(
                 entry
                     .relay_lists
@@ -5023,6 +5012,7 @@ impl MarmotApp {
             return false;
         }
         let records = match self
+            .directory()
             .fetch_key_package_events_for_account_id_with_limit(
                 &account.account_id_hex,
                 &source_relays,
@@ -5358,7 +5348,7 @@ impl MarmotApp {
         // the configured directory relays as the same operational fallback used
         // when local accounts publish a KeyPackage without rewriting NIP-65.
         if !has_explicit_bootstrap_relays && relay_lists.nip65.relays.is_empty() {
-            let discovery_relays = self.directory_source_relays(&[]);
+            let discovery_relays = self.directory().directory_source_relays(&[]);
             if !discovery_relays.is_empty() {
                 relay_lists = self
                     .fetch_account_relay_list_status_for_account_id(
@@ -5379,7 +5369,7 @@ impl MarmotApp {
             "account key package listing",
         );
         if source_relays.is_empty() {
-            source_relays = self.directory_source_relays(&[]);
+            source_relays = self.directory().directory_source_relays(&[]);
         }
         if source_relays.is_empty() {
             return Err(AppError::MissingRelayLists(vec![
@@ -5388,6 +5378,7 @@ impl MarmotApp {
         }
 
         let mut relay_records = self
+            .directory()
             .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
             .await?;
         sort_directory_records(&mut relay_records);
@@ -5762,6 +5753,7 @@ impl MarmotApp {
             );
             if !source_relays.is_empty() {
                 let records = self
+                    .directory()
                     .fetch_key_package_events_for_account_id(&account_id, &source_relays)
                     .await?;
                 let mut fetched = fresh_or_cached_key_package(
@@ -5811,7 +5803,9 @@ impl MarmotApp {
             .into_iter()
             .map(|account| account.account_id_hex)
             .collect::<Vec<_>>();
-        Ok(self.display_names_for_account_ids(&account_ids)?)
+        Ok(self
+            .directory()
+            .display_names_for_account_ids(&account_ids)?)
     }
 
     fn display_name_for_account_id(
@@ -5928,7 +5922,7 @@ impl MarmotApp {
             })
             .collect::<HashSet<_>>();
         let senders = senders.into_iter().collect::<Vec<_>>();
-        let names = self.display_names_for_account_ids(&senders)?;
+        let names = self.directory().display_names_for_account_ids(&senders)?;
         for row in rows {
             let Some(message) = row.last_message.as_mut() else {
                 continue;

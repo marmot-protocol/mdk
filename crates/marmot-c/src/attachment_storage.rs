@@ -22,6 +22,7 @@ c_mirror! {
         copy database_free_bytes: u64,
         copy migration: MarmotAttachmentMigrationState,
         copy migration_bytes: u64,
+        copy cache_bytes: u64,
     }
 }
 

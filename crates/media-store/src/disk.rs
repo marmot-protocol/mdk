@@ -56,6 +56,12 @@ impl DiskPolicy {
         body
     }
 
+    /// Bytes caching a `body`-byte avatar or group image writes: its whole
+    /// store file, framing included.
+    pub fn cache_need(body: u64) -> u64 {
+        crate::format::file_bytes(body)
+    }
+
     /// Bytes moving a `body`-byte legacy database body into the store
     /// writes: its whole store file, framing included. The database rows it
     /// came from are deleted afterwards, so they free nothing on the volume

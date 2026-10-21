@@ -3862,6 +3862,52 @@ struct MediaHttpDone {
     cancellation: Option<crate::ProductObservation>,
 }
 
+/// Stores a fetched avatar image as a cache file and settles its attempt.
+/// A disk too full for it, or any failure, retries the fetch later; the
+/// previous image stays. Blocking: runs on the blocking pool.
+fn store_acquired_avatar(
+    app: &crate::MarmotApp,
+    label: &str,
+    job: &storage_sqlite::AvatarAcquisition,
+    image: &storage_sqlite::AvatarImage,
+) {
+    let now = crate::unix_now_seconds();
+    let refresh = matches!(
+        job.descriptor,
+        storage_sqlite::SelectedAvatar::RemoteImage { .. }
+    )
+    .then(|| now.saturating_add(24 * 60 * 60));
+    let Ok(account) = app.account_storage(label) else {
+        return;
+    };
+    let storage = account.app_storage();
+    let stored = (|| {
+        let media = app.account_media_store(label, &account)?;
+        let reserve = storage
+            .attachment_download_policy(&super::attachment_controls::default_policy(&app.config))?
+            .disk_reserve;
+        let directory = app.account_dir(label);
+        let free = || crate::media::attachment_resume::available_space(&directory);
+        crate::media::avatar_files::store_acquired(
+            &storage, &media, reserve, &free, job, image, refresh,
+        )
+    })();
+    match stored {
+        Ok(crate::media::avatar_files::StoredAvatar::Stored)
+        | Ok(crate::media::avatar_files::StoredAvatar::Superseded) => {}
+        Ok(crate::media::avatar_files::StoredAvatar::NoRoom) => {
+            let _ = storage.fail_avatar_acquisition(job, now, true);
+        }
+        Err(_) => {
+            // Publication failure leaves the old image untouched. Avoid
+            // stranding a fetching row until process reconstruction.
+            let _ = storage.fail_avatar_acquisition(job, now, true);
+            tracing::warn!(target: "marmot_app::runtime", method = "avatar_acquisition",
+                "avatar completion could not be committed");
+        }
+    }
+}
+
 enum MediaHttpCompletion {
     AttachmentRetained {
         result: Result<(), AppError>,
@@ -3876,6 +3922,8 @@ enum MediaHttpCompletion {
         job: storage_sqlite::AvatarAcquisition,
         result: Result<storage_sqlite::AvatarImage, AppError>,
     },
+    /// A fetched image finished storing on the blocking pool.
+    AvatarStored,
     Upload {
         finish: EncryptedMediaUploadFinish,
         result: Result<
@@ -4148,35 +4196,45 @@ async fn complete_media_http(
             drop(background_permit);
         }
         MediaHttpCompletion::Avatar { job, result } => {
-            if let Ok(storage) = client.app.account_storage(&client.state.label) {
-                let now = crate::unix_now_seconds();
-                let completed = match result {
-                    Ok(image) => {
-                        let refresh = matches!(
-                            job.descriptor,
-                            storage_sqlite::SelectedAvatar::RemoteImage { .. }
-                        )
-                        .then(|| now.saturating_add(24 * 60 * 60));
-                        storage
+            match result {
+                // The image becomes a cache file on the blocking pool (file
+                // I/O, hashing, AEAD); the permit is held until it is stored.
+                Ok(image) => {
+                    let app = client.app.clone();
+                    let label = client.state.label.clone();
+                    let tx = media_http.tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        store_acquired_avatar(&app, &label, &job, &image);
+                        let _ = tx.send(MediaHttpDone {
+                            permit,
+                            completion: MediaHttpCompletion::AvatarStored,
+                            cancellation: None,
+                        });
+                    });
+                    return;
+                }
+                Err(error) => {
+                    if let Ok(storage) = client.app.account_storage(&client.state.label) {
+                        let now = crate::unix_now_seconds();
+                        let retryable = crate::media::avatar::retryable(&error);
+                        if storage
                             .app_storage()
-                            .complete_avatar_acquisition(&job, &image, refresh)
-                            .map(|_| ())
+                            .fail_avatar_acquisition(&job, now, retryable)
+                            .is_err()
+                        {
+                            tracing::warn!(target: "marmot_app::runtime", method = "avatar_acquisition",
+                                "avatar completion could not be committed");
+                        }
                     }
-                    Err(error) => storage
-                        .app_storage()
-                        .fail_avatar_acquisition(&job, now, crate::media::avatar::retryable(&error))
-                        .map(|_| ()),
-                };
-                if completed.is_err() {
-                    // Publication failure leaves the old bytes untouched. Avoid
-                    // stranding a fetching row until process reconstruction.
-                    let _ = storage
-                        .app_storage()
-                        .fail_avatar_acquisition(&job, now, true);
-                    tracing::warn!(target: "marmot_app::runtime", method = "avatar_acquisition",
-                        "avatar completion could not be committed");
                 }
             }
+            let _ = client
+                .app
+                .presentation_signals
+                .avatars
+                .send(client.state.label.clone());
+        }
+        MediaHttpCompletion::AvatarStored => {
             let _ = client
                 .app
                 .presentation_signals

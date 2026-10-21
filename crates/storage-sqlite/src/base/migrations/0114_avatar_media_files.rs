@@ -9,6 +9,13 @@
 //! recreated around the rebuild; the repair trigger now fires when `digest`
 //! clears, which covers both layouts.
 //!
+//! The rebuild copies the images still held in the database while the
+//! account opens, so it keeps at most [`KEPT_AVATAR_BYTES`] of them, smallest
+//! first. Owners beyond that are not copied, as if evicted: their recency,
+//! fetch and identity-demand rows go with them, and a screen that shows one
+//! binds and fetches it again. That bounds the time and extra disk this
+//! migration costs on a full 128 MiB cache.
+//!
 //! `avatar_file_refs` ties an owner row to a ready cache file (category 2).
 //! Identical images share one file. Removing the last reference deletes the
 //! file's row (its key); the store unlinks the file. A new source generation
@@ -17,6 +24,9 @@ use crate::SqliteResultExt;
 use cgka_traits::StorageError;
 use cgka_traits::storage::StorageResult;
 use rusqlite::Transaction;
+
+/// Database-held image bytes the rebuild copies, smallest images first.
+pub(crate) const KEPT_AVATAR_BYTES: i64 = 32 * 1024 * 1024;
 
 /// The registry suspends enforcement for this parent rebuild and checks the
 /// tables that reference it.
@@ -32,6 +42,25 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             "avatar asset rebuild requires migration-runner foreign-key scope".into(),
         ));
     }
+    // Owners kept: every one without an image, then images smallest first
+    // while their running total stays within the cap.
+    tx.execute(
+        "CREATE TEMP TABLE avatar_assets_kept AS SELECT token FROM (
+            SELECT token, sum(coalesce(length(bytes), 0)) OVER (
+                ORDER BY coalesce(length(bytes), 0), token ROWS UNBOUNDED PRECEDING) AS held
+            FROM avatar_assets) WHERE held <= ?1",
+        [KEPT_AVATAR_BYTES],
+    )
+    .storage()?;
+    // The rest are dropped as eviction drops an owner.
+    tx.execute_batch(
+        "DELETE FROM avatar_identity_demand WHERE owner_key IN (SELECT owner_key FROM avatar_assets
+            WHERE token NOT IN (SELECT token FROM temp.avatar_assets_kept));
+        DELETE FROM avatar_access WHERE token NOT IN (SELECT token FROM temp.avatar_assets_kept);
+        DELETE FROM avatar_acquisition
+            WHERE token NOT IN (SELECT token FROM temp.avatar_assets_kept);",
+    )
+    .storage()?;
     tx.execute_batch(
         "DROP TRIGGER avatar_cache_store_reset;
         DROP TRIGGER avatar_chat_deleted;
@@ -65,7 +94,9 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
         INSERT INTO avatar_assets_next(owner_key, source_key, token, content_revision, bytes,
                 digest, media_type, width, height, refresh_at)
             SELECT owner_key, source_key, token, content_revision, bytes, digest, media_type,
-                width, height, refresh_at FROM avatar_assets;
+                width, height, refresh_at FROM avatar_assets
+            WHERE token IN (SELECT token FROM temp.avatar_assets_kept);
+        DROP TABLE temp.avatar_assets_kept;
         DROP TABLE avatar_assets;
         ALTER TABLE avatar_assets_next RENAME TO avatar_assets;
         CREATE TABLE avatar_file_refs (
@@ -216,5 +247,90 @@ mod tests {
         )
         .unwrap();
         assert_eq!(count(&conn, "SELECT count(*) FROM avatar_assets"), 0);
+    }
+
+    /// A database-held cache over the cap keeps its smallest images up to the
+    /// cap; the rest are dropped with their recency, fetch and demand rows,
+    /// and owners without an image are kept.
+    #[test]
+    fn avatar_media_upgrade_caps_what_it_copies() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..113]).unwrap();
+        let ten_mib = 10 * 1024 * 1024;
+        // Tokens in owner order, so equal sizes are kept in that order and
+        // owner-3 is the one past the cap.
+        for (i, size) in [ten_mib, ten_mib, ten_mib, ten_mib, 1_000]
+            .into_iter()
+            .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO avatar_assets(owner_key, source_key, token, bytes, digest,
+                    media_type, width, height)
+                 VALUES(?1, 's', ?3, zeroblob(?2), zeroblob(32), 'image/png', 1, 1)",
+                rusqlite::params![format!("owner-{i}"), size, vec![i as u8 + 1; 16]],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO avatar_assets(owner_key, source_key, token)
+             VALUES('empty', 's', randomblob(16))",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO avatar_access SELECT token, 1 FROM avatar_assets;
+             INSERT INTO avatar_acquisition(token, descriptor, state, due)
+                SELECT token, x'01', 0, NULL FROM avatar_assets;
+             PRAGMA foreign_keys = OFF;
+             INSERT INTO chat_list_rows(group_id_hex, updated_at, archived, self_membership,
+                unread_count, pending_confirmation) VALUES('aa', 0, 0, 0, 0, 0);
+             INSERT INTO avatar_identity_demand
+                SELECT owner, 'aa', 'member', zeroblob(16), 0, 1
+                FROM (SELECT 'owner-0' AS owner UNION ALL SELECT 'owner-3'
+                    UNION ALL SELECT 'placeholder');
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+        run(&mut conn, MIGRATIONS).unwrap();
+        let demand: String = conn
+            .query_row(
+                "SELECT group_concat(owner_key) FROM
+                    (SELECT owner_key FROM avatar_identity_demand ORDER BY owner_key)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            demand, "owner-0,placeholder",
+            "only the dropped owner's (owner-3) demand goes; a kept owner and a placeholder stay"
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM avatar_assets"),
+            5,
+            "the empty owner, the small image and three 10 MiB images within 32 MiB"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM avatar_assets WHERE owner_key = 'empty'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT coalesce(sum(length(bytes)), 0) FROM avatar_assets"
+            ),
+            3 * ten_mib + 1_000
+        );
+        assert_eq!(count(&conn, "SELECT count(*) FROM avatar_access"), 5);
+        assert_eq!(count(&conn, "SELECT count(*) FROM avatar_acquisition"), 5);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM sqlite_temp_master WHERE name = 'avatar_assets_kept'"
+            ),
+            0
+        );
     }
 }

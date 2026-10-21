@@ -30,6 +30,18 @@ You need:
   the same Mac or Linux machine where you will run the connector;
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel.
 
+For Claude Code, paste the copied White Noise installation prompt into
+**Claude Code in a terminal on the computer where the connector will run**.
+The Claude mobile app uses a separate cloud session; installation belongs on
+your Mac or Linux machine. Install and sign in to Claude Code first using its
+[official setup guide](https://code.claude.com/docs/en/setup), then check
+`claude --version` and an ordinary local conversation under the service user.
+
+On your phone, check that White Noise's relay list contains
+`wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat` for the
+default setup. Check the phone settings directly; the connector computer
+cannot confirm them. For a custom set, configure the connector to match it.
+
 Choose the runtime you already use:
 
 | Runtime | Connector style | Best fit |
@@ -53,7 +65,9 @@ verify it, and only then execute the local file:
 Define this helper once, then choose a runtime below. It downloads the installer
 and its sibling checksum, verifies the bytes, and runs only the verified local
 file. The release publisher is the trust anchor; the checksum is not an
-independent endorsement.
+independent endorsement. The helper runs the verified script with `bash`;
+do not double-click the downloaded `.sh` file. For a manual download, verify
+its matching checksum before running `bash install-claude-marmot.sh`.
 
 For the documented release, use the pinned `base_url` below. Its installers and
 companion assets stay in the same cohort. Remove stale `MARMOT_RELEASE_REPO`,
@@ -129,7 +143,8 @@ install_verified "$base_url/install-openclaw-marmot.sh" \
 ### Claude Code
 
 Claude Code 2.1.0 or newer must already be installed, authenticated, and
-runnable as `claude`.
+runnable as `claude` on the connector computer. See the
+[official setup guide](https://code.claude.com/docs/en/setup) if it is not ready.
 
 Run this example in the same shell where `install_verified` above was defined.
 

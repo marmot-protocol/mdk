@@ -78,13 +78,28 @@
 - Migration 0114 advances account storage to schema 114 on first open. Older
   binaries reject the upgraded database; downgrade is unsupported. It rebuilds
   `avatar_assets` so an image can be file-backed (new `byte_len`, `bytes`
-  optional when present) and adds `avatar_file_refs`. Existing images keep
-  their database bytes.
+  optional when present) and adds `avatar_file_refs`. The rebuild copies at
+  most 32 MiB of database-held images, smallest first; owners beyond that are
+  dropped as if evicted (with their recency, fetch and identity-demand rows)
+  and are fetched again when shown. On a full 128 MiB cache this bounds the
+  open-time cost to about 1.1 s and 166 MiB of extra disk on a desktop
+  (debug build), against 1.8 s and 265 MiB for copying everything.
 - `AvatarAssetRead` gains `file` (`AvatarStoredFile`): a file-backed image
   comes back there, with `image` empty, for the caller to read through the
   media store. `AttachmentStorageUsage` gains `cache_bytes`.
 
 ### Added
+
+- Moving avatars onto the media store (mdk#2314 step 9b):
+  `AvatarPublication::for_acquisition` publishes a claimed fetch's image and
+  settles the attempt in the same commit (`settle_avatar_acquisition` settles
+  a refused one), and `AvatarPublication::for_migration` moves a
+  database-held image into a file without changing its content revision or
+  recency. `database_held_avatars` (smallest first), `database_avatar_body`,
+  `drop_corrupt_database_avatar` and `database_avatar_bytes` are the
+  migration's database side, and
+  `ready_media_file` finds the file a publication would reuse, so the move
+  can verify it before giving up the database copy.
 
 - Avatars and group images in the media store's cache category (mdk#2314
   step 9): `AvatarPublication` is the `media_store::PublishTarget` for one

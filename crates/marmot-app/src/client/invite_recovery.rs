@@ -294,6 +294,7 @@ impl AppClient {
                     };
                     match self
                         .app
+                        .directory()
                         .resolve_compatible_member_key_packages(
                             members,
                             &requirements,

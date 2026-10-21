@@ -64,6 +64,19 @@
 
 ### Changed
 
+- Avatars and group images are stored as encrypted media-store cache files
+  (mdk#2314 step 9). A fetched image is published on the blocking pool;
+  identical images share one file, and a disk without room for the file
+  retries the fetch later. Reads take file-backed images from the store; a
+  missing or corrupt file is cleared and fetched again for every chat that
+  shows it. The maintenance tick moves images still held in the account
+  database into files in small batches, smallest first, without changing
+  what viewers see. An identical file already on disk is read back in full
+  and then reused at no space cost. When the disk cannot take a new file, or
+  free space cannot be measured, the move waits for the next tick; like the
+  attachment move it deletes nothing to make room. Compaction's live-size
+  log waits until no avatar image remains in the database.
+
 - Downloaded attachment bodies are retained as encrypted files in the account's
   `media/` directory (the `media-store` crate) instead of SQLCipher rows
   (mdk#2314). Identical content is stored once and attached without downloading

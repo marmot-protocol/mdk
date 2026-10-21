@@ -218,6 +218,7 @@ impl MarmotApp {
         let account = self.account_home().account(label)?;
         let target = parse_account_id_hex(user_account_id_hex)?;
         let current = self
+            .directory()
             .fetch_current_follow_list_event_for_account_id(&account.account_id_hex, source_relays)
             .await?
             .ok_or(AppError::FollowListUnavailable)?;

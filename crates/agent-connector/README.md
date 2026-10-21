@@ -66,6 +66,13 @@ The [recommended chat setup](../../integrations/README.md#recommended-chat-setup
 covers the trusted-agent admin default, task titles, progress reactions,
 missing preference questions and a complete phone acceptance checklist.
 
+For Claude Code, paste the copied installation prompt into Claude Code in a
+terminal on the computer where the harness will run. The Claude phone app
+uses a separate cloud session. Install and authenticate Claude Code first using
+the
+[official setup guide](https://code.claude.com/docs/en/setup); verify it is
+available on the service user's `PATH` or select its executable explicitly.
+
 White Noise's copied installation prompt links to this README. Installation
 also requires the selected runtime's guide: the
 [quickstart](../../integrations/README.md#get-started-white-noise--agents) links
@@ -108,7 +115,10 @@ not the agent's identity and never a secret key to import.
 4. **Verify the local wiring before the phone test.** The daemon, adapter and
    bootstrap must agree on home, socket and selected agent account. Use public
    relays shared with the phone; relay WebSocket URLs and Blossom HTTP upload
-   URLs are different settings. Verify both the invite allowlist and the host
+   URLs are different settings. Have the phone owner check that White Noise's
+   relay list contains `wss://relay.eu.whitenoise.chat` and
+   `wss://relay.us.whitenoise.chat` for the default setup. This check requires
+   access to the phone's settings. Verify both the invite allowlist and the host
    runtime's allowed-message-sender list. An accepted invite does not grant
    permission to invoke the model. Restart only the intended gateway after
    plugin/configuration changes, using the deployment's supported procedure.
