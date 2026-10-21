@@ -1,13 +1,13 @@
 //! Nostr account ids and profile references: one parser, one `nprofile` rule.
 
-use crate::directory::error::DirectoryError;
+use crate::error::DirectoryError;
 use nostr::nips::nip19::FromBech32;
 use nostr::nips::nip19::Nip19Profile;
 use nostr::nips::nip19::ToBech32;
 use nostr::prelude::RelayUrl;
 use nostr_sdk::prelude::PublicKey;
 
-pub(crate) fn parse_account_id_hex(value: &str) -> Result<String, DirectoryError> {
+pub fn parse_account_id_hex(value: &str) -> Result<String, DirectoryError> {
     parse_account_key(value)
         .map(|pubkey| pubkey.to_hex())
         .map_err(|_| DirectoryError::InvalidPublicKey)
@@ -22,7 +22,7 @@ pub(crate) fn parse_account_key(value: &str) -> Result<PublicKey, DirectoryError
     PublicKey::parse(value).map_err(|_| DirectoryError::InvalidPublicKey)
 }
 
-pub(crate) fn normalize_account_ids(values: Vec<String>) -> Result<Vec<String>, DirectoryError> {
+pub fn normalize_account_ids(values: Vec<String>) -> Result<Vec<String>, DirectoryError> {
     let mut values = values
         .into_iter()
         .map(|value| parse_account_id_hex(&value))
@@ -101,7 +101,7 @@ pub(crate) fn nprofile_fallback_token(reference: &str) -> Result<&str, Directory
     Ok(profile_ref)
 }
 
-pub(crate) fn npub_for_account_id_lossy(account_id_hex: &str) -> String {
+pub fn npub_for_account_id_lossy(account_id_hex: &str) -> String {
     npub_for_account_id(account_id_hex).unwrap_or_else(|_| account_id_hex.to_owned())
 }
 
@@ -111,11 +111,11 @@ mod tests {
         MAX_NPROFILE_REFERENCE_BYTES, account_id_hex_from_ref, nprofile_fallback_token,
         nprofile_for_account_id, npub_for_account_id, parse_account_id_hex,
     };
-    use crate::directory::error::DirectoryError;
+    use crate::error::DirectoryError;
 
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/identity_reference_vectors.rs"
+        "/../marmot-app/tests/support/identity_reference_vectors.rs"
     ));
 
     #[test]

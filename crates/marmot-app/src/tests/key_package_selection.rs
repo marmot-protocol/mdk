@@ -336,7 +336,7 @@ async fn failed_preference_refetch_preserves_only_usable_current_batch_packages(
             .resolve_compatible_member_key_packages(
                 refs.iter().map(|member| (*member).to_owned()).collect(),
                 &requirements,
-                crate::directory::MemberResolutionPurpose::Commit,
+                nostr_directory::MemberResolutionPurpose::Commit,
             )
             .await;
         assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -491,7 +491,7 @@ async fn client_preference_skips_incompatible_whitenoise_for_create_and_invite()
         .resolve_compatible_member_key_packages(
             vec![bob.account_id_hex.clone()],
             &requirements,
-            crate::directory::MemberResolutionPurpose::CommitFresh,
+            nostr_directory::MemberResolutionPurpose::CommitFresh,
         )
         .await
         .unwrap();

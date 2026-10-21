@@ -1,4 +1,4 @@
-use crate::directory::error::{DirectoryError, blocking_directory_task};
+use crate::error::{DirectoryError, blocking_directory_task};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -48,7 +48,7 @@ pub(crate) const DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS: &[u64] = &[
 ];
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DirectorySyncRunSummary {
+pub struct DirectorySyncRunSummary {
     pub(crate) watched_user_count: usize,
     pub(crate) active_subscriptions: usize,
     pub(crate) subscriptions_created: usize,
@@ -56,13 +56,13 @@ pub(crate) struct DirectorySyncRunSummary {
 }
 
 #[derive(Clone)]
-pub(crate) struct DirectorySyncHandle {
+pub struct DirectorySyncHandle {
     commands: mpsc::Sender<DirectorySyncCommand>,
     abort: AbortHandle,
     rebuild_queued: Arc<AtomicBool>,
 }
 
-pub(crate) enum DirectorySyncCommand {
+pub enum DirectorySyncCommand {
     Rebuild {
         respond: Option<oneshot::Sender<Result<DirectorySyncRunSummary, String>>>,
     },
@@ -142,7 +142,7 @@ impl DirectoryRecoveryRebuildQueue {
 /// accounts); the non-local subset syncs only [`DIRECTORY_SYNC_KINDS`],
 /// which omits contact lists so transitively discovered users cannot feed
 /// new kind-3 subscriptions back into the plan (mdk#687).
-pub(crate) fn plan_directory_sync(
+pub fn plan_directory_sync(
     endpoints: Vec<TransportEndpoint>,
     local_account_ids: Vec<String>,
     known_user_ids: Vec<String>,
@@ -226,7 +226,7 @@ fn extend_directory_sync_batches(
 }
 
 impl DirectorySyncHandle {
-    pub(crate) fn spawn<R: DirectoryResources + DirectoryObserver + BlockListSink>(
+    pub fn spawn<R: DirectoryResources + DirectoryObserver + BlockListSink>(
         directory: Directory<R>,
         relay_plane: MarmotRelayPlane,
     ) -> Self {
@@ -248,7 +248,7 @@ impl DirectorySyncHandle {
         }
     }
 
-    pub(crate) fn request_rebuild(&self) {
+    pub fn request_rebuild(&self) {
         if self.rebuild_queued.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -263,7 +263,7 @@ impl DirectorySyncHandle {
         }
     }
 
-    pub(crate) async fn request_rebuild_and_wait(
+    pub async fn request_rebuild_and_wait(
         &self,
     ) -> Result<DirectorySyncRunSummary, DirectoryError> {
         let (respond, response) = oneshot::channel();
@@ -279,19 +279,19 @@ impl DirectorySyncHandle {
             .map_err(DirectoryError::RelayDirectory)
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub async fn shutdown(&self) {
         let _ = self.commands.send(DirectorySyncCommand::Shutdown).await;
         self.abort.abort();
     }
 
     /// Whether a background rebuild is queued and not yet taken by the worker.
-    #[cfg(test)]
-    pub(crate) fn rebuild_queued(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rebuild_queued(&self) -> bool {
         self.rebuild_queued.load(Ordering::SeqCst)
     }
 }
 
-pub(crate) async fn run_directory_sync_worker<
+pub async fn run_directory_sync_worker<
     R: DirectoryResources + DirectoryObserver + BlockListSink,
 >(
     directory: Directory<R>,
@@ -448,7 +448,7 @@ fn directory_subscription_id(group: &str, index: usize, authors: &[String]) -> S
 /// write asks the same slot's worker to rebuild.
 impl<R: DirectoryResources + DirectoryObserver + BlockListSink> Directory<R> {
     /// The running sync worker, spawned on first use.
-    pub(crate) fn sync_worker(&self) -> DirectorySyncHandle {
+    pub fn sync_worker(&self) -> DirectorySyncHandle {
         let mut slot = self
             .state
             .sync_handle
@@ -466,7 +466,7 @@ impl<R: DirectoryResources + DirectoryObserver + BlockListSink> Directory<R> {
 impl<R> Directory<R> {
     /// Take the running sync worker so the caller can shut it down. Later
     /// store writes find no worker to poke.
-    pub(crate) fn take_sync_worker(&self) -> Option<DirectorySyncHandle> {
+    pub fn take_sync_worker(&self) -> Option<DirectorySyncHandle> {
         self.state
             .sync_handle
             .write()

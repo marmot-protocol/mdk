@@ -1,6 +1,6 @@
 //! Bounded discovery recovery; a relay copy is not proof of private-key possession.
 
-use crate::directory::error::DirectoryError;
+use crate::error::DirectoryError;
 use std::collections::BTreeSet;
 
 use cgka_engine::key_package::KeyPackageRequirements;
@@ -11,7 +11,7 @@ use transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE;
 use super::Directory;
 use super::resources::DirectoryResources;
 use crate::DirectoryFreshness;
-use crate::directory::published_records::{
+use crate::published_records::{
     KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, preferred_fresh_key_package_from_records,
     without_revoked_slot_winners,
 };

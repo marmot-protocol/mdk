@@ -3,7 +3,7 @@
 //! publish-endpoint selection. They hold no `MarmotApp` state.
 //!
 //! Parsing, validation and selection of other accounts' relay lists and
-//! KeyPackages live in [`crate::directory::published_records`]; they are
+//! KeyPackages live in [`nostr_directory::published_records`]; they are
 //! re-exported below so callers keep their paths.
 
 use cgka_traits::TransportEndpoint;
@@ -17,16 +17,19 @@ use crate::{
 };
 
 // Names the test module below reaches through `super::*`; the code they test
-// moved to `crate::directory::published_records`.
+// moved to `nostr_directory::published_records`.
 #[cfg(test)]
 #[allow(unused_imports)]
 use crate::error::MissingKeyPackageReason;
 #[cfg(test)]
 #[allow(unused_imports)]
-use crate::{AccountRelayListStatus, DirectoryFreshness, DirectoryKeyPackage, UserDirectoryRecord};
+use crate::{AccountRelayListStatus, DirectoryKeyPackage, UserDirectoryRecord};
 #[cfg(test)]
 #[allow(unused_imports)]
 use cgka_traits::engine::KeyPackage;
+#[cfg(test)]
+#[allow(unused_imports)]
+use nostr_directory::DirectoryFreshness;
 #[cfg(test)]
 #[allow(unused_imports)]
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
@@ -44,9 +47,9 @@ use transport_nostr_peeler::NostrTransportEvent;
 // keep their paths.
 #[cfg(test)]
 #[allow(unused_imports)]
-pub(crate) use crate::directory::published_records::validated_cached_key_package;
+pub(crate) use nostr_directory::published_records::validated_cached_key_package;
 #[allow(unused_imports)]
-pub(crate) use crate::directory::published_records::{
+pub(crate) use nostr_directory::published_records::{
     KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, KeyPackageSelection, PreferredKeyPackage,
     cached_key_package_from_entry, fresh_or_cached_key_package,
     fresh_relay_list_status_from_records, is_legacy_key_package_record,

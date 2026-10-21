@@ -1,11 +1,11 @@
 mod migrations;
 
 use super::unix_now_seconds;
-use crate::directory::error::DirectoryError;
+use crate::error::DirectoryError;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
@@ -27,7 +27,7 @@ use crate::{AccountRelayListStatus, UserDirectoryRecord, UserProfileMetadata};
 /// caching that ambiguity would make someone unfindable for a day after a
 /// transient outage. The price is re-querying accounts that genuinely have no
 /// profile; the alternative risks hiding accounts that do.
-pub(crate) const SEARCH_GRAPH_PROFILE_TTL_SECONDS: i64 = 24 * 60 * 60;
+pub const SEARCH_GRAPH_PROFILE_TTL_SECONDS: i64 = 24 * 60 * 60;
 
 /// Message carried by every storage error this cache raises after a close.
 const CLOSED_DETAIL: &str = "directory cache is closed";
@@ -42,14 +42,14 @@ thread_local! {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DirectoryCache {
+pub struct DirectoryCache {
     conn: Arc<CloseableConnection>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     put_count: Arc<AtomicUsize>,
 }
 
 impl DirectoryCache {
-    pub(crate) fn open(path: PathBuf, key: &SqlCipherKey) -> Result<Self, DirectoryError> {
+    pub fn open(path: PathBuf, key: &SqlCipherKey) -> Result<Self, DirectoryError> {
         record_directory_cache_open();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -66,7 +66,7 @@ impl DirectoryCache {
         Self::from_connection(conn)
     }
 
-    pub(crate) fn open_legacy_plaintext(path: PathBuf) -> Result<Option<Self>, DirectoryError> {
+    pub fn open_legacy_plaintext(path: PathBuf) -> Result<Option<Self>, DirectoryError> {
         if !path.exists() {
             return Ok(None);
         }
@@ -83,19 +83,19 @@ impl DirectoryCache {
         migrations::run_all(&mut conn)?;
         let cache = Self {
             conn: Arc::new(CloseableConnection::new(conn, CLOSED_DETAIL)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             put_count: Arc::new(AtomicUsize::new(0)),
         };
         Ok(cache)
     }
 
-    #[cfg(test)]
-    pub(crate) fn put_count_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn put_count_for_test(&self) -> usize {
         self.put_count.load(Ordering::SeqCst)
     }
 
-    #[cfg(test)]
-    pub(crate) fn reset_put_count_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reset_put_count_for_test(&self) {
         self.put_count.store(0, Ordering::SeqCst);
     }
 
@@ -109,7 +109,7 @@ impl DirectoryCache {
     }
 
     /// A closer for this cache's database that does not keep it open.
-    pub(crate) fn closer(&self) -> storage_sqlite::DatabaseCloser {
+    pub fn closer(&self) -> storage_sqlite::DatabaseCloser {
         self.conn.closer()
     }
 
@@ -117,7 +117,7 @@ impl DirectoryCache {
         Ok(self.conn.lock()?)
     }
 
-    pub(crate) fn entry(
+    pub fn entry(
         &self,
         account_id_hex: &str,
     ) -> Result<Option<UserDirectoryRecord>, DirectoryError> {
@@ -128,7 +128,7 @@ impl DirectoryCache {
         Self::record_from_directory_user_row(&conn, row).map(Some)
     }
 
-    pub(crate) fn entries(&self) -> Result<Vec<UserDirectoryRecord>, DirectoryError> {
+    pub fn entries(&self) -> Result<Vec<UserDirectoryRecord>, DirectoryError> {
         let conn = self.lock()?;
         let mut statement = conn.prepare(
             "SELECT account_id_hex, npub, local_account_json, profile_json,
@@ -235,7 +235,7 @@ impl DirectoryCache {
     /// has expired. It is a parameter rather than read from the clock here so
     /// one traversal resolves a whole layer against a single instant, and so
     /// expiry is directly testable.
-    pub(crate) fn search_record(
+    pub fn search_record(
         &self,
         account_id_hex: &str,
         now: i64,
@@ -246,7 +246,7 @@ impl DirectoryCache {
         self.search_graph_record(account_id_hex, now)
     }
 
-    pub(crate) fn put(&self, entry: &UserDirectoryRecord) -> Result<(), DirectoryError> {
+    pub fn put(&self, entry: &UserDirectoryRecord) -> Result<(), DirectoryError> {
         self.put_with_reason(entry, "directory")
     }
 
@@ -255,7 +255,7 @@ impl DirectoryCache {
         entry: &UserDirectoryRecord,
         reason: &str,
     ) -> Result<(), DirectoryError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.put_count.fetch_add(1, Ordering::SeqCst);
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
@@ -437,7 +437,7 @@ impl DirectoryCache {
     /// different from `Some(vec![])` -- an observed list that follows nobody.
     /// Traversal needs the distinction: the first is a candidate to fetch, the
     /// second is a settled dead end.
-    pub(crate) fn search_graph_follows(
+    pub fn search_graph_follows(
         &self,
         account_id_hex: &str,
     ) -> Result<Option<Vec<String>>, DirectoryError> {
@@ -462,7 +462,7 @@ impl DirectoryCache {
     /// metadata: it never touches `directory_users`, so an account cached here
     /// stays invisible to `directory_sync_plan` and can never become a live
     /// per-author subscription (mdk#687).
-    pub(crate) fn put_search_graph_record(
+    pub fn put_search_graph_record(
         &self,
         record: &DirectorySearchGraphRecord,
         now: i64,
@@ -481,7 +481,7 @@ impl DirectoryCache {
     /// promoting every follow would trigger (mdk#687). The author's
     /// cached profile metadata in the search graph is preserved; only the
     /// follow edges are replaced.
-    pub(crate) fn remember_search_graph_follows(
+    pub fn remember_search_graph_follows(
         &self,
         account_id_hex: &str,
         npub: &str,
@@ -767,13 +767,13 @@ struct SearchGraphUserRow {
     metadata_expires_at: Option<i64>,
 }
 
-pub(crate) struct DirectorySearchGraphRecord {
-    pub(crate) account_id_hex: String,
-    pub(crate) npub: String,
-    pub(crate) profile: Option<UserProfileMetadata>,
-    pub(crate) follows: Option<Vec<String>>,
-    pub(crate) metadata_updated_at: Option<u64>,
-    pub(crate) metadata_expires_at: Option<u64>,
+pub struct DirectorySearchGraphRecord {
+    pub account_id_hex: String,
+    pub npub: String,
+    pub profile: Option<UserProfileMetadata>,
+    pub follows: Option<Vec<String>>,
+    pub metadata_updated_at: Option<u64>,
+    pub metadata_expires_at: Option<u64>,
 }
 
 fn directory_user_row_from_row(
@@ -812,7 +812,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::directory::ids::npub_for_account_id_lossy;
+    use crate::ids::npub_for_account_id_lossy;
     use crate::{AccountRelayListStatus, UserProfileMetadata};
 
     #[test]

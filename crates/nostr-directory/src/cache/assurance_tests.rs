@@ -236,7 +236,7 @@ fn interrupted_encrypted_legacy_upgrade_recovers_without_losing_records() {
 
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact",
-                "directory::cache::migrations::assurance_tests::interrupted_encrypted_legacy_upgrade_recovers_without_losing_records",
+                "cache::migrations::assurance_tests::interrupted_encrypted_legacy_upgrade_recovers_without_losing_records",
                 "--nocapture"])
             .env(CHILD_PATH, &path)
             .status().unwrap();

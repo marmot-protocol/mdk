@@ -1,6 +1,6 @@
 //! Network-free public-profile search across every connected account's caches.
 
-use crate::directory::error::DirectoryError;
+use crate::error::DirectoryError;
 use std::collections::{BTreeMap, HashSet, btree_map::Entry};
 
 use super::Directory;
@@ -60,7 +60,7 @@ impl<R: DirectoryResources> Directory<R> {
                 }
             }
         };
-        let now = crate::directory::unix_now_seconds() as i64;
+        let now = crate::unix_now_seconds() as i64;
         for cache in self.resources.current_caches()? {
             for record in cache.public_search_records(now)? {
                 insert(record);

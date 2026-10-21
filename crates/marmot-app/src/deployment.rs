@@ -5,7 +5,7 @@
 //! behaviour exactly. [`MarmotDeployment::neutral`] configures none of them.
 //! See `docs/marmot-architecture/review/brief-host-configuration.md`.
 
-pub use crate::directory::config::{KeyPackageClientPreference, OpenRankingProvider};
+pub use nostr_directory::config::{KeyPackageClientPreference, OpenRankingProvider};
 
 /// The services and identifiers one deployment's users rely on.
 #[derive(Clone, Debug, PartialEq, Eq)]

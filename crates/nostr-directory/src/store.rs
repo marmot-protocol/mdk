@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use storage_sqlite::PublicDirectoryUserRecord;
 use storage_sqlite::SqliteSharedStorage;
 use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
@@ -31,7 +31,7 @@ use super::resources::DirectoryResources;
 use super::{Directory, DirectoryCache};
 
 impl<R: DirectoryResources> Directory<R> {
-    pub(crate) fn local_accounts_by_id(
+    pub fn local_accounts_by_id(
         &self,
     ) -> Result<HashMap<String, LocalAccountNames>, DirectoryError> {
         let mut local = HashMap::new();
@@ -51,7 +51,7 @@ impl<R: DirectoryResources> Directory<R> {
         Ok(local)
     }
 
-    pub(crate) fn directory_entry(
+    pub fn directory_entry(
         &self,
         account_id_hex: &str,
     ) -> Result<Option<UserDirectoryRecord>, DirectoryError> {
@@ -77,8 +77,7 @@ impl<R: DirectoryResources> Directory<R> {
             .unwrap_or_else(AccountRelayListStatus::empty))
     }
 
-    pub(crate) fn directory_freshness(&self) -> DirectoryFreshness {
-        #[cfg(test)]
+    pub fn directory_freshness(&self) -> DirectoryFreshness {
         if let Some(clock) = &self.config.test_clock {
             return DirectoryFreshness {
                 max_created_at: clock
@@ -89,7 +88,7 @@ impl<R: DirectoryResources> Directory<R> {
         DirectoryFreshness::from_now(self.config.max_future_skew)
     }
 
-    pub(crate) fn directory_entry_for_account_id_with_handles(
+    pub fn directory_entry_for_account_id_with_handles(
         &self,
         account_id_hex: &str,
         caches: &[DirectoryCache],
@@ -108,7 +107,7 @@ impl<R: DirectoryResources> Directory<R> {
         Ok(select_newer_directory_entry(cached_entry, shared_entry))
     }
 
-    pub(crate) fn remember_directory_relay_lists(
+    pub fn remember_directory_relay_lists(
         &self,
         account_id_hex: &str,
         relay_lists: &AccountRelayListStatus,
@@ -121,7 +120,7 @@ impl<R: DirectoryResources> Directory<R> {
         self.save_directory_entry(&entry)
     }
 
-    pub(crate) fn remember_directory_key_package(
+    pub fn remember_directory_key_package(
         &self,
         fetched: &FetchedKeyPackage,
     ) -> Result<(), DirectoryError> {
@@ -148,7 +147,7 @@ impl<R: DirectoryResources> Directory<R> {
         self.remember_directory_user_with_reason(account_id_hex, "directory")
     }
 
-    pub(crate) fn remember_directory_user_with_reason(
+    pub fn remember_directory_user_with_reason(
         &self,
         account_id_hex: &str,
         reason: &str,
@@ -160,14 +159,14 @@ impl<R: DirectoryResources> Directory<R> {
         self.save_directory_entry_with_reason(&entry, reason)
     }
 
-    pub(crate) fn remember_directory_message_sender(
+    pub fn remember_directory_message_sender(
         &self,
         sender_account_id_hex: &str,
     ) -> Result<(), DirectoryError> {
         self.remember_directory_user_with_reason(sender_account_id_hex, "message")
     }
 
-    pub(crate) fn remember_directory_follow_list(
+    pub fn remember_directory_follow_list(
         &self,
         account_id_hex: &str,
         follow_list: &FetchedFollowList,
@@ -200,7 +199,7 @@ impl<R: DirectoryResources> Directory<R> {
     /// known directory entry (e.g. a local account whose contact list we sync),
     /// its own cached follow edges are refreshed too, but its follows are still
     /// not promoted.
-    pub(crate) fn remember_directory_follow_edges_for_search(
+    pub fn remember_directory_follow_edges_for_search(
         &self,
         account_id_hex: &str,
         follow_list: &FetchedFollowList,
@@ -217,7 +216,7 @@ impl<R: DirectoryResources> Directory<R> {
         Ok(())
     }
 
-    pub(crate) fn remember_directory_profile(
+    pub fn remember_directory_profile(
         &self,
         account_id_hex: &str,
         profile: &UserProfileMetadata,
@@ -229,7 +228,7 @@ impl<R: DirectoryResources> Directory<R> {
         self.save_directory_entry(&entry)
     }
 
-    pub(crate) fn remember_directory_profile_if_newer(
+    pub fn remember_directory_profile_if_newer(
         &self,
         account_id_hex: &str,
         profile: &UserProfileMetadata,
@@ -293,7 +292,7 @@ impl<R: DirectoryResources> Directory<R> {
         self.save_directory_entry(&entry)
     }
 
-    pub(crate) fn ingest_directory_relay_event(
+    pub fn ingest_directory_relay_event(
         &self,
         record: RelayEventRecord,
     ) -> Result<(), DirectoryError> {
@@ -326,14 +325,11 @@ impl<R: DirectoryResources> Directory<R> {
         Ok(())
     }
 
-    pub(crate) fn save_directory_entry(
-        &self,
-        entry: &UserDirectoryRecord,
-    ) -> Result<(), DirectoryError> {
+    pub fn save_directory_entry(&self, entry: &UserDirectoryRecord) -> Result<(), DirectoryError> {
         self.save_directory_entry_with_reason(entry, "directory")
     }
 
-    pub(crate) fn save_directory_entry_with_reason(
+    pub fn save_directory_entry_with_reason(
         &self,
         entry: &UserDirectoryRecord,
         reason: &str,
@@ -398,7 +394,7 @@ impl<R: DirectoryResources> Directory<R> {
         }
     }
 
-    pub(crate) fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
+    pub fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
         UserDirectoryRecord {
             account_id_hex: account_id_hex.to_owned(),
             npub: npub_for_account_id_lossy(account_id_hex),
@@ -411,8 +407,8 @@ impl<R: DirectoryResources> Directory<R> {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn hydrate_public_directory_record(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hydrate_public_directory_record(
         &self,
         record: PublicDirectoryUserRecord,
     ) -> Result<UserDirectoryRecord, DirectoryError> {
@@ -422,10 +418,7 @@ impl<R: DirectoryResources> Directory<R> {
         )
     }
 
-    pub(crate) fn local_account_for_id(
-        &self,
-        account_id_hex: &str,
-    ) -> Option<UserDirectoryLocalAccount> {
+    pub fn local_account_for_id(&self, account_id_hex: &str) -> Option<UserDirectoryLocalAccount> {
         self.resources
             .local_accounts()
             .ok()?
@@ -450,7 +443,7 @@ fn directory_entry_from_caches(
     Ok(None)
 }
 
-pub(crate) fn hydrate_directory_record(
+pub fn hydrate_directory_record(
     mut entry: UserDirectoryRecord,
     local_accounts: &HashMap<String, LocalAccountNames>,
 ) -> Result<UserDirectoryRecord, DirectoryError> {

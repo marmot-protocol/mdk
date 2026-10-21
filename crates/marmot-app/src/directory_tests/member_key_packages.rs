@@ -3,8 +3,8 @@
 
 use std::time::{Duration, Instant};
 
-use crate::directory::MemberResolutionPurpose;
-use crate::directory::member_key_packages::MEMBER_PREWARM_CACHE_TTL;
+use nostr_directory::MemberResolutionPurpose;
+use nostr_directory::member_key_packages::MEMBER_PREWARM_CACHE_TTL;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_recovery_refreshes_routes_for_fresh_commit_resolution() {

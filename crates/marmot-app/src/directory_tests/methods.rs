@@ -1,7 +1,7 @@
 //! Directory record hydration over a real `MarmotApp`'s account home.
 
 use crate::MarmotApp;
-use crate::directory::hydrate_directory_record;
+use nostr_directory::hydrate_directory_record;
 
 #[test]
 fn hydration_uses_one_catalog() {

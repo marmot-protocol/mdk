@@ -9,8 +9,8 @@ use tokio::sync::{mpsc, oneshot};
 use transport_nostr::MarmotRelayPlane;
 
 use crate::MarmotApp;
-use crate::directory::DirectorySyncHandle;
-use crate::directory::sync::{DirectorySyncCommand, run_directory_sync_worker};
+use nostr_directory::DirectorySyncHandle;
+use nostr_directory::sync::{DirectorySyncCommand, run_directory_sync_worker};
 
 async fn wait_for_background_rebuild_flag_to_clear(handle: &DirectorySyncHandle) {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {

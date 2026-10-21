@@ -33,7 +33,6 @@ use crate::app_telemetry::{
     AppPerformanceOperation, AppPerformanceTelemetry, SyncErrorClass, SyncFailureClassification,
     SyncFailureStage, bounded_advisory_step,
 };
-use crate::directory::DirectorySyncHandle;
 use crate::directory_resources::directory_account;
 use crate::ids::{account_id_hex_from_ref, normalize_group_id_hex_app};
 use crate::messages::AppMessageIntent;
@@ -62,6 +61,7 @@ use crate::{
     TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
     unix_now_seconds,
 };
+use nostr_directory::DirectorySyncHandle;
 
 const MEDIA_COMMAND_QUEUE_LIMIT: usize = 8;
 
@@ -2150,7 +2150,7 @@ impl MarmotAppRuntime {
                     runtime
                         .group_co_members(&searcher)
                         .await
-                        .map_err(crate::directory::error::DirectoryError::from)
+                        .map_err(nostr_directory::error::DirectoryError::from)
                 } else {
                     Ok(Vec::new())
                 }

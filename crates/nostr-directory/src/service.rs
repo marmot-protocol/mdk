@@ -40,7 +40,7 @@ pub struct DirectoryState {
     pub(super) sync_handle: Arc<RwLock<Option<DirectorySyncHandle>>>,
     /// Bounded, process-local composition prewarm. Entries are never durable
     /// directory admission and never reserve or consume a KeyPackage.
-    pub(crate) member_key_package_prewarm_cache: Arc<Mutex<MemberKeyPackagePrewarmCache>>,
+    pub member_key_package_prewarm_cache: Arc<Mutex<MemberKeyPackagePrewarmCache>>,
 }
 
 impl<R: DirectoryResources> Directory<R> {
@@ -89,7 +89,7 @@ impl<R: DirectoryResources> Directory<R> {
 
     /// `source_relays` when given, else the configured directory relays, else
     /// the app's default relays.
-    pub(crate) fn directory_source_relays(
+    pub fn directory_source_relays(
         &self,
         source_relays: &[TransportEndpoint],
     ) -> Vec<TransportEndpoint> {

@@ -40,6 +40,7 @@ jsonschema.workspace = true
 marmot-account.workspace = true
 marmot-forensics.workspace = true
 marmot-markdown.workspace = true
+nostr-directory.workspace = true
 nostr = { workspace = true, features = ["nip04"] }
 nostr-sdk.workspace = true
 openssl.workspace = true
@@ -73,6 +74,7 @@ zeroize.workspace = true
 transport-nostr = { workspace = true, features = ["test-support"] }
 criterion.workspace = true
 media-store = { workspace = true, features = ["catalog-conformance", "test-support"] }
+nostr-directory = { workspace = true, features = ["test-support"] }
 storage-sqlite = { workspace = true, features = ["test-support"] }
 tokio-tungstenite.workspace = true
 keyring-core.workspace = true
@@ -82,9 +84,6 @@ openmls.workspace = true
 openmls_basic_credential.workspace = true
 openmls_rust_crypto.workspace = true
 parking_lot = "0.12"
-proc-macro2.workspace = true
-quote.workspace = true
-syn = { workspace = true, features = ["visit"] }
 tls_codec.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

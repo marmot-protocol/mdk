@@ -2804,7 +2804,7 @@ fn relay_repair_event(
             .and_then(|e| serde_json::from_str::<serde_json::Value>(&e.content).ok())
             .and_then(|v| v.as_object().cloned())
             .unwrap_or_default();
-        if let Some(patch) = crate::directory::records::profile_content_json(profile).as_object() {
+        if let Some(patch) = nostr_directory::records::profile_content_json(profile).as_object() {
             content.extend(patch.clone());
         }
         // None means preserve; an explicitly supplied empty string clears a

@@ -1,9 +1,7 @@
 //! The directory's settings. The host chooses them through its deployment and
 //! app configuration.
 
-#[cfg(test)]
 use std::sync::Arc;
-#[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
@@ -32,8 +30,8 @@ pub struct DirectoryConfig {
     pub fallback_seeds: Vec<String>,
     /// How Open Ranking builds its HTTP client.
     pub http_builder: HttpClientBuilder,
-    /// Replaces the wall clock for freshness checks in tests.
-    #[cfg(test)]
+    /// Replaces the wall clock for freshness checks. Tests set it; the app
+    /// passes `None`.
     pub test_clock: Option<Arc<AtomicU64>>,
 }
 
@@ -60,7 +58,7 @@ pub struct KeyPackageClientPreference {
 impl KeyPackageClientPreference {
     /// 2 for a preferred client, 0 for one ranked last, 1 for any other or no
     /// tag.
-    pub(crate) fn rank(&self, client: Option<&str>) -> u8 {
+    pub fn rank(&self, client: Option<&str>) -> u8 {
         let Some(client) = client.map(str::trim) else {
             return 1;
         };

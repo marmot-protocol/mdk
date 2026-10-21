@@ -197,52 +197,21 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   migration marker or a missing verdict always re-runs the recovery probe, so the mdk#568 crash windows keep their
   self-heal. Key presentation and the passphrase KDF work factor follow the decision record in
   `docs/marmot-architecture/storage-format-v2.md`.
-- Keep the user-directory domain in the `src/directory/` module instead of regrowing `src/lib.rs`. It splits along these
-  seams: `records.rs` (the public `UserDirectory*`/`UserProfileMetadata`/`DirectoryKeyPackage` DTOs surfaced to
-  `marmot-uniffi`/`cli`, plus the stateless record helpers — cached <-> shared record conversion, recency selection,
-  Nostr profile/follow-list parsing, search-match ranking, and `profile_content_json` — which hold no `MarmotApp`
-  state), `methods.rs` (relay-list/profile/key-package/follow-list fetches and the `directory_*`/`*_user_directory`
-  API on `Directory`; `MarmotApp`'s public versions are delegates in `src/directory_delegates.rs`), `store.rs` (the directory store on `Directory`: entry reads, the
-  `remember_*`/`save_directory_entry*` writes across the caches and the shared tier, relay-event ingest, the
-  freshness bound and record hydration),
-  `cache.rs` (the per-account SQLCipher directory cache, with its independent numbered migration runner in
-  `cache/migrations.rs`, frozen initial schema in `cache/v1.sql`, the public event preview table in `cache/v2.sql`, and populated/interrupted-upgrade
-  tests in `cache/assurance_tests.rs` using the historical `cache/fixtures/pre_ledger.sql` fixture), and `sync.rs` (the directory-subscription sync worker and
-  plan). `mod.rs` re-exports the DTOs so the `marmot_app::...` paths stay stable; private items referenced across these
-  files (and from `tests.rs`/sibling test modules) are widened to `pub(crate)`, never narrowed.
-- The directory is moving into the `nostr-directory` crate (`docs/marmot-architecture/review/brief-directory.md`).
-  What stays in this crate lives outside `src/directory/`: the per-account cache lifecycle and label-based account
-  resolution in `src/directory_resources.rs`, and publishing the account's own profile and follow list in
-  `src/profile_publication.rs`. `src/directory_crossings_tests.rs` checks every name `src/directory/` resolves in the
-  rest of the crate against `src/directory/crossings.txt`. That list is now empty, which the crate move needs: code under
-  `src/directory/` reaches the app only through the traits in `src/directory/resources.rs` and
-  `src/directory/observer.rs`, and any new crossing fails the check. Directory tests that need a real `MarmotApp` or
-  runtime live in `src/directory_tests/`, one module per directory file; tests that need only the directory stay beside
-  its code and must not name `MarmotApp`, because they move with it.
-- Directory code returns `DirectoryError` (`src/directory/error.rs`). Public `MarmotApp` methods are the boundary: they
-  keep returning `AppError`, and `From<DirectoryError> for AppError` restores the variant, message and
-  `privacy_safe_kind` the directory reported before it had its own type. An app failure that reaches directory code
-  (through `?` on an `AppError`) rides in `DirectoryError::Resource` and comes back unchanged. Every method on
-  `Directory` returns `DirectoryError`; only the delegates in `src/directory_delegates.rs` return `AppError`, so
-  directory code never sees its own failures wrapped. A new variant needs a row in `error::directory_error_tests`.
-- Directory code is `impl<R> Directory<R>` (`src/directory/service.rs`), and reaches the app only through the
-  `DirectoryResources` and `BlockListSink` traits in `src/directory/resources.rs` and `DirectoryObserver` in
-  `src/directory/observer.rs`. Ask the resources for a cache when the cache is about to be used, never before a network
-  step. `BlockListSink` returns its work as futures: the sync worker spawns adoptions into its bounded set and
-  reconciles into one abort-on-drop task, never inline in its event loop. `MarmotApp` implements the traits and builds
-  the service with `directory()` in `src/directory_resources.rs` (the sink in `src/user_blocks.rs`); its directory
-  methods are one-line delegates in `src/directory_delegates.rs`, which PR 7 removes. `directory()` builds a fresh service on each
-  call, with `DirectoryConfig` read from the app's configuration at that moment. Anything the directory keeps between
-  calls belongs in `DirectoryState`, whose shared fields live on `MarmotApp` as `directory_state`; never create state
-  inside `directory()`, where it would die with the returned value. The sync worker's handle has one owner, the
-  state's slot: `Directory::sync_worker()` gets or spawns it and `take_sync_worker()` hands it to shutdown.
-- Keep stateless relay-list and KeyPackage handling for other accounts (relay-list status, KeyPackage tag/metadata
-  validation, fresh-vs-cached reconciliation, ranking and selection, revocation evidence) and the directory-record
-  selection primitives (`DirectoryFreshness`, `DirectorySelection`, `sort_directory_records`) in
-  `src/directory/published_records.rs`, and the Nostr account-id helpers in `src/directory/ids.rs`. They hold no
-  `MarmotApp` state. The account's own KeyPackage inventory, record merge and publish-endpoint selection stay in
-  `src/key_package_records.rs`, and the group-id helpers in `src/ids.rs`; both re-export the moved items so callers keep
-  their paths.
+- The user directory is the [`nostr-directory`](../nostr-directory/AGENTS.md) crate; `src/lib.rs` re-exports its
+  types at their `marmot_app::...` paths. This crate keeps the resources the directory reaches through traits:
+  `src/directory_resources.rs` implements `DirectoryResources` and `DirectoryObserver` over the per-account cache
+  lifecycle, label-based account resolution and product analytics, and builds the service with `directory()`;
+  `src/user_blocks.rs` implements `BlockListSink`; publishing the account's own profile and follow list is
+  `src/profile_publication.rs`. `directory()` builds a fresh service on each call with `DirectoryConfig` read from the
+  app's configuration; anything the directory keeps between calls lives in `directory_state`, never in `directory()`.
+- `MarmotApp`'s directory methods are one-line delegates in `src/directory_delegates.rs` that return `AppError`
+  (PR 7 of `docs/marmot-architecture/review/brief-directory.md` repoints callers to `app.directory()`).
+  `From<DirectoryError> for AppError` in `src/error.rs` restores the variant, message and `privacy_safe_kind` the
+  directory reported before it had its own type; `error::directory_error_tests` covers every variant.
+- Directory tests that need a real `MarmotApp` or runtime live in `src/directory_tests/`, one module per directory
+  file; tests that need only the directory live in `nostr-directory`. The account's own KeyPackage inventory, record
+  merge and publish-endpoint selection stay in `src/key_package_records.rs`, and the group-id helpers in `src/ids.rs`;
+  both re-export the directory's items so callers keep their paths.
 - Keep the crate root focused on app construction, shared state, storage/projector wiring, account relay-list helpers,
   and public re-exports.
 - Keep CLI/TUI presentation out of this crate.
@@ -390,7 +359,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `deployment.rs` (`MarmotDeployment`: the deployment services, with `neutral()` and the White Noise preset; the one
   place White Noise's values are defined), `error.rs`,
   `close_registry.rs` (terminal-close closures for runtime-owned handles outside the storage caches),
-  `ids.rs` (group-id and admin-key helpers; it re-exports the npub/nprofile/account-ref helpers now in `directory/ids.rs`), `drafts.rs` (encrypted per-account composer drafts),
+  `ids.rs` (group-id and admin-key helpers; it wraps the npub/nprofile/account-ref helpers in `nostr-directory`'s `ids.rs`), `drafts.rs` (encrypted per-account composer drafts),
   `chat_presentation.rs` + `chat_presentation/` (shared selected-chat presentation policy and maintenance),
   `conversation_presentation/` (C5 header, capability, and window selectors; they never subscribe, acknowledge
   reads, or fetch media), `local_submissions.rs` + `local_submissions/` (durable device-local send admission and host
@@ -400,8 +369,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `moderation_reports/tests.rs`), `history_notices.rs` (public notice DTOs and opaque id codec),
   `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
-  `nostr_verification.rs` (stateless public-event verification), `directory/previews.rs` (verified previews of
-  `nostr:` references, stored in the directory cache; tests in `directory/previews/tests.rs`), `profile_pseudonyms.rs` (cosmetic display names; not a
+  `nostr_verification.rs` (stateless public-event verification), `profile_pseudonyms.rs` (cosmetic display names; not a
   security primitive), `publisher_sequences.rs` (QUIC preview publisher lifecycle state), `agent_streams.rs` (agent
   stream watch DTOs and manager), `root_runtime_lease.rs` (cross-process exclusive root lease), `app_telemetry.rs` +
   `app_telemetry/` (aggregate app-performance telemetry; same privacy model as relay telemetry), `product_analytics/`
@@ -421,14 +389,6 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   job).
 - The shared relay plane is the [`transport-nostr`](../transport-nostr/AGENTS.md) crate; name its items as
   `transport_nostr::`.
-- `src/directory/`: also `cached_search.rs` (network-free cross-account search), `search.rs` (streaming web-of-trust
-  search), `open_ranking.rs` (bounded Vertex Open Ranking discovery), `member_key_packages.rs` (set-oriented roster
-  KeyPackage resolution for create/invite), `config.rs` (`DirectoryConfig`, read from the app on each
-  `directory()` call, including the proxy-aware HTTP builder Open Ranking uses, and the deployment's
-  `OpenRankingProvider` and `KeyPackageClientPreference`, re-exported from `deployment.rs`), `observer.rs` (the
-  `DirectoryObserver` analytics interface; `MarmotApp` implements it over product analytics in
-  `src/directory_resources.rs`, keeping each family, operation and unit string). `mod.rs` holds the directory's own
-  clock, `unix_now_seconds`.
 - `src/sqlcipher/open_lock.rs`: in-process same-file open exclusion (the root lease covers cross-process).
 - Integration tests in `tests/` (with `tests/support/` and `tests/fixtures/`); media benchmarks in `benches/` (require
   `media-benchmarks`); `examples/usage_diagnostics_staging/`.

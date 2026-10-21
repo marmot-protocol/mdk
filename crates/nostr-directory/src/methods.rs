@@ -4,11 +4,11 @@
 //! `directory_delegates.rs`. Entry reads and writes, ingest and
 //! record hydration are the store, in `directory/store.rs`. The stateless
 //! record types and helpers these build on live in
-//! [`crate::directory::records`]. The cache lifecycle is in
+//! [`crate::records`]. The cache lifecycle is in
 //! [`crate::directory_resources`], and publishing the account's own profile and
 //! follow list is in [`crate::profile_publication`].
 
-use crate::directory::error::{DirectoryError, blocking_directory_task};
+use crate::error::{DirectoryError, blocking_directory_task};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cgka_traits::TransportEndpoint;
@@ -20,12 +20,12 @@ use transport_nostr_adapter::{
 use super::Directory;
 use super::observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, ObservedUnit};
 use super::resources::DirectoryResources;
-use crate::directory::ids::parse_account_id_hex;
-use crate::directory::published_records::{
+use crate::ids::parse_account_id_hex;
+use crate::published_records::{
     fresh_or_cached_key_package, fresh_relay_list_status_from_records,
     latest_fresh_key_package_from_records, merge_relay_list_status, relay_list_queries,
 };
-use crate::directory::records::{
+use crate::records::{
     CachedIdentityProjection, CurrentFollowList, FetchedFollowList, MAX_CACHED_IDENTITY_PAGE_SIZE,
     UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult,
     UserProfileMetadata, cached_identity_projection, display_name_for_profile,
@@ -33,23 +33,23 @@ use crate::directory::records::{
     latest_fresh_profiles_from_records, upsert_newer_directory_entry,
     user_directory_record_from_public, user_record_match,
 };
-use crate::directory::{
-    DirectoryCache, hydrate_directory_record, plan_directory_sync, sort_user_search_results,
-};
 use crate::{
     AccountRelayListStatus, FetchedKeyPackage, KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA,
     MissingRelayListKind, push_unique_strings,
+};
+use crate::{
+    DirectoryCache, hydrate_directory_record, plan_directory_sync, sort_user_search_results,
 };
 use transport_nostr::DirectorySyncPlan;
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 
 pub(crate) const USER_DIRECTORY_SEARCH_MAX_VISITED: usize = 8192;
-pub(crate) const USER_DIRECTORY_SEARCH_MAX_FRONTIER: usize = 4096;
+pub const USER_DIRECTORY_SEARCH_MAX_FRONTIER: usize = 4096;
 
 impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     /// Resolve batched profile names with first-cache precedence, then local labels.
     /// Shared profiles replace cached profiles only when strictly newer.
-    pub(crate) fn display_names_for_account_ids(
+    pub fn display_names_for_account_ids(
         &self,
         account_id_hexes: &[String],
     ) -> Result<HashMap<String, String>, DirectoryError> {
@@ -170,7 +170,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     /// inbox declaration. If the second hop fails, already-observed positive
     /// inbox metadata remains usable; an empty first hop is not promoted into
     /// authoritative absence.
-    pub(crate) async fn resolve_account_relay_list_status_for_account_id(
+    pub async fn resolve_account_relay_list_status_for_account_id(
         &self,
         account_id_hex: &str,
         discovery_relays: Vec<TransportEndpoint>,
@@ -604,7 +604,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let cached_target = cached_entry
             .as_ref()
             .and_then(|entry| entry.key_package.as_ref())
-            .map(crate::directory::published_records::KeyPackageRecoveryTarget::from_cached);
+            .map(crate::published_records::KeyPackageRecoveryTarget::from_cached);
         let records = self
             .recover_key_package_records(super::key_package_recovery::KeyPackageRecoveryRequest {
                 account: account_id_hex,
@@ -821,7 +821,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         self.cached_relay_list_status(account_id_hex)
     }
 
-    pub(crate) async fn fetch_key_package_events_for_account_id(
+    pub async fn fetch_key_package_events_for_account_id(
         &self,
         account_id_hex: &str,
         source_relays: &[TransportEndpoint],
@@ -830,7 +830,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .await
     }
 
-    pub(crate) async fn fetch_key_package_events_for_account_id_with_limit(
+    pub async fn fetch_key_package_events_for_account_id_with_limit(
         &self,
         account_id_hex: &str,
         source_relays: &[TransportEndpoint],
@@ -893,7 +893,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
 
     /// Fetch the account's current kind-3 event whole, for an edit that must
     /// republish every tag it does not change.
-    pub(crate) async fn fetch_current_follow_list_event_for_account_id(
+    pub async fn fetch_current_follow_list_event_for_account_id(
         &self,
         account_id_hex: &str,
         source_relays: Vec<TransportEndpoint>,
@@ -1001,7 +1001,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         Ok(())
     }
 
-    pub(crate) fn directory_entries(&self) -> Result<Vec<UserDirectoryRecord>, DirectoryError> {
+    pub fn directory_entries(&self) -> Result<Vec<UserDirectoryRecord>, DirectoryError> {
         let local_accounts = self.local_accounts_by_id()?;
         let mut entries_by_id = BTreeMap::new();
         for cache in self.resources.current_caches()? {
@@ -1022,7 +1022,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         Ok(entries_by_id.into_values().collect())
     }
 
-    pub(crate) fn directory_sync_plan(&self) -> Result<DirectorySyncPlan, DirectoryError> {
+    pub fn directory_sync_plan(&self) -> Result<DirectorySyncPlan, DirectoryError> {
         let local_account_ids = self
             .resources
             .local_accounts()?
@@ -1055,7 +1055,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         let caches = self.resources.current_caches()?;
         // One instant for the whole traversal: a layer must not disagree with
         // itself about whether a cached profile has expired.
-        let now = crate::directory::unix_now_seconds() as i64;
+        let now = crate::unix_now_seconds() as i64;
 
         for radius in 0..=radius_end {
             let mut next = Vec::new();
@@ -1113,7 +1113,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     }
 }
 
-pub(crate) fn cached_or_unknown_follow_list(
+pub fn cached_or_unknown_follow_list(
     cached: Option<UserDirectoryRecord>,
     source_relays: &[TransportEndpoint],
 ) -> FetchedFollowList {

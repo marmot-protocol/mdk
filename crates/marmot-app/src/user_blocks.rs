@@ -1,16 +1,16 @@
 //! Account-private block policy and NIP-51 synchronization.
-use crate::directory::BlockListSink;
-use crate::directory::error::{DirectoryError, blocking_directory_task};
 use crate::{AppError, MarmotApp};
 use cgka_traits::{TransportEndpoint, TransportEndpointFailureKind};
 use futures::{StreamExt, stream};
 use nostr::prelude::{EventBuilder, FinalizeEventAsync, Kind, PublicKey, Tag, Timestamp};
+use nostr_directory::BlockListSink;
+use nostr_directory::error::{DirectoryError, blocking_directory_task};
 use std::sync::Arc;
 use storage_sqlite::{PendingBlockPublication, StoredBlockList};
 use transport_nostr::DirectoryEventQuery;
 use transport_nostr_peeler::{NostrTransportEvent, SdkSigner};
 
-use crate::directory::records::MUTE_LIST_KIND;
+use nostr_directory::records::MUTE_LIST_KIND;
 pub use storage_sqlite::{BlockListSnapshot, BlockedUser};
 
 impl MarmotApp {
@@ -23,7 +23,10 @@ impl MarmotApp {
         // startup/reconnect, and report failures without exposing identities.
         let app_for_accounts = app.clone();
         let accounts = match blocking_directory_task(move || {
-            Ok(app_for_accounts.account_home().accounts()?)
+            Ok(app_for_accounts
+                .account_home()
+                .accounts()
+                .map_err(AppError::from)?)
         })
         .await
         {

@@ -42,6 +42,7 @@ on:
       - crates/marmot-forensics/**
       - crates/marmot-markdown/**
       - crates/media-store/**
+      - crates/nostr-directory/**
       - crates/storage-sqlite/**
       - crates/traits/**
       - crates/transport-nostr/**

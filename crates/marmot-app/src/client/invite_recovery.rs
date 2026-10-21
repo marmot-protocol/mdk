@@ -298,7 +298,7 @@ impl AppClient {
                         .resolve_compatible_member_key_packages(
                             members,
                             &requirements,
-                            crate::directory::MemberResolutionPurpose::CommitFresh,
+                            nostr_directory::MemberResolutionPurpose::CommitFresh,
                         )
                         .await
                     {

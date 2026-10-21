@@ -144,8 +144,8 @@ pub enum ConversationPresentationError {
     App(#[from] AppError),
 }
 
-impl From<crate::directory::error::DirectoryError> for ConversationPresentationError {
-    fn from(error: crate::directory::error::DirectoryError) -> Self {
+impl From<nostr_directory::error::DirectoryError> for ConversationPresentationError {
+    fn from(error: nostr_directory::error::DirectoryError) -> Self {
         Self::App(error.into())
     }
 }

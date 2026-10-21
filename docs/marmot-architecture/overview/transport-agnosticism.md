@@ -85,15 +85,15 @@ Grounded survey of the leak sites, by category.
 ### Leaking
 
 **L1. Directory plane has no seam.** KeyPackage resolution, relay lists, contact lists, and
-profiles in `marmot-app` speak concrete `NostrTransportEvent` over `NostrRelayClient` /
+profiles in `nostr-directory` speak concrete `NostrTransportEvent` over `NostrRelayClient` /
 `NostrSdkDirectoryRelayFetcher`:
 
-- `marmot-app/src/directory/member_key_packages.rs` (`resolve_member_key_packages*`),
+- `nostr-directory/src/member_key_packages.rs` (`resolve_member_key_packages*`),
 - `transport-nostr/src/directory.rs` — `DirectoryRelayFetcher` is `pub` for `marmot-app`;
   the only impl is `NostrSdkDirectoryRelayFetcher`,
-- `marmot-app/src/directory/published_records.rs` — record validation consumes
+- `nostr-directory/src/published_records.rs` — record validation consumes
   `NostrTransportEvent` directly,
-- `marmot-app/src/directory/published_records.rs` (`relays_from_relay_list_event`, NIP-65 parsing).
+- `nostr-directory/src/published_records.rs` (`relays_from_relay_list_event`, NIP-65 parsing).
 
 This is why #1521 needs to exist and why the FIPS spike could not move discovery off WebSockets.
 

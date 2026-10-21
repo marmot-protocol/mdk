@@ -38,9 +38,9 @@ use super::records::{
     latest_fresh_profiles_from_records, profile_from_record, user_record_match,
 };
 use super::resources::DirectoryResources;
-use crate::directory::error::DirectoryError;
-use crate::directory::error::blocking_directory_task;
-use crate::directory::ids::{npub_for_account_id_lossy, parse_account_id_hex};
+use crate::error::DirectoryError;
+use crate::error::blocking_directory_task;
+use crate::ids::{npub_for_account_id_lossy, parse_account_id_hex};
 use crate::{KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, relay_list_state_from_event};
 use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 use transport_nostr_adapter::KIND_NIP65_RELAY_LIST;
@@ -57,7 +57,7 @@ use transport_nostr_adapter::KIND_NIP65_RELAY_LIST;
 /// rather than silently answered shallow: it needs the outbox-model tiers
 /// (NIP-65 relay lists, per-user write relays) to resolve profiles that far
 /// out with acceptable recall.
-pub(crate) const MAX_SUPPORTED_SEARCH_RADIUS: u8 = 2;
+pub const MAX_SUPPORTED_SEARCH_RADIUS: u8 = 2;
 
 /// Ceiling on the candidates one radius may contribute to the next layer.
 ///
@@ -239,7 +239,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .await
     }
 
-    pub(crate) async fn search_users_with_seeds<F>(
+    pub async fn search_users_with_seeds<F>(
         &self,
         params: UserSearchParams,
         seeds: F,
@@ -421,7 +421,7 @@ async fn run_search<R: DirectoryResources + DirectoryObserver, F>(
                         if cache_resolved_profiles(
                             &directory,
                             &profiles,
-                            crate::directory::unix_now_seconds() as i64,
+                            crate::unix_now_seconds() as i64,
                         )
                         .await
                         .is_err()
@@ -719,7 +719,7 @@ async fn resolve_layer<R: DirectoryResources + DirectoryObserver>(
     radius: u8,
     emitter: &mut SearchEmitter,
 ) -> Result<(), DirectoryError> {
-    let now = crate::directory::unix_now_seconds() as i64;
+    let now = crate::unix_now_seconds() as i64;
     let (local, missing) = partition_locally_known(directory, frontier, now).await?;
     emitter.tally.resolved_from_cache(local.len());
     emitter.emit_matches(radius, local, query).await;
@@ -1555,7 +1555,7 @@ pub fn sort_user_search_results(results: &mut [UserDirectorySearchResult]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::directory::ids::npub_for_account_id_lossy;
+    use crate::ids::npub_for_account_id_lossy;
     use crate::{AccountRelayListStatus, MatchQuality, MatchedField};
 
     /// A cached directory record for `account_id_hex` whose profile name is

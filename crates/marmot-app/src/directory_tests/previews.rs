@@ -10,8 +10,8 @@ use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, RelayUrl, Tag, Tim
 use nostr_sdk::local_relay::MockRelay;
 use nostr_sdk::prelude::Client;
 
-use crate::directory::previews::*;
 use crate::{AppError, MarmotApp};
+use nostr_directory::previews::*;
 
 fn signed(keys: &Keys, kind: u16, created_at: u64, content: &str, tags: Vec<Tag>) -> Event {
     EventBuilder::new(Kind::from(kind), content)

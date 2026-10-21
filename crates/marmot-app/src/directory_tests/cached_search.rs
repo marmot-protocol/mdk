@@ -4,9 +4,9 @@
 use std::collections::BTreeMap;
 
 use crate::OFF_GRAPH_SEARCH_RADIUS;
-use crate::directory::DirectorySearchGraphRecord;
-use crate::directory::records::public_directory_user_record;
 use crate::{MarmotApp, UserDirectoryLocalAccount, UserProfileMetadata};
+use nostr_directory::DirectorySearchGraphRecord;
+use nostr_directory::records::public_directory_user_record;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connected_searcher_ignores_another_accounts_stale_follows() {
@@ -34,14 +34,14 @@ async fn connected_searcher_ignores_another_accounts_stale_follows() {
     own_cache
         .remember_search_graph_follows(
             &searcher.account_id_hex,
-            &crate::directory::ids::npub_for_account_id_lossy(&searcher.account_id_hex),
+            &nostr_directory::ids::npub_for_account_id_lossy(&searcher.account_id_hex),
             std::slice::from_ref(&followed),
         )
         .unwrap();
     other_cache
         .remember_search_graph_follows(
             &searcher.account_id_hex,
-            &crate::directory::ids::npub_for_account_id_lossy(&searcher.account_id_hex),
+            &nostr_directory::ids::npub_for_account_id_lossy(&searcher.account_id_hex),
             std::slice::from_ref(&stale),
         )
         .unwrap();
@@ -103,7 +103,7 @@ async fn connected_searcher_ignores_another_accounts_stale_follows() {
     // The refresh path's explicit empty kind-3 clears stale graph edges too.
     app.remember_directory_follow_list_for_test(
         &searcher.account_id_hex,
-        &crate::directory::FetchedFollowList {
+        &nostr_directory::FetchedFollowList {
             follows: Vec::new(),
             source_relays: Vec::new(),
         },
@@ -153,7 +153,7 @@ fn public_cache_spans_accounts_but_follow_labels_do_not() {
     alice_cache
         .remember_search_graph_follows(
             &alice.account_id_hex,
-            &crate::directory::ids::npub_for_account_id_lossy(&alice.account_id_hex),
+            &nostr_directory::ids::npub_for_account_id_lossy(&alice.account_id_hex),
             std::slice::from_ref(&peer),
         )
         .unwrap();
@@ -161,18 +161,18 @@ fn public_cache_spans_accounts_but_follow_labels_do_not() {
     bob_record.follows = vec![shared_peer.clone()];
     bob_cache.put(&bob_record).unwrap();
     record.account_id_hex = shared_peer.clone();
-    record.npub = crate::directory::ids::npub_for_account_id_lossy(&shared_peer);
+    record.npub = nostr_directory::ids::npub_for_account_id_lossy(&shared_peer);
     app.shared_storage()
         .unwrap()
         .put_public_directory_user(&public_directory_user_record(&record).unwrap())
         .unwrap();
-    let now = crate::directory::unix_now_seconds() as i64;
+    let now = nostr_directory::unix_now_seconds() as i64;
     for (id, expires) in [(&search_peer, now + 100), (&expired_peer, now)] {
         bob_cache
             .put_search_graph_record(
                 &DirectorySearchGraphRecord {
                     account_id_hex: id.clone(),
-                    npub: crate::directory::ids::npub_for_account_id_lossy(id),
+                    npub: nostr_directory::ids::npub_for_account_id_lossy(id),
                     profile: record.profile.clone(),
                     follows: None,
                     metadata_updated_at: Some(2),

@@ -96,9 +96,6 @@ pub use deployment::{
 };
 pub mod conversation_presentation;
 mod conversions;
-mod directory;
-#[cfg(test)]
-mod directory_crossings_tests;
 mod directory_delegates;
 mod directory_resources;
 #[cfg(test)]
@@ -225,28 +222,6 @@ pub use config::{
     RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
     RelayTelemetrySettings,
 };
-#[cfg(test)]
-use directory::USER_DIRECTORY_SEARCH_MAX_FRONTIER;
-pub use directory::previews::{
-    MAX_PUBLIC_EVENT_REFERENCES, PublicEventPreview, PublicEventPreviewRead,
-};
-#[cfg(test)]
-pub(crate) use directory::published_records::relays_from_relay_list_event;
-pub(crate) use directory::published_records::{
-    DirectoryFreshness, DirectorySelection, push_unique_strings, relay_list_state_from_event,
-    sort_directory_records,
-};
-pub(crate) use directory::records::{KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA};
-pub use directory::{
-    AccountRelayListState, AccountRelayListStatus, FetchedKeyPackage, MissingRelayListKind,
-};
-pub use directory::{
-    CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
-    MatchedField, MemberKeyPackagePrewarmSummary, OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger,
-    UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch,
-    UserDirectorySearchResult, UserProfileMetadata, UserSearchParams, UserSearchSubscription,
-    UserSearchUpdate, sort_user_search_results,
-};
 pub use drafts::{
     ChatListDraftVersion, MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary,
     MessageDraftInvalidation, MessageDraftRevision, MessageDraftSummary, SelectedMessageDraft,
@@ -286,6 +261,27 @@ pub use media::{
     media_attachment_outcomes_from_tags, parse_media_attachment,
 };
 pub use messages::{is_reserved_app_event_kind, is_stream_final_event, tag_value, tag_values};
+#[cfg(test)]
+use nostr_directory::USER_DIRECTORY_SEARCH_MAX_FRONTIER;
+pub use nostr_directory::previews::{
+    MAX_PUBLIC_EVENT_REFERENCES, PublicEventPreview, PublicEventPreviewRead,
+};
+#[cfg(test)]
+pub(crate) use nostr_directory::published_records::relays_from_relay_list_event;
+pub(crate) use nostr_directory::published_records::{
+    push_unique_strings, relay_list_state_from_event, sort_directory_records,
+};
+pub(crate) use nostr_directory::records::{KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA};
+pub use nostr_directory::{
+    AccountRelayListState, AccountRelayListStatus, FetchedKeyPackage, MissingRelayListKind,
+};
+pub use nostr_directory::{
+    CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
+    MatchedField, MemberKeyPackagePrewarmSummary, OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger,
+    UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch,
+    UserDirectorySearchResult, UserProfileMetadata, UserSearchParams, UserSearchSubscription,
+    UserSearchUpdate, sort_user_search_results,
+};
 pub use nostr_secret::is_nostr_secret;
 pub use nostr_verification::verify_public_nostr_event_json;
 pub use notifications::{
@@ -384,8 +380,6 @@ use conversions::{
     stored_app_event_from_projection, stored_push_registration_from_account,
     stored_state_from_account_state,
 };
-use directory::DirectoryCache;
-use directory::records::display_name_for_profile;
 use ids::parse_account_id_hex;
 use key_package_records::{
     account_key_package_record_from_fetched, account_key_package_relay_events_from_records,
@@ -397,6 +391,8 @@ use key_package_records::{
     fresh_or_cached_key_package, latest_fresh_key_package_from_records,
     validated_cached_key_package,
 };
+use nostr_directory::DirectoryCache;
+use nostr_directory::records::display_name_for_profile;
 use projection::LegacyAccountProjectionDb;
 
 const LEGACY_ACCOUNT_APP_DB_FILE: &str = "app.sqlite3";
@@ -560,7 +556,7 @@ pub struct MarmotApp {
     directory_caches: Arc<Mutex<HashMap<String, DirectoryCache>>>,
     /// What the directory keeps between calls; [`Self::directory`] shares it
     /// with every service it builds.
-    directory_state: directory::DirectoryState,
+    directory_state: nostr_directory::DirectoryState,
     legacy_directory_cache_checked: Arc<Mutex<bool>>,
     #[cfg(test)]
     directory_test_clock: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -1619,7 +1615,7 @@ impl MarmotApp {
             close_registry: Default::default(),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
-            directory_state: directory::DirectoryState::default(),
+            directory_state: nostr_directory::DirectoryState::default(),
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
             directory_test_clock: None,
@@ -1716,7 +1712,7 @@ impl MarmotApp {
             close_registry: Default::default(),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
-            directory_state: directory::DirectoryState::default(),
+            directory_state: nostr_directory::DirectoryState::default(),
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
             directory_test_clock: None,
@@ -2297,7 +2293,7 @@ impl MarmotApp {
                 account.account_id_hex.clone(),
                 KIND_NOSTR_METADATA,
                 Vec::new(),
-                serde_json::to_string(&directory::records::profile_content_json(profile))?,
+                serde_json::to_string(&nostr_directory::records::profile_content_json(profile))?,
             ),
             required_acks: 1,
         });
@@ -2401,7 +2397,7 @@ impl MarmotApp {
         self.remember_directory_relay_lists(&account.account_id_hex, &status)?;
         self.remember_directory_follow_edges_for_search(
             &account.account_id_hex,
-            &directory::FetchedFollowList {
+            &nostr_directory::FetchedFollowList {
                 follows: Vec::new(),
                 source_relays: content_endpoints
                     .iter()
@@ -2509,7 +2505,7 @@ impl MarmotApp {
             account.account_id_hex.clone(),
             KIND_NOSTR_METADATA,
             Vec::new(),
-            serde_json::to_string(&directory::records::profile_content_json(profile))?,
+            serde_json::to_string(&nostr_directory::records::profile_content_json(profile))?,
         );
         events.push(
             self.sign_replaceable_identity_event(label, nostr_signer.clone(), &profile_event)

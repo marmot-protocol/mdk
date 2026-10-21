@@ -25,7 +25,7 @@ use transport_nostr_peeler::NostrTransportEvent;
 
 use super::config::KeyPackageClientPreference;
 use super::unix_now_seconds;
-use crate::directory::error::{DirectoryError, MissingKeyPackageReason};
+use crate::error::{DirectoryError, MissingKeyPackageReason};
 use crate::{DirectoryKeyPackage, UserDirectoryRecord};
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 
@@ -40,7 +40,7 @@ pub struct AccountRelayListStatus {
 }
 
 impl AccountRelayListStatus {
-    pub(crate) fn empty() -> Self {
+    pub fn empty() -> Self {
         let mut status = Self {
             complete: false,
             missing: Vec::new(),
@@ -65,7 +65,7 @@ impl AccountRelayListStatus {
         status
     }
 
-    pub(crate) fn refresh(&mut self) {
+    pub fn refresh(&mut self) {
         self.default_relays = self.nip65.relays.clone();
         self.missing = Vec::new();
         if self.nip65.relays.is_empty() {
@@ -145,7 +145,7 @@ pub struct FetchedKeyPackage {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DirectoryFreshness {
+pub struct DirectoryFreshness {
     pub(crate) max_created_at: u64,
 }
 
@@ -162,12 +162,12 @@ impl DirectoryFreshness {
 }
 
 #[derive(Debug)]
-pub(crate) struct DirectorySelection<T> {
-    pub(crate) value: T,
+pub struct DirectorySelection<T> {
+    pub value: T,
     pub(crate) rejected_future: bool,
 }
 
-pub(crate) fn sort_directory_records(records: &mut [RelayEventRecord]) {
+pub fn sort_directory_records(records: &mut [RelayEventRecord]) {
     records.sort_by(|a, b| {
         a.event
             .created_at
@@ -176,16 +176,14 @@ pub(crate) fn sort_directory_records(records: &mut [RelayEventRecord]) {
     });
 }
 
-#[cfg(test)]
-pub(crate) fn relays_from_relay_list_event(event: &NostrTransportEvent) -> Vec<String> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn relays_from_relay_list_event(event: &NostrTransportEvent) -> Vec<String> {
     relay_list_state_from_event(event)
         .map(|state| state.relays)
         .unwrap_or_default()
 }
 
-pub(crate) fn relay_list_state_from_event(
-    event: &NostrTransportEvent,
-) -> Option<AccountRelayListState> {
+pub fn relay_list_state_from_event(event: &NostrTransportEvent) -> Option<AccountRelayListState> {
     match event.kind {
         KIND_NIP65_RELAY_LIST => {
             let relay_set = parse_nip65_relay_set(event);
@@ -228,10 +226,7 @@ pub(crate) fn relay_list_state_from_event(
     }
 }
 
-pub(crate) fn push_unique_strings(
-    values: &mut Vec<String>,
-    candidates: impl IntoIterator<Item = String>,
-) {
+pub fn push_unique_strings(values: &mut Vec<String>, candidates: impl IntoIterator<Item = String>) {
     for candidate in candidates {
         if !values.contains(&candidate) {
             values.push(candidate);
@@ -241,7 +236,7 @@ pub(crate) fn push_unique_strings(
 
 /// Evidence from a complete supplementary lookup, used only to restrict the
 /// direct diagnostic API's existing future-record cache fallback.
-pub(crate) struct KeyPackageRecoveryEvidence {
+pub struct KeyPackageRecoveryEvidence {
     account: String,
     winners: Vec<NostrTransportEvent>,
     deletions: Vec<NostrTransportEvent>,
@@ -249,7 +244,7 @@ pub(crate) struct KeyPackageRecoveryEvidence {
 
 /// Public lookup target metadata; deliberately excludes KeyPackage bytes.
 #[derive(Clone)]
-pub(crate) struct KeyPackageRecoveryTarget {
+pub struct KeyPackageRecoveryTarget {
     pub(crate) event_id: String,
     pub(crate) slot: String,
     pub(crate) created_at: u64,
@@ -293,7 +288,7 @@ impl KeyPackageRecoveryEvidence {
 
 /// Collapse fresh slot winners before applying deletions, retaining invalid,
 /// obsolete and incompatible replacements as barriers against older material.
-pub(crate) fn without_revoked_slot_winners(
+pub fn without_revoked_slot_winners(
     account: &str,
     mut records: Vec<RelayEventRecord>,
     deletions: &[RelayEventRecord],
@@ -347,7 +342,7 @@ pub(crate) fn without_revoked_slot_winners(
     )
 }
 
-pub(crate) fn package_is_deleted(
+pub fn package_is_deleted(
     account: &str,
     event_id: &str,
     slot: &str,
@@ -372,7 +367,7 @@ pub(crate) fn package_is_deleted(
     })
 }
 
-pub(crate) fn merge_relay_list_status(
+pub fn merge_relay_list_status(
     mut current: AccountRelayListStatus,
     candidate: AccountRelayListStatus,
 ) -> AccountRelayListStatus {
@@ -397,7 +392,7 @@ pub(crate) fn merge_relay_list_status(
     current
 }
 
-pub(crate) fn relay_list_status_from_records(
+pub fn relay_list_status_from_records(
     account_id_hex: &str,
     mut records: Vec<RelayEventRecord>,
 ) -> AccountRelayListStatus {
@@ -439,7 +434,7 @@ pub(crate) fn relay_list_status_from_records(
     status
 }
 
-pub(crate) fn fresh_relay_list_status_from_records(
+pub fn fresh_relay_list_status_from_records(
     account_id_hex: &str,
     mut records: Vec<RelayEventRecord>,
     freshness: DirectoryFreshness,
@@ -464,7 +459,7 @@ pub(crate) fn fresh_relay_list_status_from_records(
     }
 }
 
-pub(crate) fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQuery> {
+pub fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQuery> {
     [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST]
         .into_iter()
         .map(|kind| DirectoryEventQuery::new(kind, vec![account_id_hex.clone()], 12))
@@ -479,7 +474,7 @@ pub(crate) fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQu
 /// rank candidates after admission checks and never relax cryptographic gates.
 /// The ranking is the deployment's [`KeyPackageClientPreference`]; an event
 /// with no single, valued `client` tag ranks as unlabelled.
-pub(crate) fn key_package_client_priority(
+pub fn key_package_client_priority(
     event: &NostrTransportEvent,
     preference: &KeyPackageClientPreference,
 ) -> u8 {
@@ -500,7 +495,7 @@ pub(crate) fn key_package_client_priority(
 /// policy used by invitation discovery, but have no target-group requirements.
 /// A malformed current slot never revives an older publication; if no usable
 /// slot remains, the lookup returns the validation error.
-pub(crate) fn latest_fresh_key_package_from_records(
+pub fn latest_fresh_key_package_from_records(
     account_id_hex: &str,
     records: Vec<RelayEventRecord>,
     freshness: DirectoryFreshness,
@@ -520,23 +515,23 @@ pub(crate) fn latest_fresh_key_package_from_records(
     })
 }
 
-pub(crate) struct PreferredKeyPackage {
-    pub(crate) fetched: FetchedKeyPackage,
+pub struct PreferredKeyPackage {
+    pub fetched: FetchedKeyPackage,
     pub(crate) priority: u8,
 }
 
 /// Newest-slot KeyPackage selection. `legacy_slots` only explains an empty
 /// selection; it never makes a legacy publication a join candidate.
-pub(crate) struct KeyPackageSelection<T> {
-    pub(crate) value: Option<T>,
+pub struct KeyPackageSelection<T> {
+    pub value: Option<T>,
     pub(crate) rejected_future: bool,
-    pub(crate) legacy_slots: bool,
+    pub legacy_slots: bool,
 }
 
 impl<T> KeyPackageSelection<T> {
     /// Call only after the lookup that produced these records completed: an
     /// incomplete search can explain neither absence nor obsolescence.
-    pub(crate) fn into_value_or_missing(self, account_id_hex: &str) -> Result<T, DirectoryError> {
+    pub fn into_value_or_missing(self, account_id_hex: &str) -> Result<T, DirectoryError> {
         // A future-dated slot may be a clock-skewed current publication.
         let reason = if self.legacy_slots && !self.rejected_future {
             MissingKeyPackageReason::ObsoleteOnly
@@ -550,7 +545,7 @@ impl<T> KeyPackageSelection<T> {
     }
 }
 
-pub(crate) fn preferred_fresh_key_package_from_records(
+pub fn preferred_fresh_key_package_from_records(
     account_id_hex: &str,
     records: &[RelayEventRecord],
     freshness: DirectoryFreshness,
@@ -634,7 +629,7 @@ pub(crate) fn preferred_fresh_key_package_from_records(
 /// The author's MLS KeyPackage with a legacy-profile account proof. Current
 /// transport tag checks are skipped on purpose: deployed legacy publishers
 /// predate them (MDK 0.8 publishes no `app_components` tag).
-pub(crate) fn is_legacy_key_package_record(record: &RelayEventRecord) -> bool {
+pub fn is_legacy_key_package_record(record: &RelayEventRecord) -> bool {
     let Ok(bytes) = BASE64_STANDARD.decode(record.event.content.as_bytes()) else {
         return false;
     };
@@ -646,7 +641,7 @@ pub(crate) fn is_legacy_key_package_record(record: &RelayEventRecord) -> bool {
     })
 }
 
-pub(crate) fn cached_key_package_from_entry(
+pub fn cached_key_package_from_entry(
     entry: UserDirectoryRecord,
 ) -> Result<Option<FetchedKeyPackage>, DirectoryError> {
     let Some(key_package) = entry.key_package else {
@@ -666,8 +661,8 @@ pub(crate) fn cached_key_package_from_entry(
     }))
 }
 
-#[cfg(test)]
-pub(crate) fn validated_cached_key_package(
+#[cfg(any(test, feature = "test-support"))]
+pub fn validated_cached_key_package(
     account_id_hex: &str,
     key_package: &DirectoryKeyPackage,
 ) -> Result<KeyPackage, DirectoryError> {
@@ -675,7 +670,7 @@ pub(crate) fn validated_cached_key_package(
         .map(|(key_package, _)| key_package)
 }
 
-pub(crate) fn validated_cached_key_package_with_ref(
+pub fn validated_cached_key_package_with_ref(
     account_id_hex: &str,
     key_package: &DirectoryKeyPackage,
 ) -> Result<(KeyPackage, String), DirectoryError> {
@@ -708,7 +703,7 @@ pub(crate) fn validated_cached_key_package_with_ref(
     ))
 }
 
-pub(crate) fn key_package_from_hex_with_optional_source(
+pub fn key_package_from_hex_with_optional_source(
     key_package_hex: &str,
     event_id_hex: &str,
 ) -> Result<KeyPackage, DirectoryError> {
@@ -726,9 +721,7 @@ pub(crate) fn key_package_from_hex_with_optional_source(
     )
 }
 
-pub(crate) fn key_package_event_id_from_hex(
-    event_id_hex: &str,
-) -> Result<MessageId, DirectoryError> {
+pub fn key_package_event_id_from_hex(event_id_hex: &str) -> Result<MessageId, DirectoryError> {
     let bytes = hex::decode(event_id_hex)?;
     if bytes.len() != 32 {
         return Err(DirectoryError::InvalidKeyPackageEvent(format!(
@@ -739,7 +732,7 @@ pub(crate) fn key_package_event_id_from_hex(
     Ok(MessageId::new(bytes))
 }
 
-pub(crate) fn fresh_or_cached_key_package(
+pub fn fresh_or_cached_key_package(
     account_id_hex: &str,
     selection: KeyPackageSelection<FetchedKeyPackage>,
     cached_entry: Option<UserDirectoryRecord>,
@@ -756,13 +749,13 @@ pub(crate) fn fresh_or_cached_key_package(
     selection.into_value_or_missing(account_id_hex)
 }
 
-pub(crate) fn key_package_from_record(
+pub fn key_package_from_record(
     record: RelayEventRecord,
 ) -> Result<FetchedKeyPackage, DirectoryError> {
     key_package_from_borrowed_record(&record)
 }
 
-pub(crate) fn key_package_from_borrowed_record(
+pub fn key_package_from_borrowed_record(
     record: &RelayEventRecord,
 ) -> Result<FetchedKeyPackage, DirectoryError> {
     let event = &record.event;
@@ -857,7 +850,7 @@ pub(crate) fn key_package_from_borrowed_record(
 /// tag. A consumer MUST reject an event that repeats an id-list tag name rather
 /// than silently reading the first occurrence (two consumers could otherwise
 /// pick different occurrences and disagree on advertised capabilities).
-pub(crate) fn reject_duplicate_key_package_tag(
+pub fn reject_duplicate_key_package_tag(
     event: &NostrTransportEvent,
     name: &str,
 ) -> Result<(), DirectoryError> {
@@ -874,7 +867,7 @@ pub(crate) fn reject_duplicate_key_package_tag(
     Ok(())
 }
 
-pub(crate) fn require_key_package_tag(
+pub fn require_key_package_tag(
     event: &NostrTransportEvent,
     name: &str,
     predicate: impl FnOnce(&str) -> bool,
@@ -893,7 +886,7 @@ pub(crate) fn require_key_package_tag(
     }
 }
 
-pub(crate) fn require_multi_value_key_package_tag_matches(
+pub fn require_multi_value_key_package_tag_matches(
     event: &NostrTransportEvent,
     name: &str,
     expected_ids: impl IntoIterator<Item = u16>,

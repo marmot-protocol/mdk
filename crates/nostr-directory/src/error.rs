@@ -67,7 +67,7 @@ pub enum DirectoryError {
 
 impl DirectoryError {
     /// The same stable kind the `AppError` this converts to reports.
-    pub(crate) fn privacy_safe_kind(&self) -> &'static str {
+    pub fn privacy_safe_kind(&self) -> &'static str {
         match self {
             Self::InvalidKeyPackageEvent(_) => "invalid_key_package_event",
             Self::InvalidPublicKey => "invalid_public_key",
@@ -107,7 +107,7 @@ pub struct ResourceError {
 impl ResourceError {
     /// Wraps an app error together with its privacy-safe kind. For the app's
     /// use only.
-    pub(crate) fn from_app(
+    pub fn from_app(
         error: impl std::error::Error + Send + Sync + 'static,
         kind: &'static str,
     ) -> Self {
@@ -118,12 +118,12 @@ impl ResourceError {
     }
 
     /// The wrapped app error.
-    pub(crate) fn into_inner(self) -> Box<dyn std::error::Error + Send + Sync> {
+    pub fn into_inner(self) -> Box<dyn std::error::Error + Send + Sync> {
         self.inner
     }
 
     /// The wrapped error's privacy-safe kind, recorded when it was wrapped.
-    pub(crate) fn privacy_safe_kind(&self) -> &'static str {
+    pub fn privacy_safe_kind(&self) -> &'static str {
         self.kind
     }
 }
@@ -170,7 +170,7 @@ impl MissingKeyPackageReason {
     }
 }
 
-pub(crate) fn storage_error_kind(error: &StorageError) -> &'static str {
+pub fn storage_error_kind(error: &StorageError) -> &'static str {
     match error {
         StorageError::NotFound => "storage_not_found",
         StorageError::AlreadyExists => "storage_already_exists",
@@ -188,7 +188,7 @@ pub(crate) fn storage_error_kind(error: &StorageError) -> &'static str {
 }
 
 /// The stable kind of a SQLite failure.
-pub(crate) fn sqlite_error_kind(error: &rusqlite::Error) -> &'static str {
+pub fn sqlite_error_kind(error: &rusqlite::Error) -> &'static str {
     match error.sqlite_error_code() {
         Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
             "storage_busy"
@@ -201,7 +201,7 @@ pub(crate) fn sqlite_error_kind(error: &rusqlite::Error) -> &'static str {
 
 /// Runs `task` on Tokio's blocking pool, as `marmot-app`'s `blocking_app_task`
 /// does for the app.
-pub(crate) async fn blocking_directory_task<T>(
+pub async fn blocking_directory_task<T>(
     task: impl FnOnce() -> Result<T, DirectoryError> + Send + 'static,
 ) -> Result<T, DirectoryError>
 where

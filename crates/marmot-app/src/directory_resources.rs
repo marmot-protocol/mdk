@@ -15,19 +15,19 @@ use marmot_account::AccountSummary;
 use cgka_traits::TransportEndpoint;
 use storage_sqlite::SqliteSharedStorage;
 
-use crate::directory::error::DirectoryError;
-use crate::directory::hydrate_directory_record;
-use crate::directory::records::public_directory_user_record;
-use crate::directory::{
-    Directory, DirectoryAccount, DirectoryCache, DirectoryConfig, DirectoryObservation,
-    DirectoryObserver, DirectoryResources, ObservedFamily, ObservedUnit,
-};
 use crate::{
     APP_CACHE_DB_FILE, AccountRelayListStatus, AppError,
     DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER, MarmotApp, SqlcipherDatabaseKind,
     remove_sqlite_file_set,
 };
 use crate::{ProductFamily, ProductObservation, ProductUnit};
+use nostr_directory::error::DirectoryError;
+use nostr_directory::hydrate_directory_record;
+use nostr_directory::records::public_directory_user_record;
+use nostr_directory::{
+    Directory, DirectoryAccount, DirectoryCache, DirectoryConfig, DirectoryObservation,
+    DirectoryObserver, DirectoryResources, ObservedFamily, ObservedUnit,
+};
 
 /// The directory service over this app's resources.
 impl MarmotApp {
@@ -62,6 +62,8 @@ impl MarmotApp {
             http_builder: crate::network_proxy::http_builder,
             #[cfg(test)]
             test_clock: self.directory_test_clock.clone(),
+            #[cfg(not(test))]
+            test_clock: None,
         }
     }
 }
@@ -72,14 +74,19 @@ impl DirectoryResources for MarmotApp {
     fn local_accounts(&self) -> Result<Vec<DirectoryAccount>, DirectoryError> {
         Ok(self
             .account_home()
-            .accounts()?
+            .accounts()
+            .map_err(AppError::from)?
             .iter()
             .map(directory_account)
             .collect())
     }
 
     fn account_id_for_label(&self, label: &str) -> Result<String, DirectoryError> {
-        Ok(self.account_home().account(label)?.account_id_hex)
+        Ok(self
+            .account_home()
+            .account(label)
+            .map_err(AppError::from)?
+            .account_id_hex)
     }
 
     fn current_caches(&self) -> Result<Vec<DirectoryCache>, DirectoryError> {

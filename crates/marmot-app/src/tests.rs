@@ -16,7 +16,6 @@ mod suspension_close;
 mod user_blocks;
 
 use super::*;
-use crate::directory::error::DirectoryError;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -33,6 +32,7 @@ use cgka_traits::app_event::{
 use cgka_traits::storage::{DisbandCandidate, DisbandCandidateStorage};
 use cgka_traits::{GroupStorage as _, Timestamp};
 use marmot_account::AccountHomeError;
+use nostr_directory::error::DirectoryError;
 use nostr_sdk::prelude::{
     EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp as NostrTimestamp,
 };
@@ -49,16 +49,16 @@ use crate::client::epoch_stall::{BackfillDecision, EPOCH_STALL_BACKFILL_THRESHOL
 use crate::conversions::{
     app_group_from_stored_group, stored_components_from_app_group, stored_group_from_app_group,
 };
-use crate::directory::ids::npub_for_account_id_lossy;
-use crate::directory::records::{
-    FetchedFollowList, profile_content_json, public_directory_user_record,
-};
 use crate::key_package_records::{
     relay_list_queries, relay_list_status_from_records, require_key_package_tag,
     require_multi_value_key_package_tag_matches,
 };
 use crate::messages::STREAM_ROUTE_QUIC;
 use crate::messages::{AppMessageIntent, build_inner_event};
+use nostr_directory::ids::npub_for_account_id_lossy;
+use nostr_directory::records::{
+    FetchedFollowList, profile_content_json, public_directory_user_record,
+};
 
 fn one_pixel_png() -> Vec<u8> {
     use image::ImageEncoder;
@@ -9599,7 +9599,7 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .resolve_compatible_member_key_packages(
                 members.clone(),
                 &requirements,
-                crate::directory::MemberResolutionPurpose::CommitFresh,
+                nostr_directory::MemberResolutionPurpose::CommitFresh,
             )
             .await
             .unwrap();
@@ -9626,7 +9626,7 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .resolve_compatible_member_key_packages(
                 members.clone(),
                 &requirements,
-                crate::directory::MemberResolutionPurpose::CommitFresh,
+                nostr_directory::MemberResolutionPurpose::CommitFresh,
             )
             .await
             .err()
@@ -10689,7 +10689,7 @@ fn directory_search_uses_graph_cache_without_promoting_known_user() {
         .unwrap();
     cache
         .put_search_graph_record(
-            &directory::DirectorySearchGraphRecord {
+            &nostr_directory::DirectorySearchGraphRecord {
                 account_id_hex: graph_user.clone(),
                 npub: npub_for_account_id_lossy(&graph_user),
                 profile: Some(UserProfileMetadata {
@@ -11777,7 +11777,7 @@ fn contact_list_event(author_hex: &str, follows: &[String]) -> NostrTransportEve
 
 #[test]
 fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follows() {
-    use crate::directory::records::MAX_FOLLOW_LIST_ENTRIES;
+    use nostr_directory::records::MAX_FOLLOW_LIST_ENTRIES;
 
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -12099,7 +12099,7 @@ fn empty_follow_fetch_preserves_cached_edges() {
         key_package: None,
     };
 
-    let selected = directory::cached_or_unknown_follow_list(
+    let selected = nostr_directory::cached_or_unknown_follow_list(
         Some(cached),
         &[TransportEndpoint("wss://queried.example".to_owned())],
     );

@@ -8,16 +8,16 @@
 use cgka_traits::{MemberId, TransportEndpoint};
 use transport_nostr_peeler::NostrTransportEvent;
 
-use crate::directory::ids::parse_account_id_hex;
-use crate::directory::records::{
-    FetchedFollowList, UserProfileMetadata, followed_account_id, follows_from_tags,
-    profile_content_json,
-};
 use crate::ids::normalize_account_ids;
 use crate::key_package_records::publish_endpoints_from_bootstrap;
 use crate::{
     AccountRelayListBootstrap, AccountRelayListStatus, AppError, KIND_NOSTR_CONTACT_LIST,
     KIND_NOSTR_METADATA, MarmotApp, blocking_app_task,
+};
+use nostr_directory::ids::parse_account_id_hex;
+use nostr_directory::records::{
+    FetchedFollowList, UserProfileMetadata, followed_account_id, follows_from_tags,
+    profile_content_json,
 };
 
 impl MarmotApp {

@@ -1,4 +1,0 @@
-# Names production code under src/directory/ resolves in the rest of marmot-app
-# (step 3 of docs/marmot-architecture/review/brief-directory.md). One line per
-# file and target; `directory_crossings_tests` keeps this list exact, so it only
-# shrinks. The directory moves into nostr-directory when it is empty.

@@ -31,7 +31,7 @@
 //! Author profiles are not part of a preview; hosts read them through the
 //! cached-identity API and refresh them through the directory.
 
-use crate::directory::error::{DirectoryError, blocking_directory_task};
+use crate::error::{DirectoryError, blocking_directory_task};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -68,7 +68,7 @@ const MAX_QUERY_RELAYS: usize = 6;
 const MAX_FETCHED_EVENTS: usize = 64;
 /// Limit on the unattributed kind-5 query for an event ID. A full answer may
 /// hide the author's deletion behind other keys' requests.
-pub(crate) const EVENT_DELETION_QUERY_LIMIT: usize = 16;
+pub const EVENT_DELETION_QUERY_LIMIT: usize = 16;
 
 /// Local state of one referenced public event.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -618,7 +618,7 @@ fn invalid_batch(len: usize) -> DirectoryError {
 impl<R: DirectoryResources> Directory<R> {
     /// Network-free cached previews, one per reference in input order.
     /// Unparseable references are `Unsupported` rows, not errors.
-    pub(crate) fn cached_public_event_previews(
+    pub fn cached_public_event_previews(
         &self,
         account: &DirectoryAccount,
         references: &[String],
@@ -675,7 +675,7 @@ impl<R: DirectoryResources> Directory<R> {
 
     /// Refresh one reference from relays when it is missing or stale, then
     /// return its local state. A failed or empty fetch keeps prior content.
-    pub(crate) async fn resolve_public_event_preview(
+    pub async fn resolve_public_event_preview(
         &self,
         account: &DirectoryAccount,
         reference: &str,
@@ -786,7 +786,7 @@ impl<R: DirectoryResources> Directory<R> {
     }
 
     /// At most two safe reference hints, then the configured directory relays.
-    pub(crate) fn public_event_query_relays(
+    pub fn public_event_query_relays(
         &self,
         hints: Vec<TransportEndpoint>,
     ) -> Vec<TransportEndpoint> {
@@ -809,7 +809,7 @@ impl<R: DirectoryResources> Directory<R> {
         relays
     }
 
-    pub(crate) fn public_event_refresh_cooling_down(&self, key: &str) -> bool {
+    pub fn public_event_refresh_cooling_down(&self, key: &str) -> bool {
         self.state
             .public_event_refreshes
             .lock()
@@ -818,7 +818,7 @@ impl<R: DirectoryResources> Directory<R> {
             .is_some_and(|attempted| attempted.elapsed() < REFRESH_COOLDOWN)
     }
 
-    pub(crate) fn start_public_event_refresh_cooldown(&self, key: String) {
+    pub fn start_public_event_refresh_cooldown(&self, key: String) {
         let mut attempts = self
             .state
             .public_event_refreshes

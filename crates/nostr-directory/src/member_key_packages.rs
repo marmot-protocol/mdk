@@ -7,7 +7,7 @@
 //! evidence that a recipient still owns the private bundle. Unsupported batch
 //! queries fall back to bounded single-author relay requests.
 
-use crate::directory::error::{DirectoryError, MissingKeyPackageReason};
+use crate::error::{DirectoryError, MissingKeyPackageReason};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,7 +24,7 @@ use transport_nostr_adapter::{
 use super::Directory;
 use super::observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, ObservedUnit};
 use super::resources::DirectoryResources;
-use crate::directory::published_records::{
+use crate::published_records::{
     fresh_relay_list_status_from_records, merge_relay_list_status,
     preferred_fresh_key_package_from_records,
 };
@@ -45,7 +45,7 @@ const MEMBER_RESOLUTION_DEADLINE: Duration = Duration::from_secs(50);
 const KEY_PACKAGE_EVENTS_PER_AUTHOR: usize = 12;
 const RELAY_LIST_EVENTS_PER_AUTHOR: usize = 4;
 const MEMBER_PREWARM_CACHE_LIMIT: usize = 256;
-pub(crate) const MEMBER_PREWARM_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+pub const MEMBER_PREWARM_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone)]
 struct MemberKeyPackagePrewarmEntry {
@@ -75,29 +75,29 @@ mod tests {
 }
 
 #[derive(Default)]
-pub(crate) struct MemberKeyPackagePrewarmCache {
+pub struct MemberKeyPackagePrewarmCache {
     entries: HashMap<String, MemberKeyPackagePrewarmEntry>,
     order: VecDeque<String>,
 }
 
 impl MemberKeyPackagePrewarmCache {
     /// When `account_id_hex`'s entry was cached.
-    #[cfg(test)]
-    pub(crate) fn inserted_at(&self, account_id_hex: &str) -> Option<Instant> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inserted_at(&self, account_id_hex: &str) -> Option<Instant> {
         self.entries
             .get(account_id_hex)
             .map(|entry| entry.inserted_at)
     }
 
     /// Backdate `account_id_hex`'s entry, to test expiry and reuse.
-    #[cfg(test)]
-    pub(crate) fn set_inserted_at(&mut self, account_id_hex: &str, inserted_at: Instant) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_inserted_at(&mut self, account_id_hex: &str, inserted_at: Instant) {
         if let Some(entry) = self.entries.get_mut(account_id_hex) {
             entry.inserted_at = inserted_at;
         }
     }
 
-    pub(crate) fn get(&mut self, account_id_hex: &str) -> Option<AccountRelayListStatus> {
+    pub fn get(&mut self, account_id_hex: &str) -> Option<AccountRelayListStatus> {
         self.remove_expired();
         self.entries
             .get(account_id_hex)
@@ -135,7 +135,7 @@ impl MemberKeyPackagePrewarmCache {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MemberResolutionPurpose {
+pub enum MemberResolutionPurpose {
     Commit,
     CommitFresh,
     Prewarm,
@@ -155,9 +155,9 @@ pub struct MemberKeyPackagePrewarmSummary {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct MemberKeyPackageResolutionStats {
+pub struct MemberKeyPackageResolutionStats {
     pub(crate) requested_members: usize,
-    pub(crate) unique_members: usize,
+    pub unique_members: usize,
 }
 
 impl From<MemberKeyPackageResolutionStats> for MemberKeyPackagePrewarmSummary {
@@ -185,9 +185,9 @@ struct RelayListResolution {
     errors: Vec<(usize, DirectoryError)>,
 }
 
-pub(crate) struct ResolvedMemberKeyPackages {
-    pub(crate) key_packages: Vec<KeyPackage>,
-    pub(crate) stats: MemberKeyPackageResolutionStats,
+pub struct ResolvedMemberKeyPackages {
+    pub key_packages: Vec<KeyPackage>,
+    pub stats: MemberKeyPackageResolutionStats,
 }
 
 impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
@@ -212,7 +212,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
             .key_packages)
     }
 
-    pub(crate) async fn resolve_compatible_member_key_packages(
+    pub async fn resolve_compatible_member_key_packages(
         &self,
         member_refs: Vec<String>,
         requirements: &cgka_engine::key_package::KeyPackageRequirements,
@@ -264,7 +264,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         .await
     }
 
-    pub(crate) async fn resolve_member_key_packages_for_purpose(
+    pub async fn resolve_member_key_packages_for_purpose(
         &self,
         member_refs: Vec<String>,
         purpose: MemberResolutionPurpose,

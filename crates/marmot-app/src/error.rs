@@ -3,8 +3,8 @@ use marmot_account::{AccountError, AccountHomeError};
 
 use crate::MissingRelayListKind;
 use crate::app_telemetry::{SyncErrorClass, SyncFailureClassification};
-pub use crate::directory::error::MissingKeyPackageReason;
-use crate::directory::error::{
+pub use nostr_directory::error::MissingKeyPackageReason;
+use nostr_directory::error::{
     DirectoryError, ResourceError, sqlite_error_kind, storage_error_kind,
 };
 
@@ -470,12 +470,6 @@ impl From<AppError> for DirectoryError {
     fn from(error: AppError) -> Self {
         let kind = error.privacy_safe_kind();
         Self::Resource(ResourceError::from_app(error, kind))
-    }
-}
-
-impl From<AccountHomeError> for DirectoryError {
-    fn from(error: AccountHomeError) -> Self {
-        AppError::from(error).into()
     }
 }
 
@@ -1036,7 +1030,7 @@ mod directory_error_tests {
 
     use super::AppError;
     use crate::MissingRelayListKind;
-    use crate::directory::error::{DirectoryError, MissingKeyPackageReason};
+    use nostr_directory::error::{DirectoryError, MissingKeyPackageReason};
 
     /// Each case's `AppError` is built the way the directory built it before.
     fn cases() -> Vec<(DirectoryError, AppError)> {
@@ -1148,7 +1142,7 @@ mod directory_error_tests {
                 AppError::from(AccountHomeError::SecretNotFound("alice".into())),
             ),
             (
-                AccountHomeError::SecretStoreUnavailable("keychain".into()).into(),
+                AppError::from(AccountHomeError::SecretStoreUnavailable("keychain".into())).into(),
                 AppError::from(AccountHomeError::SecretStoreUnavailable("keychain".into())),
             ),
             // closed app storage,

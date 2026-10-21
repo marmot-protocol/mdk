@@ -1,5 +1,5 @@
 //! `MarmotApp`'s public directory methods, as one-line delegates to
-//! [`Directory`](crate::directory::Directory). They keep returning `AppError`
+//! [`Directory`](nostr_directory::Directory). They keep returning `AppError`
 //! until callers move to `app.directory()` and these go (PR 7 of
 //! `docs/marmot-architecture/review/brief-directory.md`).
 
@@ -12,16 +12,18 @@ use storage_sqlite::PublicDirectoryUserRecord;
 use storage_sqlite::SqliteSharedStorage;
 use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 
-use crate::directory::DirectoryCache;
-use crate::directory::error::DirectoryError;
-use crate::directory::records::{FetchedFollowList, LocalAccountNames};
+#[cfg(test)]
+use crate::UserDirectoryLocalAccount;
 use crate::{
     AccountRelayListStatus, AppError, CachedIdentityProjection, FetchedKeyPackage, MarmotApp,
     MemberKeyPackagePrewarmSummary, UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch,
     UserDirectorySearchResult, UserProfileMetadata, UserSearchParams, UserSearchSubscription,
 };
+use nostr_directory::DirectoryCache;
 #[cfg(test)]
-use crate::{DirectoryFreshness, UserDirectoryLocalAccount};
+use nostr_directory::DirectoryFreshness;
+use nostr_directory::error::DirectoryError;
+use nostr_directory::records::{FetchedFollowList, LocalAccountNames};
 
 impl MarmotApp {
     /// Search all cached public identities, independent of social-graph reachability.

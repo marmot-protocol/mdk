@@ -992,7 +992,7 @@ async fn invite_recovery_preserves_incompatible_errors_for_empty_and_failed_supp
             .resolve_compatible_member_key_packages(
                 vec![account.account_id_hex.clone()],
                 &requirements,
-                crate::directory::MemberResolutionPurpose::CommitFresh,
+                nostr_directory::MemberResolutionPurpose::CommitFresh,
             )
             .await;
         assert!(matches!(

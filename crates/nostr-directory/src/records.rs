@@ -13,18 +13,18 @@ use std::io::{self, Write};
 use serde::{Deserialize, Serialize};
 use storage_sqlite::PublicDirectoryUserRecord;
 
-use crate::directory::error::DirectoryError;
-use crate::directory::ids::parse_account_id_hex;
+use crate::error::DirectoryError;
+use crate::ids::parse_account_id_hex;
 use crate::{
     AccountRelayListStatus, DirectoryFreshness, DirectorySelection, sort_directory_records,
 };
 use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 
-pub(crate) const KIND_NOSTR_METADATA: u64 = 0;
-pub(crate) const KIND_NOSTR_CONTACT_LIST: u64 = 3;
+pub const KIND_NOSTR_METADATA: u64 = 0;
+pub const KIND_NOSTR_CONTACT_LIST: u64 = 3;
 /// NIP-51 mute list, which carries an account's block list. The sync worker
 /// subscribes to it for local accounts and hands each one to the app.
-pub(crate) const MUTE_LIST_KIND: u64 = 10000;
+pub const MUTE_LIST_KIND: u64 = 10000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserDirectoryRecord {
@@ -49,9 +49,9 @@ pub struct UserDirectoryLocalAccount {
     pub local_signing: bool,
 }
 
-pub(crate) struct LocalAccountNames {
-    pub(crate) directory: UserDirectoryLocalAccount,
-    pub(crate) label: String,
+pub struct LocalAccountNames {
+    pub directory: UserDirectoryLocalAccount,
+    pub label: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,7 +104,7 @@ pub struct CachedIdentityProjection {
     pub resolved_name: Option<String>,
 }
 
-pub(crate) fn display_name_for_profile(profile: Option<&UserProfileMetadata>) -> Option<String> {
+pub fn display_name_for_profile(profile: Option<&UserProfileMetadata>) -> Option<String> {
     let profile = profile?;
     profile
         .display_name
@@ -190,30 +190,30 @@ pub struct DirectoryKeyPackage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FetchedFollowList {
-    pub(crate) follows: Vec<String>,
-    pub(crate) source_relays: Vec<String>,
+pub struct FetchedFollowList {
+    pub follows: Vec<String>,
+    pub source_relays: Vec<String>,
 }
 
 /// An account's current kind-3 event, kept whole so a follow or unfollow can
 /// republish it with one `p` tag changed and everything else verbatim.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CurrentFollowList {
+pub struct CurrentFollowList {
     /// The parsed follows, capped at [`MAX_FOLLOW_LIST_ENTRIES`].
-    pub(crate) follow_list: FetchedFollowList,
-    pub(crate) tags: Vec<Vec<String>>,
-    pub(crate) content: String,
+    pub follow_list: FetchedFollowList,
+    pub tags: Vec<Vec<String>>,
+    pub content: String,
 }
 
 impl CurrentFollowList {
     /// Whether parsing stopped at [`MAX_FOLLOW_LIST_ENTRIES`], so the parsed
     /// follows may be missing some of the event's.
-    pub(crate) fn reached_cap(&self) -> bool {
+    pub fn reached_cap(&self) -> bool {
         self.follow_list.follows.len() >= MAX_FOLLOW_LIST_ENTRIES
     }
 }
 
-pub(crate) fn public_directory_user_record(
+pub fn public_directory_user_record(
     entry: &UserDirectoryRecord,
 ) -> Result<PublicDirectoryUserRecord, DirectoryError> {
     let mut relay_lists = entry.relay_lists.clone();
@@ -612,7 +612,7 @@ pub(crate) struct UserRecordMatch {
 impl UserRecordMatch {
     /// Ranking key: quality first, then which field matched. Sorting by this
     /// orders best match first.
-    pub(crate) fn rank(&self) -> (MatchQuality, MatchedField) {
+    pub fn rank(&self) -> (MatchQuality, MatchedField) {
         (self.quality, self.field)
     }
 }
@@ -658,7 +658,7 @@ pub(crate) fn user_record_match(
         .min_by_key(UserRecordMatch::rank)
 }
 
-pub(crate) fn profile_content_json(profile: &UserProfileMetadata) -> serde_json::Value {
+pub fn profile_content_json(profile: &UserProfileMetadata) -> serde_json::Value {
     let mut value = serde_json::Map::new();
     for (key, extra_value) in &profile.extra {
         if !is_known_profile_field(key) {
@@ -762,7 +762,7 @@ fn latest_follow_list_record(
 /// many follows to a relay), so we bound the follows stored from any single
 /// list to keep a malicious mega-list from bloating the directory/search cache.
 /// This is generous for legitimate follow lists while capping the worst case.
-pub(crate) const MAX_FOLLOW_LIST_ENTRIES: usize = 2048;
+pub const MAX_FOLLOW_LIST_ENTRIES: usize = 2048;
 
 pub(crate) fn follow_list_from_record(record: RelayEventRecord) -> FetchedFollowList {
     FetchedFollowList {
@@ -773,7 +773,7 @@ pub(crate) fn follow_list_from_record(record: RelayEventRecord) -> FetchedFollow
 
 /// The distinct, sorted account ids a kind-3 event's `p` tags follow, capped
 /// at [`MAX_FOLLOW_LIST_ENTRIES`].
-pub(crate) fn follows_from_tags(tags: &[Vec<String>]) -> Vec<String> {
+pub fn follows_from_tags(tags: &[Vec<String>]) -> Vec<String> {
     let mut follows = BTreeSet::new();
     for tag in tags {
         if follows.len() >= MAX_FOLLOW_LIST_ENTRIES {
@@ -787,7 +787,7 @@ pub(crate) fn follows_from_tags(tags: &[Vec<String>]) -> Vec<String> {
 }
 
 /// The account id a kind-3 `p` tag follows, if the tag is one.
-pub(crate) fn followed_account_id(tag: &[String]) -> Option<String> {
+pub fn followed_account_id(tag: &[String]) -> Option<String> {
     if tag.first().is_none_or(|name| name != "p") {
         return None;
     }
