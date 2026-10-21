@@ -47,10 +47,10 @@ use crate::client::epoch_stall::{BackfillDecision, EPOCH_STALL_BACKFILL_THRESHOL
 use crate::conversions::{
     app_group_from_stored_group, stored_components_from_app_group, stored_group_from_app_group,
 };
+use crate::directory::ids::npub_for_account_id_lossy;
 use crate::directory::records::{
     FetchedFollowList, profile_content_json, public_directory_user_record,
 };
-use crate::ids::npub_for_account_id_lossy;
 use crate::key_package_records::{
     relay_list_queries, relay_list_status_from_records, require_key_package_tag,
     require_multi_value_key_package_tag_matches,

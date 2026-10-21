@@ -206,12 +206,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `src/profile_publication.rs`. `src/directory_crossings_tests.rs` lists every name `src/directory/` still resolves in
   the rest of the crate in `src/directory/crossings.txt`; a change may shrink that list, never grow it without saying
   why.
-- Keep stateless account relay-list and KeyPackage parsing/validation (relay-list status, KeyPackage tag/metadata
-  validation, fresh-vs-cached reconciliation, record merge, publish-endpoint selection) in
-  `src/key_package_records.rs`. They hold no `MarmotApp` state.
+- Keep stateless relay-list and KeyPackage handling for other accounts (relay-list status, KeyPackage tag/metadata
+  validation, fresh-vs-cached reconciliation, ranking and selection, revocation evidence) and the directory-record
+  selection primitives (`DirectoryFreshness`, `DirectorySelection`, `sort_directory_records`) in
+  `src/directory/published_records.rs`, and the Nostr account-id helpers in `src/directory/ids.rs`. They hold no
+  `MarmotApp` state. The account's own KeyPackage inventory, record merge and publish-endpoint selection stay in
+  `src/key_package_records.rs`, and the group-id helpers in `src/ids.rs`; both re-export the moved items so callers keep
+  their paths.
 - Keep the crate root focused on app construction, shared state, storage/projector wiring, account relay-list helpers,
-  the shared directory-record selection primitives (`DirectoryFreshness`, `DirectorySelection`, `sort_directory_records`)
-  reused by `key_package_records.rs`, and public re-exports.
+  and public re-exports.
 - Keep CLI/TUI presentation out of this crate.
 - Keep the Nostr user directory app-facing and pubkey-keyed. It may cache local-account links, profile metadata, follow
   lists, relay lists, and KeyPackages. Web-of-trust search may traverse the live follow graph, but traversal is bounded
@@ -351,8 +354,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `moderation_reports/tests.rs`), `history_notices.rs` (public notice DTOs and opaque id codec),
   `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
-  `nostr_verification.rs` (stateless public-event verification), `public_event_preview.rs` (verified previews of
-  `nostr:` references, stored in the directory cache; tests in `public_event_preview/tests.rs`), `profile_pseudonyms.rs` (cosmetic display names; not a
+  `nostr_verification.rs` (stateless public-event verification), `directory/previews.rs` (verified previews of
+  `nostr:` references, stored in the directory cache; tests in `directory/previews/tests.rs`), `profile_pseudonyms.rs` (cosmetic display names; not a
   security primitive), `publisher_sequences.rs` (QUIC preview publisher lifecycle state), `agent_streams.rs` (agent
   stream watch DTOs and manager), `root_runtime_lease.rs` (cross-process exclusive root lease), `app_telemetry.rs` +
   `app_telemetry/` (aggregate app-performance telemetry; same privacy model as relay telemetry), `product_analytics/`

@@ -818,7 +818,7 @@ fn unix_now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::npub_for_account_id_lossy;
+    use crate::directory::ids::npub_for_account_id_lossy;
     use crate::{AccountRelayListStatus, UserProfileMetadata};
 
     #[test]

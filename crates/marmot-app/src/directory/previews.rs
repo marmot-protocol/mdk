@@ -784,7 +784,9 @@ impl MarmotApp {
 
     /// At most two safe reference hints, then the configured directory relays.
     fn public_event_query_relays(&self, hints: Vec<TransportEndpoint>) -> Vec<TransportEndpoint> {
-        let hints = self.retain_safe_discovered_endpoints(hints, "public event hint");
+        let hints = self
+            .relay_plane
+            .retain_safe_discovered_endpoints(hints, "public event hint");
         let mut relays = Vec::new();
         for relay in hints
             .into_iter()
@@ -828,5 +830,4 @@ impl MarmotApp {
 }
 
 #[cfg(test)]
-#[path = "public_event_preview/tests.rs"]
 mod tests;

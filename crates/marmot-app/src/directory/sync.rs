@@ -10,11 +10,11 @@ use cgka_traits::TransportEndpoint;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
-use crate::{
-    AppError, KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
-    KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, MarmotRelayPlane, blocking_app_task,
+use crate::{AppError, KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, blocking_app_task};
+use transport_nostr::{DirectorySyncBatch, DirectorySyncPlan, MarmotRelayPlane};
+use transport_nostr_adapter::{
+    KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
 };
-use transport_nostr::{DirectorySyncBatch, DirectorySyncPlan};
 
 pub(crate) const DIRECTORY_SYNC_USER_BATCH_SIZE: usize = 200;
 
