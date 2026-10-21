@@ -1517,7 +1517,7 @@ impl AppClient {
         // The job counts against the process pool until admission and its
         // checkpoint finish, not only while the network request runs.
         let settled = self
-            .admit_comparison_until(grant, execution, result, control)
+            .admit_comparison_until(grant, execution, result, control, None)
             .await;
         drop(credit);
         settled
@@ -1540,11 +1540,12 @@ impl AppClient {
     /// the steady-state worker runs one turn per loop instead.
     pub(crate) async fn admit_comparison_inline(
         &mut self,
+        on_progress: Option<&CommittedSyncProgress<'_>>,
         grant: AttemptGrant,
         execution: ComparisonExecution,
         network: ComparisonNetworkResult,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
-        self.admit_comparison_until(grant, execution, network, None)
+        self.admit_comparison_until(grant, execution, network, None, on_progress)
             .await
     }
 
@@ -1554,6 +1555,7 @@ impl AppClient {
         mut execution: ComparisonExecution,
         network: ComparisonNetworkResult,
         control: Option<&FullHistoryRepairControl<'_>>,
+        on_progress: Option<&CommittedSyncProgress<'_>>,
     ) -> Result<EpochBackfillRunOutcome, AppError> {
         let mut admission = match self
             .accept_comparison_network(&grant, &mut execution, network)
@@ -1583,10 +1585,17 @@ impl AppClient {
                     admission.pending.clear();
                     break;
                 }
-                match self
+                let turn = self
                     .admit_comparison_turn(&grant, &mut execution, admission)
-                    .await
+                    .await;
+                if turn.is_ok()
+                    && let Some(on_progress) = on_progress
                 {
+                    let mut committed = admission.take_committed_summary();
+                    committed.merge(self.take_pending_applied_sync_summary());
+                    on_progress(self, committed);
+                }
+                match turn {
                     Ok(true) => break,
                     Ok(false) => {
                         tokio::select! {
@@ -2134,6 +2143,7 @@ mod tests {
         let result = fixture
             .client
             .admit_comparison_inline(
+                None,
                 grant,
                 execution,
                 ComparisonNetworkResult {
@@ -2224,6 +2234,7 @@ mod tests {
         let result = fixture
             .client
             .admit_comparison_inline(
+                None,
                 grant,
                 execution,
                 network_result(route.clone(), Some([8; 32])),
@@ -2278,7 +2289,12 @@ mod tests {
             .unwrap();
         let result = fixture
             .client
-            .admit_comparison_inline(grant, attempt, network_result(route.clone(), Some([8; 32])))
+            .admit_comparison_inline(
+                None,
+                grant,
+                attempt,
+                network_result(route.clone(), Some([8; 32])),
+            )
             .await
             .unwrap();
         assert!(matches!(result, EpochBackfillRunOutcome::Deferred));
@@ -2300,7 +2316,7 @@ mod tests {
         );
         fixture
             .client
-            .finish_deferred_comparison_sync()
+            .finish_deferred_comparison_sync(None)
             .await
             .unwrap();
         assert_eq!(
@@ -2361,6 +2377,7 @@ mod tests {
         let result = fixture
             .client
             .admit_comparison_inline(
+                None,
                 grant,
                 attempt,
                 network_result(TransportReconciliationRoute::Inbox, Some([8; 32])),
@@ -2410,7 +2427,12 @@ mod tests {
         );
         let result = fixture
             .client
-            .admit_comparison_inline(grant, attempt, network_result(route.clone(), Some([8; 32])))
+            .admit_comparison_inline(
+                None,
+                grant,
+                attempt,
+                network_result(route.clone(), Some([8; 32])),
+            )
             .await
             .unwrap();
         assert!(matches!(result, EpochBackfillRunOutcome::Deferred));
@@ -2445,7 +2467,12 @@ mod tests {
         let attempt = fixture.client.begin_comparison_grant(&grant).await.unwrap();
         let result = fixture
             .client
-            .admit_comparison_inline(grant, attempt, network_result(route.clone(), Some([8; 32])))
+            .admit_comparison_inline(
+                None,
+                grant,
+                attempt,
+                network_result(route.clone(), Some([8; 32])),
+            )
             .await
             .unwrap();
         assert!(matches!(result, EpochBackfillRunOutcome::Incomplete(_)));
@@ -3042,7 +3069,7 @@ mod tests {
             );
             fixture
                 .client
-                .admit_comparison_inline(grant, execution, network)
+                .admit_comparison_inline(None, grant, execution, network)
                 .await
                 .unwrap();
             drop(credit);
@@ -3594,7 +3621,7 @@ mod tests {
             let (credit, network) = job.wait().await.unwrap();
             fixture
                 .client
-                .admit_comparison_inline(grant, execution, network)
+                .admit_comparison_inline(None, grant, execution, network)
                 .await
                 .unwrap();
             drop(credit);
@@ -3999,6 +4026,7 @@ mod tests {
         let result = fixture
             .client
             .admit_comparison_inline(
+                None,
                 grant,
                 execution,
                 fetched(
@@ -4032,6 +4060,7 @@ mod tests {
         let result = fixture
             .client
             .admit_comparison_inline(
+                None,
                 grant,
                 execution,
                 fetched(route.clone(), vec![candidate_for_route(group_route)]),
@@ -4225,7 +4254,12 @@ mod tests {
         // This event routes to no route of the account, so it is not admitted.
         let result = fixture
             .client
-            .admit_comparison_inline(grant, execution, fetched(route.clone(), vec![candidate()]))
+            .admit_comparison_inline(
+                None,
+                grant,
+                execution,
+                fetched(route.clone(), vec![candidate()]),
+            )
             .await
             .unwrap();
         assert!(matches!(result, EpochBackfillRunOutcome::Incomplete(_)));
@@ -4311,7 +4345,7 @@ mod tests {
         ))));
         fixture
             .client
-            .admit_comparison_inline(grant, attempt, network)
+            .admit_comparison_inline(None, grant, attempt, network)
             .await
             .unwrap();
         assert_eq!(
@@ -4632,6 +4666,7 @@ mod tests {
         fixture
             .client
             .admit_comparison_inline(
+                None,
                 grant,
                 execution,
                 fetched(
@@ -4712,6 +4747,7 @@ mod tests {
         let result = fixture
             .client
             .admit_comparison_inline(
+                None,
                 grant,
                 attempt,
                 fetched(route, vec![candidate(), candidate()]),
@@ -4777,7 +4813,13 @@ mod tests {
         };
         fixture
             .client
-            .admit_comparison_until(grant, execution, fetched(route, events), Some(&control))
+            .admit_comparison_until(
+                grant,
+                execution,
+                fetched(route, events),
+                Some(&control),
+                None,
+            )
             .await
             .unwrap();
         let app = fixture.client.app.clone();
@@ -4829,6 +4871,7 @@ mod tests {
         fixture
             .client
             .admit_comparison_inline(
+                None,
                 grant,
                 execution,
                 ComparisonNetworkResult {
@@ -4895,7 +4938,7 @@ mod tests {
             };
             fixture
                 .client
-                .admit_comparison_inline(grant, execution, network)
+                .admit_comparison_inline(None, grant, execution, network)
                 .await
                 .unwrap();
             let comparison = fixture.storage.app_storage().recovery_comparison().unwrap();
@@ -4970,6 +5013,7 @@ mod tests {
         fixture
             .client
             .admit_comparison_inline(
+                None,
                 grant,
                 execution,
                 ComparisonNetworkResult {
@@ -5016,6 +5060,7 @@ mod tests {
         fixture
             .client
             .admit_comparison_inline(
+                None,
                 grant,
                 execution,
                 ComparisonNetworkResult {

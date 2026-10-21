@@ -30,11 +30,15 @@ async fn wait_for_message(
     .unwrap_or_else(|_| panic!("{account_label} never received {plaintext:?}"));
 }
 
-async fn start_runtime(app: &MarmotApp) -> MarmotAppRuntime {
+async fn start_runtime(
+    app: &MarmotApp,
+    relay: Arc<ScriptedPushRelayClient>,
+) -> (MarmotAppRuntime, ScriptedEosePump) {
+    let eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();
-    runtime
+    (runtime, eose)
 }
 
 async fn wait_for_joined(
@@ -72,7 +76,7 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
     remember_test_member_inbox(&app, &alice.account_id_hex, "wss://relay.example");
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
 
-    let runtime = start_runtime(&app).await;
+    let (runtime, eose) = start_runtime(&app, relay.clone()).await;
     let mut events = runtime.subscribe();
     let bob_members = std::slice::from_ref(&bob.account_id_hex);
     let broken = runtime
@@ -99,6 +103,7 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
         assert!(runtime.delete_group_local("alice", &broken).await.unwrap());
     }
     runtime.shutdown().await;
+    drop(eose);
 
     // Two ambiguous apply snapshots make alice's next open quarantine the
     // group with the production reason, without touching its stored state.
@@ -114,7 +119,7 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
         // A restart is a fresh process: new app, relay plane and workers.
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
-        let runtime = start_runtime(&app).await;
+        let (runtime, _eose) = start_runtime(&app, relay.clone()).await;
         let mut events = runtime.subscribe();
         let quarantined = runtime.quarantined_groups("alice").await.unwrap();
         assert_eq!(quarantined.len(), 1, "pass {pass}");
@@ -190,7 +195,7 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
     // while it was quarantined is applied, restoring a deleted chat.
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
-    let runtime = start_runtime(&app).await;
+    let (runtime, _eose) = start_runtime(&app, relay.clone()).await;
     let mut events = runtime.subscribe();
     for snapshot in SNAPSHOTS {
         storage.release_group_snapshot(&broken, snapshot).unwrap();

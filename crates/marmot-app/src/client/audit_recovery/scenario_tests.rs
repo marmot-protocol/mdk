@@ -508,12 +508,21 @@ fn cursor_rows_record_settled_advances_and_only_large_live_promotions() {
             .relay_plane
             .route_account_delivery_for_test(exposed);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while fixture.client.adapter.delivery_loss_blocks_cursor() {
+            // Live promotion replaced the REQ; its current peers must finish too.
+            while fixture.client.adapter.delivery_loss_blocks_cursor()
+                || !fixture
+                    .client
+                    .adapter
+                    .account_subscription_eose()
+                    .await
+                    .complete()
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("the spill write becomes durable");
+        .expect("the spill is durable and the replacement replay is ready");
+        fixture.client.synchronize_native_replay().await.unwrap();
 
         // A drain checkpoint records its advance with that count.
         fixture.client.state.last_transport_timestamp = Some(cursor_before + 5_000);

@@ -601,6 +601,7 @@ async fn queued_publication_updates_live_window_before_later_publish_finishes() 
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://progress.example")
         .with_test_relay_client(relay.clone());
+    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let (client, group, ids) = queued_messages(&app).await;
     drop(client);
     struct HeldSchedule(String);
@@ -647,54 +648,56 @@ async fn queued_publication_updates_live_window_before_later_publish_finishes() 
     let published_before = relay.published_events.lock().unwrap().len();
     relay.block_next_publish();
     drop(held_schedule);
-    // Wake the worker after releasing the test-only scheduled-pass gate.
-    runtime
-        .group_recovery_status("alice", &group)
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), relay.wait_for_blocked_publish())
-        .await
-        .unwrap();
-    relay.block_next_publish();
-    relay.release_publish();
-    tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_publish())
-        .await
-        .unwrap();
-    assert_eq!(
-        relay.published_events.lock().unwrap().len(),
-        published_before + 1
-    );
-    let expected_source = relay
-        .published_events
-        .lock()
-        .unwrap()
-        .last()
-        .unwrap()
-        .id
-        .clone();
-    let committed = app
-        .timeline_message("alice", &hex::encode(group.as_slice()), &ids[0])
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        committed.source_message_id_hex.as_ref(),
-        Some(&expected_source)
-    );
-    let observed = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let snapshot = window.recv().await.unwrap().unwrap();
-            if snapshot.page.page().messages.iter().any(|row| {
-                row.message_id_hex == ids[0]
-                    && row.source_message_id_hex.as_ref() == Some(&expected_source)
-            }) {
-                break snapshot;
+    // The due pass may start before the wake command is answered. Drive the
+    // relay holds concurrently instead of waiting on that command behind them.
+    let observe = async {
+        tokio::time::timeout(Duration::from_secs(10), relay.wait_for_blocked_publish())
+            .await
+            .unwrap();
+        relay.block_next_publish();
+        relay.release_publish();
+        tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_publish())
+            .await
+            .unwrap();
+        assert_eq!(
+            relay.published_events.lock().unwrap().len(),
+            published_before + 1
+        );
+        let expected_source = relay
+            .published_events
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .id
+            .clone();
+        let committed = app
+            .timeline_message("alice", &hex::encode(group.as_slice()), &ids[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            committed.source_message_id_hex.as_ref(),
+            Some(&expected_source)
+        );
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = window.recv().await.unwrap().unwrap();
+                if snapshot.page.page().messages.iter().any(|row| {
+                    row.message_id_hex == ids[0]
+                        && row.source_message_id_hex.as_ref() == Some(&expected_source)
+                }) {
+                    break snapshot;
+                }
             }
-        }
-    })
-    .await;
-    // Release and close even on the expected RED timeout.
-    relay.release_publish();
+        })
+        .await;
+        // Release even on a consumer timeout so the queued wake can finish.
+        relay.release_publish();
+        observed
+    };
+    let (wake, observed) = tokio::join!(runtime.group_recovery_status("alice", &group), observe,);
     runtime.shutdown_and_close().await.unwrap();
+    wake.unwrap();
     let observed = observed.expect("live conversation must show the first accepted source before the later publication is released");
     assert!(observed.presentation.header.epoch.is_some());
     assert!(observed.presentation.header.capabilities.can_send);
@@ -721,6 +724,7 @@ async fn durable_send_interrupts_due_secondary_retry_and_updates_live_window() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://progress.example")
         .with_test_relay_client(relay.clone());
+    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     let group = client
         .create_group_with_options(

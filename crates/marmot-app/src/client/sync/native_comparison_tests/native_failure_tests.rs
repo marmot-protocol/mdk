@@ -311,7 +311,7 @@ async fn mixed_error_keeps_input() {
     assert!(
         fixture
             .receiver
-            .admit_comparison_inline(grant, execution, network)
+            .admit_comparison_inline(None, grant, execution, network)
             .await
             .is_err()
     );

@@ -9,8 +9,8 @@ use transport_nostr_adapter::ReplayBatchTake;
 
 use super::comparison_job::MAX_COMPARISON_ADMISSION_PER_TURN;
 use crate::AppError;
-use crate::client::AppClient;
 use crate::client::delivery_spill::ACCOUNT_DELIVERY_SPILL_LIMITS;
+use crate::client::{AppClient, AppPerformanceOperation};
 
 pub(super) enum NativeFrontier {
     Ready,
@@ -184,10 +184,27 @@ impl AppClient {
         };
         let timestamp = delivery.message.timestamp.0;
         let result = async {
-            let (summary, settled) = self.admit_recovered_delivery(delivery).await?;
+            let started = std::time::Instant::now();
+            let admitted = self.admit_recovered_delivery(delivery).await;
+            if !matches!(&admitted, Ok((_, super::RecoveredDelivery::AlreadyHeld)))
+                && let Some(telemetry) = &self.runtime_telemetry
+            {
+                telemetry.record(
+                    AppPerformanceOperation::InboundDeliveryProjection,
+                    started.elapsed(),
+                    admitted.is_ok(),
+                );
+            }
+            let (summary, settled) = admitted?;
             let ingested = matches!(settled, super::RecoveredDelivery::Ingested { .. });
             self.recovery_owner.native_receive_pending |= ingested;
-            self.pending_applied_sync_summary.merge(summary);
+            if self.pending_applied_sync_summary == crate::SyncSummary::default() {
+                // Direct clients retain the full prefix across ACK waits. Move
+                // its buffer back instead of recopying it for every frame.
+                self.pending_applied_sync_summary = summary;
+            } else {
+                self.pending_applied_sync_summary.merge(summary);
+            }
             if let Some(&seq) = self.recovery_owner.retained_spill.get(&delivery.message.id) {
                 let event_id = hex::encode(delivery.message.id.as_slice());
                 self.try_settle_spill_row(seq, &event_id)?;

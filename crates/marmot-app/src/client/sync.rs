@@ -48,6 +48,9 @@ mod native_ingress;
 pub(crate) use comparison_job::TestComparisonActivityWitness;
 pub(crate) use comparison_job::{ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob};
 
+/// The worker consumes committed output; direct clients retain full summaries.
+pub(crate) type CommittedSyncProgress<'a> = dyn Fn(&AppClient, SyncSummary) + Send + Sync + 'a;
+
 pub(crate) enum PendingRecoverySelection {
     NotPending,
     Deferred,
@@ -1716,7 +1719,7 @@ impl AppClient {
         }
         // Network cooldown never withholds already queued input or engine
         // events. Receiving existing subscriptions is not a new acquisition.
-        let mut summary = self.sync_sdk_relay().await?;
+        let mut summary = self.sync_sdk_relay(None).await?;
         use crate::runtime::account_worker::recovery_credits;
         let state_persist = |summary: SyncSummary, error| {
             ClassifiedSyncFailure::at_stage(summary, error, SyncFailureStage::StatePersist)
@@ -1749,7 +1752,7 @@ impl AppClient {
             // before the inventory freezes, so the job does not fetch it again.
             self.pending_applied_sync_summary
                 .merge(std::mem::take(&mut summary));
-            let drained = self.sync_sdk_relay().await;
+            let drained = self.sync_sdk_relay(None).await;
             self.prepend_pending_applied_summary(&mut summary);
             match drained {
                 Ok(drained) => summary.merge(drained),
@@ -1916,8 +1919,9 @@ impl AppClient {
     /// without rebuilding any subscription or replaying the account backlog.
     pub(crate) async fn finish_deferred_comparison_sync(
         &mut self,
+        on_progress: Option<&CommittedSyncProgress<'_>>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        let summary = self.sync_sdk_relay().await?;
+        let summary = self.sync_sdk_relay(on_progress).await?;
         self.finish_prepared_sync_summary(summary).await
     }
 
@@ -2581,6 +2585,9 @@ impl AppClient {
 
     /// Transfer older output before any caller-owned newer deltas, exactly once.
     fn prepend_pending_applied_summary(&mut self, summary: &mut SyncSummary) {
+        if self.pending_applied_sync_summary == SyncSummary::default() {
+            return;
+        }
         let mut older = self.take_pending_applied_sync_summary();
         older.merge(std::mem::take(summary));
         *summary = older;
@@ -3166,7 +3173,10 @@ impl AppClient {
     /// Drain the transport for an ordinary floored sync: ingest what is waiting
     /// and return as soon as the relays go quiet. A loss control record ends
     /// the drain once its loss is durable; recovery settles it by comparison.
-    async fn sync_sdk_relay(&mut self) -> Result<SyncSummary, ClassifiedSyncFailure> {
+    async fn sync_sdk_relay(
+        &mut self,
+        on_progress: Option<&CommittedSyncProgress<'_>>,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let mut counts = DrainCounts::default();
         let mut summary = std::mem::take(&mut self.pending_failed_sync_summary);
         summary.merge(self.take_pending_applied_sync_summary());
@@ -3205,15 +3215,23 @@ impl AppClient {
                         .await);
                 }
             };
-            summary.merge(self.take_pending_applied_sync_summary());
+            let committed = self.take_pending_applied_sync_summary();
+            if let Some(on_progress) = on_progress {
+                // Native admission already checkpointed these frames. Keep
+                // ordinary, not-yet-checkpointed drain output in `summary`.
+                on_progress(self, committed);
+            } else {
+                summary.merge(committed);
+            }
             let wait = if first_wait {
                 SDK_FIRST_SYNC_WAIT
             } else {
                 SDK_DRAIN_WAIT
             };
             first_wait = false;
-            self.pending_applied_sync_summary
-                .merge(std::mem::take(&mut summary));
+            // The pending buffer was just taken. Park the prefix without
+            // reallocating and moving all prior output on every bounded turn.
+            std::mem::swap(&mut self.pending_applied_sync_summary, &mut summary);
             let receive = async {
                 loop {
                     match timeout(EOSE_QUIET_WAIT, self.adapter.receive_account_delivery()).await {
@@ -3288,8 +3306,7 @@ impl AppClient {
                     .config
                     .dev_fail_sync_before_delivery
                     .is_some_and(|limit| counts.deliveries >= limit);
-            self.pending_applied_sync_summary
-                .merge(std::mem::take(&mut summary));
+            std::mem::swap(&mut self.pending_applied_sync_summary, &mut summary);
             let receipts = match self.transport_receipts() {
                 Ok(receipts) => receipts,
                 Err(error) => {
@@ -3311,6 +3328,9 @@ impl AppClient {
                 self.record_durable_transport_reconciliation_delivery(&delivery);
                 self.adapter.release_account_delivery(&delivery.message.id);
                 counts.skipped = counts.skipped.saturating_add(1);
+                // A skipped receive must not leave uncheckpointed ordinary
+                // output in the next native turn's committed-output buffer.
+                self.prepend_pending_applied_summary(&mut summary);
                 continue;
             }
             if fail_before_delivery {
@@ -3372,7 +3392,13 @@ impl AppClient {
                 self.remember_seen_event(event_id);
             }
             counts.deliveries = counts.deliveries.saturating_add(1);
-            summary.merge(delivery_summary);
+            if summary == SyncSummary::default() {
+                // Ingest prepended the parked prefix to this delivery. Keep
+                // that allocation instead of moving the full pass back out.
+                summary = delivery_summary;
+            } else {
+                summary.merge(delivery_summary);
+            }
             routes_dirty |= ingested.routes_dirty;
             // A cancelled drain cannot replay an already-applied commit's
             // group effects. Save them before waiting for another delivery.
@@ -7138,7 +7164,7 @@ mod live_cursor_checkpoint_tests {
             .await;
             fixture
                 .client
-                .sync_sdk_relay()
+                .sync_sdk_relay(None)
                 .await
                 .unwrap_or_else(|_| panic!("the drain completes"));
             retry_drain_cursor(&mut fixture, cursor_before + 4_000).await;
@@ -7172,7 +7198,7 @@ mod live_cursor_checkpoint_tests {
             let cursor_before = fixture.cursor_before;
             let older = queue_newest_first_with_a_failing_older(&mut fixture).await;
             assert!(
-                fixture.client.sync_sdk_relay().await.is_err(),
+                fixture.client.sync_sdk_relay(None).await.is_err(),
                 "the older delivery's ingest fails the drain"
             );
             assert_eq!(
@@ -9791,7 +9817,7 @@ mod tests {
         client.sync_runtime_groups().await.unwrap();
         tokio::time::pause();
         let started = tokio::time::Instant::now();
-        client.sync_sdk_relay().await.unwrap();
+        client.sync_sdk_relay(None).await.unwrap();
         assert!(started.elapsed() >= crate::SDK_FIRST_SYNC_WAIT);
         assert!(started.elapsed() <= crate::SDK_FIRST_SYNC_WAIT + Duration::from_millis(1));
         for subscription in relay.accepted_subscriptions() {
@@ -9803,7 +9829,7 @@ mod tests {
         }
         assert!(client.adapter.account_subscription_eose().await.complete());
         let started = tokio::time::Instant::now();
-        client.sync_sdk_relay().await.unwrap();
+        client.sync_sdk_relay(None).await.unwrap();
         assert!(started.elapsed() >= super::EOSE_QUIET_WAIT);
         assert!(started.elapsed() <= super::EOSE_QUIET_WAIT + Duration::from_millis(1));
     }
@@ -9826,7 +9852,7 @@ mod tests {
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.sync_runtime_groups().await.unwrap();
         tokio::time::pause();
-        client.sync_sdk_relay().await.unwrap();
+        client.sync_sdk_relay(None).await.unwrap();
         let subscriptions = relay.accepted_subscriptions();
         let (refused, served) = subscriptions
             .split_first()
@@ -9856,7 +9882,7 @@ mod tests {
         assert!(!progress.complete());
         assert!(!client.live_cursor_promotion_ready().await.unwrap());
         let started = tokio::time::Instant::now();
-        client.sync_sdk_relay().await.unwrap();
+        client.sync_sdk_relay(None).await.unwrap();
         assert!(started.elapsed() >= super::EOSE_QUIET_WAIT);
         assert!(started.elapsed() <= super::EOSE_QUIET_WAIT + Duration::from_millis(1));
     }
@@ -9891,7 +9917,7 @@ mod tests {
             "unrelated profile is corrupt"
         );
         tokio::time::pause();
-        let summary = client.sync_sdk_relay().await.unwrap();
+        let summary = client.sync_sdk_relay(None).await.unwrap();
         assert!(summary.messages.is_empty());
     }
 

@@ -267,7 +267,7 @@ async fn mixed_ingress_case(side: ComparisonSide) {
     lease_native(&mut fixture.receiver, &fixture.group, native).await;
     let outcome = fixture
         .receiver
-        .admit_comparison_inline(grant, execution, result)
+        .admit_comparison_inline(None, grant, execution, result)
         .await
         .unwrap();
     let mut summary = match outcome {

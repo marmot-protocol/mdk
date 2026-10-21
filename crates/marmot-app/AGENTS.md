@@ -451,8 +451,7 @@ every thread its stack (`thread_stack_size`). Only a test that needs one thread 
 `#[tokio::test(start_paused = true)]` for a clock paused from the start (Tokio allows that only on the current-thread
 runtime), otherwise `flavor = "current_thread"`, `run_composed_app_runtime_test_on_one_thread`, or
 `Builder::new_current_thread()` with a `//` comment on the line above saying why.
-`async_suites_choose_their_tokio_flavor` rejects a bare `#[tokio::test]` and any of those one-thread pins without that
-comment. When a multi-thread test waits for an effect, wait for the state it expects rather than the next event: other
+When a multi-thread test waits for an effect, wait for the state it expects rather than the next event: other
 tasks run between your steps, and window subscriptions keep only the latest snapshot. `Notify::notify_waiters` reaches
 only waiters already registered, so a fixture signal either uses `notify_one`'s permit or the waiter `enable()`s its
 `notified()` before announcing it waits.

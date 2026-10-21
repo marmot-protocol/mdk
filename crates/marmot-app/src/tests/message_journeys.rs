@@ -243,6 +243,11 @@ async fn message_journey_queue_cancel() {
     let group = client.create_group("journey", &[]).await.unwrap();
     drop(client);
     let runtime = app.runtime();
+    let _eose = scripted_eose_pump(
+        runtime.shared_services().relay_plane().clone(),
+        relay.clone(),
+        every_subscription,
+    );
     runtime.reconcile_accounts().await.unwrap();
     relay.block_next_publish();
     let sender = runtime.clone();

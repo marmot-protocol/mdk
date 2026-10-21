@@ -695,7 +695,7 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join() {
-    use transport_nostr::{AccountDeliveryReceive, MarmotRelayPlane};
+    use transport_nostr::MarmotRelayPlane;
     let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
     let config = || crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
@@ -757,14 +757,7 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
     bob_client.prepare_transport().await.unwrap();
     timeout(Duration::from_secs(20), async {
         while bob_client.runtime.group_record(&group).is_err() {
-            if let AccountDeliveryReceive::Delivery(delivery) =
-                bob_client.receive_next_delivery().await.unwrap()
-            {
-                bob_client
-                    .ingest_received_delivery(*delivery)
-                    .await
-                    .unwrap();
-            }
+            bob_client.next_event().await.unwrap();
         }
     })
     .await
@@ -776,18 +769,8 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
     );
 
     // Control: the live REQs, which resume after the rename, never bring it.
-    while let Ok(received) = timeout(
-        Duration::from_millis(1_500),
-        bob_client.receive_next_delivery(),
-    )
-    .await
-    {
-        if let AccountDeliveryReceive::Delivery(delivery) = received.unwrap() {
-            bob_client
-                .ingest_received_delivery(*delivery)
-                .await
-                .unwrap();
-        }
+    while let Ok(summary) = timeout(Duration::from_millis(1_500), bob_client.next_event()).await {
+        summary.unwrap();
     }
     assert_eq!(
         bob_client.runtime.group_record(&group).unwrap().epoch,
@@ -832,18 +815,13 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
         .reconciliation_attempts;
     timeout(Duration::from_secs(20), async {
         while bob_client.runtime.group_record(&group).unwrap().epoch < renamed_epoch {
-            if let AccountDeliveryReceive::Delivery(delivery) =
-                bob_client.receive_next_delivery().await.unwrap()
-            {
-                bob_client
-                    .ingest_received_delivery(*delivery)
-                    .await
-                    .unwrap();
-            }
+            // Group replay is native-owned; next_event admits it only after
+            // this maintenance source reaches its own relay boundary.
+            bob_client.next_event().await.unwrap();
         }
     })
     .await
-    .expect("the maintenance REQ brings the rename made before Bob joined");
+    .expect("the maintenance REQ admits the rename made before Bob joined");
     assert_eq!(
         bob_app
             .relay_telemetry()

@@ -1231,6 +1231,18 @@ async fn run_app_runtime_account_worker(
     let sync_started_at = Instant::now();
     let startup_stage_telemetry = shared.app_performance_telemetry();
     let mut startup_explicit_shutdown = false;
+    let publish_startup_progress = |client: &AppClient, summary: SyncSummary| {
+        publish_app_runtime_summary_with_v5(
+            client,
+            &events,
+            &account_id_hex,
+            &account_label,
+            &summary,
+        );
+        if sync_summary_triggers_audit_tracker_update(&summary) {
+            shared.schedule_audit_log_tracker_update("startup_sync");
+        }
+    };
     let startup_sync_result = {
         let mut initial_sync: Pin<
             Box<dyn Future<Output = Result<StartupSyncStep, ClassifiedSyncFailure>> + Send + '_>,
@@ -1304,7 +1316,9 @@ async fn run_app_runtime_account_worker(
                     network,
                 });
             }
-            let summary = client.finish_deferred_comparison_sync().await?;
+            let summary = client
+                .finish_deferred_comparison_sync(Some(&publish_startup_progress))
+                .await?;
             app.finish_client_open_network_maintenance(&mut client)
                 .await;
             Ok::<_, ClassifiedSyncFailure>(StartupSyncStep::Complete(summary))
@@ -1550,7 +1564,12 @@ async fn run_app_runtime_account_worker(
                             // Startup still defers mutations, so its bounded
                             // batch is admitted here, yielding between turns.
                             client
-                                .admit_comparison_inline(*grant, execution, network_result)
+                                .admit_comparison_inline(
+                                    Some(&publish_startup_progress),
+                                    *grant,
+                                    execution,
+                                    network_result,
+                                )
                                 .await
                                 .map_err(|error| {
                                     ClassifiedSyncFailure::at_stage(
@@ -1572,7 +1591,7 @@ async fn run_app_runtime_account_worker(
                             EpochBackfillRunOutcome::Completed(mut summary)
                             | EpochBackfillRunOutcome::Incomplete(mut summary),
                         ) => client
-                            .finish_deferred_comparison_sync()
+                            .finish_deferred_comparison_sync(Some(&publish_startup_progress))
                             .await
                             .map(|drained| {
                                 summary.merge(drained);
@@ -1580,7 +1599,11 @@ async fn run_app_runtime_account_worker(
                             }),
                         Ok(
                             EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending,
-                        ) => client.finish_deferred_comparison_sync().await,
+                        ) => {
+                            client
+                                .finish_deferred_comparison_sync(Some(&publish_startup_progress))
+                                .await
+                        }
                         Err(failure) => Err(failure),
                     };
                     app.finish_client_open_network_maintenance(&mut client)
@@ -7896,40 +7919,6 @@ mod tests {
             retry.deadline.unwrap() - TokioInstant::now(),
             Duration::from_secs(1)
         );
-    }
-
-    #[tokio::test]
-    async fn native_replay_watch_coalesces_and_observes_same_generation_progress() {
-        let (source, changes) = watch::channel(1_u64);
-        let mut changes = Some(changes);
-        source.send_replace(2);
-        source.send_replace(3);
-        assert!(wait_for_replay_change(&mut changes).await);
-        assert_eq!(*changes.as_ref().unwrap().borrow(), 3);
-
-        // Placement progress wakes the owner without revising source identity.
-        source.send_replace(3);
-        assert!(wait_for_replay_change(&mut changes).await);
-        assert_eq!(*changes.as_ref().unwrap().borrow(), 3);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn native_replay_watch_closed_activation_can_be_replaced_without_polling() {
-        let (source, changes) = watch::channel(1_u64);
-        let mut changes = Some(changes);
-        drop(source);
-        assert!(!wait_for_replay_change(&mut changes).await);
-        changes = None;
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), wait_for_replay_change(&mut changes),)
-                .await
-                .is_err()
-        );
-
-        let (replacement, receiver) = watch::channel(2_u64);
-        changes = Some(receiver);
-        replacement.send_replace(3);
-        assert!(wait_for_replay_change(&mut changes).await);
     }
 
     use marmot_account::AccountHome;

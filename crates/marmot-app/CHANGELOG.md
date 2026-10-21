@@ -196,10 +196,11 @@
   original ranges raise the existing history notice instead of silently blocking
   the cursor; terminal group removal retires obsolete native scopes. Native
   backend errors remain visible and automatic retries back off. Native-fed live
-  messages run the same receive recovery as ordinary deliveries. A live cursor-check
-  failure preserves already-durable delivery counts. Committed comparison
-  chunks publish while recovery continues, rather than waiting for the whole batch
-  to settle. Already-held copies adopt durable spill ownership before
+  messages run the same receive recovery and inbound projection measurement as
+  ordinary deliveries. A live cursor-check failure preserves already-durable
+  delivery counts. Committed native and comparison chunks publish during startup
+  and follow-up drains, rather than waiting for the whole batch to settle.
+  Already-held copies adopt durable spill ownership before
   source replacement, without copying the ciphertext. Empty or silent peers do not
   create notification loss. Sender-ratchet tolerance remains 100; timestamp/id
   ordering does not establish sender-generation order within a single second.
