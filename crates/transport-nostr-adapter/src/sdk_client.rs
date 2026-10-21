@@ -3235,6 +3235,12 @@ impl NostrSdkRelayClient {
                     {
                         return Err(failure);
                     }
+                    // `blocked:`, `invalid:`, `pow:`, `restricted:` and the
+                    // like are the relay's final answer for this event;
+                    // resending only repeats the rejection (mdk#2270).
+                    if failure.kind == TransportEndpointFailureKind::TerminalRejected {
+                        return Err(failure);
+                    }
                     last_failure = failure;
                 }
                 Err(_) => {
@@ -8650,6 +8656,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_rejection_is_not_retried() {
+        for (reason, category) in [
+            (
+                "blocked: not allowed",
+                TransportEndpointRejectionCategory::Blocked,
+            ),
+            (
+                "invalid: bad event",
+                TransportEndpointRejectionCategory::Invalid,
+            ),
+            (
+                "pow: difficulty 30",
+                TransportEndpointRejectionCategory::Pow,
+            ),
+            (
+                "restricted: members only",
+                TransportEndpointRejectionCategory::Restricted,
+            ),
+        ] {
+            let (endpoint, _, attempts) =
+                counting_publish_relay_rejecting(Arc::new(AtomicBool::new(true)), reason).await;
+            let sdk = NostrSdkRelayClient::from_builder(Client::builder());
+            let error = sdk
+                .publish_event(
+                    std::slice::from_ref(&endpoint),
+                    &signed_group_event_dto(),
+                    1,
+                )
+                .await
+                .expect_err("the relay rejected the event");
+            let failures = error.publish_endpoint_failures();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(
+                failures[0].kind,
+                TransportEndpointFailureKind::TerminalRejected
+            );
+            assert_eq!(failures[0].rejection_category, Some(category));
+            assert_eq!(
+                attempts.lock().await.len(),
+                1,
+                "{reason} is final; resending only repeats it"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn rate_limit_reuses_socket() {
         let limited = Arc::new(AtomicBool::new(true));
         let (endpoint, connections, attempts) = counting_publish_relay(limited.clone()).await;
@@ -9721,6 +9773,19 @@ mod tests {
         Arc<AtomicUsize>,
         Arc<Mutex<Vec<tokio::time::Instant>>>,
     ) {
+        counting_publish_relay_rejecting(limited, "rate-limited: try later").await
+    }
+
+    /// A relay that counts connections and EVENT attempts, and answers each
+    /// EVENT with `OK false` and `reason` while `limited` is set.
+    async fn counting_publish_relay_rejecting(
+        limited: Arc<AtomicBool>,
+        reason: &'static str,
+    ) -> (
+        TransportEndpoint,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<tokio::time::Instant>>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
         let connections = Arc::new(AtomicUsize::new(0));
@@ -9749,11 +9814,7 @@ mod tests {
                         }
                         attempts.lock().await.push(tokio::time::Instant::now());
                         let rejected = limited.load(Ordering::Relaxed);
-                        let reason = if rejected {
-                            "rate-limited: try later"
-                        } else {
-                            ""
-                        };
+                        let reason = if rejected { reason } else { "" };
                         let response = serde_json::json!(["OK", value[1]["id"], !rejected, reason]);
                         if socket.send(response.to_string().into()).await.is_err() {
                             return;
