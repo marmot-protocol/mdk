@@ -80,6 +80,7 @@ impl AppClient {
     /// returns its unacknowledged suffix in the original per-group order.
     pub(crate) async fn admit_native_turn(&mut self) -> Result<bool, AppError> {
         let mut progressed = false;
+        let mut inventory = super::InventoryBatch::default();
         for _ in 0..MAX_COMPARISON_ADMISSION_PER_TURN {
             if !matches!(self.take_native_batch(None).await, NativeFrontier::Ready) {
                 break;
@@ -104,12 +105,14 @@ impl AppClient {
                     ));
                 }
             }
-            let ingested = self.admit_native_frame().await?;
+            let (ingested, record) = self.admit_native_frame().await?;
+            inventory.stage(self, record);
             self.native_sync_deliveries = self
                 .native_sync_deliveries
                 .saturating_add(u64::from(ingested));
             progressed = true;
         }
+        inventory.flush(self);
         // The source returns this suffix behind independent ready groups;
         // its one-outstanding-batch rule still prevents same-group overtaking.
         self.recovery_owner.native_batch = None;
@@ -198,18 +201,22 @@ impl AppClient {
 
     /// Acknowledge one borrowed frame only after ordinary ingest and spill
     /// receipt settlement. The return value charges only actual ingests.
-    pub(super) async fn admit_native_frame(&mut self) -> Result<bool, AppError> {
+    pub(super) async fn admit_native_frame(
+        &mut self,
+    ) -> Result<(bool, Option<super::InventoryRecord>), AppError> {
         let Some(mut batch) = self.recovery_owner.native_batch.take() else {
-            return Ok(false);
+            return Ok((false, None));
         };
         let Some(delivery) = batch.delivery() else {
-            return Ok(false);
+            return Ok((false, None));
         };
         let timestamp = delivery.message.timestamp.0;
         let result = async {
             let started = std::time::Instant::now();
-            let admitted = self.admit_recovered_delivery(delivery).await;
-            if !matches!(&admitted, Ok((_, super::RecoveredDelivery::AlreadyHeld)))
+            let admitted = self
+                .admit_recovered_delivery(delivery, super::InventoryWrite::NativeTurn)
+                .await;
+            if !matches!(&admitted, Ok((_, super::RecoveredDelivery::AlreadyHeld, _)))
                 && let Some(telemetry) = &self.runtime_telemetry
             {
                 telemetry.record(
@@ -218,7 +225,7 @@ impl AppClient {
                     admitted.is_ok(),
                 );
             }
-            let (summary, settled) = admitted?;
+            let (summary, settled, inventory_record) = admitted?;
             let ingested = matches!(settled, super::RecoveredDelivery::Ingested { .. });
             self.recovery_owner.native_receive_pending |= ingested;
             if self.pending_applied_sync_summary == crate::SyncSummary::default() {
@@ -245,10 +252,11 @@ impl AppClient {
                             ..
                         }
                 ),
+                inventory_record,
             ))
         }
         .await;
-        let (ingested, durable) = match result {
+        let (ingested, durable, inventory_record) = match result {
             Ok(settled) => settled,
             Err(error) => {
                 // Explicit callers keep the failed frame pinned and observe
@@ -271,6 +279,6 @@ impl AppClient {
         if batch.delivery().is_some() {
             self.recovery_owner.native_batch = Some(batch);
         }
-        Ok(ingested)
+        Ok((ingested, inventory_record))
     }
 }

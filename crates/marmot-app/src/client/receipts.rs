@@ -224,7 +224,7 @@ mod tests {
             // durable journal must revoke it together with the active cache.
             storage
                 .app_storage()
-                .record_transport_reconciliation_item(&route, &item)
+                .record_reconciliation_items(std::iter::once((&route, &item)))
                 .unwrap();
             assert!(
                 storage

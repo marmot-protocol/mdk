@@ -34,10 +34,10 @@ use marmot_forensics::{
 #[cfg(test)]
 use marmot_forensics::EpochBackfillCompletionKind;
 
-use super::AppClient;
 use super::audit::EpochBackfillTerminalAudit;
 use super::epoch_stall::BackfillDecision;
 use super::recovery::{AttemptGrant, ExplicitRecoveryPermit};
+use super::{AppClient, InventoryWrite};
 use crate::config::CursorPersistence;
 
 pub(super) mod comparison_job;
@@ -590,6 +590,48 @@ struct DeliveryIngest {
     /// it is deliberately narrower than `must_stay_fetchable`: an unknown-group
     /// object was not refused for want of a resource.
     refused_group: Option<cgka_traits::GroupId>,
+    inventory_record: Option<InventoryRecord>,
+}
+
+type InventoryRecord = (TransportReconciliationRoute, TransportReconciliationItem);
+
+#[derive(Default)]
+struct InventoryBatch {
+    items: [Option<InventoryRecord>; comparison_job::MAX_COMPARISON_ADMISSION_PER_TURN],
+    len: usize,
+}
+
+impl InventoryBatch {
+    fn stage(&mut self, client: &AppClient, item: Option<InventoryRecord>) {
+        let Some(item) = item else {
+            // Without a deferred record, input may have retired a route.
+            // Omit buffered advisory rows rather than recreate it.
+            self.discard();
+            return;
+        };
+        self.items[self.len] = Some(item);
+        self.len += 1;
+        if self.len == self.items.len() {
+            self.flush(client);
+        }
+    }
+
+    fn discard(&mut self) {
+        for item in &mut self.items[..self.len] {
+            *item = None;
+        }
+        self.len = 0;
+    }
+
+    fn flush(&mut self, client: &AppClient) {
+        client.record_reconciliation_items(
+            self.items[..self.len]
+                .iter()
+                .flatten()
+                .map(|(route, item)| (route, item)),
+        );
+        self.discard();
+    }
 }
 
 /// How one comparison-fetched delivery settled on admission.
@@ -3000,9 +3042,11 @@ impl AppClient {
         delivery: cgka_traits::TransportDelivery,
     ) -> Result<SyncSummary, (SyncSummary, bool, bool, AppError, SyncFailureStage)> {
         // A spilled delivery gets exactly the live path's one ingest attempt.
-        let result = self.ingest_received_delivery_once(&delivery, true).await;
+        let result = self
+            .ingest_received_delivery_once(&delivery, true, InventoryWrite::Immediate)
+            .await;
         self.settle_spilled_delivery();
-        result.map(|(summary, _)| summary)
+        result.map(|(summary, _, _)| summary)
     }
 
     /// Admit one delivery a comparison fetched through the ordinary ingest
@@ -3011,14 +3055,27 @@ impl AppClient {
     pub(crate) async fn admit_recovered_delivery(
         &mut self,
         delivery: &cgka_traits::TransportDelivery,
-    ) -> Result<(SyncSummary, RecoveredDelivery), AppError> {
+        inventory_write: InventoryWrite,
+    ) -> Result<(SyncSummary, RecoveredDelivery, Option<InventoryRecord>), AppError> {
         let event_id = hex::encode(delivery.message.id.as_slice());
         if self.transport_receipts()?.contains(&event_id) {
-            self.record_durable_transport_reconciliation_delivery(delivery);
+            let inventory_record = match inventory_write {
+                InventoryWrite::Immediate => {
+                    self.record_durable_transport_reconciliation_delivery(delivery);
+                    None
+                }
+                InventoryWrite::NativeTurn => {
+                    transport_reconciliation_record(self.adapter.account_id(), delivery)
+                }
+            };
             self.adapter.release_account_delivery(&delivery.message.id);
-            return Ok((SyncSummary::default(), RecoveredDelivery::AlreadyHeld));
+            return Ok((
+                SyncSummary::default(),
+                RecoveredDelivery::AlreadyHeld,
+                inventory_record,
+            ));
         }
-        self.ingest_received_delivery_once(delivery, false)
+        self.ingest_received_delivery_once(delivery, false, inventory_write)
             .await
             .map_err(|(summary, _, _, error, _)| {
                 self.pending_applied_sync_summary.merge(summary);
@@ -3033,8 +3090,9 @@ impl AppClient {
         &mut self,
         delivery: &cgka_traits::TransportDelivery,
         live_cursor: bool,
+        inventory_write: InventoryWrite,
     ) -> Result<
-        (SyncSummary, RecoveredDelivery),
+        (SyncSummary, RecoveredDelivery, Option<InventoryRecord>),
         (SyncSummary, bool, bool, AppError, SyncFailureStage),
     > {
         let cursor_before_secs = self.state.last_transport_timestamp;
@@ -3050,7 +3108,7 @@ impl AppClient {
                 SyncFailureStage::StatePersist,
             )
         })?;
-        let ingested = Self::ingest_delivery(receipts, delivery, &mut summary)
+        let ingested = Self::ingest_delivery(receipts, delivery, &mut summary, inventory_write)
             .await
             .map_err(|error| {
                 // Projection may have repaired an older durable prefix before
@@ -3169,7 +3227,7 @@ impl AppClient {
         }
         self.pending_runtime_group_subscription_refresh |= routes_dirty || refresh.routing_changed;
         self.drain_epoch_stall_escalations(&mut summary);
-        Ok((summary, settled))
+        Ok((summary, settled, ingested.inventory_record))
     }
 
     fn checkpoint_error_stage_and_cursor(
@@ -3390,7 +3448,13 @@ impl AppClient {
             }
             let mut delivery_summary = SyncSummary::default();
             let message_id = delivery.message.id.clone();
-            let ingest = Self::ingest_delivery(receipts, &delivery, &mut delivery_summary).await;
+            let ingest = Self::ingest_delivery(
+                receipts,
+                &delivery,
+                &mut delivery_summary,
+                InventoryWrite::Immediate,
+            )
+            .await;
             self.prepend_pending_applied_summary(&mut summary);
             let ingested = match ingest {
                 Ok(ingested) => ingested,
@@ -3659,18 +3723,25 @@ impl AppClient {
         }
     }
 
-    fn record_transport_reconciliation_item(
+    fn record_reconciliation_items<'a>(
         &self,
-        route: &TransportReconciliationRoute,
-        item: &TransportReconciliationItem,
+        items: impl Iterator<
+            Item = (
+                &'a TransportReconciliationRoute,
+                &'a TransportReconciliationItem,
+            ),
+        > + Clone,
     ) {
+        if items.clone().next().is_none() {
+            return;
+        }
         let recorded = self
             .app
             .account_storage(&self.state.label)
             .and_then(|storage| {
                 storage
                     .app_storage()
-                    .record_transport_reconciliation_item(route, item)
+                    .record_reconciliation_items(items)
                     .map_err(AppError::from)
             });
         if recorded.is_err() {
@@ -3680,8 +3751,8 @@ impl AppClient {
             // optimization checkpoint failed.
             tracing::warn!(
                 target: "marmot_app::relay_plane",
-                method = "record_transport_reconciliation_item",
-                "could not persist transport reconciliation item"
+                method = "record_reconciliation_items",
+                "could not persist transport reconciliation items"
             );
         }
     }
@@ -3696,7 +3767,7 @@ impl AppClient {
             // Own relay echoes and seen-index hits are skipped precisely because
             // the event is already durable. Recording them here closes the
             // migration/echo seam without replaying them through the engine.
-            self.record_transport_reconciliation_item(&route, &item);
+            self.record_reconciliation_items(std::iter::once((&route, &item)));
         }
     }
 
@@ -3706,6 +3777,7 @@ impl AppClient {
         receipts: super::receipts::SynchronizedTransportReceipts<'_>,
         delivery: &cgka_traits::TransportDelivery,
         summary: &mut SyncSummary,
+        inventory_write: InventoryWrite,
     ) -> Result<DeliveryIngest, AppError> {
         let client = receipts.into_client();
         #[cfg(test)]
@@ -3753,6 +3825,7 @@ impl AppClient {
                     routes_dirty: false,
                     must_stay_fetchable: false,
                     refused_group: None,
+                    inventory_record: None,
                 });
             }
             // Dismissals remain authoritative after unblock. With no current
@@ -3778,6 +3851,7 @@ impl AppClient {
                         routes_dirty: false,
                         must_stay_fetchable: false,
                         refused_group: None,
+                        inventory_record: None,
                     });
                 }
             }
@@ -3911,6 +3985,17 @@ impl AppClient {
             .was_released(&source_message_id_hex);
         let publish_error = fail_if_publish_failed(&effects.effects).err();
         let must_stay_fetchable = effects.left_object_unpersisted || source_released;
+        // Structural effects keep immediate cache ordering: terminal cleanup
+        // must not be followed by a deferred write that recreates a retired route.
+        let defer_inventory = !must_stay_fetchable
+            && inventory_write == InventoryWrite::NativeTurn
+            && matches!(
+                effects.effects.events.as_slice(),
+                [cgka_traits::engine::GroupEvent::MessageReceived { .. }]
+            )
+            && effects.effects.published_app_messages.is_empty()
+            && effects.effects.failed_app_messages.is_empty()
+            && effects.effects.superseded_intents.is_empty();
         // The side effects alone do not prove the transport input was retained.
         // A refusal or failed receipt classification still needs genuine reingest;
         // only a durably settled source may release its pin after projection repair.
@@ -3943,7 +4028,9 @@ impl AppClient {
                 .source_delivery_id = Some(source_message_id.clone());
         }
         if !must_stay_fetchable && let Some((route, item)) = &reconciliation_record {
-            client.record_transport_reconciliation_item(route, item);
+            if !defer_inventory {
+                client.record_reconciliation_items(std::iter::once((route, item)));
+            }
             if matches!(
                 effects.outcome,
                 IngestOutcome::Processed
@@ -4056,6 +4143,11 @@ impl AppClient {
             routes_dirty,
             must_stay_fetchable,
             refused_group,
+            inventory_record: if defer_inventory {
+                reconciliation_record
+            } else {
+                None
+            },
         })
     }
 
@@ -7372,7 +7464,7 @@ mod live_cursor_checkpoint_tests {
                 .await;
             fixture
                 .client
-                .admit_recovered_delivery(&drained)
+                .admit_recovered_delivery(&drained, crate::client::sync::InventoryWrite::Immediate)
                 .await
                 .unwrap();
             assert_eq!(
@@ -7429,7 +7521,7 @@ mod live_cursor_checkpoint_tests {
                 .await;
             fixture
                 .client
-                .admit_recovered_delivery(&drained)
+                .admit_recovered_delivery(&drained, crate::client::sync::InventoryWrite::Immediate)
                 .await
                 .unwrap();
             assert_eq!(fixture.persisted(), None);

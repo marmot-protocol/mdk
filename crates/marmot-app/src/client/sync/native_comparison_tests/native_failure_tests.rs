@@ -498,7 +498,10 @@ async fn native_receipts_yield() {
             .unwrap();
         fixture
             .receiver
-            .admit_recovered_delivery(&deliveries[0])
+            .admit_recovered_delivery(
+                &deliveries[0],
+                crate::client::sync::InventoryWrite::Immediate,
+            )
             .await
             .unwrap();
     }
@@ -773,7 +776,10 @@ async fn mixed_receipts_yield() {
             .unwrap();
         fixture
             .receiver
-            .admit_recovered_delivery(&deliveries[0])
+            .admit_recovered_delivery(
+                &deliveries[0],
+                crate::client::sync::InventoryWrite::Immediate,
+            )
             .await
             .unwrap();
     }

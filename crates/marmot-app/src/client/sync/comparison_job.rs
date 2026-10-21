@@ -1301,6 +1301,7 @@ impl AppClient {
         let mut spent = 0;
         let mut native_examined = 0;
         let mut blocked = HashSet::new();
+        let mut inventory = super::InventoryBatch::default();
         while spent < MAX_COMPARISON_ADMISSION_PER_TURN
             && native_examined < MAX_COMPARISON_ADMISSION_PER_TURN
         {
@@ -1313,10 +1314,13 @@ impl AppClient {
             admission.prefer_native = !admission.prefer_native;
             let OrderedInput::Comparison(position) = input else {
                 native_examined += 1;
-                spent += usize::from(self.admit_native_frame().await?);
+                let (ingested, record) = self.admit_native_frame().await?;
+                inventory.stage(self, record);
+                spent += usize::from(ingested);
                 admission.progressed = true;
                 continue;
             };
+            inventory.flush(self);
             let (index, source, delivery) = &admission.pending[position];
             let expected_route = &admission.routes[*index].route;
             let window_scoped = source == &PendingSource::Window
@@ -1332,7 +1336,9 @@ impl AppClient {
                 });
             let mut unretained = false;
             let mut window_fetched = 0_usize;
-            let (summary, settled) = self.admit_recovered_delivery(delivery).await?;
+            let (summary, settled, _) = self
+                .admit_recovered_delivery(delivery, super::InventoryWrite::Immediate)
+                .await?;
             admission.summary.merge(summary);
             let mut route =
                 (source == &PendingSource::Comparison).then(|| &mut admission.routes[*index]);
@@ -1405,6 +1411,7 @@ impl AppClient {
                 break;
             }
         }
+        inventory.flush(self);
         self.recovery_owner.native_batch = None;
         Ok(admission.pending.is_empty())
     }
@@ -2374,13 +2381,13 @@ mod tests {
         fixture
             .storage
             .app_storage()
-            .record_transport_reconciliation_item(
+            .record_reconciliation_items(std::iter::once((
                 &TransportReconciliationRoute::Group(route),
                 &TransportReconciliationItem {
                     event_id: [5; 32],
                     created_at: unix_now_seconds(),
                 },
-            )
+            )))
             .unwrap();
         fixture
             .storage

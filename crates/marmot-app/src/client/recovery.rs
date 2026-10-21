@@ -5306,10 +5306,10 @@ mod tests {
             created_at,
         };
         storage
-            .record_transport_reconciliation_item(&route, &item(1, now))
+            .record_reconciliation_items(std::iter::once((&route, &item(1, now))))
             .unwrap();
         storage
-            .record_transport_reconciliation_item(&route, &item(2, now + 1000))
+            .record_reconciliation_items(std::iter::once((&route, &item(2, now + 1000))))
             .unwrap();
         storage
             .request_recovery(
@@ -5334,7 +5334,7 @@ mod tests {
         assert_eq!(frozen.items.len(), 1);
         assert_eq!(frozen.items[0].event_id, [1; 32]);
         storage
-            .record_transport_reconciliation_item(&route, &item(3, now))
+            .record_reconciliation_items(std::iter::once((&route, &item(3, now))))
             .unwrap();
         assert_eq!(
             frozen.items.len(),

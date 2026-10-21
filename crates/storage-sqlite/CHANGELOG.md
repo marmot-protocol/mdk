@@ -4,6 +4,10 @@
 
 ### Breaking changes
 
+- `record_reconciliation_items` replaces
+  `record_transport_reconciliation_item`. It accepts a cloneable iterator of
+  borrowed route/item pairs and commits the advisory inventory batch atomically,
+  retaining the existing per-route floor, cap and recovery-fence rules.
 - App storage has its own handle, `SqliteAppStorage`.
   `SqliteAccountStorage::app_storage()` returns one over the same connection:
   it opens nothing, closes with the account storage, and fails the same way

@@ -204,7 +204,10 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
 
     for event in events {
         for delivery in client.adapter.recovered_deliveries(event).await.unwrap() {
-            client.admit_recovered_delivery(&delivery).await.unwrap();
+            client
+                .admit_recovered_delivery(&delivery, crate::client::InventoryWrite::Immediate)
+                .await
+                .unwrap();
         }
     }
     assert!(

@@ -279,13 +279,13 @@ async fn late_commit_700_recovers() {
             .await
             .unwrap();
         storage
-            .record_transport_reconciliation_item(
+            .record_reconciliation_items(std::iter::once((
                 &storage_sqlite::TransportReconciliationRoute::Group(route),
                 &storage_sqlite::TransportReconciliationItem {
                     event_id: retained.id.to_bytes(),
                     created_at: retained.created_at.as_secs(),
                 },
-            )
+            )))
             .unwrap();
     }
     assert!(

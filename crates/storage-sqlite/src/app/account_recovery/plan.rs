@@ -2001,15 +2001,18 @@ mod tests {
             };
             store
                 .app_storage()
-                .record_transport_reconciliation_item(&TransportReconciliationRoute::Inbox, &item)
+                .record_reconciliation_items(std::iter::once((
+                    &TransportReconciliationRoute::Inbox,
+                    &item,
+                )))
                 .unwrap();
             let (_, steps) = measure(&store, || {
                 store
                     .app_storage()
-                    .record_transport_reconciliation_item(
+                    .record_reconciliation_items(std::iter::once((
                         &TransportReconciliationRoute::Inbox,
                         &item,
-                    )
+                    )))
                     .unwrap()
             });
             if let Some(old) = previous {
@@ -2244,13 +2247,13 @@ mod tests {
                         .unwrap();
                     store
                         .app_storage()
-                        .record_transport_reconciliation_item(
+                        .record_reconciliation_items(std::iter::once((
                             &route,
                             &TransportReconciliationItem {
                                 event_id: [9; 32],
                                 created_at: now + 1,
                             },
-                        )
+                        )))
                         .unwrap();
                     assert!(
                         store
@@ -2425,13 +2428,13 @@ mod tests {
             assert!(
                 store
                     .app_storage()
-                    .record_transport_reconciliation_item(
+                    .record_reconciliation_items(std::iter::once((
                         &TransportReconciliationRoute::Inbox,
                         &TransportReconciliationItem {
                             event_id: [9; 32],
                             created_at: now + 1
                         }
-                    )
+                    )))
                     .is_err()
             );
             assert_eq!(
@@ -2457,13 +2460,13 @@ mod tests {
                 .unwrap();
             store
                 .app_storage()
-                .record_transport_reconciliation_item(
+                .record_reconciliation_items(std::iter::once((
                     &TransportReconciliationRoute::Inbox,
                     &TransportReconciliationItem {
                         event_id: [9; 32],
                         created_at: now + 1,
                     },
-                )
+                )))
                 .unwrap();
             assert!(
                 !store

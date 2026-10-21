@@ -205,6 +205,10 @@
   counts, including eventless deferred input.
   Native input wakes `next_event` for pending convergence or epoch backfill
   even when no visible event was produced.
+  Native turns batch optional reconciliation-inventory writes at the existing
+  four-frame boundary. Engine/app persistence, seen receipts and frame ACKs
+  remain per delivery; structural input keeps immediate inventory bookkeeping.
+  Route refresh skips convergence and epoch reads when no prior route can retire.
   Recovered Welcomes publish `GroupJoined` before live-subscription I/O and
   retain their grant-owned post-join history work in both streamed chunks and
   final comparison results.

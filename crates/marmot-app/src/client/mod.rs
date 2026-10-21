@@ -630,6 +630,13 @@ fn prepared_group_image_status(
     }
 }
 
+/// Optional inventory writes are separate from per-frame durability and ACKs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InventoryWrite {
+    Immediate,
+    NativeTurn,
+}
+
 /// Outcome of one [`AppClient::refresh_group_routes`] pass, separating the
 /// in-memory routing-table delta from durable-state mutation: only the latter
 /// obligates a state save, only the former obligates a relay-subscription
@@ -6710,10 +6717,11 @@ impl AppClient {
             // prune while convergence still has unresolved inputs: the
             // retained anchor is not settled yet, so conservatively keep every
             // prior address until the next stable reconciliation.
-            if !self
-                .runtime
-                .has_pending_convergence_inputs(&group_id)
-                .unwrap_or(true)
+            if !group.prior_nostr_routes.is_empty()
+                && !self
+                    .runtime
+                    .has_pending_convergence_inputs(&group_id)
+                    .unwrap_or(true)
                 && let Ok(group_record) = self.runtime.group_record(&group_id)
                 && group.prune_prior_nostr_routes(group_record.epoch.0)
             {
