@@ -71,10 +71,10 @@
   shows it. The maintenance tick moves images still held in the account
   database into files in small batches, smallest first, without changing
   what viewers see. An identical file already on disk is read back in full
-  and then reused at no space cost; when the disk cannot take a new file,
-  that image's owner is dropped, to be fetched again when shown, and nothing
-  waits for space. Compaction's live-size log waits until no
-  avatar image remains in the database.
+  and then reused at no space cost. When the disk cannot take a new file, or
+  free space cannot be measured, the move waits for the next tick; like the
+  attachment move it deletes nothing to make room. Compaction's live-size
+  log waits until no avatar image remains in the database.
 
 - Downloaded attachment bodies are retained as encrypted files in the account's
   `media/` directory (the `media-store` crate) instead of SQLCipher rows

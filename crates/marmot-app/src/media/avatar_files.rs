@@ -6,11 +6,12 @@
 //! corrupt file is reported so every owner sharing it fetches it again.
 //! Images still held in the account database move into files in small
 //! batches on the maintenance tick, smallest first. An identical file
-//! already on disk is reused without writing, so only a new file is charged
-//! against free space. Cache files are always re-fetchable, so an image the
-//! disk cannot take has its owner dropped, as eviction would, and nothing
-//! waits on free space. Every function here does file I/O: call them only on the blocking
-//! pool.
+//! already on disk is verified and reused without writing, so only a new
+//! file is charged against free space. When the disk cannot take the next
+//! new file, or free space cannot be measured, the move waits and the next
+//! tick tries again: like the attachment move, it never deletes anything to
+//! make room. Every function here does file I/O: call them only on the
+//! blocking pool.
 use std::io::Cursor;
 
 use media_store::{Admission, Category, DiskPolicy, FileId, MediaError, PublishOutcome};
@@ -172,10 +173,11 @@ pub(crate) struct AvatarMigrationBatch {
     pub(crate) moved_bytes: u64,
     /// Corrupt images cleared for refetch.
     pub(crate) dropped_corrupt: usize,
-    /// Owners removed because the disk could not take their files.
-    pub(crate) evicted: usize,
     /// The batch stopped before it ran out of database-held images.
     pub(crate) more: bool,
+    /// The next image needs a new file the disk cannot take now, or free
+    /// space could not be measured; the next tick tries again.
+    pub(crate) waiting_for_space: bool,
     /// A store or database failure stopped the batch; the next tick retries.
     pub(crate) deferred: bool,
 }
@@ -221,13 +223,12 @@ pub(crate) fn migrate_batch(
         let digest: [u8; 32] = Sha256::digest(image.bytes()).into();
         // The commit drops the database copy, and attaching an identical
         // ready file checks only its presence and length. Read any such file
-        // in full first: one that fails is marked lost, so it is not
-        // attached and a fresh file is written from these bytes instead.
+        // in full first. One that fails is marked lost; go on only once it no
+        // longer counts as ready, so it cannot be attached and a fresh file
+        // is written from these bytes instead.
         let twin_checked = match storage.ready_media_file(Category::Cache, &digest) {
             Ok(Some(twin)) => match media.verify(&twin, &digest) {
                 Ok(true) => true,
-                // It failed and should now be marked lost. Proceed only once
-                // it no longer counts as ready, so it cannot be attached.
                 Ok(false) => storage
                     .ready_media_file(Category::Cache, &digest)
                     .is_ok_and(|still| still != Some(twin)),
@@ -236,42 +237,33 @@ pub(crate) fn migrate_batch(
             Ok(None) => true,
             Err(_) => false,
         };
+        if !twin_checked {
+            batch.deferred = true;
+            return batch;
+        }
         let Ok(publication) = AvatarPublication::for_migration(storage.clone(), avatar, &image)
         else {
             batch.deferred = true;
             return batch;
         };
-        if !twin_checked {
-            batch.deferred = true;
-            return batch;
-        }
         // An identical file on disk is attached without writing; only a new
-        // file is charged against free space.
+        // file is charged against free space. Images go smallest first, so
+        // when one does not fit the batch stops and waits.
         let published = match media.attach_existing(&publication, Category::Cache, &digest) {
             Ok(Some(outcome)) => Ok(outcome),
-            Ok(None) => match fits(reserve, free, byte_len) {
-                Some(true) => media.publish(
-                    &publication,
-                    Category::Cache,
-                    &mut Cursor::new(image.bytes()),
-                    byte_len,
-                    digest,
-                    crate::unix_now_seconds(),
-                    &|| false,
-                ),
-                // Measured and too small: drop only this owner.
-                Some(false) => {
-                    if !evict(storage, avatar, &mut batch) {
-                        return batch;
-                    }
-                    continue;
-                }
-                // Free space cannot be measured: drop nothing, retry later.
-                None => {
-                    batch.deferred = true;
-                    return batch;
-                }
-            },
+            Ok(None) if fits(reserve, free, byte_len) == Some(true) => media.publish(
+                &publication,
+                Category::Cache,
+                &mut Cursor::new(image.bytes()),
+                byte_len,
+                digest,
+                crate::unix_now_seconds(),
+                &|| false,
+            ),
+            Ok(None) => {
+                batch.waiting_for_space = true;
+                return batch;
+            }
             Err(error) => Err(error),
         };
         media.unlink_released(&publication.take_released());
@@ -282,10 +274,10 @@ pub(crate) fn migrate_batch(
             }
             // The row changed underneath the move.
             Ok(_) => {}
+            // The volume filled during the write.
             Err(MediaError::Capacity) => {
-                if !evict(storage, avatar, &mut batch) {
-                    return batch;
-                }
+                batch.waiting_for_space = true;
+                return batch;
             }
             Err(_) => {
                 batch.deferred = true;
@@ -296,29 +288,8 @@ pub(crate) fn migrate_batch(
     batch
 }
 
-/// The disk cannot take this image's file: drop its owner instead of
-/// pausing. Images go smallest first, so the rest of the batch fits only by
-/// reusing a file already on disk. `false` (with the batch deferred) on a
-/// database failure.
-fn evict(
-    storage: &SqliteAppStorage,
-    avatar: &storage_sqlite::DatabaseAvatar,
-    batch: &mut AvatarMigrationBatch,
-) -> bool {
-    match storage.evict_database_avatar(avatar) {
-        Ok(evicted) => {
-            batch.evicted += usize::from(evicted);
-            true
-        }
-        Err(_) => {
-            batch.deferred = true;
-            false
-        }
-    }
-}
-
 /// Runs one batch and logs it. `true` when avatar observers should hear
-/// about it: an owner was cleared or removed.
+/// about it: a corrupt image was cleared for refetch.
 pub(crate) fn run_batch(
     storage: &SqliteAppStorage,
     media: &AccountMediaStore,
@@ -331,21 +302,21 @@ pub(crate) fn run_batch(
         moved,
         moved_bytes,
         dropped_corrupt,
-        evicted,
         more,
+        waiting_for_space,
         deferred,
     } = batch;
     if deferred {
         tracing::warn!(target: TRACE_TARGET, method = "migrate_avatar_images",
-            moved, dropped_corrupt, evicted, retry_scheduled = true,
+            moved, dropped_corrupt, retry_scheduled = true,
             "avatar image migration batch deferred");
-    } else if moved + dropped_corrupt + evicted > 0 {
+    } else if moved + dropped_corrupt > 0 {
         tracing::info!(target: TRACE_TARGET, method = "migrate_avatar_images",
-            moved, moved_bytes, dropped_corrupt, evicted, more,
+            moved, moved_bytes, dropped_corrupt, more, waiting_for_space,
             duration_ms = started.elapsed().as_millis() as u64,
             "moved one bounded batch of avatar images");
     }
-    dropped_corrupt + evicted > 0
+    dropped_corrupt > 0
 }
 
 #[cfg(test)]

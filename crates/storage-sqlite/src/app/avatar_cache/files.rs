@@ -459,26 +459,6 @@ impl SqliteAppStorage {
         })
     }
 
-    /// Removes the owner of database-held image `avatar`, as eviction does:
-    /// a later visible request binds and fetches it again. For a disk too
-    /// full to move it into a file. `false` when the row changed.
-    pub fn evict_database_avatar(&self, avatar: &DatabaseAvatar) -> StorageResult<bool> {
-        Ok(self
-            .lock()?
-            .execute(
-                "DELETE FROM avatar_assets
-                 WHERE token = ?1 AND content_revision = ?2 AND bytes IS NOT NULL
-                    AND (SELECT store_epoch FROM chat_presentation_meta WHERE id = 1) = ?3",
-                params![
-                    avatar.reference.token,
-                    u64_to_i64(avatar.revision)?,
-                    avatar.reference.store_epoch
-                ],
-            )
-            .storage()?
-            == 1)
-    }
-
     /// Bytes of images still held in the database.
     pub fn database_avatar_bytes(&self) -> StorageResult<u64> {
         let bytes: i64 = self

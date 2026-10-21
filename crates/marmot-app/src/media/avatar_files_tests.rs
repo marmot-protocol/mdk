@@ -278,10 +278,10 @@ fn database_avatars_move_into_cache_files() {
         (
             batch.moved,
             batch.dropped_corrupt,
-            batch.evicted,
+            batch.waiting_for_space,
             batch.deferred
         ),
-        (2, 1, 0, false)
+        (2, 1, false, false)
     );
     assert_eq!(f.storage().database_avatar_bytes().unwrap(), 0);
     assert_eq!(f.files_on_disk(), 2);
@@ -302,26 +302,33 @@ fn database_avatars_move_into_cache_files() {
     );
 }
 
-/// On a disk too full for the files, the remaining database images are
-/// dropped like evictions instead of waiting for space.
+/// On a disk too full for the files, the move waits for space: nothing is
+/// deleted, and it continues once there is room.
 #[test]
-fn a_full_disk_drops_database_avatars() {
+fn a_full_disk_makes_the_move_wait() {
     let f = Fixture::new();
-    for owner in ["chat:aa", "chat:bb"] {
+    let mut held = Vec::new();
+    for (owner, seed) in [("chat:aa", 8), ("chat:bb", 9)] {
         let reference = f.storage().bind_avatar_source(owner, "source").unwrap();
         f.storage()
-            .publish_avatar(&reference, 0, &image(8, 2_000), None)
+            .publish_avatar(&reference, 0, &image(seed, 2_000), None)
             .unwrap();
+        held.push(reference);
     }
     let tight = || Ok(RESERVE);
     let batch = migrate_batch(&f.storage(), &f.media, RESERVE, &tight);
-    assert_eq!((batch.moved, batch.evicted), (0, 2));
-    assert_eq!(f.count("SELECT count(*) FROM avatar_assets"), 0);
-    assert_eq!(f.files_on_disk(), 0);
-    assert!(
-        !run_batch(&f.storage(), &f.media, RESERVE, &tight),
-        "nothing is left to drop"
+    assert_eq!((batch.moved, batch.waiting_for_space), (0, true));
+    assert_eq!(
+        f.count("SELECT count(*) FROM avatar_assets WHERE bytes IS NOT NULL"),
+        2,
+        "nothing is deleted to make room"
     );
+    assert_eq!(f.files_on_disk(), 0);
+    assert!(!run_batch(&f.storage(), &f.media, RESERVE, &tight));
+
+    let batch = migrate_batch(&f.storage(), &f.media, RESERVE, &plenty);
+    assert_eq!((batch.moved, batch.waiting_for_space), (2, false));
+    assert_eq!(f.storage().database_avatar_bytes().unwrap(), 0);
 }
 
 /// An identical cache file that is corrupt is never trusted with the only
@@ -373,7 +380,7 @@ fn a_corrupt_identical_file_is_not_reused_by_the_move() {
 
 /// A copy of an image already on disk costs no space: on a disk too full for
 /// a new file the fetch still attaches it, and the move attaches a
-/// database-held copy instead of dropping it.
+/// database-held copy, then waits at the first image that needs a new file.
 #[test]
 fn a_full_disk_still_attaches_an_image_already_on_disk() {
     let f = Fixture::new();
@@ -392,13 +399,14 @@ fn a_full_disk_still_attaches_an_image_already_on_disk() {
     let held = f.storage().bind_avatar_source("chat:bb", "source").unwrap();
     f.storage().publish_avatar(&held, 0, &shared, None).unwrap();
     let other = f.storage().bind_avatar_source("chat:cc", "source").unwrap();
+    // Larger, so the smallest-first move reaches it after the shared copy.
     f.storage()
-        .publish_avatar(&other, 0, &image(11, 6_000), None)
+        .publish_avatar(&other, 0, &image(11, 7_000), None)
         .unwrap();
     let tight = || Ok(RESERVE);
 
     let batch = migrate_batch(&f.storage(), &f.media, RESERVE, &tight);
-    assert_eq!((batch.moved, batch.evicted), (1, 1));
+    assert_eq!((batch.moved, batch.waiting_for_space), (1, true));
     assert_eq!(f.read(&held).image, Some(shared.clone()));
     assert_eq!(f.files_on_disk(), 1);
     assert_eq!(
@@ -406,8 +414,8 @@ fn a_full_disk_still_attaches_an_image_already_on_disk() {
             .avatar_status(&other, crate::unix_now_seconds())
             .unwrap()
             .availability,
-        AvatarAvailability::Invalidated,
-        "only the image that needed a new file was dropped"
+        AvatarAvailability::Ready,
+        "the image that needs a new file waits in the database"
     );
 
     let (reference, second) = f.claim("chat:dd");
@@ -472,12 +480,16 @@ fn a_missing_identical_file_is_charged_as_a_new_one() {
     let held = f.storage().bind_avatar_source("chat:cc", "source").unwrap();
     f.storage().publish_avatar(&held, 0, &shared, None).unwrap();
     let batch = migrate_batch(&f.storage(), &f.media, RESERVE, &tight);
-    assert_eq!((batch.moved, batch.evicted), (0, 1));
+    assert_eq!((batch.moved, batch.waiting_for_space), (0, true));
     assert_eq!(f.files_on_disk(), 0);
+    assert_eq!(
+        f.count("SELECT count(*) FROM avatar_assets WHERE bytes IS NOT NULL"),
+        1
+    );
 }
 
-/// Free space that cannot be measured is not a full disk: the move drops
-/// nothing and retries later.
+/// Free space that cannot be measured admits no new file: the move drops
+/// nothing and tries again later.
 #[test]
 fn an_unmeasurable_disk_drops_no_avatars() {
     let f = Fixture::new();
@@ -487,8 +499,7 @@ fn an_unmeasurable_disk_drops_no_avatars() {
         .unwrap();
     let unknown = || Err(std::io::Error::other("statvfs"));
     let batch = migrate_batch(&f.storage(), &f.media, RESERVE, &unknown);
-    assert!(batch.deferred);
-    assert_eq!((batch.moved, batch.evicted), (0, 0));
+    assert_eq!((batch.moved, batch.waiting_for_space), (0, true));
     assert_eq!(
         f.count("SELECT count(*) FROM avatar_assets WHERE bytes IS NOT NULL"),
         1
