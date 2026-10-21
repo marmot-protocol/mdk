@@ -34,6 +34,7 @@ use crate::app_telemetry::{
     SyncFailureStage, bounded_advisory_step,
 };
 use crate::directory::DirectorySyncHandle;
+use crate::directory_resources::directory_account;
 use crate::ids::{account_id_hex_from_ref, normalize_group_id_hex_app};
 use crate::messages::AppMessageIntent;
 use crate::notifications;
@@ -4688,7 +4689,8 @@ impl MarmotAppRuntime {
         Ok(self
             .accounts
             .app
-            .cached_public_event_previews(&account, references)?)
+            .directory()
+            .cached_public_event_previews(&directory_account(&account), references)?)
     }
 
     /// Fetch one referenced public event from relays when it is missing or
@@ -4705,7 +4707,8 @@ impl MarmotAppRuntime {
         Ok(self
             .accounts
             .app
-            .resolve_public_event_preview(&account, reference)
+            .directory()
+            .resolve_public_event_preview(&directory_account(&account), reference)
             .await?)
     }
 

@@ -226,7 +226,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   about to be used, never before a network step. `MarmotApp` implements the trait and builds the service with
   `directory()` in `src/directory_resources.rs`; its public directory methods become one-line delegates in
   `src/directory_delegates.rs`, which PR 7 removes. Code still in `impl MarmotApp` calls converted methods through
-  `self.directory()`, listed as a crossing until that file converts too.
+  `self.directory()`, listed as a crossing until that file converts too. `directory()` builds a fresh service on each
+  call, with `DirectoryConfig` read from the app's configuration at that moment. Anything the directory keeps between
+  calls belongs in `DirectoryState`, whose shared fields live on `MarmotApp` as `directory_state`; never create state
+  inside `directory()`, where it would die with the returned value.
 - Keep stateless relay-list and KeyPackage handling for other accounts (relay-list status, KeyPackage tag/metadata
   validation, fresh-vs-cached reconciliation, ranking and selection, revocation evidence) and the directory-record
   selection primitives (`DirectoryFreshness`, `DirectorySelection`, `sort_directory_records`) in

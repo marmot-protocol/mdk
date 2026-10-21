@@ -18,6 +18,7 @@ mod sync;
 pub(crate) use cache::DirectoryCache;
 #[cfg(test)]
 pub(crate) use cache::DirectorySearchGraphRecord;
+pub(crate) use config::DirectoryConfig;
 pub use member_key_packages::MemberKeyPackagePrewarmSummary;
 pub(crate) use member_key_packages::{MemberKeyPackagePrewarmCache, MemberResolutionPurpose};
 #[cfg(test)]
@@ -38,7 +39,7 @@ pub use search::{
     OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger, UserSearchParams, UserSearchSubscription,
     UserSearchUpdate, sort_user_search_results,
 };
-pub(crate) use service::Directory;
+pub(crate) use service::{Directory, DirectoryState};
 pub(crate) use sync::{DirectorySyncHandle, plan_directory_sync};
 
 /// The directory's wall clock, in Unix seconds.

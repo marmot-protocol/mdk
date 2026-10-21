@@ -12,11 +12,14 @@ use std::path::PathBuf;
 
 use marmot_account::AccountSummary;
 
+use cgka_traits::TransportEndpoint;
 use storage_sqlite::SqliteSharedStorage;
 
 use crate::directory::error::DirectoryError;
 use crate::directory::records::public_directory_user_record;
-use crate::directory::{Directory, DirectoryAccount, DirectoryCache, DirectoryResources};
+use crate::directory::{
+    Directory, DirectoryAccount, DirectoryCache, DirectoryConfig, DirectoryResources,
+};
 use crate::{
     APP_CACHE_DB_FILE, AccountRelayListStatus, AppError,
     DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER, MarmotApp, SqlcipherDatabaseKind,
@@ -25,8 +28,31 @@ use crate::{
 
 /// The directory service over this app's resources.
 impl MarmotApp {
+    /// Builds the service on each call. What the directory keeps between
+    /// calls lives in `directory_state` and is shared into every service, so
+    /// nothing it needs later is owned by the value returned here.
     pub(crate) fn directory(&self) -> Directory<MarmotApp> {
-        Directory::new(self.clone())
+        Directory::new(
+            self.clone(),
+            self.directory_config(),
+            self.relay_plane.clone(),
+            self.directory_state.clone(),
+        )
+    }
+
+    /// Read from the app's configuration on each call, so a test that edits
+    /// `config` after construction sees its change.
+    fn directory_config(&self) -> DirectoryConfig {
+        DirectoryConfig {
+            directory_relays: self
+                .config
+                .directory_relay_urls
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+            default_relays: self.relay_endpoints(),
+        }
     }
 }
 
@@ -40,6 +66,10 @@ impl DirectoryResources for MarmotApp {
             .iter()
             .map(directory_account)
             .collect())
+    }
+
+    fn account_id_for_label(&self, label: &str) -> Result<String, DirectoryError> {
+        Ok(self.account_home().account(label)?.account_id_hex)
     }
 
     fn current_caches(&self) -> Result<Vec<DirectoryCache>, DirectoryError> {
@@ -63,7 +93,7 @@ impl DirectoryResources for MarmotApp {
 }
 
 /// The directory's view of a local account.
-fn directory_account(account: &AccountSummary) -> DirectoryAccount {
+pub(crate) fn directory_account(account: &AccountSummary) -> DirectoryAccount {
     DirectoryAccount {
         account_id_hex: account.account_id_hex.clone(),
         label: account.label.clone(),

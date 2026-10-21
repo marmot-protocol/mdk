@@ -1,4 +1,4 @@
-use crate::AppError;
+use crate::{AppError, MarmotApp};
 use marmot_account::AccountHome;
 use nostr::nips::nip19::{Nip19Coordinate, Nip19Event, ToBech32};
 use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Tag, Timestamp};
@@ -771,8 +771,26 @@ fn relay_hints_pass_the_discovered_endpoint_safety_rule() {
     .map(|url| TransportEndpoint(url.to_owned()))
     .to_vec();
     assert_eq!(
-        app.public_event_query_relays(hints),
+        app.directory().public_event_query_relays(hints),
         ["wss://hint.example", "wss://relay.example"]
             .map(|url| TransportEndpoint(RelayUrl::parse(url).unwrap().to_string()))
+    );
+}
+
+/// `MarmotApp::directory()` builds a new service per call, so the cooldowns
+/// must live in the app's shared state rather than in the service.
+#[test]
+fn refresh_cooldowns_outlive_the_service_that_started_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(dir.path(), vec!["wss://relay.example".to_owned()]);
+    let key = "alice\nnote".to_owned();
+    assert!(!app.directory().public_event_refresh_cooling_down(&key));
+    app.directory()
+        .start_public_event_refresh_cooldown(key.clone());
+    assert!(app.directory().public_event_refresh_cooling_down(&key));
+    assert!(
+        app.clone()
+            .directory()
+            .public_event_refresh_cooling_down(&key)
     );
 }

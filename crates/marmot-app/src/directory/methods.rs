@@ -1084,19 +1084,7 @@ impl MarmotApp {
         &self,
         source_relays: &[TransportEndpoint],
     ) -> Vec<TransportEndpoint> {
-        if !source_relays.is_empty() {
-            return source_relays.to_vec();
-        }
-        if !self.config.directory_relay_urls.is_empty() {
-            return self
-                .config
-                .directory_relay_urls
-                .iter()
-                .cloned()
-                .map(TransportEndpoint)
-                .collect();
-        }
-        self.relay_endpoints()
+        self.directory().directory_source_relays(source_relays)
     }
 
     pub(crate) fn directory_entries(&self) -> Result<Vec<UserDirectoryRecord>, DirectoryError> {

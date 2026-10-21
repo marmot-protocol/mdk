@@ -31,12 +31,6 @@ directory/methods.rs crate::MarmotApp
 directory/methods.rs crate::ProductFamily
 directory/methods.rs crate::ProductUnit
 directory/open_ranking.rs crate::network_proxy::http_builder
-directory/previews.rs MarmotApp.public_event_refreshes
-directory/previews.rs MarmotApp.relay_plane
-directory/previews.rs MarmotApp::account_home()
-directory/previews.rs MarmotApp::directory_cache_for_account()
-directory/previews.rs crate::MarmotApp
-directory/previews.rs marmot_account::AccountSummary
 directory/search.rs MarmotApp.product_analytics
 directory/search.rs MarmotApp.relay_plane
 directory/search.rs MarmotApp::deployment()

@@ -24,9 +24,13 @@ pub struct DirectoryAccount {
 /// Ask for a cache when it is about to be used. A handle taken before a
 /// network step can outlive its account's eviction and keep writing to a
 /// closed account's cache.
-pub trait DirectoryResources {
+pub trait DirectoryResources: Clone + Send + Sync + 'static {
     /// Every local account, signed-out ones included, in account-home order.
     fn local_accounts(&self) -> Result<Vec<DirectoryAccount>, DirectoryError>;
+
+    /// The id of the account that holds `label` now. It differs from an
+    /// earlier read when the account was removed and the label reused.
+    fn account_id_for_label(&self, label: &str) -> Result<String, DirectoryError>;
 
     /// The caches of every active-signing account, opening any not yet open.
     fn current_caches(&self) -> Result<Vec<DirectoryCache>, DirectoryError>;

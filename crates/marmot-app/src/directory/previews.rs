@@ -37,15 +37,14 @@ use std::time::{Duration, Instant};
 
 use cgka_traits::TransportEndpoint;
 use cgka_traits::storage::StorageError;
-use marmot_account::AccountSummary;
 use nostr::event::Event;
 use nostr::nips::nip01::Coordinate;
 use nostr::nips::nip19::{FromBech32, Nip19};
 use nostr::prelude::{EventId, Filter, Kind, RelayUrl};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use super::unix_now_seconds;
-use crate::MarmotApp;
+use super::resources::{DirectoryAccount, DirectoryResources};
+use super::{Directory, unix_now_seconds};
 
 /// Maximum references in one cached batch read.
 pub const MAX_PUBLIC_EVENT_REFERENCES: usize = 16;
@@ -616,12 +615,12 @@ fn invalid_batch(len: usize) -> DirectoryError {
     ))
 }
 
-impl MarmotApp {
+impl<R: DirectoryResources> Directory<R> {
     /// Network-free cached previews, one per reference in input order.
     /// Unparseable references are `Unsupported` rows, not errors.
     pub(crate) fn cached_public_event_previews(
         &self,
-        account: &AccountSummary,
+        account: &DirectoryAccount,
         references: &[String],
     ) -> Result<Vec<PublicEventPreviewRead>, DirectoryError> {
         if references.len() > MAX_PUBLIC_EVENT_REFERENCES {
@@ -633,7 +632,7 @@ impl MarmotApp {
             .collect::<Vec<_>>();
         let mut found = HashMap::new();
         if keys.iter().any(Option::is_some) {
-            let cache = self.directory_cache_for_account(account)?;
+            let cache = self.resources.cache_for_account(account)?;
             let mut conn = cache.lock()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
             let now = unix_now_seconds();
@@ -678,7 +677,7 @@ impl MarmotApp {
     /// return its local state. A failed or empty fetch keeps prior content.
     pub(crate) async fn resolve_public_event_preview(
         &self,
-        account: &AccountSummary,
+        account: &DirectoryAccount,
         reference: &str,
     ) -> Result<PublicEventPreviewRead, DirectoryError> {
         let read = |preview| PublicEventPreviewRead {
@@ -690,11 +689,11 @@ impl MarmotApp {
         };
         let key = parsed.target.cache_key();
         let stored = {
-            let app = self.clone();
+            let resources = self.resources.clone();
             let account = account.clone();
             let key = key.clone();
             blocking_directory_task(move || {
-                let cache = app.directory_cache_for_account(&account)?;
+                let cache = resources.cache_for_account(&account)?;
                 let conn = cache.lock()?;
                 read_row(&conn, &key)
             })
@@ -755,18 +754,17 @@ impl MarmotApp {
             return Ok(current(stored.as_ref()));
         }
 
-        let app = self.clone();
+        let resources = self.resources.clone();
         let account = account.clone();
         let target = parsed.target;
         let preview = blocking_directory_task(move || {
             // The account may have been removed or replaced during the fetch.
-            if app.account_home().account(&account.label)?.account_id_hex != account.account_id_hex
-            {
+            if resources.account_id_for_label(&account.label)? != account.account_id_hex {
                 return Err(DirectoryError::from(StorageError::Backend(
                     "account changed during public event refresh".into(),
                 )));
             }
-            let cache = app.directory_cache_for_account(&account)?;
+            let cache = resources.cache_for_account(&account)?;
             let mut conn = cache.lock()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // Admission re-reads the row inside the write lock: a concurrent
@@ -809,7 +807,8 @@ impl MarmotApp {
     }
 
     fn public_event_refresh_cooling_down(&self, key: &str) -> bool {
-        self.public_event_refreshes
+        self.state
+            .public_event_refreshes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(key)
@@ -818,6 +817,7 @@ impl MarmotApp {
 
     fn start_public_event_refresh_cooldown(&self, key: String) {
         let mut attempts = self
+            .state
             .public_event_refreshes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());

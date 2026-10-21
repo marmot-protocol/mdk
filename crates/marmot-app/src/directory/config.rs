@@ -1,4 +1,17 @@
-//! The directory's settings, which a host chooses through its deployment.
+//! The directory's settings. The host chooses them through its deployment and
+//! app configuration.
+
+use cgka_traits::TransportEndpoint;
+
+/// The relays the directory reads from, as the app configured them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DirectoryConfig {
+    /// Relays the host chose for directory reads. Empty means
+    /// [`Self::default_relays`].
+    pub directory_relays: Vec<TransportEndpoint>,
+    /// The app's default relays.
+    pub default_relays: Vec<TransportEndpoint>,
+}
 
 /// An Open Ranking pubkey-search endpoint and the relays that hydrate its
 /// results into signed kind-0 profiles.

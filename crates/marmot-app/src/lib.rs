@@ -557,9 +557,9 @@ pub struct MarmotApp {
     close_registry: Arc<close_registry::CloseRegistry>,
     account_session_owners: Arc<Mutex<HashSet<String>>>,
     directory_caches: Arc<Mutex<HashMap<String, DirectoryCache>>>,
-    /// When each `(account label, cache key)` public event refresh last
-    /// finished; see `public_event_preview`.
-    public_event_refreshes: Arc<Mutex<HashMap<String, Instant>>>,
+    /// What the directory keeps between calls; [`Self::directory`] shares it
+    /// with every service it builds.
+    directory_state: directory::DirectoryState,
     /// Bounded, process-local composition prewarm. Entries are never durable
     /// directory admission and never reserve or consume a KeyPackage.
     member_key_package_prewarm_cache: Arc<Mutex<directory::MemberKeyPackagePrewarmCache>>,
@@ -1622,7 +1622,7 @@ impl MarmotApp {
             close_registry: Default::default(),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
-            public_event_refreshes: Arc::default(),
+            directory_state: directory::DirectoryState::default(),
             member_key_package_prewarm_cache: Arc::new(Mutex::new(
                 directory::MemberKeyPackagePrewarmCache::default(),
             )),
@@ -1723,7 +1723,7 @@ impl MarmotApp {
             close_registry: Default::default(),
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
-            public_event_refreshes: Arc::default(),
+            directory_state: directory::DirectoryState::default(),
             member_key_package_prewarm_cache: Arc::new(Mutex::new(
                 directory::MemberKeyPackagePrewarmCache::default(),
             )),
