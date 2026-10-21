@@ -82,7 +82,15 @@ impl Fixture {
     fn read(&self, reference: &AvatarAssetRef) -> AvatarAssetRead {
         let now = crate::unix_now_seconds();
         let mut read = self.storage().read_avatar(reference, now).unwrap();
-        read_file_backed(&self.storage(), &self.media, reference, &mut read, now).unwrap();
+        read_file_backed(
+            &self.storage(),
+            &self.media,
+            reference,
+            &mut read,
+            now,
+            storage_sqlite::MAX_AVATAR_BYTES as u64,
+        )
+        .unwrap();
         read
     }
 }
@@ -505,4 +513,56 @@ fn an_unmeasurable_disk_drops_no_avatars() {
         1
     );
     assert_eq!(f.files_on_disk(), 0);
+}
+
+/// An owner that moves to another file between the lookup and the read (a
+/// newer image landed and its old file was unlinked) is read again from its
+/// current file, not returned as an empty "ready" image.
+#[test]
+fn a_read_follows_an_owner_that_moved_to_another_file() {
+    let f = Fixture::new();
+    let (reference, first) = f.claim("chat:aa");
+    store_acquired(
+        &f.storage(),
+        &f.media,
+        RESERVE,
+        &plenty,
+        &first,
+        &image(14, 3_000),
+        Some(0),
+    )
+    .unwrap();
+    let now = crate::unix_now_seconds();
+    let mut stale = f.storage().read_avatar(&reference, now).unwrap();
+    assert!(stale.file.is_some());
+    // A newer image replaces the owner's file and the old one is unlinked.
+    let newer = image(15, 4_000);
+    let second = f.storage().claim_avatar_acquisition(now).unwrap().unwrap();
+    assert_eq!(
+        store_acquired(
+            &f.storage(),
+            &f.media,
+            RESERVE,
+            &plenty,
+            &second,
+            &newer,
+            None
+        )
+        .unwrap(),
+        StoredAvatar::Stored
+    );
+    assert_eq!(f.files_on_disk(), 1, "the old file is gone");
+
+    read_file_backed(
+        &f.storage(),
+        &f.media,
+        &reference,
+        &mut stale,
+        now,
+        storage_sqlite::MAX_AVATAR_BYTES as u64,
+    )
+    .unwrap();
+    assert_eq!(stale.image, Some(newer));
+    assert!(!stale.repaired);
+    assert_eq!(stale.status.content_revision, 2);
 }

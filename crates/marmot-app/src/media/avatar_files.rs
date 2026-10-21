@@ -26,6 +26,8 @@ use crate::{AccountMediaStore, AppError};
 
 /// Most database-held images one maintenance batch moves.
 pub(crate) const AVATAR_MIGRATION_BATCH: usize = 64;
+/// Times a read follows an owner that moved to another file mid-read.
+const FILE_READ_ATTEMPTS: usize = 3;
 /// A batch stops starting new images once it has moved this many bytes.
 const AVATAR_MIGRATION_BATCH_BYTES: u64 = 16 * 1024 * 1024;
 const TRACE_TARGET: &str = "marmot_app::avatar_cache";
@@ -97,33 +99,46 @@ pub(crate) fn store_acquired(
 /// Fills `read.image` from a file-backed image's cache file. A file that is
 /// missing or fails authentication is reported: this owner is cleared at
 /// once (`read.repaired`, with its new status) and every owner sharing the
-/// file fetches it again. Other store failures are returned unchanged.
+/// file fetches it again. If the owner moved to another file between the
+/// lookup and the read (a publication or the move replaced it), the read
+/// starts over from the current row, within `max_bytes`, a few times at most.
+/// Other store failures are returned unchanged.
 pub(crate) fn read_file_backed(
     storage: &SqliteAppStorage,
     media: &AccountMediaStore,
     reference: &AvatarAssetRef,
     read: &mut AvatarAssetRead,
     now: u64,
+    max_bytes: u64,
 ) -> Result<(), AppError> {
-    let Some(file) = read.file.take() else {
-        return Ok(());
-    };
-    let image = match read_whole(media, &file.id, file.byte_len) {
-        Ok(Some(bytes)) => AvatarImage::new(bytes, file.format, file.width, file.height).ok(),
-        Ok(None) => None,
-        Err(error) => return Err(storage_sqlite::media_storage_error(error).into()),
-    };
-    if let Some(image) = image {
-        read.image = Some(image);
-        return Ok(());
+    for _ in 0..FILE_READ_ATTEMPTS {
+        let Some(file) = read.file.take() else {
+            return Ok(());
+        };
+        let image = match read_whole(media, &file.id, file.byte_len) {
+            Ok(Some(bytes)) => AvatarImage::new(bytes, file.format, file.width, file.height).ok(),
+            Ok(None) => None,
+            Err(error) => return Err(storage_sqlite::media_storage_error(error).into()),
+        };
+        if let Some(image) = image {
+            read.image = Some(image);
+            return Ok(());
+        }
+        let (cleared, released) = storage.discard_avatar_file(reference, file.id)?;
+        media.unlink_released(&released);
+        if cleared {
+            read.repaired = true;
+            read.status = storage.avatar_status(reference, now)?;
+            return Ok(());
+        }
+        // The owner no longer uses that file: read what it holds now.
+        let repaired = read.repaired;
+        *read = storage.read_avatar_bounded(reference, now, max_bytes)?;
+        read.repaired |= repaired;
     }
-    let (cleared, released) = storage.discard_avatar_file(reference, file.id)?;
-    media.unlink_released(&released);
-    if cleared {
-        read.repaired = true;
-        read.status = storage.avatar_status(reference, now)?;
-    }
-    Ok(())
+    Err(AppError::from(cgka_traits::StorageError::Backend(
+        "avatar kept changing while it was read".into(),
+    )))
 }
 
 /// The whole plaintext of file `id`, or `None` when it is missing, has the

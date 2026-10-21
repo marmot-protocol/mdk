@@ -151,6 +151,7 @@ impl MarmotAppRuntime {
                                 &reference,
                                 &mut result,
                                 now,
+                                remaining,
                             )?;
                         }
                     }
