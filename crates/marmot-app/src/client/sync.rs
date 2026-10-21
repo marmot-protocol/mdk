@@ -3212,31 +3212,12 @@ impl AppClient {
         &mut self,
         on_progress: Option<&CommittedSyncProgress<'_>>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        let result = self.sync_sdk_relay_inner(on_progress).await;
-        let mut committed = std::mem::take(&mut self.pending_native_sync_summary);
-        match result {
-            Ok(summary) => {
-                committed.merge(summary);
-                Ok(committed)
-            }
-            Err(mut failure) => {
-                committed.merge(failure.partial_summary);
-                failure.partial_summary = committed;
-                Err(failure)
-            }
-        }
-    }
-
-    async fn sync_sdk_relay_inner(
-        &mut self,
-        on_progress: Option<&CommittedSyncProgress<'_>>,
-    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let mut counts = DrainCounts::default();
         let mut summary = std::mem::take(&mut self.pending_failed_sync_summary);
         summary.merge(self.take_pending_applied_sync_summary());
         if let Err(error) = self.retry_applied_effect_projections(&mut summary).await {
             return Err(ClassifiedSyncFailure::at_stage(
-                summary,
+                self.take_native_sync_prefix(summary),
                 error,
                 SyncFailureStage::Unknown,
             ));
@@ -3518,7 +3499,11 @@ impl AppClient {
                 cursor_before_secs,
                 cursor_after_secs,
             );
-            return Err(ClassifiedSyncFailure::at_stage(summary, source, stage));
+            return Err(ClassifiedSyncFailure::at_stage(
+                self.take_native_sync_prefix(summary),
+                source,
+                stage,
+            ));
         }
         self.record_sync_drain(
             drain_started.elapsed().as_millis() as u64,
@@ -3526,7 +3511,13 @@ impl AppClient {
             cursor_before_secs,
             self.state.last_transport_timestamp,
         );
-        Ok(summary)
+        Ok(self.take_native_sync_prefix(summary))
+    }
+
+    fn take_native_sync_prefix(&mut self, summary: SyncSummary) -> SyncSummary {
+        let mut committed = std::mem::take(&mut self.pending_native_sync_summary);
+        committed.merge(summary);
+        committed
     }
 
     async fn finish_failed_sync_drain(
@@ -3570,7 +3561,7 @@ impl AppClient {
             error_class = source.sync_error_class().as_str(),
             "sync drain failed"
         );
-        ClassifiedSyncFailure::at_stage(summary, source, stage)
+        ClassifiedSyncFailure::at_stage(self.take_native_sync_prefix(summary), source, stage)
     }
 
     pub(super) async fn checkpoint_sync_prefix(
