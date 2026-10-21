@@ -106,9 +106,14 @@ async fn native_cursor_save_retry() {
             .last_transport_timestamp
             .is_some_and(|cursor| cursor >= event.event.created_at)
     );
+    fixture.receiver.admit_native_turn().await.unwrap();
     assert!(
-        !fixture.receiver.admit_native_turn().await.unwrap(),
-        "the successful retry leaves no duplicate native work"
+        fixture
+            .receiver
+            .take_pending_applied_sync_summary()
+            .messages
+            .is_empty(),
+        "cursor settlement must not publish duplicate plaintext"
     );
 }
 
@@ -157,6 +162,78 @@ async fn held_native_restores_cursor() {
             .is_empty(),
         "an already-held replay repairs its floor without duplicate plaintext notifications"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_check_counts_ingest() {
+    let mut fixture = crypto_fixture().await;
+    let (events, expected) = encrypted_texts(&mut fixture.sender, &fixture.group).await;
+    let app = fixture.receiver.app.clone();
+    drop(fixture.receiver);
+    fixture.receiver = client_on_app_relay_plane(&app, "receiver").await;
+    fixture.receiver.set_audit_recording(true);
+    // Start a real source generation without synchronizing its owner yet.
+    // The first live ingest must checkpoint that generation after MLS commits.
+    fixture.receiver.open_native_ingress().await.unwrap();
+    fixture
+        .receiver
+        .runtime
+        .activate_transport(None)
+        .await
+        .unwrap();
+    let delivery = fixture
+        .receiver
+        .adapter
+        .recovered_deliveries(events[0].clone())
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let routes_before = fixture.receiver.pending_runtime_group_subscription_refresh;
+    let connection = fault_connection(&fixture.receiver);
+    connection.execute_batch(
+        "CREATE TRIGGER fail_live_check BEFORE UPDATE OF scope_payload ON account_recovery_scopes
+         BEGIN SELECT RAISE(FAIL, 'injected live replay checkpoint failure'); END;",
+    ).unwrap();
+
+    let failure = fixture
+        .receiver
+        .ingest_received_delivery_with_partial(delivery.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        failure
+            .source
+            .to_string()
+            .contains("injected live replay checkpoint failure")
+    );
+    let messages = visible_messages(&fixture.receiver, &fixture.group);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        expected.get(&messages[0].message_id_hex),
+        Some(&messages[0].plaintext)
+    );
+    assert_eq!(
+        fixture.receiver.pending_runtime_group_subscription_refresh, routes_before,
+        "a plaintext ingest does not dirty membership routes"
+    );
+    let drains = crate::client::audit_recovery::recorded_v5_rows(&app, "sync_drain");
+    assert_eq!(drains.len(), 1);
+    assert_eq!(
+        drains[0]["event"]["deliveries"], 1,
+        "the failed live cursor check must count the already-durable delivery"
+    );
+
+    connection
+        .execute_batch("DROP TRIGGER fail_live_check")
+        .unwrap();
+    let retry = fixture
+        .receiver
+        .ingest_received_delivery_with_partial(delivery)
+        .await
+        .unwrap();
+    assert!(retry.messages.is_empty());
+    assert_eq!(visible_messages(&fixture.receiver, &fixture.group).len(), 1);
 }
 
 async fn mixed_network(
@@ -358,7 +435,15 @@ async fn native_spill_ack_is_durable() {
             .deliveries
             .is_empty()
     );
-    assert!(!fixture.receiver.admit_native_turn().await.unwrap());
+    fixture.receiver.admit_native_turn().await.unwrap();
+    assert!(
+        fixture
+            .receiver
+            .take_pending_applied_sync_summary()
+            .messages
+            .is_empty(),
+        "an acknowledged spill must not publish duplicate plaintext"
+    );
     assert_eq!(visible_messages(&fixture.receiver, &fixture.group).len(), 1);
 }
 
@@ -385,7 +470,15 @@ async fn native_error_stays_visible() {
         expected.get(&message.message_id_hex),
         Some(&message.plaintext)
     );
-    assert!(!fixture.receiver.admit_native_turn().await.unwrap());
+    fixture.receiver.admit_native_turn().await.unwrap();
+    assert!(
+        fixture
+            .receiver
+            .take_pending_applied_sync_summary()
+            .messages
+            .is_empty(),
+        "retrying a settled native input must not publish duplicate plaintext"
+    );
     assert_eq!(visible_messages(&fixture.receiver, &fixture.group).len(), 1);
 }
 
@@ -443,7 +536,15 @@ async fn native_receipts_yield() {
             .len(),
         1
     );
-    assert!(!fixture.receiver.admit_native_turn().await.unwrap());
+    fixture.receiver.admit_native_turn().await.unwrap();
+    assert!(
+        fixture
+            .receiver
+            .take_pending_applied_sync_summary()
+            .messages
+            .is_empty(),
+        "settled receipts must not publish duplicate plaintext"
+    );
     assert_eq!(
         visible_messages(&fixture.receiver, &fixture.group).len(),
         held + MAX_COMPARISON_ADMISSION_PER_TURN + 1

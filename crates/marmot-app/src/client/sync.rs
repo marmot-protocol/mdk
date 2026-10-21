@@ -3051,8 +3051,8 @@ impl AppClient {
             self.live_cursor_promotion_ready().await.map_err(|error| {
                 (
                     summary.clone(),
+                    true,
                     routes_dirty,
-                    false,
                     error,
                     SyncFailureStage::StatePersist,
                 )

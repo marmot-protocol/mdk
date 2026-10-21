@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-10-20
+updated: 2026-10-21
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -186,7 +186,7 @@ Today, when the 1,024-slot account queue is full, the router holds the whole
 current design follows from that choice: loss of unknown scope, broad replay, a completion
 nobody can certify, and the wait behind the queued backlog.
 
-Inbox and legacy delivery behavior, with each tier falling back to the next. Native group input uses section 0:
+Native group input uses section 0. Inbox and legacy delivery use these tiers, each falling back to the next:
 
 ```
 router ─► account queue (1,024, memory) ─► worker ingest

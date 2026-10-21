@@ -1,7 +1,7 @@
 ---
 title: "Forensic Audit Logging Inventory"
 created: 2026-06-10
-updated: 2026-09-28
+updated: 2026-10-21
 tags: [marmot, architecture, audit, forensics, jsonl, privacy]
 status: current
 ---
@@ -1361,7 +1361,7 @@ metadata keys for indexing.
 | `new_state` | `sent`, `created`, `processed`, `failed`, `retryable`, `peel_deferred`, `epoch_invalidated` |
 | `ForkWinner` | `candidate`, `incumbent`, `missing_snapshot` |
 | `PeelerOutcomeKind` | `success`, `decrypt_failed`, `stale_epoch`, `malformed`, `other` |
-| `RecoveryObligationCause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history` |
+| `RecoveryObligationCause` | `queue_loss`, `notification_loss`, `epoch_gap`, `maintenance`, `explicit_history`, `known_event`, `incremental_history`, `subscription_replay` |
 | `RecoveryNeedChange` | `recorded`, `joined`, `resumed`, `notice_shown`, `notice_dismissed`, `closed`, `closed_below_window` |
 | `RecoveryGoalBound` | `floor`, `unbounded`, `retained_window` |
 | `RecoveryAttemptScope` | `history`, `exact_event`, `maintenance_boundary`, `mixed` |

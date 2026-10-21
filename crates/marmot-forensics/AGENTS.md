@@ -20,7 +20,7 @@ Shared JSONL forensic audit schema for Marmot incident capture.
   digests, lengths, counts, and typed outcomes only. Never add decrypted content, cleartext group values, full account
   or member identities, bearer/upload tokens, auth headers, private keys, ciphertext, or raw MLS bytes.
 - New opt-in app audit sessions record v5 into separate files. Keep `schema/audit-log-event.v5.schema.json`, the Rust
-  types/semantic validator, and `tests/audit_v5.rs` in lockstep, including the 52 typed operational kinds and Welcome
+  types/semantic validator, and `tests/audit_v5.rs` in lockstep, including the 51 typed operational kinds and Welcome
   evidence. Seven of those kinds are v5-only (`AuditEventKind::is_v5_only`: the recovery-owner, transport-cursor,
   historical lag-lost EOSE repair rows in `src/audit/recovery.rs`, and the subscription
   refusal row in `src/audit/refusal.rs`); a v4 recorder drops them, and the frozen v4 schema and its catalog tests
