@@ -583,9 +583,12 @@ impl Marmot {
     /// current kind-3 contact list. Returns the complete updated list.
     ///
     /// This fetches the current replaceable event from the account's known
-    /// outbox/default relays before publishing. If no current event can be
-    /// established, it returns `FollowListUnavailable` rather than risking a
-    /// destructive replacement.
+    /// outbox/default relays and appends one `p` tag; petnames, relay hints,
+    /// other tags and the content are republished unchanged. If no current
+    /// event can be established, it returns `FollowListUnavailable` rather
+    /// than risking a destructive replacement. If the list has 2,048 follows
+    /// or more, the most MDK reads from one list, it returns
+    /// `FollowListTooLarge` and publishes nothing.
     pub async fn follow_user(
         &self,
         account_ref: String,
@@ -600,6 +603,10 @@ impl Marmot {
 
     /// Unfollow `user_ref` while preserving every other entry in the account's
     /// current kind-3 contact list. Returns the complete updated list.
+    ///
+    /// Removes only `user_ref`'s `p` tags and otherwise behaves as
+    /// `follow_user`, including `FollowListUnavailable` and
+    /// `FollowListTooLarge`.
     pub async fn unfollow_user(
         &self,
         account_ref: String,

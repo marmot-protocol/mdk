@@ -1,6 +1,7 @@
 #[cfg(feature = "test-policy-overrides")]
 mod canonical_membership;
 mod draft_lifecycle;
+mod follow_list_edits;
 mod group_lookup;
 pub(crate) mod invite_recovery;
 mod key_package_inventory;

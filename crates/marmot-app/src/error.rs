@@ -227,6 +227,11 @@ pub enum AppError {
     /// an empty list could silently erase follows published elsewhere.
     #[error("current account follow list is unavailable")]
     FollowListUnavailable,
+    /// The current kind-3 contact list has at least `MAX_FOLLOW_LIST_ENTRIES`
+    /// follows, more than MDK reads from one list. Publishing an edit of the
+    /// list it read could drop follows, so nothing was published.
+    #[error("current account follow list is too large to update")]
+    FollowListTooLarge,
     #[error("user is blocked")]
     UserBlocked,
     #[error("block list synchronization unavailable")]
@@ -562,6 +567,7 @@ impl AppError {
             Self::ModerationReportRateLimited => "moderation_report_rate_limited",
             Self::InvalidEditTarget => "invalid_edit_target",
             Self::FollowListUnavailable => "follow_list_unavailable",
+            Self::FollowListTooLarge => "follow_list_too_large",
             Self::RelayDirectory(_) => "relay_directory",
             Self::AccountCatchUp(_) => "account_catch_up",
             Self::InvalidPublicKey => "invalid_public_key",

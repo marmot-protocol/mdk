@@ -222,6 +222,11 @@ enum MarmotStatus
    * cannot stage before uploading anything; retry once space is free.
    */
   MARMOT_STATUS_STORAGE_FULL = 106,
+  /**
+   * The current kind-3 contact list has at least 2,048 follows, more than
+   * MDK reads from one list; a follow or unfollow published nothing.
+   */
+  MARMOT_STATUS_FOLLOW_LIST_TOO_LARGE = 107,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -8297,8 +8302,10 @@ MarmotStatus marmot_is_following(const struct MarmotClient *client,
                                  bool *out);
 
 /**
- * Follow `user_ref` and publish the updated list. Writes the new
- * follow set. Free with `marmot_string_list_free`.
+ * Follow `user_ref` and publish the updated list, keeping its other
+ * tags and content. Writes the new follow set. Returns
+ * `MARMOT_STATUS_FOLLOW_LIST_TOO_LARGE`, publishing nothing, when the
+ * list has 2,048 follows or more. Free with `marmot_string_list_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -8312,8 +8319,10 @@ MarmotStatus marmot_follow_user(const struct MarmotClient *client,
                                 struct MarmotStringList **out);
 
 /**
- * Unfollow `user_ref` and publish the updated list. Free with
- * `marmot_string_list_free`.
+ * Unfollow `user_ref` and publish the updated list, keeping its other
+ * tags and content. Returns `MARMOT_STATUS_FOLLOW_LIST_TOO_LARGE`,
+ * publishing nothing, when the list has 2,048 follows or more. Free
+ * with `marmot_string_list_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid

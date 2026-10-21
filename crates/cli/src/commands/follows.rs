@@ -2,7 +2,7 @@
 
 use cgka_traits::TransportEndpoint;
 use marmot_account::AccountHome;
-use marmot_app::{AccountRelayListBootstrap, MarmotApp, MarmotAppRuntime};
+use marmot_app::{AccountRelayListBootstrap, AppError, MarmotApp, MarmotAppRuntime};
 use serde_json::{Value, json};
 
 use crate::{
@@ -61,16 +61,15 @@ pub(crate) async fn follows_command_with_runtime(
             })
         }
         FollowsCommand::Add { pubkey } => {
-            update_follows_command(app, runtime, account, relay, pubkey, true).await
+            update_follows_command(runtime, account, relay, pubkey, true).await
         }
         FollowsCommand::Remove { pubkey } => {
-            update_follows_command(app, runtime, account, relay, pubkey, false).await
+            update_follows_command(runtime, account, relay, pubkey, false).await
         }
     }
 }
 
 async fn update_follows_command(
-    app: &MarmotApp,
     runtime: &MarmotAppRuntime,
     account: marmot_account::AccountSummary,
     relay: Option<String>,
@@ -80,32 +79,23 @@ async fn update_follows_command(
     let target = parse_public_key(&pubkey)?;
     let relay = relay.ok_or(WnError::MissingRelay)?;
     let endpoint = TransportEndpoint(validate_relay_url(&relay)?);
-    let mut follows = app
-        .fetch_current_follow_list_for_account_id(&account.account_id_hex, vec![endpoint.clone()])
-        .await?
-        .ok_or_else(|| {
-            replaceable_list_inconclusive(
+    let follows = runtime
+        .update_account_follow_list(
+            &account.label,
+            &target,
+            add,
+            vec![endpoint.clone()],
+            AccountRelayListBootstrap::new(vec![endpoint.clone()], vec![endpoint.clone()]),
+        )
+        .await
+        .map_err(|error| match error {
+            AppError::FollowListUnavailable => replaceable_list_inconclusive(
                 "follows",
                 &account.account_id_hex,
                 std::slice::from_ref(&endpoint),
-            )
+            ),
+            error => error.into(),
         })?;
-    if add {
-        if !follows.contains(&target) {
-            follows.push(target);
-        }
-    } else {
-        follows.retain(|follow| follow != &target);
-    }
-    follows.sort();
-    follows.dedup();
-    runtime
-        .publish_account_follow_list(
-            &account.label,
-            &follows,
-            AccountRelayListBootstrap::new(vec![endpoint.clone()], vec![endpoint.clone()]),
-        )
-        .await?;
     let _ = runtime
         .refresh_user_directory_for_account_id(&account.account_id_hex, vec![endpoint])
         .await;

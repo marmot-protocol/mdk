@@ -192,6 +192,24 @@ pub(crate) struct FetchedFollowList {
     pub(crate) source_relays: Vec<String>,
 }
 
+/// An account's current kind-3 event, kept whole so a follow or unfollow can
+/// republish it with one `p` tag changed and everything else verbatim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CurrentFollowList {
+    /// The parsed follows, capped at [`MAX_FOLLOW_LIST_ENTRIES`].
+    pub(crate) follow_list: FetchedFollowList,
+    pub(crate) tags: Vec<Vec<String>>,
+    pub(crate) content: String,
+}
+
+impl CurrentFollowList {
+    /// Whether parsing stopped at [`MAX_FOLLOW_LIST_ENTRIES`], so the parsed
+    /// follows may be missing some of the event's.
+    pub(crate) fn reached_cap(&self) -> bool {
+        self.follow_list.follows.len() >= MAX_FOLLOW_LIST_ENTRIES
+    }
+}
+
 pub(crate) fn public_directory_user_record(
     entry: &UserDirectoryRecord,
 ) -> Result<PublicDirectoryUserRecord, DirectoryError> {
@@ -683,9 +701,40 @@ pub(crate) fn profile_content_json(profile: &UserProfileMetadata) -> serde_json:
 
 pub(crate) fn latest_follow_list_from_records(
     account_id_hex: &str,
-    mut records: Vec<RelayEventRecord>,
+    records: Vec<RelayEventRecord>,
     freshness: DirectoryFreshness,
 ) -> DirectorySelection<Option<FetchedFollowList>> {
+    let selection = latest_follow_list_record(account_id_hex, records, freshness);
+    DirectorySelection {
+        value: selection.value.map(follow_list_from_record),
+        rejected_future: selection.rejected_future,
+    }
+}
+
+pub(crate) fn latest_current_follow_list_from_records(
+    account_id_hex: &str,
+    records: Vec<RelayEventRecord>,
+    freshness: DirectoryFreshness,
+) -> DirectorySelection<Option<CurrentFollowList>> {
+    let selection = latest_follow_list_record(account_id_hex, records, freshness);
+    DirectorySelection {
+        value: selection.value.map(|record| CurrentFollowList {
+            follow_list: FetchedFollowList {
+                follows: follows_from_tags(&record.event.tags),
+                source_relays: source_relays_from_record(&record),
+            },
+            tags: record.event.tags,
+            content: record.event.content,
+        }),
+        rejected_future: selection.rejected_future,
+    }
+}
+
+fn latest_follow_list_record(
+    account_id_hex: &str,
+    mut records: Vec<RelayEventRecord>,
+    freshness: DirectoryFreshness,
+) -> DirectorySelection<Option<RelayEventRecord>> {
     let mut rejected_future = false;
     records.retain(|record| {
         if record.event.kind != KIND_NOSTR_CONTACT_LIST || record.event.pubkey != account_id_hex {
@@ -696,12 +745,8 @@ pub(crate) fn latest_follow_list_from_records(
         accepted
     });
     sort_directory_records(&mut records);
-    let value = records.into_iter().rev().find_map(|record| {
-        if record.event.kind == KIND_NOSTR_CONTACT_LIST && record.event.pubkey == account_id_hex {
-            Some(follow_list_from_record(record))
-        } else {
-            None
-        }
+    let value = records.into_iter().rev().find(|record| {
+        record.event.kind == KIND_NOSTR_CONTACT_LIST && record.event.pubkey == account_id_hex
     });
     DirectorySelection {
         value,
@@ -717,25 +762,33 @@ pub(crate) fn latest_follow_list_from_records(
 pub(crate) const MAX_FOLLOW_LIST_ENTRIES: usize = 2048;
 
 pub(crate) fn follow_list_from_record(record: RelayEventRecord) -> FetchedFollowList {
+    FetchedFollowList {
+        follows: follows_from_tags(&record.event.tags),
+        source_relays: source_relays_from_record(&record),
+    }
+}
+
+/// The distinct, sorted account ids a kind-3 event's `p` tags follow, capped
+/// at [`MAX_FOLLOW_LIST_ENTRIES`].
+pub(crate) fn follows_from_tags(tags: &[Vec<String>]) -> Vec<String> {
     let mut follows = BTreeSet::new();
-    for tag in &record.event.tags {
+    for tag in tags {
         if follows.len() >= MAX_FOLLOW_LIST_ENTRIES {
             break;
         }
-        if tag.first().is_none_or(|name| name != "p") {
-            continue;
-        }
-        let Some(value) = tag.get(1) else {
-            continue;
-        };
-        if let Ok(account_id) = parse_account_id_hex(value) {
+        if let Some(account_id) = followed_account_id(tag) {
             follows.insert(account_id);
         }
     }
-    FetchedFollowList {
-        follows: follows.into_iter().collect(),
-        source_relays: source_relays_from_record(&record),
+    follows.into_iter().collect()
+}
+
+/// The account id a kind-3 `p` tag follows, if the tag is one.
+pub(crate) fn followed_account_id(tag: &[String]) -> Option<String> {
+    if tag.first().is_none_or(|name| name != "p") {
+        return None;
     }
+    parse_account_id_hex(tag.get(1)?).ok()
 }
 
 pub(crate) fn latest_profiles_from_records(

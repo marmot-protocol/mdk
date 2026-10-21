@@ -535,6 +535,9 @@ wn usage-diagnostics enable
 wn usage-diagnostics disable
 ```
 
+- `follows add|remove` edits your current contact list on the relay: it adds or removes that account's `p` tag and keeps
+  every other tag and the content. A list with 2,048 follows or more is refused with `follow_list_too_large`, since
+  MDK reads no more than that from one list.
 - `users search` searches your follow graph; `--radius START..END` defaults to `0..1` (0 is you, 1 who you follow, 2
   follows-of-follows).
 - `notifications subscribe` streams daemon-backed local notification updates as JSON lines.

@@ -11,6 +11,10 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- `wn follows add` / `remove` and the MarmotKit `follow_user` / `unfollow_user` keep petnames, relay hints, other tags
+  and the content of the account's kind-3 contact list, changing only the followed account's `p` tag (mdk#2268).
+  A list with 2,048 follows or more, the most MDK reads from one list, is refused with `follow_list_too_large`
+  instead of being republished cut to 2,048 follows.
 - The retention sweep status `deferred_scan_exhausted` no longer exists
   (mdk#2425); the sweep has no page cap to hit.
 - An invite built from a KeyPackage the invitee had just replaced is no longer silently ignored (mdk#2344). After a

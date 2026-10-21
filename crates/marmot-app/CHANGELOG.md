@@ -42,6 +42,7 @@
   `open_with_keychain` with the deployment's `keychain_service`.
 - `AppError` adds `GroupCatchingUp` and `GroupCommitUndelivered`; update exhaustive matches.
 - `AppError` adds `InvalidEditTarget`; update exhaustive matches.
+- `AppError` adds `FollowListTooLarge` (mdk#2268); update exhaustive matches.
 - `AppError` adds `DirectoryLookupIncomplete(account)` (mdk#2302). Invite member resolution,
   directory KeyPackage lookup and relay-list lookup return it instead of `RelayDirectory` when
   time or relay coverage ran out, so nothing is known to be missing. When the invite deadline
@@ -155,6 +156,18 @@
 - `MarmotAppRuntime::group_commit_delivery` returns the relays still owed the group's last change (`GroupCommitDelivery`), and `acknowledge_group_commit_undelivered` lets the next group change through after `GroupCommitUndelivered`.
 
 ### Fixed
+
+- `follow_user` and `unfollow_user` edit the account's current kind-3
+  contact list in place (mdk#2268). A follow appends one `p` tag and an
+  unfollow removes that account's `p` tags; petnames, relay hints, other tags
+  and the content are republished unchanged. Before, every edit rebuilt the
+  list from bare `p` tags, dropping that metadata. When the list has 2,048
+  follows or more, the most MDK reads from one list, both refuse with
+  `AppError::FollowListTooLarge` and publish nothing; before, they
+  republished the list cut to its first 2,048 follows.
+  `MarmotAppRuntime::update_account_follow_list` and
+  `MarmotApp::update_account_follow_list` run the same edit against chosen
+  relays.
 
 - Epoch-gap fallback searches older raw pages when a relay cannot compare,
   instead of repeatedly fetching only its newest 256 events (mdk#2257).

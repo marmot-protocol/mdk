@@ -773,6 +773,12 @@ fn app_error_json(err: &AppError) -> Value {
             "message": err.to_string(),
             "missing": missing.iter().map(|k| k.token()).collect::<Vec<_>>(),
         }),
+        // Terminal for this list: it holds more follows than MDK reads from
+        // one kind-3 event, so an edit could drop some. Nothing was published.
+        AppError::FollowListTooLarge => json!({
+            "code": "follow_list_too_large",
+            "message": err.to_string(),
+        }),
         AppError::RelayDirectory(reason) => json!({
             "code": "relay_directory_failed",
             "message": err.to_string(),

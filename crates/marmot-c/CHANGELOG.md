@@ -38,6 +38,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 - Add `marmot_cached_public_event_previews` and `marmot_resolve_public_event_preview` (record `MarmotPublicEventPreview`, enum `MarmotPublicEventPreviewState`, freed with `marmot_public_event_preview_free` / `marmot_public_event_preview_list_free`) for cached public Nostr event previews (mdk#1547), and `MARMOT_STATUS_INVALID_PUBLIC_EVENT_REFERENCES` (103) for a read of more than 16 references. Use matching regenerated headers and libraries.
 
+- Add `MARMOT_STATUS_FOLLOW_LIST_TOO_LARGE` (107): `marmot_follow_user` and
+  `marmot_unfollow_user` published nothing because the account's kind-3 list
+  has 2,048 follows or more, the most MDK reads from one list (mdk#2268). Both
+  now keep the list's petnames, relay hints, other tags and content. Use
+  matching regenerated headers and libraries.
+
 - Add `MARMOT_STATUS_STORAGE_FULL` (106): the device has no room for the operation (mdk#2314).
   Media uploads return it when an attachment cannot be stored locally beyond the disk reserve,
   before anything is uploaded; a full disk or database elsewhere also returns it instead of the

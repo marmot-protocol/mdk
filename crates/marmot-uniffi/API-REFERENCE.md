@@ -418,9 +418,9 @@ Return whether `account_ref` currently follows `user_ref`, using the same local 
 pub async fn follow_user( &self, account_ref: String, user_ref: String, ) -> Result<Vec<String>, MarmotKitError>
 ```
 
-Follow `user_ref` while preserving every other entry in the account's current kind-3 contact list. Returns the complete updated list.
+Follow `user_ref` while preserving every other entry in the account's current kind-3 contact list. Returns the complete updated list. Appends one `p` tag and republishes petnames, relay hints, other tags and the content unchanged. Returns `FollowListUnavailable` when no current list is found, and `FollowListTooLarge`, publishing nothing, when the list has 2,048 follows or more (the most MDK reads from one list).
 
-[Source](src/commands/account.rs#L589)
+[Source](src/commands/account.rs#L592)
 
 ### `Marmot::unfollow_user`
 
@@ -430,9 +430,9 @@ Follow `user_ref` while preserving every other entry in the account's current ki
 pub async fn unfollow_user( &self, account_ref: String, user_ref: String, ) -> Result<Vec<String>, MarmotKitError>
 ```
 
-Unfollow `user_ref` while preserving every other entry in the account's current kind-3 contact list. Returns the complete updated list.
+Unfollow `user_ref` while preserving every other entry in the account's current kind-3 contact list. Returns the complete updated list. Removes only `user_ref`'s `p` tags; errors as `follow_user`.
 
-[Source](src/commands/account.rs#L603)
+[Source](src/commands/account.rs#L610)
 
 ### `Marmot::reveal_nsec`
 
@@ -444,7 +444,7 @@ pub fn reveal_nsec(&self, account_ref: String) -> Result<String, MarmotKitError>
 
 Export the active account's raw private key in canonical `nsec1...` bech32 form for an in-app key-backup display (mdk#543).
 
-[Source](src/commands/account.rs#L627)
+[Source](src/commands/account.rs#L634)
 
 ### `Marmot::export_encrypted_secret_key`
 
@@ -456,7 +456,7 @@ pub fn export_encrypted_secret_key( &self, account_ref: String, passphrase: Stri
 
 Export the active account's private key as a password-encrypted NIP-49 `ncryptsec1...` bech32 backup string (mdk#544).
 
-[Source](src/commands/account.rs#L644)
+[Source](src/commands/account.rs#L651)
 
 ### `Marmot::publish_user_profile`
 
@@ -468,7 +468,7 @@ pub async fn publish_user_profile( &self, account_ref: String, profile: UserProf
 
 Publish Nostr kind:0 metadata with explicit caller-supplied relay overrides. Most app clients should use `publish_user_profile_using_account_relays` so relay selection remains owned by MDK. This override remains for diagnostics, tests, and specialized clients. Public indexers receive a best-effort copy of the same event.
 
-[Source](src/commands/account.rs#L666)
+[Source](src/commands/account.rs#L673)
 
 ### `Marmot::publish_user_profile_using_account_relays`
 
@@ -480,7 +480,7 @@ pub async fn publish_user_profile_using_account_relays( &self, account_ref: Stri
 
 Publish Nostr kind:0 metadata using one coherent snapshot of the selected account's MDK-owned relay configuration. Public indexers receive a best-effort copy of the same event.
 
-[Source](src/commands/account.rs#L695)
+[Source](src/commands/account.rs#L702)
 
 ### `Marmot::upload_profile_image`
 
@@ -492,7 +492,7 @@ pub async fn upload_profile_image( &self, account_ref: String, data: Vec<u8>, me
 
 Upload a public raster profile image to Blossom with the account's signer. The returned HTTPS URL can be published as kind:0 `picture`.
 
-[Source](src/commands/account.rs#L713)
+[Source](src/commands/account.rs#L720)
 
 ### `Marmot::download_profile_image`
 
@@ -504,7 +504,7 @@ pub async fn download_profile_image( &self, url: String, max_bytes: u64, ) -> Re
 
 Fetch one untrusted kind:0 profile `picture` URL with MDK dial-safe HTTPS policy, address pinning, and bounded streaming.
 
-[Source](src/commands/account.rs#L728)
+[Source](src/commands/account.rs#L735)
 
 </details>
 

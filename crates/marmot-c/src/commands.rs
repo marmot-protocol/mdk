@@ -1040,12 +1040,16 @@ c_cmd! {
     /// Whether `user_ref` (`npub` or hex account id) is followed.
     sync fn marmot_is_following(account_ref: str, user_ref: str) -> scalar(bool) = is_following;
 
-    /// Follow `user_ref` and publish the updated list. Writes the new
-    /// follow set. Free with `marmot_string_list_free`.
+    /// Follow `user_ref` and publish the updated list, keeping its other
+    /// tags and content. Writes the new follow set. Returns
+    /// `MARMOT_STATUS_FOLLOW_LIST_TOO_LARGE`, publishing nothing, when the
+    /// list has 2,048 follows or more. Free with `marmot_string_list_free`.
     async fn marmot_follow_user(account_ref: str, user_ref: str) -> rec(MarmotStringList) = follow_user;
 
-    /// Unfollow `user_ref` and publish the updated list. Free with
-    /// `marmot_string_list_free`.
+    /// Unfollow `user_ref` and publish the updated list, keeping its other
+    /// tags and content. Returns `MARMOT_STATUS_FOLLOW_LIST_TOO_LARGE`,
+    /// publishing nothing, when the list has 2,048 follows or more. Free
+    /// with `marmot_string_list_free`.
     async fn marmot_unfollow_user(account_ref: str, user_ref: str) -> rec(MarmotStringList) = unfollow_user;
 
     /// Discard the local state of an account whose setup never completed.

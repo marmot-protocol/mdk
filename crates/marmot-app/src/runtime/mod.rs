@@ -4808,38 +4808,44 @@ impl MarmotAppRuntime {
                 source_relays.push(endpoint);
             }
         }
-        let mut follows = self
-            .accounts
+        let fallback = self.accounts.app.directory_source_relays(&[]);
+        self.accounts
             .app
-            .fetch_current_follow_list_for_account_id(&account.account_id_hex, source_relays)
-            .await?
-            .ok_or(AppError::FollowListUnavailable)?;
-
-        let changed = if following {
-            if follows.iter().any(|follow| follow == user_account_id_hex) {
-                false
-            } else {
-                follows.push(user_account_id_hex.to_owned());
-                true
-            }
-        } else {
-            let previous_len = follows.len();
-            follows.retain(|follow| follow != user_account_id_hex);
-            follows.len() != previous_len
-        };
-        follows.sort();
-        follows.dedup();
-
-        if changed {
-            let fallback = self.accounts.app.directory_source_relays(&[]);
-            self.publish_account_follow_list_unlocked(
-                &account,
-                &follows,
+            .update_account_follow_list(
+                &account.label,
+                user_account_id_hex,
+                following,
+                source_relays,
                 AccountRelayListBootstrap::new(fallback.clone(), fallback),
             )
-            .await?;
-        }
-        Ok(follows)
+            .await
+    }
+
+    /// Follow or unfollow one account through
+    /// [`MarmotApp::update_account_follow_list`], fetching the current list
+    /// from `source_relays` and publishing through `bootstrap`, serialized
+    /// with this account's other follow-list updates.
+    pub async fn update_account_follow_list(
+        &self,
+        account_ref: &str,
+        user_account_id_hex: &str,
+        following: bool,
+        source_relays: Vec<TransportEndpoint>,
+        bootstrap: AccountRelayListBootstrap,
+    ) -> Result<Vec<String>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        let update_lock = self.follow_list_update_lock(&account.account_id_hex).await;
+        let _update_guard = update_lock.lock().await;
+        self.accounts
+            .app
+            .update_account_follow_list(
+                &account.label,
+                user_account_id_hex,
+                following,
+                source_relays,
+                bootstrap,
+            )
+            .await
     }
 
     async fn follow_list_update_lock(&self, account_id_hex: &str) -> Arc<Mutex<()>> {

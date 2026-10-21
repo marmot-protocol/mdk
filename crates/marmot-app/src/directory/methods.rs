@@ -29,10 +29,11 @@ use crate::directory::published_records::{
     latest_fresh_key_package_from_records, merge_relay_list_status, relay_list_queries,
 };
 use crate::directory::records::{
-    CachedIdentityProjection, DirectoryKeyPackage, FetchedFollowList, LocalAccountNames,
-    MAX_CACHED_IDENTITY_PAGE_SIZE, UserDirectoryLocalAccount, UserDirectoryRecord,
-    UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
-    cached_identity_projection, display_name_for_profile, follow_list_from_record,
+    CachedIdentityProjection, CurrentFollowList, DirectoryKeyPackage, FetchedFollowList,
+    LocalAccountNames, MAX_CACHED_IDENTITY_PAGE_SIZE, UserDirectoryLocalAccount,
+    UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult,
+    UserProfileMetadata, cached_identity_projection, display_name_for_profile,
+    follow_list_from_record, latest_current_follow_list_from_records,
     latest_follow_list_from_records, latest_fresh_profiles_from_records, profile_from_record,
     public_directory_user_record, select_newer_directory_entry, source_relays_from_record,
     upsert_newer_directory_entry, user_directory_record_from_public, user_record_match,
@@ -939,13 +940,29 @@ impl MarmotApp {
         account_id_hex: &str,
         source_relays: Vec<TransportEndpoint>,
     ) -> Result<Option<Vec<String>>, AppError> {
+        Ok(self
+            .fetch_current_follow_list_event_for_account_id(account_id_hex, source_relays)
+            .await?
+            .map(|current| current.follow_list.follows))
+    }
+
+    /// Fetch the account's current kind-3 event whole, for an edit that must
+    /// republish every tag it does not change.
+    pub(crate) async fn fetch_current_follow_list_event_for_account_id(
+        &self,
+        account_id_hex: &str,
+        source_relays: Vec<TransportEndpoint>,
+    ) -> Result<Option<CurrentFollowList>, AppError> {
         let observation = self.product_analytics.begin(
             crate::ProductFamily::Directory,
             "follows",
             crate::ProductUnit::Attempt,
         );
         let result = self
-            .fetch_current_follow_list_for_account_id_unobserved(account_id_hex, source_relays)
+            .fetch_current_follow_list_event_for_account_id_unobserved(
+                account_id_hex,
+                source_relays,
+            )
             .await;
         if let Some(observation) = observation {
             observation.directory_sample(
@@ -962,11 +979,11 @@ impl MarmotApp {
         result.map_err(AppError::from)
     }
 
-    async fn fetch_current_follow_list_for_account_id_unobserved(
+    async fn fetch_current_follow_list_event_for_account_id_unobserved(
         &self,
         account_id_hex: &str,
         source_relays: Vec<TransportEndpoint>,
-    ) -> Result<Option<Vec<String>>, DirectoryError> {
+    ) -> Result<Option<CurrentFollowList>, DirectoryError> {
         let account_id_hex = parse_account_id_hex(account_id_hex)?;
         let records = self
             .fetch_events_for_account_ids(
@@ -975,22 +992,25 @@ impl MarmotApp {
                 &source_relays,
             )
             .await?;
-        let Some(follow_list) =
-            latest_follow_list_from_records(&account_id_hex, records, self.directory_freshness())
-                .value
+        let Some(current) = latest_current_follow_list_from_records(
+            &account_id_hex,
+            records,
+            self.directory_freshness(),
+        )
+        .value
         else {
             return Ok(None);
         };
         {
             let app = self.clone();
             let account_id = account_id_hex.clone();
-            let remembered = follow_list.clone();
+            let remembered = current.follow_list.clone();
             blocking_directory_task(move || {
                 app.remember_directory_follow_list(&account_id, &remembered)
             })
             .await?;
         }
-        Ok(Some(follow_list.follows))
+        Ok(Some(current))
     }
 
     async fn refresh_directory_profiles(

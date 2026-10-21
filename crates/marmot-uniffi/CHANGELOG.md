@@ -43,6 +43,7 @@
   maps here instead of `Runtime`. Ask the user to free space. Regenerate bindings and update
   exhaustive Swift `switch` / Kotlin `when` handling.
 - `MarmotKitError` adds `InvalidEditTarget`, returned by `edit_message` (see Fixed). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
+- `MarmotKitError` adds `FollowListTooLarge`, returned by `follow_user` and `unfollow_user` (see Fixed). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 - `MarmotKitError` adds `GroupCommitUndelivered`: a group change was refused because the group's last change has not reached every group relay yet (mdk#2255). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 
 ### Added
@@ -72,6 +73,8 @@
 - `Marmot::group_commit_delivery` returns the relays still owed the group's last change (`GroupCommitDeliveryFfi`), and `Marmot::acknowledge_group_commit_undelivered` lets one change through after `GroupCommitUndelivered` once the user accepts the risk. See [the delivery notes](README.md#history-may-be-incomplete-notices).
 
 ### Fixed
+
+- `follow_user` and `unfollow_user` change only the followed account's `p` tag in the current kind-3 contact list; petnames, relay hints, other tags and the content stay as published (mdk#2268). Before, every edit dropped them. A list with 2,048 follows or more, the most MDK reads from one list, returns `FollowListTooLarge` and publishes nothing, where it used to be republished cut to 2,048 follows.
 
 - `edit_message` returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Before, an edit of another account's message, a reaction or a deleted message was published to the group and reported as sent, then ignored by every recipient. The check uses this device's view when the edit is requested; recipients stay authoritative.
 

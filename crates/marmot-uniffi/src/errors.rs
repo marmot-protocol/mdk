@@ -167,6 +167,11 @@ pub enum MarmotKitError {
     /// an assumed empty list is not.
     #[error("current account follow list is unavailable")]
     FollowListUnavailable,
+    /// The current kind-3 list has at least 2,048 follows, more than MDK reads
+    /// from one list, so a follow or unfollow could drop follows. Nothing was
+    /// published; manage this list in a client that edits it whole.
+    #[error("current account follow list is too large to update")]
+    FollowListTooLarge,
     #[error("transport closed")]
     TransportClosed,
     /// Another process or runtime owns the shared Marmot root. This is a typed,
@@ -577,6 +582,7 @@ impl From<&AppError> for MarmotKitError {
                 details: details.clone(),
             },
             AppError::FollowListUnavailable => Self::FollowListUnavailable,
+            AppError::FollowListTooLarge => Self::FollowListTooLarge,
             AppError::TransportClosed => Self::TransportClosed,
             AppError::RuntimeBusy => Self::RuntimeBusy,
             AppError::AccountSessionBusy => Self::AccountSessionBusy,
