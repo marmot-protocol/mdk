@@ -270,7 +270,7 @@ impl MarmotApp {
     /// re-fetches packages and enforces the engine's membership policy.
     ///
     /// The roster must also resolve a safe Marmot inbox route for every member;
-    /// missing routes return [`DirectoryError::MissingMemberInboxRoute`]. Successfully
+    /// missing routes return [`AppError::MissingMemberInboxRoute`]. Successfully
     /// discovered routes remain cached even when another member fails readiness.
     /// A malformed current slot publication suppresses older packages here too;
     /// return an error rather than report readiness from superseded material.
