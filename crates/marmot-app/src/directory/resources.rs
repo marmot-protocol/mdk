@@ -2,7 +2,10 @@
 //! [`DirectoryResources`] over the cache lifecycle it keeps (step 3 of
 //! `docs/marmot-architecture/review/brief-directory.md`).
 
+use std::future::Future;
+
 use storage_sqlite::SqliteSharedStorage;
+use transport_nostr_peeler::NostrTransportEvent;
 
 use super::DirectoryCache;
 use super::error::DirectoryError;
@@ -46,4 +49,22 @@ pub trait DirectoryResources: Clone + Send + Sync + 'static {
 
     /// A stored entry changed, so presentation should refresh that account.
     fn directory_entry_changed(&self, account_id_hex: &str);
+}
+
+/// Block lists are account state the app keeps. The sync worker receives
+/// their mute-list events with the directory's own and hands the work over.
+///
+/// Each method returns the work as a future and starts nothing. The worker
+/// runs adoptions in its bounded task set and reconciles in one abort-on-drop
+/// task, never inline in its event loop, where an account's update lock would
+/// park it.
+pub trait BlockListSink: Clone + Send + Sync + 'static {
+    /// Adopt one live mute-list event for the local account that published it.
+    fn adopt_block_list_event(
+        &self,
+        event: NostrTransportEvent,
+    ) -> impl Future<Output = Result<(), DirectoryError>> + Send + 'static;
+
+    /// Fetch and reconcile every local account's block list.
+    fn reconcile_block_lists(&self) -> impl Future<Output = ()> + Send + 'static;
 }

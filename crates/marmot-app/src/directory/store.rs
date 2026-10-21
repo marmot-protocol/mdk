@@ -28,7 +28,7 @@ use super::records::{
     select_newer_directory_entry, source_relays_from_record, user_directory_record_from_public,
 };
 use super::resources::DirectoryResources;
-use super::{Directory, DirectoryCache, DirectorySyncHandle};
+use super::{Directory, DirectoryCache};
 
 impl<R: DirectoryResources> Directory<R> {
     pub(crate) fn local_accounts_by_id(
@@ -384,14 +384,6 @@ impl<R: DirectoryResources> Directory<R> {
         }
         self.request_directory_sync_rebuild();
         Ok(())
-    }
-
-    pub(crate) fn set_directory_sync_handle(&self, handle: Option<DirectorySyncHandle>) {
-        *self
-            .state
-            .sync_handle
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = handle;
     }
 
     fn request_directory_sync_rebuild(&self) {

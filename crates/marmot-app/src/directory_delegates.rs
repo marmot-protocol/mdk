@@ -12,9 +12,9 @@ use storage_sqlite::PublicDirectoryUserRecord;
 use storage_sqlite::SqliteSharedStorage;
 use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 
+use crate::directory::DirectoryCache;
 use crate::directory::error::DirectoryError;
 use crate::directory::records::{FetchedFollowList, LocalAccountNames};
-use crate::directory::{DirectoryCache, DirectorySyncHandle};
 use crate::{
     AccountRelayListStatus, AppError, CachedIdentityProjection, FetchedKeyPackage, MarmotApp,
     MemberKeyPackagePrewarmSummary, UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch,
@@ -394,10 +394,6 @@ impl MarmotApp {
     ) -> Result<(), DirectoryError> {
         self.directory()
             .save_directory_entry_with_reason(entry, reason)
-    }
-
-    pub(crate) fn set_directory_sync_handle(&self, handle: Option<DirectorySyncHandle>) {
-        self.directory().set_directory_sync_handle(handle)
     }
 }
 

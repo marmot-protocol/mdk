@@ -4,15 +4,17 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use futures::{StreamExt, stream};
 use sha2::{Digest, Sha256};
 
 use cgka_traits::TransportEndpoint;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
+use super::Directory;
+use super::observer::DirectoryObserver;
 use super::records::MUTE_LIST_KIND;
-use crate::{KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp};
+use super::resources::{BlockListSink, DirectoryResources};
+use crate::{KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA};
 use transport_nostr::{DirectorySyncBatch, DirectorySyncPlan, MarmotRelayPlane};
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
@@ -91,15 +93,15 @@ impl Drop for BlockListReconcileTask {
     }
 }
 
-fn request_block_reconcile(
-    app: &MarmotApp,
+fn request_block_reconcile<R: DirectoryResources + DirectoryObserver + BlockListSink>(
+    directory: &Directory<R>,
     queue: &mut DirectoryRecoveryRebuildQueue,
     task: &mut Option<BlockListReconcileTask>,
 ) {
     if queue.request() {
-        *task = Some(BlockListReconcileTask(tokio::spawn(reconcile_block_lists(
-            app.clone(),
-        ))));
+        *task = Some(BlockListReconcileTask(tokio::spawn(
+            directory.resources.reconcile_block_lists(),
+        )));
     }
 }
 
@@ -224,12 +226,15 @@ fn extend_directory_sync_batches(
 }
 
 impl DirectorySyncHandle {
-    pub(crate) fn spawn(app: MarmotApp, relay_plane: MarmotRelayPlane) -> Self {
+    pub(crate) fn spawn<R: DirectoryResources + DirectoryObserver + BlockListSink>(
+        directory: Directory<R>,
+        relay_plane: MarmotRelayPlane,
+    ) -> Self {
         let (commands, command_rx) = mpsc::channel(32);
         let directory_events = relay_plane.subscribe_directory_events();
         let rebuild_queued = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn(run_directory_sync_worker(
-            app,
+            directory,
             relay_plane,
             command_rx,
             directory_events,
@@ -280,8 +285,8 @@ impl DirectorySyncHandle {
     }
 }
 
-async fn run_directory_sync_worker(
-    app: MarmotApp,
+async fn run_directory_sync_worker<R: DirectoryResources + DirectoryObserver + BlockListSink>(
+    directory: Directory<R>,
     relay_plane: MarmotRelayPlane,
     mut commands: mpsc::Receiver<DirectorySyncCommand>,
     mut directory_events: tokio::sync::broadcast::Receiver<
@@ -303,8 +308,8 @@ async fn run_directory_sync_worker(
                     Some(DirectorySyncCommand::Rebuild { respond }) => {
                         rebuild_queued.store(false, Ordering::SeqCst);
                         let result =
-                            run_directory_sync_once(app.clone(), relay_plane.clone(), false).await;
-                        request_block_reconcile(&app, &mut block_rebuilds, &mut block_task);
+                            run_directory_sync_once(directory.clone(), relay_plane.clone(), false).await;
+                        request_block_reconcile(&directory, &mut block_rebuilds, &mut block_task);
                         if let Some(respond) = respond {
                             let _ = respond.send(result.map_err(|err| err.to_string()));
                         }
@@ -331,7 +336,7 @@ async fn run_directory_sync_worker(
                 }
                 if recovery_rebuilds.complete() {
                     recovery_task = Some(spawn_directory_recovery_rebuild(
-                        app.clone(),
+                        directory.clone(),
                         relay_plane.clone(),
                     ));
                 }
@@ -344,7 +349,7 @@ async fn run_directory_sync_worker(
                     tracing::warn!(target: "marmot_app::directory", method = "run_directory_sync_worker", "block list reconciliation task failed");
                 }
                 if block_rebuilds.complete() {
-                    block_task = Some(BlockListReconcileTask(tokio::spawn(reconcile_block_lists(app.clone()))));
+                    block_task = Some(BlockListReconcileTask(tokio::spawn(directory.resources.reconcile_block_lists())));
                 }
             }
             adoption = block_adoptions.join_next(), if !block_adoptions.is_empty() => {
@@ -355,27 +360,26 @@ async fn run_directory_sync_worker(
             event = directory_events.recv() => {
                 match event {
                     Ok(transport_nostr::DirectoryRelayPlaneEvent::Record(record)) => {
-                        let app = app.clone();
                         if record.event.kind == MUTE_LIST_KIND {
                             if block_adoptions.len() < MAX_BLOCK_ADOPTIONS {
-                                block_adoptions.spawn(async move {
-                                    app.ingest_block_list_event(record.event).await
-                                });
+                                block_adoptions
+                                    .spawn(directory.resources.adopt_block_list_event(record.event));
                             } else {
                                 // Bound queued decryptions. A complete owned-account
                                 // relay fetch recovers the current replacements.
-                                request_block_reconcile(&app, &mut block_rebuilds, &mut block_task);
+                                request_block_reconcile(&directory, &mut block_rebuilds, &mut block_task);
                             }
                         } else {
-                            let _ = blocking_directory_task(move || app.directory().ingest_directory_relay_event(record)).await;
+                            let directory = directory.clone();
+                            let _ = blocking_directory_task(move || directory.ingest_directory_relay_event(record)).await;
                         }
                     }
                     Ok(transport_nostr::DirectoryRelayPlaneEvent::RecoveryRequired)
                     | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        request_block_reconcile(&app, &mut block_rebuilds, &mut block_task);
+                        request_block_reconcile(&directory, &mut block_rebuilds, &mut block_task);
                         if recovery_rebuilds.request() {
                             recovery_task = Some(spawn_directory_recovery_rebuild(
-                                app.clone(),
+                                directory.clone(),
                                 relay_plane.clone(),
                             ));
                         }
@@ -390,25 +394,23 @@ async fn run_directory_sync_worker(
     }
 }
 
-fn spawn_directory_recovery_rebuild(
-    app: MarmotApp,
+fn spawn_directory_recovery_rebuild<R: DirectoryResources + DirectoryObserver + BlockListSink>(
+    directory: Directory<R>,
     relay_plane: MarmotRelayPlane,
 ) -> DirectoryRecoveryRebuildTask {
     DirectoryRecoveryRebuildTask(tokio::spawn(run_directory_sync_once(
-        app,
+        directory,
         relay_plane,
         true,
     )))
 }
 
-async fn run_directory_sync_once(
-    app: MarmotApp,
+async fn run_directory_sync_once<R: DirectoryResources + DirectoryObserver + BlockListSink>(
+    directory: Directory<R>,
     relay_plane: MarmotRelayPlane,
     force_rebuild: bool,
 ) -> Result<DirectorySyncRunSummary, DirectoryError> {
-    let app_for_plan = app.clone();
-    let plan =
-        blocking_directory_task(move || app_for_plan.directory().directory_sync_plan()).await?;
+    let plan = blocking_directory_task(move || directory.directory_sync_plan()).await?;
     let watched_user_count = plan.watched_user_count;
     let subscriptions = relay_plane
         .sync_directory_user_subscriptions(plan, force_rebuild)
@@ -420,40 +422,6 @@ async fn run_directory_sync_once(
         subscriptions_created: subscriptions.subscriptions_created,
         subscriptions_removed: subscriptions.subscriptions_removed,
     })
-}
-
-async fn reconcile_block_lists(app: MarmotApp) {
-    // Install live subscriptions first. Reconcile accounts concurrently with a
-    // fixed bound so one slow account does not serialize every other account's
-    // startup/reconnect, and report failures without exposing identities.
-    let app_for_accounts = app.clone();
-    let accounts = match blocking_directory_task(move || {
-        Ok(app_for_accounts.account_home().accounts()?)
-    })
-    .await
-    {
-        Ok(accounts) => accounts,
-        Err(_) => {
-            tracing::warn!(target: "marmot_app::directory", method = "reconcile_block_lists", "block list account enumeration failed");
-            return;
-        }
-    };
-    let failures = stream::iter(accounts.into_iter().map(|account| {
-        let app = app.clone();
-        async move {
-            let lock = app.block_update_lock(&account.label).await;
-            let _guard = lock.lock().await;
-            app.fetch_block_list(&account.label).await.is_err()
-        }
-    }))
-    .buffer_unordered(4)
-    .fold(0usize, |count, failed| async move {
-        count + usize::from(failed)
-    })
-    .await;
-    if failures != 0 {
-        tracing::warn!(target: "marmot_app::directory", method = "reconcile_block_lists", failed_account_count = failures, "block list reconciliation incomplete");
-    }
 }
 
 fn directory_subscription_id(group: &str, index: usize, authors: &[String]) -> String {
@@ -468,9 +436,41 @@ fn directory_subscription_id(group: &str, index: usize, authors: &[String]) -> S
     format!("directory_{group}_{index}_{}", &digest[..16])
 }
 
+/// The sync worker has one owner: `DirectoryState`'s handle slot. A store
+/// write asks the same slot's worker to rebuild.
+impl<R: DirectoryResources + DirectoryObserver + BlockListSink> Directory<R> {
+    /// The running sync worker, spawned on first use.
+    pub(crate) fn sync_worker(&self) -> DirectorySyncHandle {
+        let mut slot = self
+            .state
+            .sync_handle
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(handle) = slot.as_ref() {
+            return handle.clone();
+        }
+        let handle = DirectorySyncHandle::spawn(self.clone(), self.relay_plane.clone());
+        *slot = Some(handle.clone());
+        handle
+    }
+}
+
+impl<R> Directory<R> {
+    /// Take the running sync worker so the caller can shut it down. Later
+    /// store writes find no worker to poke.
+    pub(crate) fn take_sync_worker(&self) -> Option<DirectorySyncHandle> {
+        self.state
+            .sync_handle
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MarmotApp;
     use nostr::prelude::FinalizeEvent;
 
     fn account_id(value: u8) -> String {
@@ -626,7 +626,7 @@ mod tests {
         let relay_plane = MarmotRelayPlane::with_subscription_rebuild_lookback(
             std::time::Duration::from_secs(30),
         );
-        let handle = DirectorySyncHandle::spawn(app, relay_plane);
+        let handle = DirectorySyncHandle::spawn(app.directory(), relay_plane);
 
         handle.request_rebuild();
         wait_for_background_rebuild_flag_to_clear(&handle).await;
@@ -689,7 +689,7 @@ mod tests {
         let (commands, command_rx) = mpsc::channel(32);
         let (events, event_rx) = tokio::sync::broadcast::channel(64);
         let worker = tokio::spawn(run_directory_sync_worker(
-            app.clone(),
+            app.directory(),
             app.relay_plane.clone(),
             command_rx,
             event_rx,

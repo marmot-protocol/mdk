@@ -192,7 +192,6 @@ pub struct MarmotAppRuntime {
     shared: RuntimeSharedServices,
     accounts: AccountManager,
     follow_list_updates: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    directory_sync: Arc<Mutex<Option<DirectorySyncHandle>>>,
     initial_directory_sync: Arc<Mutex<Option<JoinHandle<()>>>>,
     #[cfg(test)]
     shutdown_test_hook: Arc<StdMutex<Option<ShutdownTestHook>>>,
@@ -1560,7 +1559,6 @@ impl MarmotAppRuntime {
             shared,
             accounts,
             follow_list_updates: Arc::new(Mutex::new(HashMap::new())),
-            directory_sync: Arc::new(Mutex::new(None)),
             initial_directory_sync: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             shutdown_test_hook: Arc::new(StdMutex::new(None)),
@@ -1789,19 +1787,7 @@ impl MarmotAppRuntime {
     }
 
     async fn ensure_directory_sync_worker(&self) -> DirectorySyncHandle {
-        let mut directory_sync = self.directory_sync.lock().await;
-        if let Some(handle) = directory_sync.as_ref() {
-            return handle.clone();
-        }
-        let handle = DirectorySyncHandle::spawn(
-            self.accounts.app.clone(),
-            self.shared.relay_plane().clone(),
-        );
-        self.accounts
-            .app
-            .set_directory_sync_handle(Some(handle.clone()));
-        *directory_sync = Some(handle.clone());
-        handle
+        self.accounts.app.directory().sync_worker()
     }
 
     pub async fn reconcile_accounts(&self) -> Result<(), AppError> {
@@ -6056,7 +6042,7 @@ impl MarmotAppRuntime {
         #[cfg(test)]
         self.stall_shutdown_phase_for_test(ShutdownTestPhase::DirectorySync)
             .await;
-        if let Some(directory_sync) = self.directory_sync.lock().await.take() {
+        if let Some(directory_sync) = self.accounts.app.directory().take_sync_worker() {
             directory_sync.shutdown().await;
         }
         #[cfg(test)]
@@ -6065,7 +6051,6 @@ impl MarmotAppRuntime {
         if let Some(initial_directory_sync) = self.initial_directory_sync.lock().await.take() {
             let _ = initial_directory_sync.await;
         }
-        self.accounts.app.set_directory_sync_handle(None);
         let accounts = async {
             #[cfg(test)]
             self.stall_shutdown_phase_for_test(ShutdownTestPhase::AccountWorkers)

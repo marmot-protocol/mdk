@@ -37,7 +37,7 @@ pub use records::{
     MatchedField, UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh,
     UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
 };
-pub(crate) use resources::{DirectoryAccount, DirectoryResources};
+pub(crate) use resources::{BlockListSink, DirectoryAccount, DirectoryResources};
 pub use search::{
     OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger, UserSearchParams, UserSearchSubscription,
     UserSearchUpdate, sort_user_search_results,

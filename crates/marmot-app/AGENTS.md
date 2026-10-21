@@ -213,24 +213,27 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - The directory is moving into the `nostr-directory` crate (`docs/marmot-architecture/review/brief-directory.md`).
   What stays in this crate lives outside `src/directory/`: the per-account cache lifecycle and label-based account
   resolution in `src/directory_resources.rs`, and publishing the account's own profile and follow list in
-  `src/profile_publication.rs`. `src/directory_crossings_tests.rs` lists every name `src/directory/` still resolves in
-  the rest of the crate in `src/directory/crossings.txt`; a change may shrink that list, never grow it without saying
-  why.
+  `src/profile_publication.rs`. `src/directory_crossings_tests.rs` checks every name `src/directory/` resolves in the
+  rest of the crate against `src/directory/crossings.txt`. That list is now empty, which the crate move needs: code under
+  `src/directory/` reaches the app only through the traits in `src/directory/resources.rs` and
+  `src/directory/observer.rs`, and any new crossing fails the check.
 - Directory code returns `DirectoryError` (`src/directory/error.rs`). Public `MarmotApp` methods are the boundary: they
   keep returning `AppError`, and `From<DirectoryError> for AppError` restores the variant, message and
   `privacy_safe_kind` the directory reported before it had its own type. An app failure that reaches directory code
   (through `?` on an `AppError`) rides in `DirectoryError::Resource` and comes back unchanged. Every method on
   `Directory` returns `DirectoryError`; only the delegates in `src/directory_delegates.rs` return `AppError`, so
   directory code never sees its own failures wrapped. A new variant needs a row in `error::directory_error_tests`.
-- Converted directory code is `impl<R: DirectoryResources> Directory<R>` (`src/directory/service.rs`), and reaches the
-  app only through the `DirectoryResources` trait in `src/directory/resources.rs`. Ask it for a cache when the cache is
-  about to be used, never before a network step. `MarmotApp` implements the trait and builds the service with
-  `directory()` in `src/directory_resources.rs`; its public directory methods become one-line delegates in
-  `src/directory_delegates.rs`, which PR 7 removes. Code still in `impl MarmotApp` calls converted methods through
-  `self.directory()`, listed as a crossing until that file converts too. `directory()` builds a fresh service on each
+- Directory code is `impl<R> Directory<R>` (`src/directory/service.rs`), and reaches the app only through the
+  `DirectoryResources` and `BlockListSink` traits in `src/directory/resources.rs` and `DirectoryObserver` in
+  `src/directory/observer.rs`. Ask the resources for a cache when the cache is about to be used, never before a network
+  step. `BlockListSink` returns its work as futures: the sync worker spawns adoptions into its bounded set and
+  reconciles into one abort-on-drop task, never inline in its event loop. `MarmotApp` implements the traits and builds
+  the service with `directory()` in `src/directory_resources.rs` (the sink in `src/user_blocks.rs`); its directory
+  methods are one-line delegates in `src/directory_delegates.rs`, which PR 7 removes. `directory()` builds a fresh service on each
   call, with `DirectoryConfig` read from the app's configuration at that moment. Anything the directory keeps between
   calls belongs in `DirectoryState`, whose shared fields live on `MarmotApp` as `directory_state`; never create state
-  inside `directory()`, where it would die with the returned value.
+  inside `directory()`, where it would die with the returned value. The sync worker's handle has one owner, the
+  state's slot: `Directory::sync_worker()` gets or spawns it and `take_sync_worker()` hands it to shutdown.
 - Keep stateless relay-list and KeyPackage handling for other accounts (relay-list status, KeyPackage tag/metadata
   validation, fresh-vs-cached reconciliation, ranking and selection, revocation evidence) and the directory-record
   selection primitives (`DirectoryFreshness`, `DirectorySelection`, `sort_directory_records`) in
