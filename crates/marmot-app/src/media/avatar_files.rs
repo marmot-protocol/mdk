@@ -61,7 +61,11 @@ pub(crate) fn store_acquired(
     // only a new file is charged against free space.
     let published = match media.attach_existing(&publication, Category::Cache, &digest) {
         Ok(Some(outcome)) => Ok(outcome),
-        Ok(None) if !fits(reserve, free, byte_len) => return Ok(StoredAvatar::NoRoom),
+        // Unknown free space admits nothing, as for downloads; the fetch is
+        // retried later.
+        Ok(None) if fits(reserve, free, byte_len) != Some(true) => {
+            return Ok(StoredAvatar::NoRoom);
+        }
         Ok(None) => media.publish(
             &publication,
             Category::Cache,
@@ -148,9 +152,11 @@ fn read_whole(
     Ok(Some(std::mem::take(&mut *bytes)))
 }
 
-fn fits(reserve: u64, free: &dyn Fn() -> std::io::Result<u64>, byte_len: u64) -> bool {
-    // Unknown free space admits nothing, as for downloads.
-    free().is_ok_and(|available| {
+/// Whether a new `byte_len`-byte cache file fits above the reserve. `None`
+/// when free space cannot be measured: that is not a full disk, and nothing
+/// may be dropped on it.
+fn fits(reserve: u64, free: &dyn Fn() -> std::io::Result<u64>, byte_len: u64) -> Option<bool> {
+    free().ok().map(|available| {
         DiskPolicy {
             reserve_bytes: reserve,
         }
@@ -218,7 +224,15 @@ pub(crate) fn migrate_batch(
         // in full first: one that fails is marked lost, so it is not
         // attached and a fresh file is written from these bytes instead.
         let twin_checked = match storage.ready_media_file(Category::Cache, &digest) {
-            Ok(Some(twin)) => media.verify(&twin, &digest).is_ok(),
+            Ok(Some(twin)) => match media.verify(&twin, &digest) {
+                Ok(true) => true,
+                // It failed and should now be marked lost. Proceed only once
+                // it no longer counts as ready, so it cannot be attached.
+                Ok(false) => storage
+                    .ready_media_file(Category::Cache, &digest)
+                    .is_ok_and(|still| still != Some(twin)),
+                Err(_) => false,
+            },
             Ok(None) => true,
             Err(_) => false,
         };
@@ -235,21 +249,29 @@ pub(crate) fn migrate_batch(
         // file is charged against free space.
         let published = match media.attach_existing(&publication, Category::Cache, &digest) {
             Ok(Some(outcome)) => Ok(outcome),
-            Ok(None) if !fits(reserve, free, byte_len) => {
-                if !evict(storage, avatar, &mut batch) {
+            Ok(None) => match fits(reserve, free, byte_len) {
+                Some(true) => media.publish(
+                    &publication,
+                    Category::Cache,
+                    &mut Cursor::new(image.bytes()),
+                    byte_len,
+                    digest,
+                    crate::unix_now_seconds(),
+                    &|| false,
+                ),
+                // Measured and too small: drop only this owner.
+                Some(false) => {
+                    if !evict(storage, avatar, &mut batch) {
+                        return batch;
+                    }
+                    continue;
+                }
+                // Free space cannot be measured: drop nothing, retry later.
+                None => {
+                    batch.deferred = true;
                     return batch;
                 }
-                continue;
-            }
-            Ok(None) => media.publish(
-                &publication,
-                Category::Cache,
-                &mut Cursor::new(image.bytes()),
-                byte_len,
-                digest,
-                crate::unix_now_seconds(),
-                &|| false,
-            ),
+            },
             Err(error) => Err(error),
         };
         media.unlink_released(&publication.take_released());

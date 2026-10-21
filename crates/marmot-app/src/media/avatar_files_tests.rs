@@ -475,3 +475,23 @@ fn a_missing_identical_file_is_charged_as_a_new_one() {
     assert_eq!((batch.moved, batch.evicted), (0, 1));
     assert_eq!(f.files_on_disk(), 0);
 }
+
+/// Free space that cannot be measured is not a full disk: the move drops
+/// nothing and retries later.
+#[test]
+fn an_unmeasurable_disk_drops_no_avatars() {
+    let f = Fixture::new();
+    let held = f.storage().bind_avatar_source("chat:aa", "source").unwrap();
+    f.storage()
+        .publish_avatar(&held, 0, &image(13, 2_000), None)
+        .unwrap();
+    let unknown = || Err(std::io::Error::other("statvfs"));
+    let batch = migrate_batch(&f.storage(), &f.media, RESERVE, &unknown);
+    assert!(batch.deferred);
+    assert_eq!((batch.moved, batch.evicted), (0, 0));
+    assert_eq!(
+        f.count("SELECT count(*) FROM avatar_assets WHERE bytes IS NOT NULL"),
+        1
+    );
+    assert_eq!(f.files_on_disk(), 0);
+}
