@@ -7,7 +7,7 @@ use cgka_traits::TransportEndpoint;
 use nostr_sdk::prelude::RelayUrl;
 use transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE;
 
-use crate::key_package_records::{
+use crate::directory::published_records::{
     KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, preferred_fresh_key_package_from_records,
     without_revoked_slot_winners,
 };

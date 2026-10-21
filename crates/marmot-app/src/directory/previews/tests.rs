@@ -361,8 +361,7 @@ fn refresh_rules_follow_target_kind_and_completeness() {
 
 fn previews_table() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(include_str!("../directory/cache/v2.sql"))
-        .unwrap();
+    conn.execute_batch(include_str!("../cache/v2.sql")).unwrap();
     conn
 }
 

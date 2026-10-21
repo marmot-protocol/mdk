@@ -34,14 +34,12 @@ use super::records::{
     UserDirectoryRecord, UserDirectorySearchResult, latest_follow_list_from_records,
     latest_fresh_profiles_from_records, profile_from_record, user_record_match,
 };
+use crate::directory::ids::{npub_for_account_id_lossy, parse_account_id_hex};
 use crate::error::AppError;
-use crate::ids::{npub_for_account_id_lossy, parse_account_id_hex};
 use crate::runtime::blocking_app_task;
-use crate::{
-    KIND_NIP65_RELAY_LIST, KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp,
-    relay_list_state_from_event,
-};
+use crate::{KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, relay_list_state_from_event};
 use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
+use transport_nostr_adapter::KIND_NIP65_RELAY_LIST;
 
 /// Deepest radius the traversal producer currently answers.
 ///
@@ -1549,7 +1547,7 @@ mod tests {
 
     use super::*;
     use crate::AccountRelayListStatus;
-    use crate::ids::npub_for_account_id_lossy;
+    use crate::directory::ids::npub_for_account_id_lossy;
     use crate::{MatchQuality, MatchedField, UserProfileMetadata};
     use marmot_account::AccountHome;
 

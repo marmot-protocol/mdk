@@ -13,13 +13,15 @@ use std::io::{self, Write};
 use serde::{Deserialize, Serialize};
 use storage_sqlite::PublicDirectoryUserRecord;
 
+use crate::directory::ids::parse_account_id_hex;
 use crate::error::AppError;
-use crate::ids::parse_account_id_hex;
 use crate::{
-    AccountRelayListStatus, DirectoryFreshness, DirectorySelection, KIND_NOSTR_CONTACT_LIST,
-    KIND_NOSTR_METADATA, sort_directory_records,
+    AccountRelayListStatus, DirectoryFreshness, DirectorySelection, sort_directory_records,
 };
 use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
+
+pub(crate) const KIND_NOSTR_METADATA: u64 = 0;
+pub(crate) const KIND_NOSTR_CONTACT_LIST: u64 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserDirectoryRecord {

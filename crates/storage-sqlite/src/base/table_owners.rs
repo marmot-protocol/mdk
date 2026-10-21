@@ -85,6 +85,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("avatar_acquisition_bootstrap", Side::App),
     ("avatar_assets", Side::App),
     ("avatar_cache_meta", Side::App),
+    ("avatar_file_refs", Side::App),
     ("avatar_identity_demand", Side::App),
     ("blocked_notification_suppressions", Side::App),
     ("blocked_pending_invites", Side::App),

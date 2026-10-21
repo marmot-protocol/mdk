@@ -75,8 +75,26 @@
   a partial index for parked rows, and keeps ciphertext checkpoints for jobs
   parked on disk space.
 - `AttachmentTransferState` adds `StorageBlocked`; update exhaustive matches.
+- Migration 0114 advances account storage to schema 114 on first open. Older
+  binaries reject the upgraded database; downgrade is unsupported. It rebuilds
+  `avatar_assets` so an image can be file-backed (new `byte_len`, `bytes`
+  optional when present) and adds `avatar_file_refs`. Existing images keep
+  their database bytes.
+- `AvatarAssetRead` gains `file` (`AvatarStoredFile`): a file-backed image
+  comes back there, with `image` empty, for the caller to read through the
+  media store. `AttachmentStorageUsage` gains `cache_bytes`.
 
 ### Added
+
+- Avatars and group images in the media store's cache category (mdk#2314
+  step 9): `AvatarPublication` is the `media_store::PublishTarget` for one
+  source generation (`AvatarFileImage` describes the image), fenced on the
+  content revision like `publish_avatar`. Identical images share one file;
+  the 128 MiB budget counts each file once, and eviction reports the files it
+  released for an immediate unlink. `discard_avatar_file` reports a missing or
+  corrupt file: it is marked lost, and every owner sharing it is cleared and
+  refetched. `AttachmentStorageUsage::cache_bytes` totals the cache in both
+  layouts.
 
 - New account databases are created with `auto_vacuum=INCREMENTAL`, so
   freed pages return to the filesystem without the one-time compaction

@@ -19,6 +19,13 @@ use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
 };
 
+use crate::directory::ids::{
+    normalize_account_ids, npub_for_account_id, npub_for_account_id_lossy, parse_account_id_hex,
+};
+use crate::directory::published_records::{
+    fresh_or_cached_key_package, fresh_relay_list_status_from_records, key_package_from_record,
+    latest_fresh_key_package_from_records, merge_relay_list_status, relay_list_queries,
+};
 use crate::directory::records::{
     CachedIdentityProjection, DirectoryKeyPackage, FetchedFollowList, LocalAccountNames,
     MAX_CACHED_IDENTITY_PAGE_SIZE, UserDirectoryLocalAccount, UserDirectoryRecord,
@@ -31,21 +38,16 @@ use crate::directory::records::{
 use crate::directory::{
     DirectoryCache, DirectorySyncHandle, plan_directory_sync, sort_user_search_results,
 };
-use crate::ids::{
-    normalize_account_ids, npub_for_account_id, npub_for_account_id_lossy, parse_account_id_hex,
-};
-use crate::key_package_records::{
-    fresh_or_cached_key_package, fresh_relay_list_status_from_records, key_package_from_record,
-    latest_fresh_key_package_from_records, merge_relay_list_status, relay_list_queries,
-};
 use crate::{
     AccountRelayListStatus, AppError, DirectoryFreshness, FetchedKeyPackage,
     KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, MissingRelayListKind,
-    USER_DIRECTORY_SEARCH_MAX_FRONTIER, USER_DIRECTORY_SEARCH_MAX_VISITED, blocking_app_task,
-    push_unique_strings, relay_list_state_from_event,
+    blocking_app_task, push_unique_strings, relay_list_state_from_event,
 };
 use transport_nostr::DirectorySyncPlan;
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
+
+pub(crate) const USER_DIRECTORY_SEARCH_MAX_VISITED: usize = 8192;
+pub(crate) const USER_DIRECTORY_SEARCH_MAX_FRONTIER: usize = 4096;
 
 impl MarmotApp {
     /// Resolve batched profile names with first-cache precedence, then local labels.
@@ -612,7 +614,7 @@ impl MarmotApp {
         let cached_target = cached_entry
             .as_ref()
             .and_then(|entry| entry.key_package.as_ref())
-            .map(crate::key_package_records::KeyPackageRecoveryTarget::from_cached);
+            .map(crate::directory::published_records::KeyPackageRecoveryTarget::from_cached);
         let records = self
             .recover_key_package_records(super::key_package_recovery::KeyPackageRecoveryRequest {
                 account: account_id_hex,

@@ -184,14 +184,14 @@ mod tests {
         own_cache
             .remember_search_graph_follows(
                 &searcher.account_id_hex,
-                &crate::ids::npub_for_account_id_lossy(&searcher.account_id_hex),
+                &crate::directory::ids::npub_for_account_id_lossy(&searcher.account_id_hex),
                 std::slice::from_ref(&followed),
             )
             .unwrap();
         other_cache
             .remember_search_graph_follows(
                 &searcher.account_id_hex,
-                &crate::ids::npub_for_account_id_lossy(&searcher.account_id_hex),
+                &crate::directory::ids::npub_for_account_id_lossy(&searcher.account_id_hex),
                 std::slice::from_ref(&stale),
             )
             .unwrap();
@@ -303,7 +303,7 @@ mod tests {
         alice_cache
             .remember_search_graph_follows(
                 &alice.account_id_hex,
-                &crate::ids::npub_for_account_id_lossy(&alice.account_id_hex),
+                &crate::directory::ids::npub_for_account_id_lossy(&alice.account_id_hex),
                 std::slice::from_ref(&peer),
             )
             .unwrap();
@@ -311,7 +311,7 @@ mod tests {
         bob_record.follows = vec![shared_peer.clone()];
         bob_cache.put(&bob_record).unwrap();
         record.account_id_hex = shared_peer.clone();
-        record.npub = crate::ids::npub_for_account_id_lossy(&shared_peer);
+        record.npub = crate::directory::ids::npub_for_account_id_lossy(&shared_peer);
         app.shared_storage()
             .unwrap()
             .put_public_directory_user(&public_directory_user_record(&record).unwrap())
@@ -322,7 +322,7 @@ mod tests {
                 .put_search_graph_record(
                     &DirectorySearchGraphRecord {
                         account_id_hex: id.clone(),
-                        npub: crate::ids::npub_for_account_id_lossy(id),
+                        npub: crate::directory::ids::npub_for_account_id_lossy(id),
                         profile: record.profile.clone(),
                         follows: None,
                         metadata_updated_at: Some(2),

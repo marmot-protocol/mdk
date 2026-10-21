@@ -20,7 +20,7 @@ use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
 };
 
-use crate::key_package_records::{
+use crate::directory::published_records::{
     fresh_relay_list_status_from_records, merge_relay_list_status,
     preferred_fresh_key_package_from_records,
 };
