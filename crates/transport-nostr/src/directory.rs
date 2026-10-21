@@ -1120,6 +1120,10 @@ async fn strict_fetch_endpoint(
         issued.insert(subscription_id.clone());
 
         let mut query_counts = vec![0usize; queries.len()];
+        // Counted per REQ: an event an earlier chunk already returned still
+        // fills this chunk's queries toward their limits. Only the returned
+        // records are deduplicated across chunks.
+        let mut chunk_event_ids = HashSet::new();
         let chunk_complete =
             timeout(DIRECTORY_RELAY_FETCH_WAIT, async {
                 loop {
@@ -1199,13 +1203,16 @@ async fn strict_fetch_endpoint(
                             }
                             continue;
                         }
-                        if !seen_event_ids.insert(event.id.clone()) {
+                        if !chunk_event_ids.insert(event.id.clone()) {
                             continue;
                         }
                         for (query, count) in queries.iter().zip(&mut query_counts) {
                             if query.matches(&event) {
                                 *count += 1;
                             }
+                        }
+                        if !seen_event_ids.insert(event.id.clone()) {
+                            continue;
                         }
                         if records.len() < max_records {
                             records.push(DirectoryRelayEventRecord {
@@ -1500,6 +1507,46 @@ mod tests {
                 "{query_count} queries split under the filter limit establish absence"
             );
         }
+    }
+
+    /// An event an earlier REQ already returned still counts toward a later
+    /// REQ's queries. Three `[A]` queries fill the first REQ; an `[A, X]` query
+    /// with limit 1 sorts into the second. The relay returns A's one event for
+    /// both, so the second REQ's query reaches its limit and cannot establish
+    /// absence (mdk#2269).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_directory_fetch_counts_events_shared_across_reqs_per_req() {
+        use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys};
+
+        let author = Keys::generate();
+        let other = Keys::generate().public_key().to_hex();
+        let event = EventBuilder::new(Kind::TextNote, "shared")
+            .finalize(&author)
+            .unwrap();
+        let (endpoint, filter_counts, server) =
+            spawn_filter_limited_relay(3, vec![serde_json::to_value(&event).unwrap()]).await;
+        let author = author.public_key().to_hex();
+        let mut queries = [10, 11, 12]
+            .into_iter()
+            .map(|limit| DirectoryEventQuery::new(1, vec![author.clone()], limit))
+            .collect::<Vec<_>>();
+        queries.push(DirectoryEventQuery::new(1, vec![author, other], 1));
+        let request = DirectoryFetchRequest::new(vec![endpoint], queries).unwrap();
+        let outcome = timeout(
+            Duration::from_secs(20),
+            NostrSdkDirectoryRelayFetcher::standalone()
+                .fetch_directory_events_with_completion(request),
+        )
+        .await
+        .expect("strict fetch completes")
+        .unwrap();
+        server.abort();
+        assert_eq!(*filter_counts.lock().unwrap(), vec![3, 1]);
+        assert_eq!(outcome.records.len(), 1, "records stay deduplicated");
+        assert!(
+            !outcome.complete,
+            "the second REQ's query reached its limit"
+        );
     }
 
     /// strfry silently clamps every REQ to 500 stored events and then sends
