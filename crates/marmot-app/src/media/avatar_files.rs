@@ -55,25 +55,24 @@ pub(crate) fn store_acquired(
 ) -> Result<StoredAvatar, AppError> {
     let byte_len = image.bytes().len() as u64;
     let digest: [u8; 32] = Sha256::digest(image.bytes()).into();
-    // An identical image already on disk is attached without writing, so
-    // only a new file is charged against free space.
-    let reused = storage
-        .ready_media_file(Category::Cache, &digest)?
-        .is_some();
-    if !reused && !fits(reserve, free, byte_len) {
-        return Ok(StoredAvatar::NoRoom);
-    }
     let file = AvatarFileImage::new(byte_len, image.format(), image.width(), image.height())?;
     let publication = AvatarPublication::for_acquisition(storage.clone(), job, file, refresh_at)?;
-    let published = media.publish(
-        &publication,
-        Category::Cache,
-        &mut Cursor::new(image.bytes()),
-        byte_len,
-        digest,
-        crate::unix_now_seconds(),
-        &|| false,
-    );
+    // An identical image whose file is on disk is attached without writing;
+    // only a new file is charged against free space.
+    let published = match media.attach_existing(&publication, Category::Cache, &digest) {
+        Ok(Some(outcome)) => Ok(outcome),
+        Ok(None) if !fits(reserve, free, byte_len) => return Ok(StoredAvatar::NoRoom),
+        Ok(None) => media.publish(
+            &publication,
+            Category::Cache,
+            &mut Cursor::new(image.bytes()),
+            byte_len,
+            digest,
+            crate::unix_now_seconds(),
+            &|| false,
+        ),
+        Err(error) => Err(error),
+    };
     media.unlink_released(&publication.take_released());
     match published {
         Ok(PublishOutcome::Published(_) | PublishOutcome::Existing(_))
@@ -214,46 +213,45 @@ pub(crate) fn migrate_batch(
         };
         let byte_len = image.bytes().len() as u64;
         let digest: [u8; 32] = Sha256::digest(image.bytes()).into();
-        // The commit drops the database copy, and a publication reuses an
-        // identical ready file after checking only its presence and length.
-        // Read any such file in full first: one that fails is marked lost,
-        // so the publication writes a fresh file from these bytes instead.
-        // A good one is attached without writing, so only a new file is
-        // charged against free space.
-        let reused = match storage.ready_media_file(Category::Cache, &digest) {
-            Ok(Some(twin)) => match media.verify(&twin, &digest) {
-                Ok(verified) => verified,
-                Err(_) => {
-                    batch.deferred = true;
-                    return batch;
-                }
-            },
-            Ok(None) => false,
-            Err(_) => {
-                batch.deferred = true;
-                return batch;
-            }
+        // The commit drops the database copy, and attaching an identical
+        // ready file checks only its presence and length. Read any such file
+        // in full first: one that fails is marked lost, so it is not
+        // attached and a fresh file is written from these bytes instead.
+        let twin_checked = match storage.ready_media_file(Category::Cache, &digest) {
+            Ok(Some(twin)) => media.verify(&twin, &digest).is_ok(),
+            Ok(None) => true,
+            Err(_) => false,
         };
-        if !reused && !fits(reserve, free, byte_len) {
-            if !evict(storage, avatar, &mut batch) {
-                return batch;
-            }
-            continue;
-        }
         let Ok(publication) = AvatarPublication::for_migration(storage.clone(), avatar, &image)
         else {
             batch.deferred = true;
             return batch;
         };
-        let published = media.publish(
-            &publication,
-            Category::Cache,
-            &mut Cursor::new(image.bytes()),
-            byte_len,
-            digest,
-            crate::unix_now_seconds(),
-            &|| false,
-        );
+        if !twin_checked {
+            batch.deferred = true;
+            return batch;
+        }
+        // An identical file on disk is attached without writing; only a new
+        // file is charged against free space.
+        let published = match media.attach_existing(&publication, Category::Cache, &digest) {
+            Ok(Some(outcome)) => Ok(outcome),
+            Ok(None) if !fits(reserve, free, byte_len) => {
+                if !evict(storage, avatar, &mut batch) {
+                    return batch;
+                }
+                continue;
+            }
+            Ok(None) => media.publish(
+                &publication,
+                Category::Cache,
+                &mut Cursor::new(image.bytes()),
+                byte_len,
+                digest,
+                crate::unix_now_seconds(),
+                &|| false,
+            ),
+            Err(error) => Err(error),
+        };
         media.unlink_released(&publication.take_released());
         match published {
             Ok(_) if publication.published_revision().is_some() => {

@@ -427,3 +427,51 @@ fn a_full_disk_still_attaches_an_image_already_on_disk() {
     assert_eq!(f.read(&reference).image, Some(shared));
     assert_eq!(f.files_on_disk(), 1);
 }
+
+/// A ready row whose file is gone is not "already on disk": with no room for
+/// a new file, neither a fetch nor the move writes one into the reserve.
+#[test]
+fn a_missing_identical_file_is_charged_as_a_new_one() {
+    let f = Fixture::new();
+    let shared = image(12, 6_000);
+    let (_, first) = f.claim("chat:aa");
+    store_acquired(
+        &f.storage(),
+        &f.media,
+        RESERVE,
+        &plenty,
+        &first,
+        &shared,
+        None,
+    )
+    .unwrap();
+    let id = f
+        .storage()
+        .ready_media_file(Category::Cache, &Sha256::digest(shared.bytes()).into())
+        .unwrap()
+        .unwrap();
+    std::fs::remove_file(f.media.path(&id)).unwrap();
+    let tight = || Ok(RESERVE);
+
+    let (_, second) = f.claim("chat:bb");
+    assert_eq!(
+        store_acquired(
+            &f.storage(),
+            &f.media,
+            RESERVE,
+            &tight,
+            &second,
+            &shared,
+            None
+        )
+        .unwrap(),
+        StoredAvatar::NoRoom
+    );
+    assert_eq!(f.files_on_disk(), 0, "nothing was written into the reserve");
+
+    let held = f.storage().bind_avatar_source("chat:cc", "source").unwrap();
+    f.storage().publish_avatar(&held, 0, &shared, None).unwrap();
+    let batch = migrate_batch(&f.storage(), &f.media, RESERVE, &tight);
+    assert_eq!((batch.moved, batch.evicted), (0, 1));
+    assert_eq!(f.files_on_disk(), 0);
+}
