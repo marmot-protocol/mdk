@@ -187,15 +187,6 @@ impl<R: DirectoryResources> Directory<R> {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn remember_directory_follow_list_for_test(
-        &self,
-        account_id_hex: &str,
-        follow_list: &FetchedFollowList,
-    ) -> Result<(), DirectoryError> {
-        self.remember_directory_follow_list(account_id_hex, follow_list)
-    }
-
     /// Persist the follow edges from an ingested remote contact list for
     /// bounded directory search, without promoting the author's follows into
     /// known directory entries.

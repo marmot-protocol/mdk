@@ -1,9 +1,10 @@
 //! User-directory domain methods for [`MarmotApp`].
 //!
 //! Split `impl MarmotApp` block covering the user-directory cache/sync surface:
-//! relay-list and profile/key-package/follow-list fetches, the public
-//! `directory_*`/`*_user_directory` API, and in-memory directory-record
-//! hydration. The stateless record types and helpers these build on live in
+//! relay-list and profile/key-package/follow-list fetches and the public
+//! `directory_*`/`*_user_directory` API. Entry reads and writes, ingest and
+//! record hydration are the store, in `directory/store.rs`. The stateless
+//! record types and helpers these build on live in
 //! [`crate::directory::records`]. The cache lifecycle is in
 //! [`crate::directory_resources`], and publishing the account's own profile and
 //! follow list is in [`crate::profile_publication`].
@@ -1236,7 +1237,7 @@ impl MarmotApp {
         follow_list: &FetchedFollowList,
     ) -> Result<(), DirectoryError> {
         self.directory()
-            .remember_directory_follow_list_for_test(account_id_hex, follow_list)
+            .remember_directory_follow_list(account_id_hex, follow_list)
     }
 
     pub(crate) fn remember_directory_key_package(
