@@ -1,16 +1,27 @@
 //! The directory's settings. The host chooses them through its deployment and
 //! app configuration.
 
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
+
 use cgka_traits::TransportEndpoint;
 
-/// The relays the directory reads from, as the app configured them.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// The directory's settings, as the app configured them.
+#[derive(Clone, Debug, Default)]
 pub struct DirectoryConfig {
     /// Relays the host chose for directory reads. Empty means
     /// [`Self::default_relays`].
     pub directory_relays: Vec<TransportEndpoint>,
     /// The app's default relays.
     pub default_relays: Vec<TransportEndpoint>,
+    /// How far past now an event's `created_at` may be and still count.
+    pub max_future_skew: Duration,
+    /// Replaces the wall clock for freshness checks in tests.
+    #[cfg(test)]
+    pub test_clock: Option<Arc<AtomicU64>>,
 }
 
 /// An Open Ranking pubkey-search endpoint and the relays that hydrate its

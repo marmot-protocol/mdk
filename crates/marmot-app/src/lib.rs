@@ -382,8 +382,8 @@ use conversions::{
     stored_app_event_from_projection, stored_push_registration_from_account,
     stored_state_from_account_state,
 };
+use directory::DirectoryCache;
 use directory::records::display_name_for_profile;
-use directory::{DirectoryCache, DirectorySyncHandle};
 use ids::parse_account_id_hex;
 use key_package_records::{
     account_key_package_record_from_fetched, account_key_package_relay_events_from_records,
@@ -542,7 +542,6 @@ pub struct MarmotApp {
     account_home: AccountHome,
     relay_plane: MarmotRelayPlane,
     config: MarmotAppConfig,
-    directory_sync: Arc<RwLock<Option<DirectorySyncHandle>>>,
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
     /// One encrypted media store per account (mdk#2314), over that account's
     /// cached storage handle. Its in-flight set and sweep cursor are per
@@ -1612,7 +1611,6 @@ impl MarmotApp {
             relay_urls,
             relay_plane,
             config,
-            directory_sync: Arc::new(RwLock::new(None)),
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
@@ -1713,7 +1711,6 @@ impl MarmotApp {
             account_home,
             relay_plane,
             config,
-            directory_sync: Arc::new(RwLock::new(None)),
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),

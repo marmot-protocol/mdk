@@ -3,12 +3,13 @@
 //! `directory/` to it slice by slice.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use cgka_traits::TransportEndpoint;
 use transport_nostr::MarmotRelayPlane;
 
+use super::DirectorySyncHandle;
 use super::config::DirectoryConfig;
 use super::resources::DirectoryResources;
 
@@ -29,6 +30,9 @@ pub struct DirectoryState {
     /// When each `(account label, cache key)` public event refresh last
     /// finished; see `previews`.
     pub(super) public_event_refreshes: Arc<Mutex<HashMap<String, Instant>>>,
+    /// The running sync worker, which a store write asks to rebuild its
+    /// subscriptions.
+    pub(super) sync_handle: Arc<RwLock<Option<DirectorySyncHandle>>>,
 }
 
 impl<R: DirectoryResources> Directory<R> {

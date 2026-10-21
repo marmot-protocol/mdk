@@ -21,29 +21,27 @@ use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
 };
 
-use crate::directory::ids::{
-    normalize_account_ids, npub_for_account_id, npub_for_account_id_lossy, parse_account_id_hex,
-};
+use crate::directory::ids::parse_account_id_hex;
 use crate::directory::published_records::{
-    fresh_or_cached_key_package, fresh_relay_list_status_from_records, key_package_from_record,
+    fresh_or_cached_key_package, fresh_relay_list_status_from_records,
     latest_fresh_key_package_from_records, merge_relay_list_status, relay_list_queries,
 };
+#[cfg(test)]
+use crate::directory::records::UserDirectoryLocalAccount;
 use crate::directory::records::{
-    CachedIdentityProjection, DirectoryKeyPackage, FetchedFollowList, LocalAccountNames,
-    MAX_CACHED_IDENTITY_PAGE_SIZE, UserDirectoryLocalAccount, UserDirectoryRecord,
-    UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
-    cached_identity_projection, display_name_for_profile, follow_list_from_record,
-    latest_follow_list_from_records, latest_fresh_profiles_from_records, profile_from_record,
-    public_directory_user_record, select_newer_directory_entry, source_relays_from_record,
+    CachedIdentityProjection, FetchedFollowList, LocalAccountNames, MAX_CACHED_IDENTITY_PAGE_SIZE,
+    UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch, UserDirectorySearchResult,
+    UserProfileMetadata, cached_identity_projection, display_name_for_profile,
+    latest_follow_list_from_records, latest_fresh_profiles_from_records,
     upsert_newer_directory_entry, user_directory_record_from_public, user_record_match,
 };
 use crate::directory::{
-    DirectoryCache, DirectorySyncHandle, plan_directory_sync, sort_user_search_results,
+    DirectoryCache, DirectorySyncHandle, hydrate_directory_record, plan_directory_sync,
+    sort_user_search_results,
 };
 use crate::{
     AccountRelayListStatus, DirectoryFreshness, FetchedKeyPackage, KIND_NOSTR_CONTACT_LIST,
     KIND_NOSTR_METADATA, MarmotApp, MissingRelayListKind, push_unique_strings,
-    relay_list_state_from_event,
 };
 use transport_nostr::DirectorySyncPlan;
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
@@ -110,26 +108,6 @@ impl MarmotApp {
         }
 
         Ok(names)
-    }
-
-    pub(crate) fn local_accounts_by_id(
-        &self,
-    ) -> Result<HashMap<String, LocalAccountNames>, DirectoryError> {
-        let mut local = HashMap::new();
-        for account in self.account_home().accounts()? {
-            // Preserve first-record directory links and last-label display fallback for aliases.
-            local
-                .entry(account.account_id_hex)
-                .and_modify(|names: &mut LocalAccountNames| names.label = account.label.clone())
-                .or_insert_with(|| LocalAccountNames {
-                    directory: UserDirectoryLocalAccount {
-                        label: account.label.clone(),
-                        local_signing: account.local_signing,
-                    },
-                    label: account.label,
-                });
-        }
-        Ok(local)
     }
 
     pub async fn fetch_account_relay_list_status_for_account_id(
@@ -711,22 +689,6 @@ impl MarmotApp {
         Ok(self.directory_entry(account_id_hex)?)
     }
 
-    pub(crate) fn directory_entry(
-        &self,
-        account_id_hex: &str,
-    ) -> Result<Option<UserDirectoryRecord>, DirectoryError> {
-        let account_id_hex = parse_account_id_hex(account_id_hex)?;
-        let caches = self.directory_caches()?;
-        let shared_storage = self.shared_storage()?;
-        let local_accounts = self.local_accounts_by_id()?;
-        self.directory_entry_for_account_id_with_handles(
-            &account_id_hex,
-            &caches,
-            &shared_storage,
-            &local_accounts,
-        )
-    }
-
     /// Bounded local cached-identity page for many account IDs.
     ///
     /// Acquires directory caches and shared storage once, then projects each
@@ -864,16 +826,6 @@ impl MarmotApp {
         account_id_hex: &str,
     ) -> Result<AccountRelayListStatus, AppError> {
         Ok(self.cached_relay_list_status(account_id_hex)?)
-    }
-
-    pub(crate) fn cached_relay_list_status(
-        &self,
-        account_id_hex: &str,
-    ) -> Result<AccountRelayListStatus, DirectoryError> {
-        Ok(self
-            .directory_entry(account_id_hex)?
-            .map(|entry| entry.relay_lists)
-            .unwrap_or_else(AccountRelayListStatus::empty))
     }
 
     pub(crate) async fn fetch_key_package_events_for_account_id(
@@ -1062,18 +1014,6 @@ impl MarmotApp {
             })
     }
 
-    pub(crate) fn directory_freshness(&self) -> DirectoryFreshness {
-        #[cfg(test)]
-        if let Some(clock) = &self.directory_test_clock {
-            return DirectoryFreshness {
-                max_created_at: clock
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    .saturating_add(self.config.directory_max_future_skew.as_secs()),
-            };
-        }
-        DirectoryFreshness::from_now(self.config.directory_max_future_skew)
-    }
-
     /// Accounts to fall back to when a searcher's own web of trust is empty.
     /// See [`MarmotAppConfig::directory_search_fallback_seeds`].
     pub(crate) fn directory_search_fallback_seeds(&self) -> &[String] {
@@ -1094,12 +1034,12 @@ impl MarmotApp {
             for entry in cache.entries()? {
                 upsert_newer_directory_entry(
                     &mut entries_by_id,
-                    Self::hydrate_directory_record(entry, &local_accounts)?,
+                    hydrate_directory_record(entry, &local_accounts)?,
                 );
             }
         }
         for record in self.shared_storage()?.public_directory_users()? {
-            let entry = Self::hydrate_directory_record(
+            let entry = hydrate_directory_record(
                 user_directory_record_from_public(record)?,
                 &local_accounts,
             )?;
@@ -1186,40 +1126,6 @@ impl MarmotApp {
         Ok(records)
     }
 
-    pub(crate) fn directory_entry_for_account_id_with_handles(
-        &self,
-        account_id_hex: &str,
-        caches: &[DirectoryCache],
-        shared_storage: &SqliteSharedStorage,
-        local_accounts: &HashMap<String, LocalAccountNames>,
-    ) -> Result<Option<UserDirectoryRecord>, DirectoryError> {
-        let cached_entry = Self::directory_entry_from_caches(caches, account_id_hex)?
-            .map(|entry| Self::hydrate_directory_record(entry, local_accounts))
-            .transpose()?;
-        let shared_entry = shared_storage
-            .public_directory_user(account_id_hex)?
-            .map(|record| {
-                Self::hydrate_directory_record(
-                    user_directory_record_from_public(record)?,
-                    local_accounts,
-                )
-            })
-            .transpose()?;
-        Ok(select_newer_directory_entry(cached_entry, shared_entry))
-    }
-
-    fn directory_entry_from_caches(
-        caches: &[DirectoryCache],
-        account_id_hex: &str,
-    ) -> Result<Option<UserDirectoryRecord>, DirectoryError> {
-        for cache in caches {
-            if let Some(entry) = cache.entry(account_id_hex)? {
-                return Ok(Some(entry));
-            }
-        }
-        Ok(None)
-    }
-
     fn directory_search_record_from_caches(
         caches: &[DirectoryCache],
         account_id_hex: &str,
@@ -1232,81 +1138,95 @@ impl MarmotApp {
         }
         Ok(None)
     }
+}
 
-    pub(crate) fn remember_directory_relay_lists(
+// The store moved to `Directory` (`directory/store.rs`). These delegates serve
+// code that still sits in `impl MarmotApp`; each goes when its last caller
+// converts.
+impl MarmotApp {
+    pub(crate) fn cached_relay_list_status(
         &self,
         account_id_hex: &str,
-        relay_lists: &AccountRelayListStatus,
-    ) -> Result<(), DirectoryError> {
-        let mut entry = self
-            .directory_entry(account_id_hex)?
-            .unwrap_or_else(|| self.empty_directory_record(account_id_hex));
-        entry.account_id_hex = account_id_hex.to_owned();
-        entry.relay_lists = merge_relay_list_status(entry.relay_lists, relay_lists.clone());
-        self.save_directory_entry(&entry)
+    ) -> Result<AccountRelayListStatus, DirectoryError> {
+        self.directory().cached_relay_list_status(account_id_hex)
     }
 
-    pub(crate) fn remember_directory_key_package(
-        &self,
-        fetched: &FetchedKeyPackage,
-    ) -> Result<(), DirectoryError> {
-        let mut entry = self
-            .directory_entry(&fetched.account_id_hex)?
-            .unwrap_or_else(|| self.empty_directory_record(&fetched.account_id_hex));
-        entry.account_id_hex = fetched.account_id_hex.clone();
-        entry.relay_lists = merge_relay_list_status(entry.relay_lists, fetched.relay_lists.clone());
-        entry.key_package = Some(DirectoryKeyPackage {
-            key_package_id: fetched.key_package_id.clone(),
-            key_package_ref_hex: fetched.key_package_ref_hex.clone(),
-            key_package_event_id: fetched.key_package_event_id.clone(),
-            key_package_hex: hex::encode(fetched.key_package.bytes()),
-            created_at: fetched.created_at,
-            source_relays: fetched.source_relays.clone(),
-        });
-        self.save_directory_entry(&entry)
-    }
-
-    fn remember_directory_user(&self, account_id_hex: &str) -> Result<(), DirectoryError> {
-        self.remember_directory_user_with_reason(account_id_hex, "directory")
-    }
-
-    pub(crate) fn remember_directory_user_with_reason(
+    pub(crate) fn directory_entry(
         &self,
         account_id_hex: &str,
-        reason: &str,
-    ) -> Result<(), DirectoryError> {
-        let account_id_hex = parse_account_id_hex(account_id_hex)?;
-        let entry = self
-            .directory_entry(&account_id_hex)?
-            .unwrap_or_else(|| self.empty_directory_record(&account_id_hex));
-        self.save_directory_entry_with_reason(&entry, reason)
+    ) -> Result<Option<UserDirectoryRecord>, DirectoryError> {
+        self.directory().directory_entry(account_id_hex)
     }
 
-    pub(crate) fn remember_directory_message_sender(
+    pub(crate) fn directory_entry_for_account_id_with_handles(
         &self,
-        sender_account_id_hex: &str,
-    ) -> Result<(), DirectoryError> {
-        self.remember_directory_user_with_reason(sender_account_id_hex, "message")
+        account_id_hex: &str,
+        caches: &[DirectoryCache],
+        shared_storage: &SqliteSharedStorage,
+        local_accounts: &HashMap<String, LocalAccountNames>,
+    ) -> Result<Option<UserDirectoryRecord>, DirectoryError> {
+        self.directory()
+            .directory_entry_for_account_id_with_handles(
+                account_id_hex,
+                caches,
+                shared_storage,
+                local_accounts,
+            )
     }
 
-    fn remember_directory_follow_list(
+    pub(crate) fn directory_freshness(&self) -> DirectoryFreshness {
+        self.directory().directory_freshness()
+    }
+
+    pub(crate) fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
+        self.directory().empty_directory_record(account_id_hex)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hydrate_public_directory_record(
+        &self,
+        record: PublicDirectoryUserRecord,
+    ) -> Result<UserDirectoryRecord, DirectoryError> {
+        self.directory().hydrate_public_directory_record(record)
+    }
+
+    pub(crate) fn ingest_directory_relay_event(
+        &self,
+        record: RelayEventRecord,
+    ) -> Result<(), DirectoryError> {
+        self.directory().ingest_directory_relay_event(record)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_account_for_id(
+        &self,
+        account_id_hex: &str,
+    ) -> Option<UserDirectoryLocalAccount> {
+        self.directory().local_account_for_id(account_id_hex)
+    }
+
+    pub(crate) fn local_accounts_by_id(
+        &self,
+    ) -> Result<HashMap<String, LocalAccountNames>, DirectoryError> {
+        self.directory().local_accounts_by_id()
+    }
+
+    pub(crate) fn remember_directory_follow_edges_for_search(
         &self,
         account_id_hex: &str,
         follow_list: &FetchedFollowList,
     ) -> Result<(), DirectoryError> {
-        let mut entry = self
-            .directory_entry(account_id_hex)?
-            .unwrap_or_else(|| self.empty_directory_record(account_id_hex));
-        entry.follows = follow_list.follows.clone();
-        entry.follow_source_relays = follow_list.source_relays.clone();
-        self.save_directory_entry(&entry)?;
-        // A fetched empty kind-3 is authoritative, unlike a profile-only
-        // promotion whose empty follow vec means "not loaded".
-        self.remember_directory_follow_edges_for_search(account_id_hex, follow_list)?;
-        for follow in &follow_list.follows {
-            self.remember_directory_user(follow)?;
-        }
-        Ok(())
+        self.directory()
+            .remember_directory_follow_edges_for_search(account_id_hex, follow_list)
+    }
+
+    pub(crate) fn remember_directory_follow_list(
+        &self,
+        account_id_hex: &str,
+        follow_list: &FetchedFollowList,
+    ) -> Result<(), DirectoryError> {
+        self.directory()
+            .remember_directory_follow_list(account_id_hex, follow_list)
     }
 
     #[cfg(test)]
@@ -1315,37 +1235,23 @@ impl MarmotApp {
         account_id_hex: &str,
         follow_list: &FetchedFollowList,
     ) -> Result<(), DirectoryError> {
-        self.remember_directory_follow_list(account_id_hex, follow_list)
+        self.directory()
+            .remember_directory_follow_list_for_test(account_id_hex, follow_list)
     }
 
-    /// Persist the follow edges from an ingested remote contact list for
-    /// bounded directory search, without promoting the author's follows into
-    /// known directory entries.
-    ///
-    /// Promoting every followed pubkey via [`Self::remember_directory_user`]
-    /// would schedule a directory-sync rebuild that watches the new pubkeys,
-    /// whose own contact lists would in turn be ingested — an unbounded
-    /// transitive social-graph crawl (mdk#687). Instead the edges are
-    /// recorded in the per-account search graph, which directory search reads
-    /// but [`Self::directory_sync_plan`] does not. When the author is already a
-    /// known directory entry (e.g. a local account whose contact list we sync),
-    /// its own cached follow edges are refreshed too, but its follows are still
-    /// not promoted.
-    pub(crate) fn remember_directory_follow_edges_for_search(
+    pub(crate) fn remember_directory_key_package(
         &self,
-        account_id_hex: &str,
-        follow_list: &FetchedFollowList,
+        fetched: &FetchedKeyPackage,
     ) -> Result<(), DirectoryError> {
-        let npub = npub_for_account_id_lossy(account_id_hex);
-        for cache in self.directory_caches()? {
-            cache.remember_search_graph_follows(account_id_hex, &npub, &follow_list.follows)?;
-        }
-        if let Some(mut entry) = self.directory_entry(account_id_hex)? {
-            entry.follows = follow_list.follows.clone();
-            entry.follow_source_relays = follow_list.source_relays.clone();
-            self.save_directory_entry(&entry)?;
-        }
-        Ok(())
+        self.directory().remember_directory_key_package(fetched)
+    }
+
+    pub(crate) fn remember_directory_message_sender(
+        &self,
+        sender_account_id_hex: &str,
+    ) -> Result<(), DirectoryError> {
+        self.directory()
+            .remember_directory_message_sender(sender_account_id_hex)
     }
 
     pub(crate) fn remember_directory_profile(
@@ -1353,11 +1259,8 @@ impl MarmotApp {
         account_id_hex: &str,
         profile: &UserProfileMetadata,
     ) -> Result<(), DirectoryError> {
-        let mut entry = self
-            .directory_entry(account_id_hex)?
-            .unwrap_or_else(|| self.empty_directory_record(account_id_hex));
-        entry.profile = Some(profile.clone());
-        self.save_directory_entry(&entry)
+        self.directory()
+            .remember_directory_profile(account_id_hex, profile)
     }
 
     pub(crate) fn remember_directory_profile_if_newer(
@@ -1365,228 +1268,56 @@ impl MarmotApp {
         account_id_hex: &str,
         profile: &UserProfileMetadata,
     ) -> Result<(), DirectoryError> {
-        // Retain the cached profile when it is at least as recent as the
-        // fetched copy. Nostr `created_at` is second-resolution, so a rapid
-        // profile republish can carry the same timestamp as the previous
-        // pre-edit kind-0. A strict `>` guard would treat an equal-second stale
-        // relay copy as "newer or equal -> replace" and revert the just-published
-        // local edit (mdk#206). Keeping the cache on equality protects
-        // the local edit; an equal-timestamp event re-fetched from a relay is
-        // either the user's own echoed publish (identical content) or a stale
-        // copy that must not win.
-        if let Some(entry) = self.directory_entry(account_id_hex)?
-            && entry
-                .profile
-                .as_ref()
-                .is_some_and(|cached| cached.created_at >= profile.created_at)
-        {
-            return Ok(());
-        }
-        self.remember_directory_profile(account_id_hex, profile)
+        self.directory()
+            .remember_directory_profile_if_newer(account_id_hex, profile)
     }
 
-    fn remember_directory_relay_list_event(
+    pub(crate) fn remember_directory_relay_lists(
         &self,
         account_id_hex: &str,
-        record: &RelayEventRecord,
+        relay_lists: &AccountRelayListStatus,
     ) -> Result<(), DirectoryError> {
-        let Some(state) = relay_list_state_from_event(&record.event) else {
-            return Ok(());
-        };
-        let mut entry = self
-            .directory_entry(account_id_hex)?
-            .unwrap_or_else(|| self.empty_directory_record(account_id_hex));
-        // Replaceable-event timestamps have second resolution. Keep the cache
-        // on equality so a lagging relay cannot revert an accepted same-second
-        // publication, matching the profile ingest rule (mdk#920).
-        match record.event.kind {
-            KIND_NIP65_RELAY_LIST
-                if entry.relay_lists.nip65.created_at != 0
-                    && entry.relay_lists.nip65.created_at >= record.event.created_at =>
-            {
-                return Ok(());
-            }
-            KIND_MARMOT_INBOX_RELAY_LIST
-                if entry.relay_lists.inbox.created_at != 0
-                    && entry.relay_lists.inbox.created_at >= record.event.created_at =>
-            {
-                return Ok(());
-            }
-            KIND_NIP65_RELAY_LIST => entry.relay_lists.nip65 = state,
-            KIND_MARMOT_INBOX_RELAY_LIST => entry.relay_lists.inbox = state,
-            _ => return Ok(()),
-        }
-        push_unique_strings(
-            &mut entry.relay_lists.bootstrap_relays,
-            source_relays_from_record(record),
-        );
-        entry.relay_lists.refresh();
-        self.save_directory_entry(&entry)
+        self.directory()
+            .remember_directory_relay_lists(account_id_hex, relay_lists)
     }
 
-    pub(crate) fn ingest_directory_relay_event(
+    pub(crate) fn remember_directory_user(
         &self,
-        record: RelayEventRecord,
+        account_id_hex: &str,
     ) -> Result<(), DirectoryError> {
-        if !self.directory_freshness().accepts(&record) {
-            return Ok(());
-        }
-        let account_id_hex = parse_account_id_hex(&record.event.pubkey)?;
-        match record.event.kind {
-            KIND_NOSTR_METADATA => {
-                if let Some((profile_account_id, profile)) = profile_from_record(record) {
-                    self.remember_directory_profile_if_newer(&profile_account_id, &profile)?;
-                }
-            }
-            KIND_NOSTR_CONTACT_LIST => {
-                let follow_list = follow_list_from_record(record);
-                self.remember_directory_follow_edges_for_search(&account_id_hex, &follow_list)?;
-            }
-            KIND_NIP65_RELAY_LIST | KIND_MARMOT_INBOX_RELAY_LIST => {
-                self.remember_directory_relay_list_event(&account_id_hex, &record)?;
-            }
-            KIND_MARMOT_KEY_PACKAGE => {
-                let mut fetched = key_package_from_record(record)?;
-                fetched.relay_lists = self
-                    .cached_relay_list_status(&account_id_hex)
-                    .unwrap_or_else(|_| AccountRelayListStatus::empty());
-                self.remember_directory_key_package(&fetched)?;
-            }
-            _ => {}
-        }
-        Ok(())
+        self.directory().remember_directory_user(account_id_hex)
     }
 
+    #[cfg(test)]
+    pub(crate) fn remember_directory_user_with_reason(
+        &self,
+        account_id_hex: &str,
+        reason: &str,
+    ) -> Result<(), DirectoryError> {
+        self.directory()
+            .remember_directory_user_with_reason(account_id_hex, reason)
+    }
+
+    #[cfg(test)]
     pub(crate) fn save_directory_entry(
         &self,
         entry: &UserDirectoryRecord,
     ) -> Result<(), DirectoryError> {
-        self.save_directory_entry_with_reason(entry, "directory")
+        self.directory().save_directory_entry(entry)
     }
 
+    #[cfg(test)]
     pub(crate) fn save_directory_entry_with_reason(
         &self,
         entry: &UserDirectoryRecord,
         reason: &str,
     ) -> Result<(), DirectoryError> {
-        let local_accounts = self.local_accounts_by_id()?;
-        let proposed_entry = Self::hydrate_directory_record(entry.clone(), &local_accounts)?;
-        let shared_storage = self.shared_storage()?;
-        let shared_record = shared_storage.public_directory_user(&proposed_entry.account_id_hex)?;
-        let shared_entry = shared_record
-            .clone()
-            .map(|record| {
-                Self::hydrate_directory_record(
-                    user_directory_record_from_public(record)?,
-                    &local_accounts,
-                )
-            })
-            .transpose()?;
-        let entry = select_newer_directory_entry(Some(proposed_entry), shared_entry.clone())
-            .expect("proposed directory entry should be present");
-        let caches = self.directory_caches()?;
-        let public_entry = public_directory_user_record(&entry)?;
-        let shared_entry_matches = shared_record.as_ref() == Some(&public_entry);
-        let mut caches_match = true;
-        for cache in &caches {
-            let cached_entry = cache
-                .entry(&entry.account_id_hex)?
-                .map(|record| Self::hydrate_directory_record(record, &local_accounts))
-                .transpose()?;
-            if cached_entry.as_ref() != Some(&entry) {
-                caches_match = false;
-                break;
-            }
-        }
-        if shared_entry_matches && caches_match {
-            // Do not call `put_with_reason` just to refresh
-            // `directory_known_user_reasons.last_seen_at`: this is the receive
-            // hot path for duplicate senders, and a write-per-message would
-            // recreate the amplification this guard prevents. Today the reason
-            // table is provenance for persisted directory entries, not an
-            // activity log.
-            return Ok(());
-        }
-        shared_storage.put_public_directory_user(&public_entry)?;
-        let _ = self
-            .presentation_signals
-            .profile_updates
-            .send(entry.account_id_hex.clone());
-        self.presentation_signals.wake();
-        for cache in caches {
-            cache.put_with_reason(&entry, reason)?;
-        }
-        self.request_directory_sync_rebuild();
-        Ok(())
+        self.directory()
+            .save_directory_entry_with_reason(entry, reason)
     }
 
     pub(crate) fn set_directory_sync_handle(&self, handle: Option<DirectorySyncHandle>) {
-        *self
-            .directory_sync
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = handle;
-    }
-
-    fn request_directory_sync_rebuild(&self) {
-        let handle = self
-            .directory_sync
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        if let Some(handle) = handle {
-            handle.request_rebuild();
-        }
-    }
-
-    pub(crate) fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
-        UserDirectoryRecord {
-            account_id_hex: account_id_hex.to_owned(),
-            npub: npub_for_account_id_lossy(account_id_hex),
-            local_account: self.local_account_for_id(account_id_hex),
-            profile: None,
-            follows: Vec::new(),
-            follow_source_relays: Vec::new(),
-            relay_lists: AccountRelayListStatus::empty(),
-            key_package: None,
-        }
-    }
-
-    pub(crate) fn hydrate_directory_record(
-        mut entry: UserDirectoryRecord,
-        local_accounts: &HashMap<String, LocalAccountNames>,
-    ) -> Result<UserDirectoryRecord, DirectoryError> {
-        entry.account_id_hex = parse_account_id_hex(&entry.account_id_hex)?;
-        entry.npub = npub_for_account_id(&entry.account_id_hex)?;
-        entry.local_account = local_accounts
-            .get(&entry.account_id_hex)
-            .map(|names| names.directory.clone());
-        entry.follows = normalize_account_ids(entry.follows)?;
-        entry.follow_source_relays.sort();
-        entry.follow_source_relays.dedup();
-        Ok(entry)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn hydrate_public_directory_record(
-        &self,
-        record: PublicDirectoryUserRecord,
-    ) -> Result<UserDirectoryRecord, DirectoryError> {
-        Self::hydrate_directory_record(
-            user_directory_record_from_public(record)?,
-            &self.local_accounts_by_id()?,
-        )
-    }
-
-    fn local_account_for_id(&self, account_id_hex: &str) -> Option<UserDirectoryLocalAccount> {
-        self.account_home()
-            .accounts()
-            .ok()?
-            .into_iter()
-            .find(|account| account.account_id_hex == account_id_hex)
-            .map(|account| UserDirectoryLocalAccount {
-                label: account.label,
-                local_signing: account.local_signing,
-            })
+        self.directory().set_directory_sync_handle(handle)
     }
 }
 
@@ -1654,7 +1385,7 @@ mod tests {
             if index != 0 {
                 row.account_id_hex = format!("{index:064x}");
             }
-            let hydrated = MarmotApp::hydrate_directory_record(row, &local_accounts).unwrap();
+            let hydrated = hydrate_directory_record(row, &local_accounts).unwrap();
             if index == 0 {
                 assert_eq!(hydrated.local_account.unwrap(), local.directory);
             } else {

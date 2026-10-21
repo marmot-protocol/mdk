@@ -16,8 +16,6 @@ directory/member_key_packages.rs crate::ProductFamily
 directory/member_key_packages.rs crate::ProductObservation
 directory/member_key_packages.rs crate::ProductUnit
 directory/methods.rs MarmotApp.config
-directory/methods.rs MarmotApp.directory_sync
-directory/methods.rs MarmotApp.presentation_signals
 directory/methods.rs MarmotApp.product_analytics
 directory/methods.rs MarmotApp.relay_plane
 directory/methods.rs MarmotApp::account_home()

@@ -13,6 +13,7 @@ pub(crate) mod records;
 pub(crate) mod resources;
 mod search;
 mod service;
+mod store;
 mod sync;
 
 pub(crate) use cache::DirectoryCache;
@@ -40,6 +41,7 @@ pub use search::{
     UserSearchUpdate, sort_user_search_results,
 };
 pub(crate) use service::{Directory, DirectoryState};
+pub(crate) use store::hydrate_directory_record;
 pub(crate) use sync::{DirectorySyncHandle, plan_directory_sync};
 
 /// The directory's wall clock, in Unix seconds.

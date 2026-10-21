@@ -201,8 +201,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   seams: `records.rs` (the public `UserDirectory*`/`UserProfileMetadata`/`DirectoryKeyPackage` DTOs surfaced to
   `marmot-uniffi`/`cli`, plus the stateless record helpers — cached <-> shared record conversion, recency selection,
   Nostr profile/follow-list parsing, search-match ranking, and `profile_content_json` — which hold no `MarmotApp`
-  state), `methods.rs` (the split `impl MarmotApp` block: relay-list/profile/key-package/follow-list fetches, the
-  public `directory_*`/`*_user_directory` API, and in-memory directory-record hydration),
+  state), `methods.rs` (the split `impl MarmotApp` block: relay-list/profile/key-package/follow-list fetches and the
+  public `directory_*`/`*_user_directory` API), `store.rs` (the directory store on `Directory`: entry reads, the
+  `remember_*`/`save_directory_entry*` writes across the caches and the shared tier, relay-event ingest, the
+  freshness bound and record hydration),
   `cache.rs` (the per-account SQLCipher directory cache, with its independent numbered migration runner in
   `cache/migrations.rs`, frozen initial schema in `cache/v1.sql`, the public event preview table in `cache/v2.sql`, and populated/interrupted-upgrade
   tests in `cache/assurance_tests.rs` using the historical `cache/fixtures/pre_ledger.sql` fixture), and `sync.rs` (the directory-subscription sync worker and

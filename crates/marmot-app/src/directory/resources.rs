@@ -43,4 +43,7 @@ pub trait DirectoryResources: Clone + Send + Sync + 'static {
 
     /// The shared public directory tier.
     fn shared_storage(&self) -> Result<SqliteSharedStorage, DirectoryError>;
+
+    /// A stored entry changed, so presentation should refresh that account.
+    fn directory_entry_changed(&self, account_id_hex: &str);
 }

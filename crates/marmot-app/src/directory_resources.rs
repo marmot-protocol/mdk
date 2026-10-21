@@ -16,6 +16,7 @@ use cgka_traits::TransportEndpoint;
 use storage_sqlite::SqliteSharedStorage;
 
 use crate::directory::error::DirectoryError;
+use crate::directory::hydrate_directory_record;
 use crate::directory::records::public_directory_user_record;
 use crate::directory::{
     Directory, DirectoryAccount, DirectoryCache, DirectoryConfig, DirectoryResources,
@@ -52,6 +53,9 @@ impl MarmotApp {
                 .map(TransportEndpoint)
                 .collect(),
             default_relays: self.relay_endpoints(),
+            max_future_skew: self.config.directory_max_future_skew,
+            #[cfg(test)]
+            test_clock: self.directory_test_clock.clone(),
         }
     }
 }
@@ -89,6 +93,14 @@ impl DirectoryResources for MarmotApp {
 
     fn shared_storage(&self) -> Result<SqliteSharedStorage, DirectoryError> {
         Ok(MarmotApp::shared_storage(self)?)
+    }
+
+    fn directory_entry_changed(&self, account_id_hex: &str) {
+        let _ = self
+            .presentation_signals
+            .profile_updates
+            .send(account_id_hex.to_owned());
+        self.presentation_signals.wake();
     }
 }
 
@@ -278,7 +290,7 @@ impl MarmotApp {
         let local_accounts = self.local_accounts_by_id()?;
         let entries = entries
             .into_iter()
-            .map(|entry| Self::hydrate_directory_record(entry, &local_accounts))
+            .map(|entry| hydrate_directory_record(entry, &local_accounts))
             .collect::<Result<Vec<_>, _>>()?;
         let shared_storage = self.shared_storage()?;
         for entry in &entries {
