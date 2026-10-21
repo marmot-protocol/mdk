@@ -113,7 +113,11 @@ provider login and tokens private; do not paste them into White Noise.
    public relays. The phone's public npub identifies the sender to allow; it is
    not a secret identity to import as the agent.
 3. Send `/help`, then select a trusted directory under the service user's `HOME`
-   with `/<path>` or `/cd <path>` and confirm `/pwd` / `/status`. These are local
+   with `/<path>` or `/cd <path>` and confirm `/pwd` / `/status`. The path is
+   relative to that user's home, not an absolute filesystem path: create
+   `$HOME/Claude` on the computer, then send `/Claude` to select it. On macOS,
+   `/Users/me/Claude` would incorrectly select `$HOME/Users/me/Claude`. The
+   directory must already exist. These are local
    harness commands, not proof that a model ran. Codex needs a Git repository
    by default; the other backends retain their own project rules.
 4. Send an ordinary text prompt and verify an actual model reply in the same

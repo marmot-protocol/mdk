@@ -60,6 +60,14 @@ available through this chat; shared harness commands are handled locally.
 
 ## First-install checklist
 
+Paste the copied White Noise installation prompt into **Claude Code in a
+terminal on the computer where the harness will run**. The Claude phone app
+uses a separate cloud session; installation belongs on your computer. Claude
+Code must already be installed, on `PATH` (or configured with
+an explicit executable), and signed in under the service user. Start with the
+[official setup guide](https://code.claude.com/docs/en/setup) if needed; verify
+`claude --version` and a normal local conversation before installing Marmot.
+
 Follow the [shared terminal-harness first-install guide](../../terminal-harness/README.md#first-installation-and-verification)
 before the release command below. It covers the two services, matching home and
 socket, sender authorization, manual environment loading, independent instance
@@ -85,7 +93,10 @@ Prerequisites:
 
 - Claude Code 2.1.0 or newer, installed, authenticated, and runnable on `PATH`,
   or an executable path set with `WN_CLAUDE_BIN` / `--claude-bin`
-- White Noise pointed at the same public relay set
+- On the phone, check White Noise's relay list for
+  `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat`, or
+  explicitly configure both sides with your custom public relay set; the
+  phone owner must confirm the phone's settings
 - Linux x86_64, Linux arm64, macOS Apple Silicon, or macOS Intel
 
 Versioned `wn-agent-v*` releases publish `wn-agent`, `wn-claude`, checksums, and
@@ -153,8 +164,12 @@ wn-agent bootstrap --home "$MARMOT_HOME" --socket "$MARMOT_AGENT_SOCKET" \
 wn-claude
 ```
 
-On the first message, use `/<path>` to select a working directory under
-`$HOME`. A picker-only message stores the directory without starting Claude.
+On the first message, use `/<path>` to select an existing working directory
+relative to the service user's `$HOME`. For example, create `$HOME/Claude` on
+the computer, then send `/Claude` in White Noise. On a Mac where `$HOME` is
+`/Users/me`, this selects `/Users/me/Claude`; sending `/Users/me/Claude`
+would look for `$HOME/Users/me/Claude`. The picker does not create directories.
+A picker-only message stores the directory without starting Claude.
 Later prompts resume that group's exact Claude session UUID. `/new` and
 `/reset-session` clear only the stored UUID while retaining the workdir and
 Claude-owned transcript; the next prompt starts a fresh UUID. `/help` lists the
