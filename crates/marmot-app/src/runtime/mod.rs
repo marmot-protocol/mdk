@@ -1601,6 +1601,7 @@ impl MarmotAppRuntime {
         Ok(self
             .accounts
             .app
+            .directory()
             .display_names_for_account_ids(account_id_hexes)?)
     }
 
@@ -4807,7 +4808,7 @@ impl MarmotAppRuntime {
             .into_iter()
             .map(TransportEndpoint)
             .collect::<Vec<_>>();
-        for endpoint in self.accounts.app.directory_source_relays(&[]) {
+        for endpoint in self.accounts.app.directory().directory_source_relays(&[]) {
             if !source_relays.contains(&endpoint) {
                 source_relays.push(endpoint);
             }
@@ -4835,7 +4836,7 @@ impl MarmotAppRuntime {
         follows.dedup();
 
         if changed {
-            let fallback = self.accounts.app.directory_source_relays(&[]);
+            let fallback = self.accounts.app.directory().directory_source_relays(&[]);
             self.publish_account_follow_list_unlocked(
                 &account,
                 &follows,
@@ -8105,6 +8106,7 @@ impl AccountManager {
     ) -> Option<AccountRelayListStatus> {
         let status = match self
             .app
+            .directory()
             .resolve_account_relay_list_status_for_account_id(account_id_hex, discovery_relays)
             .await
         {
@@ -8330,10 +8332,12 @@ impl AccountManager {
                         &self.shared.app_performance_telemetry(),
                         ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
                         "import_relay_list_status",
-                        self.app.resolve_account_relay_list_status_for_account_id(
-                            &account.account_id_hex,
-                            directory_discovery_relays_for_setup(request),
-                        ),
+                        self.app
+                            .directory()
+                            .resolve_account_relay_list_status_for_account_id(
+                                &account.account_id_hex,
+                                directory_discovery_relays_for_setup(request),
+                            ),
                     )
                     .await
                     {
@@ -8402,6 +8406,7 @@ impl AccountManager {
             }
             Ok(self
                 .app
+                .directory()
                 .resolve_account_relay_list_status_for_account_id(
                     &account.account_id_hex,
                     bootstrap_relays,

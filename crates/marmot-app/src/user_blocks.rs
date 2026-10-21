@@ -26,7 +26,7 @@ impl MarmotApp {
             .map(|s| s.nip65.relays)
             .unwrap_or_default();
         if relays.is_empty() {
-            self.directory_source_relays(&[])
+            self.directory().directory_source_relays(&[])
         } else {
             relays.into_iter().map(TransportEndpoint).collect()
         }

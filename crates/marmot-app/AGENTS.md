@@ -201,8 +201,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   seams: `records.rs` (the public `UserDirectory*`/`UserProfileMetadata`/`DirectoryKeyPackage` DTOs surfaced to
   `marmot-uniffi`/`cli`, plus the stateless record helpers — cached <-> shared record conversion, recency selection,
   Nostr profile/follow-list parsing, search-match ranking, and `profile_content_json` — which hold no `MarmotApp`
-  state), `methods.rs` (the split `impl MarmotApp` block: relay-list/profile/key-package/follow-list fetches and the
-  public `directory_*`/`*_user_directory` API), `store.rs` (the directory store on `Directory`: entry reads, the
+  state), `methods.rs` (relay-list/profile/key-package/follow-list fetches and the `directory_*`/`*_user_directory`
+  API on `Directory`; `MarmotApp`'s public versions are delegates in `src/directory_delegates.rs`), `store.rs` (the directory store on `Directory`: entry reads, the
   `remember_*`/`save_directory_entry*` writes across the caches and the shared tier, relay-event ingest, the
   freshness bound and record hydration),
   `cache.rs` (the per-account SQLCipher directory cache, with its independent numbered migration runner in
@@ -219,10 +219,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - Directory code returns `DirectoryError` (`src/directory/error.rs`). Public `MarmotApp` methods are the boundary: they
   keep returning `AppError`, and `From<DirectoryError> for AppError` restores the variant, message and
   `privacy_safe_kind` the directory reported before it had its own type. An app failure that reaches directory code
-  (through `?` on an `AppError`) rides in `DirectoryError::Resource` and comes back unchanged. Directory code that matches
-  on its own failures must call the `DirectoryError` twin (`directory_entry`, `cached_relay_list_status`,
-  `fetch_relay_list_status`), never the public method, whose failures would arrive wrapped. A new variant needs a row in
-  `error::directory_error_tests`.
+  (through `?` on an `AppError`) rides in `DirectoryError::Resource` and comes back unchanged. Every method on
+  `Directory` returns `DirectoryError`; only the delegates in `src/directory_delegates.rs` return `AppError`, so
+  directory code never sees its own failures wrapped. A new variant needs a row in `error::directory_error_tests`.
 - Converted directory code is `impl<R: DirectoryResources> Directory<R>` (`src/directory/service.rs`), and reaches the
   app only through the `DirectoryResources` trait in `src/directory/resources.rs`. Ask it for a cache when the cache is
   about to be used, never before a network step. `MarmotApp` implements the trait and builds the service with

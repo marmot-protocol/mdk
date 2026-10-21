@@ -4756,7 +4756,7 @@ impl MarmotApp {
                     .collect(),
             );
         }
-        for entry in self.directory_entries()? {
+        for entry in self.directory().directory_entries()? {
             let endpoints = self.retain_safe_discovered_endpoints(
                 entry
                     .relay_lists
@@ -5012,6 +5012,7 @@ impl MarmotApp {
             return false;
         }
         let records = match self
+            .directory()
             .fetch_key_package_events_for_account_id_with_limit(
                 &account.account_id_hex,
                 &source_relays,
@@ -5347,7 +5348,7 @@ impl MarmotApp {
         // the configured directory relays as the same operational fallback used
         // when local accounts publish a KeyPackage without rewriting NIP-65.
         if !has_explicit_bootstrap_relays && relay_lists.nip65.relays.is_empty() {
-            let discovery_relays = self.directory_source_relays(&[]);
+            let discovery_relays = self.directory().directory_source_relays(&[]);
             if !discovery_relays.is_empty() {
                 relay_lists = self
                     .fetch_account_relay_list_status_for_account_id(
@@ -5368,7 +5369,7 @@ impl MarmotApp {
             "account key package listing",
         );
         if source_relays.is_empty() {
-            source_relays = self.directory_source_relays(&[]);
+            source_relays = self.directory().directory_source_relays(&[]);
         }
         if source_relays.is_empty() {
             return Err(AppError::MissingRelayLists(vec![
@@ -5377,6 +5378,7 @@ impl MarmotApp {
         }
 
         let mut relay_records = self
+            .directory()
             .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
             .await?;
         sort_directory_records(&mut relay_records);
@@ -5751,6 +5753,7 @@ impl MarmotApp {
             );
             if !source_relays.is_empty() {
                 let records = self
+                    .directory()
                     .fetch_key_package_events_for_account_id(&account_id, &source_relays)
                     .await?;
                 let mut fetched = fresh_or_cached_key_package(
@@ -5800,7 +5803,9 @@ impl MarmotApp {
             .into_iter()
             .map(|account| account.account_id_hex)
             .collect::<Vec<_>>();
-        Ok(self.display_names_for_account_ids(&account_ids)?)
+        Ok(self
+            .directory()
+            .display_names_for_account_ids(&account_ids)?)
     }
 
     fn display_name_for_account_id(
@@ -5917,7 +5922,7 @@ impl MarmotApp {
             })
             .collect::<HashSet<_>>();
         let senders = senders.into_iter().collect::<Vec<_>>();
-        let names = self.display_names_for_account_ids(&senders)?;
+        let names = self.directory().display_names_for_account_ids(&senders)?;
         for row in rows {
             let Some(message) = row.last_message.as_mut() else {
                 continue;

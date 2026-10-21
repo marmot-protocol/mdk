@@ -8046,11 +8046,12 @@ fn configured_directory_relays_stay_separate_from_operational_relays() {
         "directory configuration must not widen operational publication fanout"
     );
     assert_eq!(
-        app.directory_source_relays(&[]),
+        app.directory().directory_source_relays(&[]),
         vec![TransportEndpoint(discovery.into())]
     );
     assert_eq!(
-        app.directory_source_relays(std::slice::from_ref(&explicit)),
+        app.directory()
+            .directory_source_relays(std::slice::from_ref(&explicit)),
         vec![explicit],
         "per-operation discovery relays must retain precedence"
     );
@@ -8759,6 +8760,7 @@ async fn account_outbox_route_cap_keeps_usable_first_hop_metadata() {
     ];
 
     let status = app
+        .directory()
         .resolve_account_relay_list_status_for_account_id(
             &account_id,
             vec![TransportEndpoint("wss://directory.example".into())],
@@ -8911,6 +8913,7 @@ async fn account_outbox_route_cap_without_inbox_remains_unknown() {
         String::new(),
     )];
     let error = app
+        .directory()
         .resolve_account_relay_list_status_for_account_id(
             id,
             vec![TransportEndpoint("wss://directory.example".into())],
@@ -8937,6 +8940,7 @@ async fn account_signed_empty_inbox_with_incomplete_outbox_remains_unknown() {
     }
     *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://shared.example".into());
     let error = app
+        .directory()
         .resolve_account_relay_list_status_for_account_id(
             id,
             vec![TransportEndpoint("wss://directory.example".into())],
@@ -8955,6 +8959,7 @@ async fn account_signed_empty_inbox_with_incomplete_outbox_remains_unknown() {
     // outbox also completes; retaining it in the cache must not mask retries.
     *fetcher.incomplete_endpoint.lock().unwrap() = None;
     let error = app
+        .directory()
         .resolve_account_relay_list_status_for_account_id(
             id,
             vec![TransportEndpoint("wss://directory.example".into())],
@@ -8989,6 +8994,7 @@ async fn account_read_only_nip65_returns_typed_missing_write_routes() {
         ),
     ];
     let error = app
+        .directory()
         .resolve_account_relay_list_status_for_account_id(
             id,
             vec![TransportEndpoint("wss://directory.example".into())],
@@ -9016,6 +9022,7 @@ async fn future_dated_inbox_is_unknown_for_account_and_member_resolution() {
         }
     }
     let account_error = app
+        .directory()
         .resolve_account_relay_list_status_for_account_id(
             id,
             vec![TransportEndpoint("wss://directory.example".into())],
@@ -11129,12 +11136,20 @@ fn batch_names_preserve_selection() {
         (alice.account_id_hex.clone(), "alice".to_owned()),
     ]);
     assert_eq!(
-        app.display_names_for_account_ids(&requested).unwrap(),
+        app.directory()
+            .display_names_for_account_ids(&requested)
+            .unwrap(),
         expected
     );
-    assert!(app.display_names_for_account_ids(&[]).unwrap().is_empty());
     assert!(
-        app.display_names_for_account_ids(&["invalid".into()])
+        app.directory()
+            .display_names_for_account_ids(&[])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        app.directory()
+            .display_names_for_account_ids(&["invalid".into()])
             .is_err()
     );
 
@@ -11145,7 +11160,9 @@ fn batch_names_preserve_selection() {
         )
         .unwrap();
     assert_eq!(
-        app.display_names_for_account_ids(&requested).unwrap()[&ids[1]],
+        app.directory()
+            .display_names_for_account_ids(&requested)
+            .unwrap()[&ids[1]],
         "updated"
     );
 }
@@ -11165,6 +11182,7 @@ fn batch_display_name_lookup_opens_one_directory_cache_per_local_account() {
 
     for _ in 0..5 {
         let names = app
+            .directory()
             .display_names_for_account_ids(&[contact.clone(), bob.account_id_hex.clone()])
             .unwrap();
         assert_eq!(names.get(&contact), Some(&"Batch Contact".to_owned()));
@@ -11353,7 +11371,8 @@ fn warm_directory_storage_opens_shared_and_local_directory_handles() {
         Some("alice".to_owned())
     );
     assert_eq!(
-        app.display_names_for_account_ids(&[bob.account_id_hex.clone(), public_key])
+        app.directory()
+            .display_names_for_account_ids(&[bob.account_id_hex.clone(), public_key])
             .unwrap()
             .get(&bob.account_id_hex),
         Some(&"bob".to_owned())
@@ -11607,7 +11626,7 @@ fn directory_entries_and_save_keep_newer_shared_record() {
         .put_public_directory_user(&public_directory_user_record(&fresh).unwrap())
         .unwrap();
 
-    let listed = app.directory_entries().unwrap();
+    let listed = app.directory().directory_entries().unwrap();
     let listed_entry = listed
         .iter()
         .find(|entry| entry.account_id_hex == contact)
@@ -11667,7 +11686,7 @@ fn directory_sync_plan_watches_local_accounts_and_known_users() {
     app.remember_directory_user_with_reason(&contact, "message")
         .unwrap();
 
-    let plan = app.directory_sync_plan().unwrap();
+    let plan = app.directory().directory_sync_plan().unwrap();
     let watched = plan
         .batches
         .iter()
@@ -11697,7 +11716,7 @@ fn directory_sync_plan_does_not_subscribe_kind3_for_non_local_known_user() {
     app.remember_directory_user_with_reason(&sender, "message")
         .unwrap();
 
-    let plan = app.directory_sync_plan().unwrap();
+    let plan = app.directory().directory_sync_plan().unwrap();
 
     let local_kinds = plan
         .batches
@@ -11776,6 +11795,7 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
 
     // None of the followed pubkeys may be promoted into known directory entries.
     let known_ids = app
+        .directory()
         .directory_entries()
         .unwrap()
         .into_iter()
@@ -11797,7 +11817,7 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
 
     // The directory sync plan still watches only the author and local account,
     // never the discovered follows — so no transitive crawl is scheduled.
-    let plan = app.directory_sync_plan().unwrap();
+    let plan = app.directory().directory_sync_plan().unwrap();
     let watched = plan
         .batches
         .iter()
@@ -11906,6 +11926,7 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
     drop(app);
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let reopened = app
+        .directory()
         .directory_entries()
         .unwrap()
         .into_iter()
@@ -12002,6 +12023,7 @@ fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
     drop(app);
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let reopened = app
+        .directory()
         .directory_entries()
         .unwrap()
         .into_iter()
@@ -12045,7 +12067,7 @@ fn local_account_directory_refresh_still_promotes_follows() {
         "an explicit follow-list refresh promotes follows into directory entries"
     );
 
-    let plan = app.directory_sync_plan().unwrap();
+    let plan = app.directory().directory_sync_plan().unwrap();
     let local_batch = plan
         .batches
         .iter()

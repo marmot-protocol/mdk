@@ -2,20 +2,9 @@
 # (step 3 of docs/marmot-architecture/review/brief-directory.md). One line per
 # file and target; `directory_crossings_tests` keeps this list exact, so it only
 # shrinks. The directory moves into nostr-directory when it is empty.
-directory/methods.rs MarmotApp.product_analytics
-directory/methods.rs MarmotApp.relay_plane
-directory/methods.rs MarmotApp::account_home()
-directory/methods.rs MarmotApp::deployment()
-directory/methods.rs MarmotApp::directory()
-directory/methods.rs MarmotApp::directory_caches()
-directory/methods.rs MarmotApp::relay_endpoints()
-directory/methods.rs MarmotApp::shared_storage()
-directory/methods.rs crate::AppError
-directory/methods.rs crate::MarmotApp
-directory/methods.rs crate::ProductFamily
-directory/methods.rs crate::ProductUnit
 directory/sync.rs MarmotApp::account_home()
 directory/sync.rs MarmotApp::block_update_lock()
+directory/sync.rs MarmotApp::directory()
 directory/sync.rs MarmotApp::fetch_block_list()
 directory/sync.rs MarmotApp::ingest_block_list_event()
 directory/sync.rs crate::MarmotApp

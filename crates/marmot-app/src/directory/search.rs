@@ -2365,7 +2365,7 @@ mod tests {
             "graph provenance wins over provider ranking metadata"
         );
         assert!(
-            app.directory_entries().unwrap().is_empty(),
+            app.directory().directory_entries().unwrap().is_empty(),
             "an Open Ranking result must remain an ephemeral search candidate"
         );
     }

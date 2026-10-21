@@ -1953,6 +1953,7 @@ fn messages_recovery_updates(
         .map(|record| record.sender.clone())
         .collect::<Vec<_>>();
     let display_names = app
+        .directory()
         .display_names_for_account_ids(&senders)
         .unwrap_or_default();
     let updates = records

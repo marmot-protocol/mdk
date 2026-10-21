@@ -367,7 +367,7 @@ async fn run_directory_sync_worker(
                                 request_block_reconcile(&app, &mut block_rebuilds, &mut block_task);
                             }
                         } else {
-                            let _ = blocking_directory_task(move || app.ingest_directory_relay_event(record)).await;
+                            let _ = blocking_directory_task(move || app.directory().ingest_directory_relay_event(record)).await;
                         }
                     }
                     Ok(transport_nostr::DirectoryRelayPlaneEvent::RecoveryRequired)
@@ -407,7 +407,8 @@ async fn run_directory_sync_once(
     force_rebuild: bool,
 ) -> Result<DirectorySyncRunSummary, DirectoryError> {
     let app_for_plan = app.clone();
-    let plan = blocking_directory_task(move || app_for_plan.directory_sync_plan()).await?;
+    let plan =
+        blocking_directory_task(move || app_for_plan.directory().directory_sync_plan()).await?;
     let watched_user_count = plan.watched_user_count;
     let subscriptions = relay_plane
         .sync_directory_user_subscriptions(plan, force_rebuild)
