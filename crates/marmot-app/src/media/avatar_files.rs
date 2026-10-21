@@ -98,10 +98,11 @@ pub(crate) fn store_acquired(
 
 /// Fills `read.image` from a file-backed image's cache file. A file that is
 /// missing or fails authentication is reported: this owner is cleared at
-/// once (`read.repaired`, with its new status) and every owner sharing the
-/// file fetches it again. If the owner moved to another file between the
-/// lookup and the read (a publication or the move replaced it), the read
-/// starts over from the current row, within `max_bytes`, a few times at most.
+/// once (`read.repaired`) and every owner sharing the file fetches it again.
+/// After any failed file read the owner's current row is read again, within
+/// `max_bytes`: empty once cleared, or another file when a publication, the
+/// move or a quick refetch replaced it, which is then read in turn, a few
+/// times at most. The status returned always matches the image returned.
 /// Other store failures are returned unchanged.
 pub(crate) fn read_file_backed(
     storage: &SqliteAppStorage,
@@ -126,13 +127,9 @@ pub(crate) fn read_file_backed(
         }
         let (cleared, released) = storage.discard_avatar_file(reference, file.id)?;
         media.unlink_released(&released);
-        if cleared {
-            read.repaired = true;
-            read.status = storage.avatar_status(reference, now)?;
-            return Ok(());
-        }
-        // The owner no longer uses that file: read what it holds now.
-        let repaired = read.repaired;
+        // Read what the owner holds now: nothing once cleared (unless a
+        // refetch already landed), or the file it moved to.
+        let repaired = read.repaired || cleared;
         *read = storage.read_avatar_bounded(reference, now, max_bytes)?;
         read.repaired |= repaired;
     }
