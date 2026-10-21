@@ -2028,6 +2028,8 @@ impl MarmotApp {
             pending_resumed_message_notifications: Default::default(),
             pending_push_leaf_reconciliations: Default::default(),
             pending_failed_sync_summary: SyncSummary::default(),
+            pending_native_sync_summary: SyncSummary::default(),
+            native_sync_deliveries: 0,
             explicit_history_window_certified: false,
             recovery_job_network_cut: false,
             recovery_job_admission_expired: false,

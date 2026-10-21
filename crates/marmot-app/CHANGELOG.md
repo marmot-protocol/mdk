@@ -200,6 +200,9 @@
   ordinary deliveries. A live cursor-check failure preserves already-durable
   delivery counts. Committed native and comparison chunks publish during startup
   and follow-up drains, rather than waiting for the whole batch to settle.
+  Direct catch-up failures retain already-committed native outputs in their
+  completed prefix. Native ingests contribute to the existing drain delivery
+  counts, including eventless deferred input.
   Recovered Welcomes publish `GroupJoined` before live-subscription I/O and
   retain their grant-owned post-join history work in both streamed chunks and
   final comparison results.

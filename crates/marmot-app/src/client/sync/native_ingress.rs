@@ -84,7 +84,30 @@ impl AppClient {
             if !matches!(self.take_native_batch(None).await, NativeFrontier::Ready) {
                 break;
             }
-            self.admit_native_frame().await?;
+            #[cfg(feature = "test-policy-overrides")]
+            if self
+                .app
+                .config
+                .dev_fail_sync_before_delivery
+                .is_some_and(|limit| self.native_sync_deliveries >= limit)
+            {
+                let id = self
+                    .recovery_owner
+                    .native_batch
+                    .as_ref()
+                    .and_then(|batch| batch.delivery())
+                    .map(|delivery| hex::encode(delivery.message.id.as_slice()))
+                    .expect("the selected native batch is ready");
+                if !self.transport_receipts()?.contains(&id) {
+                    return Err(AppError::BlockingTask(
+                        "injected catch-up delivery failure".to_owned(),
+                    ));
+                }
+            }
+            let ingested = self.admit_native_frame().await?;
+            self.native_sync_deliveries = self
+                .native_sync_deliveries
+                .saturating_add(u64::from(ingested));
             progressed = true;
         }
         // The source returns this suffix behind independent ready groups;

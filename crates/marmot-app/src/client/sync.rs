@@ -3209,6 +3209,25 @@ impl AppClient {
         &mut self,
         on_progress: Option<&CommittedSyncProgress<'_>>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
+        let result = self.sync_sdk_relay_inner(on_progress).await;
+        let mut committed = std::mem::take(&mut self.pending_native_sync_summary);
+        match result {
+            Ok(summary) => {
+                committed.merge(summary);
+                Ok(committed)
+            }
+            Err(mut failure) => {
+                committed.merge(failure.partial_summary);
+                failure.partial_summary = committed;
+                Err(failure)
+            }
+        }
+    }
+
+    async fn sync_sdk_relay_inner(
+        &mut self,
+        on_progress: Option<&CommittedSyncProgress<'_>>,
+    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let mut counts = DrainCounts::default();
         let mut summary = std::mem::take(&mut self.pending_failed_sync_summary);
         summary.merge(self.take_pending_applied_sync_summary());
@@ -3231,10 +3250,14 @@ impl AppClient {
         let mut routes_dirty = false;
         let overflowed = loop {
             let mut native_changes = self.adapter.replay_changes().await;
-            let native_progress = match self.admit_native_turn().await {
+            self.native_sync_deliveries = counts.deliveries;
+            let native_result = self.admit_native_turn().await;
+            counts.deliveries = self.native_sync_deliveries;
+            let native_progress = match native_result {
                 Ok(progress) => progress,
                 Err(error) => {
-                    summary.merge(self.take_pending_applied_sync_summary());
+                    let committed = self.take_pending_applied_sync_summary();
+                    self.pending_native_sync_summary.merge(committed);
                     return Err(self
                         .finish_failed_sync_drain(
                             summary,
@@ -3253,7 +3276,7 @@ impl AppClient {
                 // ordinary, not-yet-checkpointed drain output in `summary`.
                 on_progress.publish(self, committed).await;
             } else {
-                summary.merge(committed);
+                self.pending_native_sync_summary.merge(committed);
             }
             let wait = if first_wait {
                 SDK_FIRST_SYNC_WAIT

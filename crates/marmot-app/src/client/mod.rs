@@ -792,6 +792,9 @@ pub struct AppClient {
     /// successful checkpoint. A reopened client recovers the same outputs from
     /// the durable engine outbox instead.
     pub(crate) pending_failed_sync_summary: crate::SyncSummary,
+    /// Native checkpoints already committed; retained across drain cancellation.
+    pub(super) pending_native_sync_summary: crate::SyncSummary,
+    pub(super) native_sync_deliveries: u64,
     /// Whether the last settled job certified the retained window of every
     /// explicit-history scope it compared. Explicit history reaches below
     /// that window, so this never completes it; it names why it stays open.

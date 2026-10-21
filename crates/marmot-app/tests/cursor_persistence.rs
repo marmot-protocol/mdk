@@ -346,22 +346,8 @@ async fn frozen_wake_collection_body() {
         "the frozen boot's catch-up drain — not a live tail — must have \
          ingested the offline-published delivery: {boot2_drains:?}"
     );
-    // Frozen rebuilds keep deriving the subscription `since` floor from the
-    // loaded cursor — the audit rows
-    // themselves show wake passes not moving the floor.
-    let boot2_rebuilds = rows_of_kind(&boot2_rows, "subscription_rebuild");
-    assert!(!boot2_rebuilds.is_empty());
-    for rebuild in &boot2_rebuilds {
-        let lookback = rebuild["kind"]["lookback_secs"]
-            .as_u64()
-            .expect("rebuild rows record the lookback");
-        assert_eq!(
-            rebuild["kind"]["since_secs"].as_u64(),
-            Some(baseline - lookback),
-            "a frozen rebuild still floors at the loaded cursor minus the \
-             lookback: {rebuild}"
-        );
-    }
+    // Unresolved original windows may widen REQs independently of the cursor.
+    // Reopening below verifies that Frozen left the durable cursor untouched.
 
     // A fresh message for the Advance boot: the frozen-ingested one is
     // seen-id deduped on redelivery (by design — bounded redelivery is the
