@@ -344,7 +344,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `deployment.rs` (`MarmotDeployment`: the deployment services, with `neutral()` and the White Noise preset; the one
   place White Noise's values are defined), `error.rs`,
   `close_registry.rs` (terminal-close closures for runtime-owned handles outside the storage caches),
-  `ids.rs` (npub/nprofile/account-ref helpers), `drafts.rs` (encrypted per-account composer drafts),
+  `ids.rs` (group-id and admin-key helpers; it re-exports the npub/nprofile/account-ref helpers now in `directory/ids.rs`), `drafts.rs` (encrypted per-account composer drafts),
   `chat_presentation.rs` + `chat_presentation/` (shared selected-chat presentation policy and maintenance),
   `conversation_presentation/` (C5 header, capability, and window selectors; they never subscribe, acknowledge
   reads, or fetch media), `local_submissions.rs` + `local_submissions/` (durable device-local send admission and host

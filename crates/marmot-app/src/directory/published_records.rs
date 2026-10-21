@@ -38,6 +38,45 @@ pub struct AccountRelayListStatus {
     pub inbox: AccountRelayListState,
 }
 
+impl AccountRelayListStatus {
+    pub(crate) fn empty() -> Self {
+        let mut status = Self {
+            complete: false,
+            missing: Vec::new(),
+            default_relays: Vec::new(),
+            bootstrap_relays: Vec::new(),
+            nip65: AccountRelayListState {
+                kind: KIND_NIP65_RELAY_LIST,
+                created_at: 0,
+                relays: Vec::new(),
+                read_relays: Vec::new(),
+                write_relays: Vec::new(),
+            },
+            inbox: AccountRelayListState {
+                kind: KIND_MARMOT_INBOX_RELAY_LIST,
+                created_at: 0,
+                relays: Vec::new(),
+                read_relays: Vec::new(),
+                write_relays: Vec::new(),
+            },
+        };
+        status.refresh();
+        status
+    }
+
+    pub(crate) fn refresh(&mut self) {
+        self.default_relays = self.nip65.relays.clone();
+        self.missing = Vec::new();
+        if self.nip65.relays.is_empty() {
+            self.missing.push(MissingRelayListKind::Nip65);
+        }
+        if self.inbox.relays.is_empty() {
+            self.missing.push(MissingRelayListKind::Inbox);
+        }
+        self.complete = self.missing.is_empty();
+    }
+}
+
 /// A relay list the account is missing. Typed so FFI clients can localize
 /// each kind without parsing protocol-jargon strings (mdk#565).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

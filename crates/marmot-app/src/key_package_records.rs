@@ -1,10 +1,10 @@
-//! Stateless parsing and validation for relay-fetched account relay lists and
-//! Marmot KeyPackages.
+//! The account's own KeyPackage inventory: records built from fetched
+//! KeyPackages, relay-history deduplication, the merge with local state, and
+//! publish-endpoint selection. They hold no `MarmotApp` state.
 //!
-//! These helpers turn directory relay-event records into typed relay-list
-//! status and [`FetchedKeyPackage`] values, validate KeyPackage event tags and
-//! decoded metadata, reconcile fresh vs cached results, merge KeyPackage
-//! records, and pick publish endpoints. They hold no `MarmotApp` state.
+//! Parsing, validation and selection of other accounts' relay lists and
+//! KeyPackages live in [`crate::directory::published_records`]; they are
+//! re-exported below so callers keep their paths.
 
 use cgka_traits::TransportEndpoint;
 #[cfg(test)]
