@@ -993,35 +993,6 @@ impl MarmotApp {
         Ok(())
     }
 
-    pub(crate) async fn fetch_events_for_account_ids(
-        &self,
-        account_ids: &[String],
-        kind: u64,
-        source_relays: &[TransportEndpoint],
-    ) -> Result<Vec<RelayEventRecord>, DirectoryError> {
-        let source_relays = self.directory_source_relays(source_relays);
-        let account_ids = account_ids
-            .iter()
-            .map(|account_id| parse_account_id_hex(account_id))
-            .collect::<Result<Vec<_>, _>>()?;
-        let limit = (account_ids.len() * 4).max(1);
-        self.relay_plane
-            .fetch_directory_events(
-                source_relays,
-                vec![DirectoryEventQuery::new(kind, account_ids, limit)],
-            )
-            .await
-            .map_err(|e| {
-                DirectoryError::RelayDirectory(format!("fetch user directory events: {e}"))
-            })
-    }
-
-    /// Accounts to fall back to when a searcher's own web of trust is empty.
-    /// See [`MarmotAppConfig::directory_search_fallback_seeds`].
-    pub(crate) fn directory_search_fallback_seeds(&self) -> &[String] {
-        &self.config.directory_search_fallback_seeds
-    }
-
     pub(crate) fn directory_source_relays(
         &self,
         source_relays: &[TransportEndpoint],
@@ -1146,6 +1117,17 @@ impl MarmotApp {
 // code that still sits in `impl MarmotApp`; each goes when its last caller
 // converts.
 impl MarmotApp {
+    pub(crate) async fn fetch_events_for_account_ids(
+        &self,
+        account_ids: &[String],
+        kind: u64,
+        source_relays: &[TransportEndpoint],
+    ) -> Result<Vec<RelayEventRecord>, DirectoryError> {
+        self.directory()
+            .fetch_events_for_account_ids(account_ids, kind, source_relays)
+            .await
+    }
+
     pub(crate) fn cached_relay_list_status(
         &self,
         account_id_hex: &str,
@@ -1180,6 +1162,7 @@ impl MarmotApp {
         self.directory().directory_freshness()
     }
 
+    #[cfg(test)]
     pub(crate) fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
         self.directory().empty_directory_record(account_id_hex)
     }

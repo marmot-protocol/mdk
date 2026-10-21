@@ -9,8 +9,12 @@ use std::time::Duration;
 
 use cgka_traits::TransportEndpoint;
 
+/// Builds an HTTP client that honours the host's network proxy.
+pub type HttpClientBuilder =
+    fn(reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder, &'static str>;
+
 /// The directory's settings, as the app configured them.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DirectoryConfig {
     /// Relays the host chose for directory reads. Empty means
     /// [`Self::default_relays`].
@@ -21,6 +25,13 @@ pub struct DirectoryConfig {
     pub max_future_skew: Duration,
     /// How KeyPackage candidates rank by their `client` tag.
     pub key_package_client_preference: KeyPackageClientPreference,
+    /// The Open Ranking discovery tier for search, when the deployment has one.
+    pub open_ranking: Option<OpenRankingProvider>,
+    /// Accounts search starts from when the searcher's own web of trust is
+    /// empty.
+    pub fallback_seeds: Vec<String>,
+    /// How Open Ranking builds its HTTP client.
+    pub http_builder: HttpClientBuilder,
     /// Replaces the wall clock for freshness checks in tests.
     #[cfg(test)]
     pub test_clock: Option<Arc<AtomicU64>>,

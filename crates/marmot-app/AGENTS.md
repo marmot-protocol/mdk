@@ -405,7 +405,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `transport_nostr::`.
 - `src/directory/`: also `cached_search.rs` (network-free cross-account search), `search.rs` (streaming web-of-trust
   search), `open_ranking.rs` (bounded Vertex Open Ranking discovery), `member_key_packages.rs` (set-oriented roster
-  KeyPackage resolution for create/invite), `config.rs` (the directory settings a deployment carries,
+  KeyPackage resolution for create/invite), `config.rs` (`DirectoryConfig`, read from the app on each
+  `directory()` call, including the proxy-aware HTTP builder Open Ranking uses, and the deployment's
   `OpenRankingProvider` and `KeyPackageClientPreference`, re-exported from `deployment.rs`), `observer.rs` (the
   `DirectoryObserver` analytics interface; `MarmotApp` implements it over product analytics in
   `src/directory_resources.rs`, keeping each family, operation and unit string). `mod.rs` holds the directory's own

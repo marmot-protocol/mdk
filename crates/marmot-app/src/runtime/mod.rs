@@ -2156,6 +2156,7 @@ impl MarmotAppRuntime {
         let include_groups = params.radius_end >= 1;
         self.accounts
             .app
+            .directory()
             .search_users_with_seeds(params, async move {
                 if include_groups {
                     // The worker's error travels through the directory unchanged.

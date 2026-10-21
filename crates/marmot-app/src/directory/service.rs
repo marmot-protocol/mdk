@@ -7,10 +7,14 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use cgka_traits::TransportEndpoint;
-use transport_nostr::MarmotRelayPlane;
+use transport_nostr::{
+    DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord, MarmotRelayPlane,
+};
 
 use super::DirectorySyncHandle;
 use super::config::DirectoryConfig;
+use super::error::DirectoryError;
+use super::ids::parse_account_id_hex;
 use super::member_key_packages::MemberKeyPackagePrewarmCache;
 use super::resources::DirectoryResources;
 
@@ -52,6 +56,35 @@ impl<R: DirectoryResources> Directory<R> {
             relay_plane,
             state,
         }
+    }
+
+    pub(crate) async fn fetch_events_for_account_ids(
+        &self,
+        account_ids: &[String],
+        kind: u64,
+        source_relays: &[TransportEndpoint],
+    ) -> Result<Vec<RelayEventRecord>, DirectoryError> {
+        let source_relays = self.directory_source_relays(source_relays);
+        let account_ids = account_ids
+            .iter()
+            .map(|account_id| parse_account_id_hex(account_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let limit = (account_ids.len() * 4).max(1);
+        self.relay_plane
+            .fetch_directory_events(
+                source_relays,
+                vec![DirectoryEventQuery::new(kind, account_ids, limit)],
+            )
+            .await
+            .map_err(|e| {
+                DirectoryError::RelayDirectory(format!("fetch user directory events: {e}"))
+            })
+    }
+
+    /// Accounts to fall back to when a searcher's own web of trust is empty.
+    /// See `MarmotAppConfig::directory_search_fallback_seeds`.
+    pub(crate) fn directory_search_fallback_seeds(&self) -> &[String] {
+        &self.config.fallback_seeds
     }
 
     /// `source_relays` when given, else the configured directory relays, else

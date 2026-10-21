@@ -5,7 +5,10 @@
 
 use cgka_traits::engine::KeyPackage;
 
-use crate::{AppError, MarmotApp, MemberKeyPackagePrewarmSummary, UserDirectorySearchResult};
+use crate::{
+    AppError, MarmotApp, MemberKeyPackagePrewarmSummary, UserDirectorySearchResult,
+    UserSearchParams, UserSearchSubscription,
+};
 
 impl MarmotApp {
     /// Search all cached public identities, independent of social-graph reachability.
@@ -21,6 +24,18 @@ impl MarmotApp {
         Ok(self
             .directory()
             .search_cached_users(searcher_account_id_hex, query, limit)?)
+    }
+
+    /// Start a streaming search across the searcher's web of trust.
+    ///
+    /// Returns as soon as the traversal is spawned; matches arrive through
+    /// [`UserSearchSubscription::next_update`]. Dropping the subscription stops
+    /// the traversal at its next checkpoint.
+    pub async fn search_users(
+        &self,
+        params: UserSearchParams,
+    ) -> Result<UserSearchSubscription, AppError> {
+        Ok(self.directory().search_users(params).await?)
     }
 
     /// Resolve a roster as one deterministic set.
