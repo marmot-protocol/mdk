@@ -1823,11 +1823,10 @@ mod tests {
         );
     }
 
-    /// A layer that overflows the candidate cap is a prefix of the real one.
-    /// The traversal must say so rather than let a short result list pass for a
-    /// complete one.
+    /// A ranked Open Ranking result for an account the graph already reached
+    /// keeps its graph radius and carries no provider rank.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn open_ranking_profiles_keep_graph_provenance_and_stay_ephemeral() {
+    async fn open_ranking_profiles_keep_graph_provenance() {
         let account_id_hex = format!("{:064x}", 98);
         let (updates_tx, mut updates_rx) = mpsc::channel(2);
         let mut emitter = SearchEmitter::new(updates_tx);
@@ -1854,6 +1853,9 @@ mod tests {
         // directory's resources, so it has nowhere to persist one.
     }
 
+    /// A layer that overflows the candidate cap is a prefix of the real one.
+    /// The traversal must say so rather than let a short result list pass for a
+    /// complete one.
     #[test]
     fn an_overflowing_layer_is_reported_as_truncated() {
         let mut seen = HashSet::new();
