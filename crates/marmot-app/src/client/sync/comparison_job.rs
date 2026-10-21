@@ -19,8 +19,7 @@ use tokio::task::JoinHandle;
 use transport_nostr::MarmotRelayPlane;
 use transport_nostr_adapter::{
     NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionRequest,
-    NostrAcquisitionScope, NostrReconciliationProgress, ReplayCapturePlan,
-    SubscriptionAttempt,
+    NostrAcquisitionScope, NostrReconciliationProgress, ReplayCapturePlan, SubscriptionAttempt,
 };
 
 /// Owned events one worker turn admits before commands and live input run.
@@ -50,6 +49,7 @@ struct WindowObservation {
 }
 
 enum WindowOffer {
+    Unconverted,
     /// One raw event may route to several account-scoped deliveries.
     Pending(usize),
     Unretained,
@@ -391,11 +391,15 @@ async fn fetch_epoch_gap_window(
         async move {
             let (events, hint, reached) =
                 page_epoch_gap_window(plane, page_request, local, hint, deadline).await;
-            let offered = events.iter().filter_map(|event| {
-                let mut id = [0; 32];
-                hex::decode_to_slice(&event.event.id, &mut id).ok()
-                    .map(|()| (id, WindowOffer::Pending(1)))
-            }).collect();
+            let offered = events
+                .iter()
+                .filter_map(|event| {
+                    let mut id = [0; 32];
+                    hex::decode_to_slice(&event.event.id, &mut id)
+                        .ok()
+                        .map(|()| (id, WindowOffer::Unconverted))
+                })
+                .collect();
             (
                 events,
                 WindowObservation {
@@ -1202,7 +1206,9 @@ impl AppClient {
                     None
                 } else {
                     let mut id = [0; 32];
-                    hex::decode_to_slice(&event.event.id, &mut id).ok().map(|()| id)
+                    hex::decode_to_slice(&event.event.id, &mut id)
+                        .ok()
+                        .map(|()| id)
                 };
                 let deliveries = match self.adapter.recovered_deliveries(event).await {
                     Ok(deliveries) => deliveries,
@@ -1224,10 +1230,18 @@ impl AppClient {
                 };
                 if let Some(event_id) = event_id {
                     for observation in &mut admission.routes[index].window_progress {
-                        if deliveries.is_empty() {
+                        let Some(offered) = observation.offered.get_mut(&event_id) else {
+                            continue;
+                        };
+                        match offered {
+                            WindowOffer::Unconverted => {
+                                *offered = WindowOffer::Pending(deliveries.len());
+                            }
+                            WindowOffer::Pending(remaining) => *remaining += deliveries.len(),
+                            WindowOffer::Unretained => continue,
+                        }
+                        if matches!(offered, WindowOffer::Pending(0)) {
                             observation.offered.remove(&event_id);
-                        } else if let Some(offered) = observation.offered.get_mut(&event_id) {
-                            *offered = WindowOffer::Pending(deliveries.len());
                         }
                     }
                 }
@@ -1361,11 +1375,18 @@ impl AppClient {
             let route = &mut admission.routes[*index];
             route.fetched = route.fetched.saturating_add(window_fetched);
             if !route.window_progress.is_empty() {
-                let event_id: [u8; 32] = delivery.message.id.as_slice().try_into()
+                let event_id: [u8; 32] = delivery
+                    .message
+                    .id
+                    .as_slice()
+                    .try_into()
                     .expect("the Nostr adapter validates 32-byte event IDs");
                 for observation in &mut route.window_progress {
                     let std::collections::hash_map::Entry::Occupied(mut offered) =
-                        observation.offered.entry(event_id) else { continue };
+                        observation.offered.entry(event_id)
+                    else {
+                        continue;
+                    };
                     if unretained {
                         *offered.get_mut() = WindowOffer::Unretained;
                         continue;
@@ -5145,7 +5166,7 @@ mod tests {
             }
         }
         arm_unpaced_epoch_gap(&fixture);
-        let (grant, _) = epoch_gap_grant(&mut fixture);
+        let (grant, _) = epoch_gap_grant(&mut fixture).await;
         let until = grant
             .inventory
             .iter()
@@ -5283,7 +5304,7 @@ mod tests {
             .await
             .unwrap();
         arm_unpaced_epoch_gap(&fixture);
-        let (grant, _) = epoch_gap_grant(&mut fixture);
+        let (grant, _) = epoch_gap_grant(&mut fixture).await;
         let route = grant
             .plan()
             .unwrap()
@@ -5380,7 +5401,7 @@ mod tests {
             .client
             .recovery_owner
             .test_advance_to_retry(&fixture.storage);
-        let (grant, _) = epoch_gap_grant(&mut fixture);
+        let (grant, _) = epoch_gap_grant(&mut fixture).await;
         assert!(!grant.fence.obligations.contains(&(goal.id, goal.revision)));
         fixture
             .client
@@ -5417,7 +5438,7 @@ mod tests {
             .client
             .recovery_owner
             .test_advance_clock(Duration::from_secs(60));
-        let (grant, _) = epoch_gap_grant(&mut fixture);
+        let (grant, _) = epoch_gap_grant(&mut fixture).await;
         assert!(grant.fence.obligations.contains(&(goal.id, goal.revision)));
         fixture
             .client
@@ -5546,7 +5567,7 @@ mod tests {
                 .client
                 .recovery_owner
                 .test_advance_clock(Duration::from_secs(60));
-            let (grant, _) = epoch_gap_grant(&mut fixture);
+            let (grant, _) = epoch_gap_grant(&mut fixture).await;
             fixture.client.test_comparison_results = Some(group_route_comparison(true));
             fixture
                 .client

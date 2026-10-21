@@ -88,13 +88,13 @@ use push::notification_trigger_for_intent;
 #[cfg(test)]
 pub(crate) use sync::ScriptedComparisons;
 #[cfg(test)]
-pub(crate) use sync::TestComparisonActivityWitness;
-#[cfg(test)]
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
     CommittedSyncProgress, ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob,
     ConvergenceScheduleState, EpochBackfillRunOutcome, PendingRecoverySelection, SyncMode,
 };
+#[cfg(test)]
+pub(crate) use sync::{MAX_COMPARISON_ADMISSION_PER_TURN, TestComparisonActivityWitness};
 
 #[cfg(test)]
 const CREATE_GROUP_LOOKUP_CONCURRENCY: usize = 8;

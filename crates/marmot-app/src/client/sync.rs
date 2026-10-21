@@ -44,9 +44,9 @@ pub(super) mod comparison_job;
 #[cfg(test)]
 mod native_comparison_tests;
 mod native_ingress;
-#[cfg(test)]
-pub(crate) use comparison_job::TestComparisonActivityWitness;
 pub(crate) use comparison_job::{ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob};
+#[cfg(test)]
+pub(crate) use comparison_job::{MAX_COMPARISON_ADMISSION_PER_TURN, TestComparisonActivityWitness};
 
 /// The worker consumes committed output; direct clients retain full summaries.
 pub(crate) struct CommittedSyncProgress<'a> {

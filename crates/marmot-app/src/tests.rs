@@ -3754,8 +3754,7 @@ where
 /// [`run_composed_app_runtime_test`] on a current-thread runtime, for a test
 /// that pauses the clock (Tokio allows `time::pause` only there) or builds an
 /// interleaving that needs one thread. Say why with a `//` comment on the line
-/// above the call; `async_suites_choose_their_tokio_flavor` rejects a call
-/// without one.
+/// above the call.
 pub(crate) fn run_composed_app_runtime_test_on_one_thread<F, Fut>(thread_name: &str, body: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
