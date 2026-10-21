@@ -222,6 +222,9 @@ Each PR keeps behaviour unchanged and ships alone.
    - It adds the crate README and `AGENTS.md`, the root README crate map and the AGENTS routing row.
 7. **Repoint and delete delegates** (decision 3). `marmot-uniffi`, `cli`, `agent-connector`, `marmot-app` and tests
    call `app.directory()`.
+   - Narrow `nostr-directory`'s public surface to what those callers and the host traits need. PR 6 widened by
+     compiler error and by name, so modules are `pub mod` and many internals are `pub`; once the delegates are gone,
+     what `marmot-app` still names is the real surface, and the rest returns to `pub(crate)`.
 8. **Tracing targets.** `marmot_app::directory` becomes `nostr_directory::<module>`, as storage-boundaries PR 5 did
    (#2402).
 

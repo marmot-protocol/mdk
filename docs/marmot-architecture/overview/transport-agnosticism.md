@@ -161,7 +161,7 @@ impl. An embedder then implements "fetch this Nostr document from my overlay" wi
 any validation logic, and #1521's caller-held packages become the degenerate case: a directory
 that answers from the embedder's own index.
 
-What stays fixed: record validation (`directory/published_records.rs`), dedup-by-account semantics, and
+What stays fixed: record validation (`nostr-directory/src/published_records.rs`), dedup-by-account semantics, and
 the requirement that Welcomes address by source event id.
 
 ### S2. Peeler/envelope injection (mostly done, finish it)
