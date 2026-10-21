@@ -1,5 +1,6 @@
 //! Bounded discovery recovery; a relay copy is not proof of private-key possession.
 
+use crate::directory::error::DirectoryError;
 use std::collections::BTreeSet;
 
 use cgka_engine::key_package::KeyPackageRequirements;
@@ -11,7 +12,7 @@ use crate::directory::published_records::{
     KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, preferred_fresh_key_package_from_records,
     without_revoked_slot_winners,
 };
-use crate::{AppError, DirectoryFreshness, MarmotApp};
+use crate::{DirectoryFreshness, MarmotApp};
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord};
 
 const RECOVERY_ENDPOINT_LIMIT: usize = 8;
@@ -42,7 +43,7 @@ impl MarmotApp {
     pub(super) async fn recover_key_package_records(
         &self,
         request: KeyPackageRecoveryRequest<'_>,
-    ) -> Result<RecoveredKeyPackageRecords, AppError> {
+    ) -> Result<RecoveredKeyPackageRecords, DirectoryError> {
         let KeyPackageRecoveryRequest {
             account,
             searched,
@@ -228,8 +229,8 @@ fn distinct_recovery_routes<'a>(
 }
 
 /// Lookup or deletion coverage was not established for this account.
-fn recovery_incomplete(account: &str) -> AppError {
-    AppError::DirectoryLookupIncomplete(account.to_owned())
+fn recovery_incomplete(account: &str) -> DirectoryError {
+    DirectoryError::DirectoryLookupIncomplete(account.to_owned())
 }
 
 #[cfg(test)]

@@ -206,6 +206,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `src/profile_publication.rs`. `src/directory_crossings_tests.rs` lists every name `src/directory/` still resolves in
   the rest of the crate in `src/directory/crossings.txt`; a change may shrink that list, never grow it without saying
   why.
+- Directory code returns `DirectoryError` (`src/directory/error.rs`). Public `MarmotApp` methods are the boundary: they
+  keep returning `AppError`, and `From<DirectoryError> for AppError` restores the variant, message and
+  `privacy_safe_kind` the directory reported before it had its own type. An app failure that reaches directory code
+  (through `?` on an `AppError`) rides in `DirectoryError::Resource` and comes back unchanged. Directory code that matches
+  on its own failures must call the `DirectoryError` twin (`directory_entry`, `cached_relay_list_status`,
+  `fetch_relay_list_status`), never the public method, whose failures would arrive wrapped. A new variant needs a row in
+  `error::directory_error_tests`.
 - Keep stateless relay-list and KeyPackage handling for other accounts (relay-list status, KeyPackage tag/metadata
   validation, fresh-vs-cached reconciliation, ranking and selection, revocation evidence) and the directory-record
   selection primitives (`DirectoryFreshness`, `DirectorySelection`, `sort_directory_records`) in

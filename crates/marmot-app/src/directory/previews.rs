@@ -31,6 +31,7 @@
 //! Author profiles are not part of a preview; hosts read them through the
 //! cached-identity API and refresh them through the directory.
 
+use crate::directory::error::{DirectoryError, blocking_directory_task};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -43,7 +44,7 @@ use nostr::nips::nip19::{FromBech32, Nip19};
 use nostr::prelude::{EventId, Filter, Kind, RelayUrl};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use crate::{AppError, MarmotApp, blocking_app_task, unix_now_seconds};
+use crate::{MarmotApp, unix_now_seconds};
 
 /// Maximum references in one cached batch read.
 pub const MAX_PUBLIC_EVENT_REFERENCES: usize = 16;
@@ -436,11 +437,11 @@ fn needs_refresh(target: &Target, stored: Option<&Stored>, now: u64) -> bool {
     }
 }
 
-fn corrupt_row() -> AppError {
+fn corrupt_row() -> DirectoryError {
     StorageError::Serialization("invalid cached public event".into()).into()
 }
 
-fn read_row(conn: &Connection, key: &str) -> Result<Option<Stored>, AppError> {
+fn read_row(conn: &Connection, key: &str) -> Result<Option<Stored>, DirectoryError> {
     let row = conn
         .query_row(
             "SELECT event_json, deleted_through, complete, fetched_at
@@ -478,7 +479,10 @@ fn read_row(conn: &Connection, key: &str) -> Result<Option<Stored>, AppError> {
 }
 
 /// The host-facing state of one row, without parsing its stored event.
-fn read_preview(conn: &Connection, key: &str) -> Result<Option<PublicEventPreview>, AppError> {
+fn read_preview(
+    conn: &Connection,
+    key: &str,
+) -> Result<Option<PublicEventPreview>, DirectoryError> {
     let row = conn
         .query_row(
             "SELECT event_json, fetched_at FROM public_event_previews WHERE cache_key = ?1",
@@ -511,7 +515,7 @@ fn persist_refresh(
     fetched: &[Event],
     complete: bool,
     now: u64,
-) -> Result<(), AppError> {
+) -> Result<(), DirectoryError> {
     let stored = read_row(conn, key)?;
     let row = match admit(target, stored.as_ref().map(|stored| &stored.row), fetched) {
         Admitted::Nothing => return Ok(()),
@@ -544,7 +548,7 @@ fn write_row(
     row: &Row,
     complete: bool,
     now: u64,
-) -> Result<(), AppError> {
+) -> Result<(), DirectoryError> {
     let event_json = row.event.as_ref().map(|event| event.as_json());
     let bytes = ROW_OVERHEAD_BYTES
         + i64::try_from(key.len() + event_json.as_ref().map_or(0, String::len)).unwrap_or(i64::MAX);
@@ -574,7 +578,7 @@ fn write_row(
 /// Evict least recently used rows until both budgets hold, rows without a
 /// deletion time first. The row just written (`keep`) is never evicted, so a
 /// cache full of deletion times still admits new previews.
-fn trim(conn: &Connection, keep: &str) -> Result<(), AppError> {
+fn trim(conn: &Connection, keep: &str) -> Result<(), DirectoryError> {
     let (mut count, mut total): (i64, i64) = conn.query_row(
         "SELECT count(*), coalesce(sum(bytes), 0) FROM public_event_previews",
         [],
@@ -605,8 +609,8 @@ fn trim(conn: &Connection, keep: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn invalid_batch(len: usize) -> AppError {
-    AppError::InvalidPublicEventReferences(format!(
+fn invalid_batch(len: usize) -> DirectoryError {
+    DirectoryError::InvalidPublicEventReferences(format!(
         "requested {len} references; maximum is {MAX_PUBLIC_EVENT_REFERENCES}"
     ))
 }
@@ -618,7 +622,7 @@ impl MarmotApp {
         &self,
         account: &AccountSummary,
         references: &[String],
-    ) -> Result<Vec<PublicEventPreviewRead>, AppError> {
+    ) -> Result<Vec<PublicEventPreviewRead>, DirectoryError> {
         if references.len() > MAX_PUBLIC_EVENT_REFERENCES {
             return Err(invalid_batch(references.len()));
         }
@@ -675,7 +679,7 @@ impl MarmotApp {
         &self,
         account: &AccountSummary,
         reference: &str,
-    ) -> Result<PublicEventPreviewRead, AppError> {
+    ) -> Result<PublicEventPreviewRead, DirectoryError> {
         let read = |preview| PublicEventPreviewRead {
             reference: reference.to_owned(),
             preview,
@@ -688,7 +692,7 @@ impl MarmotApp {
             let app = self.clone();
             let account = account.clone();
             let key = key.clone();
-            blocking_app_task(move || {
+            blocking_directory_task(move || {
                 let cache = app.directory_cache_for_account(&account)?;
                 let conn = cache.lock()?;
                 read_row(&conn, &key)
@@ -753,11 +757,11 @@ impl MarmotApp {
         let app = self.clone();
         let account = account.clone();
         let target = parsed.target;
-        let preview = blocking_app_task(move || {
+        let preview = blocking_directory_task(move || {
             // The account may have been removed or replaced during the fetch.
             if app.account_home().account(&account.label)?.account_id_hex != account.account_id_hex
             {
-                return Err(AppError::from(StorageError::Backend(
+                return Err(DirectoryError::from(StorageError::Backend(
                     "account changed during public event refresh".into(),
                 )));
             }

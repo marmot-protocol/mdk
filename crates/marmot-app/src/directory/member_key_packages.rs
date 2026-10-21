@@ -7,6 +7,8 @@
 //! evidence that a recipient still owns the private bundle. Unsupported batch
 //! queries fall back to bounded single-author relay requests.
 
+use crate::AppError;
+use crate::directory::error::{DirectoryError, MissingKeyPackageReason};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,7 +26,7 @@ use crate::directory::published_records::{
     fresh_relay_list_status_from_records, merge_relay_list_status,
     preferred_fresh_key_package_from_records,
 };
-use crate::{AccountRelayListStatus, AppError, FetchedKeyPackage, MarmotApp};
+use crate::{AccountRelayListStatus, FetchedKeyPackage, MarmotApp};
 use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome};
 
 /// Maximum authors placed in one Nostr directory filter.
@@ -217,7 +219,7 @@ struct MemberTarget {
 #[derive(Default)]
 struct RelayListResolution {
     completed: HashSet<usize>,
-    errors: Vec<(usize, AppError)>,
+    errors: Vec<(usize, DirectoryError)>,
 }
 
 #[allow(dead_code)]
@@ -258,7 +260,7 @@ impl MarmotApp {
         member_refs: Vec<String>,
         requirements: &cgka_engine::key_package::KeyPackageRequirements,
         purpose: MemberResolutionPurpose,
-    ) -> Result<ResolvedMemberKeyPackages, AppError> {
+    ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
         self.resolve_member_key_packages_for_purpose(member_refs, purpose, Some(requirements))
             .await
     }
@@ -268,7 +270,7 @@ impl MarmotApp {
     /// re-fetches packages and enforces the engine's membership policy.
     ///
     /// The roster must also resolve a safe Marmot inbox route for every member;
-    /// missing routes return [`AppError::MissingMemberInboxRoute`]. Successfully
+    /// missing routes return [`DirectoryError::MissingMemberInboxRoute`]. Successfully
     /// discovered routes remain cached even when another member fails readiness.
     /// A malformed current slot publication suppresses older packages here too;
     /// return an error rather than report readiness from superseded material.
@@ -291,12 +293,13 @@ impl MarmotApp {
         )
         .await
         .map(|resolved| resolved.stats.into())
+        .map_err(AppError::from)
     }
 
     pub(crate) async fn resolve_member_key_packages_with_stats(
         &self,
         member_refs: Vec<String>,
-    ) -> Result<ResolvedMemberKeyPackages, AppError> {
+    ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
         self.resolve_member_key_packages_for_purpose(
             member_refs,
             MemberResolutionPurpose::Commit,
@@ -310,7 +313,7 @@ impl MarmotApp {
         member_refs: Vec<String>,
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
-    ) -> Result<ResolvedMemberKeyPackages, AppError> {
+    ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
         let observation = self.product_analytics.begin(
             crate::ProductFamily::KeyPackage,
             "lookup",
@@ -323,8 +326,8 @@ impl MarmotApp {
         if let Some(observation) = observation {
             observation.finish(match &result {
                 Ok(_) => "usable",
-                Err(AppError::MissingKeyPackage { .. }) => "absent",
-                Err(AppError::InvalidKeyPackageEvent(_)) => "invalid",
+                Err(DirectoryError::MissingKeyPackage { .. }) => "absent",
+                Err(DirectoryError::InvalidKeyPackageEvent(_)) => "invalid",
                 Err(_) => "unavailable",
             });
         }
@@ -340,7 +343,7 @@ impl MarmotApp {
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
         deadline: tokio::time::Instant,
-    ) -> Result<ResolvedMemberKeyPackages, AppError> {
+    ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
         let directory_observation = self
             .product_analytics
             .begin(
@@ -356,14 +359,14 @@ impl MarmotApp {
             let account_id_hex = match &local {
                 Some(account) => account.account_id_hex.clone(),
                 None => PublicKey::parse(member_ref)
-                    .map_err(|_| AppError::InvalidPublicKey)?
+                    .map_err(|_| DirectoryError::InvalidPublicKey)?
                     .to_hex(),
             };
             if !seen.insert(account_id_hex.clone()) {
                 continue;
             }
             let relay_lists = self
-                .directory_entry_for_account_id(&account_id_hex)?
+                .directory_entry(&account_id_hex)?
                 .map(|entry| entry.relay_lists)
                 .unwrap_or_else(AccountRelayListStatus::empty);
             targets.push(MemberTarget {
@@ -376,7 +379,7 @@ impl MarmotApp {
 
         let mut outcomes = (0..targets.len())
             .map(|_| None)
-            .collect::<Vec<Option<Result<KeyPackage, AppError>>>>();
+            .collect::<Vec<Option<Result<KeyPackage, DirectoryError>>>>();
         // Even a valid, unexpired cached package may have been consumed on
         // another device. Every purpose, including composition prewarm, must
         // fetch current relay publications; only discovery routes are reused.
@@ -455,7 +458,7 @@ impl MarmotApp {
         if !finished {
             for (target, outcome) in targets.iter().zip(&mut outcomes) {
                 outcome.get_or_insert_with(|| {
-                    Err(AppError::DirectoryLookupIncomplete(
+                    Err(DirectoryError::DirectoryLookupIncomplete(
                         target.account_id_hex.clone(),
                     ))
                 });
@@ -466,7 +469,7 @@ impl MarmotApp {
             for outcome in &outcomes {
                 let outcome = match outcome {
                     Some(Ok(_)) => "success",
-                    Some(Err(AppError::MissingKeyPackage { .. })) | None => "empty",
+                    Some(Err(DirectoryError::MissingKeyPackage { .. })) | None => "empty",
                     Some(Err(_)) => "failure",
                 };
                 observation.directory_sample(outcome, "network", 1);
@@ -511,9 +514,9 @@ impl MarmotApp {
         let mut key_packages = Vec::with_capacity(targets.len());
         for (index, outcome) in outcomes.into_iter().enumerate() {
             match outcome.unwrap_or_else(|| {
-                Err(AppError::MissingKeyPackage {
+                Err(DirectoryError::MissingKeyPackage {
                     account: targets[index].account_id_hex.clone(),
-                    reason: crate::MissingKeyPackageReason::NotFound,
+                    reason: MissingKeyPackageReason::NotFound,
                 })
             }) {
                 Ok(key_package) => {
@@ -529,7 +532,7 @@ impl MarmotApp {
                         "member invite inbox readiness",
                     );
                     if safe_inbox.is_empty() {
-                        return Err(AppError::MissingMemberInboxRoute(
+                        return Err(DirectoryError::MissingMemberInboxRoute(
                             targets[index].account_id_hex.clone(),
                         ));
                     }
@@ -551,7 +554,7 @@ impl MarmotApp {
         &self,
         purpose: MemberResolutionPurpose,
         fetched: FetchedKeyPackage,
-    ) -> Result<KeyPackage, AppError> {
+    ) -> Result<KeyPackage, DirectoryError> {
         let key_package = self.validate_member_key_package_current(
             &fetched.account_id_hex,
             fetched.key_package.clone(),
@@ -569,7 +572,7 @@ impl MarmotApp {
         &self,
         account_id_hex: &str,
         key_package: KeyPackage,
-    ) -> Result<KeyPackage, AppError> {
+    ) -> Result<KeyPackage, DirectoryError> {
         let observation = self.product_analytics.begin(
             crate::ProductFamily::KeyPackage,
             "lookup",
@@ -816,7 +819,7 @@ impl MarmotApp {
             // lookups report MissingMemberInboxRoute.
             .map(|index| {
                 let account = targets[index].account_id_hex.clone();
-                (index, AppError::DirectoryLookupIncomplete(account))
+                (index, DirectoryError::DirectoryLookupIncomplete(account))
             })
             .collect();
         RelayListResolution { completed, errors }
@@ -826,7 +829,7 @@ impl MarmotApp {
         &self,
         targets: &[MemberTarget],
         unresolved: &[usize],
-        outcomes: &mut [Option<Result<KeyPackage, AppError>>],
+        outcomes: &mut [Option<Result<KeyPackage, DirectoryError>>],
         purpose: MemberResolutionPurpose,
         requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
     ) {
@@ -850,7 +853,7 @@ impl MarmotApp {
             endpoints.sort();
             endpoints.dedup();
             if endpoints.is_empty() {
-                outcomes[index] = Some(Err(AppError::MissingRelayLists(vec![
+                outcomes[index] = Some(Err(DirectoryError::MissingRelayLists(vec![
                     crate::MissingRelayListKind::Nip65,
                 ])));
             } else {
@@ -890,7 +893,7 @@ impl MarmotApp {
                         .fetch_directory_events(endpoints, vec![query])
                         .await
                         .map_err(|error| {
-                            AppError::RelayDirectory(format!("fetch key packages: {error}"))
+                            DirectoryError::RelayDirectory(format!("fetch key packages: {error}"))
                         });
                     (indices, result)
                 }
@@ -1036,7 +1039,7 @@ impl MarmotApp {
                             .into_value_or_missing(&target.account_id_hex)?
                             .fetched;
                             fetched.relay_lists = target.relay_lists;
-                            Ok::<_, AppError>(fetched)
+                            Ok::<_, DirectoryError>(fetched)
                         }
                         .await;
                         (index, result)
@@ -1055,12 +1058,12 @@ impl MarmotApp {
 fn validate_current_member_key_package(
     account_id_hex: &str,
     key_package: KeyPackage,
-) -> (Result<KeyPackage, AppError>, &'static str) {
+) -> (Result<KeyPackage, DirectoryError>, &'static str) {
     let metadata = match key_package_metadata(&key_package) {
         Ok(metadata) => metadata,
         Err(error) => {
             return (
-                Err(AppError::InvalidKeyPackageEvent(error.to_string())),
+                Err(DirectoryError::InvalidKeyPackageEvent(error.to_string())),
                 "invalid",
             );
         }
@@ -1069,7 +1072,7 @@ fn validate_current_member_key_package(
         || metadata.credential_identity_hex != account_id_hex
     {
         return (
-            Err(AppError::InvalidKeyPackageEvent(
+            Err(DirectoryError::InvalidKeyPackageEvent(
                 "member KeyPackage identity or profile is invalid".to_owned(),
             )),
             "invalid",
@@ -1081,7 +1084,7 @@ fn validate_current_member_key_package(
         .as_secs();
     if now < metadata.not_before || now > metadata.not_after {
         return (
-            Err(AppError::InvalidKeyPackageEvent(
+            Err(DirectoryError::InvalidKeyPackageEvent(
                 "member KeyPackage is outside its current lifetime".to_owned(),
             )),
             if now > metadata.not_after {

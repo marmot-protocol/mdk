@@ -1,3 +1,4 @@
+use crate::AppError;
 use marmot_account::AccountHome;
 use nostr::nips::nip19::{Nip19Coordinate, Nip19Event, ToBech32};
 use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Tag, Timestamp};

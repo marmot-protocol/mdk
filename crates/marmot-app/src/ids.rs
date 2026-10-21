@@ -5,9 +5,35 @@ use crate::AppError;
 // The Nostr account-id helpers moved to the directory (step 3 of
 // docs/marmot-architecture/review/brief-directory.md); re-exported so callers
 // keep their paths.
-pub use crate::directory::ids::{
-    account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
-};
+/// Convert a hex Nostr public key (account id) into its `npub...` bech32 form.
+/// Public so embedders (FFI/UI) can render npubs instead of raw hex.
+pub fn npub_for_account_id(account_id_hex: &str) -> Result<String, AppError> {
+    Ok(crate::directory::ids::npub_for_account_id(account_id_hex)?)
+}
+
+/// Validate relay URL strings before encoding them into invite URIs.
+pub fn validate_relay_urls(relays: &[String]) -> Result<(), AppError> {
+    Ok(crate::directory::ids::validate_relay_urls(relays)?)
+}
+
+/// Encode a hex account id and relay hints as an `nprofile1…` invite URI.
+pub fn nprofile_for_account_id(
+    account_id_hex: &str,
+    relays: &[String],
+) -> Result<String, AppError> {
+    Ok(crate::directory::ids::nprofile_for_account_id(
+        account_id_hex,
+        relays,
+    )?)
+}
+
+/// Normalize a public identity reference (hex, `npub`, `nostr:npub`, `nprofile`
+/// or `nostr:nprofile`) into a canonical hex account id. Failures return
+/// [`AppError::InvalidPublicKey`] without echoing the input; see
+/// [`crate::directory::ids::account_id_hex_from_ref`].
+pub fn account_id_hex_from_ref(reference: &str) -> Result<String, AppError> {
+    Ok(crate::directory::ids::account_id_hex_from_ref(reference)?)
+}
 pub(crate) use crate::directory::ids::{normalize_account_ids, parse_account_id_hex};
 
 pub(crate) fn normalize_group_id_hex_app(value: &str) -> Result<String, AppError> {

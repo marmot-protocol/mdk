@@ -1,3 +1,4 @@
+use crate::directory::error::{DirectoryError, blocking_directory_task};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -10,7 +11,7 @@ use cgka_traits::TransportEndpoint;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
-use crate::{AppError, KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, blocking_app_task};
+use crate::{KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp};
 use transport_nostr::{DirectorySyncBatch, DirectorySyncPlan, MarmotRelayPlane};
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
@@ -71,7 +72,7 @@ struct DirectoryRecoveryRebuildQueue {
     pending: bool,
 }
 
-struct DirectoryRecoveryRebuildTask(JoinHandle<Result<DirectorySyncRunSummary, AppError>>);
+struct DirectoryRecoveryRebuildTask(JoinHandle<Result<DirectorySyncRunSummary, DirectoryError>>);
 
 impl Drop for DirectoryRecoveryRebuildTask {
     fn drop(&mut self) {
@@ -258,18 +259,18 @@ impl DirectorySyncHandle {
 
     pub(crate) async fn request_rebuild_and_wait(
         &self,
-    ) -> Result<DirectorySyncRunSummary, AppError> {
+    ) -> Result<DirectorySyncRunSummary, DirectoryError> {
         let (respond, response) = oneshot::channel();
         self.commands
             .send(DirectorySyncCommand::Rebuild {
                 respond: Some(respond),
             })
             .await
-            .map_err(|_| AppError::TransportClosed)?;
+            .map_err(|_| DirectoryError::TransportClosed)?;
         response
             .await
-            .map_err(|_| AppError::TransportClosed)?
-            .map_err(AppError::RelayDirectory)
+            .map_err(|_| DirectoryError::TransportClosed)?
+            .map_err(DirectoryError::RelayDirectory)
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -365,7 +366,7 @@ async fn run_directory_sync_worker(
                                 request_block_reconcile(&app, &mut block_rebuilds, &mut block_task);
                             }
                         } else {
-                            let _ = blocking_app_task(move || app.ingest_directory_relay_event(record)).await;
+                            let _ = blocking_directory_task(move || app.ingest_directory_relay_event(record)).await;
                         }
                     }
                     Ok(transport_nostr::DirectoryRelayPlaneEvent::RecoveryRequired)
@@ -403,14 +404,14 @@ async fn run_directory_sync_once(
     app: MarmotApp,
     relay_plane: MarmotRelayPlane,
     force_rebuild: bool,
-) -> Result<DirectorySyncRunSummary, AppError> {
+) -> Result<DirectorySyncRunSummary, DirectoryError> {
     let app_for_plan = app.clone();
-    let plan = blocking_app_task(move || app_for_plan.directory_sync_plan()).await?;
+    let plan = blocking_directory_task(move || app_for_plan.directory_sync_plan()).await?;
     let watched_user_count = plan.watched_user_count;
     let subscriptions = relay_plane
         .sync_directory_user_subscriptions(plan, force_rebuild)
         .await
-        .map_err(AppError::RelayDirectory)?;
+        .map_err(DirectoryError::RelayDirectory)?;
     Ok(DirectorySyncRunSummary {
         watched_user_count,
         active_subscriptions: subscriptions.active_subscriptions,
@@ -424,7 +425,7 @@ async fn reconcile_block_lists(app: MarmotApp) {
     // fixed bound so one slow account does not serialize every other account's
     // startup/reconnect, and report failures without exposing identities.
     let app_for_accounts = app.clone();
-    let accounts = match blocking_app_task(move || {
+    let accounts = match blocking_directory_task(move || {
         Ok(app_for_accounts.account_home().accounts()?)
     })
     .await
@@ -737,7 +738,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if app
-                    .directory_entry_for_account_id(&remote.public_key().to_hex())
+                    .directory_entry(&remote.public_key().to_hex())
                     .unwrap()
                     .is_some_and(|entry| entry.profile.is_some())
                 {

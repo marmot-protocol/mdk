@@ -1597,9 +1597,10 @@ impl MarmotAppRuntime {
         &self,
         account_id_hexes: &[String],
     ) -> Result<HashMap<String, String>, AppError> {
-        self.accounts
+        Ok(self
+            .accounts
             .app
-            .display_names_for_account_ids(account_id_hexes)
+            .display_names_for_account_ids(account_id_hexes)?)
     }
 
     pub fn cached_identity_projections_for_account_ids(
@@ -2156,12 +2157,17 @@ impl MarmotAppRuntime {
             .app
             .search_users_with_seeds(params, async move {
                 if include_groups {
-                    runtime.group_co_members(&searcher).await
+                    // The worker's error travels through the directory unchanged.
+                    runtime
+                        .group_co_members(&searcher)
+                        .await
+                        .map_err(crate::directory::error::DirectoryError::from)
                 } else {
                     Ok(Vec::new())
                 }
             })
             .await
+            .map_err(AppError::from)
     }
 
     /// Accounts the searcher currently shares a group with.
@@ -4679,9 +4685,10 @@ impl MarmotAppRuntime {
         references: &[String],
     ) -> Result<Vec<crate::PublicEventPreviewRead>, AppError> {
         let account = self.accounts.resolve(account_ref)?;
-        self.accounts
+        Ok(self
+            .accounts
             .app
-            .cached_public_event_previews(&account, references)
+            .cached_public_event_previews(&account, references)?)
     }
 
     /// Fetch one referenced public event from relays when it is missing or
@@ -4695,10 +4702,11 @@ impl MarmotAppRuntime {
         reference: &str,
     ) -> Result<crate::PublicEventPreviewRead, AppError> {
         let account = self.accounts.resolve(account_ref)?;
-        self.accounts
+        Ok(self
+            .accounts
             .app
             .resolve_public_event_preview(&account, reference)
-            .await
+            .await?)
     }
 
     /// Fast, network-free membership check against [`Self::account_follows`].
@@ -8335,7 +8343,7 @@ impl AccountManager {
                             );
                             return self
                                 .complete_cached_relay_list_status(&account.label)
-                                .or(Err(error));
+                                .or(Err(AppError::from(error)));
                         }
                         None => {
                             return self
@@ -8388,12 +8396,13 @@ impl AccountManager {
             if bootstrap_relays.is_empty() {
                 return Err(AppError::MissingDefaultRelays);
             }
-            self.app
+            Ok(self
+                .app
                 .resolve_account_relay_list_status_for_account_id(
                     &account.account_id_hex,
                     bootstrap_relays,
                 )
-                .await
+                .await?)
         }
     }
 

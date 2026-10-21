@@ -996,9 +996,9 @@ async fn invite_recovery_preserves_incompatible_errors_for_empty_and_failed_supp
             .await;
         assert!(matches!(
             result,
-            Err(AppError::Session(cgka_session::SessionError::Engine(
+            Err(DirectoryError::KeyPackageRequirements(
                 cgka_traits::EngineError::MissingRequiredCapabilities { .. }
-            )))
+            ))
         ));
     }
     {

@@ -187,7 +187,7 @@ fn legacy_conversion_disk_full_preserves_both_tiers_and_retries() {
         "disk exhaustion must interrupt legacy conversion"
     );
     assert!(
-        matches!(error, AppError::Sqlite(rusqlite::Error::SqliteFailure(code, None))
+        matches!(error, DirectoryError::Sqlite(rusqlite::Error::SqliteFailure(code, None))
         if code.code == rusqlite::ErrorCode::DiskFull)
     );
     assert_eq!(snapshot(&conn, &tables, -1), before);

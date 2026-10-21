@@ -24,7 +24,7 @@ use transport_nostr_adapter::{
 use transport_nostr_peeler::NostrTransportEvent;
 
 use crate::deployment::KeyPackageClientPreference;
-use crate::error::{AppError, MissingKeyPackageReason};
+use crate::directory::error::{DirectoryError, MissingKeyPackageReason};
 use crate::{DirectoryKeyPackage, UserDirectoryRecord, unix_now_seconds};
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 
@@ -504,7 +504,7 @@ pub(crate) fn latest_fresh_key_package_from_records(
     records: Vec<RelayEventRecord>,
     freshness: DirectoryFreshness,
     preference: &KeyPackageClientPreference,
-) -> Result<KeyPackageSelection<FetchedKeyPackage>, AppError> {
+) -> Result<KeyPackageSelection<FetchedKeyPackage>, DirectoryError> {
     let selection = preferred_fresh_key_package_from_records(
         account_id_hex,
         &records,
@@ -535,14 +535,14 @@ pub(crate) struct KeyPackageSelection<T> {
 impl<T> KeyPackageSelection<T> {
     /// Call only after the lookup that produced these records completed: an
     /// incomplete search can explain neither absence nor obsolescence.
-    pub(crate) fn into_value_or_missing(self, account_id_hex: &str) -> Result<T, AppError> {
+    pub(crate) fn into_value_or_missing(self, account_id_hex: &str) -> Result<T, DirectoryError> {
         // A future-dated slot may be a clock-skewed current publication.
         let reason = if self.legacy_slots && !self.rejected_future {
             MissingKeyPackageReason::ObsoleteOnly
         } else {
             MissingKeyPackageReason::NotFound
         };
-        self.value.ok_or_else(|| AppError::MissingKeyPackage {
+        self.value.ok_or_else(|| DirectoryError::MissingKeyPackage {
             account: account_id_hex.to_owned(),
             reason,
         })
@@ -555,7 +555,7 @@ pub(crate) fn preferred_fresh_key_package_from_records(
     freshness: DirectoryFreshness,
     requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
     preference: &KeyPackageClientPreference,
-) -> Result<KeyPackageSelection<PreferredKeyPackage>, AppError> {
+) -> Result<KeyPackageSelection<PreferredKeyPackage>, DirectoryError> {
     let mut records = records.iter().collect::<Vec<_>>();
     records.sort_by(|a, b| {
         a.event
@@ -606,7 +606,7 @@ pub(crate) fn preferred_fresh_key_package_from_records(
         if let Some(requirements) = requirements
             && let Err(error) = requirements.validate(&fetched.key_package)
         {
-            newest_error.get_or_insert(AppError::from(cgka_session::SessionError::from(error)));
+            newest_error.get_or_insert(DirectoryError::KeyPackageRequirements(error));
             continue;
         }
         if selected.is_none() || priority > selected_priority {
@@ -647,7 +647,7 @@ pub(crate) fn is_legacy_key_package_record(record: &RelayEventRecord) -> bool {
 
 pub(crate) fn cached_key_package_from_entry(
     entry: UserDirectoryRecord,
-) -> Result<Option<FetchedKeyPackage>, AppError> {
+) -> Result<Option<FetchedKeyPackage>, DirectoryError> {
     let Some(key_package) = entry.key_package else {
         return Ok(None);
     };
@@ -669,7 +669,7 @@ pub(crate) fn cached_key_package_from_entry(
 pub(crate) fn validated_cached_key_package(
     account_id_hex: &str,
     key_package: &DirectoryKeyPackage,
-) -> Result<KeyPackage, AppError> {
+) -> Result<KeyPackage, DirectoryError> {
     validated_cached_key_package_with_ref(account_id_hex, key_package)
         .map(|(key_package, _)| key_package)
 }
@@ -677,27 +677,27 @@ pub(crate) fn validated_cached_key_package(
 pub(crate) fn validated_cached_key_package_with_ref(
     account_id_hex: &str,
     key_package: &DirectoryKeyPackage,
-) -> Result<(KeyPackage, String), AppError> {
+) -> Result<(KeyPackage, String), DirectoryError> {
     let decoded = key_package_from_hex_with_optional_source(
         &key_package.key_package_hex,
         &key_package.key_package_event_id,
     )?;
     let metadata = key_package_metadata(&decoded)
-        .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
+        .map_err(|e| DirectoryError::InvalidKeyPackageEvent(e.to_string()))?;
     if metadata.protocol_profile != ProtocolProfile::Current {
-        return Err(AppError::InvalidKeyPackageEvent(
+        return Err(DirectoryError::InvalidKeyPackageEvent(
             "strict cutover rejects legacy KeyPackages for new joins".into(),
         ));
     }
     if metadata.credential_identity_hex != account_id_hex {
-        return Err(AppError::InvalidKeyPackageEvent(
+        return Err(DirectoryError::InvalidKeyPackageEvent(
             "cached KeyPackage credential identity does not match directory account".into(),
         ));
     }
     if !key_package.key_package_ref_hex.is_empty()
         && key_package.key_package_ref_hex != metadata.key_package_ref_hex
     {
-        return Err(AppError::InvalidKeyPackageEvent(
+        return Err(DirectoryError::InvalidKeyPackageEvent(
             "cached KeyPackage ref does not match decoded KeyPackageRef".into(),
         ));
     }
@@ -710,7 +710,7 @@ pub(crate) fn validated_cached_key_package_with_ref(
 pub(crate) fn key_package_from_hex_with_optional_source(
     key_package_hex: &str,
     event_id_hex: &str,
-) -> Result<KeyPackage, AppError> {
+) -> Result<KeyPackage, DirectoryError> {
     // After the strict cutover, unannotated local/directory cache records are
     // candidates only for the current profile. Mark them current before the
     // decoded proof/profile consistency check; legacy bytes then fail closed
@@ -725,10 +725,12 @@ pub(crate) fn key_package_from_hex_with_optional_source(
     )
 }
 
-pub(crate) fn key_package_event_id_from_hex(event_id_hex: &str) -> Result<MessageId, AppError> {
+pub(crate) fn key_package_event_id_from_hex(
+    event_id_hex: &str,
+) -> Result<MessageId, DirectoryError> {
     let bytes = hex::decode(event_id_hex)?;
     if bytes.len() != 32 {
-        return Err(AppError::InvalidKeyPackageEvent(format!(
+        return Err(DirectoryError::InvalidKeyPackageEvent(format!(
             "KeyPackage event id must be 32 bytes, got {}",
             bytes.len()
         )));
@@ -740,7 +742,7 @@ pub(crate) fn fresh_or_cached_key_package(
     account_id_hex: &str,
     selection: KeyPackageSelection<FetchedKeyPackage>,
     cached_entry: Option<UserDirectoryRecord>,
-) -> Result<FetchedKeyPackage, AppError> {
+) -> Result<FetchedKeyPackage, DirectoryError> {
     if selection.value.is_none()
         && selection.rejected_future
         && let Some(cached) = cached_entry
@@ -755,30 +757,32 @@ pub(crate) fn fresh_or_cached_key_package(
 
 pub(crate) fn key_package_from_record(
     record: RelayEventRecord,
-) -> Result<FetchedKeyPackage, AppError> {
+) -> Result<FetchedKeyPackage, DirectoryError> {
     key_package_from_borrowed_record(&record)
 }
 
 pub(crate) fn key_package_from_borrowed_record(
     record: &RelayEventRecord,
-) -> Result<FetchedKeyPackage, AppError> {
+) -> Result<FetchedKeyPackage, DirectoryError> {
     let event = &record.event;
     require_key_package_tag(event, "mls_protocol_version", |value| value == "1.0")?;
     let key_package_id = event
         .tag_value("d")
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::InvalidKeyPackageEvent("missing d tag".into()))?
+        .ok_or_else(|| DirectoryError::InvalidKeyPackageEvent("missing d tag".into()))?
         .to_owned();
     let key_package_ref = event
         .tag_value("i")
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| AppError::InvalidKeyPackageEvent("missing i tag".into()))?
+        .ok_or_else(|| DirectoryError::InvalidKeyPackageEvent("missing i tag".into()))?
         .to_owned();
     let key_package_bytes = BASE64_STANDARD
         .decode(event.content.as_bytes())
-        .map_err(|e| AppError::InvalidKeyPackageEvent(format!("invalid base64 content: {e}")))?;
+        .map_err(|e| {
+            DirectoryError::InvalidKeyPackageEvent(format!("invalid base64 content: {e}"))
+        })?;
     if key_package_bytes.is_empty() {
-        return Err(AppError::InvalidKeyPackageEvent(
+        return Err(DirectoryError::InvalidKeyPackageEvent(
             "empty key package content".into(),
         ));
     }
@@ -793,7 +797,7 @@ pub(crate) fn key_package_from_borrowed_record(
     )
     .with_protocol_profile(ProtocolProfile::Current);
     let metadata = key_package_metadata(&key_package)
-        .map_err(|e| AppError::InvalidKeyPackageEvent(e.to_string()))?;
+        .map_err(|e| DirectoryError::InvalidKeyPackageEvent(e.to_string()))?;
     require_key_package_tag(event, "mls_ciphersuite", |value| {
         value == format!("0x{:04x}", metadata.ciphersuite)
     })?;
@@ -818,12 +822,12 @@ pub(crate) fn key_package_from_borrowed_record(
     )?;
     let key_package = key_package.with_protocol_profile(metadata.protocol_profile);
     if metadata.credential_identity_hex != event.pubkey {
-        return Err(AppError::InvalidKeyPackageEvent(
+        return Err(DirectoryError::InvalidKeyPackageEvent(
             "transport author does not match KeyPackage credential identity".into(),
         ));
     }
     if metadata.key_package_ref_hex != key_package_ref {
-        return Err(AppError::InvalidKeyPackageEvent(
+        return Err(DirectoryError::InvalidKeyPackageEvent(
             "i tag does not match decoded KeyPackageRef".into(),
         ));
     }
@@ -855,14 +859,14 @@ pub(crate) fn key_package_from_borrowed_record(
 pub(crate) fn reject_duplicate_key_package_tag(
     event: &NostrTransportEvent,
     name: &str,
-) -> Result<(), AppError> {
+) -> Result<(), DirectoryError> {
     let count = event
         .tags
         .iter()
         .filter(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
         .count();
     if count > 1 {
-        return Err(AppError::InvalidKeyPackageEvent(format!(
+        return Err(DirectoryError::InvalidKeyPackageEvent(format!(
             "duplicate {name} tag"
         )));
     }
@@ -873,16 +877,16 @@ pub(crate) fn require_key_package_tag(
     event: &NostrTransportEvent,
     name: &str,
     predicate: impl FnOnce(&str) -> bool,
-) -> Result<(), AppError> {
+) -> Result<(), DirectoryError> {
     reject_duplicate_key_package_tag(event, name)?;
     match event.tag_value(name) {
         Some(value) if predicate(value) => Ok(()),
         // Never echo the tag value: it is attacker-controlled kind:30443 event
         // content, and this error's Display reaches tracing at upper layers.
-        Some(_) => Err(AppError::InvalidKeyPackageEvent(format!(
+        Some(_) => Err(DirectoryError::InvalidKeyPackageEvent(format!(
             "invalid {name} tag"
         ))),
-        None => Err(AppError::InvalidKeyPackageEvent(format!(
+        None => Err(DirectoryError::InvalidKeyPackageEvent(format!(
             "missing {name} tag"
         ))),
     }
@@ -892,14 +896,14 @@ pub(crate) fn require_multi_value_key_package_tag_matches(
     event: &NostrTransportEvent,
     name: &str,
     expected_ids: impl IntoIterator<Item = u16>,
-) -> Result<(), AppError> {
+) -> Result<(), DirectoryError> {
     reject_duplicate_key_package_tag(event, name)?;
     let Some(tag) = event
         .tags
         .iter()
         .find(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
     else {
-        return Err(AppError::InvalidKeyPackageEvent(format!(
+        return Err(DirectoryError::InvalidKeyPackageEvent(format!(
             "missing {name} tag"
         )));
     };
@@ -910,7 +914,7 @@ pub(crate) fn require_multi_value_key_package_tag_matches(
         .map(|id| format!("0x{id:04x}"))
         .collect::<BTreeSet<_>>();
     if values.len() != actual.len() || actual != expected {
-        return Err(AppError::InvalidKeyPackageEvent(format!(
+        return Err(DirectoryError::InvalidKeyPackageEvent(format!(
             "{name} tag does not exactly match decoded KeyPackage metadata"
         )));
     }

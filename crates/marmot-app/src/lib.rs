@@ -5746,7 +5746,7 @@ impl MarmotApp {
         };
         if let Some(entry) = self.directory_entry_for_account_id(&account_id)? {
             if let Some(key_package) = entry.key_package {
-                return validated_cached_key_package(&account_id, &key_package);
+                return Ok(validated_cached_key_package(&account_id, &key_package)?);
             }
             let source_relays = self.retain_safe_discovered_endpoints(
                 entry
@@ -5810,7 +5810,7 @@ impl MarmotApp {
             .into_iter()
             .map(|account| account.account_id_hex)
             .collect::<Vec<_>>();
-        self.display_names_for_account_ids(&account_ids)
+        Ok(self.display_names_for_account_ids(&account_ids)?)
     }
 
     fn display_name_for_account_id(

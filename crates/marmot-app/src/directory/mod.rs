@@ -1,5 +1,6 @@
 mod cache;
 mod cached_search;
+pub(crate) mod error;
 pub(crate) mod ids;
 mod key_package_recovery;
 mod member_key_packages;

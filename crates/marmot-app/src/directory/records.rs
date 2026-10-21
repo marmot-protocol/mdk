@@ -13,8 +13,8 @@ use std::io::{self, Write};
 use serde::{Deserialize, Serialize};
 use storage_sqlite::PublicDirectoryUserRecord;
 
+use crate::directory::error::DirectoryError;
 use crate::directory::ids::parse_account_id_hex;
-use crate::error::AppError;
 use crate::{
     AccountRelayListStatus, DirectoryFreshness, DirectorySelection, sort_directory_records,
 };
@@ -163,9 +163,9 @@ pub struct UserDirectorySearchResult {
 }
 
 impl UserDirectorySearch {
-    pub(crate) fn validate(&self) -> Result<(), AppError> {
+    pub(crate) fn validate(&self) -> Result<(), DirectoryError> {
         if self.radius_start > self.radius_end {
-            return Err(AppError::InvalidDirectorySearch(
+            return Err(DirectoryError::InvalidDirectorySearch(
                 "radius_start must be less than or equal to radius_end".into(),
             ));
         }
@@ -194,7 +194,7 @@ pub(crate) struct FetchedFollowList {
 
 pub(crate) fn public_directory_user_record(
     entry: &UserDirectoryRecord,
-) -> Result<PublicDirectoryUserRecord, AppError> {
+) -> Result<PublicDirectoryUserRecord, DirectoryError> {
     let mut relay_lists = entry.relay_lists.clone();
     relay_lists.bootstrap_relays.clear();
 
@@ -242,7 +242,7 @@ pub(crate) fn public_directory_user_record(
 
 pub(crate) fn user_directory_record_from_public(
     record: PublicDirectoryUserRecord,
-) -> Result<UserDirectoryRecord, AppError> {
+) -> Result<UserDirectoryRecord, DirectoryError> {
     Ok(UserDirectoryRecord {
         account_id_hex: record.account_id_hex,
         npub: record.npub,

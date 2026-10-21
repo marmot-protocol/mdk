@@ -1,10 +1,12 @@
 //! Network-free public-profile search across every connected account's caches.
 
+use crate::AppError;
+use crate::directory::error::DirectoryError;
 use std::collections::{BTreeMap, HashSet, btree_map::Entry};
 
 use super::records::user_record_match;
 use crate::{
-    AppError, MarmotApp, OFF_GRAPH_SEARCH_RADIUS, UserDirectoryRecord, UserDirectorySearchResult,
+    MarmotApp, OFF_GRAPH_SEARCH_RADIUS, UserDirectoryRecord, UserDirectorySearchResult,
     parse_account_id_hex, sort_user_search_results,
 };
 
@@ -24,6 +26,7 @@ impl MarmotApp {
     ) -> Result<Vec<UserDirectorySearchResult>, AppError> {
         self.cached_search_snapshot(searcher_account_id_hex, query, limit)
             .map(|(_, results)| results)
+            .map_err(AppError::from)
     }
 
     pub(crate) fn cached_search_snapshot(
@@ -31,7 +34,7 @@ impl MarmotApp {
         searcher_account_id_hex: &str,
         query: &str,
         limit: usize,
-    ) -> Result<(HashSet<String>, Vec<UserDirectorySearchResult>), AppError> {
+    ) -> Result<(HashSet<String>, Vec<UserDirectorySearchResult>), DirectoryError> {
         let searcher = parse_account_id_hex(searcher_account_id_hex)?;
         let query = query.trim().to_lowercase();
         if query.is_empty() || limit == 0 {
@@ -109,7 +112,7 @@ impl MarmotApp {
     pub(crate) fn cached_search_follows(
         &self,
         searcher: &str,
-    ) -> Result<HashSet<String>, AppError> {
+    ) -> Result<HashSet<String>, DirectoryError> {
         Ok(self
             .cached_search_follow_list(searcher)?
             .unwrap_or_default()
@@ -123,7 +126,7 @@ impl MarmotApp {
     pub(crate) fn cached_search_follow_list(
         &self,
         searcher: &str,
-    ) -> Result<Option<Vec<String>>, AppError> {
+    ) -> Result<Option<Vec<String>>, DirectoryError> {
         let account = self
             .account_home()
             .accounts()?

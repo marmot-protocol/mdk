@@ -3,6 +3,10 @@ use marmot_account::{AccountError, AccountHomeError};
 
 use crate::MissingRelayListKind;
 use crate::app_telemetry::{SyncErrorClass, SyncFailureClassification};
+pub use crate::directory::error::MissingKeyPackageReason;
+use crate::directory::error::{
+    DirectoryError, ResourceError, sqlite_error_kind, storage_error_kind,
+};
 
 /// Worker-safe account catch-up failure. The human-facing message remains for
 /// compatibility, while telemetry propagation uses only the closed
@@ -42,30 +46,6 @@ impl AccountCatchUpFailure {
 impl std::fmt::Display for AccountCatchUpFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.message.fmt(formatter)
-    }
-}
-
-/// Why a completed KeyPackage lookup found nothing usable for joins.
-/// Both reasons describe only the searched relays; neither proves global
-/// absence, and neither relaxes current-profile admission.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum MissingKeyPackageReason {
-    /// No newest slot held a KeyPackage publication.
-    #[error("no published key package for account")]
-    NotFound,
-    /// Every newest slot held a legacy-profile publication: the account
-    /// must update and publish a current KeyPackage before it can be invited.
-    #[error("account has only obsolete key packages published")]
-    ObsoleteOnly,
-}
-
-impl MissingKeyPackageReason {
-    /// Stable token for CLI JSON and diagnostics.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::NotFound => "not_found",
-            Self::ObsoleteOnly => "obsolete_only",
-        }
     }
 }
 
@@ -435,6 +415,65 @@ pub enum AppError {
     TransportClosed,
 }
 
+/// The directory's errors convert back to the `AppError` they replaced: the
+/// same variant, message and `privacy_safe_kind` as before the directory had its
+/// own type.
+impl From<DirectoryError> for AppError {
+    fn from(error: DirectoryError) -> Self {
+        match error {
+            DirectoryError::InvalidKeyPackageEvent(value) => Self::InvalidKeyPackageEvent(value),
+            DirectoryError::RelayDirectory(value) => Self::RelayDirectory(value),
+            DirectoryError::InvalidDirectorySearch(value) => Self::InvalidDirectorySearch(value),
+            DirectoryError::DirectoryLookupIncomplete(value) => {
+                Self::DirectoryLookupIncomplete(value)
+            }
+            DirectoryError::MissingRelayLists(value) => Self::MissingRelayLists(value),
+            DirectoryError::MissingMemberInboxRoute(value) => Self::MissingMemberInboxRoute(value),
+            DirectoryError::InvalidPublicEventReferences(value) => {
+                Self::InvalidPublicEventReferences(value)
+            }
+            DirectoryError::MissingDirectoryEntry(value) => Self::MissingDirectoryEntry(value),
+            DirectoryError::InvalidNostrRouting(value) => Self::InvalidNostrRouting(value),
+            DirectoryError::InvalidCachedIdentityPage(value) => {
+                Self::InvalidCachedIdentityPage(value)
+            }
+            DirectoryError::BlockingTask(value) => Self::BlockingTask(value),
+            DirectoryError::Storage(value) => Self::Storage(value),
+            DirectoryError::Io(value) => Self::Io(value),
+            DirectoryError::Json(value) => Self::Json(value),
+            DirectoryError::Sqlite(value) => Self::Sqlite(value),
+            DirectoryError::Hex(value) => Self::Hex(value),
+            DirectoryError::InvalidPublicKey => Self::InvalidPublicKey,
+            DirectoryError::TransportClosed => Self::TransportClosed,
+            DirectoryError::MissingKeyPackage { account, reason } => {
+                Self::MissingKeyPackage { account, reason }
+            }
+            DirectoryError::KeyPackageRequirements(error) => {
+                Self::from(cgka_session::SessionError::from(error))
+            }
+            DirectoryError::Resource(error) => *error
+                .into_inner()
+                .downcast::<AppError>()
+                .expect("only marmot-app builds a ResourceError, always from an AppError"),
+        }
+    }
+}
+
+/// An app failure inside directory code travels as
+/// [`DirectoryError::Resource`] and converts back unchanged.
+impl From<AppError> for DirectoryError {
+    fn from(error: AppError) -> Self {
+        let kind = error.privacy_safe_kind();
+        Self::Resource(ResourceError::from_app(error, kind))
+    }
+}
+
+impl From<AccountHomeError> for DirectoryError {
+    fn from(error: AccountHomeError) -> Self {
+        AppError::from(error).into()
+    }
+}
+
 impl From<TransportAdapterError> for AppError {
     fn from(error: TransportAdapterError) -> Self {
         if error.to_string().contains(crate::EXTERNAL_SIGNER_REJECTED) {
@@ -481,14 +520,7 @@ impl AppError {
             Self::Transport(_) => "transport",
             Self::Io(_) => "io",
             Self::Json(_) => "json",
-            Self::Sqlite(error) => match error.sqlite_error_code() {
-                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
-                    "storage_busy"
-                }
-                Some(rusqlite::ErrorCode::DatabaseCorrupt) => "storage_corruption",
-                Some(rusqlite::ErrorCode::DiskFull) => "storage_capacity",
-                _ => "sqlite",
-            },
+            Self::Sqlite(error) => sqlite_error_kind(error),
             Self::Hex(_) => "hex",
             Self::MissingKeyPackage { .. } => "missing_key_package",
             Self::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
@@ -780,23 +812,6 @@ fn storage_error_class(error: &StorageError) -> SyncErrorClass {
     }
 }
 
-fn storage_error_kind(error: &StorageError) -> &'static str {
-    match error {
-        StorageError::NotFound => "storage_not_found",
-        StorageError::AlreadyExists => "storage_already_exists",
-        StorageError::SnapshotMissing(_) => "storage_snapshot_missing",
-        StorageError::TimelineCursorExpired => "storage_timeline_cursor_expired",
-        StorageError::Busy(_) => "storage_busy",
-        StorageError::Corruption(_) => "storage_corruption",
-        StorageError::Capacity(_) => "storage_capacity",
-        StorageError::Closed(_) => "storage_closed",
-        StorageError::UnsupportedSchemaVersion { .. } => "storage_unsupported_schema_version",
-        StorageError::InvalidAttachmentBody(_) => "storage_invalid_attachment_body",
-        StorageError::Backend(_) => "storage_backend",
-        StorageError::Serialization(_) => "storage_serialization",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{AccountCatchUpFailure, AccountError, AppError, StorageError};
@@ -1000,5 +1015,218 @@ mod tests {
             let kind = AppError::Session(error).privacy_safe_kind();
             assert_eq!(transient, kind == "storage_busy", "kind {kind}");
         }
+    }
+}
+
+#[cfg(test)]
+mod directory_error_tests {
+    //! `DirectoryError` converts back to the `AppError` the directory used
+    //! before it had its own type (step 3 of
+    //! `docs/marmot-architecture/review/brief-directory.md`).
+
+    use cgka_traits::error::EngineError;
+    use cgka_traits::storage::StorageError;
+    use marmot_account::AccountHomeError;
+
+    use super::AppError;
+    use crate::MissingRelayListKind;
+    use crate::directory::error::{DirectoryError, MissingKeyPackageReason};
+
+    /// Each case's `AppError` is built the way the directory built it before.
+    fn cases() -> Vec<(DirectoryError, AppError)> {
+        let sqlite_busy = || {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            )
+        };
+        let json = || serde_json::from_str::<u8>("x").unwrap_err();
+        let hex = || hex::decode("zz").unwrap_err();
+        let io = || std::io::Error::other("disk");
+        vec![
+            (
+                DirectoryError::InvalidKeyPackageEvent("tag".into()),
+                AppError::InvalidKeyPackageEvent("tag".into()),
+            ),
+            (DirectoryError::InvalidPublicKey, AppError::InvalidPublicKey),
+            (
+                DirectoryError::RelayDirectory("timeout".into()),
+                AppError::RelayDirectory("timeout".into()),
+            ),
+            (
+                DirectoryError::MissingKeyPackage {
+                    account: "a".into(),
+                    reason: MissingKeyPackageReason::ObsoleteOnly,
+                },
+                AppError::MissingKeyPackage {
+                    account: "a".into(),
+                    reason: MissingKeyPackageReason::ObsoleteOnly,
+                },
+            ),
+            (
+                DirectoryError::InvalidDirectorySearch("radius".into()),
+                AppError::InvalidDirectorySearch("radius".into()),
+            ),
+            (
+                DirectoryError::DirectoryLookupIncomplete("a".into()),
+                AppError::DirectoryLookupIncomplete("a".into()),
+            ),
+            (
+                DirectoryError::MissingRelayLists(vec![MissingRelayListKind::Inbox]),
+                AppError::MissingRelayLists(vec![MissingRelayListKind::Inbox]),
+            ),
+            (DirectoryError::TransportClosed, AppError::TransportClosed),
+            (
+                DirectoryError::MissingMemberInboxRoute("a".into()),
+                AppError::MissingMemberInboxRoute("a".into()),
+            ),
+            (
+                DirectoryError::InvalidPublicEventReferences("17".into()),
+                AppError::InvalidPublicEventReferences("17".into()),
+            ),
+            (
+                DirectoryError::MissingDirectoryEntry("a".into()),
+                AppError::MissingDirectoryEntry("a".into()),
+            ),
+            (
+                DirectoryError::InvalidNostrRouting("relay".into()),
+                AppError::InvalidNostrRouting("relay".into()),
+            ),
+            (
+                DirectoryError::InvalidCachedIdentityPage("101".into()),
+                AppError::InvalidCachedIdentityPage("101".into()),
+            ),
+            (
+                DirectoryError::BlockingTask("panicked".into()),
+                AppError::BlockingTask("panicked".into()),
+            ),
+            (
+                DirectoryError::Storage(StorageError::Closed("cache".into())),
+                AppError::Storage(StorageError::Closed("cache".into())),
+            ),
+            (
+                DirectoryError::Storage(StorageError::Busy("cache".into())),
+                AppError::Storage(StorageError::Busy("cache".into())),
+            ),
+            (DirectoryError::Io(io()), AppError::Io(io())),
+            (DirectoryError::Json(json()), AppError::Json(json())),
+            (
+                DirectoryError::Sqlite(sqlite_busy()),
+                AppError::Sqlite(sqlite_busy()),
+            ),
+            (DirectoryError::Hex(hex()), AppError::Hex(hex())),
+            // A KeyPackage requirements failure: the app's session-error step.
+            (
+                DirectoryError::KeyPackageRequirements(EngineError::UnknownPending),
+                AppError::from(cgka_session::SessionError::from(
+                    EngineError::UnknownPending,
+                )),
+            ),
+            (
+                DirectoryError::KeyPackageRequirements(EngineError::Storage(StorageError::Busy(
+                    "engine".into(),
+                ))),
+                AppError::from(cgka_session::SessionError::from(EngineError::Storage(
+                    StorageError::Busy("engine".into()),
+                ))),
+            ),
+            // App failures that reach directory code through a resource call:
+            // account lookup,
+            (
+                AppError::from(AccountHomeError::UnknownAccount("alice".into())).into(),
+                AppError::from(AccountHomeError::UnknownAccount("alice".into())),
+            ),
+            // the cache key's signing or external secret,
+            (
+                AppError::from(AccountHomeError::SecretNotFound("alice".into())).into(),
+                AppError::from(AccountHomeError::SecretNotFound("alice".into())),
+            ),
+            (
+                AccountHomeError::SecretStoreUnavailable("keychain".into()).into(),
+                AppError::from(AccountHomeError::SecretStoreUnavailable("keychain".into())),
+            ),
+            // closed app storage,
+            (
+                AppError::Storage(StorageError::Closed("app storage".into())).into(),
+                AppError::Storage(StorageError::Closed("app storage".into())),
+            ),
+            // a cache or shared-storage open, and its salt file,
+            (
+                AppError::Sqlite(sqlite_busy()).into(),
+                AppError::Sqlite(sqlite_busy()),
+            ),
+            (AppError::Io(io()).into(), AppError::Io(io())),
+            // and the block list.
+            (
+                AppError::BlockListUnavailable.into(),
+                AppError::BlockListUnavailable,
+            ),
+        ]
+    }
+
+    /// Fails to compile when a variant is added without a case above.
+    fn covered(error: &DirectoryError) {
+        match error {
+            DirectoryError::InvalidKeyPackageEvent(_)
+            | DirectoryError::InvalidPublicKey
+            | DirectoryError::RelayDirectory(_)
+            | DirectoryError::MissingKeyPackage { .. }
+            | DirectoryError::InvalidDirectorySearch(_)
+            | DirectoryError::DirectoryLookupIncomplete(_)
+            | DirectoryError::MissingRelayLists(_)
+            | DirectoryError::TransportClosed
+            | DirectoryError::MissingMemberInboxRoute(_)
+            | DirectoryError::InvalidPublicEventReferences(_)
+            | DirectoryError::MissingDirectoryEntry(_)
+            | DirectoryError::InvalidNostrRouting(_)
+            | DirectoryError::InvalidCachedIdentityPage(_)
+            | DirectoryError::BlockingTask(_)
+            | DirectoryError::Storage(_)
+            | DirectoryError::Io(_)
+            | DirectoryError::Json(_)
+            | DirectoryError::Sqlite(_)
+            | DirectoryError::Hex(_)
+            | DirectoryError::KeyPackageRequirements(_)
+            | DirectoryError::Resource(_) => {}
+        }
+    }
+
+    #[test]
+    fn every_directory_error_converts_to_the_app_error_it_replaced() {
+        for (directory_error, expected) in cases() {
+            covered(&directory_error);
+            let message = directory_error.to_string();
+            let kind = directory_error.privacy_safe_kind();
+            let converted = AppError::from(directory_error);
+            assert_eq!(
+                std::mem::discriminant(&converted),
+                std::mem::discriminant(&expected),
+                "{converted:?} is not the variant of {expected:?}"
+            );
+            assert_eq!(converted.to_string(), expected.to_string());
+            assert_eq!(
+                message,
+                expected.to_string(),
+                "directory message for {expected:?}"
+            );
+            assert_eq!(converted.privacy_safe_kind(), expected.privacy_safe_kind());
+            assert_eq!(
+                kind,
+                expected.privacy_safe_kind(),
+                "directory kind for {expected:?}"
+            );
+            assert_eq!(format!("{converted:?}"), format!("{expected:?}"));
+        }
+    }
+
+    #[test]
+    fn app_errors_come_back_from_the_directory_unchanged() {
+        let app = AppError::from(AccountHomeError::UnknownAccount("alice".into()));
+        let carried = DirectoryError::from(app);
+        assert!(matches!(carried, DirectoryError::Resource(_)));
+        assert!(matches!(
+            AppError::from(carried),
+            AppError::AccountHome(AccountHomeError::UnknownAccount(label)) if label == "alice"
+        ));
     }
 }

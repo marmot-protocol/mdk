@@ -16,6 +16,7 @@
 //! The synchronous [`MarmotApp::search_user_directory`] remains the offline
 //! path over already-cached follow edges; this module is the live one.
 
+use crate::AppError;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -34,9 +35,9 @@ use super::records::{
     UserDirectoryRecord, UserDirectorySearchResult, latest_follow_list_from_records,
     latest_fresh_profiles_from_records, profile_from_record, user_record_match,
 };
+use crate::directory::error::DirectoryError;
+use crate::directory::error::blocking_directory_task;
 use crate::directory::ids::{npub_for_account_id_lossy, parse_account_id_hex};
-use crate::error::AppError;
-use crate::runtime::blocking_app_task;
 use crate::{KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp, relay_list_state_from_event};
 use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 use transport_nostr_adapter::KIND_NIP65_RELAY_LIST;
@@ -137,14 +138,14 @@ pub struct UserSearchParams {
 
 impl UserSearchParams {
     /// Check the request and return the searcher's canonical pubkey hex.
-    fn validate(&self) -> Result<String, AppError> {
+    fn validate(&self) -> Result<String, DirectoryError> {
         if self.radius_start > self.radius_end {
-            return Err(AppError::InvalidDirectorySearch(
+            return Err(DirectoryError::InvalidDirectorySearch(
                 "radius_start must be less than or equal to radius_end".into(),
             ));
         }
         if self.radius_end > MAX_SUPPORTED_SEARCH_RADIUS {
-            return Err(AppError::InvalidDirectorySearch(format!(
+            return Err(DirectoryError::InvalidDirectorySearch(format!(
                 "radius_end must be at most {MAX_SUPPORTED_SEARCH_RADIUS}"
             )));
         }
@@ -233,15 +234,16 @@ impl MarmotApp {
     ) -> Result<UserSearchSubscription, AppError> {
         self.search_users_with_seeds(params, std::future::ready(Ok(Vec::new())))
             .await
+            .map_err(AppError::from)
     }
 
     pub(crate) async fn search_users_with_seeds<F>(
         &self,
         params: UserSearchParams,
         seeds: F,
-    ) -> Result<UserSearchSubscription, AppError>
+    ) -> Result<UserSearchSubscription, DirectoryError>
     where
-        F: Future<Output = Result<Vec<String>, AppError>> + Send + 'static,
+        F: Future<Output = Result<Vec<String>, DirectoryError>> + Send + 'static,
     {
         let observation = self.product_analytics.begin(
             crate::ProductFamily::Directory,
@@ -284,7 +286,7 @@ async fn run_search<F>(
     observation: Option<crate::ProductObservation>,
     seeds: F,
 ) where
-    F: Future<Output = Result<Vec<String>, AppError>> + Send,
+    F: Future<Output = Result<Vec<String>, DirectoryError>> + Send,
 {
     let source_observation = app
         .product_analytics
@@ -316,7 +318,7 @@ async fn run_search<F>(
         let cached_searcher = searcher_account_id_hex.clone();
         let cached_query = query.clone();
         let cached_started = Instant::now();
-        let cached = blocking_app_task(move || {
+        let cached = blocking_directory_task(move || {
             cached_app.cached_search_snapshot(
                 &cached_searcher,
                 &cached_query,
@@ -489,9 +491,9 @@ async fn drive_search_sources<G, D>(
     updates: mpsc::Sender<UserSearchUpdate>,
     graph: G,
     discovery: D,
-) -> Option<Result<(), AppError>>
+) -> Option<Result<(), DirectoryError>>
 where
-    G: Future<Output = Result<(), AppError>>,
+    G: Future<Output = Result<(), DirectoryError>>,
     D: Future<Output = ()>,
 {
     tokio::select! {
@@ -543,7 +545,7 @@ async fn hydrate_open_ranking_profiles(
     app: &MarmotApp,
     ranked_pubkeys: Vec<RankedPubkey>,
     profile_relays: &[TransportEndpoint],
-) -> Result<Vec<RankedDirectoryRecord>, AppError> {
+) -> Result<Vec<RankedDirectoryRecord>, DirectoryError> {
     let account_ids = ranked_pubkeys
         .iter()
         .map(|ranked| ranked.account_id_hex.clone())
@@ -578,7 +580,7 @@ async fn traverse_graph(
     query: &str,
     params: &UserSearchParams,
     emitter: &mut SearchEmitter,
-) -> Result<(), AppError> {
+) -> Result<(), DirectoryError> {
     let mut frontier = vec![searcher_account_id_hex.to_owned()];
     let mut seen: HashSet<String> = frontier.iter().cloned().collect();
     // Set once the traversal leaves the searcher's own graph for a configured
@@ -661,7 +663,7 @@ async fn advance_radius(
     params: &UserSearchParams,
     seen: &mut HashSet<String>,
     emitter: &mut SearchEmitter,
-) -> Result<Vec<String>, AppError> {
+) -> Result<Vec<String>, DirectoryError> {
     // Radii below the requested window are traversed but not reported: they
     // are only the path to the layers the caller did ask for, so resolving
     // their profiles would be relay traffic for results nobody receives.
@@ -707,7 +709,7 @@ async fn resolve_layer(
     query: &str,
     radius: u8,
     emitter: &mut SearchEmitter,
-) -> Result<(), AppError> {
+) -> Result<(), DirectoryError> {
     let now = crate::unix_now_seconds() as i64;
     let (local, missing) = partition_locally_known(app, frontier, now).await?;
     emitter.tally.resolved_from_cache(local.len());
@@ -788,7 +790,7 @@ fn replace_resolved_profiles(
 async fn resolve_from_write_relays(
     app: &MarmotApp,
     account_ids: &[String],
-) -> Result<Vec<UserDirectoryRecord>, AppError> {
+) -> Result<Vec<UserDirectoryRecord>, DirectoryError> {
     let mut authors_by_relay: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for record in app
         .fetch_events_for_account_ids(account_ids, KIND_NIP65_RELAY_LIST, &[])
@@ -876,7 +878,7 @@ async fn cache_resolved_profiles(
     app: &MarmotApp,
     records: &[UserDirectoryRecord],
     now: i64,
-) -> Result<(), AppError> {
+) -> Result<(), DirectoryError> {
     let resolved = records
         .iter()
         .filter(|record| record.profile.is_some())
@@ -896,7 +898,7 @@ async fn cache_resolved_profiles(
     }
 
     let app = app.clone();
-    blocking_app_task(move || {
+    blocking_directory_task(move || {
         for cache in app.directory_caches()? {
             for record in &resolved {
                 cache.put_search_graph_record(record, now)?;
@@ -919,10 +921,10 @@ async fn partition_locally_known(
     app: &MarmotApp,
     frontier: &[String],
     now: i64,
-) -> Result<(Vec<UserDirectoryRecord>, Vec<String>), AppError> {
+) -> Result<(Vec<UserDirectoryRecord>, Vec<String>), DirectoryError> {
     let app = app.clone();
     let frontier = frontier.to_vec();
-    blocking_app_task(move || {
+    blocking_directory_task(move || {
         let caches = app.directory_caches()?;
         let shared_storage = app.shared_storage()?;
         let local_accounts = app.local_accounts_by_id()?;
@@ -960,7 +962,7 @@ fn search_graph_profile(
     caches: &[DirectoryCache],
     account_id_hex: &str,
     now: i64,
-) -> Result<Option<UserDirectoryRecord>, AppError> {
+) -> Result<Option<UserDirectoryRecord>, DirectoryError> {
     for cache in caches {
         if let Some(record) = cache.search_graph_record(account_id_hex, now)?
             && record.profile.is_some()
@@ -982,7 +984,7 @@ fn search_graph_profile(
 async fn fetch_profile_records(
     app: &MarmotApp,
     batch: &[String],
-) -> Result<Vec<UserDirectoryRecord>, AppError> {
+) -> Result<Vec<UserDirectoryRecord>, DirectoryError> {
     let mut profiles = app
         .fetch_events_for_account_ids(batch, KIND_NOSTR_METADATA, &[])
         .await?
@@ -1008,11 +1010,11 @@ async fn extend_with_follows(
     layer: &mut NextLayer,
     searcher: Option<&str>,
     emitter: &mut SearchEmitter,
-) -> Result<(), AppError> {
+) -> Result<(), DirectoryError> {
     let (cached, unknown) = if let Some(searcher) = searcher {
         let app = app.clone();
         let searcher = searcher.to_owned();
-        blocking_app_task(move || {
+        blocking_directory_task(move || {
             Ok(match app.cached_search_follow_list(&searcher)? {
                 Some(follows) => (vec![follows], Vec::new()),
                 None => (Vec::new(), vec![searcher]),
@@ -1135,10 +1137,10 @@ impl NextLayer {
 async fn partition_cached_follows(
     app: &MarmotApp,
     frontier: &[String],
-) -> Result<(Vec<Vec<String>>, Vec<String>), AppError> {
+) -> Result<(Vec<Vec<String>>, Vec<String>), DirectoryError> {
     let app = app.clone();
     let frontier = frontier.to_vec();
-    blocking_app_task(move || {
+    blocking_directory_task(move || {
         let caches = app.directory_caches()?;
         let mut cached = Vec::new();
         let mut unknown = Vec::new();
@@ -1171,7 +1173,7 @@ async fn partition_cached_follows(
 async fn fetch_follow_lists(
     app: &MarmotApp,
     batch: &[String],
-) -> Result<Vec<(String, Vec<String>)>, AppError> {
+) -> Result<Vec<(String, Vec<String>)>, DirectoryError> {
     let records = app
         .fetch_events_for_account_ids(batch, KIND_NOSTR_CONTACT_LIST, &[])
         .await?;
@@ -1203,10 +1205,10 @@ async fn fetch_follow_lists(
 async fn cache_resolved_follows(
     app: &MarmotApp,
     fetched: &[(String, Vec<String>)],
-) -> Result<(), AppError> {
+) -> Result<(), DirectoryError> {
     let fetched = fetched.to_vec();
     let app = app.clone();
-    blocking_app_task(move || {
+    blocking_directory_task(move || {
         for cache in app.directory_caches()? {
             for (account_id_hex, follows) in &fetched {
                 cache.remember_search_graph_follows(
@@ -1615,7 +1617,7 @@ mod tests {
             async move {
                 let _lifetime = graph_lifetime;
                 let _ = graph_started.send(());
-                std::future::pending::<Result<(), AppError>>().await
+                std::future::pending::<Result<(), DirectoryError>>().await
             },
             async move {
                 let _lifetime = provider_lifetime;
@@ -1659,7 +1661,7 @@ mod tests {
         let subscription = app
             .search_users_with_seeds(
                 params(&account.account_id_hex, "needle", (0, 0)),
-                std::future::ready(Err(AppError::RelayDirectory(
+                std::future::ready(Err(DirectoryError::RelayDirectory(
                     "membership unavailable".into(),
                 ))),
             )
@@ -1709,7 +1711,7 @@ mod tests {
                 async move {
                     let _guard = DropSignal(Some(dropped_tx));
                     let _ = seed_started_tx.send(());
-                    std::future::pending::<Result<Vec<String>, AppError>>().await
+                    std::future::pending::<Result<Vec<String>, DirectoryError>>().await
                 },
             )
             .await

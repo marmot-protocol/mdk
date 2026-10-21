@@ -1,5 +1,6 @@
 mod migrations;
 
+use crate::directory::error::DirectoryError;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use storage_sqlite::{
     CloseableConnection, ConnectionGuard, SqlCipherHardening, SqlCipherKey, open_hardened_sqlcipher,
 };
 
-use crate::{AccountRelayListStatus, AppError, UserDirectoryRecord, UserProfileMetadata};
+use crate::{AccountRelayListStatus, UserDirectoryRecord, UserProfileMetadata};
 
 /// How long a `kind:0` profile resolved by web-of-trust search stays usable
 /// before search re-fetches it.
@@ -48,7 +49,7 @@ pub(crate) struct DirectoryCache {
 }
 
 impl DirectoryCache {
-    pub(crate) fn open(path: PathBuf, key: &SqlCipherKey) -> Result<Self, AppError> {
+    pub(crate) fn open(path: PathBuf, key: &SqlCipherKey) -> Result<Self, DirectoryError> {
         record_directory_cache_open();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -65,7 +66,7 @@ impl DirectoryCache {
         Self::from_connection(conn)
     }
 
-    pub(crate) fn open_legacy_plaintext(path: PathBuf) -> Result<Option<Self>, AppError> {
+    pub(crate) fn open_legacy_plaintext(path: PathBuf) -> Result<Option<Self>, DirectoryError> {
         if !path.exists() {
             return Ok(None);
         }
@@ -78,7 +79,7 @@ impl DirectoryCache {
         Self::from_connection(conn).map(Some)
     }
 
-    fn from_connection(mut conn: Connection) -> Result<Self, AppError> {
+    fn from_connection(mut conn: Connection) -> Result<Self, DirectoryError> {
         migrations::run_all(&mut conn)?;
         let cache = Self {
             conn: Arc::new(CloseableConnection::new(conn, CLOSED_DETAIL)),
@@ -103,7 +104,7 @@ impl DirectoryCache {
     /// storage error and nothing reopens. `MarmotApp::close_storage` closes
     /// caches through [`Self::closer`].
     #[cfg(test)]
-    pub(crate) fn close(&self) -> Result<(), AppError> {
+    pub(crate) fn close(&self) -> Result<(), DirectoryError> {
         Ok(self.conn.close()?)
     }
 
@@ -112,14 +113,14 @@ impl DirectoryCache {
         self.conn.closer()
     }
 
-    pub(crate) fn lock(&self) -> Result<ConnectionGuard<'_>, AppError> {
+    pub(crate) fn lock(&self) -> Result<ConnectionGuard<'_>, DirectoryError> {
         Ok(self.conn.lock()?)
     }
 
     pub(crate) fn entry(
         &self,
         account_id_hex: &str,
-    ) -> Result<Option<UserDirectoryRecord>, AppError> {
+    ) -> Result<Option<UserDirectoryRecord>, DirectoryError> {
         let conn = self.lock()?;
         let Some(row) = Self::directory_user_row(&conn, account_id_hex)? else {
             return Ok(None);
@@ -127,7 +128,7 @@ impl DirectoryCache {
         Self::record_from_directory_user_row(&conn, row).map(Some)
     }
 
-    pub(crate) fn entries(&self) -> Result<Vec<UserDirectoryRecord>, AppError> {
+    pub(crate) fn entries(&self) -> Result<Vec<UserDirectoryRecord>, DirectoryError> {
         let conn = self.lock()?;
         let mut statement = conn.prepare(
             "SELECT account_id_hex, npub, local_account_json, profile_json,
@@ -146,7 +147,7 @@ impl DirectoryCache {
     pub(crate) fn profiles_for_ids(
         &self,
         account_ids: &[String],
-    ) -> Result<Vec<(String, Option<UserProfileMetadata>)>, AppError> {
+    ) -> Result<Vec<(String, Option<UserProfileMetadata>)>, DirectoryError> {
         let conn = self.lock()?;
         let mut profiles = Vec::new();
         for ids in account_ids.chunks(PROFILE_QUERY_BATCH_SIZE) {
@@ -174,7 +175,7 @@ impl DirectoryCache {
     pub(crate) fn public_search_records(
         &self,
         now: i64,
-    ) -> Result<Vec<UserDirectoryRecord>, AppError> {
+    ) -> Result<Vec<UserDirectoryRecord>, DirectoryError> {
         self.public_search_records_capped(now, super::cached_search::CACHED_SEARCH_MAX_RECORDS)
     }
 
@@ -182,7 +183,7 @@ impl DirectoryCache {
         &self,
         now: i64,
         max: usize,
-    ) -> Result<Vec<UserDirectoryRecord>, AppError> {
+    ) -> Result<Vec<UserDirectoryRecord>, DirectoryError> {
         let conn = self.lock()?;
         let mut statement = conn.prepare(
             "WITH candidates AS (
@@ -238,14 +239,14 @@ impl DirectoryCache {
         &self,
         account_id_hex: &str,
         now: i64,
-    ) -> Result<Option<UserDirectoryRecord>, AppError> {
+    ) -> Result<Option<UserDirectoryRecord>, DirectoryError> {
         if let Some(record) = self.entry(account_id_hex)? {
             return Ok(Some(record));
         }
         self.search_graph_record(account_id_hex, now)
     }
 
-    pub(crate) fn put(&self, entry: &UserDirectoryRecord) -> Result<(), AppError> {
+    pub(crate) fn put(&self, entry: &UserDirectoryRecord) -> Result<(), DirectoryError> {
         self.put_with_reason(entry, "directory")
     }
 
@@ -253,7 +254,7 @@ impl DirectoryCache {
         &self,
         entry: &UserDirectoryRecord,
         reason: &str,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), DirectoryError> {
         #[cfg(test)]
         self.put_count.fetch_add(1, Ordering::SeqCst);
         let mut conn = self.lock()?;
@@ -267,7 +268,7 @@ impl DirectoryCache {
         conn: &Connection,
         entry: &UserDirectoryRecord,
         reason: &str,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), DirectoryError> {
         let now = unix_now_seconds() as i64;
         conn.execute(
             "INSERT INTO directory_users (
@@ -318,7 +319,7 @@ impl DirectoryCache {
     fn directory_user_row(
         conn: &Connection,
         account_id_hex: &str,
-    ) -> Result<Option<DirectoryUserRow>, AppError> {
+    ) -> Result<Option<DirectoryUserRow>, DirectoryError> {
         conn.query_row(
             "SELECT account_id_hex, npub, local_account_json, profile_json,
                     relay_lists_json, key_package_json
@@ -328,13 +329,13 @@ impl DirectoryCache {
             directory_user_row_from_row,
         )
         .optional()
-        .map_err(AppError::from)
+        .map_err(DirectoryError::from)
     }
 
     fn record_from_directory_user_row(
         conn: &Connection,
         row: DirectoryUserRow,
-    ) -> Result<UserDirectoryRecord, AppError> {
+    ) -> Result<UserDirectoryRecord, DirectoryError> {
         let follows = Self::follow_rows(conn, "directory_user_follows", &row.account_id_hex)?;
         let follow_source_relays = Self::follow_source_rows(conn, &row.account_id_hex)?;
         Ok(UserDirectoryRecord {
@@ -360,7 +361,7 @@ impl DirectoryCache {
         &self,
         account_id_hex: &str,
         now: i64,
-    ) -> Result<Option<UserDirectoryRecord>, AppError> {
+    ) -> Result<Option<UserDirectoryRecord>, DirectoryError> {
         let conn = self.lock()?;
         let Some(row) = conn
             .query_row(
@@ -409,7 +410,7 @@ impl DirectoryCache {
         conn: &Connection,
         entry: &UserDirectoryRecord,
         now: i64,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), DirectoryError> {
         Self::put_search_graph_record_locked(
             conn,
             &DirectorySearchGraphRecord {
@@ -439,7 +440,7 @@ impl DirectoryCache {
     pub(crate) fn search_graph_follows(
         &self,
         account_id_hex: &str,
-    ) -> Result<Option<Vec<String>>, AppError> {
+    ) -> Result<Option<Vec<String>>, DirectoryError> {
         let conn = self.lock()?;
         let known = conn
             .query_row(
@@ -465,7 +466,7 @@ impl DirectoryCache {
         &self,
         record: &DirectorySearchGraphRecord,
         now: i64,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), DirectoryError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         Self::put_search_graph_record_locked(&tx, record, now)?;
@@ -485,7 +486,7 @@ impl DirectoryCache {
         account_id_hex: &str,
         npub: &str,
         follows: &[String],
-    ) -> Result<(), AppError> {
+    ) -> Result<(), DirectoryError> {
         let now = unix_now_seconds() as i64;
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
@@ -521,7 +522,7 @@ impl DirectoryCache {
         conn: &Connection,
         record: &DirectorySearchGraphRecord,
         now: i64,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), DirectoryError> {
         let metadata_updated_at = record
             .metadata_updated_at
             .and_then(|value| i64::try_from(value).ok());
@@ -587,7 +588,7 @@ impl DirectoryCache {
         account_id_hex: &str,
         follows: &[String],
         now: i64,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), DirectoryError> {
         conn.execute(
             &format!("DELETE FROM {table} WHERE account_id_hex = ?1"),
             [account_id_hex],
@@ -619,7 +620,7 @@ impl DirectoryCache {
         account_id_hex: &str,
         source_relays: &[String],
         now: i64,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), DirectoryError> {
         conn.execute(
             "DELETE FROM directory_follow_source_relays WHERE account_id_hex = ?1",
             [account_id_hex],
@@ -649,7 +650,7 @@ impl DirectoryCache {
         account_id_hex: &str,
         reason: &str,
         now: i64,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), DirectoryError> {
         conn.execute(
             "INSERT INTO directory_known_user_reasons (
                 account_id_hex,
@@ -669,7 +670,7 @@ impl DirectoryCache {
         conn: &Connection,
         table: &str,
         account_id_hex: &str,
-    ) -> Result<Vec<String>, AppError> {
+    ) -> Result<Vec<String>, DirectoryError> {
         let mut statement = conn.prepare(&format!(
             "SELECT follow_account_id_hex FROM {table}
              WHERE account_id_hex = ?1
@@ -686,7 +687,7 @@ impl DirectoryCache {
     fn follow_source_rows(
         conn: &Connection,
         account_id_hex: &str,
-    ) -> Result<Vec<String>, AppError> {
+    ) -> Result<Vec<String>, DirectoryError> {
         let mut statement = conn.prepare(
             "SELECT relay_url FROM directory_follow_source_relays
              WHERE account_id_hex = ?1
@@ -700,7 +701,7 @@ impl DirectoryCache {
         Ok(relays)
     }
 
-    fn migrate_legacy_json_records(conn: &Connection) -> Result<(), AppError> {
+    fn migrate_legacy_json_records(conn: &Connection) -> Result<(), DirectoryError> {
         if !Self::table_exists_locked(conn, "user_directory_records")? {
             return Ok(());
         }
@@ -724,12 +725,12 @@ impl DirectoryCache {
     }
 
     #[cfg(test)]
-    fn table_exists(&self, table: &str) -> Result<bool, AppError> {
+    fn table_exists(&self, table: &str) -> Result<bool, DirectoryError> {
         let conn = self.lock()?;
         Self::table_exists_locked(&conn, table)
     }
 
-    fn table_exists_locked(conn: &Connection, table: &str) -> Result<bool, AppError> {
+    fn table_exists_locked(conn: &Connection, table: &str) -> Result<bool, DirectoryError> {
         conn.query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
             [table],
@@ -737,7 +738,7 @@ impl DirectoryCache {
         )
         .optional()
         .map(|value| value.is_some())
-        .map_err(AppError::from)
+        .map_err(DirectoryError::from)
     }
 }
 
@@ -788,7 +789,7 @@ fn directory_user_row_from_row(
     })
 }
 
-fn optional_json<T>(value: &Option<T>) -> Result<Option<String>, AppError>
+fn optional_json<T>(value: &Option<T>) -> Result<Option<String>, DirectoryError>
 where
     T: Serialize,
 {
@@ -796,16 +797,16 @@ where
         .as_ref()
         .map(serde_json::to_string)
         .transpose()
-        .map_err(AppError::from)
+        .map_err(DirectoryError::from)
 }
 
-fn optional_value<T>(json: Option<String>) -> Result<Option<T>, AppError>
+fn optional_value<T>(json: Option<String>) -> Result<Option<T>, DirectoryError>
 where
     T: DeserializeOwned,
 {
     json.map(|json| serde_json::from_str(&json))
         .transpose()
-        .map_err(AppError::from)
+        .map_err(DirectoryError::from)
 }
 
 fn unix_now_seconds() -> u64 {
@@ -1030,7 +1031,7 @@ mod tests {
         let path = dir.path().join("directory.sqlite3");
         assert!(matches!(
             DirectoryCache::open(path.clone(), &key),
-            Err(AppError::Storage(
+            Err(DirectoryError::Storage(
                 cgka_traits::storage::StorageError::UnsupportedSchemaVersion {
                     found: 3,
                     latest_supported: 2
