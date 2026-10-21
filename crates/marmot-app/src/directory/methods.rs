@@ -1152,7 +1152,7 @@ impl MarmotApp {
         let caches = self.directory_caches()?;
         // One instant for the whole traversal: a layer must not disagree with
         // itself about whether a cached profile has expired.
-        let now = crate::unix_now_seconds() as i64;
+        let now = crate::directory::unix_now_seconds() as i64;
 
         for radius in 0..=radius_end {
             let mut next = Vec::new();

@@ -44,7 +44,8 @@ use nostr::nips::nip19::{FromBech32, Nip19};
 use nostr::prelude::{EventId, Filter, Kind, RelayUrl};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use crate::{MarmotApp, unix_now_seconds};
+use super::unix_now_seconds;
+use crate::MarmotApp;
 
 /// Maximum references in one cached batch read.
 pub const MAX_PUBLIC_EVENT_REFERENCES: usize = 16;

@@ -11,6 +11,7 @@ use cgka_traits::TransportEndpoint;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 
+use super::records::MUTE_LIST_KIND;
 use crate::{KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA, MarmotApp};
 use transport_nostr::{DirectorySyncBatch, DirectorySyncPlan, MarmotRelayPlane};
 use transport_nostr_adapter::{
@@ -36,7 +37,7 @@ pub(crate) const DIRECTORY_SYNC_KINDS: &[u64] = &[
 /// not amplify: their follows feed search/discovery without scheduling new
 /// contact-list subscriptions for the discovered users.
 pub(crate) const DIRECTORY_SYNC_LOCAL_ACCOUNT_KINDS: &[u64] = &[
-    crate::user_blocks::MUTE_LIST_KIND,
+    MUTE_LIST_KIND,
     KIND_NOSTR_METADATA,
     KIND_NOSTR_CONTACT_LIST,
     KIND_NIP65_RELAY_LIST,
@@ -355,7 +356,7 @@ async fn run_directory_sync_worker(
                 match event {
                     Ok(transport_nostr::DirectoryRelayPlaneEvent::Record(record)) => {
                         let app = app.clone();
-                        if record.event.kind == crate::user_blocks::MUTE_LIST_KIND {
+                        if record.event.kind == MUTE_LIST_KIND {
                             if block_adoptions.len() < MAX_BLOCK_ADOPTIONS {
                                 block_adoptions.spawn(async move {
                                     app.ingest_block_list_event(record.event).await

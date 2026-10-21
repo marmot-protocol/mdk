@@ -386,7 +386,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `transport_nostr::`.
 - `src/directory/`: also `cached_search.rs` (network-free cross-account search), `search.rs` (streaming web-of-trust
   search), `open_ranking.rs` (bounded Vertex Open Ranking discovery), `member_key_packages.rs` (set-oriented roster
-  KeyPackage resolution for create/invite).
+  KeyPackage resolution for create/invite), `config.rs` (the directory settings a deployment carries,
+  `OpenRankingProvider` and `KeyPackageClientPreference`, re-exported from `deployment.rs`). `mod.rs` holds the
+  directory's own clock, `unix_now_seconds`.
 - `src/sqlcipher/open_lock.rs`: in-process same-file open exclusion (the root lease covers cross-process).
 - Integration tests in `tests/` (with `tests/support/` and `tests/fixtures/`); media benchmarks in `benches/` (require
   `media-benchmarks`); `examples/usage_diagnostics_staging/`.

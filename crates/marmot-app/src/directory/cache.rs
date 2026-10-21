@@ -1,12 +1,12 @@
 mod migrations;
 
+use super::unix_now_seconds;
 use crate::directory::error::DirectoryError;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::Serialize;
@@ -807,13 +807,6 @@ where
     json.map(|json| serde_json::from_str(&json))
         .transpose()
         .map_err(DirectoryError::from)
-}
-
-fn unix_now_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(test)]

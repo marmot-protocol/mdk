@@ -4,10 +4,11 @@ use crate::AppError;
 use crate::directory::error::DirectoryError;
 use std::collections::{BTreeMap, HashSet, btree_map::Entry};
 
+use super::ids::parse_account_id_hex;
 use super::records::user_record_match;
 use crate::{
     MarmotApp, OFF_GRAPH_SEARCH_RADIUS, UserDirectoryRecord, UserDirectorySearchResult,
-    parse_account_id_hex, sort_user_search_results,
+    sort_user_search_results,
 };
 
 /// Defensive materialization cap, matching the shared public directory's bound.
@@ -59,7 +60,7 @@ impl MarmotApp {
                 }
             }
         };
-        let now = crate::unix_now_seconds() as i64;
+        let now = crate::directory::unix_now_seconds() as i64;
         for cache in self.directory_caches()? {
             for record in cache.public_search_records(now)? {
                 insert(record);
@@ -319,7 +320,7 @@ mod tests {
             .unwrap()
             .put_public_directory_user(&public_directory_user_record(&record).unwrap())
             .unwrap();
-        let now = crate::unix_now_seconds() as i64;
+        let now = crate::directory::unix_now_seconds() as i64;
         for (id, expires) in [(&search_peer, now + 100), (&expired_peer, now)] {
             bob_cache
                 .put_search_graph_record(

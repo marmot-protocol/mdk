@@ -1,5 +1,6 @@
 mod cache;
 mod cached_search;
+pub(crate) mod config;
 pub(crate) mod error;
 pub(crate) mod ids;
 mod key_package_recovery;
@@ -35,3 +36,11 @@ pub use search::{
     UserSearchUpdate, sort_user_search_results,
 };
 pub(crate) use sync::{DirectorySyncHandle, plan_directory_sync};
+
+/// The directory's wall clock, in Unix seconds.
+pub(crate) fn unix_now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}

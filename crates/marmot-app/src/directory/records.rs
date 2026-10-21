@@ -22,6 +22,9 @@ use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 
 pub(crate) const KIND_NOSTR_METADATA: u64 = 0;
 pub(crate) const KIND_NOSTR_CONTACT_LIST: u64 = 3;
+/// NIP-51 mute list, which carries an account's block list. The sync worker
+/// subscribes to it for local accounts and hands each one to the app.
+pub(crate) const MUTE_LIST_KIND: u64 = 10000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserDirectoryRecord {

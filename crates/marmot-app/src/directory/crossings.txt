@@ -8,8 +8,6 @@ directory/cached_search.rs MarmotApp::directory_caches()
 directory/cached_search.rs MarmotApp::shared_storage()
 directory/cached_search.rs crate::AppError
 directory/cached_search.rs crate::MarmotApp
-directory/cached_search.rs crate::parse_account_id_hex
-directory/cached_search.rs crate::unix_now_seconds
 directory/key_package_recovery.rs MarmotApp.relay_plane
 directory/key_package_recovery.rs MarmotApp::deployment()
 directory/key_package_recovery.rs crate::MarmotApp
@@ -37,17 +35,13 @@ directory/methods.rs crate::AppError
 directory/methods.rs crate::MarmotApp
 directory/methods.rs crate::ProductFamily
 directory/methods.rs crate::ProductUnit
-directory/methods.rs crate::unix_now_seconds
 directory/open_ranking.rs crate::network_proxy::http_builder
 directory/previews.rs MarmotApp.public_event_refreshes
 directory/previews.rs MarmotApp.relay_plane
 directory/previews.rs MarmotApp::account_home()
 directory/previews.rs MarmotApp::directory_cache_for_account()
 directory/previews.rs crate::MarmotApp
-directory/previews.rs crate::unix_now_seconds
 directory/previews.rs marmot_account::AccountSummary
-directory/published_records.rs crate::deployment::KeyPackageClientPreference
-directory/published_records.rs crate::unix_now_seconds
 directory/search.rs MarmotApp.product_analytics
 directory/search.rs MarmotApp.relay_plane
 directory/search.rs MarmotApp::deployment()
@@ -58,10 +52,8 @@ directory/search.rs crate::MarmotApp
 directory/search.rs crate::ProductFamily
 directory/search.rs crate::ProductObservation
 directory/search.rs crate::ProductUnit
-directory/search.rs crate::unix_now_seconds
 directory/sync.rs MarmotApp::account_home()
 directory/sync.rs MarmotApp::block_update_lock()
 directory/sync.rs MarmotApp::fetch_block_list()
 directory/sync.rs MarmotApp::ingest_block_list_event()
 directory/sync.rs crate::MarmotApp
-directory/sync.rs crate::user_blocks::MUTE_LIST_KIND

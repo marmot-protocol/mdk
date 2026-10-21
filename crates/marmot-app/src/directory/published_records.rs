@@ -23,9 +23,10 @@ use transport_nostr_adapter::{
 };
 use transport_nostr_peeler::NostrTransportEvent;
 
-use crate::deployment::KeyPackageClientPreference;
+use super::config::KeyPackageClientPreference;
+use super::unix_now_seconds;
 use crate::directory::error::{DirectoryError, MissingKeyPackageReason};
-use crate::{DirectoryKeyPackage, UserDirectoryRecord, unix_now_seconds};
+use crate::{DirectoryKeyPackage, UserDirectoryRecord};
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

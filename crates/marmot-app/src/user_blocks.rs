@@ -7,8 +7,8 @@ use storage_sqlite::{PendingBlockPublication, StoredBlockList};
 use transport_nostr::DirectoryEventQuery;
 use transport_nostr_peeler::{NostrTransportEvent, SdkSigner};
 
+use crate::directory::records::MUTE_LIST_KIND;
 pub use storage_sqlite::{BlockListSnapshot, BlockedUser};
-pub(crate) const MUTE_LIST_KIND: u64 = 10000;
 
 impl MarmotApp {
     pub(crate) async fn block_update_lock(&self, label: &str) -> Arc<tokio::sync::Mutex<()>> {

@@ -420,7 +420,7 @@ async fn run_search<F>(
                         if cache_resolved_profiles(
                             &app,
                             &profiles,
-                            crate::unix_now_seconds() as i64,
+                            crate::directory::unix_now_seconds() as i64,
                         )
                         .await
                         .is_err()
@@ -710,7 +710,7 @@ async fn resolve_layer(
     radius: u8,
     emitter: &mut SearchEmitter,
 ) -> Result<(), DirectoryError> {
-    let now = crate::unix_now_seconds() as i64;
+    let now = crate::directory::unix_now_seconds() as i64;
     let (local, missing) = partition_locally_known(app, frontier, now).await?;
     emitter.tally.resolved_from_cache(local.len());
     emitter.emit_matches(radius, local, query).await;
@@ -1955,7 +1955,7 @@ mod tests {
         let stranger = format!("{:064x}", 77);
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
         let cache = app.directory_cache_for_account(&account).unwrap();
-        let now = crate::unix_now_seconds() as i64;
+        let now = crate::directory::unix_now_seconds() as i64;
 
         // The searcher's own follow list is promoted (it is the local account's
         // own contact list, not a stranger's), so radius 1 expands offline.
@@ -2079,7 +2079,7 @@ mod tests {
         assert!(!result_profile.extra.contains_key("custom_blob"));
         assert_eq!(result_profile.extra.len(), 2);
 
-        let now = crate::unix_now_seconds() as i64;
+        let now = crate::directory::unix_now_seconds() as i64;
         let cached = cache
             .search_record(&stranger.account_id_hex, now)
             .unwrap()
@@ -2106,7 +2106,7 @@ mod tests {
         let stranger = format!("{:064x}", 62);
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
         let cache = app.directory_cache_for_account(&account).unwrap();
-        let now = crate::unix_now_seconds() as i64;
+        let now = crate::directory::unix_now_seconds() as i64;
 
         // alice -> friend (promoted, her own contact list)
         cache
@@ -2406,7 +2406,7 @@ mod tests {
         let co_member = format!("{:064x}", 81);
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
         let cache = app.directory_cache_for_account(&account).unwrap();
-        let now = crate::unix_now_seconds() as i64;
+        let now = crate::directory::unix_now_seconds() as i64;
 
         cache
             .put_search_graph_record(
@@ -2573,7 +2573,7 @@ mod tests {
                 .with_open_ranking_provider(None, Vec::new()),
         );
         let cache = app.directory_cache_for_account(&account).unwrap();
-        let now = crate::unix_now_seconds() as i64;
+        let now = crate::directory::unix_now_seconds() as i64;
 
         // Alice follows nobody. The seed follows someone worth finding.
         cache
@@ -2635,7 +2635,7 @@ mod tests {
                 .with_open_ranking_provider(None, Vec::new()),
         );
         let cache = app.directory_cache_for_account(&account).unwrap();
-        let now = crate::unix_now_seconds() as i64;
+        let now = crate::directory::unix_now_seconds() as i64;
 
         cache
             .put(&UserDirectoryRecord {
@@ -2714,7 +2714,7 @@ mod tests {
         let stranger = format!("{:064x}", 101);
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
         let cache = app.directory_cache_for_account(&account).unwrap();
-        let now = crate::unix_now_seconds() as i64;
+        let now = crate::directory::unix_now_seconds() as i64;
 
         cache
             .put(&UserDirectoryRecord {
