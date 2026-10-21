@@ -478,7 +478,7 @@ jobs:
           shared-key: rust-test
 
       - name: Verify workspace shard coverage
-        run: bash scripts/check_ci_partitions.sh 5 --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --timings --profile ci -E "$WORKSPACE_FILTER"
+        run: bash scripts/check_ci_partitions.sh 7 --workspace --exclude cgka-conformance-simulator --features wn-cli/test-policy-overrides,cgka-engine/test-policy-overrides,cgka-engine/test-crash-hooks --locked --timings --profile ci -E "$WORKSPACE_FILTER"
 
       - name: Upload workspace compiler timings
         if: always()
@@ -503,8 +503,13 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # Seven shards keep the slowest one near 20 minutes. Each shard's tests run
+  # about four at a time, so its time tracks its total test time, and a slow
+  # runner adds up to a quarter to that. Downloading the 2 GB test archive takes
+  # anywhere from 20 seconds to 7 minutes on top. Five shards ran 15-28 minutes
+  # and one was cancelled at the 30-minute limit.
   rust-test:
-    name: Rust tests (${{ matrix.partition }}/5)
+    name: Rust tests (${{ matrix.partition }}/7)
     needs: [changes, rust-test-build]
     if: needs.changes.outputs.ci_mode == 'full'
     runs-on: ubuntu-latest
@@ -512,7 +517,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [1, 2, 3, 4, 5]
+        partition: [1, 2, 3, 4, 5, 6, 7]
 
     steps:
       - name: Check out repository
@@ -543,7 +548,7 @@ jobs:
         # The subprocess-heavy `wn-cli::cli` suite runs in its own
         # `cli-e2e` job so its fan-out never starves these fast unit tests
         # (issue #103). `relay_runtime` keeps its own serial job.
-        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --partition count:${{ matrix.partition }}/5 --no-tests=pass --profile ci -E "$WORKSPACE_FILTER"
+        run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --partition count:${{ matrix.partition }}/7 --no-tests=pass --profile ci -E "$WORKSPACE_FILTER"
 
   rust-test-extras:
     name: Doctests and diagnostic exporters
