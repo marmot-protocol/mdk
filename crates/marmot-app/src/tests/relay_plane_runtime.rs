@@ -803,11 +803,6 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
             .post_join_maintenance_subscriptions
             .contains_key(&group)
     );
-    assert_eq!(
-        bob_client.runtime.group_record(&group).unwrap().epoch,
-        joined_epoch,
-        "installing the REQ fetched nothing by itself"
-    );
     let comparisons = bob_app
         .relay_telemetry()
         .await

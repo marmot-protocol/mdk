@@ -205,6 +205,8 @@
   final comparison results.
   Epoch-gap page hints wait for every routed delivery to be retained or
   definitively rejected, including comparison/window duplicates.
+  A recovered canonical context rearms ready retained ciphertext so deferred
+  messages retry without another relay delivery or manual convergence retry.
   Already-held copies adopt durable spill ownership before
   source replacement, without copying the ciphertext. Empty or silent peers do not
   create notification loss. Sender-ratchet tolerance remains 100; timestamp/id
