@@ -257,6 +257,8 @@ mod tests {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         run(&mut conn, &MIGRATIONS[..113]).unwrap();
         let ten_mib = 10 * 1024 * 1024;
+        // Tokens in owner order, so equal sizes are kept in that order and
+        // owner-3 is the one past the cap.
         for (i, size) in [ten_mib, ten_mib, ten_mib, ten_mib, 1_000]
             .into_iter()
             .enumerate()
@@ -264,8 +266,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO avatar_assets(owner_key, source_key, token, bytes, digest,
                     media_type, width, height)
-                 VALUES(?1, 's', randomblob(16), zeroblob(?2), zeroblob(32), 'image/png', 1, 1)",
-                rusqlite::params![format!("owner-{i}"), size],
+                 VALUES(?1, 's', ?3, zeroblob(?2), zeroblob(32), 'image/png', 1, 1)",
+                rusqlite::params![format!("owner-{i}"), size, vec![i as u8 + 1; 16]],
             )
             .unwrap();
         }
@@ -278,10 +280,30 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO avatar_access SELECT token, 1 FROM avatar_assets;
              INSERT INTO avatar_acquisition(token, descriptor, state, due)
-                SELECT token, x'01', 0, NULL FROM avatar_assets;",
+                SELECT token, x'01', 0, NULL FROM avatar_assets;
+             PRAGMA foreign_keys = OFF;
+             INSERT INTO chat_list_rows(group_id_hex, updated_at, archived, self_membership,
+                unread_count, pending_confirmation) VALUES('aa', 0, 0, 0, 0, 0);
+             INSERT INTO avatar_identity_demand
+                SELECT owner, 'aa', 'member', zeroblob(16), 0, 1
+                FROM (SELECT 'owner-0' AS owner UNION ALL SELECT 'owner-3'
+                    UNION ALL SELECT 'placeholder');
+             PRAGMA foreign_keys = ON;",
         )
         .unwrap();
         run(&mut conn, MIGRATIONS).unwrap();
+        let demand: String = conn
+            .query_row(
+                "SELECT group_concat(owner_key) FROM
+                    (SELECT owner_key FROM avatar_identity_demand ORDER BY owner_key)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            demand, "owner-0,placeholder",
+            "only the dropped owner's (owner-3) demand goes; a kept owner and a placeholder stay"
+        );
         assert_eq!(
             count(&conn, "SELECT count(*) FROM avatar_assets"),
             5,
