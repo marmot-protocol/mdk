@@ -70,7 +70,7 @@ use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
     NostrAccountRelayListKind, NostrAccountRelayListPublication, NostrEventPublishRequest,
     NostrKeyPackagePublication, NostrKeyPackagePublisher, NostrNip65RelayListPublication,
-    NostrNip65RelaySet, NostrRelayClient, parse_nip65_relay_set,
+    NostrNip65RelaySet, NostrRelayClient,
 };
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
@@ -222,6 +222,21 @@ pub use config::{
     RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
     RelayTelemetrySettings,
 };
+#[cfg(test)]
+use directory::USER_DIRECTORY_SEARCH_MAX_FRONTIER;
+pub use directory::previews::{
+    MAX_PUBLIC_EVENT_REFERENCES, PublicEventPreview, PublicEventPreviewRead,
+};
+#[cfg(test)]
+pub(crate) use directory::published_records::relays_from_relay_list_event;
+pub(crate) use directory::published_records::{
+    DirectoryFreshness, DirectorySelection, push_unique_strings, relay_list_state_from_event,
+    sort_directory_records,
+};
+pub(crate) use directory::records::{KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA};
+pub use directory::{
+    AccountRelayListState, AccountRelayListStatus, FetchedKeyPackage, MissingRelayListKind,
+};
 pub use directory::{
     CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
     MatchedField, MemberKeyPackagePrewarmSummary, OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger,
@@ -270,7 +285,6 @@ pub use media::{
 pub use messages::{is_reserved_app_event_kind, is_stream_final_event, tag_value, tag_values};
 pub use nostr_secret::is_nostr_secret;
 pub use nostr_verification::verify_public_nostr_event_json;
-mod public_event_preview;
 pub use notifications::{
     BackgroundNotificationCollection, ChatNotificationSettings, GroupPushDebugInfo,
     GroupPushTokenDebugEntry, GroupPushTokenRecord, KIND_MARMOT_NOTIFICATION_RUMOR,
@@ -284,9 +298,6 @@ pub use notifications::{
     parse_provider_token, push_token_fingerprint,
 };
 pub use profile_pseudonyms::{default_profile_pseudonym, random_profile_pseudonym};
-pub use public_event_preview::{
-    MAX_PUBLIC_EVENT_REFERENCES, PublicEventPreview, PublicEventPreviewRead,
-};
 pub use relay_telemetry_export::{
     ExportHistogram, ExportMetricPoint, ExportMetricValue, RelayExportError,
     RelayTelemetryExportBatch, RelayTelemetryExporter, build_export_batch,
@@ -300,11 +311,15 @@ pub use storage_sqlite::{
     TimelinePagination, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
     select_reusable_direct_conversation,
 };
+#[cfg(test)]
+use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 pub use transport_nostr::{
     EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
     RelayEndpointClassification, RelayEndpointPolicy, RelayPlaneHealth, RelayRollupEntry,
     RelayTelemetryRollup, RelayTelemetrySnapshot, retired_relay_hosts,
 };
+#[cfg(test)]
+use transport_nostr_adapter::parse_nip65_relay_set;
 pub use transport_nostr_adapter::{
     DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
     RelayDeliveryStats, RelayLabelResolution, RelayLatencyStats, RelayRefusalStats,
@@ -380,7 +395,6 @@ use key_package_records::{
     validated_cached_key_package,
 };
 use projection::LegacyAccountProjectionDb;
-use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 
 const LEGACY_ACCOUNT_APP_DB_FILE: &str = "app.sqlite3";
 const LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER: &str = "legacy-account-projection-v1";
@@ -472,14 +486,9 @@ const ACCOUNT_WORKER_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 const ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS: u64 = 500;
 const APP_RUNTIME_SUBSCRIPTION_BUFFER: usize = 1024;
 const AGENT_STREAM_START_LOOKBACK_LIMIT: usize = 200;
-const USER_DIRECTORY_SEARCH_MAX_VISITED: usize = 8192;
-const USER_DIRECTORY_SEARCH_MAX_FRONTIER: usize = 4096;
 const DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER: &str =
     ".marmot-directory-future-created-at-cleanup-v1";
 pub(crate) const MAX_SEEN_EVENT_IDS: usize = 16_384;
-const KIND_NOSTR_METADATA: u64 = 0;
-const KIND_NOSTR_CONTACT_LIST: u64 = 3;
-
 type AppRuntime = AccountDeviceRuntime<
     MarmotRelayPlaneAccountAdapter,
     AppTransportRouting,
@@ -641,16 +650,6 @@ pub struct AppDatabaseStatus {
     pub encrypted: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AccountRelayListStatus {
-    pub complete: bool,
-    pub missing: Vec<MissingRelayListKind>,
-    pub default_relays: Vec<String>,
-    pub bootstrap_relays: Vec<String>,
-    pub nip65: AccountRelayListState,
-    pub inbox: AccountRelayListState,
-}
-
 pub(crate) struct GeneratedAccountBootstrapPublication {
     pub status: AccountRelayListStatus,
     pub relay_and_follow_duration: Duration,
@@ -796,64 +795,6 @@ fn relay_endpoint_key(endpoint: &TransportEndpoint) -> String {
         .unwrap_or_else(|_| endpoint.0.clone())
 }
 
-/// A relay list the account is missing. Typed so FFI clients can localize
-/// each kind without parsing protocol-jargon strings (mdk#565).
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum MissingRelayListKind {
-    /// NIP-65 relay list (kind 10002) — where this account publishes
-    /// ("outbox"/write-side). Missing when the account has no NIP-65 relays.
-    #[serde(rename = "nip65")]
-    Nip65,
-    /// Marmot inbox relay list (kind 10050) — where this account receives
-    /// ("inbox"/read-side). Missing when the account has no inbox relays.
-    #[serde(rename = "inbox")]
-    Inbox,
-}
-
-impl MissingRelayListKind {
-    /// Stable lowercase token, kept for the existing CLI `--json` / plain
-    /// output contract (`"missing": ["nip65","inbox"]`). NOT a localization
-    /// key — clients localize from the enum variant, not this string.
-    pub fn token(self) -> &'static str {
-        match self {
-            Self::Nip65 => "nip65",
-            Self::Inbox => "inbox",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AccountRelayListState {
-    pub kind: u64,
-    /// Timestamp of the replaceable event that produced this cached state.
-    ///
-    /// Zero denotes a legacy or caller-constructed state with unknown recency.
-    #[serde(default, skip_serializing_if = "is_zero_u64")]
-    pub created_at: u64,
-    /// Direction-appropriate relay targets for this list.
-    ///
-    /// For NIP-65 kind 10002 this is specifically the write-capable set:
-    /// unmarked and `write` entries, excluding `read`-only entries. For the
-    /// Marmot inbox list this is the declared inbox relay set.
-    pub relays: Vec<String>,
-    /// NIP-65 read-capable relays, including unmarked entries.
-    ///
-    /// Empty for non-NIP-65 lists and for cache records written before
-    /// directional roles were persisted.
-    #[serde(default)]
-    pub read_relays: Vec<String>,
-    /// NIP-65 write-capable relays, including unmarked entries.
-    ///
-    /// This is the explicit directional counterpart of the compatibility
-    /// `relays` field. Empty for non-NIP-65 lists and for legacy cache records.
-    #[serde(default)]
-    pub write_relays: Vec<String>,
-}
-
-fn is_zero_u64(value: &u64) -> bool {
-    *value == 0
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountRelayListBootstrap {
     pub default_relays: Vec<TransportEndpoint>,
@@ -908,45 +849,6 @@ impl AccountRelayListBootstrap {
             NostrAccountRelayListKind::Nip65 => self.default_relays.clone(),
             NostrAccountRelayListKind::Inbox => self.inbox_declaration().to_vec(),
         }
-    }
-}
-
-impl AccountRelayListStatus {
-    fn empty() -> Self {
-        let mut status = Self {
-            complete: false,
-            missing: Vec::new(),
-            default_relays: Vec::new(),
-            bootstrap_relays: Vec::new(),
-            nip65: AccountRelayListState {
-                kind: KIND_NIP65_RELAY_LIST,
-                created_at: 0,
-                relays: Vec::new(),
-                read_relays: Vec::new(),
-                write_relays: Vec::new(),
-            },
-            inbox: AccountRelayListState {
-                kind: KIND_MARMOT_INBOX_RELAY_LIST,
-                created_at: 0,
-                relays: Vec::new(),
-                read_relays: Vec::new(),
-                write_relays: Vec::new(),
-            },
-        };
-        status.refresh();
-        status
-    }
-
-    fn refresh(&mut self) {
-        self.default_relays = self.nip65.relays.clone();
-        self.missing = Vec::new();
-        if self.nip65.relays.is_empty() {
-            self.missing.push(MissingRelayListKind::Nip65);
-        }
-        if self.inbox.relays.is_empty() {
-            self.missing.push(MissingRelayListKind::Inbox);
-        }
-        self.complete = self.missing.is_empty();
     }
 }
 
@@ -1295,18 +1197,6 @@ pub struct RetentionSweepReport {
 pub struct GroupInviteDeclineResult {
     pub group: AppGroupRecord,
     pub summary: SendSummary,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FetchedKeyPackage {
-    pub account_id_hex: String,
-    pub key_package: KeyPackage,
-    pub key_package_id: String,
-    pub key_package_ref_hex: String,
-    pub key_package_event_id: String,
-    pub created_at: u64,
-    pub source_relays: Vec<String>,
-    pub relay_lists: AccountRelayListStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2100,6 +1990,7 @@ impl MarmotApp {
             #[cfg(test)]
             test_comparison_saved_cursor: None,
             recovery_owner,
+            epoch_gap_windows: Default::default(),
             // Unit tests run many directly owned clients in one process; each
             // gets its own pool so one test's held job cannot stall another.
             #[cfg(not(test))]
@@ -5856,7 +5747,7 @@ impl MarmotApp {
         };
         if let Some(entry) = self.directory_entry_for_account_id(&account_id)? {
             if let Some(key_package) = entry.key_package {
-                return validated_cached_key_package(&account_id, &key_package);
+                return Ok(validated_cached_key_package(&account_id, &key_package)?);
             }
             let source_relays = self.retain_safe_discovered_endpoints(
                 entry
@@ -5920,7 +5811,7 @@ impl MarmotApp {
             .into_iter()
             .map(|account| account.account_id_hex)
             .collect::<Vec<_>>();
-        self.display_names_for_account_ids(&account_ids)
+        Ok(self.display_names_for_account_ids(&account_ids)?)
     }
 
     fn display_name_for_account_id(
@@ -8146,38 +8037,6 @@ pub(crate) fn history_floor(anchor_secs: u64) -> cgka_traits::transport::Timesta
     )
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DirectoryFreshness {
-    max_created_at: u64,
-}
-
-impl DirectoryFreshness {
-    fn from_now(max_future_skew: Duration) -> Self {
-        Self {
-            max_created_at: unix_now_seconds().saturating_add(max_future_skew.as_secs()),
-        }
-    }
-
-    pub(crate) fn accepts(self, record: &RelayEventRecord) -> bool {
-        record.event.created_at <= self.max_created_at
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct DirectorySelection<T> {
-    pub(crate) value: T,
-    pub(crate) rejected_future: bool,
-}
-
-fn sort_directory_records(records: &mut [RelayEventRecord]) {
-    records.sort_by(|a, b| {
-        a.event
-            .created_at
-            .cmp(&b.event.created_at)
-            .then_with(|| a.event.id.cmp(&b.event.id))
-    });
-}
-
 fn sqlite_file_requires_key(path: &Path) -> bool {
     if !path.exists() {
         return false;
@@ -8189,56 +8048,6 @@ fn sqlite_file_requires_key(path: &Path) -> bool {
             })
         })
         .is_err()
-}
-
-#[cfg(test)]
-fn relays_from_relay_list_event(event: &NostrTransportEvent) -> Vec<String> {
-    relay_list_state_from_event(event)
-        .map(|state| state.relays)
-        .unwrap_or_default()
-}
-
-fn relay_list_state_from_event(event: &NostrTransportEvent) -> Option<AccountRelayListState> {
-    match event.kind {
-        KIND_NIP65_RELAY_LIST => {
-            let relay_set = parse_nip65_relay_set(event);
-            let read_relays = relay_set
-                .read_relays
-                .into_iter()
-                .map(|endpoint| endpoint.0)
-                .collect::<Vec<_>>();
-            let write_relays = relay_set
-                .write_relays
-                .into_iter()
-                .map(|endpoint| endpoint.0)
-                .collect::<Vec<_>>();
-            Some(AccountRelayListState {
-                kind: KIND_NIP65_RELAY_LIST,
-                created_at: event.created_at,
-                relays: write_relays.clone(),
-                read_relays,
-                write_relays,
-            })
-        }
-        KIND_MARMOT_INBOX_RELAY_LIST => {
-            let mut relays = Vec::new();
-            for tag in &event.tags {
-                if tag.first().is_some_and(|name| name == "relay")
-                    && let Some(value) = tag.get(1).filter(|value| !value.trim().is_empty())
-                {
-                    push_unique_strings(&mut relays, [value.clone()]);
-                }
-            }
-            Some(AccountRelayListState {
-                kind: KIND_MARMOT_INBOX_RELAY_LIST,
-                created_at: event.created_at,
-                relays,
-                read_relays: Vec::new(),
-                write_relays: Vec::new(),
-            })
-        }
-        _ => None,
-    }
 }
 
 fn nip65_relay_set_from_state(state: &AccountRelayListState) -> NostrNip65RelaySet {
@@ -8374,14 +8183,6 @@ fn observe_public_indexer_outcomes(
             failed,
             "public directory indexer publication was incomplete"
         );
-    }
-}
-
-fn push_unique_strings(values: &mut Vec<String>, candidates: impl IntoIterator<Item = String>) {
-    for candidate in candidates {
-        if !values.contains(&candidate) {
-            values.push(candidate);
-        }
     }
 }
 

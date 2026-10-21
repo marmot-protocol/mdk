@@ -1,3 +1,4 @@
+use crate::AppError;
 use marmot_account::AccountHome;
 use nostr::nips::nip19::{Nip19Coordinate, Nip19Event, ToBech32};
 use nostr::prelude::{EventBuilder, FinalizeEvent, Keys, Tag, Timestamp};
@@ -361,8 +362,7 @@ fn refresh_rules_follow_target_kind_and_completeness() {
 
 fn previews_table() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(include_str!("../directory/cache/v2.sql"))
-        .unwrap();
+    conn.execute_batch(include_str!("../cache/v2.sql")).unwrap();
     conn
 }
 

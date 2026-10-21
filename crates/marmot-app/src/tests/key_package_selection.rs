@@ -363,13 +363,16 @@ async fn failed_preference_refetch_preserves_only_usable_current_batch_packages(
                 .err()
                 .expect("unusable batch material must not become a fallback");
             match batch_case {
-                "absent" => assert!(matches!(error, AppError::DirectoryLookupIncomplete(_))),
-                "malformed" => assert!(matches!(error, AppError::InvalidKeyPackageEvent(_))),
+                "absent" => assert!(matches!(
+                    error,
+                    DirectoryError::DirectoryLookupIncomplete(_)
+                )),
+                "malformed" => assert!(matches!(error, DirectoryError::InvalidKeyPackageEvent(_))),
                 "incompatible" => assert!(matches!(
                     error,
-                    AppError::Session(cgka_session::SessionError::Engine(
+                    DirectoryError::KeyPackageRequirements(
                         cgka_traits::EngineError::MissingRequiredCapabilities { .. }
-                    ))
+                    )
                 )),
                 _ => unreachable!(),
             }
@@ -724,7 +727,7 @@ async fn legacy_slots_never_select_or_mask_current_slots() {
     // A current slot's rejection outranks the obsolete diagnosis.
     assert!(matches!(
         select(&[&legacy, &malformed]),
-        Err(AppError::InvalidKeyPackageEvent(_))
+        Err(DirectoryError::InvalidKeyPackageEvent(_))
     ));
     // A future-dated slot may be a skewed current publication.
     let mut future = current.clone();
@@ -733,7 +736,7 @@ async fn legacy_slots_never_select_or_mask_current_slots() {
         select(&[&legacy, &future])
             .unwrap()
             .into_value_or_missing(&account.account_id_hex),
-        Err(AppError::MissingKeyPackage {
+        Err(DirectoryError::MissingKeyPackage {
             reason: crate::MissingKeyPackageReason::NotFound,
             ..
         })

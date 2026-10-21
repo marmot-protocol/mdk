@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-10-17
+updated: 2026-10-20
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -41,6 +41,16 @@ Tracking issue: marmot-protocol/mdk#381.
 The retry delay starts at one second, doubles after each actual failure, and caps at 60 seconds.
 Suppressed calls do not advance the count or deadline. Expiry permits an attempt on the next
 existing trigger; no timer retains an account or holds the transaction through a cooldown.
+
+### `marmot-app` epoch-gap paging (`src/client/sync/comparison_job.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Advisory group/peer resume hints | At most 1,024 entries per client; at most 2,048 two-word boundaries per hint (32 KiB of boundary values), plus route/peer identity and ownership metadata | LRU eviction, stale ownership and client drop discard hints. Losing a hint causes a rescan, never a reset of the durable park budget. No event bodies or scan-credit ledger persist in the cache. |
+
+Each peer's scan receives at most 16,384 raw events and 4 MiB of validated event JSON per pass, in 256-event
+pages and at most three seconds within the shared pass deadline. Held-only traversal is not recovery progress;
+the existing durable unserved-pass count and backoff survive client reconstruction unchanged.
 
 ### `marmot-app` runtime performance observations (`src/app_telemetry/runtime.rs`)
 

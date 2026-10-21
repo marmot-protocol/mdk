@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-10-01
+updated: 2026-10-20
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -191,16 +191,23 @@ Every cause runs the same job:
    Request-local NIP-77 comparison plus bounded exact-ID fetch, reusing #2031/#2037. The
    task returns an owned batch plus a per-relay outcome: complete, truncated, failed or
    unsupported. On an epoch-gap group route, each relay that failed without answering its
-   comparison is then asked for the route's newest events in the same window (a REQ `limit`
-   of 256, and at most 4 MiB per relay, inside the pass deadline). A commit first accepted
-   long after it was wrapped keeps its wrap-time `created_at`, so it sits below every live
-   `since` and a relay that cannot compare would otherwise never return it (mdk#2256). The
-   fetch keeps the oldest-first boundary: it does not run while a compared relay still owes
-   older history or the pass could not order what it was missing, only a page the relay
-   ended itself is kept (a cut page holds only the newer events), and the route's
-   comparison and window events are admitted together, oldest first. That window fetch is
-   investigation, not coverage: its events never certify a route, move its replay cursor or
-   withhold its certificate.
+   comparison is searched backwards through the same window in 256-event raw pages. Each
+   relay gets at most 16,384 raw events and 4 MiB of validated event JSON per pass, with at
+   most three seconds within the shared pass deadline. Raw SDK counts and oldest timestamps survive
+   filtering. Full pages overlap their oldest second; a short page probes the older prefix
+   before admission. An empty probe returns the buffered short page without fetching it
+   twice. Only a completed oldest page is admitted; cuts and saturated seconds release no
+   newer suffix. Bounded advisory hints resume held spans on later passes. The fetch never
+   runs ahead of older comparison backlog, and comparison/window candidates stay ordered
+   oldest first. Window events never certify a route, move its replay cursor or withhold
+   its certificate. Original comparison stability and SQL fences remain unchanged.
+   Inventory revisions invalidate held-span hints, so released input is not skipped on reuse.
+   Hints follow every pending epoch-gap ticket, including capacity-waiting tickets
+   omitted from another grant's selection.
+   Traversing already-held input is not recovery progress: it cannot reset backoff or the
+   durable unserved-pass count. Reconstruction or hint eviction may repeat traversal but
+   cannot renew that budget. A sufficiently deep prefix may exhaust it and park for explicit
+   repair. This paging change does not activate an independent known-event retry tier.
 3. **Admit** (worker, bounded turns). A few events per turn go straight into the normal
    ingest path, never through the live queue. The worker yields between turns, so commands
    and live input interleave. A turn admits at most four events.

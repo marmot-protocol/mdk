@@ -91,9 +91,9 @@ profiles in `marmot-app` speak concrete `NostrTransportEvent` over `NostrRelayCl
 - `marmot-app/src/directory/member_key_packages.rs` (`resolve_member_key_packages*`),
 - `transport-nostr/src/directory.rs` — `DirectoryRelayFetcher` is `pub` for `marmot-app`;
   the only impl is `NostrSdkDirectoryRelayFetcher`,
-- `marmot-app/src/key_package_records.rs` — record validation consumes
+- `marmot-app/src/directory/published_records.rs` — record validation consumes
   `NostrTransportEvent` directly,
-- `marmot-app/src/lib.rs` (`relays_from_relay_list_event`, NIP-65 parsing).
+- `marmot-app/src/directory/published_records.rs` (`relays_from_relay_list_event`, NIP-65 parsing).
 
 This is why #1521 needs to exist and why the FIPS spike could not move discovery off WebSockets.
 
@@ -161,7 +161,7 @@ impl. An embedder then implements "fetch this Nostr document from my overlay" wi
 any validation logic, and #1521's caller-held packages become the degenerate case: a directory
 that answers from the embedder's own index.
 
-What stays fixed: record validation (`key_package_records.rs`), dedup-by-account semantics, and
+What stays fixed: record validation (`directory/published_records.rs`), dedup-by-account semantics, and
 the requirement that Welcomes address by source event id.
 
 ### S2. Peeler/envelope injection (mostly done, finish it)

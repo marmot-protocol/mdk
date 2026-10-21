@@ -2,12 +2,12 @@
 use cgka_traits::storage::StorageError;
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
-use super::{AppError, DirectoryCache};
+use super::{DirectoryCache, DirectoryError};
 
 struct Migration {
     version: i64,
     name: &'static str,
-    apply: fn(&Transaction<'_>) -> Result<(), AppError>,
+    apply: fn(&Transaction<'_>) -> Result<(), DirectoryError>,
 }
 
 const MIGRATIONS: &[Migration] = &[
@@ -27,16 +27,16 @@ const VERSION_1_SQL: &str = include_str!("v1.sql");
 const VERSION_2_SQL: &str = include_str!("v2.sql");
 
 /// Open the cache's independent migration domain without exposing stored values.
-pub(super) fn run_all(conn: &mut Connection) -> Result<(), AppError> {
+pub(super) fn run_all(conn: &mut Connection) -> Result<(), DirectoryError> {
     run(conn, MIGRATIONS).map_err(|error| match error {
         // These errors are constructed here from static text or version numbers.
-        AppError::Storage(_) => error,
+        DirectoryError::Storage(_) => error,
         // Extended result codes preserve BUSY/IOERR/NOTADB diagnostics without
         // SQLite's optional message (including user-defined trigger messages).
-        AppError::Sqlite(rusqlite::Error::SqliteFailure(code, _)) => {
-            AppError::Sqlite(rusqlite::Error::SqliteFailure(code, None))
+        DirectoryError::Sqlite(rusqlite::Error::SqliteFailure(code, _)) => {
+            DirectoryError::Sqlite(rusqlite::Error::SqliteFailure(code, None))
         }
-        AppError::Json(_) => {
+        DirectoryError::Json(_) => {
             StorageError::Serialization("invalid legacy directory cache record".into()).into()
         }
         _ => StorageError::Backend("directory cache schema migration failed".into()).into(),
@@ -46,7 +46,7 @@ pub(super) fn run_all(conn: &mut Connection) -> Result<(), AppError> {
 /// Mirror storage-sqlite/src/migrations.rs's atomic body-plus-ledger contract.
 /// Keep this runner local: that runner hardcodes the session ledger and owns
 /// session-specific legacy-name reconciliation, neither of which applies here.
-fn run(conn: &mut Connection, migrations: &[Migration]) -> Result<(), AppError> {
+fn run(conn: &mut Connection, migrations: &[Migration]) -> Result<(), DirectoryError> {
     let mut previous = 0;
     for migration in migrations {
         if migration.version <= previous {
@@ -88,7 +88,7 @@ fn run(conn: &mut Connection, migrations: &[Migration]) -> Result<(), AppError> 
 }
 
 /// Validate history as an exact prefix and return the number already applied.
-fn applied_count(conn: &Connection, migrations: &[Migration]) -> Result<usize, AppError> {
+fn applied_count(conn: &Connection, migrations: &[Migration]) -> Result<usize, DirectoryError> {
     if !DirectoryCache::table_exists_locked(conn, "app_cache_schema_migrations")? {
         return Ok(0);
     }
@@ -120,21 +120,21 @@ fn applied_count(conn: &Connection, migrations: &[Migration]) -> Result<usize, A
     Ok(recorded.len())
 }
 
-fn invalid_history() -> AppError {
+fn invalid_history() -> DirectoryError {
     StorageError::Backend("invalid directory cache migration history".into()).into()
 }
 
-fn invalid_shape() -> AppError {
+fn invalid_shape() -> DirectoryError {
     StorageError::Backend("invalid directory cache schema shape".into()).into()
 }
 
-fn version_1(tx: &Transaction<'_>) -> Result<(), AppError> {
+fn version_1(tx: &Transaction<'_>) -> Result<(), DirectoryError> {
     tx.execute_batch(VERSION_1_SQL)?;
     validate_version_1(tx)?;
     DirectoryCache::migrate_legacy_json_records(tx)
 }
 
-fn version_2(tx: &Transaction<'_>) -> Result<(), AppError> {
+fn version_2(tx: &Transaction<'_>) -> Result<(), DirectoryError> {
     tx.execute_batch(VERSION_2_SQL)?;
     Ok(())
 }
@@ -143,7 +143,7 @@ fn version_2(tx: &Transaction<'_>) -> Result<(), AppError> {
 /// the frozen v1 DDL as the reference, including types, nullability, defaults,
 /// primary keys and index columns, before blessing an unversioned database.
 /// The reference is empty and memory-only; no cached records leave SQLCipher.
-fn validate_version_1(conn: &Connection) -> Result<(), AppError> {
+fn validate_version_1(conn: &Connection) -> Result<(), DirectoryError> {
     let reference = Connection::open_in_memory()?;
     reference.execute_batch(VERSION_1_SQL)?;
     let mut statement = reference.prepare(
@@ -188,7 +188,7 @@ fn validate_version_1(conn: &Connection) -> Result<(), AppError> {
 
 type ColumnShape = (String, String, i64, Option<String>, i64);
 
-fn shape(conn: &Connection, query: &str, name: &str) -> Result<Vec<ColumnShape>, AppError> {
+fn shape(conn: &Connection, query: &str, name: &str) -> Result<Vec<ColumnShape>, DirectoryError> {
     Ok(conn
         .prepare(query)?
         .query_map([name], |row| {
@@ -234,7 +234,7 @@ mod tests {
         let error = run_all(&mut conn).unwrap_err();
         assert!(!error.to_string().contains("private profile data"));
         assert!(
-            matches!(error, AppError::Sqlite(rusqlite::Error::SqliteFailure(code, None))
+            matches!(error, DirectoryError::Sqlite(rusqlite::Error::SqliteFailure(code, None))
             if code.code == rusqlite::ErrorCode::ConstraintViolation)
         );
         conn.execute_batch(

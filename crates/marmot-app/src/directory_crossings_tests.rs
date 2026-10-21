@@ -184,6 +184,111 @@ fn the_scan_sees_each_kind_of_crossing() {
     );
 }
 
+/// A type the directory defines must keep its inherent methods with it: an
+/// `impl` of it elsewhere is a dependency the crossing list cannot see, and
+/// cannot survive the move to `nostr-directory` (inherent impls must live in
+/// the defining crate).
+#[test]
+fn directory_types_have_no_inherent_impls_outside_directory() {
+    let stray = outside_inherent_impls(&production_files());
+    assert!(
+        stray.is_empty(),
+        "inherent impls of directory-owned types outside directory/; move them next to the type:\n{}",
+        stray.join("\n")
+    );
+}
+
+#[test]
+fn the_impl_check_sees_an_outside_inherent_impl() {
+    let file = |rel: &str, source: &str| SourceFile {
+        rel: rel.to_owned(),
+        ast: syn::parse_file(source).unwrap(),
+    };
+    let files = [
+        file(
+            "directory/records.rs",
+            "pub struct Status; pub struct Shared;",
+        ),
+        file(
+            "lib.rs",
+            "pub struct Shared; impl Status { fn f() {} } impl Clone for Status { fn clone(&self) -> Self { todo!() } } impl Shared {}",
+        ),
+    ];
+    // `Shared` is defined on both sides, so its impl is ambiguous and skipped;
+    // a trait impl is not an inherent impl.
+    assert_eq!(outside_inherent_impls(&files), ["lib.rs impl Status"]);
+}
+
+/// Inherent impls outside `directory/` of types only `directory/` defines.
+fn outside_inherent_impls(files: &[SourceFile]) -> Vec<String> {
+    let mut inside = BTreeSet::new();
+    let mut outside = BTreeSet::new();
+    for file in files {
+        let mut types = TypeCollector::default();
+        types.visit_file(&file.ast);
+        if file.rel.starts_with(DIRECTORY) {
+            inside.extend(types.names);
+        } else {
+            outside.extend(types.names);
+        }
+    }
+    let owned: BTreeSet<_> = inside.difference(&outside).cloned().collect();
+    let mut stray = Vec::new();
+    for file in files.iter().filter(|file| !file.rel.starts_with(DIRECTORY)) {
+        let mut impls = InherentImpls::default();
+        impls.visit_file(&file.ast);
+        for name in impls.names.into_iter().filter(|name| owned.contains(name)) {
+            stray.push(format!("{} impl {name}", file.rel));
+        }
+    }
+    stray.sort();
+    stray.dedup();
+    stray
+}
+
+#[derive(Default)]
+struct TypeCollector {
+    names: BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for TypeCollector {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if !starts_test_only(item.to_token_stream()) {
+            visit::visit_item(self, item);
+        }
+    }
+
+    fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+        self.names.insert(item.ident.to_string());
+    }
+
+    fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+        self.names.insert(item.ident.to_string());
+    }
+}
+
+#[derive(Default)]
+struct InherentImpls {
+    names: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for InherentImpls {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if !starts_test_only(item.to_token_stream()) {
+            visit::visit_item(self, item);
+        }
+    }
+
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        if item.trait_.is_none()
+            && let syn::Type::Path(p) = &*item.self_ty
+            && let Some(last) = p.path.segments.last()
+        {
+            self.names.push(last.ident.to_string());
+        }
+    }
+}
+
 /// One production source file, with its path relative to `src/`.
 struct SourceFile {
     rel: String,

@@ -144,6 +144,12 @@ pub enum ConversationPresentationError {
     App(#[from] AppError),
 }
 
+impl From<crate::directory::error::DirectoryError> for ConversationPresentationError {
+    fn from(error: crate::directory::error::DirectoryError) -> Self {
+        Self::App(error.into())
+    }
+}
+
 impl ConversationWindowPresentation {
     /// Reuse the existing profile-commit signal. Lag means refresh all; M4
     /// owns subscription-before-read coordination and retry obligations.

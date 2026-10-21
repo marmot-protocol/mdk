@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{sleep, timeout};
 use url::{Host, Url};
 
-use crate::ids::parse_account_id_hex;
+use crate::directory::ids::parse_account_id_hex;
 
 const OPEN_RANKING_TIMEOUT: Duration = Duration::from_secs(5);
 const OPEN_RANKING_MAX_RESPONSE_BYTES: usize = 64 * 1024;

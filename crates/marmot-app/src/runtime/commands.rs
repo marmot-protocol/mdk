@@ -617,7 +617,7 @@ impl AccountManager {
         // authoritative roster if that cache is unavailable.
         let app = self.app.clone();
         let display_names =
-            crate::blocking_app_task(move || app.display_names_for_account_ids(&member_ids))
+            crate::blocking_app_task(move || Ok(app.display_names_for_account_ids(&member_ids)?))
                 .await
                 .unwrap_or_default();
         Ok(AppGroupConversationSnapshot {

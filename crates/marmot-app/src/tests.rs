@@ -15,6 +15,7 @@ mod suspension_close;
 mod user_blocks;
 
 use super::*;
+use crate::directory::error::DirectoryError;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -47,10 +48,10 @@ use crate::client::epoch_stall::{BackfillDecision, EPOCH_STALL_BACKFILL_THRESHOL
 use crate::conversions::{
     app_group_from_stored_group, stored_components_from_app_group, stored_group_from_app_group,
 };
+use crate::directory::ids::npub_for_account_id_lossy;
 use crate::directory::records::{
     FetchedFollowList, profile_content_json, public_directory_user_record,
 };
-use crate::ids::npub_for_account_id_lossy;
 use crate::key_package_records::{
     relay_list_queries, relay_list_status_from_records, require_key_package_tag,
     require_multi_value_key_package_tag_matches,
@@ -1094,11 +1095,57 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 }
             }
         }
-        self.acquisition_result
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(transport_nostr_adapter::NostrAcquisitionError::Unsupported)
+        let scripted = self.acquisition_result.lock().unwrap();
+        let scripted = scripted
+            .as_ref()
+            .ok_or(transport_nostr_adapter::NostrAcquisitionError::Unsupported)?;
+        if let transport_nostr_adapter::NostrAcquisitionScope::GroupWindow {
+            transport_group_id,
+            since,
+            until,
+            newest,
+        } = request.scope
+        {
+            let group = hex::encode(transport_group_id);
+            let mut endpoints = Vec::with_capacity(request.endpoints.len());
+            for page in &scripted.endpoints {
+                if !request.endpoints.iter().any(|endpoint| {
+                    transport_nostr::same_relay(endpoint.as_str(), page.endpoint.as_str())
+                }) {
+                    continue;
+                }
+                let mut selected = page
+                    .events
+                    .iter()
+                    .filter(|event| event.created_at >= since && event.created_at <= until)
+                    .filter(|event| {
+                        event.kind == u64::from(nostr_sdk::prelude::Kind::MlsGroupMessage.as_u16())
+                            && event.tags.iter().any(|tag| {
+                                matches!(tag.as_slice(), [name, value, ..] if name == "h" && value == &group)
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                selected.sort_by(|a, b| (b.created_at, &b.id).cmp(&(a.created_at, &a.id)));
+                selected.truncate(newest.unwrap_or(usize::MAX));
+                let mut stats = page.stats;
+                stats.raw_received_items = selected.len();
+                stats.oldest_raw_created_at = selected.iter().map(|event| event.created_at).min();
+                stats.received_items = selected.len();
+                stats.serialized_event_bytes = selected
+                    .iter()
+                    .map(|event| serde_json::to_vec(event).unwrap().len())
+                    .sum();
+                endpoints.push(transport_nostr_adapter::NostrAcquisitionEndpoint {
+                    endpoint: page.endpoint.clone(),
+                    session_generation: page.session_generation,
+                    events: selected.into_iter().cloned().collect(),
+                    end: page.end,
+                    stats,
+                });
+            }
+            return Ok(transport_nostr_adapter::NostrAcquisitionResult { endpoints });
+        }
+        Ok(scripted.clone())
     }
     fn supports_scoped_subscriptions(&self) -> bool {
         true
@@ -8870,7 +8917,9 @@ async fn account_outbox_route_cap_without_inbox_remains_unknown() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, AppError::DirectoryLookupIncomplete(ref account) if account == id));
+    assert!(
+        matches!(error, DirectoryError::DirectoryLookupIncomplete(ref account) if account == id)
+    );
     let cached = app.directory_entry_for_account_id(id).unwrap().unwrap();
     assert_eq!(cached.relay_lists.nip65.relays.len(), 17);
     assert!(cached.relay_lists.inbox.relays.is_empty());
@@ -8894,7 +8943,9 @@ async fn account_signed_empty_inbox_with_incomplete_outbox_remains_unknown() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, AppError::DirectoryLookupIncomplete(ref account) if account == id));
+    assert!(
+        matches!(error, DirectoryError::DirectoryLookupIncomplete(ref account) if account == id)
+    );
     let cached = app.directory_entry_for_account_id(id).unwrap().unwrap();
     assert!(cached.relay_lists.inbox.created_at > 0);
     assert!(cached.relay_lists.inbox.relays.is_empty());
@@ -8911,7 +8962,7 @@ async fn account_signed_empty_inbox_with_incomplete_outbox_remains_unknown() {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, AppError::MissingRelayLists(ref kinds) if kinds == &[MissingRelayListKind::Inbox])
+        matches!(error, DirectoryError::MissingRelayLists(ref kinds) if kinds == &[MissingRelayListKind::Inbox])
     );
 }
 
@@ -8945,7 +8996,7 @@ async fn account_read_only_nip65_returns_typed_missing_write_routes() {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, AppError::MissingRelayLists(ref kinds) if kinds == &[MissingRelayListKind::Nip65])
+        matches!(error, DirectoryError::MissingRelayLists(ref kinds) if kinds == &[MissingRelayListKind::Nip65])
     );
     let cached = app.directory_entry_for_account_id(id).unwrap().unwrap();
     assert!(cached.relay_lists.nip65.relays.is_empty());
@@ -8972,7 +9023,7 @@ async fn future_dated_inbox_is_unknown_for_account_and_member_resolution() {
         .await
         .unwrap_err();
     assert!(
-        matches!(account_error, AppError::DirectoryLookupIncomplete(ref account) if account == id)
+        matches!(account_error, DirectoryError::DirectoryLookupIncomplete(ref account) if account == id)
     );
     let member_error = app
         .resolve_member_key_packages(&[id.as_str()])
@@ -9564,7 +9615,7 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .err()
             .expect("future-only discovery must fail closed");
         assert!(
-            matches!(error, AppError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
+            matches!(error, DirectoryError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
         );
         assert!(
             fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -20832,7 +20883,7 @@ fn close_storage_releases_every_database_and_the_root_lease() {
     assert!(
         matches!(
             directory_cache.entries(),
-            Err(AppError::Storage(err)) if err.is_closed()
+            Err(DirectoryError::Storage(err)) if err.is_closed()
         ),
         "the directory cache connection must be closed, not just uncached",
     );
@@ -21196,7 +21247,7 @@ fn assert_suspension_storage_closed(
     assert!(shared.is_closed());
     assert!(matches!(
         directory.entries(),
-        Err(AppError::Storage(error)) if error.is_closed()
+        Err(DirectoryError::Storage(error)) if error.is_closed()
     ));
     for database in [session_path, shared_path] {
         for suffix in ["-wal", "-shm"] {
