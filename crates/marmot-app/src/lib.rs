@@ -101,6 +101,8 @@ mod directory;
 mod directory_crossings_tests;
 mod directory_delegates;
 mod directory_resources;
+#[cfg(test)]
+mod directory_tests;
 mod drafts;
 mod local_submissions;
 pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};

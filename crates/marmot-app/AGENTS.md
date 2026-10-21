@@ -216,7 +216,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `src/profile_publication.rs`. `src/directory_crossings_tests.rs` checks every name `src/directory/` resolves in the
   rest of the crate against `src/directory/crossings.txt`. That list is now empty, which the crate move needs: code under
   `src/directory/` reaches the app only through the traits in `src/directory/resources.rs` and
-  `src/directory/observer.rs`, and any new crossing fails the check.
+  `src/directory/observer.rs`, and any new crossing fails the check. Directory tests that need a real `MarmotApp` or
+  runtime live in `src/directory_tests/`, one module per directory file; tests that need only the directory stay beside
+  its code and must not name `MarmotApp`, because they move with it.
 - Directory code returns `DirectoryError` (`src/directory/error.rs`). Public `MarmotApp` methods are the boundary: they
   keep returning `AppError`, and `From<DirectoryError> for AppError` restores the variant, message and
   `privacy_safe_kind` the directory reported before it had its own type. An app failure that reaches directory code

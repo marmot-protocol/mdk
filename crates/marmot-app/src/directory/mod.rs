@@ -4,7 +4,7 @@ pub(crate) mod config;
 pub(crate) mod error;
 pub(crate) mod ids;
 mod key_package_recovery;
-mod member_key_packages;
+pub(crate) mod member_key_packages;
 mod methods;
 pub(crate) mod observer;
 mod open_ranking;
@@ -12,14 +12,14 @@ pub(crate) mod previews;
 pub(crate) mod published_records;
 pub(crate) mod records;
 pub(crate) mod resources;
-mod search;
+pub(crate) mod search;
 mod service;
 mod store;
-mod sync;
+pub(crate) mod sync;
 
 pub(crate) use cache::DirectoryCache;
 #[cfg(test)]
-pub(crate) use cache::DirectorySearchGraphRecord;
+pub(crate) use cache::{DirectorySearchGraphRecord, SEARCH_GRAPH_PROFILE_TTL_SECONDS};
 pub(crate) use config::DirectoryConfig;
 pub use member_key_packages::MemberKeyPackagePrewarmSummary;
 pub(crate) use member_key_packages::MemberResolutionPurpose;

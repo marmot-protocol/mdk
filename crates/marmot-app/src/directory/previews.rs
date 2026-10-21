@@ -68,7 +68,7 @@ const MAX_QUERY_RELAYS: usize = 6;
 const MAX_FETCHED_EVENTS: usize = 64;
 /// Limit on the unattributed kind-5 query for an event ID. A full answer may
 /// hide the author's deletion behind other keys' requests.
-const EVENT_DELETION_QUERY_LIMIT: usize = 16;
+pub(crate) const EVENT_DELETION_QUERY_LIMIT: usize = 16;
 
 /// Local state of one referenced public event.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -786,7 +786,10 @@ impl<R: DirectoryResources> Directory<R> {
     }
 
     /// At most two safe reference hints, then the configured directory relays.
-    fn public_event_query_relays(&self, hints: Vec<TransportEndpoint>) -> Vec<TransportEndpoint> {
+    pub(crate) fn public_event_query_relays(
+        &self,
+        hints: Vec<TransportEndpoint>,
+    ) -> Vec<TransportEndpoint> {
         let hints = self
             .relay_plane
             .retain_safe_discovered_endpoints(hints, "public event hint");
@@ -806,7 +809,7 @@ impl<R: DirectoryResources> Directory<R> {
         relays
     }
 
-    fn public_event_refresh_cooling_down(&self, key: &str) -> bool {
+    pub(crate) fn public_event_refresh_cooling_down(&self, key: &str) -> bool {
         self.state
             .public_event_refreshes
             .lock()
@@ -815,7 +818,7 @@ impl<R: DirectoryResources> Directory<R> {
             .is_some_and(|attempted| attempted.elapsed() < REFRESH_COOLDOWN)
     }
 
-    fn start_public_event_refresh_cooldown(&self, key: String) {
+    pub(crate) fn start_public_event_refresh_cooldown(&self, key: String) {
         let mut attempts = self
             .state
             .public_event_refreshes

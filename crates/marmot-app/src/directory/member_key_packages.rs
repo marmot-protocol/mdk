@@ -45,7 +45,7 @@ const MEMBER_RESOLUTION_DEADLINE: Duration = Duration::from_secs(50);
 const KEY_PACKAGE_EVENTS_PER_AUTHOR: usize = 12;
 const RELAY_LIST_EVENTS_PER_AUTHOR: usize = 4;
 const MEMBER_PREWARM_CACHE_LIMIT: usize = 256;
-const MEMBER_PREWARM_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+pub(crate) const MEMBER_PREWARM_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone)]
 struct MemberKeyPackagePrewarmEntry {
@@ -56,31 +56,6 @@ struct MemberKeyPackagePrewarmEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn discovery_recovery_refreshes_routes_for_fresh_commit_resolution() {
-        let (_directory, app, accounts, fetcher) =
-            crate::tests::invite_recovery::discovery_fixture(1).await;
-        app.prewarm_group_member_key_packages(&[&accounts[0].account_id_hex])
-            .await
-            .unwrap();
-        fetcher.requests.lock().unwrap().clear();
-        let result = app
-            .directory()
-            .resolve_member_key_packages_for_purpose(
-                vec![accounts[0].account_id_hex.clone()],
-                MemberResolutionPurpose::CommitFresh,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(result.key_packages.len(), 1);
-        assert!(fetcher.requests.lock().unwrap().iter().any(|r| {
-            r.queries
-                .iter()
-                .any(|q| q.kind == transport_nostr_adapter::KIND_NIP65_RELAY_LIST)
-        }));
-    }
 
     #[test]
     fn composition_prewarm_cache_is_bounded_and_expires_entries() {
@@ -97,42 +72,6 @@ mod tests {
         assert!(cache.get(&newest).is_none());
         assert!(!cache.order.contains(&newest));
     }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn composition_prewarm_route_reuse_preserves_original_freshness_deadline() {
-        let (_directory, app, accounts, _fetcher) =
-            crate::tests::member_resolution_fixture(1, false).await;
-        let id = &accounts[0].account_id_hex;
-        app.prewarm_group_member_key_packages(&[id.as_str()])
-            .await
-            .unwrap();
-        let original = Instant::now() - Duration::from_secs(240);
-        app.directory_state
-            .member_key_package_prewarm_cache
-            .lock()
-            .unwrap()
-            .entries
-            .get_mut(id)
-            .unwrap()
-            .inserted_at = original;
-        for _ in 0..3 {
-            app.prewarm_group_member_key_packages(&[id.as_str()])
-                .await
-                .unwrap();
-            app.resolve_member_key_packages(&[id.as_str()])
-                .await
-                .unwrap();
-        }
-        let mut cache = app
-            .directory_state
-            .member_key_package_prewarm_cache
-            .lock()
-            .unwrap();
-        assert_eq!(cache.entries.get(id).unwrap().inserted_at, original);
-        cache.entries.get_mut(id).unwrap().inserted_at =
-            Instant::now() - MEMBER_PREWARM_CACHE_TTL - Duration::from_secs(1);
-        assert!(cache.get(id).is_none());
-    }
 }
 
 #[derive(Default)]
@@ -142,7 +81,23 @@ pub(crate) struct MemberKeyPackagePrewarmCache {
 }
 
 impl MemberKeyPackagePrewarmCache {
-    fn get(&mut self, account_id_hex: &str) -> Option<AccountRelayListStatus> {
+    /// When `account_id_hex`'s entry was cached.
+    #[cfg(test)]
+    pub(crate) fn inserted_at(&self, account_id_hex: &str) -> Option<Instant> {
+        self.entries
+            .get(account_id_hex)
+            .map(|entry| entry.inserted_at)
+    }
+
+    /// Backdate `account_id_hex`'s entry, to test expiry and reuse.
+    #[cfg(test)]
+    pub(crate) fn set_inserted_at(&mut self, account_id_hex: &str, inserted_at: Instant) {
+        if let Some(entry) = self.entries.get_mut(account_id_hex) {
+            entry.inserted_at = inserted_at;
+        }
+    }
+
+    pub(crate) fn get(&mut self, account_id_hex: &str) -> Option<AccountRelayListStatus> {
         self.remove_expired();
         self.entries
             .get(account_id_hex)
@@ -309,7 +264,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         .await
     }
 
-    async fn resolve_member_key_packages_for_purpose(
+    pub(crate) async fn resolve_member_key_packages_for_purpose(
         &self,
         member_refs: Vec<String>,
         purpose: MemberResolutionPurpose,

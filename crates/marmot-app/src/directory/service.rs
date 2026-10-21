@@ -40,7 +40,7 @@ pub struct DirectoryState {
     pub(super) sync_handle: Arc<RwLock<Option<DirectorySyncHandle>>>,
     /// Bounded, process-local composition prewarm. Entries are never durable
     /// directory admission and never reserve or consume a KeyPackage.
-    pub(super) member_key_package_prewarm_cache: Arc<Mutex<MemberKeyPackagePrewarmCache>>,
+    pub(crate) member_key_package_prewarm_cache: Arc<Mutex<MemberKeyPackagePrewarmCache>>,
 }
 
 impl<R: DirectoryResources> Directory<R> {
