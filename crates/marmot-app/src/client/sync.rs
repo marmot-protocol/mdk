@@ -2779,7 +2779,10 @@ impl AppClient {
                 self.retry_pending_runtime_group_subscription_refresh()
                     .await?;
                 let summary = self.take_pending_applied_sync_summary();
-                if summary != SyncSummary::default() {
+                if summary != SyncSummary::default()
+                    || !self.pending_convergence_groups.is_empty()
+                    || self.has_pending_epoch_backfill()
+                {
                     return Ok(summary);
                 }
                 continue;

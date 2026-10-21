@@ -203,6 +203,8 @@
   Direct catch-up failures retain already-committed native outputs in their
   completed prefix. Native ingests contribute to the existing drain delivery
   counts, including eventless deferred input.
+  Native input wakes `next_event` for pending convergence or epoch backfill
+  even when no visible event was produced.
   Recovered Welcomes publish `GroupJoined` before live-subscription I/O and
   retain their grant-owned post-join history work in both streamed chunks and
   final comparison results.
