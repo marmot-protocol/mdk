@@ -10,7 +10,9 @@ mod open_ranking;
 pub(crate) mod previews;
 pub(crate) mod published_records;
 pub(crate) mod records;
+pub(crate) mod resources;
 mod search;
+mod service;
 mod sync;
 
 pub(crate) use cache::DirectoryCache;
@@ -31,10 +33,12 @@ pub use records::{
     MatchedField, UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh,
     UserDirectorySearch, UserDirectorySearchResult, UserProfileMetadata,
 };
+pub(crate) use resources::{DirectoryAccount, DirectoryResources};
 pub use search::{
     OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger, UserSearchParams, UserSearchSubscription,
     UserSearchUpdate, sort_user_search_results,
 };
+pub(crate) use service::Directory;
 pub(crate) use sync::{DirectorySyncHandle, plan_directory_sync};
 
 /// The directory's wall clock, in Unix seconds.

@@ -12,13 +12,65 @@ use std::path::PathBuf;
 
 use marmot_account::AccountSummary;
 
-use crate::directory::DirectoryCache;
+use storage_sqlite::SqliteSharedStorage;
+
+use crate::directory::error::DirectoryError;
 use crate::directory::records::public_directory_user_record;
+use crate::directory::{Directory, DirectoryAccount, DirectoryCache, DirectoryResources};
 use crate::{
     APP_CACHE_DB_FILE, AccountRelayListStatus, AppError,
     DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER, MarmotApp, SqlcipherDatabaseKind,
     remove_sqlite_file_set,
 };
+
+/// The directory service over this app's resources.
+impl MarmotApp {
+    pub(crate) fn directory(&self) -> Directory<MarmotApp> {
+        Directory::new(self.clone())
+    }
+}
+
+/// The directory's handles come from the lifecycle below, so it never opens,
+/// keys or evicts a cache itself.
+impl DirectoryResources for MarmotApp {
+    fn local_accounts(&self) -> Result<Vec<DirectoryAccount>, DirectoryError> {
+        Ok(self
+            .account_home()
+            .accounts()?
+            .iter()
+            .map(directory_account)
+            .collect())
+    }
+
+    fn current_caches(&self) -> Result<Vec<DirectoryCache>, DirectoryError> {
+        Ok(self.directory_caches()?)
+    }
+
+    fn cache_for_account(
+        &self,
+        account: &DirectoryAccount,
+    ) -> Result<DirectoryCache, DirectoryError> {
+        Ok(self.open_directory_cache(
+            &account.label,
+            &account.account_id_hex,
+            account.local_signing,
+        )?)
+    }
+
+    fn shared_storage(&self) -> Result<SqliteSharedStorage, DirectoryError> {
+        Ok(MarmotApp::shared_storage(self)?)
+    }
+}
+
+/// The directory's view of a local account.
+fn directory_account(account: &AccountSummary) -> DirectoryAccount {
+    DirectoryAccount {
+        account_id_hex: account.account_id_hex.clone(),
+        label: account.label.clone(),
+        local_signing: account.local_signing,
+        active_signing: account.is_active_signing(),
+    }
+}
 
 impl MarmotApp {
     pub fn warm_directory_storage(&self) -> Result<(), AppError> {
@@ -73,13 +125,28 @@ impl MarmotApp {
         &self,
         account: &AccountSummary,
     ) -> Result<DirectoryCache, AppError> {
+        self.open_directory_cache(
+            &account.label,
+            &account.account_id_hex,
+            account.local_signing,
+        )
+    }
+
+    /// The account's cache, from the handle map or opened under the storage
+    /// gate.
+    fn open_directory_cache(
+        &self,
+        label: &str,
+        account_id_hex: &str,
+        local_signing: bool,
+    ) -> Result<DirectoryCache, AppError> {
         self.ensure_storage_open("directory cache")?;
         self.clean_future_dated_directory_caches_for_all_accounts_once()?;
         if let Some(cache) = self
             .directory_caches
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&account.label)
+            .get(label)
             .cloned()
         {
             return Ok(cache);
@@ -91,30 +158,30 @@ impl MarmotApp {
             method = "directory_cache_for_account"
         )
         .entered();
-        let path = self.directory_cache_path(&account.label);
+        let path = self.directory_cache_path(label);
         let lock = crate::sqlcipher::database_open_lock(&path);
         let database = lock.lock();
         if let Some(cache) = self
             .directory_caches
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&account.label)
+            .get(label)
             .cloned()
         {
             return Ok(cache);
         }
-        let key = if account.local_signing {
-            let keys = self.account_home().load_signing_keys(&account.label)?;
+        let key = if local_signing {
+            let keys = self.account_home().load_signing_keys(label)?;
             self.sqlcipher_key_locked(
-                &account.label,
+                label,
                 &keys,
                 &database,
                 SqlcipherDatabaseKind::DirectoryCache,
             )?
         } else {
             self.external_sqlcipher_key(
-                &account.label,
-                &account.account_id_hex,
+                label,
+                account_id_hex,
                 &database,
                 SqlcipherDatabaseKind::DirectoryCache,
             )?
@@ -131,7 +198,7 @@ impl MarmotApp {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Ok(caches
-            .entry(account.label.clone())
+            .entry(label.to_owned())
             .or_insert_with(|| cache.clone())
             .clone())
     }

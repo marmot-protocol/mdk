@@ -213,6 +213,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   on its own failures must call the `DirectoryError` twin (`directory_entry`, `cached_relay_list_status`,
   `fetch_relay_list_status`), never the public method, whose failures would arrive wrapped. A new variant needs a row in
   `error::directory_error_tests`.
+- Converted directory code is `impl<R: DirectoryResources> Directory<R>` (`src/directory/service.rs`), and reaches the
+  app only through the `DirectoryResources` trait in `src/directory/resources.rs`. Ask it for a cache when the cache is
+  about to be used, never before a network step. `MarmotApp` implements the trait and builds the service with
+  `directory()` in `src/directory_resources.rs`; its public directory methods become one-line delegates in
+  `src/directory_delegates.rs`, which PR 7 removes. Code still in `impl MarmotApp` calls converted methods through
+  `self.directory()`, listed as a crossing until that file converts too.
 - Keep stateless relay-list and KeyPackage handling for other accounts (relay-list status, KeyPackage tag/metadata
   validation, fresh-vs-cached reconciliation, ranking and selection, revocation evidence) and the directory-record
   selection primitives (`DirectoryFreshness`, `DirectorySelection`, `sort_directory_records`) in

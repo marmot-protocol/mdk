@@ -314,12 +314,12 @@ async fn run_search<F>(
             .into_iter()
             .map(TransportEndpoint)
             .collect::<Vec<_>>();
-        let cached_app = app.clone();
+        let cached_directory = app.directory();
         let cached_searcher = searcher_account_id_hex.clone();
         let cached_query = query.clone();
         let cached_started = Instant::now();
         let cached = blocking_directory_task(move || {
-            cached_app.cached_search_snapshot(
+            cached_directory.cached_search_snapshot(
                 &cached_searcher,
                 &cached_query,
                 super::cached_search::CACHED_SEARCH_MAX_RECORDS,
@@ -1012,10 +1012,10 @@ async fn extend_with_follows(
     emitter: &mut SearchEmitter,
 ) -> Result<(), DirectoryError> {
     let (cached, unknown) = if let Some(searcher) = searcher {
-        let app = app.clone();
+        let directory = app.directory();
         let searcher = searcher.to_owned();
         blocking_directory_task(move || {
-            Ok(match app.cached_search_follow_list(&searcher)? {
+            Ok(match directory.cached_search_follow_list(&searcher)? {
                 Some(follows) => (vec![follows], Vec::new()),
                 None => (Vec::new(), vec![searcher]),
             })

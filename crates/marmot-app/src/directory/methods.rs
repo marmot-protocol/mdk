@@ -830,8 +830,9 @@ impl MarmotApp {
             return Ok(Vec::new());
         }
 
-        let follows =
-            self.cached_search_follows(&parse_account_id_hex(&search.searcher_account_id_hex)?)?;
+        let follows = self
+            .directory()
+            .cached_search_follows(&parse_account_id_hex(&search.searcher_account_id_hex)?)?;
         let mut results = Vec::new();
         for (record, radius) in records {
             if radius < search.radius_start || radius > search.radius_end {
@@ -1174,6 +1175,7 @@ impl MarmotApp {
                 };
                 if radius == 0 {
                     record.follows = self
+                        .directory()
                         .cached_search_follow_list(&account_id)?
                         .unwrap_or_default();
                 }

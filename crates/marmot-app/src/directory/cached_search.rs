@@ -1,20 +1,21 @@
 //! Network-free public-profile search across every connected account's caches.
 
-use crate::AppError;
 use crate::directory::error::DirectoryError;
 use std::collections::{BTreeMap, HashSet, btree_map::Entry};
 
+use super::Directory;
 use super::ids::parse_account_id_hex;
 use super::records::user_record_match;
+use super::resources::DirectoryResources;
 use crate::{
-    MarmotApp, OFF_GRAPH_SEARCH_RADIUS, UserDirectoryRecord, UserDirectorySearchResult,
+    OFF_GRAPH_SEARCH_RADIUS, UserDirectoryRecord, UserDirectorySearchResult,
     sort_user_search_results,
 };
 
 /// Defensive materialization cap, matching the shared public directory's bound.
 pub(crate) const CACHED_SEARCH_MAX_RECORDS: usize = 10_000;
 
-impl MarmotApp {
+impl<R: DirectoryResources> Directory<R> {
     /// Search all cached public identities, independent of social-graph reachability.
     /// This does no relay work or group-membership reads. Follow attribution is
     /// relative to `searcher_account_id_hex`; local labels and private nicknames
@@ -24,10 +25,9 @@ impl MarmotApp {
         searcher_account_id_hex: &str,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<UserDirectorySearchResult>, AppError> {
+    ) -> Result<Vec<UserDirectorySearchResult>, DirectoryError> {
         self.cached_search_snapshot(searcher_account_id_hex, query, limit)
             .map(|(_, results)| results)
-            .map_err(AppError::from)
     }
 
     pub(crate) fn cached_search_snapshot(
@@ -61,12 +61,16 @@ impl MarmotApp {
             }
         };
         let now = crate::directory::unix_now_seconds() as i64;
-        for cache in self.directory_caches()? {
+        for cache in self.resources.current_caches()? {
             for record in cache.public_search_records(now)? {
                 insert(record);
             }
         }
-        for record in self.shared_storage()?.public_directory_profiles()? {
+        for record in self
+            .resources
+            .shared_storage()?
+            .public_directory_profiles()?
+        {
             insert(UserDirectoryRecord {
                 account_id_hex: record.account_id_hex,
                 npub: record.npub,
@@ -129,15 +133,15 @@ impl MarmotApp {
         searcher: &str,
     ) -> Result<Option<Vec<String>>, DirectoryError> {
         let account = self
-            .account_home()
-            .accounts()?
+            .resources
+            .local_accounts()?
             .into_iter()
-            .find(|account| account.account_id_hex == searcher && account.is_active_signing());
+            .find(|account| account.account_id_hex == searcher && account.active_signing);
         let caches = if let Some(account) = account {
-            vec![self.directory_cache_for_account(&account)?]
+            vec![self.resources.cache_for_account(&account)?]
         } else {
             // The Rust API also supports a public, non-connected graph root.
-            self.directory_caches()?
+            self.resources.current_caches()?
         };
         for cache in &caches {
             if let Some(follows) = cache.search_graph_follows(searcher)? {
@@ -160,7 +164,7 @@ mod tests {
     use super::*;
     use crate::directory::cache::DirectorySearchGraphRecord;
     use crate::directory::records::public_directory_user_record;
-    use crate::{UserDirectoryLocalAccount, UserProfileMetadata};
+    use crate::{MarmotApp, UserDirectoryLocalAccount, UserProfileMetadata};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connected_searcher_ignores_another_accounts_stale_follows() {
