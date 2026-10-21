@@ -559,9 +559,6 @@ pub struct MarmotApp {
     /// What the directory keeps between calls; [`Self::directory`] shares it
     /// with every service it builds.
     directory_state: directory::DirectoryState,
-    /// Bounded, process-local composition prewarm. Entries are never durable
-    /// directory admission and never reserve or consume a KeyPackage.
-    member_key_package_prewarm_cache: Arc<Mutex<directory::MemberKeyPackagePrewarmCache>>,
     legacy_directory_cache_checked: Arc<Mutex<bool>>,
     #[cfg(test)]
     directory_test_clock: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -1621,9 +1618,6 @@ impl MarmotApp {
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
             directory_state: directory::DirectoryState::default(),
-            member_key_package_prewarm_cache: Arc::new(Mutex::new(
-                directory::MemberKeyPackagePrewarmCache::default(),
-            )),
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
             directory_test_clock: None,
@@ -1721,9 +1715,6 @@ impl MarmotApp {
             account_session_owners: Arc::new(Mutex::new(HashSet::new())),
             directory_caches: Arc::new(Mutex::new(HashMap::new())),
             directory_state: directory::DirectoryState::default(),
-            member_key_package_prewarm_cache: Arc::new(Mutex::new(
-                directory::MemberKeyPackagePrewarmCache::default(),
-            )),
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
             directory_test_clock: None,

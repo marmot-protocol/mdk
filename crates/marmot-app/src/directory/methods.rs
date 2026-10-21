@@ -613,6 +613,7 @@ impl MarmotApp {
             .and_then(|entry| entry.key_package.as_ref())
             .map(crate::directory::published_records::KeyPackageRecoveryTarget::from_cached);
         let records = self
+            .directory()
             .recover_key_package_records(super::key_package_recovery::KeyPackageRecoveryRequest {
                 account: account_id_hex,
                 searched: &source_relays,

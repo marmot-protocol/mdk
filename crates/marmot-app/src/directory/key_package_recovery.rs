@@ -8,11 +8,13 @@ use cgka_traits::TransportEndpoint;
 use nostr_sdk::prelude::RelayUrl;
 use transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE;
 
+use super::Directory;
+use super::resources::DirectoryResources;
+use crate::DirectoryFreshness;
 use crate::directory::published_records::{
     KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, preferred_fresh_key_package_from_records,
     without_revoked_slot_winners,
 };
-use crate::{DirectoryFreshness, MarmotApp};
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord};
 
 const RECOVERY_ENDPOINT_LIMIT: usize = 8;
@@ -37,7 +39,7 @@ pub(super) struct KeyPackageRecoveryRequest<'a> {
     pub(super) cached_target: Option<KeyPackageRecoveryTarget>,
 }
 
-impl MarmotApp {
+impl<R: DirectoryResources> Directory<R> {
     /// Recover only after normal selection fails. Never replace a positive
     /// normal lookup with another network stage, or admit cached member bytes.
     pub(super) async fn recover_key_package_records(
@@ -59,7 +61,7 @@ impl MarmotApp {
             &observed,
             freshness,
             requirements,
-            &self.deployment().key_package_client_preference,
+            &self.config.key_package_client_preference,
         )
         .is_ok_and(|selection| selection.value.is_some())
         {
@@ -126,7 +128,7 @@ impl MarmotApp {
                 &records,
                 freshness,
                 requirements,
-                &self.deployment().key_package_client_preference,
+                &self.config.key_package_client_preference,
             )?;
             let target = selection
                 .value

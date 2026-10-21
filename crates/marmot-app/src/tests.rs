@@ -9580,13 +9580,14 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .session()
             .invite_key_package_requirements(&group)
             .unwrap();
-        app.resolve_compatible_member_key_packages(
-            members.clone(),
-            &requirements,
-            crate::directory::MemberResolutionPurpose::CommitFresh,
-        )
-        .await
-        .unwrap();
+        app.directory()
+            .resolve_compatible_member_key_packages(
+                members.clone(),
+                &requirements,
+                crate::directory::MemberResolutionPurpose::CommitFresh,
+            )
+            .await
+            .unwrap();
         for member in &members {
             assert!(
                 app.directory_entry_for_account_id(member)
@@ -9606,6 +9607,7 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
         }
         fetcher.requests.lock().unwrap().clear();
         let error = app
+            .directory()
             .resolve_compatible_member_key_packages(
                 members.clone(),
                 &requirements,

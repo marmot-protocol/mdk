@@ -19,13 +19,15 @@ use crate::directory::error::DirectoryError;
 use crate::directory::hydrate_directory_record;
 use crate::directory::records::public_directory_user_record;
 use crate::directory::{
-    Directory, DirectoryAccount, DirectoryCache, DirectoryConfig, DirectoryResources,
+    Directory, DirectoryAccount, DirectoryCache, DirectoryConfig, DirectoryObservation,
+    DirectoryObserver, DirectoryResources, ObservedFamily, ObservedUnit,
 };
 use crate::{
     APP_CACHE_DB_FILE, AccountRelayListStatus, AppError,
     DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER, MarmotApp, SqlcipherDatabaseKind,
     remove_sqlite_file_set,
 };
+use crate::{ProductFamily, ProductObservation, ProductUnit};
 
 /// The directory service over this app's resources.
 impl MarmotApp {
@@ -54,6 +56,7 @@ impl MarmotApp {
                 .collect(),
             default_relays: self.relay_endpoints(),
             max_future_skew: self.config.directory_max_future_skew,
+            key_package_client_preference: self.deployment().key_package_client_preference.clone(),
             #[cfg(test)]
             test_clock: self.directory_test_clock.clone(),
         }
@@ -101,6 +104,58 @@ impl DirectoryResources for MarmotApp {
             .profile_updates
             .send(account_id_hex.to_owned());
         self.presentation_signals.wake();
+    }
+}
+
+/// Directory analytics go to the app's usage-diagnostics collector, under the
+/// families and units they always used.
+impl DirectoryObserver for MarmotApp {
+    type Observation = ProductObservation;
+
+    fn begin(
+        &self,
+        family: ObservedFamily,
+        operation: &'static str,
+        unit: ObservedUnit,
+    ) -> Option<ProductObservation> {
+        self.product_analytics
+            .begin(product_family(family), operation, product_unit(unit))
+    }
+}
+
+impl DirectoryObservation for ProductObservation {
+    fn counts_only(self) -> Self {
+        ProductObservation::counts_only(self)
+    }
+
+    fn count(&self, outcome: &str, unit: ObservedUnit, count: u64) {
+        ProductObservation::count(self, outcome, product_unit(unit), count);
+    }
+
+    fn directory_sample(&self, outcome: &str, source: &str, count: u64) {
+        ProductObservation::directory_sample(self, outcome, source, count);
+    }
+
+    fn finish(self, outcome: &str) {
+        ProductObservation::finish(self, outcome);
+    }
+
+    fn discard(self) {
+        ProductObservation::discard(self);
+    }
+}
+
+fn product_family(family: ObservedFamily) -> ProductFamily {
+    match family {
+        ObservedFamily::Directory => ProductFamily::Directory,
+        ObservedFamily::KeyPackage => ProductFamily::KeyPackage,
+    }
+}
+
+fn product_unit(unit: ObservedUnit) -> ProductUnit {
+    match unit {
+        ObservedUnit::Action => ProductUnit::Action,
+        ObservedUnit::Attempt => ProductUnit::Attempt,
     }
 }
 
@@ -354,5 +409,98 @@ impl MarmotApp {
             .filter(|account| account.is_active_signing())
             .collect::<Vec<_>>();
         self.clean_future_dated_directory_caches_once(&accounts)
+    }
+}
+
+#[cfg(all(test, feature = "product-analytics-export"))]
+mod observer_tests {
+    use super::*;
+
+    fn summaries(app: &MarmotApp, event: &str, operation: &str) -> Vec<serde_json::Value> {
+        app.product_analytics
+            .test_payloads()
+            .into_iter()
+            .filter(|payload| {
+                payload["eventName"] == event && payload["props"]["operation"] == operation
+            })
+            .map(|payload| payload["props"].clone())
+            .collect()
+    }
+
+    /// Directory analytics reach the collector under the families,
+    /// operations and units they used before the observer, and keep the
+    /// collector's rule that an unfinished observation records a cancellation
+    /// unless it is counts-only.
+    #[test]
+    fn directory_observations_keep_their_events_and_drop_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = MarmotApp::with_relays(dir.path(), vec![]);
+        app.product_analytics = crate::product_analytics::test_product_collector();
+        app.set_usage_diagnostics_consent(true).unwrap();
+
+        let counts = DirectoryObserver::begin(
+            &app,
+            ObservedFamily::Directory,
+            "key_package",
+            ObservedUnit::Attempt,
+        )
+        .map(DirectoryObservation::counts_only)
+        .unwrap();
+        DirectoryObservation::count(&counts, "success", ObservedUnit::Attempt, 2);
+        DirectoryObservation::directory_sample(&counts, "success", "cache", 3);
+        drop(counts);
+        DirectoryObservation::finish(
+            DirectoryObserver::begin(
+                &app,
+                ObservedFamily::KeyPackage,
+                "lookup",
+                ObservedUnit::Action,
+            )
+            .unwrap(),
+            "usable",
+        );
+        DirectoryObservation::discard(
+            DirectoryObserver::begin(
+                &app,
+                ObservedFamily::KeyPackage,
+                "lookup",
+                ObservedUnit::Attempt,
+            )
+            .unwrap(),
+        );
+        drop(
+            DirectoryObserver::begin(
+                &app,
+                ObservedFamily::Directory,
+                "relay_list",
+                ObservedUnit::Attempt,
+            )
+            .unwrap(),
+        );
+
+        let key_package = summaries(&app, "mdk_directory_summary", "key_package");
+        assert!(
+            key_package
+                .iter()
+                .all(|props| props["outcome"] != "cancelled"),
+            "a counts-only observation records no cancellation: {key_package:?}"
+        );
+        assert!(key_package.iter().any(|props| {
+            props["outcome"] == "success" && props["unit"] == "attempt" && props["source"].is_null()
+        }));
+        assert!(key_package.iter().any(|props| props["source"] == "cache"));
+
+        let lookups = summaries(&app, "mdk_key_package_summary", "lookup");
+        assert_eq!(lookups.len(), 1, "a discarded observation records nothing");
+        assert_eq!(lookups[0]["outcome"], "usable");
+        assert_eq!(lookups[0]["unit"], "action");
+
+        let relay_lists = summaries(&app, "mdk_directory_summary", "relay_list");
+        assert!(
+            relay_lists
+                .iter()
+                .any(|props| props["outcome"] == "cancelled"),
+            "an unfinished observation still records a cancellation: {relay_lists:?}"
+        );
     }
 }

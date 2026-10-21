@@ -2,19 +2,6 @@
 # (step 3 of docs/marmot-architecture/review/brief-directory.md). One line per
 # file and target; `directory_crossings_tests` keeps this list exact, so it only
 # shrinks. The directory moves into nostr-directory when it is empty.
-directory/key_package_recovery.rs MarmotApp.relay_plane
-directory/key_package_recovery.rs MarmotApp::deployment()
-directory/key_package_recovery.rs crate::MarmotApp
-directory/member_key_packages.rs MarmotApp.member_key_package_prewarm_cache
-directory/member_key_packages.rs MarmotApp.product_analytics
-directory/member_key_packages.rs MarmotApp.relay_plane
-directory/member_key_packages.rs MarmotApp::account_home()
-directory/member_key_packages.rs MarmotApp::deployment()
-directory/member_key_packages.rs crate::AppError
-directory/member_key_packages.rs crate::MarmotApp
-directory/member_key_packages.rs crate::ProductFamily
-directory/member_key_packages.rs crate::ProductObservation
-directory/member_key_packages.rs crate::ProductUnit
 directory/methods.rs MarmotApp.config
 directory/methods.rs MarmotApp.product_analytics
 directory/methods.rs MarmotApp.relay_plane

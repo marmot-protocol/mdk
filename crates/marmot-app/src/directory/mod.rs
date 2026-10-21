@@ -6,6 +6,7 @@ pub(crate) mod ids;
 mod key_package_recovery;
 mod member_key_packages;
 mod methods;
+pub(crate) mod observer;
 mod open_ranking;
 pub(crate) mod previews;
 pub(crate) mod published_records;
@@ -21,11 +22,12 @@ pub(crate) use cache::DirectoryCache;
 pub(crate) use cache::DirectorySearchGraphRecord;
 pub(crate) use config::DirectoryConfig;
 pub use member_key_packages::MemberKeyPackagePrewarmSummary;
-pub(crate) use member_key_packages::{MemberKeyPackagePrewarmCache, MemberResolutionPurpose};
+pub(crate) use member_key_packages::MemberResolutionPurpose;
 #[cfg(test)]
 pub(crate) use methods::USER_DIRECTORY_SEARCH_MAX_FRONTIER;
 #[cfg(test)]
 pub(crate) use methods::cached_or_unknown_follow_list;
+pub(crate) use observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, ObservedUnit};
 pub use published_records::{
     AccountRelayListState, AccountRelayListStatus, FetchedKeyPackage, MissingRelayListKind,
 };

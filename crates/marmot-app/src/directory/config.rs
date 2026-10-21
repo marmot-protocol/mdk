@@ -19,6 +19,8 @@ pub struct DirectoryConfig {
     pub default_relays: Vec<TransportEndpoint>,
     /// How far past now an event's `created_at` may be and still count.
     pub max_future_skew: Duration,
+    /// How KeyPackage candidates rank by their `client` tag.
+    pub key_package_client_preference: KeyPackageClientPreference,
     /// Replaces the wall clock for freshness checks in tests.
     #[cfg(test)]
     pub test_clock: Option<Arc<AtomicU64>>,

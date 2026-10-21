@@ -988,6 +988,7 @@ async fn invite_recovery_preserves_incompatible_errors_for_empty_and_failed_supp
         *fetcher.failing_endpoint.lock().unwrap() = supplement_error.then(|| DISCOVERY.into());
         *fetcher.failing_endpoint_kind.lock().unwrap() = Some(KIND_MARMOT_KEY_PACKAGE);
         let result = app
+            .directory()
             .resolve_compatible_member_key_packages(
                 vec![account.account_id_hex.clone()],
                 &requirements,

@@ -11,6 +11,7 @@ use transport_nostr::MarmotRelayPlane;
 
 use super::DirectorySyncHandle;
 use super::config::DirectoryConfig;
+use super::member_key_packages::MemberKeyPackagePrewarmCache;
 use super::resources::DirectoryResources;
 
 /// The user directory: lookups and search over other people's public Nostr
@@ -33,6 +34,9 @@ pub struct DirectoryState {
     /// The running sync worker, which a store write asks to rebuild its
     /// subscriptions.
     pub(super) sync_handle: Arc<RwLock<Option<DirectorySyncHandle>>>,
+    /// Bounded, process-local composition prewarm. Entries are never durable
+    /// directory admission and never reserve or consume a KeyPackage.
+    pub(super) member_key_package_prewarm_cache: Arc<Mutex<MemberKeyPackagePrewarmCache>>,
 }
 
 impl<R: DirectoryResources> Directory<R> {
