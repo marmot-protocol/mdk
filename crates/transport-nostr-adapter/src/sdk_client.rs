@@ -1247,16 +1247,26 @@ impl PublishRelayCache {
             }
         }
         state.relays.retain(|endpoint, entry| {
-            entry.leases != 0
-                || state.subscription_owned.contains(endpoint)
-                || relays
-                    .get(endpoint)
-                    .is_some_and(|relay| !relay.capabilities().can_read())
+            if entry.leases != 0 {
+                return true;
+            }
+            let Some(relay) = relays.get(endpoint) else {
+                state.subscription_owned.remove(endpoint);
+                return false;
+            };
+            (state.subscription_owned.contains(endpoint)
+                && !state
+                    .subscriptions
+                    .values()
+                    .any(|endpoints| endpoints.contains(endpoint)))
+                || !relay.capabilities().can_read()
         });
         let mut idle_count = state
             .relays
-            .values()
-            .filter(|entry| entry.leases == 0)
+            .iter()
+            .filter(|(endpoint, entry)| {
+                entry.leases == 0 && !state.subscription_owned.contains(*endpoint)
+            })
             .count();
         loop {
             let now = tokio::time::Instant::now();
@@ -1302,8 +1312,9 @@ impl PublishRelayCache {
                 break;
             }
             state.relays.remove(&endpoint);
-            state.subscription_owned.remove(&endpoint);
-            idle_count -= 1;
+            if !state.subscription_owned.remove(&endpoint) {
+                idle_count -= 1;
+            }
         }
     }
 
@@ -1462,9 +1473,9 @@ async fn dispatch_sdk_notification(
                     subscription_id,
                     event,
                 } => {
-                    // The pinned SDK validates signatures before emitting raw
-                    // Message copies as well as deduplicated Event copies.
-                    // Count every copy before admission, in relay/EOSE order.
+                    // The SDK authenticates event ids, not later cache-hit bytes.
+                    // Group copies reuse trusted bodies or validate the body hash.
+                    // Keep observation and admission in relay/EOSE order.
                     let endpoint = TransportEndpoint(relay_url.to_string());
                     if event.kind == Kind::MlsGroupMessage {
                         let _ = adapter
@@ -1475,7 +1486,7 @@ async fn dispatch_sdk_notification(
                                 account_id,
                             )
                             .await;
-                    } else {
+                    } else if event.verify_id() {
                         adapter
                             .observe_relay_event(
                                 event.id.as_bytes(),
@@ -6818,6 +6829,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_relay_keeps_expiry() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let url = relay.url().await;
+        let id = SubscriptionId::new("removed-before-close");
+        sdk.add_subscription_relay(url.clone(), &id).await.unwrap();
+        sdk.client().remove_relay(url).await.unwrap();
+        sdk.release_subscription_relays(&id).await;
+
+        let writer = MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(writer.url().await.to_string());
+        sdk.publish_event(
+            std::slice::from_ref(&endpoint),
+            &signed_group_event_dto(),
+            1,
+        )
+        .await
+        .unwrap();
+        tokio::time::pause();
+        advance(SDK_PUBLISH_RELAY_IDLE_WAIT + Duration::from_secs(1)).await;
+        for _ in 0..100 {
+            if sdk
+                .client()
+                .relay(endpoint.as_str())
+                .await
+                .unwrap()
+                .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            sdk.client()
+                .relay(endpoint.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sdk.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn subscriptions_keep_idle_room() {
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let id = SubscriptionId::new("shared-publish");
+        let mut relays = Vec::new();
+        for _ in 0..SDK_PUBLISH_RELAY_IDLE_LIMIT {
+            let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+            let url = relay.url().await;
+            sdk.add_subscription_relay(url.clone(), &id).await.unwrap();
+            let mut lease = ScopedPublishRelayLease::new(sdk.clone());
+            lease.retain(&url).await.unwrap();
+            lease.release().await;
+            relays.push(relay);
+        }
+        let writer = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let url = writer.url().await;
+        let mut lease = ScopedPublishRelayLease::new(sdk.clone());
+        lease.retain(&url).await.unwrap();
+        sdk.client().connect_relay(url.clone()).await.unwrap();
+        timeout(Duration::from_secs(10), async {
+            while sdk
+                .client()
+                .relay(url.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .status()
+                != RelayStatus::Connected
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        lease.release().await;
+        assert!(
+            sdk.client().relay(url.clone()).await.unwrap().is_some(),
+            "live subscriptions must not consume the idle publication allowance"
+        );
+        sdk.release_subscription_relays(&id).await;
+        assert!(sdk.client().relay(url).await.unwrap().is_some());
+        sdk.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn subscription_release_preserves_shared_socket_owners() {
         for owner in ["external", "acquisition", "publish"] {
             let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
@@ -7572,20 +7670,18 @@ mod tests {
         let sdk = NostrSdkRelayClient::new(Client::default());
         let adapter = NostrTransportAdapter::new(Arc::new(sdk.clone()));
         let mut notifications = sdk.notifications();
-        adapter
-            .activate_account(crate::TransportAccountActivation {
-                account_id: account.clone(),
-                inbox_endpoints: vec![endpoints[0].clone()],
-                group_subscriptions: vec![crate::TransportGroupSubscription {
-                    group_id: group.clone(),
-                    transport_group_id: vec![0xc3; 32],
-                    endpoints: endpoints.clone(),
-                    retained_since: None,
-                }],
-                since: None,
-            })
-            .await
-            .unwrap();
+        let activation = crate::TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![endpoints[0].clone()],
+            group_subscriptions: vec![crate::TransportGroupSubscription {
+                group_id: group.clone(),
+                transport_group_id: vec![0xc3; 32],
+                endpoints: endpoints.clone(),
+                retained_since: None,
+            }],
+            since: None,
+        };
+        adapter.activate_account(activation.clone()).await.unwrap();
         let mut copies = Vec::new();
         let mut deferred = Vec::new();
         timeout(Duration::from_secs(10), async {
@@ -7707,6 +7803,53 @@ mod tests {
             "released live duplicates also avoid conversion"
         );
         assert_eq!(adapter.delivery_spread().await.spread.sample_count(), 2);
+        // A fresh replay has the SDK-cached id but no held body to trust.
+        adapter.deactivate_account(&account).await.unwrap();
+        adapter.activate_account(activation).await.unwrap();
+        let request = adapter.state.read().await.account_replay_coverage[&account]
+            .windows
+            .iter()
+            .find_map(|(id, window)| {
+                matches!(window.scope, crate::ReplayScope::Groups(_)).then(|| id.clone())
+            })
+            .unwrap();
+        let mut altered = event.clone();
+        altered.created_at = NostrTimestamp::from_secs(1);
+        assert!(matches!(
+            adapter
+                .handle_sdk_group_copy(
+                    &altered,
+                    endpoints[0].clone(),
+                    request.clone(),
+                    Some(&account)
+                )
+                .await,
+            Err(TransportAdapterError::InvalidInboundSignature)
+        ));
+        altered.kind = Kind::TextNote;
+        dispatch_sdk_notification(
+            ClientNotification::Message {
+                relay_url: RelayUrl::parse(endpoints[0].as_str()).unwrap(),
+                message: Box::new(RelayMessage::Event {
+                    subscription_id: std::borrow::Cow::Owned(SubscriptionId::new(request)),
+                    event: std::borrow::Cow::Owned(altered),
+                }),
+            },
+            &adapter,
+            Some(&account),
+            &|reason| sdk.subscription_refusal(reason),
+        )
+        .await;
+        {
+            let state = adapter.state.read().await;
+            assert!(
+                state.account_replay_coverage[&account]
+                    .stored
+                    .values()
+                    .flat_map(|relays| relays.values())
+                    .all(|stored| stored.events == 0 && stored.oldest.is_none())
+            );
+        }
         sdk.client().shutdown().await;
         drop(relays);
     }

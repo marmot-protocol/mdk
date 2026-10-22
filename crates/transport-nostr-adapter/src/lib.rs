@@ -2110,6 +2110,9 @@ impl NostrTransportAdapter {
         account_id: Option<&MemberId>,
     ) -> Result<usize, TransportAdapterError> {
         let Some(account) = self.group_copy_account(&subscription_id, account_id).await else {
+            if !event.verify_id() {
+                return Err(TransportAdapterError::InvalidInboundSignature);
+            }
             self.observe_relay_event(
                 event.id.as_bytes(),
                 &endpoint,
@@ -2135,31 +2138,21 @@ impl NostrTransportAdapter {
         let parsed_endpoint = RelayUrl::parse(endpoint.as_str()).ok();
         {
             let mut state = self.state.write().await;
-            let created_at = route
-                .as_ref()
-                .and_then(|route| {
-                    let coverage = state.account_replay_coverage.get(&account)?;
-                    state
-                        .by_transport_group
-                        .get(route.as_slice())?
-                        .iter()
-                        .find_map(|entry| {
-                            coverage
-                                .groups
-                                .get(&entry.group_id)?
-                                .events
-                                .get(&id)
-                                .map(|held| held.delivery.message.timestamp.0)
-                        })
-                })
-                .unwrap_or(event.created_at.as_secs());
-            state.observe_relay_id(
-                &id,
-                &endpoint,
-                Some(&subscription_id),
-                created_at,
-                self.now_ms(),
-            );
+            let created_at = route.as_ref().and_then(|route| {
+                let coverage = state.account_replay_coverage.get(&account)?;
+                state
+                    .by_transport_group
+                    .get(route.as_slice())?
+                    .iter()
+                    .find_map(|entry| {
+                        coverage
+                            .groups
+                            .get(&entry.group_id)?
+                            .events
+                            .get(&id)
+                            .map(|held| held.delivery.message.timestamp.0)
+                    })
+            });
             let relay = state.relay_index.existing_index_for(&endpoint);
             let AdapterState {
                 by_transport_group,
@@ -2184,17 +2177,18 @@ impl NostrTransportAdapter {
                 let released_live = !coverage.copy_is_historical(&subscription_id, relay)
                     && coverage.released.contains(&id);
                 if released_live
-                    || matching.clone().all(|entry| {
-                        coverage
-                            .groups
-                            .get(&entry.group_id)
-                            .and_then(|group| group.events.get(&id))
-                            .is_some_and(|held| {
-                                matches!(&held.delivery.message.envelope,
+                    || (created_at.is_some()
+                        && matching.clone().all(|entry| {
+                            coverage
+                                .groups
+                                .get(&entry.group_id)
+                                .and_then(|group| group.events.get(&id))
+                                .is_some_and(|held| {
+                                    matches!(&held.delivery.message.envelope,
                             TransportEnvelope::GroupMessage { transport_group_id }
                                 if transport_group_id.as_slice() == route.as_slice())
-                            })
-                    })
+                                })
+                        }))
                 {
                     let mut delivered = 0;
                     for entry in matching {
@@ -2207,6 +2201,20 @@ impl NostrTransportAdapter {
                             );
                         }
                         delivered += 1;
+                    }
+                    let now_ms = self.now_ms();
+                    if let Some(created_at) = created_at {
+                        state.observe_relay_id(
+                            &id,
+                            &endpoint,
+                            Some(&subscription_id),
+                            created_at,
+                            now_ms,
+                        );
+                    } else {
+                        // Released live duplicates have no stored-page slot.
+                        state.record_delivery_timing(&id, &endpoint, now_ms);
+                        state.record_subscription_first_event(&subscription_id, &endpoint, now_ms);
                     }
                     state.record_inbound_event(delivered);
                     return Ok(delivered);
@@ -2221,10 +2229,30 @@ impl NostrTransportAdapter {
             subscription_id: Some(subscription_id),
             event: NostrTransportEvent::from_nostr_event(event).map_err(map_inbound_event_error)?,
         };
-        let message = relay_event
-            .event
-            .to_transport_message()
-            .map_err(map_inbound_event_error)?;
+        let message = match relay_event.event.to_transport_message() {
+            Ok(message) => message,
+            Err(error) => {
+                if event.verify_id()
+                    && let Some(subscription_id) = relay_event.subscription_id
+                {
+                    self.observe_unconvertible_relay_event(
+                        relay_event.endpoint,
+                        subscription_id,
+                        event.created_at.as_secs(),
+                    )
+                    .await;
+                }
+                return Err(map_inbound_event_error(error));
+            }
+        };
+        // Bind uncached metadata to the authenticated id before replay accounting.
+        self.observe_relay_event(
+            &id,
+            &relay_event.endpoint,
+            relay_event.subscription_id.as_deref(),
+            message.timestamp.0,
+        )
+        .await;
         self.admit_relay_message(&relay_event, message, Some(&account), RelayCopy::RawGroup)
             .await
     }

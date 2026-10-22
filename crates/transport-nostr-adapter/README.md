@@ -51,10 +51,11 @@ TransportPublishRequest -> NostrTransportAdapter -> NostrRelayClient
 `NostrSdkRelayClient` behind the `sdk` feature.
 
 Public DTO ingress verifies the event signature and id/content binding before delivery, including reconciliation
-and acquired replay pages. The SDK notification path relies on the pinned SDK's signature validation before
-both deduplicated `Event` and per-relay `Message` notifications. The first admitted copy still checks the
-id/content binding and exact Marmot tag shape. Group peeling relies on this authenticated transport boundary;
-it checks payload identity and routing without repeating Schnorr verification.
+and acquired replay pages. SDK notifications carry event ids authenticated by the pinned SDK. Its verification
+cache is keyed by id, so later copies may contain altered bytes: a buffered copy reuses only the held body's
+trusted routing and timestamp, while an uncached copy must match the authenticated event hash before replay
+accounting. Admission also enforces the exact Marmot tag shape. Group peeling checks payload identity and
+routing without repeating Schnorr verification.
 
 `observe_relay_event` accepts an authenticated event id, endpoint, subscription id and timestamp. It records
 every relay's timing and stored-page slot without building or serializing an ingest DTO. While a replay body
@@ -72,7 +73,9 @@ acknowledgements, including the distinction between affirmative and duplicate AC
 Subscription-created connections close when their last subscription ends. An active
 publication keeps a shared connection open until its lease ends. Externally supplied
 connections and connections promoted for history acquisition keep their existing
-pool lifetime.
+pool lifetime. Subscription-owned connections do not consume the idle WRITE-only
+publication allowance, either while subscribed or while awaiting removal. Missing
+subscription connections do not prevent other idle sockets from expiring.
 
 The app-runtime layer projects group subscriptions and group-message publish targets from
 `marmot.transport.nostr.routing.v1` and applies relay endpoint parsing/deduplication before subscription or publish.
