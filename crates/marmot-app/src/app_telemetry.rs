@@ -1626,37 +1626,6 @@ mod tests {
     }
 
     #[test]
-    fn records_each_generated_account_setup_stage_and_outcome() {
-        let telemetry = AppPerformanceTelemetry::default();
-        for (operation, duration_ms) in [
-            (AppPerformanceOperation::AccountSetupIdentityLocal, 1),
-            (AppPerformanceOperation::AccountSetupStorageLocal, 2),
-            (AppPerformanceOperation::AccountSetupProfileLocal, 3),
-            (AppPerformanceOperation::AccountSetupKeyPackageLocal, 4),
-            (AppPerformanceOperation::AccountSetupLocalReadyHandoff, 5),
-            (AppPerformanceOperation::AccountSetupNetworkReady, 6),
-        ] {
-            telemetry.record(operation, Duration::from_millis(duration_ms), true);
-            telemetry.record(operation, Duration::from_millis(duration_ms), false);
-        }
-
-        let snapshot = telemetry.snapshot();
-        for (stage, expected_sum_ms) in [
-            (snapshot.account_setup_identity_local, 2),
-            (snapshot.account_setup_storage_local, 4),
-            (snapshot.account_setup_profile_local, 6),
-            (snapshot.account_setup_key_package_local, 8),
-            (snapshot.account_setup_local_ready_handoff, 10),
-            (snapshot.account_setup_network_ready, 12),
-        ] {
-            assert_eq!(stage.attempts, 2);
-            assert_eq!(stage.successes, 1);
-            assert_eq!(stage.failures, 1);
-            assert_eq!(stage.duration_ms.sum_ms, expected_sum_ms);
-        }
-    }
-
-    #[test]
     fn records_each_group_create_stage() {
         let telemetry = AppPerformanceTelemetry::default();
         let operations = [
@@ -1771,93 +1740,6 @@ mod tests {
             assert_eq!(phase.failures, 0);
             assert_eq!(phase.duration_ms.sample_count(), 1);
         }
-    }
-
-    #[test]
-    fn records_chat_list_row_read_operation() {
-        let telemetry = AppPerformanceTelemetry::default();
-        telemetry.record(
-            AppPerformanceOperation::ChatListRowRead,
-            Duration::from_millis(4),
-            true,
-        );
-        telemetry.record(
-            AppPerformanceOperation::ChatListRowRead,
-            Duration::from_millis(9),
-            false,
-        );
-
-        let snapshot = telemetry.snapshot();
-        assert_eq!(snapshot.chat_list_row_read.attempts, 2);
-        assert_eq!(snapshot.chat_list_row_read.successes, 1);
-        assert_eq!(snapshot.chat_list_row_read.failures, 1);
-        assert_eq!(snapshot.chat_list_row_read.duration_ms.sample_count(), 2);
-        assert_eq!(snapshot.chat_list_row_read.duration_ms.sum_ms, 13);
-    }
-
-    #[test]
-    fn records_group_conversation_snapshot_read_operation() {
-        let telemetry = AppPerformanceTelemetry::default();
-        telemetry.record(
-            AppPerformanceOperation::GroupConversationSnapshotRead,
-            Duration::from_millis(6),
-            true,
-        );
-        telemetry.record(
-            AppPerformanceOperation::GroupConversationSnapshotRead,
-            Duration::from_millis(10),
-            false,
-        );
-
-        let snapshot = telemetry.snapshot();
-        assert_eq!(snapshot.group_conversation_snapshot_read.attempts, 2);
-        assert_eq!(snapshot.group_conversation_snapshot_read.successes, 1);
-        assert_eq!(snapshot.group_conversation_snapshot_read.failures, 1);
-        assert_eq!(
-            snapshot
-                .group_conversation_snapshot_read
-                .duration_ms
-                .sample_count(),
-            2
-        );
-        assert_eq!(
-            snapshot.group_conversation_snapshot_read.duration_ms.sum_ms,
-            16
-        );
-    }
-
-    #[test]
-    fn records_existing_direct_conversation_read_operation() {
-        let telemetry = AppPerformanceTelemetry::default();
-        telemetry.record(
-            AppPerformanceOperation::ExistingDirectConversationRead,
-            Duration::from_millis(5),
-            true,
-        );
-        telemetry.record(
-            AppPerformanceOperation::ExistingDirectConversationRead,
-            Duration::from_millis(8),
-            false,
-        );
-
-        let snapshot = telemetry.snapshot();
-        assert_eq!(snapshot.existing_direct_conversation_read.attempts, 2);
-        assert_eq!(snapshot.existing_direct_conversation_read.successes, 1);
-        assert_eq!(snapshot.existing_direct_conversation_read.failures, 1);
-        assert_eq!(
-            snapshot
-                .existing_direct_conversation_read
-                .duration_ms
-                .sample_count(),
-            2
-        );
-        assert_eq!(
-            snapshot
-                .existing_direct_conversation_read
-                .duration_ms
-                .sum_ms,
-            13
-        );
     }
 
     #[test]

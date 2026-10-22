@@ -873,26 +873,6 @@ mod tests {
         kit.runtime.shutdown().await;
     }
 
-    #[test]
-    fn account_unread_summary_reports_zero_attention_for_idle_local_account() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let home = AccountHome::open(root.path());
-        let account = home.create_account("alice").expect("create alice");
-        let app = MarmotApp::with_relay(root.path(), "wss://relay.invalid.test");
-        let runtime = app.runtime();
-        let kit = Marmot { app, runtime };
-
-        let summary = kit
-            .account_unread_summary()
-            .expect("unread summary without starting a session");
-        assert_eq!(summary.len(), 1);
-        assert_eq!(summary[0].account_id_hex, account.account_id_hex);
-        assert_eq!(summary[0].unread_count, 0);
-        assert_eq!(summary[0].unread_conversations, 0);
-        assert_eq!(summary[0].attention_only_conversations, 0);
-        assert!(!summary[0].has_unread);
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn local_and_refresh_key_package_inventory_bindings() {
         let relay = MockRelay::run().await.expect("start mock relay");

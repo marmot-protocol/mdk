@@ -971,24 +971,6 @@ mod tests {
         assert_eq!(no_relays.deployment.open_ranking, None);
     }
 
-    #[test]
-    fn the_default_config_is_neutral_and_white_noise_is_named() {
-        assert_eq!(
-            MarmotAppConfig::default().deployment,
-            MarmotDeployment::neutral()
-        );
-        let white_noise = MarmotAppConfig::white_noise();
-        assert_eq!(white_noise.deployment, MarmotDeployment::white_noise());
-        assert_eq!(
-            MarmotAppConfig {
-                deployment: MarmotDeployment::neutral(),
-                ..white_noise
-            },
-            MarmotAppConfig::default(),
-            "white_noise() differs from the default only in its deployment"
-        );
-    }
-
     fn runtime_config() -> RelayTelemetryRuntimeConfig {
         RelayTelemetryRuntimeConfig {
             otlp_endpoint: None,

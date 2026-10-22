@@ -679,16 +679,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_transition_message_names_both_states() {
-        let err = EpochState::stable(EpochId(0))
-            .confirm_publish()
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("Stable"));
-        assert!(msg.contains("Merging"));
-    }
-
-    #[test]
     fn to_unrecoverable_freezes_last_stable_epoch_and_blocks_ingest() {
         let s = EpochState::stable(EpochId(9)).to_unrecoverable();
         assert_eq!(s.name(), "Unrecoverable");

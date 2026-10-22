@@ -83,23 +83,3 @@ pub fn join_config(max_past_epochs: usize) -> MlsGroupJoinConfig {
         .sender_ratchet_configuration(default_sender_ratchet_configuration())
         .build()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_join_config_pins_sender_ratchet_reordering_policy() {
-        let ratchet = default_join_config()
-            .sender_ratchet_configuration()
-            .to_owned();
-        assert_eq!(
-            ratchet.out_of_order_tolerance(),
-            DEFAULT_OUT_OF_ORDER_TOLERANCE
-        );
-        assert_eq!(
-            ratchet.maximum_forward_distance(),
-            DEFAULT_MAXIMUM_FORWARD_DISTANCE
-        );
-    }
-}

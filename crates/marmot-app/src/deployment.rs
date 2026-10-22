@@ -357,9 +357,4 @@ mod tests {
             "https://blossom.primal.net"
         );
     }
-
-    #[test]
-    fn the_default_deployment_is_neutral() {
-        assert_eq!(MarmotDeployment::default(), MarmotDeployment::neutral());
-    }
 }

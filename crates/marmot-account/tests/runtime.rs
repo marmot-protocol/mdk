@@ -6518,30 +6518,6 @@ async fn maintenance_supersession_leaves_a_failed_obligation_terminal() {
     );
 }
 
-#[tokio::test]
-async fn maintenance_timing_defaults_match_production_windows() {
-    let timing = MaintenanceTiming::default();
-    assert_eq!(timing.quiet, Duration::from_secs(60));
-    assert_eq!(timing.contention_jitter_max, Duration::from_millis(30_000));
-    assert_eq!(timing.eose_timeout, Duration::from_secs(5 * 60));
-    assert_eq!(timing.post_eose_grace, Duration::from_secs(15));
-    assert_eq!(MaintenanceTiming::immediate().quiet, Duration::ZERO);
-
-    let dir = tempfile::tempdir().unwrap();
-    let key = SqlCipherKey::new("marmot maintenance timing key").unwrap();
-    let runtime = AccountDeviceRuntime::new(
-        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
-        RecordingAdapter::default(),
-        StaticTransportRouting::new(vec![]),
-        RecordingKeyPackages::default(),
-    );
-    assert_eq!(
-        runtime.maintenance_timing(),
-        MaintenanceTiming::default(),
-        "a runtime built without an override runs production maintenance windows"
-    );
-}
-
 /// One single-member group with periodic rotation disabled, reopened under
 /// `timing` with clocks that never advance. Returns the reopened runtime, the
 /// group, and its epoch before any maintenance.

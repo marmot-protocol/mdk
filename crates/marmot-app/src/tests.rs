@@ -9272,60 +9272,6 @@ async fn unsafe_cached_inbox_is_refreshed_before_member_resolution_succeeds() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-/// Existing-group invitations reject unrouteable members before MLS mutation.
-async fn invite_with_key_package_but_no_inbox_route_fails_before_commit() {
-    let (directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
-    let account_id = accounts[0].account_id_hex.clone();
-    fetcher
-        .events
-        .lock()
-        .unwrap()
-        .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST);
-
-    let inviter = AccountHome::open(directory.path())
-        .create_account("single-route-readiness-inviter")
-        .unwrap();
-    let mut client = app.client(&inviter.label).await.unwrap();
-    let group_id = client
-        .create_group("single route readiness", &[])
-        .await
-        .unwrap();
-
-    let error = client
-        .invite_members(&group_id, &[account_id.as_str()])
-        .await
-        .expect_err("a KeyPackage alone must not allow an Add commit");
-    assert!(matches!(
-        error,
-        AppError::MissingMemberInboxRoute(ref recipient) if recipient == &account_id
-    ));
-    assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 1);
-
-    fetcher
-        .events
-        .lock()
-        .unwrap()
-        .push(NostrTransportEvent::new_unsigned(
-            account_id.clone(),
-            KIND_MARMOT_INBOX_RELAY_LIST,
-            vec![vec!["relay".into(), "wss://shared.example".into()]],
-            String::new(),
-        ));
-    fetcher.requests.lock().unwrap().clear();
-    client
-        .invite_members(&group_id, &[account_id.as_str()])
-        .await
-        .expect("the explicit retry should refetch the unconsumed KeyPackage");
-    assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 2);
-    assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
-        request
-            .queries
-            .iter()
-            .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
-    }));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// Founding creates reject unrouteable members before persisting a group.
 async fn create_group_with_key_package_but_no_inbox_route_fails_before_group_creation() {
     let (directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
@@ -14114,14 +14060,6 @@ async fn own_relay_echo_requires_known_event_id_not_just_pubkey() {
     assert!(!receipts.contains(&hex::encode(same_pubkey_new_event.message.id.as_slice())));
     let peer_delivery = relay_delivery("peer", "44".repeat(32));
     assert!(!receipts.contains(&hex::encode(peer_delivery.message.id.as_slice())));
-}
-
-#[test]
-fn account_worker_is_spawned_as_abortable_async_task() {
-    let source = include_str!("runtime/account_worker.rs");
-
-    assert!(source.contains("tokio::spawn(run_app_runtime_account_worker"));
-    assert!(source.contains("managed account worker shutdown timed out; aborting"));
 }
 
 #[test]

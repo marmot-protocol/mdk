@@ -39,7 +39,7 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     behavior the engine relies on)
 
 - **File:** `scaffold.rs`
-  - **Owns:** `EngineBuilder` validation; `Box<dyn CgkaEngine>` witness
+  - **Owns:** `EngineBuilder` validation and empty-engine behavior
 
 - **File:** `group_creation.rs`
   - **Owns:** Fresh KeyPackage, create, join welcome, confirm

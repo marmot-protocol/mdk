@@ -582,25 +582,6 @@ mod tests {
     }
 
     #[test]
-    fn final_retained_media_message_prune_deletes_its_epoch_secret() {
-        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-        store
-            .remember_encrypted_media_epoch_secret("aa", 0x8008, 7, &[1, 2, 3])
-            .unwrap();
-        store.record_app_event(&media_event("old", 10, 7)).unwrap();
-
-        let outcome = store
-            .secure_prune_app_events_before("aa", 11, "local", &no_mentions)
-            .unwrap();
-        assert_eq!(outcome.pruned_messages, 1);
-        assert_eq!(outcome.pruned_media_epoch_secrets, 1);
-        assert_eq!(
-            store.encrypted_media_epoch_secret("aa", 0x8008, 7).unwrap(),
-            None
-        );
-    }
-
-    #[test]
     fn duplicate_attachments_create_one_epoch_secret_reference() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         store

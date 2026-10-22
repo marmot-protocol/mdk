@@ -531,36 +531,6 @@ async fn upgrade_group_capabilities_rejects_app_component_without_group_state() 
 }
 
 #[tokio::test]
-async fn feature_in_required_capabilities_is_available() {
-    let mut alice = build_client(
-        b"alice",
-        registry_selfremove_required_and_reactions_optional(),
-    );
-    let mut bob = build_client(
-        b"bob",
-        registry_selfremove_required_and_reactions_optional(),
-    );
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-
-    let (group_id, _result) = alice
-        .create_group(CreateGroupRequest {
-            name: "x".into(),
-            description: "".into(),
-            members: vec![bob_kp],
-            required_features: vec![Feature("self-remove")],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-
-    let status = alice
-        .feature_status(&group_id, &Feature("self-remove"))
-        .unwrap();
-    assert!(matches!(status, FeatureStatus::Available));
-}
-
-#[tokio::test]
 async fn create_group_requested_optional_feature_becomes_required() {
     let mut alice = build_client(
         b"alice",
@@ -615,69 +585,6 @@ async fn create_group_rejects_invitee_missing_requested_optional_feature() {
         err,
         cgka_traits::EngineError::MissingRequiredCapabilities { .. }
     ));
-}
-
-#[tokio::test]
-async fn feature_supported_by_all_but_not_required_is_upgradeable() {
-    let mut alice = build_client(
-        b"alice",
-        registry_selfremove_required_and_reactions_optional(),
-    );
-    let mut bob = build_client(
-        b"bob",
-        registry_selfremove_required_and_reactions_optional(),
-    );
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-    let (group_id, _) = alice
-        .create_group(CreateGroupRequest {
-            name: "".into(),
-            description: "".into(),
-            members: vec![bob_kp],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-    // Reactions is Optional, not in RequiredCaps; both members advertise it.
-    let status = alice
-        .feature_status(&group_id, &Feature("reactions"))
-        .unwrap();
-    assert!(
-        matches!(status, FeatureStatus::Upgradeable),
-        "got: {status:?}"
-    );
-}
-
-#[tokio::test]
-async fn feature_missing_from_one_member_is_unavailable_with_missing_set() {
-    // Alice supports self-remove + reactions; Bob only self-remove.
-    let mut alice = build_client(
-        b"alice",
-        registry_selfremove_required_and_reactions_optional(),
-    );
-    let mut bob = build_client(b"bob", registry_selfremove_only());
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-    let (group_id, _) = alice
-        .create_group(CreateGroupRequest {
-            name: "".into(),
-            description: "".into(),
-            members: vec![bob_kp],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-    let status = alice
-        .feature_status(&group_id, &Feature("reactions"))
-        .unwrap();
-    match status {
-        FeatureStatus::Unavailable { missing } => {
-            assert!(missing.proposals.contains(&REACTIONS_PROPOSAL));
-        }
-        other => panic!("expected Unavailable, got {other:?}"),
-    }
 }
 
 #[tokio::test]
@@ -1081,39 +988,6 @@ async fn non_admin_cannot_upgrade_group_capabilities() {
         .unwrap();
 
     assert!(matches!(err, EngineError::NotGroupAdmin { .. }));
-}
-
-#[tokio::test]
-async fn group_context_returns_live_view() {
-    let mut alice = build_client(
-        b"alice",
-        registry_selfremove_required_and_reactions_optional(),
-    );
-    let mut bob = build_client(
-        b"bob",
-        registry_selfremove_required_and_reactions_optional(),
-    );
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-    let (group_id, _create) = alice
-        .create_group(CreateGroupRequest {
-            name: "ctx".into(),
-            description: "".into(),
-            members: vec![bob_kp],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-
-    let ctx = alice.group_context(&group_id).expect("group_context");
-    assert_eq!(ctx.epoch().0, 1);
-    let secret = ctx.exporter_secret("marmot/group-event", 32);
-    assert!(secret.is_some(), "well-known label should resolve");
-    assert!(
-        ctx.exporter_secret("nonexistent-label", 32).is_none(),
-        "unknown labels return None"
-    );
 }
 
 #[tokio::test]

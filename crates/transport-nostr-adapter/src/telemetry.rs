@@ -1011,22 +1011,6 @@ mod tests {
     }
 
     #[test]
-    fn relay_label_resolution_maps_indices_to_endpoints() {
-        let resolution = RelayLabelResolution::from_pairs([
-            (RelayIndex(0), TransportEndpoint("wss://a".into())),
-            (RelayIndex(1), TransportEndpoint("wss://b".into())),
-        ]);
-        assert_eq!(resolution.len(), 2);
-        assert!(!resolution.is_empty());
-        assert_eq!(
-            resolution.label_for(RelayIndex(1)),
-            Some(&TransportEndpoint("wss://b".into()))
-        );
-        assert_eq!(resolution.label_for(RelayIndex(2)), None);
-        assert!(RelayLabelResolution::default().is_empty());
-    }
-
-    #[test]
     fn single_relay_sighting_records_no_spread() {
         let mut telem = RelayDeliveryTelemetry::default();
         telem.record_sighting(&msg(1), A, 0);

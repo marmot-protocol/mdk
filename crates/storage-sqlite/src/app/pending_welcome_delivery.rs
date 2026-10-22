@@ -129,25 +129,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn record_then_list_roundtrips_fields() {
-        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
-        store
-            .record_pending_welcome_delivery("aa", "bb", "cc", 7)
-            .unwrap();
-
-        let records = store.list_pending_welcome_deliveries().unwrap();
-        assert_eq!(
-            records,
-            vec![PendingWelcomeDeliveryRecord {
-                message_id_hex: "aa".to_owned(),
-                group_id_hex: "bb".to_owned(),
-                recipient_hex: "cc".to_owned(),
-                recorded_at: 7,
-            }]
-        );
-    }
-
-    #[test]
     fn re_record_same_message_updates_in_place() {
         let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
         store

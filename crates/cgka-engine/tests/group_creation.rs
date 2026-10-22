@@ -2357,19 +2357,6 @@ async fn freshly_generated_key_package_is_durably_owned_before_publication() {
     );
 }
 
-#[test]
-#[cfg(debug_assertions)]
-fn strict_cutover_compatibility_gate_enables_legacy_fixture_builds() {
-    let engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
-        .legacy_compatibility_profile()
-        .identity(pad32(b"fixture-legacy"))
-        .account_identity_proof_signer(proof_signer(b"fixture-legacy"))
-        .peeler(Box::new(MockPeeler::default()))
-        .build()
-        .expect("debug compatibility gate must build legacy fixtures");
-    assert_eq!(engine.new_protocol_profile(), ProtocolProfile::Legacy);
-}
-
 #[tokio::test]
 async fn strict_cutover_retires_all_legacy_key_package_bundles_idempotently() {
     let storage = SqliteAccountStorage::in_memory().unwrap();

@@ -240,7 +240,8 @@ scenario does this after the initial Welcome joins).
    test surface.
 6. Update [`SCENARIOS.md`](SCENARIOS.md) with the setup, fault shape, and expected outcome.
 
-Look at `three_client_happy_path_via_harness` for the canonical shape.
+Look at `vectors/three-client-message-exchange.v1.json` for the canonical shape; the
+`canonical_vector_fixtures_match_generated_traces` test executes it and checks its full trace.
 
 ## How to add or update a vector fixture
 

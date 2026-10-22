@@ -412,12 +412,6 @@ portable vectors.
 
 These are real simulator scenarios that are still tied to Rust harness details.
 
-### `three_client_happy_path_via_harness`
-
-- Setup: Alice creates a three-client group. Alice, Bob, and Carol each send one app message.
-- Expected: all clients converge and each receives the other two messages.
-- Reason: this duplicates the smoke vector at direct harness level.
-
 ### `exact_oracle_matches_full_canonical_state_after_join`
 
 - Setup: Alice creates a group with Bob and Bob joins from the Welcome.

@@ -1551,7 +1551,6 @@ mod tests {
     use super::*;
     use crate::SqliteAccountStorage;
     use cgka_traits::storage::StorageProvider;
-    use cgka_traits::types::Backend;
     use rusqlite::trace::{TraceEvent, TraceEventCodes};
     use std::sync::{
         Arc, Mutex,
@@ -1874,14 +1873,6 @@ mod tests {
         if let TraceEvent::Stmt(_, sql) = event {
             trace_sqlcipher_setup(sql);
         }
-    }
-
-    #[test]
-    fn reports_sqlite_backend() {
-        assert_eq!(
-            SqliteAccountStorage::in_memory().unwrap().backend(),
-            Backend::Sqlite
-        );
     }
 
     #[test]

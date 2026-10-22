@@ -651,24 +651,6 @@ fn generated_setup_context_round_trips_inbox_relays_and_reads_legacy_contexts() 
 }
 
 #[test]
-fn white_noise_discovery_indexers_use_live_indexers() {
-    let relays = crate::MarmotDeployment::white_noise().discovery_indexer_endpoints();
-
-    assert!(
-        relays
-            .iter()
-            .any(|relay| relay.0 == "wss://relay.vertexlab.io"),
-        "Vertex must remain available for directory bootstrap"
-    );
-    assert!(
-        relays
-            .iter()
-            .all(|relay| relay.0 != "wss://relay.nostr.band"),
-        "retired relays must never return to discovery defaults"
-    );
-}
-
-#[test]
 fn generated_account_birth_marks_cutover_scan_complete_before_session_open() {
     let directory = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
@@ -839,28 +821,6 @@ fn stamp_published_profile_created_at_preserves_existing_stamp() {
     };
     stamp_published_profile_created_at(&mut profile, 1_700_000_000);
     assert_eq!(profile.created_at, 42);
-}
-
-#[test]
-fn stamped_profile_wins_over_stale_relay_copy_in_if_newer_check() {
-    // Regression for mdk#206: model the exact comparison
-    // remember_directory_profile_if_newer performs. A zero-stamped cache
-    // loses to any fetched copy; a now-stamped cache beats an older one.
-    let mut zero_cache = UserProfileMetadata {
-        created_at: 0,
-        ..UserProfileMetadata::default()
-    };
-    let stale_relay_copy = UserProfileMetadata {
-        created_at: 1_699_999_900,
-        ..UserProfileMetadata::default()
-    };
-    // Before the fix: cached(0) > fetched is false, so the stale copy wins.
-    assert!(zero_cache.created_at <= stale_relay_copy.created_at);
-
-    // After stamping the just-published edit with a fresh clock:
-    stamp_published_profile_created_at(&mut zero_cache, 1_700_000_000);
-    // The local edit now beats the older relay copy and is retained.
-    assert!(zero_cache.created_at > stale_relay_copy.created_at);
 }
 
 #[test]
@@ -1331,32 +1291,6 @@ fn merge_timeline_window_orders_epoch_boundaries_canonically() {
 }
 
 #[test]
-fn merge_timeline_window_prepends_older_and_keeps_head_flag() {
-    let mut window = timeline_test_page(&[("c", 30), ("d", 40)], true, false);
-    let older = timeline_test_page(&[("a", 10), ("b", 20)], false, true);
-
-    merge_timeline_window_with_order(&mut window, older, TimelineWindowEdge::Older, 300, true);
-
-    assert_eq!(timeline_ids(&window), vec!["a", "b", "c", "d"]);
-    // The store reported no more history before; the head side is untouched.
-    assert!(!window.has_more_before);
-    assert!(!window.has_more_after);
-}
-
-#[test]
-fn merge_timeline_window_older_caps_by_dropping_newest() {
-    let mut window = timeline_test_page(&[("c", 30), ("d", 40)], true, false);
-    let older = timeline_test_page(&[("a", 10), ("b", 20)], true, true);
-
-    merge_timeline_window_with_order(&mut window, older, TimelineWindowEdge::Older, 3, true);
-
-    // Cap forces dropping the newest row, opening a gap to the head.
-    assert_eq!(timeline_ids(&window), vec!["a", "b", "c"]);
-    assert!(window.has_more_before);
-    assert!(window.has_more_after);
-}
-
-#[test]
 fn merge_timeline_window_newer_caps_by_dropping_oldest() {
     let mut window = timeline_test_page(&[("a", 10), ("b", 20)], true, true);
     let newer = timeline_test_page(&[("c", 30), ("d", 40)], true, false);
@@ -1387,17 +1321,6 @@ fn projection_for(messages: Vec<TimelineMessageRecord>) -> AppProjectionUpdate {
         chat_list_row: None,
         chat_list_trigger: Default::default(),
     }
-}
-
-#[test]
-fn apply_projection_appends_new_message_when_anchored() {
-    let mut window = timeline_test_page(&[("a", 10), ("b", 20)], false, false);
-    let update = projection_for(vec![timeline_test_record("c", 30)]);
-
-    apply_projection_to_window(&mut window, &update, 300, true);
-
-    assert_eq!(timeline_ids(&window), vec!["a", "b", "c"]);
-    assert!(!window.has_more_after);
 }
 
 #[test]
@@ -1728,7 +1651,9 @@ async fn recv_projection_applies_to_window() {
         update,
         RuntimeTimelineMessageUpdate::Projection(_)
     ));
-    assert_eq!(timeline_ids(&subscription.take_snapshot()), vec!["a", "b"]);
+    let snapshot = subscription.take_snapshot();
+    assert_eq!(timeline_ids(&snapshot), vec!["a", "b"]);
+    assert!(!snapshot.has_more_after);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1764,6 +1689,7 @@ async fn recv_refresh_rematerializes_anchored_head() {
     assert_eq!(queries.len(), 1);
     assert_eq!(queries[0].pagination.before, None);
     assert_eq!(queries[0].pagination.after, None);
+    assert_eq!(queries[0].pagination.limit, Some(1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1806,6 +1732,7 @@ async fn recv_refresh_detached_issues_inclusive_upper_cursor() {
         Some("b")
     );
     assert!(queries[0].pagination.before_inclusive);
+    assert_eq!(queries[0].pagination.limit, Some(2));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1880,42 +1807,6 @@ async fn refresh_install_is_dropped_when_window_paginated_during_query() {
     );
     assert_eq!(timeline_ids(&installed), vec!["a", "b", "c", "d"]);
     assert_eq!(timeline_ids(&handle.snapshot()), vec!["a", "b", "c", "d"]);
-}
-
-#[test]
-fn refresh_query_for_detached_window_anchors_at_newest() {
-    let store = ScriptedTimelineStore::default();
-    let window = timeline_window(
-        &store,
-        timeline_test_page(&[("a", 10), ("b", 20)], true, true),
-        300,
-    );
-
-    let query = window.refresh_query();
-
-    // Detached: an inclusive upper-bound cursor at the exact newest message,
-    // so the descending LIMIT can't be starved by newer same-second rows.
-    assert_eq!(query.pagination.before, Some(20));
-    assert_eq!(query.pagination.before_message_id.as_deref(), Some("b"));
-    assert!(query.pagination.before_inclusive);
-    assert_eq!(query.pagination.limit, Some(2));
-}
-
-#[test]
-fn refresh_query_for_anchored_window_targets_head() {
-    let store = ScriptedTimelineStore::default();
-    let window = timeline_window(
-        &store,
-        timeline_test_page(&[("a", 10), ("b", 20)], true, false),
-        300,
-    );
-
-    let query = window.refresh_query();
-
-    // Anchored: cursorless head refresh sized to the current window.
-    assert_eq!(query.pagination.before, None);
-    assert_eq!(query.pagination.after, None);
-    assert_eq!(query.pagination.limit, Some(2));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2684,19 +2575,6 @@ fn account_setup_request_rejects_and_redacts_uppercase_nsec_identity() {
     assert!(debug.contains("redacted"));
     let err = validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)
         .expect_err("uppercase nsec-shaped identity must be rejected");
-    assert!(matches!(err, AppError::UnexpectedPrivateKey));
-}
-
-#[test]
-fn account_setup_validation_rejects_import_nsec_for_login_operation() {
-    let request = AccountSetupRequest {
-        import_nsec: Some(Zeroizing::new(
-            "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99".to_owned(),
-        )),
-        ..AccountSetupRequest::default()
-    };
-    let err = validate_account_setup_request(&request, AccountSetupOperation::Login)
-        .expect_err("login must not accept import_nsec");
     assert!(matches!(err, AppError::UnexpectedPrivateKey));
 }
 

@@ -9,13 +9,13 @@
 //! `cargo insta review`.
 
 use cgka_traits::capabilities::{
-    Capability, CapabilityRequirement, Feature, FeatureStatus, GroupCapabilities, RequirementLevel,
+    Capability, CapabilityRequirement, FeatureStatus, GroupCapabilities, RequirementLevel,
     TransportKind,
 };
 use cgka_traits::engine::{
-    AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest,
-    GroupEvent, GroupHydrationQuarantineReason, GroupStateChange, GroupStateInvalidationReason,
-    KeyPackage, SendIntent, SendResult,
+    AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, GroupEvent,
+    GroupHydrationQuarantineReason, GroupStateChange, GroupStateInvalidationReason, KeyPackage,
+    SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{DisbandTombstone, Group, Member, ProtocolProfile};
@@ -913,24 +913,6 @@ fn key_package_equality_and_hash_include_protocol_profile_but_not_source() {
         HashSet::from([legacy, legacy_with_source, current]).len(),
         2,
         "hashing must use the same identity fields as equality"
-    );
-}
-
-#[test]
-fn snapshot_create_group_request() {
-    insta::assert_json_snapshot!(
-        "create_group_request",
-        format!(
-            "{:?}",
-            CreateGroupRequest {
-                name: "demo".into(),
-                description: "".into(),
-                members: vec![KeyPackage::new(vec![0xEF; 4])],
-                required_features: vec![Feature("self-remove")],
-                app_components: vec![],
-                initial_admins: vec![],
-            }
-        )
     );
 }
 

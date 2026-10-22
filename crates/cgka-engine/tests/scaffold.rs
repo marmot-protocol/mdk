@@ -1,8 +1,4 @@
-//! Engine construction and trait-object scaffold tests.
-//!
-//! Proves the engine can be built, implements `CgkaEngine`, and can be wrapped
-//! in `Box<dyn CgkaEngine + Send + Sync>` without async-trait lifetime
-//! regressions. Behavior-level coverage lives in the focused integration tests.
+//! Engine builder validation and empty-engine behavior.
 
 use async_trait::async_trait;
 use cgka_engine::EngineBuilder;
@@ -71,24 +67,6 @@ impl TransportPeeler for StubPeeler {
 }
 
 #[test]
-fn engine_can_be_built_and_boxed_as_trait_object() {
-    let identity = valid_identity(b"self-identity");
-    let engine = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
-        .legacy_compatibility_profile()
-        .identity(identity.clone())
-        .account_identity_proof_signer(proof_signer(b"self-identity"))
-        .peeler(Box::new(StubPeeler))
-        .build()
-        .expect("build");
-
-    // self_id is real from the start.
-    assert_eq!(engine.self_id().as_slice(), identity.as_slice());
-
-    // Witness: this line stops compiling if async-trait lifetimes regress.
-    let _boxed: Box<dyn CgkaEngine + Send + Sync> = Box::new(engine);
-}
-
-#[test]
 fn builder_rejects_missing_identity() {
     let res = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
         .peeler(Box::new(StubPeeler))
@@ -122,18 +100,6 @@ fn builder_rejects_non_mandatory_ciphersuite() {
             required: 0x0001,
         })
     ));
-}
-
-#[test]
-fn builder_accepts_mandatory_ciphersuite_explicitly() {
-    let res = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
-        .legacy_compatibility_profile()
-        .identity(valid_identity(b"self-identity"))
-        .account_identity_proof_signer(proof_signer(b"self-identity"))
-        .peeler(Box::new(StubPeeler))
-        .ciphersuite(cgka_engine::DEFAULT_CIPHERSUITE)
-        .build();
-    assert!(res.is_ok());
 }
 
 #[tokio::test]

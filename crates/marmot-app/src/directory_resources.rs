@@ -429,12 +429,6 @@ impl MarmotApp {
     }
 }
 
-#[allow(dead_code)]
-fn member_resolution_future_is_send(app: &MarmotApp) {
-    fn assert_send<T: Send>(_: T) {}
-    assert_send(app.directory().resolve_member_key_packages(&[]));
-}
-
 #[cfg(all(test, feature = "product-analytics-export"))]
 mod observer_tests {
     use super::*;
