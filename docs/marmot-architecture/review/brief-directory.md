@@ -231,7 +231,8 @@ Each PR keeps behaviour unchanged and ships alone.
 8. **Tracing targets.** `marmot_app::directory` becomes `nostr_directory::<module>`, as storage-boundaries PR 5 did
    (#2402).
    - The `marmot-app` events that also used `marmot_app::directory` take their own module's target:
-     `directory_resources`, `user_blocks` and `profile_publication`.
+     `directory_resources`, `user_blocks` and `profile_publication`, and `marmot_app` for the crate root's
+     identity-publication helpers, which relay-list publication shares.
 
 ## Proof that behaviour is unchanged
 
