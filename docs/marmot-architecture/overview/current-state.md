@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-10-09
+updated: 2026-10-22
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -163,6 +163,9 @@ setup/onboarding changes can retry it. Aggregate reconciliation still reports pa
 
 MDK now exposes opt-in durable onboarding for imported identities, with per-step
 validation, repair proposals, explicit approval, and Swift/Kotlin/C bindings.
+Repair approval requires a completed freshness query from every onboarding
+source, including relays in the signed relay declaration and public indexers.
+An unavailable source blocks replacement even when another returns a record.
 It requires single-device acknowledgment before KeyPackage publication and offers
 advisory detection of packages that may belong to another installation.
 Account onboarding gates normal worker commands until required checks and

@@ -2494,10 +2494,23 @@ async fn defaults_preserve_relay_tags() {
         runtime.shutdown_and_close().await.unwrap();
         let runtime = super::tests::runtime(dir.path(), network.clone());
         let manager = runtime.accounts();
-        manager
+        let result = manager
             .approve_onboarding_repair(&id, revision)
             .await
             .unwrap();
+        if step == OnboardingStep::Relays {
+            // Unreachable and capped declared sources cannot authorize replacement.
+            assert_eq!(
+                result.steps[step.index()].status,
+                OnboardingStatus::RetryableFailure
+            );
+            assert!(result.proposal.is_none());
+            assert!(network.attempts.lock().is_empty());
+            let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+            assert_eq!(c.records[step.index()].as_ref().unwrap().tags, tags);
+            runtime.shutdown_and_close().await.unwrap();
+            continue;
+        }
         let published = network.attempts.lock().last().unwrap().clone();
         assert!(published.tags.starts_with(&tags));
         assert_eq!(published.tags.len(), tags.len() + 1);
@@ -2786,6 +2799,84 @@ async fn partial_lookup_is_not_fresh() {
             assert!(state.findings.iter().any(|f| f.issue == issue));
             if !fail_index {
                 let current = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+                assert_eq!(current.records[step.index()].as_ref().unwrap().id, newer.id);
+            }
+        }
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declared_lookup_is_not_fresh() {
+    for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
+        let (_dir, runtime, network, keys, id) = fixture().await;
+        let manager = runtime.accounts();
+        let declaration = signed(
+            &keys,
+            10002,
+            vec![vec!["r".into(), "wss://index.example".into()]],
+            "",
+            unix_now_seconds(),
+        );
+        let old = if step == OnboardingStep::Relays {
+            declaration.clone()
+        } else {
+            signed(
+                &keys,
+                step.kind() as u16,
+                vec![],
+                "",
+                declaration.created_at,
+            )
+        };
+        let newer = signed(
+            &keys,
+            step.kind() as u16,
+            vec![],
+            "newer",
+            old.created_at + 1,
+        );
+        network.events.lock().push(old.clone());
+        network.index_events.lock().push(newer.clone());
+        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        c.options.discovery_relays = vec!["wss://healthy.example".into()];
+        c.records[OnboardingStep::Relays.index()] = Some(declaration);
+        c.records[step.index()] = Some(old);
+        for fail_index in [true, false] {
+            c.set(step, OnboardingStatus::NeedsInput, vec![]);
+            manager.save_onboarding(&mut c).unwrap();
+            let writes = if step == OnboardingStep::Relays {
+                vec!["wss://default.example".into()]
+            } else {
+                Vec::new()
+            };
+            let proposal = manager
+                .propose_onboarding_relays(
+                    &id,
+                    step,
+                    Some((vec!["wss://default.example".into()], writes)),
+                )
+                .await
+                .unwrap();
+            network.fail_index_only.store(fail_index, Ordering::SeqCst);
+            let result = manager
+                .approve_onboarding_repair(&id, proposal.revision)
+                .await
+                .unwrap();
+            let state = &result.steps[step.index()];
+            assert_eq!(state.status, OnboardingStatus::RetryableFailure);
+            assert!(result.proposal.is_none());
+            assert!(network.attempts.lock().is_empty());
+            let issue = if fail_index {
+                OnboardingIssue::TimedOut
+            } else {
+                OnboardingIssue::RecordChanged
+            };
+            assert!(state.findings.iter().any(|f| f.issue == issue));
+            let current = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+            assert!(!current.approved);
+            assert!(current.signed_repair.is_none());
+            if !fail_index {
                 assert_eq!(current.records[step.index()].as_ref().unwrap().id, newer.id);
             }
         }

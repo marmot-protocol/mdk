@@ -2395,20 +2395,11 @@ impl AccountManager {
             )
             .await?;
         self.require_live_onboarding_attempt(&c)?;
-        // Every configured source, including each searched public indexer, must
-        // finish: a timeout may hide a newer record. Unreachable user-declared
-        // hints cannot establish absence either.
-        let indexers: HashSet<String> = self
-            .app
-            .discovery_indexer_relays()
-            .iter()
-            .map(|endpoint| relay_key(&endpoint.0))
-            .collect();
+        // Every source, including declared relays and public indexers, must
+        // finish: a timeout may hide a newer record even if another source answers.
         if completed.is_empty()
-            || c.options
-                .discovery_relays
+            || sources
                 .iter()
-                .chain(sources.iter().filter(|s| indexers.contains(&relay_key(s))))
                 .any(|endpoint| !completed.contains(&relay_key(endpoint)))
             || (records.is_empty() && !failures.is_empty())
         {
