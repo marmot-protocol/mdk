@@ -2154,6 +2154,7 @@ impl NostrRelayClient for RecordingRelayClient {
     async fn unsubscribe_account(
         &self,
         account_id: &MemberId,
+        _replacements: &[NostrSubscription],
     ) -> Result<(), TransportAdapterError> {
         self.unsubscribed_accounts
             .lock()
@@ -6156,8 +6157,12 @@ impl NostrRelayClient for ObservedPublishClient {
         self.inner.unsubscribe(subscription).await
     }
 
-    async fn unsubscribe_account(&self, account: &MemberId) -> Result<(), TransportAdapterError> {
-        self.inner.unsubscribe_account(account).await
+    async fn unsubscribe_account(
+        &self,
+        account: &MemberId,
+        replacements: &[NostrSubscription],
+    ) -> Result<(), TransportAdapterError> {
+        self.inner.unsubscribe_account(account, replacements).await
     }
 
     async fn publish_event(

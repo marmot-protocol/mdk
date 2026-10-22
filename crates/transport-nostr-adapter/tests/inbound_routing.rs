@@ -141,6 +141,7 @@ impl NostrRelayClient for ConcurrentSubscribeRelayClient {
     async fn unsubscribe_account(
         &self,
         _account_id: &MemberId,
+        _replacements: &[NostrSubscription],
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         Ok(())
     }
@@ -184,6 +185,7 @@ impl NostrRelayClient for BlockingSubscribeRelayClient {
     async fn unsubscribe_account(
         &self,
         _account_id: &MemberId,
+        _replacements: &[NostrSubscription],
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         Ok(())
     }
@@ -287,6 +289,7 @@ impl NostrRelayClient for StoredReplayRelayClient {
     async fn unsubscribe_account(
         &self,
         _account_id: &MemberId,
+        _replacements: &[NostrSubscription],
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         Ok(())
     }
@@ -351,6 +354,7 @@ impl NostrRelayClient for PartialFailureRelayClient {
     async fn unsubscribe_account(
         &self,
         _account_id: &MemberId,
+        _replacements: &[NostrSubscription],
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         Ok(())
     }
@@ -571,6 +575,7 @@ impl NostrRelayClient for FakeRelayClient {
     async fn unsubscribe_account(
         &self,
         account_id: &MemberId,
+        _replacements: &[NostrSubscription],
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         self.unsubscribed_accounts
             .lock()
@@ -634,6 +639,7 @@ impl NostrRelayClient for FlakySubscribeRelayClient {
     async fn unsubscribe_account(
         &self,
         account_id: &MemberId,
+        _replacements: &[NostrSubscription],
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         self.unsubscribed_accounts
             .lock()
@@ -694,6 +700,7 @@ impl NostrRelayClient for FlakyUnsubscribeRelayClient {
     async fn unsubscribe_account(
         &self,
         account_id: &MemberId,
+        _replacements: &[NostrSubscription],
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         self.unsubscribed_accounts
             .lock()
@@ -762,6 +769,7 @@ impl NostrRelayClient for BlockingUnsubscribeRelayClient {
     async fn unsubscribe_account(
         &self,
         account_id: &MemberId,
+        _replacements: &[NostrSubscription],
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         self.unsubscribed_accounts
             .lock()
@@ -816,6 +824,7 @@ impl NostrRelayClient for UnsubscribeOverlapProbeRelayClient {
     async fn unsubscribe_account(
         &self,
         _account_id: &MemberId,
+        _replacements: &[NostrSubscription],
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         Ok(())
     }
@@ -6130,6 +6139,7 @@ impl NostrRelayClient for RefusingGroupRelayClient {
     async fn unsubscribe_account(
         &self,
         _account_id: &MemberId,
+        _replacements: &[NostrSubscription],
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         Ok(())
     }
@@ -6257,6 +6267,7 @@ impl NostrRelayClient for ReleasableSubscribeRelayClient {
     async fn unsubscribe_account(
         &self,
         _account_id: &MemberId,
+        _replacements: &[NostrSubscription],
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         if self.release_during_sweep.swap(false, Ordering::SeqCst) {
             let held = self.held.load(Ordering::SeqCst);

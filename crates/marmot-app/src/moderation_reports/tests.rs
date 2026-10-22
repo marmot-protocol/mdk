@@ -85,7 +85,11 @@ impl NostrRelayClient for RecordingPublisher {
         Ok(())
     }
 
-    async fn unsubscribe_account(&self, _: &MemberId) -> Result<(), TransportAdapterError> {
+    async fn unsubscribe_account(
+        &self,
+        _: &MemberId,
+        _: &[NostrSubscription],
+    ) -> Result<(), TransportAdapterError> {
         Ok(())
     }
 

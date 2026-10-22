@@ -777,6 +777,7 @@ pub enum NostrSdkNotification {
 const SDK_NOTIFICATION_CAPACITY: usize = 4096;
 static SDK_READER_EPOCH: AtomicU64 = AtomicU64::new(1);
 static SDK_MONITOR_ID: AtomicU64 = AtomicU64::new(1);
+static SDK_CONNECTION_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 fn next_reader_epoch() -> u64 {
     SDK_READER_EPOCH.fetch_add(1, Ordering::SeqCst)
@@ -968,6 +969,13 @@ impl SdkNotificationFrontier {
             .contains_key(id)
     }
 
+    fn detach(&self, endpoint: &RelayUrl) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = state.relays.remove(endpoint) {
+            entry.monitor.abort();
+        }
+    }
+
     fn attach(self: &Arc<Self>, relay: &Relay, mode: RelayMonitorAttach) {
         let url = relay.url().clone();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1023,7 +1031,8 @@ impl SdkNotificationFrontier {
                             RelayNotification::RelayStatus {
                                 status: RelayStatus::Connected,
                             } => {
-                                entry.connection += 1;
+                                entry.connection =
+                                    SDK_CONNECTION_EPOCH.fetch_add(1, Ordering::SeqCst);
                                 entry.reason = ReplayRestart::Connection;
                                 let _ = frontier.sender.send(NostrSdkNotification::Replay {
                                     endpoint: TransportEndpoint(monitor_url.to_string()),
@@ -1058,10 +1067,7 @@ impl SdkNotificationFrontier {
                 }
             }
         });
-        let connection = state
-            .relays
-            .get(&url)
-            .map_or(0, |entry| entry.connection + 1);
+        let connection = SDK_CONNECTION_EPOCH.fetch_add(1, Ordering::SeqCst);
         state.relays.insert(
             url,
             RelayFrontier {
@@ -1214,6 +1220,7 @@ enum SdkPublication {
 
 struct PublishRelayCache {
     client: Client,
+    frontier: Arc<SdkNotificationFrontier>,
     lifecycle: Mutex<PublishRelayState>,
 }
 
@@ -1252,6 +1259,7 @@ impl PublishRelayCache {
             }
             let Some(relay) = relays.get(endpoint) else {
                 state.subscription_owned.remove(endpoint);
+                self.frontier.detach(endpoint);
                 return false;
             };
             (state.subscription_owned.contains(endpoint)
@@ -1311,6 +1319,7 @@ impl PublishRelayCache {
                 );
                 break;
             }
+            self.frontier.detach(&endpoint);
             state.relays.remove(&endpoint);
             if !state.subscription_owned.remove(&endpoint) {
                 idle_count -= 1;
@@ -1577,19 +1586,21 @@ impl NostrSdkRelayClient {
     pub fn new(client: Client) -> Self {
         let notification_loss_tx = watch::channel(None).0;
         let subscription_floors = Arc::new(StdMutex::new(SubscriptionFloors::default()));
+        let frontier = Arc::new(SdkNotificationFrontier::new(
+            notification_loss_tx.clone(),
+            subscription_floors.clone(),
+        ));
         Self {
             publish_relay_cache: Arc::new(PublishRelayCache {
                 client: client.clone(),
+                frontier: frontier.clone(),
                 lifecycle: Mutex::new(PublishRelayState::default()),
             }),
             client,
             signer: None,
             account_id: None,
             account_clients: Arc::new(RwLock::new(HashMap::new())),
-            frontier: Arc::new(SdkNotificationFrontier::new(
-                notification_loss_tx.clone(),
-                subscription_floors.clone(),
-            )),
+            frontier,
             notification_loss_tx,
             require_account_context: false,
             publication: SdkPublication::OpaqueClient,
@@ -4743,11 +4754,14 @@ impl NostrRelayClient for NostrSdkRelayClient {
     async fn unsubscribe_account(
         &self,
         account_id: &MemberId,
+        replacements: &[NostrSubscription],
     ) -> Result<(), TransportAdapterError> {
         if self.require_account_context {
             let client = self.account_clients.read().await.get(account_id).cloned();
             return match client {
-                Some(client) => Box::pin(client.unsubscribe_account(account_id)).await,
+                Some(client) => {
+                    Box::pin(client.unsubscribe_account(account_id, replacements)).await
+                }
                 None => Ok(()),
             };
         }
@@ -4760,19 +4774,58 @@ impl NostrRelayClient for NostrSdkRelayClient {
                 "account context does not match requested account".to_owned(),
             ));
         }
+        let plans = replacements
+            .iter()
+            .map(|subscription| {
+                if subscription.account_id() != account_id {
+                    return Err(TransportAdapterError::Subscription(
+                        "replacement subscription does not match requested account".to_owned(),
+                    ));
+                }
+                Self::plan_subscription(subscription)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // Snapshot old ids first. Every pending id must remain reachable by
+        // account teardown if replacement setup or the CLOSE sweep is dropped.
+        let ids = {
+            let mut accounts = self.account_subscriptions.write().await;
+            let ids = accounts.get(account_id).cloned().unwrap_or_default();
+            if !plans.is_empty() {
+                let tracked = accounts.entry(account_id.clone()).or_default();
+                for plan in &plans {
+                    tracked.push_unique(plan.subscription_id.clone());
+                }
+            }
+            ids
+        };
+        if !plans.is_empty() {
+            let mut state = self.publish_relay_cache.lifecycle.lock().await;
+            let relays = self.client.relays().await;
+            for plan in &plans {
+                for endpoint in &plan.endpoints {
+                    // Preserve existing subscription ownership, and promote only
+                    // sockets already owned by the publication cache. External
+                    // and acquisition sockets keep their independent ownership.
+                    if relays.contains_key(endpoint)
+                        && state.relays.contains_key(endpoint)
+                        && !state.acquisition_retained.contains(endpoint)
+                    {
+                        state.subscription_owned.insert(endpoint.clone());
+                    }
+                }
+                state
+                    .subscriptions
+                    .entry(plan.subscription_id.clone())
+                    .or_default()
+                    .extend(plan.endpoints.iter().cloned());
+            }
+        }
         // Drop the account's undrained registration bucket along with its
         // subscriptions: a sign-out between a subscribe and the next sync's
         // drain would otherwise orphan the bucket, and a later reactivation
         // would OR-merge fresh registrations into the stale session's relays —
         // misstating the next `subscription_rebuild` audit row.
         self.registration_log.lock().await.remove(account_id);
-        let ids = self
-            .account_subscriptions
-            .read()
-            .await
-            .get(account_id)
-            .cloned()
-            .unwrap_or_default();
         tracing::debug!(
             target: "transport_nostr_adapter::sdk_client",
             method = "unsubscribe_account",
@@ -4789,13 +4842,16 @@ impl NostrRelayClient for NostrSdkRelayClient {
                 failed.push(id);
                 continue;
             }
-            self.release_subscription_relays(&id).await;
-            if let Some(tracked) = self.account_subscriptions.write().await.get_mut(account_id) {
-                tracked.retain(|tracked| tracked != &id);
+            if !plans.iter().any(|plan| plan.subscription_id == id) {
+                self.release_subscription_relays(&id).await;
+                if let Some(tracked) = self.account_subscriptions.write().await.get_mut(account_id)
+                {
+                    tracked.retain(|tracked| tracked != &id);
+                }
             }
             self.subscription_floors().close(&id);
         }
-        if self.account_id.is_some() {
+        if self.account_id.is_some() && plans.is_empty() {
             self.subscription_floors().close_all_except(&failed);
         }
         if failed.is_empty() {
@@ -5876,7 +5932,7 @@ mod tests {
         // found by id, and it keeps counting once the REQ is closed.
         root.unsubscribe(group(None)).await.unwrap();
         assert_eq!(account.notification_loss_floor(), Since(1_000));
-        root.unsubscribe_account(&account_id).await.unwrap();
+        root.unsubscribe_account(&account_id, &[]).await.unwrap();
         assert!(account.subscription_floors().live.is_empty());
         assert_eq!(
             account.notification_loss_floor(),
@@ -6719,6 +6775,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removed_relay_has_no_frontier() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let url = relay.url().await;
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let id = SubscriptionId::new("frontier-owner");
+        sdk.add_subscription_relay(url.clone(), &id).await.unwrap();
+        let mut notifications = sdk.notifications();
+        let first = match notifications.next().await.unwrap() {
+            NotificationUpdate::Notification(NostrSdkNotification::Replay { epoch, .. }) => epoch,
+            update => panic!("expected initial replay boundary: {update:?}"),
+        };
+        sdk.release_subscription_relays(&id).await;
+        let mut replacement = sdk.notifications();
+        assert!(
+            timeout(Duration::from_millis(25), replacement.next())
+                .await
+                .is_err(),
+            "removed relays must not appear in a replacement receiver's frontier"
+        );
+        sdk.add_subscription_relay(url, &id).await.unwrap();
+        let mut replacement = sdk.notifications();
+        let next = match replacement.next().await.unwrap() {
+            NotificationUpdate::Notification(NostrSdkNotification::Replay { epoch, .. }) => epoch,
+            update => panic!("expected re-added replay boundary: {update:?}"),
+        };
+        assert!(
+            next[1] > first[1],
+            "re-added sockets need fresh connection epochs"
+        );
+        sdk.release_subscription_relays(&id).await;
+        sdk.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn shared_close_keeps_peer() {
         let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
         let endpoint = TransportEndpoint(relay.url().await.to_string());
@@ -6826,6 +6916,316 @@ mod tests {
         assert!(sdk.client().relay(second_url).await.unwrap().is_some());
         adapter.deactivate_account(&account_id).await.unwrap();
         assert!(sdk.client().relays().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reactivation_keeps_connections() {
+        let inbox = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let group = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let urls = [inbox.url().await, group.url().await];
+        let root = NostrSdkRelayClient::multi_account();
+        let keys = Keys::generate();
+        let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+        let account = root
+            .register_account(account_id.clone(), Arc::new(keys))
+            .await
+            .unwrap();
+        let adapter = NostrTransportAdapter::new(Arc::new(root.clone()));
+        let forwarder = account.spawn_notification_forwarder(adapter.clone());
+        let activation = crate::TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint(urls[0].to_string())],
+            group_subscriptions: vec![cgka_traits::TransportGroupSubscription {
+                group_id: cgka_traits::GroupId::new(vec![3; 16]),
+                transport_group_id: vec![4; 32],
+                endpoints: vec![TransportEndpoint(urls[1].to_string())],
+                retained_since: None,
+            }],
+            since: Some(Timestamp(100)),
+        };
+        adapter.activate_account(activation.clone()).await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !adapter
+                .account_subscription_eose(&account_id)
+                .await
+                .complete()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial inbox and group REQs must reach their real sockets");
+        let mut connections = Vec::new();
+        for url in &urls {
+            let relay = account.client().relay(url.clone()).await.unwrap().unwrap();
+            assert_eq!(relay.status(), RelayStatus::Connected);
+            assert_eq!(relay.stats().success(), 1);
+            connections.push(relay);
+        }
+        let epochs = {
+            let state = account.frontier.state.lock().unwrap();
+            urls.each_ref().map(|url| {
+                let relay = &state.relays[url];
+                (state.reader, relay.connection, relay.monitor_id)
+            })
+        };
+        let old_ids = adapter
+            .state
+            .read()
+            .await
+            .account_subscription_ids(&account_id);
+
+        adapter.activate_account(activation).await.unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !adapter
+                .account_subscription_eose(&account_id)
+                .await
+                .complete()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement REQs must finish on the retained sockets");
+        assert_ne!(
+            adapter
+                .state
+                .read()
+                .await
+                .account_subscription_ids(&account_id),
+            old_ids
+        );
+        for (index, relay) in connections.iter().enumerate() {
+            assert_eq!(relay.status(), RelayStatus::Connected);
+            assert_eq!(relay.stats().success(), 1);
+            let state = account.frontier.state.lock().unwrap();
+            let current = &state.relays[&urls[index]];
+            assert_eq!(
+                (state.reader, current.connection, current.monitor_id),
+                epochs[index],
+                "replacement activation must not manufacture a connection boundary"
+            );
+        }
+        assert_eq!(account.subscription_floors().live.len(), 2);
+
+        adapter.deactivate_account(&account_id).await.unwrap();
+        assert!(account.client().relays().await.is_empty());
+        assert!(account.subscription_floors().live.is_empty());
+        account.shutdown().await;
+        root.shutdown().await;
+        timeout(Duration::from_secs(2), forwarder)
+            .await
+            .unwrap()
+            .unwrap();
+        inbox.shutdown();
+        group.shutdown();
+    }
+
+    #[tokio::test]
+    async fn cancelled_replacement_cleans() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let account_id = MemberId::new(Keys::generate().public_key().to_bytes().to_vec());
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let old = NostrSubscription::AccountInbox {
+            account_id: account_id.clone(),
+            endpoints: vec![endpoint.clone()],
+            since: Some(Timestamp(100)),
+            attempt: SubscriptionAttempt::INITIAL,
+        };
+        let mut replacement = old.clone();
+        if let NostrSubscription::AccountInbox { attempt, .. } = &mut replacement {
+            *attempt = attempt.next();
+        }
+        sdk.subscribe(old.clone()).await.unwrap();
+        let pending_id = SubscriptionId::new(replacement.subscription_id());
+        // Stop after pending ownership is registered, before the old CLOSE.
+        let registrations = sdk.registration_log.lock().await;
+        let sweep = tokio::spawn({
+            let sdk = sdk.clone();
+            let account_id = account_id.clone();
+            async move { sdk.unsubscribe_account(&account_id, &[replacement]).await }
+        });
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if sdk
+                    .publish_relay_cache
+                    .lifecycle
+                    .lock()
+                    .await
+                    .subscriptions
+                    .contains_key(&pending_id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement ownership must precede closing the old REQ");
+        sweep.abort();
+        assert!(sweep.await.unwrap_err().is_cancelled());
+        drop(registrations);
+        let tracked = sdk.account_subscriptions.read().await;
+        assert!(tracked[&account_id].contains(&pending_id));
+        assert!(tracked[&account_id].contains(&SubscriptionId::new(old.subscription_id())));
+        drop(tracked);
+
+        sdk.unsubscribe_account(&account_id, &[]).await.unwrap();
+        assert!(
+            sdk.account_subscriptions
+                .read()
+                .await
+                .get(&account_id)
+                .is_none()
+        );
+        assert!(
+            sdk.publish_relay_cache
+                .lifecycle
+                .lock()
+                .await
+                .subscriptions
+                .is_empty()
+        );
+        assert!(sdk.client().relays().await.is_empty());
+        sdk.shutdown().await;
+        relay.shutdown();
+    }
+
+    #[tokio::test]
+    async fn invalid_replacement_keeps_old() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let account_id = MemberId::new(Keys::generate().public_key().to_bytes().to_vec());
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        let old = NostrSubscription::AccountInbox {
+            account_id: account_id.clone(),
+            endpoints: vec![endpoint.clone()],
+            since: None,
+            attempt: SubscriptionAttempt::INITIAL,
+        };
+        sdk.subscribe(old.clone()).await.unwrap();
+        let valid = NostrSubscription::AccountInbox {
+            account_id: account_id.clone(),
+            endpoints: vec![endpoint.clone()],
+            since: None,
+            attempt: SubscriptionAttempt::INITIAL.next(),
+        };
+        for invalid in [
+            NostrSubscription::AccountInbox {
+                account_id: account_id.clone(),
+                endpoints: vec![TransportEndpoint("not a relay URL".to_owned())],
+                since: None,
+                attempt: SubscriptionAttempt::INITIAL.next(),
+            },
+            NostrSubscription::AccountInbox {
+                account_id: MemberId::new(vec![0xAA; 32]),
+                endpoints: vec![endpoint.clone()],
+                since: None,
+                attempt: SubscriptionAttempt::INITIAL.next(),
+            },
+        ] {
+            assert!(
+                sdk.unsubscribe_account(&account_id, &[valid.clone(), invalid])
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                sdk.account_subscriptions.read().await[&account_id],
+                vec![SubscriptionId::new(old.subscription_id())]
+            );
+            let state = sdk.publish_relay_cache.lifecycle.lock().await;
+            assert_eq!(state.subscriptions.len(), 1);
+            assert!(
+                state
+                    .subscriptions
+                    .contains_key(&SubscriptionId::new(old.subscription_id()))
+            );
+            drop(state);
+            assert!(
+                sdk.client()
+                    .relay(endpoint.as_str())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        sdk.unsubscribe_account(&account_id, &[]).await.unwrap();
+        sdk.shutdown().await;
+        relay.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pending_replacement_releases() {
+        for owner in ["subscription", "publish"] {
+            let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+            let url = relay.url().await;
+            let account_id = MemberId::new(Keys::generate().public_key().to_bytes().to_vec());
+            let sdk = NostrSdkRelayClient::new(Client::default());
+            let old = NostrSubscription::AccountInbox {
+                account_id: account_id.clone(),
+                endpoints: vec![TransportEndpoint(url.to_string())],
+                since: None,
+                attempt: SubscriptionAttempt::INITIAL,
+            };
+            if owner == "subscription" {
+                sdk.subscribe(old.clone()).await.unwrap();
+            } else {
+                sdk.publish_event(
+                    &[TransportEndpoint(url.to_string())],
+                    &signed_group_event_dto(),
+                    1,
+                )
+                .await
+                .unwrap();
+            }
+            let mut pending = old;
+            if let NostrSubscription::AccountInbox { attempt, .. } = &mut pending {
+                *attempt = attempt.next();
+            }
+            let pending_id = SubscriptionId::new(pending.subscription_id());
+            sdk.unsubscribe_account(&account_id, &[pending])
+                .await
+                .unwrap();
+            assert!(
+                sdk.client().relay(url.clone()).await.unwrap().is_some(),
+                "{owner}"
+            );
+            assert_eq!(
+                sdk.account_subscriptions.read().await[&account_id],
+                vec![pending_id]
+            );
+            assert!(
+                sdk.publish_relay_cache
+                    .lifecycle
+                    .lock()
+                    .await
+                    .subscription_owned
+                    .contains(&url)
+            );
+
+            // Activation can stop after its opening sweep, without ever
+            // subscribing the planned REQ. Final teardown still owns it.
+            sdk.unsubscribe_account(&account_id, &[]).await.unwrap();
+            assert!(sdk.client().relays().await.is_empty(), "{owner}");
+            assert!(
+                sdk.account_subscriptions
+                    .read()
+                    .await
+                    .get(&account_id)
+                    .is_none()
+            );
+            assert!(
+                sdk.publish_relay_cache
+                    .lifecycle
+                    .lock()
+                    .await
+                    .subscriptions
+                    .is_empty()
+            );
+            sdk.shutdown().await;
+            relay.shutdown();
+        }
     }
 
     #[tokio::test]
@@ -8978,7 +9378,7 @@ mod tests {
             [(relay("wss://stale.example"), true)],
         );
 
-        sdk.unsubscribe_account(&account).await.unwrap();
+        sdk.unsubscribe_account(&account, &[]).await.unwrap();
 
         assert!(
             sdk.take_subscription_registrations(&account)

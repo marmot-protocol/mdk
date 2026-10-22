@@ -42,8 +42,9 @@ impl NostrRelayClient for CrashRelay {
     async fn unsubscribe_account(
         &self,
         account: &MemberId,
+        replacements: &[NostrSubscription],
     ) -> Result<(), cgka_traits::TransportAdapterError> {
-        self.inner.unsubscribe_account(account).await
+        self.inner.unsubscribe_account(account, replacements).await
     }
 
     async fn publish_event(

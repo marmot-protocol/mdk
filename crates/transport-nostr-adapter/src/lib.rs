@@ -857,13 +857,23 @@ pub trait NostrRelayClient: Send + Sync {
 
     /// Tear down every subscription this client holds for an account.
     ///
-    /// Must be a no-op returning `Ok` for an account the client knows nothing
-    /// about: `activate_account` calls this unconditionally — before the first
-    /// activation as well as before a replacement — and propagates the error
-    /// with `?`, so an implementation that faulted on an unknown account would
+    /// `replacements` are the exact subscriptions the caller will issue next.
+    /// Track their planned socket ownership before closing the old REQs so
+    /// replacement activation preserves sockets still needed by the account.
+    /// An empty slice requests final teardown without retaining socket ownership.
+    /// This does not issue the replacement REQs; the caller subscribes afterward.
+    ///
+    /// Must return `Ok` when the account has no existing subscriptions, while
+    /// still allowing nonempty `replacements` to register planned ownership.
+    /// With empty replacements, teardown of an unknown account is a no-op.
+    /// `activate_account` calls this unconditionally, including before the first
+    /// activation, and propagates errors, so rejecting an unknown account would
     /// make every first activation fail.
-    async fn unsubscribe_account(&self, account_id: &MemberId)
-    -> Result<(), TransportAdapterError>;
+    async fn unsubscribe_account(
+        &self,
+        account_id: &MemberId,
+        replacements: &[NostrSubscription],
+    ) -> Result<(), TransportAdapterError>;
 
     async fn publish_event(
         &self,
@@ -2916,14 +2926,6 @@ impl TransportAdapter for NostrTransportAdapter {
                 state.next_activation_attempt(&account_id),
             )
         };
-        // Unconditional, not gated on live local routes. Attempt-scoped ids mean
-        // a re-issued REQ no longer replaces its predecessor relay-side, and a
-        // rolled-back activation can leave `accounts` empty while the relay
-        // client still holds this account's subscriptions. An orphaned REQ
-        // double-delivers, because routing is content-keyed rather than
-        // subscription-keyed. The SDK client is a no-op on an empty id list.
-        self.relay_client.unsubscribe_account(&account_id).await?;
-
         let prior_route_keys = prior_group_route_keys(&account_id, &activation.group_subscriptions);
         let routes = activation
             .group_subscriptions
@@ -2944,6 +2946,17 @@ impl TransportAdapter for NostrTransportAdapter {
             attempt,
         ));
         issued.extend(batches.iter().cloned());
+        // Unconditional, not gated on live local routes. Attempt-scoped ids mean
+        // a re-issued REQ no longer replaces its predecessor relay-side, and a
+        // rolled-back activation can leave `accounts` empty while the relay
+        // client still holds this account's subscriptions. An orphaned REQ
+        // double-delivers, because routing is content-keyed rather than
+        // subscription-keyed. Transfer planned ownership before closing old
+        // REQs so sockets needed by the replacement stay open.
+        self.relay_client
+            .unsubscribe_account(&account_id, &issued)
+            .await?;
+
         // Register routing/telemetry state BEFORE the relay REQs go out: a
         // relay may stream stored events the moment it sees a subscription,
         // and an event arriving before the routes exist is dropped as
@@ -2988,7 +3001,7 @@ impl TransportAdapter for NostrTransportAdapter {
             // relay and are still streaming.
             let relay_cleanup_failed = self
                 .relay_client
-                .unsubscribe_account(&account_id)
+                .unsubscribe_account(&account_id, &[])
                 .await
                 .is_err();
             let mut state = self.state.write().await;
@@ -3224,7 +3237,9 @@ impl TransportAdapter for NostrTransportAdapter {
             subscriptions_removed = removed_count,
             "deactivating transport account"
         );
-        self.relay_client.unsubscribe_account(account_id).await?;
+        self.relay_client
+            .unsubscribe_account(account_id, &[])
+            .await?;
         let mut state = self.state.write().await;
         state.forget_account_subscription_starts(account_id);
         // The blanket `unsubscribe_account` above supersedes any queued

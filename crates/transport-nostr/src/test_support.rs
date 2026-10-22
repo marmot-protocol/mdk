@@ -83,6 +83,7 @@ impl NostrRelayClient for CountingClient {
     async fn unsubscribe_account(
         &self,
         _account_id: &MemberId,
+        _replacements: &[transport_nostr_adapter::NostrSubscription],
     ) -> Result<(), TransportAdapterError> {
         Ok(())
     }

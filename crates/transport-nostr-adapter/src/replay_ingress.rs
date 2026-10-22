@@ -862,7 +862,11 @@ mod tests {
             panic!("ingress registration must not unsubscribe")
         }
 
-        async fn unsubscribe_account(&self, _: &MemberId) -> Result<(), TransportAdapterError> {
+        async fn unsubscribe_account(
+            &self,
+            _: &MemberId,
+            _: &[NostrSubscription],
+        ) -> Result<(), TransportAdapterError> {
             panic!("ingress registration must not replace an account")
         }
 

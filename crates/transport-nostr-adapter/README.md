@@ -77,6 +77,14 @@ pool lifetime. Subscription-owned connections do not consume the idle WRITE-only
 publication allowance, either while subscribed or while awaiting removal. Missing
 subscription connections do not prevent other idle sockets from expiring.
 
+Replacement activation passes its planned subscriptions to
+`unsubscribe_account(account_id, replacements)` before closing old REQs. Their
+ownership keeps unchanged sockets and connection epochs alive; final teardown
+passes an empty slice. Pending replacements remain reachable by account cleanup
+if setup is cancelled. Removed sockets also lose their notification monitors and
+frontier entries; re-adding a relay receives a fresh process-monotonic connection
+epoch.
+
 The app-runtime layer projects group subscriptions and group-message publish targets from
 `marmot.transport.nostr.routing.v1` and applies relay endpoint parsing/deduplication before subscription or publish.
 KeyPackage publish targets come from the user's kind `10002` NIP-65 relay list, and directory/profile discovery is
