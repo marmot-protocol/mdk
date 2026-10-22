@@ -9,6 +9,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use cgka_engine::account_identity_proof::AccountIdentityProofSigner;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
+pub use cgka_engine::engine::WelcomeDeliveryIndex;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
@@ -747,6 +748,11 @@ impl AccountDeviceSession {
     /// IDs of delivery-aware outbound Welcomes, including completed ones.
     pub fn tracked_outbound_welcome_ids(&self) -> SessionResult<Vec<MessageId>> {
         Ok(self.engine.tracked_outbound_welcome_ids()?)
+    }
+
+    /// Outstanding Welcome obligations and tracked IDs from one engine scan.
+    pub fn welcome_delivery_index(&self) -> SessionResult<WelcomeDeliveryIndex> {
+        Ok(self.engine.welcome_delivery_index()?)
     }
 
     /// Complete one retained outbound Welcome delivery obligation after the

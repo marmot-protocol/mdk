@@ -6993,10 +6993,10 @@ impl AppClient {
     /// re-creating the group, re-committing the invite, or re-consuming
     /// KeyPackages.
     fn reconcile_pending_welcome_delivery_index(&self) -> Result<(), AppError> {
-        let outstanding = self.runtime.outstanding_welcome_deliveries()?;
-        let tracked_ids = self
-            .runtime
-            .tracked_outbound_welcome_ids()?
+        let index = self.runtime.welcome_delivery_index()?;
+        let outstanding = index.outstanding;
+        let tracked_ids = index
+            .tracked_ids
             .into_iter()
             .map(|id| hex::encode(id.as_slice()))
             .collect::<HashSet<_>>();

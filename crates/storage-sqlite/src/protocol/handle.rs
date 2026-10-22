@@ -140,6 +140,18 @@ impl SqliteAccountStorage {
         self.connection.set_timing_observer(observer);
     }
 
+    /// Install a SQLite statement/row trace for dependent-crate regression tests.
+    /// SQL and row identities must never be logged by production code.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn trace_queries_for_test(
+        &self,
+        mask: rusqlite::trace::TraceEventCodes,
+        callback: Option<fn(rusqlite::trace::TraceEvent<'_>)>,
+    ) -> StorageResult<()> {
+        self.lock()?.trace_v2(mask, callback);
+        Ok(())
+    }
+
     pub(crate) fn lock(&self) -> StorageResult<ConnectionGuard<'_>> {
         self.connection.lock()
     }

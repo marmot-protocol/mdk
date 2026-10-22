@@ -982,6 +982,7 @@ dependencies = [
  "openmls_rust_crypto",
  "openmls_traits",
  "rand 0.8.6",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",

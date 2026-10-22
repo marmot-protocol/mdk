@@ -29,7 +29,7 @@ use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
-use cgka_traits::message::StoredMessagePayload;
+use cgka_traits::message::{MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
     ConvergencePassStorage, GroupStorage, KeyPackageBundleStorage, MessageStorage, StorageProvider,
@@ -1168,6 +1168,281 @@ async fn current_group_persists_profile_and_rejects_legacy_key_packages() {
     let (stored_group, stored_welcome) = reopened.stored_sent_welcome(&welcome_id).unwrap();
     assert_eq!(stored_group, group_id);
     assert_eq!(stored_welcome.id, welcome_id);
+}
+
+#[tokio::test]
+async fn welcome_scan_filters_rows() {
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    use std::cell::Cell;
+
+    thread_local! {
+        static MESSAGE_READS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    fn measure<T>(storage: &SqliteAccountStorage, read: impl FnOnce() -> T) -> (T, (usize, usize)) {
+        MESSAGE_READS.set((0, 0));
+        storage
+            .trace_queries_for_test(
+                TraceEventCodes::SQLITE_TRACE_STMT | TraceEventCodes::SQLITE_TRACE_ROW,
+                Some(|event| {
+                    let (statement, is_row) = match event {
+                        TraceEvent::Stmt(statement, _) => (statement, false),
+                        TraceEvent::Row(statement) => (statement, true),
+                        _ => return,
+                    };
+                    let sql = statement.sql();
+                    // Count executed message SELECTs, not group-liveness reads or
+                    // the nested SELECT inside a state-filtered statement.
+                    if sql.starts_with("SELECT") && sql.contains("FROM cgka_messages") {
+                        let (queries, rows) = MESSAGE_READS.get();
+                        MESSAGE_READS
+                            .set((queries + usize::from(!is_row), rows + usize::from(is_row)));
+                    }
+                }),
+            )
+            .unwrap();
+        let result = read();
+        storage
+            .trace_queries_for_test(TraceEventCodes::empty(), None)
+            .unwrap();
+        (result, MESSAGE_READS.get())
+    }
+
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = build_profile_client_on_storage(
+        b"alice-welcome-scan",
+        storage.clone(),
+        ProtocolProfile::Current,
+    );
+    let mut bob = build_current_client(b"bob-welcome-scan");
+    let mut carol = build_current_client(b"carol-welcome-scan");
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "welcome scan history".into(),
+            description: String::new(),
+            members: vec![
+                bob.fresh_key_package().await.unwrap(),
+                carol.fresh_key_package().await.unwrap(),
+            ],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcomes = match result {
+        SendResult::FoundingGroupCreated { welcomes } => welcomes,
+        other => panic!("expected founding Welcomes, got {other:?}"),
+    };
+    assert_eq!(welcomes.len(), 2);
+    // An empty live group still needs one message scan in the combined index.
+    alice
+        .create_group(CreateGroupRequest {
+            name: "empty welcome scan".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+
+    let application = match alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            payload: app_payload_for(&alice, "retained application history"),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::ApplicationMessage { msg, .. } => msg,
+        other => panic!("expected application message, got {other:?}"),
+    };
+    let mut record = storage.get_message(&application.id).unwrap();
+    // Sending also persists a raw content-dedup marker. It is not part of
+    // this fixture's 500 application rows and two Welcome obligations.
+    for row in storage
+        .list_messages(&group_id, cgka_traits::EpochId(0))
+        .unwrap()
+    {
+        if StoredMessagePayload::decode(&row.payload)
+            .unwrap()
+            .as_raw_transport()
+            .is_some()
+        {
+            storage.delete_message(&row.id).unwrap();
+        }
+    }
+    // Reuse real application bytes; these are storage-history fixtures, not
+    // additional ratchet advances. Keep exactly 500 Processed application rows.
+    for n in 0..500 {
+        let mut message = application.clone();
+        if n != 0 {
+            message.id = MessageId::new(format!("processed-application-{n}").into_bytes());
+        }
+        record.id = message.id.clone();
+        record.state = MessageState::Processed;
+        record.payload = StoredMessagePayload::openmls_wire(message)
+            .encode()
+            .unwrap();
+        storage.put_message(&record).unwrap();
+    }
+    for (n, state) in [
+        MessageState::Created,
+        MessageState::Retryable,
+        MessageState::ConvergenceDeferred,
+        MessageState::PeelDeferred,
+        MessageState::EpochInvalidated,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        record.id = MessageId::new(format!("non-target-state-{n}").into_bytes());
+        record.state = state;
+        storage.put_message(&record).unwrap();
+    }
+
+    let (outstanding, reads) = measure(&storage, || alice.outstanding_sent_welcomes().unwrap());
+    assert_eq!(
+        reads,
+        (2, 2),
+        "outstanding discovery must fetch only Sent rows"
+    );
+    let expected = welcomes
+        .iter()
+        .cloned()
+        .map(|welcome| (group_id.clone(), welcome))
+        .collect::<Vec<_>>();
+    assert_eq!(outstanding, expected);
+
+    let (tracked_ids, reads) = measure(&storage, || alice.tracked_outbound_welcome_ids().unwrap());
+    assert_eq!(
+        reads,
+        (2, 502),
+        "tracking must exclude non-target states in storage"
+    );
+    assert_eq!(
+        tracked_ids,
+        welcomes
+            .iter()
+            .map(|welcome| welcome.id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let (index, reads) = measure(&storage, || alice.welcome_delivery_index().unwrap());
+    assert_eq!(
+        reads,
+        (2, 502),
+        "combined discovery must scan each live group once"
+    );
+    assert_eq!(index.outstanding, expected);
+    assert_eq!(index.tracked_ids, tracked_ids);
+}
+
+#[tokio::test]
+async fn welcome_index_keeps_lifecycle() {
+    let storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = build_profile_client_on_storage(
+        b"alice-welcome-lifecycle",
+        storage.clone(),
+        ProtocolProfile::Current,
+    );
+    let mut bob = build_current_client(b"bob-welcome-lifecycle");
+    let mut carol = build_current_client(b"carol-welcome-lifecycle");
+    let (group_id, result) = alice
+        .create_group(CreateGroupRequest {
+            name: "welcome delivery lifecycle".into(),
+            description: String::new(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let completed = match result {
+        SendResult::FoundingGroupCreated { mut welcomes } => welcomes.remove(0),
+        other => panic!("expected founding Welcome, got {other:?}"),
+    };
+    alice.mark_sent_welcome_delivered(&completed.id).unwrap();
+    assert_eq!(
+        storage.get_message(&completed.id).unwrap().state,
+        MessageState::Processed
+    );
+
+    let (pending, staged) = match alice
+        .send(SendIntent::Invite {
+            group_id,
+            key_packages: vec![carol.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    {
+        SendResult::GroupEvolution {
+            pending,
+            mut welcomes,
+            ..
+        } => (pending, welcomes.remove(0)),
+        other => panic!("expected staged invite, got {other:?}"),
+    };
+    assert_eq!(
+        storage.get_message(&staged.id).unwrap().state,
+        MessageState::Sent
+    );
+    let expected_ids = vec![completed.id.clone(), staged.id.clone()];
+    let index = alice.welcome_delivery_index().unwrap();
+    assert!(
+        index.outstanding.is_empty(),
+        "a Sent staged invite is not deliverable"
+    );
+    assert_eq!(index.tracked_ids, expected_ids);
+    assert!(alice.outstanding_sent_welcomes().unwrap().is_empty());
+    assert_eq!(alice.tracked_outbound_welcome_ids().unwrap(), expected_ids);
+
+    alice.publish_failed(pending).await.unwrap();
+    let canceled = storage.get_message(&staged.id).unwrap();
+    assert_eq!(canceled.state, MessageState::Failed);
+    assert!(
+        StoredMessagePayload::decode(&canceled.payload)
+            .unwrap()
+            .as_outbound_welcome()
+            .is_some()
+    );
+
+    // Historical raw Welcomes and malformed payloads are never cold-discovered,
+    // including after completed and canceled obligations survive a restart.
+    let mut excluded = storage.get_message(&completed.id).unwrap();
+    let mut raw = completed.clone();
+    raw.id = MessageId::new(b"historical-raw-welcome".to_vec());
+    excluded.id = raw.id.clone();
+    excluded.state = MessageState::Sent;
+    excluded.payload = StoredMessagePayload::raw_transport(raw).encode().unwrap();
+    storage.put_message(&excluded).unwrap();
+    excluded.id = MessageId::new(b"malformed-welcome-payload".to_vec());
+    excluded.payload = vec![0xff];
+    storage.put_message(&excluded).unwrap();
+    drop(alice);
+
+    let mut reopened = build_profile_client_on_storage(
+        b"alice-welcome-lifecycle",
+        storage,
+        ProtocolProfile::Current,
+    );
+    reopened.hydrate_all_stored_groups().unwrap();
+    let index = reopened.welcome_delivery_index().unwrap();
+    assert!(index.outstanding.is_empty());
+    assert_eq!(
+        index.tracked_ids, expected_ids,
+        "completed and canceled ids remain tracked"
+    );
+    assert!(reopened.outstanding_sent_welcomes().unwrap().is_empty());
+    assert_eq!(
+        reopened.tracked_outbound_welcome_ids().unwrap(),
+        expected_ids
+    );
 }
 
 #[tokio::test]

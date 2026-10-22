@@ -956,6 +956,9 @@ async fn welcome_delivery_accessors_hide_quarantined_groups() {
         engine.tracked_outbound_welcome_ids().unwrap().is_empty(),
         "quarantined groups must not contribute tracked Welcome ids"
     );
+    let index = engine.welcome_delivery_index().unwrap();
+    assert!(index.outstanding.is_empty());
+    assert!(index.tracked_ids.is_empty());
 }
 
 async fn create_confirmed_group_flaky(engine: &mut Engine<FlakyGroupRecordStorage>) -> GroupId {

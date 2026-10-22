@@ -4455,6 +4455,11 @@ where
         Ok(self.session.tracked_outbound_welcome_ids()?)
     }
 
+    /// Outstanding Welcome obligations and tracked IDs from one engine scan.
+    pub fn welcome_delivery_index(&self) -> AccountResult<cgka_session::WelcomeDeliveryIndex> {
+        Ok(self.session.welcome_delivery_index()?)
+    }
+
     /// Delivery is already externally visible when this runs. A local state
     /// write failure must therefore leave the Welcome conservatively retryable
     /// rather than turn canonical creation/evolution into a false hard error.

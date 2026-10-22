@@ -50,6 +50,21 @@ use web_time::{SystemTime, UNIX_EPOCH};
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
+const TRACKED_WELCOME_STATES: &[MessageState] = &[
+    MessageState::Sent,
+    MessageState::Processed,
+    MessageState::Failed,
+];
+
+/// Retained Welcome obligations and the IDs needed to reconcile their projections.
+#[derive(Debug, Default)]
+pub struct WelcomeDeliveryIndex {
+    /// Delivery-aware Welcomes still awaiting acknowledgement.
+    pub outstanding: Vec<(GroupId, TransportMessage)>,
+    /// Delivery-aware and staged Welcome IDs, including completed and canceled ones.
+    pub tracked_ids: Vec<MessageId>,
+}
+
 #[derive(Clone, Copy)]
 enum SendAcceptance {
     Prepare,
@@ -3300,25 +3315,13 @@ impl<S: StorageProvider> Engine<S> {
         &self,
     ) -> Result<Vec<(GroupId, TransportMessage)>, EngineError> {
         let mut welcomes = Vec::new();
-        for group_id in self.storage.list_groups()? {
-            if self.ensure_group_live(&group_id).is_err() {
-                continue;
+        self.visit_welcome_records(&[MessageState::Sent], |group_id, _, _, payload| {
+            if let StoredMessagePayload::OutboundWelcome(message) = payload
+                && matches!(message.envelope, TransportEnvelope::Welcome { .. })
+            {
+                welcomes.push((group_id.clone(), message));
             }
-            for record in self.storage.list_messages(&group_id, EpochId(0))? {
-                if record.state != MessageState::Sent {
-                    continue;
-                }
-                let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
-                    continue;
-                };
-                let Some(message) = payload.as_outbound_welcome() else {
-                    continue;
-                };
-                if matches!(message.envelope, TransportEnvelope::Welcome { .. }) {
-                    welcomes.push((group_id.clone(), message.clone()));
-                }
-            }
-        }
+        })?;
         Ok(welcomes)
     }
 
@@ -3329,24 +3332,61 @@ impl<S: StorageProvider> Engine<S> {
     /// Staged invite ids are tracked but not outstanding, so a pre-confirmation
     /// app projection cannot expose them for delivery. Historical raw `Sent`
     /// payloads remain outside this lifecycle.
+    /// Failed Welcomes remain tracked so canceled invite projections can be cleared.
     pub fn tracked_outbound_welcome_ids(&self) -> Result<Vec<MessageId>, EngineError> {
         let mut ids = Vec::new();
+        self.visit_welcome_records(TRACKED_WELCOME_STATES, |_, id, _, payload| {
+            if matches!(
+                payload,
+                StoredMessagePayload::OutboundWelcome(_)
+                    | StoredMessagePayload::StagedInviteWelcome { .. }
+            ) {
+                ids.push(id);
+            }
+        })?;
+        Ok(ids)
+    }
+
+    /// Read outstanding obligations and tracked IDs in one state-filtered pass.
+    pub fn welcome_delivery_index(&self) -> Result<WelcomeDeliveryIndex, EngineError> {
+        let mut index = WelcomeDeliveryIndex::default();
+        self.visit_welcome_records(TRACKED_WELCOME_STATES, |group_id, id, state, payload| {
+            match payload {
+                StoredMessagePayload::OutboundWelcome(message) => {
+                    index.tracked_ids.push(id);
+                    if state == MessageState::Sent
+                        && matches!(message.envelope, TransportEnvelope::Welcome { .. })
+                    {
+                        index.outstanding.push((group_id.clone(), message));
+                    }
+                }
+                StoredMessagePayload::StagedInviteWelcome { .. } => index.tracked_ids.push(id),
+                _ => {}
+            }
+        })?;
+        Ok(index)
+    }
+
+    fn visit_welcome_records(
+        &self,
+        states: &[MessageState],
+        mut visit: impl FnMut(&GroupId, MessageId, MessageState, StoredMessagePayload),
+    ) -> Result<(), EngineError> {
         for group_id in self.storage.list_groups()? {
             if self.ensure_group_live(&group_id).is_err() {
                 continue;
             }
-            for record in self.storage.list_messages(&group_id, EpochId(0))? {
+            for record in self
+                .storage
+                .list_messages_in_states(&group_id, states, EpochId(0))?
+            {
                 let Ok(payload) = StoredMessagePayload::decode(&record.payload) else {
                     continue;
                 };
-                if payload.as_outbound_welcome().is_some()
-                    || payload.as_staged_invite_welcome().is_some()
-                {
-                    ids.push(record.id);
-                }
+                visit(&group_id, record.id, record.state, payload);
             }
         }
-        Ok(ids)
+        Ok(())
     }
 
     /// Mark one retained outbound Welcome's independent delivery obligation

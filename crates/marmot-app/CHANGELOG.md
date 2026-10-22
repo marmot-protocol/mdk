@@ -195,6 +195,10 @@
 
 ### Fixed
 
+- Pending-Welcome queries reconcile delivery obligations in one state-filtered
+  scan per live group (mdk#1798). Outstanding-only recovery reads `Sent` rows;
+  completed and canceled invites remain tracked for repair-index cleanup.
+
 - `follow_user` and `unfollow_user` edit the account's current kind-3
   contact list in place (mdk#2268). A follow appends one `p` tag and an
   unfollow removes that account's `p` tags; petnames, relay hints, other tags
