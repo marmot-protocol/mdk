@@ -2,8 +2,24 @@
 
 ## Unreleased
 
+## 0.14.0 - 2026-10-23
+
 ### Breaking changes
 
+- App databases are keyed with raw SQLCipher keys (mdk#1791). The HKDF
+  derivation and the `.salt` sidecars are unchanged, but on first open each
+  existing passphrase-keyed database (`session.sqlite`, the directory cache
+  `app-cache.sqlite3` and a legacy `app.sqlite3`, for local and
+  external-signer accounts) is rekeyed once: `PRAGMA rekey` rewrites every
+  page under a durable `<db>.raw-key-migrating` marker, and an interrupted
+  rekey recovers on the next open. Later opens skip SQLCipher's
+  256,000-iteration passphrase KDF. Older binaries cannot open a rekeyed
+  database; downgrade is unsupported. Keep the salt sidecars and secret-store
+  credentials; `docs/marmot-architecture/storage-format-v2.md` documents
+  offline opens and the key-only offline rekey.
+- Hosts must exclude the account directory, including `media/`, from cloud and
+  device backups (iCloud, Android auto-backup). Its keys are device-bound, so
+  a restored database, salt or media file could not be read anyway.
 - `AttachmentTransferState` adds `CleanedBySetting` (mdk#2314 step 10).
   Update exhaustive matches.
 
@@ -43,17 +59,29 @@
   the deployment. `marmot_account::DEFAULT_KEYCHAIN_SERVICE_NAME` and
   `AccountHome::open_with_default_keychain` are removed: call
   `open_with_keychain` with the deployment's `keychain_service`.
-- `AppError` adds `GroupCatchingUp` and `GroupCommitUndelivered`; update exhaustive matches.
-- `AppError` adds `InvalidEditTarget`; update exhaustive matches.
-- `AppError` adds `FollowListTooLarge` (mdk#2268); update exhaustive matches.
-- `AppError` adds `DirectoryLookupIncomplete(account)` (mdk#2302). Invite member resolution,
-  directory KeyPackage lookup and relay-list lookup return it instead of `RelayDirectory` when
-  time or relay coverage ran out, so nothing is known to be missing. When the invite deadline
-  passes, members already decided keep their outcome and the error names the first member
-  whose lookup had not finished. Retry it.
-- `AppError::MissingKeyPackage` is now `{ account, reason: MissingKeyPackageReason }`.
-  `ObsoleteOnly` means a completed lookup found only legacy-profile KeyPackages, so the
-  recipient must update and publish a current one; `NotFound` keeps the previous meaning.
+- `MarmotApp`'s 16 directory methods (user and cached search, directory
+  entries and refreshes, profile, follow-list and relay-list fetches, member
+  KeyPackage resolution and prewarming) move to `MarmotApp::directory()`, a
+  `Directory` from the new `nostr-directory` crate (directory brief, PRs 4-7).
+  marmot-app re-exports `Directory` and `DirectoryError`. Directory methods
+  return `DirectoryError`; `?` or `AppError::from` converts it to the same
+  `AppError` variant, message and `privacy_safe_kind` as before.
+  `MarmotAppRuntime` methods are unchanged.
+- `AppError` adds six variants; update exhaustive matches:
+  `GroupCatchingUp` and `GroupCommitUndelivered` (see Fixed),
+  `InvalidEditTarget`, `FollowListTooLarge` (mdk#2268),
+  `InvalidPublicEventReferences` (see Added) and
+  `DirectoryLookupIncomplete(account)` (mdk#2302). Invite member resolution,
+  directory KeyPackage lookup and relay-list lookup return
+  `DirectoryLookupIncomplete` instead of `RelayDirectory` when time or relay
+  coverage ran out, so nothing is known to be missing. When the invite
+  deadline passes, members already decided keep their outcome and the error
+  names the first member whose lookup had not finished. Retry it.
+- `AppError::MissingKeyPackage` is now
+  `{ account, reason: MissingKeyPackageReason }`. `ObsoleteOnly` means a
+  completed lookup found only legacy-profile KeyPackages, so the recipient
+  must update and publish a current one; `NotFound` keeps the previous
+  meaning.
 - Sends stage every attachment body in the account's media store before the
   first upload (mdk#2314 step 3). A body the disk cannot hold beyond the
   attachment policy's disk reserve fails with
@@ -71,10 +99,18 @@
   placement before completion; scoped source facts can persist earlier.
   Native input admission is separate from history certification and loss acknowledgment.
   The C and UniFFI surfaces are unchanged.
-- Rust audited engine ingestion, session delivery ingestion and account delivery
-  ingestion borrow their transport input. `ReplayIngress` and `ReplayBatch` retain
+- Rust ingestion borrows its transport input:
+  `Engine::ingest_with_audit_context` takes `&TransportMessage`,
+  `AccountDeviceSession::ingest_delivery` takes `&TransportDelivery`, and so
+  do marmot-account's `AccountDeviceRuntime::ingest_delivery` and
+  `ingest_delivery_with_observer`. `ReplayIngress` and `ReplayBatch` retain
   native frames until ordered admission acknowledges them. C and UniFFI calls
   are unchanged.
+- Group (kind 445) event signatures are verified once, at the relay
+  adapter's ingest boundary; group peeling no longer verifies Schnorr
+  signatures (mdk#1799). A Rust host that builds `TransportMessage`s from
+  `NostrTransportEvent` DTOs itself must authenticate their source or call
+  `to_verified_nostr_event` before ingesting them.
 
 ### Changed
 
@@ -94,8 +130,9 @@
 - Downloaded attachment bodies are retained as encrypted files in the account's
   `media/` directory (the `media-store` crate) instead of SQLCipher rows
   (mdk#2314). Identical content is stored once and attached without downloading
-  again. `read_attachment_asset` reads either layout unchanged; existing bodies
-  stay in the database until a later migration.
+  again. `read_attachment_asset` reads either layout unchanged; bodies earlier
+  releases kept in the database move into the store in the background (see
+  Added).
 - Sent attachment bodies are kept as encrypted media store files owned by
   their upload, and the wire ciphertext streams from that file in two passes
   (digest, then each PUT): no plaintext snapshot, ciphertext temp file or
@@ -122,8 +159,18 @@
   never on a retry timer.
 - Publication, hashing and encryption of downloaded bodies run on the blocking
   pool for in-memory bodies too, never on the account worker.
-- Hosts must exclude the account directory, including `media/`, from cloud and
-  device backups.
+- Approving an onboarding relay repair needs a completed freshness query from
+  every onboarding source, including the relays named in the account's signed
+  relay declaration, not only the discovery relays and public indexers. A
+  source that times out blocks the replacement even when another source
+  returns a record, since it may hold a newer one (mdk#2417).
+- The directory's tracing targets name their modules:
+  `nostr_directory::search`, `nostr_directory::sync` and
+  `nostr_directory::cache`, and in marmot-app
+  `marmot_app::directory_resources`, `marmot_app::user_blocks` and
+  `marmot_app::profile_publication`; identity publication at the crate root
+  logs as `marmot_app`. They replace `marmot_app::directory`; update log
+  filters that named it.
 
 ### Added
 
@@ -195,6 +242,57 @@
 
 ### Fixed
 
+- `shutdown_and_close` and `close_storage` now close every connection that
+  can hold a lock in the Marmot root before releasing the root lease,
+  including each account engine's own `session.sqlite` connection and opens
+  still in flight. Before, only the app's cached connections closed, so the
+  lease could be released while a worker still held the database: the state
+  behind iOS `0xdead10cc` kills, and a Notification Service Extension could
+  take the lease while the engine was still writing. Each resource registers
+  a `storage_sqlite::DatabaseCloser` when it opens, and the app opens the
+  engine's connection itself and hands it to the session
+  (`SessionConfig::with_storage`).
+- Opening a database the process already holds open, such as a second
+  connection to `session.sqlite`, no longer drops the live connection's POSIX
+  locks. That let another process, such as the iOS Notification Service
+  Extension, take the database exclusively and checkpoint, truncate or
+  reinitialise its `-wal`/`-shm` under it (mdk#2351).
+- A hydration-quarantined group no longer stops every conversation from
+  receiving (mdk#2318). The worker reads no delivery while an effects batch is
+  retained, and a strict read of the quarantined group failed that batch on
+  every retry while sends kept publishing. Its events are now projected
+  best-effort, a failure naming a quarantined group defers only that group's
+  events (recovery re-derives its projection), and a locally deleted,
+  quarantined group stays subscribed on its stored route. A head batch that
+  keeps failing is logged after four retries and at each doubling.
+- An inbound group event is rebuilt and verified once, not once per relay
+  copy: relay timing is recorded from authenticated event ids and a retained
+  ciphertext body is reused, while each replay source keeps its own claim
+  (mdk#1799). Subscription relays are released after their last owner, so an
+  account whose relay set rotates no longer accumulates relay connections for
+  the process lifetime (mdk#1040).
+- History recovery no longer lets stalled routes spend every pass before
+  healthy peers are searched. Routes run in bounded concurrent slots that
+  refill as each finishes, the complete pending plan is kept so skipped and
+  refused work stays retryable, negentropy work on a shared relay connection
+  is bounded per relay, and coverage debt is kept when retention makes an old
+  window unsearchable.
+- Bounded reconciliation keeps moving. A pass that ended in refusals at a full
+  deferred queue now saves its replay cursor once every comparison event has
+  had its ingest attempt, so the next pass fetches past the refused prefix
+  instead of the same events; refused ids stay fetchable and still withhold
+  the certificate. Each route pass ends at the caller's deadline, so events
+  the relay already returned are kept instead of cancelled with the pass. A
+  relay gets 5 s for its first NIP-77 reply and 20 s for the pass, instead of
+  500 ms and 2 s, and once one relay has compared, the ones still pending at
+  half the remaining pass time count as route timeouts.
+- A generated identity's setup no longer advertises the app's configured
+  relays first. While its setup journal was open, the KeyPackage lane
+  published any missing relay lists (kinds 10002 and 10050) built from the
+  app's relays alongside the lists the user chose, and where the bootstrap
+  batch never landed those stayed the account's write and inbox relays. An
+  open setup journal now owns the account's relay lists until they are
+  projected.
 - Pending-Welcome queries reconcile delivery obligations in one state-filtered
   scan per live group (mdk#1798). Outstanding-only recovery reads `Sent` rows;
   completed and canceled invites remain tracked for repair-index cleanup.
@@ -211,6 +309,14 @@
   `MarmotApp::update_account_follow_list` run the same edit against chosen
   relays.
 
+- An epoch-gap recovery pass now fetches the route's newest events in the
+  comparison window (256 events and 4 MiB per relay, inside the pass deadline)
+  from each relay its comparison did not vouch for. A commit first accepted
+  long after it was wrapped keeps its wrap-time `created_at`, below every
+  subscriber's live `since`, so a relay that could not compare never returned
+  it and the member stayed at the old epoch (mdk#2256). These events are
+  admitted like comparison events but never certify the route or move its
+  replay cursor. `publish_outcome` audit rows gain `event_age_secs`.
 - Epoch-gap fallback searches older raw pages when a relay cannot compare,
   instead of repeatedly fetching only its newest 256 events (mdk#2257).
   Bounded advisory hints resume across pass cuts. Held-only traversal does
@@ -318,11 +424,11 @@
   undeclared length grows geometrically to half the transfer limit and then
   once to the limit, so the buffer never exceeds the limit and the copy while
   it grows holds at most 1.5 times it; a failed reservation is a transient
-  failure, not an abort), decrypted in place, explicit downloads above the
-  automatic transfer limit stream through the existing private file sink, and
-  in-memory publication stores a body larger than one 64 KiB staging chunk as
-  chunk rows, so SQLite keeps no bind, record or trigger-rewrite copy of it.
-  Integrity checks, resume and retention behavior are unchanged (#2241).
+  failure, not an abort), decrypted in place, and explicit downloads above the
+  automatic transfer limit stream through the existing private file sink.
+  Publication writes the body to the encrypted media store, never to a SQLite
+  value (see Changed). Integrity checks, resume and retention behavior are
+  unchanged (#2241).
 - Self-update maintenance commits now publish through the same durable frozen fanout as every other commit. They still confirm on the first relay acknowledgement, and the app's fanout retry schedule keeps retrying every group relay that missed them. Self-updates staged before upgrading finish on their legacy record, which no longer stops retrying when its post-confirmation marker write fails.
 - Every publish pass, including secondary retries after a commit confirmed, writes `publish_attempt` and `publish_outcome` audit rows with the endpoints attempted, accepted and failed in that pass.
 - A relay still pending when a multi-relay signed publish meets quorum is now reported as `publish acknowledgement unknown` instead of being dropped from the outcome.

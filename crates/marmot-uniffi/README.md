@@ -332,6 +332,11 @@ Await `shutdownAndClose()` before suspension or root handoff; it terminally clos
 storage and releases the lease without waiting for every host reference to disappear.
 Reconstruct the runtime and its handles for the next foreground session.
 
+Exclude each account directory under `rootPath`, including its `media/` and `handoff/`
+folders, from iCloud and Android auto-backup. Attachment files are encrypted with
+device-bound keys, so a restored copy cannot be read, and `handoff/` holds plaintext
+copies lent to OS surfaces.
+
 ## Threading model
 
 MarmotKit runs MDK on a Tokio runtime it owns, not on the threads that call it.

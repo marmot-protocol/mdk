@@ -2,12 +2,60 @@
 
 ## Unreleased
 
+## 0.14.0 - 2026-10-23
+
+Account storage advances from migration 107 through 116 on first open; downgrade
+is unsupported. marmot-app also rekeys its databases once to raw SQLCipher keys
+(`SqlCipherKey::raw`); older binaries cannot open them.
+
 ### Breaking changes
 
-- `AttachmentTransferState` adds `CleanedBySetting`: the account's "Keep
-  media" setting removed the body (mdk#2314 step 10). Update exhaustive
+- Migrations 0108 through 0116 advance account storage from schema 107 to 116
+  on first open. Older binaries reject the upgraded database; downgrade is
+  unsupported. None of them rewrites message rows:
+  - 0108 adds account-wide attachment seek and expiry indexes and invalidation
+    counters, filling `attachment_history.retention_expires_at` once.
+  - 0109 adds `attachment_acquisition.storage_blocked_headroom` and
+    `storage_park_count` and keeps the checkpoints of jobs parked on disk space.
+  - 0110 adds `media_files` (per-file keys and states for the encrypted media
+    store, mdk#2314) and `media_file_refs` (attachment slot to ready file),
+    with triggers that delete a file's key with its last reference and on a
+    store reset. Both start empty.
+  - 0111 adds `cgka_messages.openmls_content` and `openmls_epoch`, which every
+    write derives from the payload, with a covering `(group_id, state,
+    openmls_content, openmls_epoch)` index and a partial index of rows not
+    derived yet. Existing rows take `-1` without a table rewrite (mdk#2330).
+  - 0112 discards existing download checkpoints (the next attempt starts its
+    body over) and adds `attachment_partial.wire_file_id` and
+    `progress_floor`: checkpoint ciphertext lives in a media store `.wire` file
+    and no longer reserves retained budget.
+  - 0113 rebuilds `media_files` to allow a `staged` state and adds
+    `outgoing_attachment_uploads.file_id`. A media file lives while a slot
+    references it or an upload owns it; deleting an upload, or pointing it at
+    another file, deletes a still-staged file's key and a promoted one no slot
+    references (mdk#2314 step 3).
+  - 0114 rebuilds `avatar_assets` so an image can be file-backed (new
+    `byte_len`, `bytes` optional when present) and adds `avatar_file_refs`. It
+    copies at most 32 MiB of database-held images, smallest first; owners
+    beyond that are dropped as if evicted (with their recency, fetch and
+    identity-demand rows) and fetched again when shown. On a full 128 MiB
+    cache this costs about 1.1 s and 166 MiB of extra disk on a desktop (debug
+    build), against 1.8 s and 265 MiB for copying everything.
+  - 0115 rebuilds `account_recovery_obligations` to admit subscription-replay
+    obligations, keeping existing obligations, scope windows and retry state.
+  - 0116 adds the "Keep media" setting (`attachment_keep_media`),
+    `attachment_removal_suppression.reason` and
+    `attachment_acquisition.keep_from`. Existing suppressions read as removed
+    by you, and the setting starts as Forever.
+- `SqlCipherKey::new` rejects SQLCipher's raw-key syntax (`x'…'` with 64, 96
+  or 160 hex digits), so a passphrase cannot skip SQLCipher's key derivation.
+  The new `SqlCipherKey::raw` presents an already-derived 32-byte key as
+  `x'<64 hex digits>'`; cipher hardening and operational defaults are
+  unchanged (mdk#1791).
+- `AttachmentTransferState` adds `StorageBlocked` (free disk cannot cover the
+  body's publication reserve) and `CleanedBySetting` (the account's "Keep
+  media" setting removed the body, mdk#2314 step 10). Update exhaustive
   matches.
-
 - `record_reconciliation_items` replaces
   `record_transport_reconciliation_item`. It accepts a cloneable iterator of
   borrowed route/item pairs and commits the advisory inventory batch atomically,
@@ -23,42 +71,9 @@
   `set_message_draft_commit_observer`. `SqliteMediaCatalog::new` and
   `SlotPublication::new` take a `SqliteAppStorage`, and
   `SqliteMediaCatalog::storage` returns one. No schema or behaviour change.
-- Migration 0113 advances account storage to schema 113 on first open. Older
-  binaries reject the upgraded database; downgrade is unsupported. It rebuilds
-  `media_files` to allow a `staged` state (an outgoing body its upload owns,
-  not yet referenced) and adds `outgoing_attachment_uploads.file_id`. A media
-  file now lives while a slot references it or an upload owns it, so an
-  upload shared by several messages keeps its promoted file for the ones still
-  waiting. Deleting an upload, or pointing it at another file, deletes a
-  still-staged file's key, and a promoted one no slot references (mdk#2314
-  step 3).
-- `attachment_upload_owners` pages file-backed uploads, with each sent message
-  of a confirmed group that carries their descriptor, for promotion (owner rows
-  are not required, so a failed owner registration cannot strand one), and `drop_lost_attachment_upload` deletes
-  an upload whose media file was lost (with that row), so its message falls
-  back to downloading. New `AttachmentUploadOwner` record.
 - `promote_attachment_uploads` skips uploads that have a media store file;
   promote those through `MediaStore::promote` with an
   `AttachmentUploadPromotion`.
-- Migration 0111 advances account storage to schema 111 on first open. Older
-  binaries reject the upgraded database; downgrade is unsupported. It adds
-  `cgka_messages.openmls_content` and `openmls_epoch`, which every write
-  derives from the payload (the OpenMLS content type and MLS epoch it
-  carries), plus a covering `(group_id, state, openmls_content,
-  openmls_epoch)` index and a partial index of rows not derived yet. Existing
-  rows take `-1` without a table rewrite (mdk#2330).
-- Migration 0110 advances account storage to schema 110 on first open. Older
-  binaries reject the upgraded database; downgrade is unsupported. It adds
-  `media_files` (per-file keys and states for the encrypted media store,
-  mdk#2314) and `media_file_refs` (attachment slot to ready file), with triggers
-  that delete a file's key with its last reference and on a store reset.
-- Migration 0112 advances account storage to schema 112 on first open. Older
-  binaries reject the upgraded database; downgrade is unsupported. It discards
-  existing download checkpoints (the next attempt starts its body over) and adds
-  `attachment_partial.wire_file_id` and `progress_floor`: checkpoint
-  ciphertext now lives in a media store `.wire` file and the row keeps only
-  its metadata (mdk#2314). Checkpoints no longer reserve retained budget
-  (`attachment_partial_usage.reserved_bytes` stays zero).
 - Download checkpoints are metadata only, written through the media store.
   `attachment_checkpoint` and `attachment_checkpoint_matching` return an
   `AttachmentCheckpoint`, the job's `media_store::CheckpointTarget`; save,
@@ -76,22 +91,6 @@
 - `read_retained_attachment` returns an error for a body stored as a media file
   (mdk#2314). Use `retained_attachment_read`, which returns legacy database bytes or
   the media file id to read through the media store.
-- Migration 0108 advances account storage to schema 108 with account-wide attachment seek/expiry indexes and invalidation counters. Older binaries reject the upgraded database; downgrade is unsupported.
-- Migration 0109 advances account storage to schema 109 on first open. Older
-  binaries reject the upgraded database; downgrade is unsupported. It adds
-  `attachment_acquisition.storage_blocked_headroom` and `storage_park_count`,
-  a partial index for parked rows, and keeps ciphertext checkpoints for jobs
-  parked on disk space.
-- `AttachmentTransferState` adds `StorageBlocked`; update exhaustive matches.
-- Migration 0114 advances account storage to schema 114 on first open. Older
-  binaries reject the upgraded database; downgrade is unsupported. It rebuilds
-  `avatar_assets` so an image can be file-backed (new `byte_len`, `bytes`
-  optional when present) and adds `avatar_file_refs`. The rebuild copies at
-  most 32 MiB of database-held images, smallest first; owners beyond that are
-  dropped as if evicted (with their recency, fetch and identity-demand rows)
-  and are fetched again when shown. On a full 128 MiB cache this bounds the
-  open-time cost to about 1.1 s and 166 MiB of extra disk on a desktop
-  (debug build), against 1.8 s and 265 MiB for copying everything.
 - `AvatarAssetRead` gains `file` (`AvatarStoredFile`): a file-backed image
   comes back there, with `image` empty, for the caller to read through the
   media store. `AttachmentStorageUsage` gains `cache_bytes`.
@@ -195,20 +194,50 @@
   message, and `attachment_upload_file` locates the staged file for the upload.
   `SqliteMediaCatalog` implements the new `staged_file` and
   `abandon_unowned_staged` catalog methods.
+- `attachment_upload_owners` pages file-backed uploads, with each sent message
+  of a confirmed group that carries their descriptor, for promotion (owner rows
+  are not required, so a failed owner registration cannot strand one), and
+  `drop_lost_attachment_upload` deletes an upload whose media file was lost
+  (with that row), so its message falls back to downloading. New
+  `AttachmentUploadOwner` record.
 
 - `MessageStorage::list_openmls_messages_in_states` leaves out, in SQL, the rows
   an `OpenMlsContentFilter` excludes (delivered applications at or below an
   epoch, everything but commits, or everything but one epoch's applications);
   rows not derived yet or unclassified are always returned (mdk#2330).
+- `StorageProvider::with_group_savepoint` runs a nested unit in a SQLite
+  `SAVEPOINT`: on `Err` or panic it undoes every write the unit made, drops the
+  after-commit wakeups it registered and moves `mls_write_generation`, and the
+  caller's transaction stays open. Canonical convergence apply uses it in place
+  of a full group snapshot, so its rollback cost no longer grows with stored
+  history (mdk#2326).
+- `StorageProvider::rollback_group_state_keeping_live_records` restores
+  canonical group state only, even from an anchor captured with full message
+  and queue images, so every rewind onto a retained anchor (replay and branch
+  probes, and now a reorg's historical apply) keeps the live message ledger,
+  pending application events and outbound queue, and costs the same however
+  much history the group stores (mdk#2330).
+- `DatabaseCloser`, from `closer()` on `CloseableConnection`,
+  `SqliteAccountStorage` and `SqliteSharedStorage`, closes a database through
+  a weak reference with the same terminal contract as the handle's own
+  `close`, and `is_released` reports whether anything is left to close. An
+  owner can register one per connection it opens, including one it hands to
+  an engine, and close them all before a host suspends without keeping any
+  handle alive.
 - `SqliteMediaCatalog` and `SlotPublication` implement the `media-store` crate's
   `MediaCatalog` and `PublishTarget` traits on the account database;
   `release_media_reference` removes a slot's reference and reports released files.
 - `AttachmentPublication` publishes a claimed download into the media store with the
   job's fences and no retained-byte budget; `retained_attachment_read` locates a
   retained body (legacy bytes or a media file id).
+- The `media-store-benchmarks` feature adds `media_store_bench` and its example
+  (`just bench-media-store`), which time the `media-store` file format against
+  the SQLCipher retained-attachment path on desktop and devices (mdk#2314
+  step 0).
 
-- Bounded account-wide attachment pages with group/sender selections, inclusive date bounds and account/query-bound continuation cursors.
-- `SqliteAccountStorage::block_attachment_storage` parks a live attempt whose
+- Bounded account-wide attachment pages with group/sender selections,
+  inclusive date bounds and account/query-bound continuation cursors.
+- `SqliteAppStorage::block_attachment_storage` parks a live attempt whose
   publication disk reserve the device cannot cover. It records the free space
   the next attempt needs beyond the reserve, refreshes the checkpoint's idle
   expiry, refunds the automatic-history claim and the claim streak, withdraws
@@ -227,7 +256,25 @@
   checkpoint's total and saved bytes. The new `test-support` feature exposes
   `limit_database_pages_for_test` and `attachment_partial_bytes_for_test` to
   dependents' tests (mdk#2239).
-- `SqliteAccountStorage::epoch_gap_recovery_open_since` reports when an unresolved epoch-gap obligation (pending, parked or retired by the user) covering a group's local epoch was first armed.
+- `SqliteAppStorage::epoch_gap_recovery_open_since` reports when an unresolved
+  epoch-gap obligation (pending, parked or retired by the user) covering a
+  group's local epoch was first armed.
+
+### Changed
+
+- Tracing targets name the emitting module, for example
+  `storage_sqlite::app::timeline`,
+  `storage_sqlite::app::attachment_acquisition::file_import`,
+  `storage_sqlite::base::connection` and
+  `storage_sqlite::protocol::openmls_storage::provider`. They replace
+  `storage_sqlite::account_projection`, `::attachments`, `::connection`,
+  `::retention`, `::timeline`, `::welcomes` and
+  `marmot.storage_sqlite.openmls`; update log filters that named them.
+- Recovery comparison plans are stored as format 2, which keeps the complete
+  pending plan, so skipped, refused and transiently failed routes stay
+  retryable. A format-1 plan saved by an earlier build froze only its selected
+  routes: it is rebuilt instead of reused, and its never-selected goals stay
+  recorded as debt.
 
 ### Fixed
 
@@ -237,6 +284,15 @@
   rare state cost the group's whole history (mdk#2330).
 - `promote_legacy_message_rows` also derives the OpenMLS content columns of
   rows written before migration 0111, writing only those columns.
+- Opening a database this process already holds open no longer drops the live
+  connection's POSIX locks (mdk#2351). `fs_private::ensure_private_db_files`
+  used to open and close the existing main file and its sidecars to set their
+  mode, which released the connection's `SHARED` and `-shm` read locks, so
+  another process (such as an iOS Notification Service Extension) could take
+  the database exclusively under it. Existing files are now tightened by path;
+  the 0600 creation posture is unchanged.
+- `remove_retained_attachments` treats a received-before bound past SQLite's
+  integer range as later than every attachment instead of failing.
 - `complete_attachment_acquisition` publishes a body larger than one 64 KiB
   staging chunk as a completed chunked file, the layout the file sink's import
   already produces, so no SQLite value holds more than one chunk of it and the
@@ -244,9 +300,6 @@
   after `bytes`, and SQLite expands a `zeroblob` that is not the record's last
   field, so a pre-sized array row would still materialize the body. A body of
   at most one chunk stays one array row (mdk#2241).
-- `load_attachment_partial` sizes the restored prefix for the complete
-  representation with a fallible reservation: a refused allocation is a
-  storage error that keeps the checkpoint, not a process abort (mdk#2241).
 
 ## 0.13.0 - 2026-10-12
 

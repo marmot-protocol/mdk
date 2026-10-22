@@ -109,7 +109,7 @@ install_verified() (
 ```
 
 ```sh
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.13.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.14.0"
 ```
 
 ### Hermes
@@ -411,7 +411,7 @@ Choose by the features you need:
 | Connector | Conversation and controls | Files |
 | --- | --- | --- |
 | [Hermes](hermes/marmot/README.md#what-you-can-do) | DM/group activation; history, quotes, reactions, own-message deletion, admin group profile updates; optional live previews/presence/approval reactions | Inbound media; image/document/video/voice sends with approved-root staging |
-| [OpenClaw](openclaw/marmot/README.md#what-you-can-do) | Gateway routing; DM/group activation; history, quotes, quiet changes, own-message deletion, reactions, admin group profile updates, consent-based public profile naming; current inbound turns are final-only | Host-authorized inbound/outbound media via normal message tool |
+| [OpenClaw](openclaw/marmot/README.md#what-you-can-do) | Gateway routing; DM/group activation; history, quotes, quiet changes, own-message edits and deletion, reactions, admin group profile updates, consent-based public profile naming; current inbound turns are final-only | Host-authorized inbound/outbound media via normal message tool |
 | [Claude Code](claude/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; admin group profile updates; text replies | Text-only; no attachments or generated-file return |
 | [Codex](codex/marmot/README.md#what-you-can-do) | Per-chat thread/project/goal; shared chat and recovery commands; admin group profile updates; completed text replies | Native images and supported staged files; opt-in generated-file return with exact grants |
 | [OpenCode](opencode/marmot/README.md#what-you-can-do) | Per-chat session/project/goal; shared chat and recovery commands; admin group profile updates; text-event replies | Supported images/PDFs/text; no generated-file return |

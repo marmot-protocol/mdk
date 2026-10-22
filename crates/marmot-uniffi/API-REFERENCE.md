@@ -2,11 +2,12 @@
 
 This reference inventories the UniFFI exports and is maintained alongside source changes.
 Start with the [integration guide](README.md#integration-guide-and-api-reference)
-for API selection, lifecycle, localization and ownership. For the 0.13.0 changes, read
-[0.12.0 → 0.13.0](../../docs/integration/0.13.0.md).
+for API selection, lifecycle, localization and ownership. For the 0.14.0 changes, read
+[0.13.0 → 0.14.0](../../docs/integration/0.14.0.md).
 
-This inventories runtime/object methods, free functions and host callback methods. `AttachmentHistoryCursor` is an opaque object with no exported
-methods. Generated disposal/concurrency helpers are platform scaffolding, not additional
+This inventories runtime/object methods, free functions and host callback methods. `AttachmentHistoryCursor`,
+`AccountAttachmentCursor`, `ChatStorageCursor`, `RetainedAttachmentsCursor` and `ChatListDraftVersionFfi` are opaque
+objects with no exported methods. Generated disposal/concurrency helpers are platform scaffolding, not additional
 MDK commands. C has a separate [complete symbol index](../marmot-c/API-REFERENCE.md), including
 its lifetime helpers and compatibility-only entry points.
 
