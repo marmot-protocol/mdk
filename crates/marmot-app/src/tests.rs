@@ -8514,7 +8514,7 @@ async fn member_key_package_falls_back_to_current_directory_for_local_account() 
     )
     .unwrap();
     app.directory()
-        .save_directory_entry(&UserDirectoryRecord {
+        .save_directory_entry_for_test(&UserDirectoryRecord {
             account_id_hex: account.account_id_hex.clone(),
             npub: npub_for_account_id_lossy(&account.account_id_hex),
             local_account: Some(UserDirectoryLocalAccount {
@@ -8808,7 +8808,9 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
     entry.relay_lists.nip65.created_at = 1;
     entry.relay_lists.nip65.relays = vec![outbox.into()];
     entry.relay_lists.refresh();
-    app.directory().save_directory_entry(&entry).unwrap();
+    app.directory()
+        .save_directory_entry_for_test(&entry)
+        .unwrap();
     fetcher.events_by_endpoint.lock().unwrap().extend([
         ("wss://directory.example".to_owned(), Vec::new()),
         (outbox.to_owned(), Vec::new()),
@@ -9452,7 +9454,9 @@ async fn thirty_incremental_invites_with_large_directory_cache_converge_without_
     for _ in 0..256 {
         let account_id = Keys::generate().public_key().to_hex();
         app.directory()
-            .save_directory_entry(&app.directory().empty_directory_record_for_test(&account_id))
+            .save_directory_entry_for_test(
+                &app.directory().empty_directory_record_for_test(&account_id),
+            )
             .unwrap();
     }
 
@@ -10935,7 +10939,7 @@ fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
 
     // Local edit cached at t=1_700_000_000 (own-account entry).
     app.directory()
-        .save_directory_entry(&test_directory_record(
+        .save_directory_entry_for_test(&test_directory_record(
             &account_id,
             "edited-local",
             1_700_000_000,
@@ -11057,7 +11061,7 @@ fn roster_labels_keep_profiles() {
     let bob = home.create_account("bob").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     app.directory()
-        .save_directory_entry(&test_directory_record(&alice.account_id_hex, "Alice", 1))
+        .save_directory_entry_for_test(&test_directory_record(&alice.account_id_hex, "Alice", 1))
         .unwrap();
     let names = app.profiles_by_id().unwrap();
     assert_eq!(names.len(), 2);
@@ -11209,7 +11213,7 @@ fn repeated_display_name_lookup_reuses_directory_cache_handle() {
     let contact = format!("{:064x}", 44);
 
     app.directory()
-        .save_directory_entry(&test_directory_record(&contact, "Cached Contact", 1))
+        .save_directory_entry_for_test(&test_directory_record(&contact, "Cached Contact", 1))
         .unwrap();
     drop(app);
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
@@ -11314,7 +11318,7 @@ fn batch_display_name_lookup_opens_one_directory_cache_per_local_account() {
     let contact = format!("{:064x}", 45);
 
     app.directory()
-        .save_directory_entry(&test_directory_record(&contact, "Batch Contact", 1))
+        .save_directory_entry_for_test(&test_directory_record(&contact, "Batch Contact", 1))
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
@@ -11378,7 +11382,7 @@ fn cached_identity_page_is_order_stable_and_distinguishes_local_from_remote() {
     let malformed = "not-a-public-key".to_owned();
 
     app.directory()
-        .save_directory_entry(&test_directory_record(&remote, "Remote Peer", 1))
+        .save_directory_entry_for_test(&test_directory_record(&remote, "Remote Peer", 1))
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
@@ -11461,7 +11465,7 @@ fn cached_identity_page_acquires_directory_handles_once_for_100_ids() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let remote = format!("{:064x}", 48);
     app.directory()
-        .save_directory_entry(&test_directory_record(&remote, "Bulk Peer", 1))
+        .save_directory_entry_for_test(&test_directory_record(&remote, "Bulk Peer", 1))
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
@@ -23583,7 +23587,9 @@ fn presentation_worker_refreshes_without_screen_subscribers_and_recovers_notific
             created_at: unix_now_seconds() + 1,
             ..Default::default()
         });
-        app.directory().save_directory_entry(&entry).unwrap();
+        app.directory()
+            .save_directory_entry_for_test(&entry)
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let storage_sqlite::ChatPresentationRead::Ready(value) =

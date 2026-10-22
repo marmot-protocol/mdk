@@ -111,7 +111,9 @@ fn profile(app: &MarmotApp, id: &str, name: &str, at: u64) {
         created_at: at,
         ..Default::default()
     });
-    app.directory().save_directory_entry(&record).unwrap();
+    app.directory()
+        .save_directory_entry_for_test(&record)
+        .unwrap();
 }
 
 #[test]

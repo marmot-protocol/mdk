@@ -22,19 +22,19 @@ fn hydration_uses_one_catalog() {
     let local_accounts = app.directory().local_accounts_by_id().unwrap();
     let local = &local_accounts[&alice.account_id_hex];
     assert_eq!(
-        local.directory,
+        *local.directory_for_test(),
         app.directory()
-            .local_account_for_id(&alice.account_id_hex)
+            .local_account_for_id_for_test(&alice.account_id_hex)
             .unwrap()
     );
     assert_eq!(local.label, home.accounts().unwrap().last().unwrap().label);
-    assert_ne!(local.directory.label, local.label);
+    assert_ne!(local.directory_for_test().label, local.label);
     // Notification's existing single-entry reader keeps the first alias.
     assert_eq!(
         app.display_name_from_directory_entry(&alice.account_id_hex, None)
             .unwrap()
             .as_deref(),
-        Some(local.directory.label.as_str())
+        Some(local.directory_for_test().label.as_str())
     );
     let entry = app
         .directory()
@@ -50,7 +50,7 @@ fn hydration_uses_one_catalog() {
         }
         let hydrated = hydrate_directory_record(row, &local_accounts).unwrap();
         if index == 0 {
-            assert_eq!(hydrated.local_account.unwrap(), local.directory);
+            assert_eq!(hydrated.local_account.unwrap(), *local.directory_for_test());
         } else {
             assert!(hydrated.local_account.is_none());
         }

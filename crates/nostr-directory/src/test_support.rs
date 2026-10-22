@@ -16,7 +16,10 @@ use crate::member_key_packages::{
 };
 use crate::observer::DirectoryObserver;
 use crate::published_records::DirectoryFreshness;
-use crate::records::{FetchedFollowList, UserDirectoryRecord, UserProfileMetadata};
+use crate::records::{
+    FetchedFollowList, LocalAccountNames, UserDirectoryLocalAccount, UserDirectoryRecord,
+    UserProfileMetadata,
+};
 use crate::resources::{BlockListSink, DirectoryResources};
 use crate::service::{Directory, DirectoryState};
 use crate::sync::DirectorySyncHandle;
@@ -58,6 +61,12 @@ impl DirectoryCache {
 impl KeyPackageClientPreference {
     pub fn rank_for_test(&self, client: Option<&str>) -> u8 {
         self.rank(client)
+    }
+}
+
+impl LocalAccountNames {
+    pub fn directory_for_test(&self) -> &UserDirectoryLocalAccount {
+        &self.directory
     }
 }
 
@@ -149,12 +158,26 @@ impl<R: DirectoryResources> Directory<R> {
         self.remember_directory_profile_if_newer(account_id_hex, profile)
     }
 
+    pub fn save_directory_entry_for_test(
+        &self,
+        entry: &UserDirectoryRecord,
+    ) -> Result<(), DirectoryError> {
+        self.save_directory_entry(entry)
+    }
+
     pub fn save_directory_entry_with_reason_for_test(
         &self,
         entry: &UserDirectoryRecord,
         reason: &str,
     ) -> Result<(), DirectoryError> {
         self.save_directory_entry_with_reason(entry, reason)
+    }
+
+    pub fn local_account_for_id_for_test(
+        &self,
+        account_id_hex: &str,
+    ) -> Option<UserDirectoryLocalAccount> {
+        self.local_account_for_id(account_id_hex)
     }
 
     pub fn empty_directory_record_for_test(&self, account_id_hex: &str) -> UserDirectoryRecord {

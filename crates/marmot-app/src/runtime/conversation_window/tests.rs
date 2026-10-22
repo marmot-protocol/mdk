@@ -765,7 +765,10 @@ async fn retained_anchor_recovers_after_expiry_and_profile_only_updates_refresh_
         created_at: 42,
         ..Default::default()
     });
-    f.app.directory().save_directory_entry(&record).unwrap();
+    f.app
+        .directory()
+        .save_directory_entry_for_test(&record)
+        .unwrap();
     let refreshed = next(&mut sub).await;
     assert_eq!(
         refreshed.presentation.identities[&"bb".repeat(32)].display_name,
@@ -1859,7 +1862,10 @@ async fn avatar_identity_sidecar_tracks_local_bytes_without_new_timeline_activit
         created_at: 42,
         ..Default::default()
     });
-    f.app.directory().save_directory_entry(&record).unwrap();
+    f.app
+        .directory()
+        .save_directory_entry_for_test(&record)
+        .unwrap();
     let mut sub = f.open(ConversationOpenTarget::Latest, 2).await;
     let asset = sub.snapshot.presentation.identities[&member]
         .avatar_asset

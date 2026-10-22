@@ -50,7 +50,7 @@ pub struct UserDirectoryLocalAccount {
 }
 
 pub struct LocalAccountNames {
-    pub directory: UserDirectoryLocalAccount,
+    pub(crate) directory: UserDirectoryLocalAccount,
     pub label: String,
 }
 

@@ -325,7 +325,10 @@ impl<R: DirectoryResources> Directory<R> {
         Ok(())
     }
 
-    pub fn save_directory_entry(&self, entry: &UserDirectoryRecord) -> Result<(), DirectoryError> {
+    pub(crate) fn save_directory_entry(
+        &self,
+        entry: &UserDirectoryRecord,
+    ) -> Result<(), DirectoryError> {
         self.save_directory_entry_with_reason(entry, "directory")
     }
 
@@ -418,7 +421,10 @@ impl<R: DirectoryResources> Directory<R> {
         )
     }
 
-    pub fn local_account_for_id(&self, account_id_hex: &str) -> Option<UserDirectoryLocalAccount> {
+    pub(crate) fn local_account_for_id(
+        &self,
+        account_id_hex: &str,
+    ) -> Option<UserDirectoryLocalAccount> {
         self.resources
             .local_accounts()
             .ok()?

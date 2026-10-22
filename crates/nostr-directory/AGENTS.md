@@ -53,7 +53,9 @@ The directory of other people's public Nostr data (step 3 of the 2026-10 archite
 - Do not change cache SQL, migration ids, file names, TTLs, timeouts or bounds as part of a move. `cache/v1.sql` and
   `cache/v2.sql` are frozen; schema changes add a numbered migration.
 - The public surface is what `src/lib.rs` re-exports, plus the `config` and `error` modules; every other module is
-  private. Make an item `pub` and re-export it only when another crate's production code names it.
+  private. `Directory`'s lookup, refresh, search and KeyPackage-resolution methods are the app-facing API that
+  replaced `MarmotApp`'s delegates and stay `pub`. Anything else is `pub` only when another crate's production code
+  names it.
 - Tests here use only the directory. A test that needs a real `MarmotApp` or runtime belongs in `marmot-app`'s
   `src/directory_tests/`. What only those tests reach is built only with the `test-support` feature: a method stays
   `pub(crate)` and gets a `_for_test` wrapper in `src/test_support.rs`; a free item is `pub` in its private module and
