@@ -111,8 +111,10 @@ impl Marmot {
     }
 
     /// Sets the account's "Keep media" setting, then removes every retained
-    /// attachment of a message received before the new window, and returns
-    /// how many it removed. They show as `CleanedBySetting` (download again
+    /// attachment older than the new window, and every unfinished automatic
+    /// download past it, and returns how many it removed. Age is the later of
+    /// the message's received time and the user's last explicit download of
+    /// that attachment. They show as `CleanedBySetting` (download again
     /// allowed), and media-store space is freed before this returns.
     /// `Forever` removes nothing. While the runtime runs, the account worker
     /// keeps applying the window as attachments age.

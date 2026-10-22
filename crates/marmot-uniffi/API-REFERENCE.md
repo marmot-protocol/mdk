@@ -815,7 +815,7 @@ pub async fn set_attachment_keep_media( &self, account_ref: String, keep: Attach
 
 Stores the account's "Keep media" setting, then removes every retained attachment already past the new window before returning, and returns how many it removed so the host can confirm what was freed. Age is the message's received time, or the user's last explicit download of that attachment when later. Removed attachments read `CleanedBySetting` in transfer snapshots, distinct from `Removed` (removed by you); `download_attachment_again` works for both. Media-store space is freed before this returns. While the runtime runs, the account worker applies the window at start and hourly as attachments age, and automatic downloads of attachments past it are skipped, or dropped if already queued but unfinished (they count toward the returned number and read `CleanedBySetting` too). `Forever` removes nothing. Ask the user to confirm before shortening the window: Blossom servers may no longer hold old media, so a removed attachment may not download again.
 
-[Source](src/commands/attachment_storage.rs#L119)
+[Source](src/commands/attachment_storage.rs#L121)
 
 </details>
 
