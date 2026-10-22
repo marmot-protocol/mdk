@@ -230,6 +230,8 @@ Each PR keeps behaviour unchanged and ships alone.
      re-exports for free items.
 8. **Tracing targets.** `marmot_app::directory` becomes `nostr_directory::<module>`, as storage-boundaries PR 5 did
    (#2402).
+   - The `marmot-app` events that also used `marmot_app::directory` take their own module's target:
+     `directory_resources`, `user_blocks` and `profile_publication`.
 
 ## Proof that behaviour is unchanged
 

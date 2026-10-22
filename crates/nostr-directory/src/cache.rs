@@ -744,7 +744,7 @@ impl DirectoryCache {
 
 fn record_directory_cache_open() {
     tracing::debug!(
-        target: "marmot_app::directory",
+        target: "nostr_directory::cache",
         method = "directory_cache_open",
         "opening directory cache"
     );

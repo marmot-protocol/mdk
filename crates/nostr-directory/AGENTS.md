@@ -19,8 +19,8 @@ The directory of other people's public Nostr data (step 3 of the 2026-10 archite
   worker spawns adoptions into its bounded set and reconciles into one abort-on-drop task, never inline in its event
   loop, where an account's update lock would park it.
 - **Privacy-safe logs only:** explicit `target` and `method` fields, aggregate counts, never ids, relay URLs, pubkeys
-  or contents (`docs/marmot-architecture/overview/observability.md`). Targets still read `marmot_app::directory`
-  until PR 8 of the brief renames them.
+  or contents (`docs/marmot-architecture/overview/observability.md`). Each target is
+  `nostr_directory::<module>`, the module that emits the event.
 
 ## Code map
 

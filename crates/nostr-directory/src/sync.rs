@@ -337,7 +337,7 @@ pub async fn run_directory_sync_worker<
                 recovery_task = None;
                 if !matches!(recovery_result, Ok(Ok(_))) {
                     tracing::warn!(
-                        target: "marmot_app::directory",
+                        target: "nostr_directory::sync",
                         method = "run_directory_sync_worker",
                         "directory subscription recovery rebuild failed",
                     );
@@ -354,7 +354,7 @@ pub async fn run_directory_sync_worker<
             }, if block_task.is_some() => {
                 block_task = None;
                 if block_result.is_err() {
-                    tracing::warn!(target: "marmot_app::directory", method = "run_directory_sync_worker", "block list reconciliation task failed");
+                    tracing::warn!(target: "nostr_directory::sync", method = "run_directory_sync_worker", "block list reconciliation task failed");
                 }
                 if block_rebuilds.complete() {
                     block_task = Some(BlockListReconcileTask(tokio::spawn(directory.resources.reconcile_block_lists())));
@@ -362,7 +362,7 @@ pub async fn run_directory_sync_worker<
             }
             adoption = block_adoptions.join_next(), if !block_adoptions.is_empty() => {
                 if !matches!(adoption, Some(Ok(Ok(())))) {
-                    tracing::warn!(target: "marmot_app::directory", method = "run_directory_sync_worker", "block list event adoption failed");
+                    tracing::warn!(target: "nostr_directory::sync", method = "run_directory_sync_worker", "block list event adoption failed");
                 }
             }
             event = directory_events.recv() => {

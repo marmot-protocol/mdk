@@ -299,7 +299,7 @@ impl MarmotApp {
             .await
             {
                 tracing::warn!(
-                    target: "marmot_app::directory",
+                    target: "marmot_app::profile_publication",
                     method = "publish_account_follow_list_event",
                     error_kind = error.privacy_safe_kind(),
                     "follow list published but local cache update failed"

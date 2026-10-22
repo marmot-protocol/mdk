@@ -340,7 +340,7 @@ async fn run_search<R: DirectoryResources + DirectoryObserver, F>(
             }
             Err(error) => {
                 tracing::debug!(
-                    target: "marmot_app::directory",
+                    target: "nostr_directory::search",
                     method = "search_cache",
                     error_kind = error.privacy_safe_kind(),
                     "cached search unavailable; continuing network search"
@@ -361,7 +361,7 @@ async fn run_search<R: DirectoryResources + DirectoryObserver, F>(
                 Ok(Ok(seeds)) => graph_params.radius_one_seeds.extend(seeds),
                 Ok(Err(error)) => {
                     tracing::debug!(
-                        target: "marmot_app::directory",
+                        target: "nostr_directory::search",
                         method = "search_group_seeds",
                         error_kind = error.privacy_safe_kind(),
                         "group search seeds unavailable; continuing without them"
@@ -369,7 +369,7 @@ async fn run_search<R: DirectoryResources + DirectoryObserver, F>(
                 }
                 Err(_) => {
                     tracing::debug!(
-                        target: "marmot_app::directory",
+                        target: "nostr_directory::search",
                         method = "search_group_seeds",
                         outcome = "timeout",
                         "group search seeds timed out; continuing without them"
@@ -427,7 +427,7 @@ async fn run_search<R: DirectoryResources + DirectoryObserver, F>(
                         .is_err()
                         {
                             tracing::debug!(
-                                target: "marmot_app::directory",
+                                target: "nostr_directory::search",
                                 method = "search_cache_provider",
                                 outcome = "failed",
                                 "search profile cache write failed"
@@ -436,7 +436,7 @@ async fn run_search<R: DirectoryResources + DirectoryObserver, F>(
                     }
                     Err(_) => {
                         tracing::debug!(
-                            target: "marmot_app::directory",
+                            target: "nostr_directory::search",
                             method = "search_users_open_ranking_hydrate",
                             outcome = "fetch_failed",
                             "Open Ranking profile hydration unavailable"
@@ -504,7 +504,7 @@ where
 }
 
 fn trace_search_stage(stage: &'static str, started: Instant) {
-    tracing::debug!(target: "marmot_app::directory", method = "search_stage",
+    tracing::debug!(target: "nostr_directory::search", method = "search_stage",
         stage, duration_ms = started.elapsed().as_millis() as u64, "user search stage finished");
 }
 
@@ -527,7 +527,7 @@ async fn fetch_open_ranking_pubkeys(
         Ok(ranked_pubkeys) => ranked_pubkeys,
         Err(_) => {
             tracing::debug!(
-                target: "marmot_app::directory",
+                target: "nostr_directory::search",
                 method = "search_users_open_ranking",
                 outcome = "fetch_failed",
                 "Open Ranking user discovery unavailable"
@@ -1424,7 +1424,7 @@ impl SearchEmitter {
     /// query text, per the privacy invariant.
     fn report_tally(&self, params: &UserSearchParams) {
         tracing::debug!(
-            target: "marmot_app::directory",
+            target: "nostr_directory::search",
             method = "search_users",
             radius_start = params.radius_start,
             radius_end = params.radius_end,

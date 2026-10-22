@@ -32,7 +32,7 @@ impl MarmotApp {
         {
             Ok(accounts) => accounts,
             Err(_) => {
-                tracing::warn!(target: "marmot_app::directory", method = "reconcile_block_lists", "block list account enumeration failed");
+                tracing::warn!(target: "marmot_app::user_blocks", method = "reconcile_block_lists", "block list account enumeration failed");
                 return;
             }
         };
@@ -50,7 +50,7 @@ impl MarmotApp {
         })
         .await;
         if failures != 0 {
-            tracing::warn!(target: "marmot_app::directory", method = "reconcile_block_lists", failed_account_count = failures, "block list reconciliation incomplete");
+            tracing::warn!(target: "marmot_app::user_blocks", method = "reconcile_block_lists", failed_account_count = failures, "block list reconciliation incomplete");
         }
     }
 

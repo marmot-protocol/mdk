@@ -187,7 +187,7 @@ pub(crate) fn directory_account(account: &AccountSummary) -> DirectoryAccount {
 impl MarmotApp {
     pub fn warm_directory_storage(&self) -> Result<(), AppError> {
         let _span = tracing::debug_span!(
-            target: "marmot_app::directory",
+            target: "marmot_app::directory_resources",
             "directory_storage_warm",
             method = "warm_directory_storage"
         )
@@ -267,7 +267,7 @@ impl MarmotApp {
         }
         let lifecycle = self.begin_storage_open("directory cache")?;
         let _span = tracing::debug_span!(
-            target: "marmot_app::directory",
+            target: "marmot_app::directory_resources",
             "directory_cache_handle_open",
             method = "directory_cache_for_account"
         )
