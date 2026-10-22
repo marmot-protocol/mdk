@@ -897,7 +897,6 @@ mod tests {
 
     #[test]
     fn commitment_domain_is_the_adopted_33_byte_value() {
-        assert_eq!(CONFORMANCE_COMMITMENT_DOMAIN.len(), 33);
         assert_eq!(
             CONFORMANCE_COMMITMENT_DOMAIN,
             b"marmot-convergence-conformance-v1"

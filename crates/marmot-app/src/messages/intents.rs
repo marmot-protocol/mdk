@@ -1084,7 +1084,6 @@ mod mention_tests {
         let input = format!("{}🦫", "a".repeat(MAX_MARKDOWN_MENTION_SCAN_BYTES - 1));
         let capped = markdown_mention_scan_input(&input);
         assert_eq!(capped, "a".repeat(MAX_MARKDOWN_MENTION_SCAN_BYTES - 1));
-        assert!(capped.is_char_boundary(capped.len()));
     }
 
     #[test]
