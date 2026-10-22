@@ -480,6 +480,12 @@ A fresh process running the current app migrates it to raw presentation again.
 
 ### Validation evidence
 
+Local regressions reserve the database writer to force rekey failure, then
+verify that the retained salt and markers allow recovery. A separate regression
+exits a child process without SQLite cleanup after rekey commits, leaving raw-key
+WAL frames over the old-key main file; reopening preserves both committed rows
+and passes `integrity_check`. Neither test simulates a power failure.
+
 On 2026-10-22, a disposable Rust harness on an AMD Ryzen AI MAX+ 395 ran
 the dev-profile app and storage APIs against a newly created, current-schema
 account database. It derived the same session HKDF bytes for both presentations,

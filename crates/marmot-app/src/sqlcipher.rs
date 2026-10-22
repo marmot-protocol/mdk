@@ -1515,6 +1515,131 @@ mod tests {
     }
 
     #[test]
+    fn failed_rekey_keeps_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        app.account_home().create_account("alice").unwrap();
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let path = dir.path().join("locked.sqlite");
+        let kind = SqlcipherDatabaseKind::Session;
+        let legacy =
+            SqlCipherKey::new(legacy_sqlcipher_key_material("alice", &keys, kind)).unwrap();
+        let blocker = Connection::open(&path).unwrap();
+        open_hardened_sqlcipher(&blocker, &legacy, SqlCipherHardening::cipher_only()).unwrap();
+        blocker
+            .execute_batch(
+                "CREATE TABLE marker (value TEXT NOT NULL);
+             INSERT INTO marker VALUES ('kept');
+             BEGIN IMMEDIATE;",
+            )
+            .unwrap();
+
+        assert!(app.sqlcipher_key("alice", &keys, &path, kind).is_err());
+        let salt = read_sqlcipher_salt(&sqlcipher_salt_path(&path)).unwrap();
+        assert!(sqlcipher_migration_marker_path(&path).exists());
+        assert!(sqlcipher_raw_marker_path(&path).exists());
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+
+        let recovered = app.sqlcipher_key("alice", &keys, &path, kind).unwrap();
+        assert_eq!(
+            read_sqlcipher_salt(&sqlcipher_salt_path(&path)).unwrap(),
+            salt
+        );
+        assert!(!sqlcipher_migration_marker_path(&path).exists());
+        assert!(!sqlcipher_raw_marker_path(&path).exists());
+        let conn = Connection::open(&path).unwrap();
+        open_hardened_sqlcipher(&conn, &recovered, SqlCipherHardening::cipher_only()).unwrap();
+        let value: String = conn
+            .query_row("SELECT value FROM marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "kept");
+    }
+
+    #[test]
+    fn raw_rekey_wal_crash_recovers() {
+        const CRASH_ROOT: &str = "MDK_SQLCIPHER_WAL_CRASH_ROOT";
+        let kind = SqlcipherDatabaseKind::Session;
+        if let Some(root) = std::env::var_os(CRASH_ROOT) {
+            let root = PathBuf::from(root);
+            let path = root.join("crashed.sqlite");
+            let home = AccountHome::open(&root);
+            let keys = home.load_signing_keys("alice").unwrap();
+            let salt = read_sqlcipher_salt(&sqlcipher_salt_path(&path)).unwrap();
+            let material = derive_sqlcipher_key_material("alice", &keys, &salt, kind).unwrap();
+            let old_key = SqlCipherKey::new(hex::encode(&material)).unwrap();
+            let conn = Connection::open(&path).unwrap();
+            open_hardened_sqlcipher(&conn, &old_key, SqlCipherHardening::cipher_only()).unwrap();
+            conn.execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+                 PRAGMA synchronous=FULL;
+                 INSERT INTO marker VALUES ('wal-committed');",
+            )
+            .unwrap();
+            write_private_new(&sqlcipher_raw_marker_path(&path), SQLCIPHER_RAW_MARKER_V1).unwrap();
+            sync_sqlcipher_directory(&path).unwrap();
+            conn.pragma_update(None, "rekey", SqlCipherKey::raw(*material).as_secret_str())
+                .unwrap();
+            // Skip SQLite's close-time checkpoint, leaving committed raw-key WAL
+            // frames over the old-key main file, as after process death.
+            std::process::exit(0);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        app.account_home().create_account("alice").unwrap();
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let path = dir.path().join("crashed.sqlite");
+        let salt = [0x5a; SQLCIPHER_SALT_LEN];
+        write_sqlcipher_salt(&sqlcipher_salt_path(&path), &salt).unwrap();
+        let material = derive_sqlcipher_key_material("alice", &keys, &salt, kind).unwrap();
+        let old_key = SqlCipherKey::new(hex::encode(&material)).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            open_hardened_sqlcipher(&conn, &old_key, SqlCipherHardening::cipher_only()).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE marker (value TEXT NOT NULL);
+                 INSERT INTO marker VALUES ('kept');",
+            )
+            .unwrap();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sqlcipher::tests::raw_rekey_wal_crash_recovers",
+                "--nocapture",
+            ])
+            .env(CRASH_ROOT, dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(path.with_file_name("crashed.sqlite-wal").exists());
+        assert!(sqlcipher_raw_marker_path(&path).exists());
+
+        let recovered = app.sqlcipher_key("alice", &keys, &path, kind).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        open_hardened_sqlcipher(&conn, &recovered, SqlCipherHardening::cipher_only()).unwrap();
+        let values: String = conn
+            .query_row(
+                "SELECT group_concat(value, ',') FROM (SELECT value FROM marker ORDER BY rowid)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(values, "kept,wal-committed");
+        let integrity: String = conn
+            .pragma_query_value(None, "integrity_check", |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert!(!sqlcipher_raw_marker_path(&path).exists());
+    }
+
+    #[test]
     fn external_raw_rekey_recovers() {
         for crash_window in 0..3 {
             let dir = tempfile::tempdir().unwrap();
