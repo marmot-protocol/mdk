@@ -1343,7 +1343,7 @@ fn automatic_demand_skips_attachments_past_the_window() {
                 .unwrap(),
             AttachmentDemand::Requested(_)
         ),
-        "an existing acquisition is left to the sweep"
+        "an existing acquisition is left to the sweep, which cleans it"
     );
 
     let older = sized(3_000, 28);
@@ -1396,5 +1396,52 @@ fn explicit_remove_relabels_a_cleaned_slot() {
         fixture.reason(GROUP, &message),
         Some(0),
         "still removed by you"
+    );
+}
+
+/// An automatic download queued before the window reached it (the setting
+/// changed, or it aged while offline) is cleaned by the sweep before it
+/// fetches; an explicitly requested one is kept.
+#[test]
+fn the_sweep_cleans_queued_automatic_downloads_but_not_explicit_ones() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let now = 100 * DAY;
+    let automatic = sized(3_000, 30);
+    let automatic_entry = fixture.recorded(&"5".repeat(64), &automatic, 0);
+    let AttachmentDemand::Requested(queued) = app
+        .request_automatic_acquisition(GROUP, &automatic_entry, digest(&automatic), 0)
+        .unwrap()
+    else {
+        panic!("requested under Forever");
+    };
+    let explicit = sized(3_000, 31);
+    let explicit_entry = fixture.recorded(&"6".repeat(64), &explicit, 0);
+    let AttachmentDemand::Requested(requested) = app
+        .request_explicit_attachment(GROUP, &explicit_entry, digest(&explicit), now)
+        .unwrap()
+    else {
+        panic!("explicit request");
+    };
+
+    app.set_attachment_keep_media(AttachmentKeepMedia::ThirtyDays)
+        .unwrap();
+    let removal = app.clean_attachments_past_keep_window(now).unwrap();
+    assert_eq!((removal.removed, removal.released_files.len()), (1, 0));
+    assert!(
+        app.claim_attachment_acquisition(&queued, now, now + LEASE)
+            .unwrap()
+            .is_none(),
+        "the queued automatic job is gone"
+    );
+    assert_eq!(
+        fixture.status(GROUP, &"5".repeat(64)),
+        AttachmentTransferState::CleanedBySetting
+    );
+    assert!(
+        app.claim_attachment_acquisition(&requested, now, now + LEASE)
+            .unwrap()
+            .is_some(),
+        "the explicit request still downloads"
     );
 }

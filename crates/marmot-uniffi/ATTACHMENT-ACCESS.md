@@ -169,7 +169,7 @@ account database.
   applies it when it starts and hourly. Age is the message's received time, or the user's last
   explicit download of that attachment when later, so something the user downloads again is
   kept for the whole window from then. Automatic downloads skip attachments already past the
-  window. Removed attachments show as `CleanedBySetting`, not `Removed`: say the setting cleaned
+  window, and unfinished automatic downloads that fall past it are dropped. Removed attachments show as `CleanedBySetting`, not `Removed`: say the setting cleaned
   them, and offer download-again as for a removal. Confirm before shortening the window, since
   servers may no longer hold old media. The setting is per device and is not synced.
 - **When space returns.** Media-store files a removal releases are deleted before the call
@@ -325,7 +325,7 @@ cancellation, retry deadlines, progress, budgets and their opaque reference.
 | RetryExhausted | The durable acquisition or network budget is spent; no automatic retry. |
 | StorageBlocked | Free disk cannot cover the publication reserve for this body, or the database reported it was full while publishing. Checkpointed ciphertext is kept; the worker readmits the job once free space covers its recorded target (the reserve, the body and the staging a retry needs) by a 4 MiB margin, and Retry readmits it at once. A readmitted job that had parked more than once shows `Queued` with a future due time (15 s doubling to an hour). Render a storage prompt, not a retry timer. |
 | Failed / Cancelled / Removed | Preserves terminal state or suppression. |
-| CleanedBySetting | The "Keep media" setting removed the body, or the message was already past its window and was never fetched. No automatic reacquisition; download-again is allowed, as for `Removed`. |
+| CleanedBySetting | The "Keep media" setting removed the body, or the message was past its window before an automatic download fetched it. No automatic reacquisition; download-again is allowed, as for `Removed`. |
 | Unavailable | Source is obsolete, hidden, expired, rejected or otherwise unusable. |
 
 For host-managed demand, the lifetime budget is **four acquisition attempts and

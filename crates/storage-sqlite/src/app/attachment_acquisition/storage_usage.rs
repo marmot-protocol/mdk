@@ -118,7 +118,7 @@ pub struct AttachmentRemoval {
 pub const ATTACHMENT_REMOVAL_BATCH: usize = 64;
 
 /// SQL for "`q` is a retained attachment at `now` (parameter `now_param`)".
-fn retained(now_param: &str) -> String {
+pub(super) fn retained(now_param: &str) -> String {
     format!(
         "q.state=3 AND {RETAINED_BODY} AND {SOURCE_MATCH}
          AND (q.expires_at IS NULL OR q.expires_at>{now_param})"
@@ -388,30 +388,33 @@ impl SqliteAppStorage {
         // A bound past SQLite's integer range is later than every stored
         // received time, so it filters nothing.
         let before = received_before.and_then(|before| i64::try_from(before).ok());
-        self.remove_retained_batch(
+        self.remove_batch(
             now,
-            "(?2 IS NULL OR q.group_id_hex=?2)
+            &format!(
+                "{} AND (?2 IS NULL OR q.group_id_hex=?2)
              AND (?3 IS NULL OR EXISTS(SELECT 1 FROM attachment_history h
                  WHERE h.group_id_hex=q.group_id_hex
                    AND h.message_id_hex=q.message_id_hex
                    AND h.attachment_index=q.attachment_index
                    AND h.received_at<?3))",
+                retained("?1")
+            ),
             params![group, before],
             RemovalReason::ByYou,
         )
     }
 
-    /// One bounded removal transaction over the retained attachments that
-    /// also match `filter` (SQL on `q`, `now` is `?1`, `filter_params` start
-    /// at `?2`).
-    pub(super) fn remove_retained_batch(
+    /// One bounded removal transaction over the acquisitions matching
+    /// `selection` (SQL on `q`, `now` is `?1`, `selection_params` start at
+    /// `?2`).
+    pub(super) fn remove_batch(
         &self,
         now: u64,
-        filter: &str,
-        filter_params: &[&dyn rusqlite::ToSql],
+        selection: &str,
+        selection_params: &[&dyn rusqlite::ToSql],
         reason: RemovalReason,
     ) -> StorageResult<AttachmentRemoval> {
-        let limit_param = filter_params.len() + 2;
+        let limit_param = selection_params.len() + 2;
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let slots = {
@@ -419,16 +422,15 @@ impl SqliteAppStorage {
                     .prepare(&format!(
                         "SELECT q.group_id_hex,q.message_id_hex,q.attachment_index
                          FROM attachment_acquisition q
-                         WHERE {} AND {filter}
+                         WHERE {selection}
                          ORDER BY q.group_id_hex,q.message_id_hex,q.attachment_index
-                         LIMIT ?{limit_param}",
-                        retained("?1")
+                         LIMIT ?{limit_param}"
                     ))
                     .storage()?;
                 let now = u64_to_i64(now)?;
                 let limit = (ATTACHMENT_REMOVAL_BATCH + 1) as i64;
                 let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&now];
-                bound.extend_from_slice(filter_params);
+                bound.extend_from_slice(selection_params);
                 bound.push(&limit);
                 stmt.query_map(bound.as_slice(), |r| {
                     Ok((

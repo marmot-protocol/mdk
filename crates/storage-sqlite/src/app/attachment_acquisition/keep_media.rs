@@ -144,20 +144,26 @@ impl SqliteAppStorage {
         })
     }
 
-    /// Removes up to [`ATTACHMENT_REMOVAL_BATCH`] retained attachments past
-    /// the "Keep media" window, as explicit `Remove` does but recorded as
-    /// cleaned by the setting, in one transaction. Nothing under Forever.
+    /// Removes up to [`ATTACHMENT_REMOVAL_BATCH`] attachments past the "Keep
+    /// media" window, as explicit `Remove` does but recorded as cleaned by
+    /// the setting, in one transaction: retained ones, and unfinished
+    /// automatic downloads the user never requested. Nothing under Forever.
     /// Unlink the returned files, then call again while `more`.
     pub fn clean_attachments_past_keep_window(&self, now: u64) -> StorageResult<AttachmentRemoval> {
         if self.attachment_keep_media()? == AttachmentKeepMedia::Forever {
             return Ok(AttachmentRemoval::default());
         }
+        // Retained attachments, and automatic downloads the user never asked
+        // for that have not finished: those were demanded before the window
+        // reached them, and would otherwise fetch a body only to remove it.
         // The window is read again inside the removal transaction, so a
         // concurrent change to Forever removes nothing more.
-        self.remove_retained_batch(
+        self.remove_batch(
             now,
             &format!(
-                "{AGE}<?1-(SELECT keep_days FROM attachment_keep_media WHERE id=1)*{DAY_SECONDS}"
+                "({} OR (q.state<>3 AND q.explicit_request=0 AND q.keep_from IS NULL))
+                 AND {AGE}<?1-(SELECT keep_days FROM attachment_keep_media WHERE id=1)*{DAY_SECONDS}",
+                super::storage_usage::retained("?1")
             ),
             &[],
             RemovalReason::BySetting,

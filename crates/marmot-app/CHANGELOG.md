@@ -135,7 +135,8 @@
   hourly, for at most 250 ms per maintenance tick, ahead of the legacy body
   move. Removed attachments read `CleanedBySetting` and can be downloaded
   again, which keeps them for the whole window from that request. Automatic
-  downloads skip attachments already past the window. Forever removes nothing.
+  downloads skip attachments already past the window, and the sweep drops
+  unfinished automatic downloads that fell past it. Forever removes nothing.
 
 - The account database returns freed space to the filesystem (mdk#2314 step
   6). Once a quarter of it is free pages, the volume has room for two copies

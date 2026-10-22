@@ -209,8 +209,9 @@ impl MarmotAppRuntime {
     }
 
     /// Sets the account's "Keep media" setting, then removes every retained
-    /// attachment already past the new window before returning, as the
-    /// account worker's sweep does: recorded as cleaned by the setting
+    /// attachment already past the new window, and every unfinished automatic
+    /// download past it, before returning, as the account worker's sweep
+    /// does: recorded as cleaned by the setting
     /// (download again allowed), media-store space freed at once. Returns how
     /// many it removed; Forever removes nothing. Afterwards the account
     /// worker keeps applying the window as attachments age.

@@ -3643,7 +3643,7 @@ Blocking read of the account's "Keep media" setting, written to `out_keep` as a 
 MarmotStatus marmot_set_attachment_keep_media(const struct MarmotClient *client, const char *account_ref, uint32_t keep, uint64_t *out_removed);
 ```
 
-Blocking: stores the setting (`keep` is a `MarmotAttachmentKeepMedia` discriminant; out of range is `MARMOT_STATUS_INVALID_ARGUMENT` before any work), then removes every retained attachment already past the new window and writes the count to `out_removed`. Removed attachments read `CleanedBySetting`. Media-store space is freed before this returns.
+Blocking: stores the setting (`keep` is a `MarmotAttachmentKeepMedia` discriminant; out of range is `MARMOT_STATUS_INVALID_ARGUMENT` before any work), then removes every retained attachment already past the new window, and drops unfinished automatic downloads past it, writing the count to `out_removed`. Removed attachments read `CleanedBySetting`. Media-store space is freed before this returns.
 
 [Header contract](include/marmot.h#L6407)
 

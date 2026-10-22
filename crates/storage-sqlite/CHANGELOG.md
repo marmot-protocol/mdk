@@ -102,8 +102,9 @@
   `AttachmentKeepMedia` (Forever by default, one year, six months, 30 days),
   `attachment_keep_media` / `set_attachment_keep_media`, and
   `clean_attachments_past_keep_window`, a bounded batch that removes retained
-  attachments past the window as explicit `Remove` does but records them as
-  cleaned by the setting. Age is the later of the message's received time and
+  attachments past the window, and unfinished automatic downloads the user
+  never requested, as explicit `Remove` does but records them as cleaned by
+  the setting. Age is the later of the message's received time and
   the last explicit request for the body (`keep_from`, set by explicit
   requests, retries and download-again). `request_automatic_acquisition` is
   `request_attachment_acquisition` for automatic demand: a slot already past
