@@ -56,7 +56,7 @@ async fn client_preference_ranks_only_valid_current_slots_and_preserves_recency(
                     endpoints: vec![],
                 })
                 .collect::<Vec<_>>(),
-            app.directory_freshness(),
+            app.directory().directory_freshness(),
             None,
             &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
@@ -158,7 +158,7 @@ async fn malformed_replacement_suppresses_older_package_in_the_same_slot() {
                     endpoints: vec![],
                 })
                 .collect::<Vec<_>>(),
-            app.directory_freshness(),
+            app.directory().directory_freshness(),
             None,
             &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
@@ -235,7 +235,11 @@ async fn client_preference_is_used_in_batch_and_single_author_fallback() {
             .iter()
             .map(|a| a.account_id_hex.as_str())
             .collect::<Vec<_>>();
-        let actual = app.resolve_member_key_packages(&refs).await.unwrap();
+        let actual = app
+            .directory()
+            .resolve_member_key_packages(&refs)
+            .await
+            .unwrap();
         let single_author_lookups = fetcher
             .requests
             .lock()
@@ -276,7 +280,10 @@ async fn failed_preference_refetch_preserves_only_usable_current_batch_packages(
             .collect::<Vec<_>>();
         // Ready prewarm reuses the batched existence answer, even for untagged
         // packages; it must not trigger per-author preference queries.
-        app.prewarm_group_member_key_packages(&refs).await.unwrap();
+        app.directory()
+            .prewarm_group_member_key_packages(&refs)
+            .await
+            .unwrap();
         assert!(!fetcher.requests.lock().unwrap().iter().any(|request| {
             request
                 .queries
@@ -424,7 +431,11 @@ async fn per_author_refetch_preserves_slot_replacements_seen_in_batch() {
         .iter()
         .map(|a| a.account_id_hex.as_str())
         .collect::<Vec<_>>();
-    let actual = app.resolve_member_key_packages(&refs).await.unwrap();
+    let actual = app
+        .directory()
+        .resolve_member_key_packages(&refs)
+        .await
+        .unwrap();
     assert_eq!(
         actual
             .iter()
@@ -637,23 +648,25 @@ async fn legacy_only_fixture() -> (
 async fn completed_legacy_only_lookup_reports_obsolete_only() {
     let (_dir, app, account, _fetcher) = legacy_only_fixture().await;
     let error = app
+        .directory()
         .resolve_member_key_packages(&[account.account_id_hex.as_str()])
         .await
         .unwrap_err();
     assert!(
-        matches!(&error, AppError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::ObsoleteOnly } if *id == account.account_id_hex),
+        matches!(&error, DirectoryError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::ObsoleteOnly } if *id == account.account_id_hex),
         "unexpected invite diagnosis: {error:?}"
     );
     assert!(!error.to_string().contains(&account.account_id_hex));
 
     let error = app
+        .directory()
         .fetch_latest_key_package_for_account_id(&account.account_id_hex, Vec::new())
         .await
         .unwrap_err();
     assert!(
         matches!(
             error,
-            AppError::MissingKeyPackage {
+            DirectoryError::MissingKeyPackage {
                 reason: crate::MissingKeyPackageReason::ObsoleteOnly,
                 ..
             }
@@ -668,11 +681,12 @@ async fn incomplete_legacy_only_lookup_claims_neither_absence_nor_obsolescence()
     *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://shared.example".into());
     *fetcher.incomplete_query_kind.lock().unwrap() = Some(KIND_MARMOT_KEY_PACKAGE);
     let error = app
+        .directory()
         .resolve_member_key_packages(&[account.account_id_hex.as_str()])
         .await
         .unwrap_err();
     assert!(
-        matches!(&error, AppError::DirectoryLookupIncomplete(id) if *id == account.account_id_hex),
+        matches!(&error, DirectoryError::DirectoryLookupIncomplete(id) if *id == account.account_id_hex),
         "an incomplete search stays retryable: {error:?}"
     );
 }
@@ -708,7 +722,7 @@ async fn legacy_slots_never_select_or_mask_current_slots() {
         preferred_fresh_key_package_from_records(
             &account.account_id_hex,
             &records,
-            app.directory_freshness(),
+            app.directory().directory_freshness(),
             None,
             &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )

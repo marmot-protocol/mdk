@@ -4,7 +4,9 @@ use std::net::SocketAddr;
 
 use cgka_traits::error::EngineError;
 use marmot_account::AccountHomeError;
-use marmot_app::{AccountRelayListStatus, AppError, MissingKeyPackageReason, MissingRelayListKind};
+use marmot_app::{
+    AccountRelayListStatus, AppError, DirectoryError, MissingKeyPackageReason, MissingRelayListKind,
+};
 use serde_json::{Value, json};
 
 use crate::relay_lists_json;
@@ -191,6 +193,14 @@ pub(crate) enum WnError {
     },
     #[error("user search did not complete: {0}")]
     UserSearch(String),
+}
+
+/// Directory failures render as the `AppError` they convert to, so `--json`
+/// codes stay the same whichever layer reported them.
+impl From<DirectoryError> for WnError {
+    fn from(error: DirectoryError) -> Self {
+        Self::App(error.into())
+    }
 }
 
 pub(crate) fn wn_error_json(err: &WnError) -> Value {

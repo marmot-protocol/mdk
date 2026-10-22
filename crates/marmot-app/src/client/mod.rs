@@ -1737,9 +1737,11 @@ impl AppClient {
         &self,
         member_refs: &[&str],
     ) -> Result<crate::MemberKeyPackagePrewarmSummary, AppError> {
-        self.app
+        Ok(self
+            .app
+            .directory()
             .prewarm_group_member_key_packages(member_refs)
-            .await
+            .await?)
     }
 
     /// Validate and encrypt a founding image, then durably stage its exact

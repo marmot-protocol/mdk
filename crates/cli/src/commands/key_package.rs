@@ -153,6 +153,7 @@ pub(crate) async fn key_package_command_with_runtime(
         } => {
             let account_id = account_selector_or_default(account_home, account, account_flag)?;
             let fetched = app
+                .directory()
                 .fetch_latest_key_package_for_account_id(
                     &account_id,
                     relay_endpoints(bootstrap_relays)?,
@@ -175,6 +176,7 @@ pub(crate) async fn key_package_command_with_runtime(
         KeyPackageCommand::Check { pubkey } => {
             let account_id = parse_public_key(&pubkey)?;
             let fetched = app
+                .directory()
                 .fetch_latest_key_package_for_account_id(&account_id, Vec::new())
                 .await?;
             Ok(CommandOutput {

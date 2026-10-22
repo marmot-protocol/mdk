@@ -365,14 +365,16 @@ async fn connector_profile_publish_rejects_hostile_optional_fields_without_publi
     }
 
     // A rejected publish must not leave a half-written profile on the relay.
-    app.refresh_profile_for_account_id(
-        &account.account_id_hex,
-        vec![crate::validation::endpoint(&relay_url)],
-    )
-    .await
-    .unwrap();
+    app.directory()
+        .refresh_profile_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&relay_url)],
+        )
+        .await
+        .unwrap();
     assert!(
-        app.directory_entry_for_account_id(&account.account_id_hex)
+        app.directory()
+            .directory_entry_for_account_id(&account.account_id_hex)
             .unwrap()
             .and_then(|entry| entry.profile)
             .is_none(),
@@ -3339,6 +3341,7 @@ async fn connector_socket_publishes_key_package() {
     assert_eq!(account_id_hex, account.account_id_hex);
     assert!(key_package_bytes > 0);
     let fetched = app
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &account.account_id_hex,
             vec![crate::validation::endpoint(&relay_url)],
@@ -3405,13 +3408,15 @@ async fn connector_socket_publishes_profile_metadata() {
     assert_eq!(name, "Hermes Agent");
     assert_eq!(display_name.as_deref(), Some("Hermes Agent"));
 
-    app.refresh_profile_for_account_id(
-        &account.account_id_hex,
-        vec![crate::validation::endpoint(&relay_url)],
-    )
-    .await
-    .unwrap();
+    app.directory()
+        .refresh_profile_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&relay_url)],
+        )
+        .await
+        .unwrap();
     let profile = app
+        .directory()
         .directory_entry_for_account_id(&account.account_id_hex)
         .unwrap()
         .and_then(|entry| entry.profile)
@@ -3466,13 +3471,15 @@ async fn connector_profile_publish_preserves_fields_the_request_did_not_name() {
         .await
         .unwrap();
 
-    app.refresh_profile_for_account_id(
-        &account.account_id_hex,
-        vec![crate::validation::endpoint(&relay_url)],
-    )
-    .await
-    .unwrap();
+    app.directory()
+        .refresh_profile_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&relay_url)],
+        )
+        .await
+        .unwrap();
     let profile = app
+        .directory()
         .directory_entry_for_account_id(&account.account_id_hex)
         .unwrap()
         .and_then(|entry| entry.profile)
@@ -3524,11 +3531,13 @@ async fn connector_profile_publish_falls_back_to_the_cached_profile_when_the_rea
     .unwrap();
     // The published profile reaches the local cache the way it does on a real
     // device: a directory refresh remembers what the relay holds.
-    app.refresh_profile_for_account_id(&account.account_id_hex, vec![published_endpoint.clone()])
+    app.directory()
+        .refresh_profile_for_account_id(&account.account_id_hex, vec![published_endpoint.clone()])
         .await
         .unwrap();
     assert_eq!(
-        app.directory_entry_for_account_id(&account.account_id_hex)
+        app.directory()
+            .directory_entry_for_account_id(&account.account_id_hex)
             .unwrap()
             .and_then(|entry| entry.profile)
             .and_then(|profile| profile.about),
@@ -3558,13 +3567,15 @@ async fn connector_profile_publish_falls_back_to_the_cached_profile_when_the_rea
         .await
         .unwrap();
 
-    app.refresh_profile_for_account_id(
-        &account.account_id_hex,
-        vec![crate::validation::endpoint(&read_url)],
-    )
-    .await
-    .unwrap();
+    app.directory()
+        .refresh_profile_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&read_url)],
+        )
+        .await
+        .unwrap();
     let profile = app
+        .directory()
         .directory_entry_for_account_id(&account.account_id_hex)
         .unwrap()
         .and_then(|entry| entry.profile)
@@ -3637,10 +3648,12 @@ async fn connector_profile_publish_prefers_the_newer_cached_profile_over_a_laggi
     .unwrap();
     // The newer edit reaches the cache the way it does on a real device: a
     // directory refresh remembers what the current relay holds.
-    app.refresh_profile_for_account_id(&account.account_id_hex, vec![current_endpoint.clone()])
+    app.directory()
+        .refresh_profile_for_account_id(&account.account_id_hex, vec![current_endpoint.clone()])
         .await
         .unwrap();
     let cached = app
+        .directory()
         .directory_entry_for_account_id(&account.account_id_hex)
         .unwrap()
         .and_then(|entry| entry.profile)
@@ -3655,6 +3668,7 @@ async fn connector_profile_publish_prefers_the_newer_cached_profile_over_a_laggi
     // Pin the premise: the copy this publish reads is the older one, and the
     // cache is not older than it.
     let read_copy = app
+        .directory()
         .fetch_current_user_profile_for_account_id(
             &account.account_id_hex,
             vec![lagging_endpoint.clone()],
@@ -3693,6 +3707,7 @@ async fn connector_profile_publish_prefers_the_newer_cached_profile_over_a_laggi
 
     // Read what the lagging relay now holds, straight from the relay.
     let published = app
+        .directory()
         .fetch_current_user_profile_for_account_id(
             &account.account_id_hex,
             vec![lagging_endpoint.clone()],
@@ -3812,6 +3827,7 @@ async fn connector_start_publishes_key_package_for_existing_local_account() {
     connector.start().await.unwrap();
 
     let fetched = app
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &account.account_id_hex,
             vec![crate::validation::endpoint(&relay_url)],
@@ -8085,6 +8101,7 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
     let published = timeout(Duration::from_secs(15), async {
         loop {
             let status = app
+                .directory()
                 .fetch_current_account_relay_list_status_for_account_id(
                     &account.account_id_hex,
                     publication_route.clone(),
@@ -8133,6 +8150,7 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
     // The relay being adopted must actually receive the event that names it: it
     // is not in the account's pre-edit outbox, so the route has to include it.
     let added_copy = app
+        .directory()
         .fetch_current_account_relay_list_status_for_account_id(
             &account.account_id_hex,
             vec![crate::validation::endpoint(&added_url)],
@@ -8164,6 +8182,7 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
         .await
         .unwrap();
     let published = app
+        .directory()
         .fetch_current_account_relay_list_status_for_account_id(
             &account.account_id_hex,
             publication_route,
@@ -8409,6 +8428,7 @@ async fn connector_relay_list_edit_starts_from_the_newer_cached_list() {
     // Pin the premise: the read this publish makes returns the pre-edit copy,
     // and the cache is not older than it.
     let read_copy = app
+        .directory()
         .fetch_current_account_relay_list_status_for_account_id(
             &account.account_id_hex,
             vec![lagging_endpoint.clone()],
@@ -8440,6 +8460,7 @@ async fn connector_relay_list_edit_starts_from_the_newer_cached_list() {
     // What the lagging relay now holds is the newer list plus the edit, not the
     // pre-edit entries that same relay was still serving.
     let published = app
+        .directory()
         .fetch_current_account_relay_list_status_for_account_id(
             &account.account_id_hex,
             vec![lagging_endpoint.clone()],

@@ -1134,7 +1134,7 @@ fn fetch_remote_follow_list(home: &std::path::Path, account_id: &str, relay: &st
     let app = MarmotApp::with_relay(home, relay.to_owned());
     let runtime = tokio::runtime::Runtime::new().expect("test runtime");
     runtime
-        .block_on(app.fetch_current_follow_list_for_account_id(
+        .block_on(app.directory().fetch_current_follow_list_for_account_id(
             account_id,
             vec![TransportEndpoint(relay.to_owned())],
         ))
@@ -1151,11 +1151,14 @@ fn fetch_remote_relay_status(
     let app = MarmotApp::with_relay(home, relay.to_owned());
     let runtime = tokio::runtime::Runtime::new().expect("test runtime");
     runtime
-        .block_on(app.fetch_current_account_relay_list_status_for_account_id(
-            account_id,
-            vec![TransportEndpoint(relay.to_owned())],
-            Some(relay_type),
-        ))
+        .block_on(
+            app.directory()
+                .fetch_current_account_relay_list_status_for_account_id(
+                    account_id,
+                    vec![TransportEndpoint(relay.to_owned())],
+                    Some(relay_type),
+                ),
+        )
         .expect("fetch relay status")
         .expect("current relay status")
 }
@@ -1168,7 +1171,7 @@ fn fetch_remote_profile(
     let app = MarmotApp::with_relay(home, relay.to_owned());
     let runtime = tokio::runtime::Runtime::new().expect("test runtime");
     runtime
-        .block_on(app.fetch_current_user_profile_for_account_id(
+        .block_on(app.directory().fetch_current_user_profile_for_account_id(
             account_id,
             vec![TransportEndpoint(relay.to_owned())],
         ))

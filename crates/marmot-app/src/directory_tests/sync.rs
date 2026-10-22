@@ -106,6 +106,7 @@ async fn blocked_account_lock_does_not_stall_directory_drain_or_rebuild_completi
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if app
+                .directory()
                 .directory_entry(&remote.public_key().to_hex())
                 .unwrap()
                 .is_some_and(|entry| entry.profile.is_some())

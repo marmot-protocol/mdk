@@ -76,6 +76,7 @@ impl AgentConnector {
         // configuration is not "nothing to read" (the trap the profile publish
         // had to fix). A read that returns nothing is unconfirmed, not empty.
         self.app
+            .directory()
             .fetch_current_account_relay_list_status_for_account_id(
                 &account.account_id_hex,
                 source_relays,

@@ -2176,7 +2176,9 @@ fn notification_user(app: &MarmotApp, account_id_hex: &str) -> Result<Notificati
     // picture from it, instead of calling `directory_entry_for_account_id` here
     // and again inside `display_name_for_account_id` (each re-opens the directory
     // caches and fans across every account's SQLCipher cache).
-    let entry = app.directory_entry_for_account_id(account_id_hex)?;
+    let entry = app
+        .directory()
+        .directory_entry_for_account_id(account_id_hex)?;
     let display_name = app.display_name_from_directory_entry(account_id_hex, entry.as_ref())?;
     Ok(NotificationUser {
         account_id_hex: account_id_hex.to_owned(),

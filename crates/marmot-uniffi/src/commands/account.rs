@@ -812,6 +812,7 @@ mod tests {
         assert_eq!(created.readiness, AccountSetupReadinessFfi::LocalReady);
         let cached = kit
             .app
+            .directory()
             .directory_entry_for_account_id(&created.account.account_id_hex)
             .expect("read cached profile")
             .and_then(|entry| entry.profile)
@@ -862,6 +863,7 @@ mod tests {
         assert_eq!(created.profile.about.as_deref(), Some("first profile"));
         let cached = kit
             .app
+            .directory()
             .directory_entry_for_account_id(&created.account.account_id_hex)
             .expect("read cached profile")
             .and_then(|entry| entry.profile)

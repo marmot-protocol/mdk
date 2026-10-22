@@ -19,11 +19,13 @@ fn hydration_uses_one_catalog() {
         &serde_json::to_vec(&alias).unwrap(),
     )
     .unwrap();
-    let local_accounts = app.local_accounts_by_id().unwrap();
+    let local_accounts = app.directory().local_accounts_by_id().unwrap();
     let local = &local_accounts[&alice.account_id_hex];
     assert_eq!(
         local.directory,
-        app.local_account_for_id(&alice.account_id_hex).unwrap()
+        app.directory()
+            .local_account_for_id(&alice.account_id_hex)
+            .unwrap()
     );
     assert_eq!(local.label, home.accounts().unwrap().last().unwrap().label);
     assert_ne!(local.directory.label, local.label);
@@ -34,7 +36,9 @@ fn hydration_uses_one_catalog() {
             .as_deref(),
         Some(local.directory.label.as_str())
     );
-    let entry = app.empty_directory_record(&alice.account_id_hex);
+    let entry = app
+        .directory()
+        .empty_directory_record(&alice.account_id_hex);
     for label in ["alice", "z-alias"] {
         fs_private::write_private(&home.account_dir(label).join("account.json"), b"broken")
             .unwrap();
@@ -51,5 +55,5 @@ fn hydration_uses_one_catalog() {
             assert!(hydrated.local_account.is_none());
         }
     }
-    assert!(app.local_accounts_by_id().unwrap().is_empty());
+    assert!(app.directory().local_accounts_by_id().unwrap().is_empty());
 }

@@ -1570,8 +1570,8 @@ impl AccountManager {
                 // Cache even imperfect signed data for settings visibility;
                 // routing still filters it through the relay safety chokepoint.
                 if let Some(event) = event {
-                    self.app
-                        .ingest_directory_relay_event(DirectoryRelayEventRecord {
+                    self.app.directory().ingest_directory_relay_event(
+                        DirectoryRelayEventRecord {
                             endpoints: c
                                 .options
                                 .discovery_relays
@@ -1580,7 +1580,8 @@ impl AccountManager {
                                 .map(TransportEndpoint)
                                 .collect(),
                             event,
-                        })?;
+                        },
+                    )?;
                 }
                 c.set(step, status, findings);
             }
@@ -2633,6 +2634,7 @@ impl AccountManager {
         match outcome {
             Ok(outcome) if !outcome.accepted.is_empty() => {
                 self.app
+                    .directory()
                     .ingest_directory_relay_event(DirectoryRelayEventRecord {
                         endpoints,
                         event: event.clone(),

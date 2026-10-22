@@ -411,6 +411,14 @@ impl From<AppError> for MarmotKitError {
     }
 }
 
+/// Directory failures map through the `AppError` they convert to, so
+/// bindings see the same error cases either way.
+impl From<marmot_app::DirectoryError> for MarmotKitError {
+    fn from(value: marmot_app::DirectoryError) -> Self {
+        Self::from(AppError::from(value))
+    }
+}
+
 impl From<&AppError> for MarmotKitError {
     fn from(value: &AppError) -> Self {
         if let Some(err) = value.as_engine_error() {

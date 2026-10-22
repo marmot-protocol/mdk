@@ -229,9 +229,10 @@ impl MarmotApp {
             // per chunk would reacquire every account's directory handles.
             let caches = self.directory_caches()?;
             let shared = self.shared_storage()?;
-            let local_accounts = self.local_accounts_by_id()?;
+            let local_accounts = self.directory().local_accounts_by_id()?;
             for id in ids {
                 let profile = self
+                    .directory()
                     .directory_entry_for_account_id_with_handles(
                         &id,
                         &caches,

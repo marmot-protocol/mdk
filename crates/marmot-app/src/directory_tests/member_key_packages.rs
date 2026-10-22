@@ -10,7 +10,8 @@ use nostr_directory::member_key_packages::MEMBER_PREWARM_CACHE_TTL;
 async fn discovery_recovery_refreshes_routes_for_fresh_commit_resolution() {
     let (_directory, app, accounts, fetcher) =
         crate::tests::invite_recovery::discovery_fixture(1).await;
-    app.prewarm_group_member_key_packages(&[&accounts[0].account_id_hex])
+    app.directory()
+        .prewarm_group_member_key_packages(&[&accounts[0].account_id_hex])
         .await
         .unwrap();
     fetcher.requests.lock().unwrap().clear();
@@ -36,7 +37,8 @@ async fn composition_prewarm_route_reuse_preserves_original_freshness_deadline()
     let (_directory, app, accounts, _fetcher) =
         crate::tests::member_resolution_fixture(1, false).await;
     let id = &accounts[0].account_id_hex;
-    app.prewarm_group_member_key_packages(&[id.as_str()])
+    app.directory()
+        .prewarm_group_member_key_packages(&[id.as_str()])
         .await
         .unwrap();
     let original = Instant::now() - Duration::from_secs(240);
@@ -46,10 +48,12 @@ async fn composition_prewarm_route_reuse_preserves_original_freshness_deadline()
         .unwrap()
         .set_inserted_at(id, original);
     for _ in 0..3 {
-        app.prewarm_group_member_key_packages(&[id.as_str()])
+        app.directory()
+            .prewarm_group_member_key_packages(&[id.as_str()])
             .await
             .unwrap();
-        app.resolve_member_key_packages(&[id.as_str()])
+        app.directory()
+            .resolve_member_key_packages(&[id.as_str()])
             .await
             .unwrap();
     }

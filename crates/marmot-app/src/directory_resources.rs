@@ -31,10 +31,15 @@ use nostr_directory::{
 
 /// The directory service over this app's resources.
 impl MarmotApp {
+    /// The user directory: lookups, refreshes, search and KeyPackage
+    /// resolution over other people's public Nostr data. Its methods return
+    /// [`DirectoryError`], which converts into [`AppError`] with the same
+    /// variant, message and `privacy_safe_kind`.
+    ///
     /// Builds the service on each call. What the directory keeps between
     /// calls lives in `directory_state` and is shared into every service, so
     /// nothing it needs later is owned by the value returned here.
-    pub(crate) fn directory(&self) -> Directory<MarmotApp> {
+    pub fn directory(&self) -> Directory<MarmotApp> {
         Directory::new(
             self.clone(),
             self.directory_config(),
@@ -217,7 +222,9 @@ impl MarmotApp {
         label: &str,
     ) -> Result<AccountRelayListStatus, AppError> {
         let account = self.account_home().account(label)?;
-        self.account_relay_list_status_for_account_id(&account.account_id_hex)
+        self.directory()
+            .account_relay_list_status_for_account_id(&account.account_id_hex)
+            .map_err(AppError::from)
     }
 
     pub(crate) fn directory_cache_path(&self, label: &str) -> PathBuf {
@@ -352,7 +359,7 @@ impl MarmotApp {
             return Ok(());
         };
 
-        let local_accounts = self.local_accounts_by_id()?;
+        let local_accounts = self.directory().local_accounts_by_id()?;
         let entries = entries
             .into_iter()
             .map(|entry| hydrate_directory_record(entry, &local_accounts))
@@ -420,6 +427,12 @@ impl MarmotApp {
             .collect::<Vec<_>>();
         self.clean_future_dated_directory_caches_once(&accounts)
     }
+}
+
+#[allow(dead_code)]
+fn member_resolution_future_is_send(app: &MarmotApp) {
+    fn assert_send<T: Send>(_: T) {}
+    assert_send(app.directory().resolve_member_key_packages(&[]));
 }
 
 #[cfg(all(test, feature = "product-analytics-export"))]

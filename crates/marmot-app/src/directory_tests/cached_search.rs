@@ -23,7 +23,7 @@ async fn connected_searcher_ignores_another_accounts_stale_follows() {
     let followed = "11".repeat(32);
     let stale = "22".repeat(32);
     for id in [&searcher.account_id_hex, &followed, &stale] {
-        let mut record = app.empty_directory_record(id);
+        let mut record = app.directory().empty_directory_record(id);
         record.profile = Some(UserProfileMetadata {
             name: Some("needle".into()),
             created_at: 1,
@@ -46,6 +46,7 @@ async fn connected_searcher_ignores_another_accounts_stale_follows() {
         )
         .unwrap();
     let cached = app
+        .directory()
         .search_cached_users(&searcher.account_id_hex, "needle", 100)
         .unwrap();
     assert_eq!(
@@ -61,6 +62,7 @@ async fn connected_searcher_ignores_another_accounts_stale_follows() {
         vec![followed.clone()]
     );
     let offline = app
+        .directory()
         .search_user_directory(crate::UserDirectorySearch {
             searcher_account_id_hex: searcher.account_id_hex.clone(),
             query: "needle".into(),
@@ -73,6 +75,7 @@ async fn connected_searcher_ignores_another_accounts_stale_follows() {
     assert_eq!(offline[0].account_id_hex, followed);
     assert!(offline[0].is_followed_by_searcher);
     let mut stream = app
+        .directory()
         .search_users(crate::UserSearchParams {
             searcher_account_id_hex: searcher.account_id_hex.clone(),
             query: "needle".into(),
@@ -101,16 +104,18 @@ async fn connected_searcher_ignores_another_accounts_stale_follows() {
     assert_eq!(latest[&stale].radius, OFF_GRAPH_SEARCH_RADIUS);
 
     // The refresh path's explicit empty kind-3 clears stale graph edges too.
-    app.remember_directory_follow_list_for_test(
-        &searcher.account_id_hex,
-        &nostr_directory::FetchedFollowList {
-            follows: Vec::new(),
-            source_relays: Vec::new(),
-        },
-    )
-    .unwrap();
+    app.directory()
+        .remember_directory_follow_list(
+            &searcher.account_id_hex,
+            &nostr_directory::FetchedFollowList {
+                follows: Vec::new(),
+                source_relays: Vec::new(),
+            },
+        )
+        .unwrap();
     assert!(
-        app.search_cached_users(&searcher.account_id_hex, "needle", 100)
+        app.directory()
+            .search_cached_users(&searcher.account_id_hex, "needle", 100)
             .unwrap()
             .iter()
             .all(|row| !row.is_followed_by_searcher)
@@ -135,7 +140,7 @@ fn public_cache_spans_accounts_but_follow_labels_do_not() {
     let shared_peer = "22".repeat(32);
     let search_peer = "33".repeat(32);
     let expired_peer = "44".repeat(32);
-    let mut record = app.empty_directory_record(&peer);
+    let mut record = app.directory().empty_directory_record(&peer);
     record.profile = Some(UserProfileMetadata {
         name: Some("Needle".into()),
         created_at: 1,
@@ -157,7 +162,7 @@ fn public_cache_spans_accounts_but_follow_labels_do_not() {
             std::slice::from_ref(&peer),
         )
         .unwrap();
-    let mut bob_record = app.empty_directory_record(&bob.account_id_hex);
+    let mut bob_record = app.directory().empty_directory_record(&bob.account_id_hex);
     bob_record.follows = vec![shared_peer.clone()];
     bob_cache.put(&bob_record).unwrap();
     record.account_id_hex = shared_peer.clone();
@@ -183,6 +188,7 @@ fn public_cache_spans_accounts_but_follow_labels_do_not() {
             .unwrap();
     }
     let results = app
+        .directory()
         .search_cached_users(&alice.account_id_hex, " needle ", 100)
         .unwrap();
     assert_eq!(results.len(), 3);
@@ -195,6 +201,7 @@ fn public_cache_spans_accounts_but_follow_labels_do_not() {
             .all(|r| !r.is_followed_by_searcher && r.radius == OFF_GRAPH_SEARCH_RADIUS)
     );
     let other = app
+        .directory()
         .search_cached_users(&bob.account_id_hex, "needle", 100)
         .unwrap();
     assert_eq!(other[0].account_id_hex, shared_peer);
@@ -207,23 +214,27 @@ fn public_cache_spans_accounts_but_follow_labels_do_not() {
             .is_followed_by_searcher
     );
     assert!(
-        app.search_cached_users(&alice.account_id_hex, "private-", 100)
+        app.directory()
+            .search_cached_users(&alice.account_id_hex, "private-", 100)
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        app.search_cached_users(&alice.account_id_hex, "needle", 1)
+        app.directory()
+            .search_cached_users(&alice.account_id_hex, "needle", 1)
             .unwrap()
             .len(),
         1
     );
     assert!(
-        app.search_cached_users(&alice.account_id_hex, "needle", 0)
+        app.directory()
+            .search_cached_users(&alice.account_id_hex, "needle", 0)
             .unwrap()
             .is_empty()
     );
     assert!(
-        app.search_cached_users(&alice.account_id_hex, "   ", 100)
+        app.directory()
+            .search_cached_users(&alice.account_id_hex, "   ", 100)
             .unwrap()
             .is_empty()
     );
@@ -231,5 +242,9 @@ fn public_cache_spans_accounts_but_follow_labels_do_not() {
         bob_cache.entry(&search_peer).unwrap().is_none(),
         "cache search must never promote strangers"
     );
-    assert!(app.search_cached_users("invalid", "needle", 100).is_err());
+    assert!(
+        app.directory()
+            .search_cached_users("invalid", "needle", 100)
+            .is_err()
+    );
 }

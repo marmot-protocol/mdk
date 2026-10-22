@@ -22,6 +22,7 @@ pub(crate) fn debug_command(
                 .into_iter()
                 .map(|account| {
                     let relay_lists = app
+                        .directory()
                         .account_relay_list_status_for_account_id(&account.account_id_hex)
                         .map(relay_lists_json)
                         .unwrap_or_else(|err| json!({"error": err.to_string()}));

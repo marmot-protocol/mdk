@@ -567,7 +567,8 @@ fn account_profile_publish_endpoint_selection_matches_canonical_outbox_fallback(
     // both fallback lists exist, canonical publication still picks bootstrap.
     let mut status = profile_relay_status(&[], &["wss://bootstrap.example"]);
     status.default_relays = vec!["wss://default.example".into()];
-    app.remember_directory_relay_lists(&account.account_id_hex, &status)
+    app.directory()
+        .remember_directory_relay_lists(&account.account_id_hex, &status)
         .unwrap();
 
     let bootstrap = AccountRelayListBootstrap::new(

@@ -1607,9 +1607,11 @@ impl MarmotAppRuntime {
         &self,
         account_id_hexes: &[String],
     ) -> Result<Vec<crate::CachedIdentityProjection>, AppError> {
-        self.accounts
+        Ok(self
+            .accounts
             .app
-            .cached_identity_projections_for_account_ids(account_id_hexes)
+            .directory()
+            .cached_identity_projections_for_account_ids(account_id_hexes)?)
     }
 
     pub fn accounts(&self) -> AccountManager {
@@ -4436,10 +4438,12 @@ impl MarmotAppRuntime {
         account_id_hex: &str,
         source_relays: Vec<TransportEndpoint>,
     ) -> Result<Option<UserProfileMetadata>, AppError> {
-        self.accounts
+        Ok(self
+            .accounts
             .app
+            .directory()
             .fetch_current_user_profile_for_account_id(account_id_hex, source_relays)
-            .await
+            .await?)
     }
 
     pub async fn publish_user_profile(
@@ -4500,6 +4504,7 @@ impl MarmotAppRuntime {
         let relay_lists = self
             .accounts
             .app
+            .directory()
             .account_relay_list_status_for_account_id(&account.account_id_hex)?;
         let endpoints = self
             .accounts
@@ -4562,6 +4567,7 @@ impl MarmotAppRuntime {
             .await?;
         self.accounts
             .app
+            .directory()
             .remember_directory_profile(&account.account_id_hex, &profile)?;
         Ok(profile)
     }
@@ -4599,11 +4605,13 @@ impl MarmotAppRuntime {
         let cached = self
             .accounts
             .app
+            .directory()
             .directory_entry_for_account_id(account_id_hex)?
             .and_then(|entry| entry.profile);
         match self
             .accounts
             .app
+            .directory()
             .fetch_current_user_profile_for_account_id(account_id_hex, source_relays.to_vec())
             .await
         {
@@ -4656,6 +4664,7 @@ impl MarmotAppRuntime {
         let mut follows = self
             .accounts
             .app
+            .directory()
             .directory_entry_for_account_id(&account.account_id_hex)?
             .map(|entry| entry.follows)
             .unwrap_or_default();
@@ -4787,6 +4796,7 @@ impl MarmotAppRuntime {
         let status = self
             .accounts
             .app
+            .directory()
             .account_relay_list_status_for_account_id(&account.account_id_hex)?;
         let mut source_relays = status
             .nip65
@@ -4854,8 +4864,10 @@ impl MarmotAppRuntime {
     ) -> Result<UserDirectoryRefresh, AppError> {
         self.accounts
             .app
+            .directory()
             .refresh_user_directory_for_account_id(account_id_hex, bootstrap_relays)
             .await
+            .map_err(AppError::from)
     }
 
     pub async fn publish_account_relay_list_kind(
@@ -5720,6 +5732,7 @@ impl MarmotAppRuntime {
             let cached = self
                 .accounts
                 .app
+                .directory()
                 .directory_entry_for_account_id(&account.account_id_hex)?
                 .and_then(|entry| entry.profile);
             let (profile, store) = generated_setup_profile(
@@ -5732,6 +5745,7 @@ impl MarmotAppRuntime {
             if store {
                 self.accounts
                     .app
+                    .directory()
                     .remember_directory_profile(&account.account_id_hex, &profile)?;
             }
             Ok::<_, AppError>(profile)
@@ -7830,7 +7844,7 @@ impl AccountManager {
                 &self.shared.app_performance_telemetry(),
                 ACCOUNT_SETUP_ADVISORY_WAIT,
                 "import_directory_refresh",
-                self.app.refresh_user_directory_for_account_id(
+                self.app.directory().refresh_user_directory_for_account_id(
                     &account.account_id_hex,
                     directory_bootstrap_relays.clone(),
                 ),
@@ -8042,7 +8056,7 @@ impl AccountManager {
             &self.shared.app_performance_telemetry(),
             ACCOUNT_SETUP_ADVISORY_WAIT,
             "login_directory_refresh",
-            self.app.refresh_user_directory_for_account_id(
+            self.app.directory().refresh_user_directory_for_account_id(
                 &account.account_id_hex,
                 directory_bootstrap_relays,
             ),
@@ -8125,6 +8139,7 @@ impl AccountManager {
         }
         if let Err(err) = self
             .app
+            .directory()
             .refresh_profile_for_account_id(account_id_hex, profile_relays)
             .await
         {
@@ -8146,6 +8161,7 @@ impl AccountManager {
     ) -> Result<(AccountRelayListStatus, Option<UserProfileMetadata>), AppError> {
         let mut profile = if let Some(cached) = self
             .app
+            .directory()
             .directory_entry_for_account_id(&account.account_id_hex)?
             .and_then(|entry| entry.profile)
         {
@@ -8188,6 +8204,7 @@ impl AccountManager {
             let status = self.app.account_relay_list_status(&account.label)?;
             if let Some(cached) = self
                 .app
+                .directory()
                 .directory_entry_for_account_id(&account.account_id_hex)?
                 .and_then(|entry| entry.profile)
             {

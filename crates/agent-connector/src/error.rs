@@ -3,7 +3,7 @@
 use agent_control::AgentControlError;
 use cgka_traits::error::EngineError;
 use marmot_account::AccountHomeError;
-use marmot_app::AppError;
+use marmot_app::{AppError, DirectoryError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectorError {
@@ -59,6 +59,13 @@ pub enum ConnectorError {
     StreamBeginRequestConflict,
     #[error("stream preview idempotency key was reused with different inputs")]
     StreamPreviewIdempotencyConflict,
+}
+
+/// Directory failures take the `AppError` codes they convert to.
+impl From<DirectoryError> for ConnectorError {
+    fn from(error: DirectoryError) -> Self {
+        Self::App(error.into())
+    }
 }
 
 impl ConnectorError {

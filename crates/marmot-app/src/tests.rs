@@ -6974,6 +6974,7 @@ async fn generated_identity_publishes_supplied_initial_profile_as_first_kind0() 
         "a zero stamp would lose to any stale relay copy"
     );
     let cached = app
+        .directory()
         .directory_entry_for_account_id(&local.account.account_id_hex)
         .unwrap()
         .and_then(|entry| entry.profile)
@@ -8446,7 +8447,8 @@ pub(crate) fn remember_test_member_inbox(app: &MarmotApp, account_id_hex: &str, 
     relay_lists.inbox.created_at = 1;
     relay_lists.inbox.relays = vec![relay.to_owned()];
     relay_lists.refresh();
-    app.remember_directory_relay_lists(account_id_hex, &relay_lists)
+    app.directory()
+        .remember_directory_relay_lists(account_id_hex, &relay_lists)
         .unwrap();
 }
 
@@ -8513,27 +8515,28 @@ async fn member_key_package_falls_back_to_current_directory_for_local_account() 
         },
     )
     .unwrap();
-    app.save_directory_entry(&UserDirectoryRecord {
-        account_id_hex: account.account_id_hex.clone(),
-        npub: npub_for_account_id_lossy(&account.account_id_hex),
-        local_account: Some(UserDirectoryLocalAccount {
-            label: account.label.clone(),
-            local_signing: true,
-        }),
-        profile: None,
-        follows: Vec::new(),
-        follow_source_relays: Vec::new(),
-        relay_lists: AccountRelayListStatus::empty(),
-        key_package: Some(DirectoryKeyPackage {
-            key_package_id: "current-directory".into(),
-            key_package_ref_hex: metadata.key_package_ref_hex.clone(),
-            key_package_event_id: String::new(),
-            key_package_hex: hex::encode(current.bytes()),
-            created_at: 2,
-            source_relays: Vec::new(),
-        }),
-    })
-    .unwrap();
+    app.directory()
+        .save_directory_entry(&UserDirectoryRecord {
+            account_id_hex: account.account_id_hex.clone(),
+            npub: npub_for_account_id_lossy(&account.account_id_hex),
+            local_account: Some(UserDirectoryLocalAccount {
+                label: account.label.clone(),
+                local_signing: true,
+            }),
+            profile: None,
+            follows: Vec::new(),
+            follow_source_relays: Vec::new(),
+            relay_lists: AccountRelayListStatus::empty(),
+            key_package: Some(DirectoryKeyPackage {
+                key_package_id: "current-directory".into(),
+                key_package_ref_hex: metadata.key_package_ref_hex.clone(),
+                key_package_event_id: String::new(),
+                key_package_hex: hex::encode(current.bytes()),
+                created_at: 2,
+                source_relays: Vec::new(),
+            }),
+        })
+        .unwrap();
 
     let selected = app.member_key_package(&account.label).await.unwrap();
     let selected_metadata = cgka_engine::key_package::key_package_metadata(&selected).unwrap();
@@ -8555,6 +8558,7 @@ async fn member_key_package_set_canonicalizes_and_deduplicates_in_input_order() 
 
     let bob_npub = npub_for_account_id_lossy(&bob.account_id_hex);
     let resolved = app
+        .directory()
         .resolve_member_key_packages(&[
             bob.label.as_str(),
             bob_npub.as_str(),
@@ -8710,6 +8714,7 @@ async fn member_inbox_is_resolved_on_discovered_outbox() {
     ]);
 
     let resolution = app
+        .directory()
         .resolve_member_key_packages(&[account_id.as_str()])
         .await;
     assert!(
@@ -8729,7 +8734,8 @@ async fn member_inbox_is_resolved_on_discovered_outbox() {
             })
     }));
     assert!(
-        app.directory_entry_for_account_id(&account_id)
+        app.directory()
+            .directory_entry_for_account_id(&account_id)
             .unwrap()
             .is_some_and(|entry| entry
                 .relay_lists
@@ -8779,6 +8785,7 @@ async fn account_outbox_route_cap_keeps_usable_first_hop_metadata() {
     assert_eq!(status.nip65.relays, outboxes);
     assert_eq!(status.inbox.relays, vec![inbox]);
     let cached = app
+        .directory()
         .directory_entry_for_account_id(&account_id)
         .unwrap()
         .expect("observed relay metadata must remain durable");
@@ -8796,13 +8803,14 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
     let account_id = accounts[0].account_id_hex.clone();
     let outbox = "wss://cached-outbox.example";
     let mut entry = app
+        .directory()
         .directory_entry_for_account_id(&account_id)
         .unwrap()
-        .unwrap_or_else(|| app.empty_directory_record(&account_id));
+        .unwrap_or_else(|| app.directory().empty_directory_record(&account_id));
     entry.relay_lists.nip65.created_at = 1;
     entry.relay_lists.nip65.relays = vec![outbox.into()];
     entry.relay_lists.refresh();
-    app.save_directory_entry(&entry).unwrap();
+    app.directory().save_directory_entry(&entry).unwrap();
     fetcher.events_by_endpoint.lock().unwrap().extend([
         ("wss://directory.example".to_owned(), Vec::new()),
         (outbox.to_owned(), Vec::new()),
@@ -8810,12 +8818,13 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
     *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://directory.example".into());
 
     let error = app
+        .directory()
         .resolve_member_key_packages(&[account_id.as_str()])
         .await
         .expect_err("an empty outbox cannot prove absence after discovery failed");
 
     assert!(
-        matches!(error, AppError::DirectoryLookupIncomplete(ref id) if *id == account_id),
+        matches!(error, DirectoryError::DirectoryLookupIncomplete(ref id) if *id == account_id),
         "unknown discovery must remain retryable instead of becoming a missing-route verdict: {error:?}"
     );
     assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -8840,12 +8849,13 @@ async fn member_inbox_of_only_retired_relays_is_reported_distinctly() {
     *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://shared.example".into());
 
     let error = app
+        .directory()
         .resolve_member_key_packages(&[account_id.as_str()])
         .await
         .expect_err("a member with no usable inbox cannot be invited");
 
     assert!(
-        matches!(error, AppError::DirectoryLookupIncomplete(ref id) if *id == account_id),
+        matches!(error, DirectoryError::DirectoryLookupIncomplete(ref id) if *id == account_id),
         "{error:?}"
     );
 }
@@ -8862,18 +8872,20 @@ async fn cached_retired_inbox_with_failed_refresh_remains_retryable() {
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
     let error = app
+        .directory()
         .resolve_member_key_packages(&[account_id.as_str()])
         .await
         .expect_err("a failed refresh cannot use a retired-only cached inbox");
     assert!(
-        matches!(error, AppError::DirectoryLookupIncomplete(ref id) if *id == account_id),
+        matches!(error, DirectoryError::DirectoryLookupIncomplete(ref id) if *id == account_id),
         "{error:?}"
     );
 
     fetcher
         .fail_all
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    app.resolve_member_key_packages(&[account_id.as_str()])
+    app.directory()
+        .resolve_member_key_packages(&[account_id.as_str()])
         .await
         .expect("a completed refresh finds the newer usable inbox without republication");
 }
@@ -8892,10 +8904,20 @@ async fn directory_relay_persistence_preserves_newer_signed_empty_lists() {
     empty.nip65.created_at = 20;
     empty.inbox.created_at = 20;
     empty.refresh();
-    app.remember_directory_relay_lists(id, &older).unwrap();
-    app.remember_directory_relay_lists(id, &empty).unwrap();
-    app.remember_directory_relay_lists(id, &older).unwrap();
-    let persisted = app.directory_entry_for_account_id(id).unwrap().unwrap();
+    app.directory()
+        .remember_directory_relay_lists(id, &older)
+        .unwrap();
+    app.directory()
+        .remember_directory_relay_lists(id, &empty)
+        .unwrap();
+    app.directory()
+        .remember_directory_relay_lists(id, &older)
+        .unwrap();
+    let persisted = app
+        .directory()
+        .directory_entry_for_account_id(id)
+        .unwrap()
+        .unwrap();
     assert_eq!(persisted.relay_lists.nip65.created_at, 20);
     assert_eq!(persisted.relay_lists.inbox.created_at, 20);
     assert!(persisted.relay_lists.nip65.relays.is_empty());
@@ -8931,7 +8953,11 @@ async fn account_outbox_route_cap_without_inbox_remains_unknown() {
     assert!(
         matches!(error, DirectoryError::DirectoryLookupIncomplete(ref account) if account == id)
     );
-    let cached = app.directory_entry_for_account_id(id).unwrap().unwrap();
+    let cached = app
+        .directory()
+        .directory_entry_for_account_id(id)
+        .unwrap()
+        .unwrap();
     assert_eq!(cached.relay_lists.nip65.relays.len(), 17);
     assert!(cached.relay_lists.inbox.relays.is_empty());
     assert_eq!(fetcher.requests.lock().unwrap().len(), 1);
@@ -8958,7 +8984,11 @@ async fn account_signed_empty_inbox_with_incomplete_outbox_remains_unknown() {
     assert!(
         matches!(error, DirectoryError::DirectoryLookupIncomplete(ref account) if account == id)
     );
-    let cached = app.directory_entry_for_account_id(id).unwrap().unwrap();
+    let cached = app
+        .directory()
+        .directory_entry_for_account_id(id)
+        .unwrap()
+        .unwrap();
     assert!(cached.relay_lists.inbox.created_at > 0);
     assert!(cached.relay_lists.inbox.relays.is_empty());
     assert_eq!(fetcher.requests.lock().unwrap().len(), 2);
@@ -9012,7 +9042,11 @@ async fn account_read_only_nip65_returns_typed_missing_write_routes() {
     assert!(
         matches!(error, DirectoryError::MissingRelayLists(ref kinds) if kinds == &[MissingRelayListKind::Nip65])
     );
-    let cached = app.directory_entry_for_account_id(id).unwrap().unwrap();
+    let cached = app
+        .directory()
+        .directory_entry_for_account_id(id)
+        .unwrap()
+        .unwrap();
     assert!(cached.relay_lists.nip65.relays.is_empty());
     assert_eq!(
         cached.relay_lists.nip65.read_relays,
@@ -9041,11 +9075,12 @@ async fn future_dated_inbox_is_unknown_for_account_and_member_resolution() {
         matches!(account_error, DirectoryError::DirectoryLookupIncomplete(ref account) if account == id)
     );
     let member_error = app
+        .directory()
         .resolve_member_key_packages(&[id.as_str()])
         .await
         .unwrap_err();
     assert!(
-        matches!(member_error, AppError::DirectoryLookupIncomplete(ref account) if account == id)
+        matches!(member_error, DirectoryError::DirectoryLookupIncomplete(ref account) if account == id)
     );
 }
 
@@ -9138,16 +9173,18 @@ async fn missing_inbox_is_discovered_when_nip65_is_cached() {
         .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST);
 
     let prewarm_error = app
+        .directory()
         .prewarm_group_member_key_packages(&[account_id.as_str()])
         .await
         .expect_err("KeyPackage-only prewarm must not report invite readiness");
     assert!(matches!(
         prewarm_error,
-        AppError::MissingMemberInboxRoute(ref recipient) if recipient == &account_id
+        DirectoryError::MissingMemberInboxRoute(ref recipient) if recipient == &account_id
     ));
     fetcher.requests.lock().unwrap().clear();
 
     let error = app
+        .directory()
         .resolve_member_key_packages(&[account_id.as_str()])
         .await
         .expect_err("commit-purpose resolution must require a safe inbox route");
@@ -9155,7 +9192,7 @@ async fn missing_inbox_is_discovered_when_nip65_is_cached() {
     assert!(
         matches!(
             &error,
-            AppError::MissingMemberInboxRoute(recipient) if recipient == &account_id
+            DirectoryError::MissingMemberInboxRoute(recipient) if recipient == &account_id
         ),
         "the typed error must identify the unready canonical recipient"
     );
@@ -9198,12 +9235,13 @@ async fn unsafe_cached_inbox_is_refreshed_before_member_resolution_succeeds() {
     fetcher.events.lock().unwrap().push(unsafe_event);
 
     let error = app
+        .directory()
         .prewarm_group_member_key_packages(&[account_id.as_str()])
         .await
         .expect_err("a loopback inbox route must not satisfy invite readiness");
     assert!(matches!(
         error,
-        AppError::MissingMemberInboxRoute(ref recipient) if recipient == &account_id
+        DirectoryError::MissingMemberInboxRoute(ref recipient) if recipient == &account_id
     ));
 
     fetcher
@@ -9221,7 +9259,8 @@ async fn unsafe_cached_inbox_is_refreshed_before_member_resolution_succeeds() {
     fetcher.events.lock().unwrap().push(safe_event);
     fetcher.requests.lock().unwrap().clear();
 
-    app.resolve_member_key_packages(&[account_id.as_str()])
+    app.directory()
+        .resolve_member_key_packages(&[account_id.as_str()])
         .await
         .expect("a safe replacement inbox route should make the member ready");
     assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -9414,7 +9453,8 @@ async fn thirty_incremental_invites_with_large_directory_cache_converge_without_
     let (directory, app, accounts, _fetcher) = member_resolution_fixture(30, false).await;
     for _ in 0..256 {
         let account_id = Keys::generate().public_key().to_hex();
-        app.save_directory_entry(&app.empty_directory_record(&account_id))
+        app.directory()
+            .save_directory_entry(&app.directory().empty_directory_record(&account_id))
             .unwrap();
     }
 
@@ -9454,11 +9494,13 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
     let recipient = &accounts[0];
     let members = [recipient.account_id_hex.as_str()];
     let old = app
+        .directory()
         .resolve_member_key_packages(&members)
         .await
         .unwrap()
         .remove(0);
     let old_directory = app
+        .directory()
         .directory_entry_for_account_id(&recipient.account_id_hex)
         .unwrap()
         .unwrap()
@@ -9493,13 +9535,15 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
         ));
     }
     let prewarm = app
+        .directory()
         .prewarm_group_member_key_packages(&members)
         .await
         .unwrap();
     assert_eq!(prewarm.reused_members, 0);
     assert_eq!(prewarm.network_resolved_members, 1);
     assert_eq!(
-        app.directory_entry_for_account_id(&recipient.account_id_hex)
+        app.directory()
+            .directory_entry_for_account_id(&recipient.account_id_hex)
             .unwrap()
             .unwrap()
             .key_package
@@ -9523,7 +9567,10 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
     }
     fetcher.requests.lock().unwrap().clear();
     assert_eq!(
-        app.resolve_member_key_packages(&members).await.unwrap(),
+        app.directory()
+            .resolve_member_key_packages(&members)
+            .await
+            .unwrap(),
         vec![latest]
     );
     let requests = fetcher.requests.lock().unwrap();
@@ -9540,8 +9587,12 @@ async fn member_key_package_resolution_fails_closed_after_cached_prewarm() {
     for relay_failure in [false, true] {
         let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
         let members = [accounts[0].account_id_hex.as_str()];
-        app.resolve_member_key_packages(&members).await.unwrap();
-        app.prewarm_group_member_key_packages(&members)
+        app.directory()
+            .resolve_member_key_packages(&members)
+            .await
+            .unwrap();
+        app.directory()
+            .prewarm_group_member_key_packages(&members)
             .await
             .unwrap();
         if relay_failure {
@@ -9554,17 +9605,22 @@ async fn member_key_package_resolution_fails_closed_after_cached_prewarm() {
                 .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
         }
         assert!(
-            app.resolve_member_key_packages(&members).await.is_err(),
+            app.directory()
+                .resolve_member_key_packages(&members)
+                .await
+                .is_err(),
             "neither a relay error nor a relay miss may authorize using the cached package"
         );
         assert!(
-            app.prewarm_group_member_key_packages(&members)
+            app.directory()
+                .prewarm_group_member_key_packages(&members)
                 .await
                 .is_err(),
             "prewarm must also refresh instead of returning cached readiness"
         );
         assert!(
-            app.directory_entry_for_account_id(members[0])
+            app.directory()
+                .directory_entry_for_account_id(members[0])
                 .unwrap()
                 .unwrap()
                 .key_package
@@ -9605,7 +9661,8 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .unwrap();
         for member in &members {
             assert!(
-                app.directory_entry_for_account_id(member)
+                app.directory()
+                    .directory_entry_for_account_id(member)
                     .unwrap()
                     .unwrap()
                     .key_package
@@ -9644,16 +9701,21 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             "single-author fallback must also reject cached material"
         );
         let refs = members.iter().map(String::as_str).collect::<Vec<_>>();
-        let ordinary = app.resolve_member_key_packages(&refs).await.unwrap_err();
+        let ordinary = app
+            .directory()
+            .resolve_member_key_packages(&refs)
+            .await
+            .unwrap_err();
         assert!(
-            matches!(ordinary, AppError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
+            matches!(ordinary, DirectoryError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
         );
         let prewarm = app
+            .directory()
             .prewarm_group_member_key_packages(&refs)
             .await
             .unwrap_err();
         assert!(
-            matches!(prewarm, AppError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
+            matches!(prewarm, DirectoryError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
         );
     }
 }
@@ -9667,6 +9729,7 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
         .collect::<Vec<_>>();
 
     let summary = app
+        .directory()
         .prewarm_group_member_key_packages(&members)
         .await
         .unwrap();
@@ -9707,7 +9770,8 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
 
     for account in &accounts {
         assert!(
-            app.directory_entry_for_account_id(&account.account_id_hex)
+            app.directory()
+                .directory_entry_for_account_id(&account.account_id_hex)
                 .unwrap()
                 .and_then(|entry| entry.key_package)
                 .is_none(),
@@ -9715,7 +9779,11 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
         );
     }
 
-    let resolved = app.resolve_member_key_packages(&members).await.unwrap();
+    let resolved = app
+        .directory()
+        .resolve_member_key_packages(&members)
+        .await
+        .unwrap();
     assert_eq!(resolved.len(), 8);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
@@ -9729,7 +9797,10 @@ async fn member_key_package_prewarm_does_not_renew_routes_after_incomplete_disco
     for incomplete in ["wss://directory.example", "wss://shared.example"] {
         let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
         let members = [accounts[0].account_id_hex.as_str()];
-        app.resolve_member_key_packages(&members).await.unwrap();
+        app.directory()
+            .resolve_member_key_packages(&members)
+            .await
+            .unwrap();
         // Keep a usable durable inbox, but make its relay refresh incomplete.
         // A successful KeyPackage fetch does not establish route freshness.
         fetcher
@@ -9738,12 +9809,16 @@ async fn member_key_package_prewarm_does_not_renew_routes_after_incomplete_disco
             .unwrap()
             .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST);
         *fetcher.incomplete_endpoint.lock().unwrap() = Some(incomplete.to_owned());
-        app.prewarm_group_member_key_packages(&members)
+        app.directory()
+            .prewarm_group_member_key_packages(&members)
             .await
             .unwrap();
         fetcher.requests.lock().unwrap().clear();
         *fetcher.incomplete_endpoint.lock().unwrap() = None;
-        app.resolve_member_key_packages(&members).await.unwrap();
+        app.directory()
+            .resolve_member_key_packages(&members)
+            .await
+            .unwrap();
         assert!(
             fetcher.requests.lock().unwrap().iter().any(|request| {
                 request
@@ -9772,7 +9847,8 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
         .iter()
         .map(|account| account.account_id_hex.as_str())
         .collect::<Vec<_>>();
-    app.prewarm_group_member_key_packages(&members)
+    app.directory()
+        .prewarm_group_member_key_packages(&members)
         .await
         .unwrap();
     let requests = fetcher.requests.lock().unwrap().clone();
@@ -9784,7 +9860,8 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     assert_eq!(requests[0].queries.len(), 2);
     assert_eq!(requests[1].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
     assert_eq!(
-        app.resolve_member_key_packages(&members)
+        app.directory()
+            .resolve_member_key_packages(&members)
             .await
             .unwrap()
             .len(),
@@ -9809,6 +9886,7 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_rejecte
         .collect::<Vec<_>>();
 
     let summary = app
+        .directory()
         .prewarm_group_member_key_packages(&members)
         .await
         .unwrap();
@@ -9842,6 +9920,7 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_incompl
         .collect::<Vec<_>>();
 
     let summary = app
+        .directory()
         .prewarm_group_member_key_packages(&members)
         .await
         .expect("CLOSED-shaped incomplete batches must retry per author");
@@ -9880,16 +9959,18 @@ async fn relay_list_fallback_failure_preserves_valid_siblings_and_input_order() 
     ];
 
     let error = app
+        .directory()
         .prewarm_group_member_key_packages(&members)
         .await
         .expect_err("the first member is missing and the third relay-list fallback fails");
     assert!(
-        matches!(error, AppError::MissingKeyPackage { account: account_id, reason: crate::MissingKeyPackageReason::NotFound } if account_id == accounts[0].account_id_hex),
+        matches!(error, DirectoryError::MissingKeyPackage { account: account_id, reason: crate::MissingKeyPackageReason::NotFound } if account_id == accounts[0].account_id_hex),
         "the first canonical member error must win over a later relay-list failure"
     );
     let requests_after_partial = fetcher.requests.lock().unwrap().len();
 
     let summary = app
+        .directory()
         .prewarm_group_member_key_packages(&[accounts[1].account_id_hex.as_str()])
         .await
         .expect("the valid sibling should remain reusable after the partial failure");
@@ -9916,12 +9997,13 @@ async fn member_key_package_set_reports_missing_packages_in_input_order() {
     ];
 
     let error = app
+        .directory()
         .prewarm_group_member_key_packages(&members)
         .await
         .expect_err("both packages are absent");
 
     assert!(
-        matches!(error, AppError::MissingKeyPackage { account: account_id, reason: crate::MissingKeyPackageReason::NotFound } if account_id == accounts[1].account_id_hex),
+        matches!(error, DirectoryError::MissingKeyPackage { account: account_id, reason: crate::MissingKeyPackageReason::NotFound } if account_id == accounts[1].account_id_hex),
         "the first canonical input error must win regardless of batch completion order"
     );
 }
@@ -9943,13 +10025,15 @@ async fn malformed_batch_member_does_not_discard_valid_member_prewarm() {
     }
 
     let error = app
+        .directory()
         .prewarm_group_member_key_packages(&[malformed_account.as_str(), valid_account.as_str()])
         .await
         .expect_err("the malformed member must fail");
-    assert!(matches!(error, AppError::InvalidKeyPackageEvent(_)));
+    assert!(matches!(error, DirectoryError::InvalidKeyPackageEvent(_)));
     let requests_after_partial = fetcher.requests.lock().unwrap().len();
 
     let summary = app
+        .directory()
         .prewarm_group_member_key_packages(&[valid_account.as_str()])
         .await
         .expect("the valid member from the partial batch remains safely reusable");
@@ -9981,6 +10065,7 @@ async fn member_key_package_resolution_ignores_older_malformed_publication() {
     }
 
     let summary = app
+        .directory()
         .prewarm_group_member_key_packages(&[account_id.as_str()])
         .await
         .expect("the newest valid KeyPackage must win over an older malformed publication");
@@ -10008,11 +10093,12 @@ async fn member_key_package_resolution_rejects_superseded_slot_after_malformed_r
     }
 
     let error = app
+        .directory()
         .prewarm_group_member_key_packages(&[account_id.as_str()])
         .await
         .expect_err("a malformed replacement must suppress the superseded KeyPackage in its slot");
 
-    assert!(matches!(error, AppError::InvalidKeyPackageEvent(_)));
+    assert!(matches!(error, DirectoryError::InvalidKeyPackageEvent(_)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10024,6 +10110,7 @@ async fn cancelled_member_prewarm_does_not_admit_or_reserve_results() {
     let task_member = member.clone();
     let task = tokio::spawn(async move {
         task_app
+            .directory()
             .prewarm_group_member_key_packages(&[task_member.as_str()])
             .await
     });
@@ -10039,7 +10126,8 @@ async fn cancelled_member_prewarm_does_not_admit_or_reserve_results() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     assert!(
-        app.directory_entry_for_account_id(&member)
+        app.directory()
+            .directory_entry_for_account_id(&member)
             .unwrap()
             .and_then(|entry| entry.key_package)
             .is_none(),
@@ -10048,6 +10136,7 @@ async fn cancelled_member_prewarm_does_not_admit_or_reserve_results() {
     *fetcher.stalled_endpoint.lock().unwrap() = None;
     let requests_before_retry = fetcher.requests.lock().unwrap().len();
     let summary = app
+        .directory()
         .prewarm_group_member_key_packages(&[member.as_str()])
         .await
         .unwrap();
@@ -10065,12 +10154,13 @@ async fn member_key_package_resolution_scaling_report() {
             .iter()
             .map(|account| account.account_id_hex.as_str())
             .collect::<Vec<_>>();
-        app.prewarm_group_member_key_packages(&members)
+        app.directory()
+            .prewarm_group_member_key_packages(&members)
             .await
             .unwrap();
         fetcher.requests.lock().unwrap().clear();
         let started = Instant::now();
-        let outcome = app.resolve_member_key_packages(&members).await;
+        let outcome = app.directory().resolve_member_key_packages(&members).await;
         report.push(format!(
             "{count},warm_cache,{},{},{}",
             fetcher.requests.lock().unwrap().len(),
@@ -10084,7 +10174,10 @@ async fn member_key_package_resolution_scaling_report() {
             .map(|account| account.account_id_hex.as_str())
             .collect::<Vec<_>>();
         let started = Instant::now();
-        let outcome = app.prewarm_group_member_key_packages(&members).await;
+        let outcome = app
+            .directory()
+            .prewarm_group_member_key_packages(&members)
+            .await;
         report.push(format!(
             "{count},shared_relays,{},{},{}",
             fetcher.requests.lock().unwrap().len(),
@@ -10098,7 +10191,10 @@ async fn member_key_package_resolution_scaling_report() {
             .map(|account| account.account_id_hex.as_str())
             .collect::<Vec<_>>();
         let started = Instant::now();
-        let outcome = app.prewarm_group_member_key_packages(&members).await;
+        let outcome = app
+            .directory()
+            .prewarm_group_member_key_packages(&members)
+            .await;
         report.push(format!(
             "{count},split_relays,{},{},{}",
             fetcher.requests.lock().unwrap().len(),
@@ -10120,7 +10216,10 @@ async fn member_key_package_resolution_scaling_report() {
             .map(|account| account.account_id_hex.as_str())
             .collect::<Vec<_>>();
         let started = Instant::now();
-        let outcome = app.prewarm_group_member_key_packages(&members).await;
+        let outcome = app
+            .directory()
+            .prewarm_group_member_key_packages(&members)
+            .await;
         report.push(format!(
             "{count},one_stalled_relay,{},{},{}",
             fetcher.requests.lock().unwrap().len(),
@@ -10140,7 +10239,10 @@ async fn member_key_package_resolution_scaling_report() {
             .map(|account| account.account_id_hex.as_str())
             .collect::<Vec<_>>();
         let started = Instant::now();
-        let outcome = app.prewarm_group_member_key_packages(&members).await;
+        let outcome = app
+            .directory()
+            .prewarm_group_member_key_packages(&members)
+            .await;
         report.push(format!(
             "{count},missing_package,{},{},{}",
             fetcher.requests.lock().unwrap().len(),
@@ -10267,22 +10369,25 @@ fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
         }
     };
 
-    app.ingest_directory_relay_event(record(
-        1,
-        vec![vec!["r".into(), "wss://stale-write.example".into()]],
-    ))
-    .unwrap();
-    app.ingest_directory_relay_event(record(
-        2,
-        vec![vec![
-            "r".into(),
-            "wss://read-only.example".into(),
-            "read".into(),
-        ]],
-    ))
-    .unwrap();
+    app.directory()
+        .ingest_directory_relay_event(record(
+            1,
+            vec![vec!["r".into(), "wss://stale-write.example".into()]],
+        ))
+        .unwrap();
+    app.directory()
+        .ingest_directory_relay_event(record(
+            2,
+            vec![vec![
+                "r".into(),
+                "wss://read-only.example".into(),
+                "read".into(),
+            ]],
+        ))
+        .unwrap();
 
     let cached = app
+        .directory()
         .directory_entry_for_account_id(&account_id)
         .unwrap()
         .expect("cached relay list");
@@ -10321,14 +10426,18 @@ fn stale_live_relay_list_events_do_not_replace_newer_cached_lists() {
             }
         };
 
-        app.ingest_directory_relay_event(record(20, "wss://new.example"))
+        app.directory()
+            .ingest_directory_relay_event(record(20, "wss://new.example"))
             .unwrap();
-        app.ingest_directory_relay_event(record(10, "wss://old.example"))
+        app.directory()
+            .ingest_directory_relay_event(record(10, "wss://old.example"))
             .unwrap();
-        app.ingest_directory_relay_event(record(20, "wss://equal.example"))
+        app.directory()
+            .ingest_directory_relay_event(record(20, "wss://equal.example"))
             .unwrap();
 
         let cached = app
+            .directory()
             .directory_entry_for_account_id(&account_id)
             .unwrap()
             .expect("cached relay list");
@@ -10357,13 +10466,15 @@ fn zero_timestamp_relay_list_event_populates_legacy_empty_state() {
     );
     event.created_at = 0;
 
-    app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
-        endpoints: vec![TransportEndpoint("wss://source.example".into())],
-        event,
-    })
-    .unwrap();
+    app.directory()
+        .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
+            endpoints: vec![TransportEndpoint("wss://source.example".into())],
+            event,
+        })
+        .unwrap();
 
     let cached = app
+        .directory()
         .directory_entry_for_account_id(&account_id)
         .unwrap()
         .expect("zero-timestamp relay list is cached");
@@ -10654,6 +10765,7 @@ fn directory_search_bounds_frontier_from_cached_follow_lists() {
     }
 
     let results = app
+        .directory()
         .search_user_directory(UserDirectorySearch {
             searcher_account_id_hex: account.account_id_hex,
             query: "needle".into(),
@@ -10713,6 +10825,7 @@ fn directory_search_uses_graph_cache_without_promoting_known_user() {
         .unwrap();
 
     let results = app
+        .directory()
         .search_user_directory(UserDirectorySearch {
             searcher_account_id_hex: account.account_id_hex.clone(),
             query: "graph-needle".into(),
@@ -10725,7 +10838,8 @@ fn directory_search_uses_graph_cache_without_promoting_known_user() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].account_id_hex, graph_user);
     assert!(
-        app.directory_entry_for_account_id(&graph_user)
+        app.directory()
+            .directory_entry_for_account_id(&graph_user)
             .unwrap()
             .is_none()
     );
@@ -10791,17 +10905,20 @@ fn duplicate_directory_entry_save_skips_cache_writes() {
     entry.profile.as_mut().unwrap().source_relays = vec!["wss://profiles.example".into()];
 
     cache.reset_put_count_for_test();
-    app.save_directory_entry_with_reason(&entry, "message")
+    app.directory()
+        .save_directory_entry_with_reason(&entry, "message")
         .unwrap();
     assert_eq!(cache.put_count_for_test(), 1);
 
     cache.reset_put_count_for_test();
-    app.save_directory_entry_with_reason(&entry, "message")
+    app.directory()
+        .save_directory_entry_with_reason(&entry, "message")
         .unwrap();
     assert_eq!(cache.put_count_for_test(), 0);
 
     entry.profile.as_mut().unwrap().display_name = Some("cached peer".into());
-    app.save_directory_entry_with_reason(&entry, "message")
+    app.directory()
+        .save_directory_entry_with_reason(&entry, "message")
         .unwrap();
     assert_eq!(cache.put_count_for_test(), 1);
 }
@@ -10819,12 +10936,13 @@ fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
     let account_id = format!("{:064x}", 206);
 
     // Local edit cached at t=1_700_000_000 (own-account entry).
-    app.save_directory_entry(&test_directory_record(
-        &account_id,
-        "edited-local",
-        1_700_000_000,
-    ))
-    .unwrap();
+    app.directory()
+        .save_directory_entry(&test_directory_record(
+            &account_id,
+            "edited-local",
+            1_700_000_000,
+        ))
+        .unwrap();
 
     // Stale relay copy arrives with the SAME second-resolution timestamp.
     let stale_same_second = UserProfileMetadata {
@@ -10832,11 +10950,13 @@ fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
         created_at: 1_700_000_000,
         ..UserProfileMetadata::default()
     };
-    app.remember_directory_profile_if_newer(&account_id, &stale_same_second)
+    app.directory()
+        .remember_directory_profile_if_newer(&account_id, &stale_same_second)
         .unwrap();
 
     // The local edit must survive the equal-timestamp refresh.
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&account_id)
         .unwrap()
         .unwrap();
@@ -10851,9 +10971,11 @@ fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
         created_at: 1_700_000_001,
         ..UserProfileMetadata::default()
     };
-    app.remember_directory_profile_if_newer(&account_id, &newer)
+    app.directory()
+        .remember_directory_profile_if_newer(&account_id, &newer)
         .unwrap();
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&account_id)
         .unwrap()
         .unwrap();
@@ -10879,16 +11001,17 @@ fn same_second_multiline_bio_does_not_replace_cached_single_line_bio() {
         (peer.as_str(), false),
         (alice.account_id_hex.as_str(), true),
     ] {
-        app.remember_directory_profile(
-            account_id,
-            &UserProfileMetadata {
-                name: Some("bob".to_owned()),
-                about: Some("onetwo".to_owned()),
-                created_at,
-                ..UserProfileMetadata::default()
-            },
-        )
-        .unwrap();
+        app.directory()
+            .remember_directory_profile(
+                account_id,
+                &UserProfileMetadata {
+                    name: Some("bob".to_owned()),
+                    about: Some("onetwo".to_owned()),
+                    created_at,
+                    ..UserProfileMetadata::default()
+                },
+            )
+            .unwrap();
         let ingest = |created_at: u64| {
             let mut event = NostrTransportEvent::new_unsigned(
                 account_id.to_owned(),
@@ -10897,12 +11020,14 @@ fn same_second_multiline_bio_does_not_replace_cached_single_line_bio() {
                 serde_json::json!({ "name": "bob", "about": "one\ntwo" }).to_string(),
             );
             event.created_at = created_at;
-            app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
-                endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
-                event,
-            })
-            .unwrap();
-            app.directory_entry_for_account_id(account_id)
+            app.directory()
+                .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
+                    endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
+                    event,
+                })
+                .unwrap();
+            app.directory()
+                .directory_entry_for_account_id(account_id)
                 .unwrap()
                 .unwrap()
         };
@@ -10933,7 +11058,8 @@ fn roster_labels_keep_profiles() {
     let alice = home.create_account("alice").unwrap();
     let bob = home.create_account("bob").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    app.save_directory_entry(&test_directory_record(&alice.account_id_hex, "Alice", 1))
+    app.directory()
+        .save_directory_entry(&test_directory_record(&alice.account_id_hex, "Alice", 1))
         .unwrap();
     let names = app.profiles_by_id().unwrap();
     assert_eq!(names.len(), 2);
@@ -10962,6 +11088,7 @@ fn directory_entry_prefers_newer_shared_record_over_stale_cache() {
         .unwrap();
 
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&contact)
         .unwrap()
         .unwrap();
@@ -11023,6 +11150,7 @@ fn directory_entry_reconciles_nostr_components_independently() {
         .unwrap();
 
     let reconciled = app
+        .directory()
         .directory_entry_for_account_id(&contact)
         .unwrap()
         .expect("reconciled directory entry");
@@ -11055,13 +11183,15 @@ fn directory_entry_reconciles_nostr_components_independently() {
         String::new(),
     );
     stale_event.created_at = 15;
-    app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
-        event: stale_event,
-        endpoints: vec![TransportEndpoint("wss://source.example".into())],
-    })
-    .unwrap();
+    app.directory()
+        .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
+            event: stale_event,
+            endpoints: vec![TransportEndpoint("wss://source.example".into())],
+        })
+        .unwrap();
 
     let after_stale_replay = app
+        .directory()
         .directory_entry_for_account_id(&contact)
         .unwrap()
         .expect("directory entry after stale replay");
@@ -11080,7 +11210,8 @@ fn repeated_display_name_lookup_reuses_directory_cache_handle() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let contact = format!("{:064x}", 44);
 
-    app.save_directory_entry(&test_directory_record(&contact, "Cached Contact", 1))
+    app.directory()
+        .save_directory_entry(&test_directory_record(&contact, "Cached Contact", 1))
         .unwrap();
     drop(app);
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
@@ -11184,7 +11315,8 @@ fn batch_display_name_lookup_opens_one_directory_cache_per_local_account() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let contact = format!("{:064x}", 45);
 
-    app.save_directory_entry(&test_directory_record(&contact, "Batch Contact", 1))
+    app.directory()
+        .save_directory_entry(&test_directory_record(&contact, "Batch Contact", 1))
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
@@ -11247,7 +11379,8 @@ fn cached_identity_page_is_order_stable_and_distinguishes_local_from_remote() {
     let unknown = format!("{:064x}", 47);
     let malformed = "not-a-public-key".to_owned();
 
-    app.save_directory_entry(&test_directory_record(&remote, "Remote Peer", 1))
+    app.directory()
+        .save_directory_entry(&test_directory_record(&remote, "Remote Peer", 1))
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
@@ -11260,6 +11393,7 @@ fn cached_identity_page_is_order_stable_and_distinguishes_local_from_remote() {
         bob.account_id_hex.clone(),
     ];
     let page = app
+        .directory()
         .cached_identity_projections_for_account_ids(&requested)
         .unwrap();
 
@@ -11315,8 +11449,9 @@ fn cached_identity_page_rejects_oversized_input() {
     let oversized = vec!["00".repeat(32); MAX_CACHED_IDENTITY_PAGE_SIZE + 1];
 
     assert!(matches!(
-        app.cached_identity_projections_for_account_ids(&oversized),
-        Err(AppError::InvalidCachedIdentityPage(_))
+        app.directory()
+            .cached_identity_projections_for_account_ids(&oversized),
+        Err(DirectoryError::InvalidCachedIdentityPage(_))
     ));
 }
 
@@ -11327,7 +11462,8 @@ fn cached_identity_page_acquires_directory_handles_once_for_100_ids() {
     home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let remote = format!("{:064x}", 48);
-    app.save_directory_entry(&test_directory_record(&remote, "Bulk Peer", 1))
+    app.directory()
+        .save_directory_entry(&test_directory_record(&remote, "Bulk Peer", 1))
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
@@ -11337,6 +11473,7 @@ fn cached_identity_page_acquires_directory_handles_once_for_100_ids() {
 
     let before = app.directory_handle_acquire_count_for_test();
     let page = app
+        .directory()
         .cached_identity_projections_for_account_ids(&requested)
         .unwrap();
     let after_page = app.directory_handle_acquire_count_for_test();
@@ -11346,7 +11483,7 @@ fn cached_identity_page_acquires_directory_handles_once_for_100_ids() {
     assert_eq!(after_page, before + 1);
 
     for account_id in &requested {
-        let _ = app.directory_entry_for_account_id(account_id);
+        let _ = app.directory().directory_entry_for_account_id(account_id);
     }
     assert_eq!(
         app.directory_handle_acquire_count_for_test(),
@@ -11520,6 +11657,7 @@ fn legacy_plaintext_directory_cache_migrates_once_into_resident_cache() {
 
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&contact)
         .unwrap()
         .unwrap();
@@ -11540,6 +11678,7 @@ fn legacy_plaintext_directory_cache_migrates_once_into_resident_cache() {
     assert!(open_count_after_migration >= 1);
 
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&contact)
         .unwrap()
         .unwrap();
@@ -11576,7 +11715,10 @@ fn legacy_plaintext_directory_cache_migrates_to_shared_storage_without_account_c
         .public_directory_user(&contact)
         .unwrap()
         .unwrap();
-    let hydrated = app.hydrate_public_directory_record(shared_entry).unwrap();
+    let hydrated = app
+        .directory()
+        .hydrate_public_directory_record(shared_entry)
+        .unwrap();
     assert_eq!(
         hydrated.profile.and_then(|profile| profile.name),
         Some("Shared Legacy Contact".to_owned())
@@ -11647,9 +11789,11 @@ fn directory_entries_and_save_keep_newer_shared_record() {
         Some("new-shared")
     );
 
-    app.save_directory_entry_with_reason(&stale, "stale-cache")
+    app.directory()
+        .save_directory_entry_with_reason(&stale, "stale-cache")
         .unwrap();
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&contact)
         .unwrap()
         .unwrap();
@@ -11668,13 +11812,17 @@ fn received_message_sender_is_admitted_to_directory_cache() {
     let sender = format!("{:064x}", 42);
 
     assert!(
-        app.directory_entry_for_account_id(&sender)
+        app.directory()
+            .directory_entry_for_account_id(&sender)
             .unwrap()
             .is_none()
     );
-    app.remember_directory_message_sender(&sender).unwrap();
+    app.directory()
+        .remember_directory_message_sender(&sender)
+        .unwrap();
 
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&sender)
         .unwrap()
         .unwrap();
@@ -11691,7 +11839,8 @@ fn directory_sync_plan_watches_local_accounts_and_known_users() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let contact = format!("{:064x}", 42);
 
-    app.remember_directory_user_with_reason(&contact, "message")
+    app.directory()
+        .remember_directory_user_with_reason(&contact, "message")
         .unwrap();
 
     let plan = app.directory().directory_sync_plan().unwrap();
@@ -11721,7 +11870,8 @@ fn directory_sync_plan_does_not_subscribe_kind3_for_non_local_known_user() {
     // A non-local known user (e.g. a message sender) is admitted to the
     // directory but must never have its kind-3 contact list subscribed: doing
     // so feeds the unbounded transitive social-graph crawl (mdk#687).
-    app.remember_directory_user_with_reason(&sender, "message")
+    app.directory()
+        .remember_directory_user_with_reason(&sender, "message")
         .unwrap();
 
     let plan = app.directory().directory_sync_plan().unwrap();
@@ -11786,7 +11936,8 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
 
     // A remote, non-local user whose contact list arrives over a relay.
     let author = format!("{:064x}", 42);
-    app.remember_directory_user_with_reason(&author, "message")
+    app.directory()
+        .remember_directory_user_with_reason(&author, "message")
         .unwrap();
 
     // Build a contact list far larger than the per-list cap.
@@ -11799,7 +11950,9 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
         event: contact_list_event(&author, &follows),
     };
 
-    app.ingest_directory_relay_event(record).unwrap();
+    app.directory()
+        .ingest_directory_relay_event(record)
+        .unwrap();
 
     // None of the followed pubkeys may be promoted into known directory entries.
     let known_ids = app
@@ -11818,6 +11971,7 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
 
     // The author's cached follow edges are bounded by the per-list cap.
     let author_entry = app
+        .directory()
         .directory_entry_for_account_id(&author)
         .unwrap()
         .unwrap();
@@ -11874,11 +12028,12 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
         .to_string(),
     );
     event.created_at = 1_700_000_867;
-    app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
-        endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
-        event,
-    })
-    .unwrap();
+    app.directory()
+        .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
+            endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
+            event,
+        })
+        .unwrap();
 
     let assert_bounded_extra = |profile: &UserProfileMetadata| {
         assert_eq!(profile.name.as_deref(), Some("alice"));
@@ -11903,6 +12058,7 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
     };
 
     let cached = app
+        .directory()
         .directory_entry_for_account_id(&author)
         .unwrap()
         .expect("ingested profile is cached");
@@ -11977,11 +12133,12 @@ fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
         .to_string(),
     );
     event.created_at = 1_700_000_868;
-    app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
-        endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
-        event,
-    })
-    .unwrap();
+    app.directory()
+        .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
+            endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
+            event,
+        })
+        .unwrap();
 
     let assert_normalized = |profile: &UserProfileMetadata, source_relays: Option<&[String]>| {
         let single = "firstsecond[2Jthird";
@@ -12005,6 +12162,7 @@ fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
     };
 
     let cached = app
+        .directory()
         .directory_entry_for_account_id(&author)
         .unwrap()
         .expect("ingested profile is cached")
@@ -12054,22 +12212,26 @@ fn local_account_directory_refresh_still_promotes_follows() {
     // A user-initiated refresh of a local account's own follow list (distinct
     // from passive relay ingest) intentionally records its follows so they are
     // searchable and watched.
-    app.remember_directory_user_with_reason(&account.account_id_hex, "local")
+    app.directory()
+        .remember_directory_user_with_reason(&account.account_id_hex, "local")
         .unwrap();
     let follow_list = FetchedFollowList {
         follows: vec![follow.clone()],
         source_relays: vec!["wss://relay.example".to_owned()],
     };
-    app.remember_directory_follow_list_for_test(&account.account_id_hex, &follow_list)
+    app.directory()
+        .remember_directory_follow_list(&account.account_id_hex, &follow_list)
         .unwrap();
 
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&account.account_id_hex)
         .unwrap()
         .unwrap();
     assert_eq!(entry.follows, vec![follow.clone()]);
     assert!(
-        app.directory_entry_for_account_id(&follow)
+        app.directory()
+            .directory_entry_for_account_id(&follow)
             .unwrap()
             .is_some(),
         "an explicit follow-list refresh promotes follows into directory entries"
@@ -23414,6 +23576,7 @@ fn presentation_worker_refreshes_without_screen_subscribers_and_recovers_notific
         let storage = app.account_storage("alice").unwrap();
         // No UI or presentation subscriber is attached for initial hydration or this update.
         let mut entry = app
+            .directory()
             .directory_entry_for_account_id(&bob.account_id_hex)
             .unwrap()
             .unwrap();
@@ -23422,7 +23585,7 @@ fn presentation_worker_refreshes_without_screen_subscribers_and_recovers_notific
             created_at: unix_now_seconds() + 1,
             ..Default::default()
         });
-        app.save_directory_entry(&entry).unwrap();
+        app.directory().save_directory_entry(&entry).unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let storage_sqlite::ChatPresentationRead::Ready(value) =
@@ -24417,9 +24580,11 @@ fn legacy_directory_label() {
         .create_account("alice")
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    app.remember_directory_user_with_reason(&account.account_id_hex, "test")
+    app.directory()
+        .remember_directory_user_with_reason(&account.account_id_hex, "test")
         .unwrap();
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&account.account_id_hex)
         .unwrap()
         .unwrap();

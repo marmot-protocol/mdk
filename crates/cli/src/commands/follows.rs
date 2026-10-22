@@ -34,6 +34,7 @@ pub(crate) async fn follows_command_with_runtime(
     match command {
         FollowsCommand::List => {
             let follows = app
+                .directory()
                 .directory_entry_for_account_id(&account.account_id_hex)?
                 .map(|entry| entry.follows)
                 .unwrap_or_default();
@@ -42,6 +43,7 @@ pub(crate) async fn follows_command_with_runtime(
         FollowsCommand::Check { pubkey } => {
             let target = parse_public_key(&pubkey)?;
             let follows = app
+                .directory()
                 .directory_entry_for_account_id(&account.account_id_hex)?
                 .map(|entry| entry.follows)
                 .unwrap_or_default();

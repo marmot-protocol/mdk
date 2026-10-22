@@ -292,7 +292,9 @@ impl MarmotApp {
                     .collect(),
             };
             if let Err(error) = blocking_app_task(move || {
-                Ok(app.remember_directory_follow_edges_for_search(&account_id, &follow_list)?)
+                Ok(app
+                    .directory()
+                    .remember_directory_follow_edges_for_search(&account_id, &follow_list)?)
             })
             .await
             {

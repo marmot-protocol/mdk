@@ -80,7 +80,8 @@ pub(crate) fn whoami_command(
         } else {
             public_account_status_json(
                 &account,
-                app.account_relay_list_status_for_account_id(&account.account_id_hex)?,
+                app.directory()
+                    .account_relay_list_status_for_account_id(&account.account_id_hex)?,
             )?
         };
         return Ok(CommandOutput {
@@ -325,8 +326,9 @@ pub(crate) async fn account_command(
         AccountCommand::Status { account } => {
             let account = resolve_account(account_home, account.or(account_flag))?;
             if !account.local_signing {
-                let relay_lists =
-                    app.account_relay_list_status_for_account_id(&account.account_id_hex)?;
+                let relay_lists = app
+                    .directory()
+                    .account_relay_list_status_for_account_id(&account.account_id_hex)?;
                 let json = public_account_status_json(&account, relay_lists)?;
                 return Ok(CommandOutput {
                     plain: terminal_safe_json_display(
@@ -391,9 +393,12 @@ async fn relay_list_status_for_account_id(
     bootstrap_relays: Vec<TransportEndpoint>,
 ) -> Result<AccountRelayListStatus, WnError> {
     if bootstrap_relays.is_empty() {
-        Ok(app.account_relay_list_status_for_account_id(account_id)?)
+        Ok(app
+            .directory()
+            .account_relay_list_status_for_account_id(account_id)?)
     } else {
         Ok(app
+            .directory()
             .fetch_account_relay_list_status_for_account_id(account_id, bootstrap_relays)
             .await?)
     }
@@ -404,6 +409,7 @@ fn account_summary_json(
     account: marmot_account::AccountSummary,
 ) -> Result<Value, WnError> {
     let profile = app
+        .directory()
         .directory_entry_for_account_id(&account.account_id_hex)
         .ok()
         .flatten()

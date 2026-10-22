@@ -65,6 +65,7 @@ impl MarmotApp {
 
     pub(crate) fn block_list_endpoints(&self, account_id: &str) -> Vec<TransportEndpoint> {
         let relays = self
+            .directory()
             .account_relay_list_status_for_account_id(account_id)
             .map(|s| s.nip65.relays)
             .unwrap_or_default();

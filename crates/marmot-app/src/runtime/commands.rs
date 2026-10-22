@@ -197,6 +197,7 @@ impl AccountManager {
         let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
         let result = self
             .app
+            .directory()
             .prewarm_group_member_key_packages(&member_refs)
             .await;
         self.shared.app_performance_telemetry().record(
@@ -204,7 +205,7 @@ impl AccountManager {
             started_at.elapsed(),
             result.is_ok(),
         );
-        result
+        Ok(result?)
     }
 
     pub async fn create_group_detailed(
