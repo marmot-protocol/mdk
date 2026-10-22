@@ -1,7 +1,7 @@
 //! End-to-end golden HTML tests for richer multi-construct documents.
 //!
-//! These complement `tests/spec.rs` (which covers one construct per case)
-//! by exercising whole-document interactions: headings + paragraphs +
+//! These complement the focused AST unit tests by exercising
+//! whole-document interactions: headings + paragraphs +
 //! lists + tables + code + math + nostr in realistic combinations.
 //!
 //! Expected strings are the renderer's *current* output captured against

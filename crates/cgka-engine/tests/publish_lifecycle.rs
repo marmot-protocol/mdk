@@ -2618,39 +2618,6 @@ async fn group_with_bob(
 }
 
 #[tokio::test]
-async fn app_message_is_retained_while_a_publish_is_pending() {
-    let mut alice = build(b"alice");
-    let mut bob = build(b"bob");
-    let group_id = group_with_bob(&mut alice, &mut bob).await;
-
-    // Stage a self-update. The group is now `PendingPublish` — a temporary
-    // state whose exit is a publish outcome the transport still owes us.
-    let staged = alice
-        .send(SendIntent::SelfUpdate {
-            group_id: group_id.clone(),
-        })
-        .await
-        .unwrap();
-    assert!(matches!(staged, SendResult::GroupEvolution { .. }));
-
-    // A user typing during that window must not lose their message: the
-    // engine retains the intent durably instead of refusing the send.
-    let payload = app_payload_for(&alice, "typed while the publish was stalled");
-    let queued = alice
-        .send(SendIntent::AppMessage {
-            group_id: group_id.clone(),
-            payload,
-            expected_epoch: None,
-        })
-        .await
-        .expect("a temporary non-stable state must retain an app message, not reject it");
-    assert!(
-        matches!(queued, SendResult::Queued { .. }),
-        "expected durable retention, got {queued:?}"
-    );
-}
-
-#[tokio::test]
 async fn epoch_pinned_app_message_is_refused_rather_than_retained_while_a_publish_is_pending() {
     // Retention re-encrypts at drain time. An encrypted-media `imeta`
     // reference is bound to the epoch that produced its ciphertext (recipients

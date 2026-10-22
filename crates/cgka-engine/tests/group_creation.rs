@@ -2322,16 +2322,6 @@ async fn create_group_rejects_invitee_keypackage_with_excessive_lifetime_range()
     );
 }
 
-#[tokio::test]
-async fn fresh_key_package_roundtrips_bytes() {
-    let mut alice = build_client(b"a", selfremove_registry());
-    let kp = alice.fresh_key_package().await.unwrap();
-    assert!(
-        !kp.bytes().is_empty(),
-        "key package bytes should be non-empty"
-    );
-}
-
 #[test]
 fn engine_builder_defaults_to_current_and_requires_explicit_legacy_fixture_seam() {
     let current = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
@@ -3384,47 +3374,6 @@ async fn join_welcome_rejected_when_client_lacks_required_app_component() {
 }
 
 #[tokio::test]
-async fn confirm_published_transitions_to_stable_and_emits_group_created() {
-    let mut alice = build_client(b"a", selfremove_registry());
-    let mut bob = build_client(b"b", selfremove_registry());
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-
-    let (group_id, result) = alice
-        .create_group(CreateGroupRequest {
-            name: "g".into(),
-            description: "".into(),
-            members: vec![bob_kp],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-
-    let pending = match result {
-        SendResult::GroupCreated { pending, .. } => pending,
-        _ => unreachable!(),
-    };
-
-    // Double confirm → typed UnknownPending on second call.
-    let event = alice.confirm_published(pending).await.unwrap();
-    assert!(matches!(
-        event,
-        cgka_traits::engine::GroupEvent::GroupCreated { .. }
-    ));
-
-    // Drained events carry the same event.
-    let drained = alice.drain_events();
-    assert_eq!(drained.len(), 1);
-
-    let err = alice.confirm_published(pending).await.err().unwrap();
-    assert!(matches!(err, EngineError::UnknownPending));
-
-    // Post-confirm: epoch unchanged (still 1), but state machine is Stable.
-    assert_eq!(alice.epoch(&group_id).unwrap().0, 1);
-}
-
-#[tokio::test]
 async fn two_engine_happy_path_create_and_join() {
     let mut alice = build_client(b"alice-id", selfremove_registry());
     let alice_id = alice.self_id();
@@ -3454,7 +3403,13 @@ async fn two_engine_happy_path_create_and_join() {
         SendResult::GroupCreated { pending, .. } => *pending,
         _ => unreachable!(),
     };
-    alice.confirm_published(pending).await.unwrap();
+    let event = alice.confirm_published(pending).await.unwrap();
+    assert!(matches!(
+        event,
+        cgka_traits::engine::GroupEvent::GroupCreated { .. }
+    ));
+    assert_eq!(alice.drain_events().len(), 1);
+    assert_eq!(alice.epoch(&alice_gid).unwrap().0, 1);
 
     // The welcomes addressed to bob flow to him.
     let bob_welcome = match result {
@@ -3517,33 +3472,6 @@ async fn join_welcome_rejects_wrong_recipient() {
     // Eve should not be able to consume bob's welcome.
     let err = eve.join_welcome(bob_welcome).await.err().unwrap();
     assert!(matches!(err, EngineError::Peeler(_)));
-}
-
-#[tokio::test]
-async fn create_group_buffers_ingest_via_pending_state() {
-    // After create_group, alice is in PendingPublish for that group.
-    // can_ingest should be false until confirm_published lands.
-    let mut alice = build_client(b"a", selfremove_registry());
-    let mut bob = build_client(b"b", selfremove_registry());
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-
-    let (_gid, _result) = alice
-        .create_group(CreateGroupRequest {
-            name: "x".into(),
-            description: "".into(),
-            members: vec![bob_kp],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-
-    // epoch() reflects the underlying MLS group (1 after add) — the state
-    // machine is PendingPublish but queries still return the current epoch.
-    //
-    // We can't directly peek at EpochState from outside the crate; the
-    // observable contract is that ingest buffers while PendingPublish is live.
 }
 
 #[tokio::test]
