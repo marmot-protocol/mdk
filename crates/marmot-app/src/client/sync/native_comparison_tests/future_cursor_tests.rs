@@ -139,7 +139,14 @@ async fn future_cursor_keeps_old_text() {
         .subscription_id();
     let mut copy = copy;
     copy.subscription_id = Some(id.clone());
-    adapter.observe_relay_event(&copy).await;
+    adapter
+        .observe_relay_event(
+            &hex::decode(&copy.event.id).unwrap(),
+            &copy.endpoint,
+            copy.subscription_id.as_deref(),
+            copy.event.created_at,
+        )
+        .await;
     adapter
         .handle_group_relay_copy(copy.clone(), Some(&account))
         .await

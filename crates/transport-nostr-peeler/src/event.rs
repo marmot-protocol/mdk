@@ -29,11 +29,15 @@ pub struct NostrTransportEvent {
 
 impl NostrTransportEvent {
     /// Convert a Nostr event into the raw transport message the engine ingests.
+    ///
+    /// This checks the event hash and routing shape, not the signature. Inbound
+    /// callers must authenticate the event before engine admission; constructing
+    /// this public DTO does not establish that trust.
     pub fn to_transport_message(&self) -> Result<TransportMessage, NostrPeelerError> {
         // #709/#351 — the resulting `TransportMessage.id` keys routing metrics,
         // telemetry, and the forensic `wire_id`, so bind it to the event hash
         // here rather than trusting the self-reported id. Signature
-        // verification still happens at peel time.
+        // verification belongs to the ingest boundary, not group peeling.
         if !self.id.eq_ignore_ascii_case(&self.computed_id()) {
             return Err(NostrPeelerError::InvalidSignature);
         }

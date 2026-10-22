@@ -417,7 +417,7 @@ async fn slow_peer_keeps_plaintext() {
         for event in events[180..].iter().rev() {
             let mut event = event.clone();
             event.subscription_id = Some(id.clone());
-            adapter.observe_relay_event(&event).await;
+            adapter.observe_relay_event(&hex::decode(&event.event.id).unwrap(), &event.endpoint, event.subscription_id.as_deref(), event.event.created_at).await;
             adapter.handle_group_relay_copy(event, Some(&account)).await.unwrap();
         }
         adapter.handle_relay_eose(fast, id.clone()).await;
@@ -443,7 +443,7 @@ async fn slow_peer_keeps_plaintext() {
             let mut event = event.clone();
             event.endpoint = slow.clone();
             event.subscription_id = Some(id.clone());
-            adapter.observe_relay_event(&event).await;
+            adapter.observe_relay_event(&hex::decode(&event.event.id).unwrap(), &event.endpoint, event.subscription_id.as_deref(), event.event.created_at).await;
             adapter.handle_group_relay_copy(event, Some(&account)).await.unwrap();
         }
         assert!(started.elapsed() < Duration::from_secs(30), "the older prefix arrives inside the production service lease");

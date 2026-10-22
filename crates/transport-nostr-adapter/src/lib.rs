@@ -1069,6 +1069,8 @@ pub struct NostrTransportAdapter {
     /// account worker drains it from a synchronous seam. Bounded per account
     /// by [`SUBSCRIPTION_REFUSAL_REPORT_LIMIT`].
     subscription_refusals: Arc<std::sync::Mutex<HashMap<MemberId, PendingSubscriptionRefusals>>>,
+    #[cfg(all(test, feature = "sdk"))]
+    sdk_dto_builds: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl NostrTransportAdapter {
@@ -1087,6 +1089,8 @@ impl NostrTransportAdapter {
             monotonic_start: std::time::Instant::now(),
             publish_accounting: publish_accounting::PublishAccounting::new(),
             subscription_refusals: Arc::default(),
+            #[cfg(all(test, feature = "sdk"))]
+            sdk_dto_builds: Arc::default(),
         }
     }
 
@@ -2058,7 +2062,10 @@ impl NostrTransportAdapter {
         if relay_event.event.kind != KIND_MARMOT_GROUP_MESSAGE {
             return Ok(0);
         }
-        let Some(account) = self.group_copy_account(&relay_event, account_id).await else {
+        let Some(subscription_id) = relay_event.subscription_id.as_deref() else {
+            return Ok(0);
+        };
+        let Some(account) = self.group_copy_account(subscription_id, account_id).await else {
             return Ok(0);
         };
         self.handle_relay_event_scoped(relay_event, Some(&account), RelayCopy::RawGroup)
@@ -2067,11 +2074,10 @@ impl NostrTransportAdapter {
 
     async fn group_copy_account(
         &self,
-        relay_event: &NostrRelayEvent,
+        id: &str,
         account_id: Option<&MemberId>,
     ) -> Option<MemberId> {
         let state = self.state.read().await;
-        let id = relay_event.subscription_id.as_ref()?;
         let owns = |coverage: &AccountReplayCoverage| {
             coverage
                 .windows
@@ -2093,22 +2099,132 @@ impl NostrTransportAdapter {
         }
     }
 
-    /// Observe every raw group copy, then reuse its validated transport body
-    /// for admission. Untracked copies still contribute observation telemetry,
-    /// but never construct account deliveries or bypass the active REQ gate.
+    /// Existing buffered bodies own their authenticated routing metadata;
+    /// another SDK-verified relay copy adds only its independent source claim.
     #[cfg(feature = "sdk")]
-    async fn observe_group_relay_copy(
+    async fn handle_sdk_group_copy(
         &self,
-        relay_event: NostrRelayEvent,
+        event: &nostr::prelude::Event,
+        endpoint: TransportEndpoint,
+        subscription_id: String,
         account_id: Option<&MemberId>,
     ) -> Result<usize, TransportAdapterError> {
-        let message = self.observe_relay_message(&relay_event).await?;
-        if relay_event.event.kind != KIND_MARMOT_GROUP_MESSAGE {
-            return Ok(0);
-        }
-        let Some(account) = self.group_copy_account(&relay_event, account_id).await else {
+        let Some(account) = self.group_copy_account(&subscription_id, account_id).await else {
+            self.observe_relay_event(
+                event.id.as_bytes(),
+                &endpoint,
+                Some(&subscription_id),
+                event.created_at.as_secs(),
+            )
+            .await;
             return Ok(0);
         };
+        let id = event.id.to_bytes();
+        let mut route = [0; 32];
+        let route = event
+            .tags
+            .iter()
+            .find_map(|tag| {
+                let [name, value] = tag.as_slice() else {
+                    return None;
+                };
+                (name == "h").then_some(value)
+            })
+            .filter(|value| hex::decode_to_slice(value, &mut route).is_ok())
+            .map(|_| route);
+        let parsed_endpoint = RelayUrl::parse(endpoint.as_str()).ok();
+        {
+            let mut state = self.state.write().await;
+            let created_at = route
+                .as_ref()
+                .and_then(|route| {
+                    let coverage = state.account_replay_coverage.get(&account)?;
+                    state
+                        .by_transport_group
+                        .get(route.as_slice())?
+                        .iter()
+                        .find_map(|entry| {
+                            coverage
+                                .groups
+                                .get(&entry.group_id)?
+                                .events
+                                .get(&id)
+                                .map(|held| held.delivery.message.timestamp.0)
+                        })
+                })
+                .unwrap_or(event.created_at.as_secs());
+            state.observe_relay_id(
+                &id,
+                &endpoint,
+                Some(&subscription_id),
+                created_at,
+                self.now_ms(),
+            );
+            let relay = state.relay_index.existing_index_for(&endpoint);
+            let AdapterState {
+                by_transport_group,
+                account_replay_coverage,
+                ..
+            } = &mut *state;
+            if let (Some(relay), Some(route), Some(coverage)) =
+                (relay, route, account_replay_coverage.get_mut(&account))
+            {
+                coverage.expire_replay(tokio::time::Instant::now());
+                let entries = by_transport_group
+                    .get(route.as_slice())
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let matching = entries.iter().filter(|entry| {
+                    entry.account_id == account
+                        && entry
+                            .endpoints
+                            .iter()
+                            .any(|candidate| candidate.matches(&endpoint, parsed_endpoint.as_ref()))
+                });
+                let released_live = !coverage.copy_is_historical(&subscription_id, relay)
+                    && coverage.released.contains(&id);
+                if released_live
+                    || matching.clone().all(|entry| {
+                        coverage
+                            .groups
+                            .get(&entry.group_id)
+                            .and_then(|group| group.events.get(&id))
+                            .is_some_and(|held| {
+                                matches!(&held.delivery.message.envelope,
+                            TransportEnvelope::GroupMessage { transport_group_id }
+                                if transport_group_id.as_slice() == route.as_slice())
+                            })
+                    })
+                {
+                    let mut delivered = 0;
+                    for entry in matching {
+                        if !released_live {
+                            coverage.claim_buffered_copy(
+                                &entry.group_id,
+                                id,
+                                &subscription_id,
+                                relay,
+                            );
+                        }
+                        delivered += 1;
+                    }
+                    state.record_inbound_event(delivered);
+                    return Ok(delivered);
+                }
+            }
+        }
+        #[cfg(test)]
+        self.sdk_dto_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let relay_event = NostrRelayEvent {
+            endpoint,
+            subscription_id: Some(subscription_id),
+            event: NostrTransportEvent::from_nostr_event(event).map_err(map_inbound_event_error)?,
+        };
+        let message = relay_event
+            .event
+            .to_transport_message()
+            .map_err(map_inbound_event_error)?;
         self.admit_relay_message(&relay_event, message, Some(&account), RelayCopy::RawGroup)
             .await
     }
@@ -2123,6 +2239,10 @@ impl NostrTransportAdapter {
         let message = relay_event
             .event
             .to_transport_message()
+            .map_err(map_inbound_event_error)?;
+        relay_event
+            .event
+            .to_verified_nostr_event()
             .map_err(map_inbound_event_error)?;
         let mut state = self.state.write().await;
         let deliveries = state.deliveries_for(&relay_event, message, Some(account_id));
@@ -2139,6 +2259,10 @@ impl NostrTransportAdapter {
         let message = relay_event
             .event
             .to_transport_message()
+            .map_err(map_inbound_event_error)?;
+        relay_event
+            .event
+            .to_verified_nostr_event()
             .map_err(map_inbound_event_error)?;
         self.admit_relay_message(&relay_event, message, account_id, copy)
             .await
@@ -2169,43 +2293,28 @@ impl NostrTransportAdapter {
     /// to observe every relay copy — including duplicates the delivery path
     /// deduplicates away — so cross-relay arrival spread and per-relay
     /// first-event timing can be measured. Timing uses the adapter's monotonic
-    /// clock, never the publisher-controlled `created_at`. Events that fail to
-    /// map to a transport message are ignored.
+    /// clock, never the publisher-controlled `created_at`. The caller supplies
+    /// an authenticated event id; this path does not inspect or serialize a body.
     ///
     /// It also counts each relay's stored events for an activation REQ before
     /// that relay's EOSE, so [`Self::handle_relay_eose`] can tell a replay the
     /// relay may have clamped (see [`RELAY_REPLAY_PAGE_LIMIT`]). Callers must
     /// pass a relay's copies in order with its EOSE.
-    pub async fn observe_relay_event(&self, relay_event: &NostrRelayEvent) {
-        let _ = self.observe_relay_message(relay_event).await;
-    }
-
-    async fn observe_relay_message(
+    pub async fn observe_relay_event(
         &self,
-        relay_event: &NostrRelayEvent,
-    ) -> Result<TransportMessage, TransportAdapterError> {
+        id: &[u8],
+        endpoint: &TransportEndpoint,
+        subscription_id: Option<&str>,
+        created_at: u64,
+    ) {
         let now_ms = self.now_ms();
-        // Count before mapping: the relay spent a slot of its page on this
-        // event whether or not it maps to a transport message.
-        if let Some(subscription_id) = &relay_event.subscription_id {
-            self.state.write().await.record_stored_replay_event(
-                subscription_id,
-                &relay_event.endpoint,
-                relay_event.event.created_at,
-            );
-        }
-        // Hash/tag validation and payload serialization must not hold the
-        // adapter write lock. The raw SDK path reuses this exact result.
-        let message = relay_event
-            .event
-            .to_transport_message()
-            .map_err(map_inbound_event_error)?;
-        let mut state = self.state.write().await;
-        state.record_delivery_timing(&message.id, &relay_event.endpoint, now_ms);
-        if let Some(subscription_id) = &relay_event.subscription_id {
-            state.record_subscription_first_event(subscription_id, &relay_event.endpoint, now_ms);
-        }
-        Ok(message)
+        self.state.write().await.observe_relay_id(
+            id,
+            endpoint,
+            subscription_id,
+            created_at,
+            now_ms,
+        );
     }
 
     /// Count one relay's copy of a stored event that could not be converted
@@ -2683,6 +2792,9 @@ impl ReplaySupervisor {
                 let Ok(message) = relay_event.event.to_transport_message() else {
                     continue;
                 };
+                if relay_event.event.to_verified_nostr_event().is_err() {
+                    continue;
+                }
                 let Some(state) = self.state.upgrade() else {
                     return PagedWindow::Closed;
                 };
@@ -4167,6 +4279,79 @@ impl AccountReplayCoverage {
         Ok(())
     }
 
+    fn copy_is_historical(&self, request: &str, relay: RelayIndex) -> bool {
+        self.subscriptions
+            .get(request)
+            .and_then(|relays| relays.get(&relay))
+            .is_some_and(|replay| *replay != RelayReplay::Eose)
+            && !self
+                .stored
+                .get(request)
+                .and_then(|relays| relays.get(&relay))
+                .is_some_and(|stored| stored.ended)
+    }
+
+    fn claim_buffered_copy(
+        &mut self,
+        group_id: &GroupId,
+        id: [u8; 32],
+        request: &str,
+        relay: RelayIndex,
+    ) {
+        let group = &self.groups[group_id];
+        let message = &group.events[&id].delivery.message;
+        let since = message.timestamp.0;
+        self.retained_since = Some(self.retained_since.map_or(since, |held| held.min(since)));
+        let TransportEnvelope::GroupMessage { transport_group_id } = &message.envelope else {
+            return;
+        };
+        let route = transport_group_id
+            .as_slice()
+            .try_into()
+            .expect("validated group route");
+        let owner = self.delivery_owner(group, Some(request), Some(relay), route);
+        let historical = self.copy_is_historical(request, relay);
+        if historical {
+            let Some(owner) = owner.as_ref() else { return };
+            let stream = &group.streams[owner];
+            if stream.phase == ReplayAdmission::Dormant {
+                self.abandon_stream(group_id, owner, ReplayAbandon::Lost);
+                return;
+            }
+            if stream.phase == ReplayAdmission::Abandoned {
+                self.record_loss(stream.since);
+                return;
+            }
+            if stream.claims.contains(&id) {
+                return;
+            }
+        } else if self.released.contains(&id) || group.live.contains(&id) {
+            return;
+        }
+        let native = historical && self.native_owned(group_id, &id);
+        if historical
+            && !native
+            && let Some(ingress) = &self.ingress
+        {
+            ingress.invalidate_group(group_id);
+        }
+        let group = self.groups.get_mut(group_id).expect("buffered group");
+        let claimed = if historical {
+            let stream = group
+                .streams
+                .get_mut(owner.as_ref().expect("historical owner"))
+                .expect("tracked source");
+            stream.observed = true;
+            stream.claims.insert(id)
+        } else {
+            group.live.insert(id)
+        };
+        if claimed && !native {
+            group.events.get_mut(&id).expect("buffered body").owners += 1;
+        }
+        self.wake_replay();
+    }
+
     fn stage_delivery(
         &mut self,
         delivery: TransportDelivery,
@@ -4178,6 +4363,21 @@ impl AccountReplayCoverage {
         let Ok(id) = <[u8; 32]>::try_from(delivery.message.id.as_slice()) else {
             return Ok(());
         };
+        if matches!(input, ReplayInput::History | ReplayInput::Live)
+            && let (Some(group_id), Some(request), Some(relay)) = (
+                delivery.group_id_hint.as_ref(),
+                delivery.source.subscription_id.as_deref(),
+                relay,
+            )
+            && self.subscriptions.contains_key(request)
+            && self
+                .groups
+                .get(group_id)
+                .is_some_and(|group| group.events.contains_key(&id))
+        {
+            self.claim_buffered_copy(group_id, id, request, relay);
+            return Ok(());
+        }
         let since = delivery.message.timestamp.0;
         self.retained_since = Some(self.retained_since.map_or(since, |held| held.min(since)));
         let Some(group_id) = delivery.group_id_hint.as_ref() else {
@@ -5790,9 +5990,27 @@ impl AdapterState {
         }
     }
 
+    fn observe_relay_id(
+        &mut self,
+        id: &[u8],
+        endpoint: &TransportEndpoint,
+        subscription_id: Option<&str>,
+        created_at: u64,
+        now_ms: u64,
+    ) {
+        if let Some(subscription_id) = subscription_id {
+            self.record_stored_replay_event(subscription_id, endpoint, created_at);
+        }
+        let Ok(id) = id.try_into() else { return };
+        self.record_delivery_timing(id, endpoint, now_ms);
+        if let Some(subscription_id) = subscription_id {
+            self.record_subscription_first_event(subscription_id, endpoint, now_ms);
+        }
+    }
+
     fn record_delivery_timing(
         &mut self,
-        message_id: &MessageId,
+        message_id: &[u8; 32],
         endpoint: &TransportEndpoint,
         now_ms: u64,
     ) {

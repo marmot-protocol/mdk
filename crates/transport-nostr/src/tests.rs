@@ -1416,7 +1416,7 @@ async fn lag_parks_missing_relay() {
     let healthy_at = OPENED_CURSOR + 500;
     let mut history = group_event("healthy-owned-history", &transport_group_id);
     history.created_at = healthy_at;
-    history.id = history.computed_id();
+    sign_group_event(&mut history);
     relay.history.lock().unwrap().push(RetainedHistory {
         account_id: account.clone(),
         routes: vec![[0xD4; 32]],
@@ -1535,7 +1535,7 @@ async fn lag_parks_missing_relay() {
 
         let mut live = group_event(&format!("healthy-live-{index}"), &transport_group_id);
         live.created_at = OPENED_CURSOR + 700 + index;
-        live.id = live.computed_id();
+        sign_group_event(&mut live);
         let live_id = live.to_transport_message().unwrap().id;
         expected.push(live_id.clone());
         plane
@@ -1606,10 +1606,10 @@ async fn lag_parks_missing_relay() {
     );
     let mut older = group_event("reconnected-history-older", &transport_group_id);
     older.created_at = OPENED_CURSOR + 1_200;
-    older.id = older.computed_id();
+    sign_group_event(&mut older);
     let mut newer = group_event("reconnected-history-newer", &transport_group_id);
     newer.created_at = OPENED_CURSOR + 1_400;
-    newer.id = newer.computed_id();
+    sign_group_event(&mut newer);
     for event in [newer.clone(), older.clone()] {
         plane
             .handle_relay_event_for_test(NostrRelayEvent {
@@ -3067,7 +3067,12 @@ async fn shared_group_event_is_delivered_to_each_matching_account_receiver() {
             .inner
             .transport
             .adapter
-            .observe_relay_event(&copy)
+            .observe_relay_event(
+                &hex::decode(&copy.event.id).unwrap(),
+                &copy.endpoint,
+                copy.subscription_id.as_deref(),
+                copy.event.created_at,
+            )
             .await;
         assert_eq!(
             relay_plane.handle_relay_event_for_test(copy).await.unwrap(),
@@ -3863,7 +3868,7 @@ async fn silent_peer_lease_fences() {
         });
         let mut event = group_event("available-replay", &transport_group_id);
         event.created_at = OPENED_CURSOR + 500;
-        event.id = event.computed_id();
+        sign_group_event(&mut event);
         let copy = NostrRelayEvent {
             endpoint: available.clone(),
             subscription_id: Some(group_id),
@@ -3873,7 +3878,12 @@ async fn silent_peer_lease_fences() {
             .inner
             .transport
             .adapter
-            .observe_relay_event(&copy)
+            .observe_relay_event(
+                &hex::decode(&copy.event.id).unwrap(),
+                &copy.endpoint,
+                copy.subscription_id.as_deref(),
+                copy.event.created_at,
+            )
             .await;
         plane.handle_relay_event_for_test(copy).await.unwrap();
         let candidate = Some(OPENED_CURSOR + 2_000);
@@ -3996,7 +4006,7 @@ async fn replay_handoff_fences_cursor() {
     let created_at = OPENED_CURSOR + 500;
     let mut event = group_event("replay-router-handoff", &transport_group_id);
     event.created_at = created_at;
-    event.id = event.computed_id();
+    sign_group_event(&mut event);
     plane
         .handle_relay_event_for_test(NostrRelayEvent {
             endpoint: endpoint.clone(),
@@ -5679,9 +5689,6 @@ async fn directory_live_event_rejected_after_subscription_removed() {
 }
 
 fn group_event(id_prefix: &str, transport_group_id: &[u8]) -> NostrTransportEvent {
-    // `to_transport_message` verifies the id against the event hash (#351), so
-    // the distinguishing prefix lives in the content and the id is computed
-    // from it — distinct `id_prefix` values still yield distinct event ids.
     let mut event = NostrTransportEvent {
         id: String::new(),
         pubkey: "22".repeat(32),
@@ -5691,8 +5698,24 @@ fn group_event(id_prefix: &str, transport_group_id: &[u8]) -> NostrTransportEven
         content: format!("encrypted {id_prefix}"),
         sig: None,
     };
-    event.id = event.computed_id();
+    sign_group_event(&mut event);
     event
+}
+
+fn sign_group_event(event: &mut NostrTransportEvent) {
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp};
+
+    let signed = EventBuilder::new(Kind::MlsGroupMessage, event.content.clone())
+        .tags(
+            event
+                .tags
+                .iter()
+                .map(|tag| Tag::parse(tag.clone()).unwrap()),
+        )
+        .custom_created_at(Timestamp::from_secs(event.created_at))
+        .finalize(&Keys::parse(&"11".repeat(32)).unwrap())
+        .unwrap();
+    *event = NostrTransportEvent::from_nostr_event(&signed).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

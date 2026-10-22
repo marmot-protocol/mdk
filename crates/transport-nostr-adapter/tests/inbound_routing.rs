@@ -263,12 +263,12 @@ impl NostrRelayClient for StoredReplayRelayClient {
                 subscription_id: Some(subscription_id.clone()),
                 event: group_event("30", transport_group_id),
             };
-            adapter.observe_relay_event(&relay_event).await;
+            observe_copy(&adapter, &relay_event).await;
             delivered += adapter.handle_relay_event(relay_event).await?;
         }
         let additional_replay = self.additional_replay.lock().unwrap().take();
         if let Some(relay_event) = additional_replay {
-            adapter.observe_relay_event(&relay_event).await;
+            observe_copy(&adapter, &relay_event).await;
             delivered += adapter.handle_relay_event(relay_event).await?;
         }
         self.replayed_deliveries
@@ -1638,7 +1638,7 @@ async fn cancelled_group_sync_rolls_back_staged_routes_and_telemetry() {
         subscription_id: Some(new_subscription_id.clone()),
         event: group_event("34", &new_transport_group_id),
     };
-    adapter.observe_relay_event(&staged_event).await;
+    observe_copy(&adapter, &staged_event).await;
     assert_eq!(adapter.handle_relay_event(staged_event).await.unwrap(), 1);
     assert!(
         tokio::time::timeout(Duration::from_millis(25), adapter.receive())
@@ -1883,13 +1883,15 @@ async fn observe_relay_event_records_every_relay_copy_for_spread() {
 
     // The same logical event seen from three relays on the raw per-relay tap.
     for endpoint in &endpoints {
-        adapter
-            .observe_relay_event(&NostrRelayEvent {
+        observe_copy(
+            &adapter,
+            &NostrRelayEvent {
                 endpoint: endpoint.clone(),
                 subscription_id: Some("group-sub".into()),
                 event: group_event("11", &transport_group_id),
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
     let spread = adapter.delivery_spread().await;
@@ -1924,13 +1926,15 @@ async fn resolve_relay_labels_maps_observed_indices_to_endpoints() {
 
     // Observing per-relay copies assigns opaque indices in first-seen order.
     for endpoint in &endpoints {
-        adapter
-            .observe_relay_event(&NostrRelayEvent {
+        observe_copy(
+            &adapter,
+            &NostrRelayEvent {
                 endpoint: endpoint.clone(),
                 subscription_id: Some("group-sub".into()),
                 event: group_event("11", &transport_group_id),
-            })
-            .await;
+            },
+        )
+        .await;
     }
 
     // The export boundary resolves those indices back to relay URLs, but only
@@ -1974,10 +1978,9 @@ async fn deduplicated_delivery_path_does_not_record_spread() {
 }
 
 #[tokio::test]
-async fn forged_event_id_fails_closed_on_delivery_and_telemetry_paths() {
+async fn forged_event_id_fails_closed_before_ingest() {
     // #351 — a subscribed, otherwise well-formed event whose self-reported id
-    // does not match the event hash must neither be routed (no `wire_id`
-    // poisoning) nor key per-relay telemetry on `observe_relay_event`.
+    // does not match the event hash must not poison the routed wire identity.
     let relay = Arc::new(FakeRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay);
     let account_id = MemberId::new(vec![0xA1; 32]);
@@ -2005,9 +2008,9 @@ async fn forged_event_id_fails_closed_on_delivery_and_telemetry_paths() {
 
     let error = adapter
         .handle_relay_event(NostrRelayEvent {
-            endpoint: endpoint.clone(),
+            endpoint,
             subscription_id: Some("group-sub".into()),
-            event: forged.clone(),
+            event: forged,
         })
         .await
         .expect_err("forged id must not map to a delivery");
@@ -2016,18 +2019,64 @@ async fn forged_event_id_fails_closed_on_delivery_and_telemetry_paths() {
         cgka_traits::TransportAdapterError::InvalidInboundSignature
     ));
 
-    adapter
-        .observe_relay_event(&NostrRelayEvent {
-            endpoint,
-            subscription_id: Some("group-sub".into()),
-            event: forged,
-        })
-        .await;
+    assert_no_delivery(&adapter).await;
+}
 
-    let spread = adapter.delivery_spread().await;
-    assert_eq!(spread.observed, 0, "forged id must not enter telemetry");
-    assert_eq!(spread.spread.sample_count(), 0);
-    assert_eq!(spread.per_relay.len(), 0);
+#[tokio::test]
+async fn unsigned_and_tampered_group_events_fail_before_ingest() {
+    let adapter = NostrTransportAdapter::new(Arc::new(FakeRelayClient::default()));
+    let account = MemberId::new(vec![0xa1; 32]);
+    let group = TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![0xb2; 16]),
+        transport_group_id: vec![0xc3; 32],
+        endpoints: vec![TransportEndpoint("wss://group.example".into())],
+        retained_since: None,
+    };
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![group.endpoints[0].clone()],
+            group_subscriptions: vec![group.clone()],
+            since: None,
+        })
+        .await
+        .unwrap();
+    let subscription_id = group_subscription_id(&adapter, &account, &group).await;
+    let signed = group_event("authenticated ciphertext", &group.transport_group_id);
+    let mut unsigned = signed.clone();
+    unsigned.sig = None;
+    let mut signature = signed.clone();
+    signature.sig = Some("00".repeat(64));
+    let mut body = signed;
+    body.content.push_str(" altered after signing");
+    body.id = body.computed_id();
+    for event in [unsigned, signature, body] {
+        let copy = NostrRelayEvent {
+            endpoint: group.endpoints[0].clone(),
+            subscription_id: Some(subscription_id.clone()),
+            event,
+        };
+        for result in [
+            adapter.handle_relay_event(copy.clone()).await,
+            adapter
+                .handle_reconciled_event(&account, copy.clone())
+                .await,
+            adapter
+                .handle_group_relay_copy(copy.clone(), Some(&account))
+                .await,
+        ] {
+            assert!(matches!(
+                result,
+                Err(cgka_traits::TransportAdapterError::InvalidInboundSignature)
+            ));
+        }
+        assert!(matches!(
+            adapter.reconciled_deliveries(&account, copy).await,
+            Err(cgka_traits::TransportAdapterError::InvalidInboundSignature)
+        ));
+    }
+    assert_no_delivery(&adapter).await;
+    assert_eq!(adapter.metrics().await.inbound_events_delivered, 0);
 }
 
 #[tokio::test]
@@ -2036,13 +2085,13 @@ async fn non_exact_kind_445_shape_is_typed_invalid_encoding() {
     let adapter = NostrTransportAdapter::new(relay);
     let mut event = group_event("extra-tag", &[0xC3; 32]);
     event.tags.push(vec!["e".into(), "11".repeat(32)]);
-    event.id = event.computed_id();
+    event = sign_group_event(event);
 
     let error = adapter
         .handle_relay_event(NostrRelayEvent {
             endpoint: TransportEndpoint("wss://group.example".into()),
             subscription_id: Some("group-sub".into()),
-            event: event.clone(),
+            event,
         })
         .await
         .expect_err("extra kind-445 tag must fail before routing");
@@ -2051,16 +2100,7 @@ async fn non_exact_kind_445_shape_is_typed_invalid_encoding() {
         cgka_traits::TransportAdapterError::InvalidInboundEncoding
     ));
 
-    adapter
-        .observe_relay_event(&NostrRelayEvent {
-            endpoint: TransportEndpoint("wss://group.example".into()),
-            subscription_id: Some("group-sub".into()),
-            event,
-        })
-        .await;
-    let spread = adapter.delivery_spread().await;
-    assert_eq!(spread.observed, 0);
-    assert_eq!(spread.per_relay.len(), 0);
+    assert_no_delivery(&adapter).await;
 }
 
 #[tokio::test]
@@ -2099,13 +2139,15 @@ async fn initial_sync_gate_closes_only_after_every_endpoint_eoses() {
 
     // A first event (observed on the per-relay tap) then EOSE from endpoint A:
     // still draining endpoint B.
-    adapter
-        .observe_relay_event(&NostrRelayEvent {
+    observe_copy(
+        &adapter,
+        &NostrRelayEvent {
             endpoint: endpoint_a.clone(),
             subscription_id: Some(sub_id.clone()),
             event: group_event("11", &transport_group_id),
-        })
-        .await;
+        },
+    )
+    .await;
     adapter.handle_relay_eose(endpoint_a, sub_id.clone()).await;
     assert_eq!(adapter.subscription_synced(&sub_id).await, Some(false));
 
@@ -4473,7 +4515,7 @@ async fn superseded_replay_is_dropped() {
         subscription_id: Some(old.clone()),
         event: event.clone(),
     };
-    adapter.observe_relay_event(&old_event).await;
+    observe_copy(&adapter, &old_event).await;
     adapter.handle_relay_event(old_event).await.unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(25), adapter.receive())
@@ -4497,7 +4539,7 @@ async fn superseded_replay_is_dropped() {
         subscription_id: Some(fresh.clone()),
         event: event.clone(),
     };
-    adapter.observe_relay_event(&fresh_event).await;
+    observe_copy(&adapter, &fresh_event).await;
     adapter.handle_relay_event(fresh_event).await.unwrap();
     adapter.handle_relay_eose(endpoint, fresh).await;
     assert_no_delivery(&adapter).await;
@@ -4705,7 +4747,7 @@ async fn cancelled_live_is_owned() {
         subscription_id: Some(id),
         event: cancelled.clone(),
     };
-    adapter.observe_relay_event(&copy).await;
+    observe_copy(&adapter, &copy).await;
     // Give background owners a turn and replenish the task's cooperative
     // budget, so the next poll reaches handoff rather than a budget yield.
     tokio::task::yield_now().await;
@@ -4806,7 +4848,7 @@ async fn cancelled_epoch_keeps_owner_fence() {
     assert_replay_idle(&adapter, &account).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn live_suffix_reuses_budget() {
     let adapter = NostrTransportAdapter::new(Arc::new(FakeRelayClient::default()));
     let account = MemberId::new(vec![0x63; 32]);
@@ -4828,14 +4870,14 @@ async fn live_suffix_reuses_budget() {
     for index in 0..32_000u64 {
         let mut event = group_event("stored", &group.transport_group_id);
         event.created_at += index;
-        event.id = event.computed_id();
+        event = sign_group_event(event);
         expected.push(event.to_transport_message().unwrap().id);
         let event = NostrRelayEvent {
             endpoint: group.endpoints[(index / 499) as usize].clone(),
             subscription_id: Some(id.clone()),
             event,
         };
-        adapter.observe_relay_event(&event).await;
+        observe_copy(&adapter, &event).await;
         adapter.handle_relay_event(event).await.unwrap();
     }
     for endpoint in &group.endpoints {
@@ -4854,14 +4896,14 @@ async fn live_suffix_reuses_budget() {
     // Its identifiers must not spend the pending live suffix's allowance.
     let mut event = group_event("live suffix", &group.transport_group_id);
     event.created_at += 32_000;
-    event.id = event.computed_id();
+    event = sign_group_event(event);
     expected.push(event.to_transport_message().unwrap().id);
     let event = NostrRelayEvent {
         endpoint: group.endpoints[0].clone(),
         subscription_id: Some(id),
         event,
     };
-    adapter.observe_relay_event(&event).await;
+    observe_copy(&adapter, &event).await;
     adapter.handle_relay_event(event).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         for id in expected.into_iter().skip(1) {
@@ -4903,7 +4945,7 @@ async fn overflow_keeps_live_order() {
             subscription_id: Some(id.clone()),
             event: event.clone(),
         };
-        adapter.observe_relay_event(&copy).await;
+        observe_copy(&adapter, &copy).await;
         adapter.handle_group_relay_copy(copy, None).await.unwrap();
         expected.push(event);
     }
@@ -5021,7 +5063,7 @@ async fn overlapping_replay_keeps_copy() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn oversized_replay_is_withheld() {
     // Keep every relay below a full page, so incomplete paging cannot mask
     // either buffer limit. The item case also stays below the byte allowance.
@@ -5052,7 +5094,7 @@ async fn oversized_replay_is_withheld() {
         for index in 0..items {
             let mut event = group_event(&body, &large.transport_group_id);
             event.created_at += index;
-            event.id = event.computed_id();
+            event = sign_group_event(event);
             let endpoint = &large.endpoints[(index / 499) as usize];
             if endpoint != abandoned {
                 expected.insert(event.to_transport_message().unwrap().id);
@@ -5062,7 +5104,7 @@ async fn oversized_replay_is_withheld() {
                 subscription_id: Some(large_id.clone()),
                 event,
             };
-            adapter.observe_relay_event(&event).await;
+            observe_copy(&adapter, &event).await;
             adapter.handle_relay_event(event).await.unwrap();
         }
         let event = group_event("healthy peer group", &small.transport_group_id);
@@ -5072,7 +5114,7 @@ async fn oversized_replay_is_withheld() {
             subscription_id: Some(small_id.clone()),
             event,
         };
-        adapter.observe_relay_event(&event).await;
+        observe_copy(&adapter, &event).await;
         adapter.handle_relay_event(event).await.unwrap();
         for endpoint in &large.endpoints {
             adapter
@@ -5121,7 +5163,7 @@ fn group_event(id_byte: &str, transport_group_id: &[u8]) -> NostrTransportEvent 
     // `to_transport_message` verifies the id against the event hash (#351), so
     // the distinguishing byte lives in the content and the id is computed from
     // it — distinct `id_byte` values still yield distinct event ids.
-    let mut event = NostrTransportEvent {
+    let event = NostrTransportEvent {
         id: String::new(),
         pubkey: "22".repeat(32),
         created_at: 1_700_000_010,
@@ -5130,8 +5172,29 @@ fn group_event(id_byte: &str, transport_group_id: &[u8]) -> NostrTransportEvent 
         content: format!("outer encrypted body {id_byte}"),
         sig: None,
     };
-    event.id = event.computed_id();
-    event
+    sign_group_event(event)
+}
+
+fn sign_group_event(event: NostrTransportEvent) -> NostrTransportEvent {
+    use nostr::prelude::{EventBuilder, Keys, Kind, Tag, Timestamp};
+    let keys = Keys::parse(&"11".repeat(32)).unwrap();
+    let signed = EventBuilder::new(Kind::from_u16(event.kind as u16), event.content)
+        .tags(event.tags.into_iter().map(|tag| Tag::parse(tag).unwrap()))
+        .custom_created_at(Timestamp::from_secs(event.created_at))
+        .finalize(&keys)
+        .unwrap();
+    NostrTransportEvent::from_nostr_event(&signed).unwrap()
+}
+
+async fn observe_copy(adapter: &NostrTransportAdapter, copy: &NostrRelayEvent) {
+    adapter
+        .observe_relay_event(
+            &hex::decode(&copy.event.id).unwrap(),
+            &copy.endpoint,
+            copy.subscription_id.as_deref(),
+            copy.event.created_at,
+        )
+        .await;
 }
 
 #[tokio::test]
@@ -5237,7 +5300,7 @@ async fn maintenance_failure_cleans_up() {
         .install_group_maintenance_subscription(&account_id, &group)
         .await
         .unwrap();
-    adapter.observe_relay_event(&event).await;
+    observe_copy(&adapter, &event).await;
     assert_eq!(adapter.handle_relay_event(event.clone()).await.unwrap(), 1);
     assert_no_delivery(&adapter).await;
     adapter
@@ -6497,7 +6560,7 @@ fn group_event_at(
 ) -> NostrTransportEvent {
     let mut event = group_event(body, &group.transport_group_id);
     event.created_at = second;
-    event.id = event.computed_id();
+    event = sign_group_event(event);
     event
 }
 
@@ -6512,7 +6575,7 @@ async fn route_group_copy(
         subscription_id: Some(subscription_id.to_owned()),
         event: event.clone(),
     };
-    adapter.observe_relay_event(&copy).await;
+    observe_copy(adapter, &copy).await;
     adapter.handle_group_relay_copy(copy, None).await.unwrap();
 }
 
@@ -7394,7 +7457,7 @@ async fn refused_peer_releases_history() {
         subscription_id: Some(id.clone()),
         event: newer.clone(),
     };
-    adapter.observe_relay_event(&copy).await;
+    observe_copy(&adapter, &copy).await;
     adapter.handle_group_relay_copy(copy, None).await.unwrap();
     adapter
         .handle_relay_eose(group.endpoints[0].clone(), id.clone())

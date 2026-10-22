@@ -66,9 +66,10 @@ for reconnect/backoff and relay status mechanics.
   - A failed or cancelled group sync closes the REQs its batch installed once its subscribe tasks settle, except ids
     the committed routes still want (`close_abandoned_sync_batch`). Its guard holds the lifecycle lock throughout.
 - Never count a replay a relay may have clamped as coverage (#2263):
-  - `observe_relay_event` counts each relay's stored events per activation, sync or maintenance REQ until that relay's EOSE, before
-    mapping them. Consumers must pass a relay's copies in order with its EOSE, and report events that fail
-    `from_nostr_event` through `observe_unconvertible_relay_event` instead of dropping them.
+  - `observe_relay_event` takes an authenticated event id and counts each relay's stored events per activation,
+    sync or maintenance REQ until that relay's EOSE, without materializing a DTO. Consumers must pass a relay's
+    copies in order with its EOSE, and report unconvertible stored events through
+    `observe_unconvertible_relay_event` instead of dropping them.
   - A relay that sent `RELAY_REPLAY_PAGE_LIMIT` or more moves to `RelayReplay::Paging`, which is neither complete nor
     settled. `page_replay` then fetches the window backwards with `acquire_history` until a page comes back short;
     only then does that relay's EOSE count.

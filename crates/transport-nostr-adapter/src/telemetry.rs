@@ -28,7 +28,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use cgka_traits::MessageId;
 use cgka_traits::TransportEndpoint;
 use cgka_traits::TransportEndpointRejectionCategory;
 use nostr::prelude::{RelayUrl, Url};
@@ -334,7 +333,7 @@ struct DeliveryTally {
 #[derive(Clone, Debug)]
 pub struct RelayDeliveryTelemetry {
     tracking_window_ms: u64,
-    pending: HashMap<MessageId, FirstSighting>,
+    pending: HashMap<[u8; 32], FirstSighting>,
     spread: DurationHistogram,
     per_relay: HashMap<RelayIndex, DeliveryTally>,
     observed: u64,
@@ -367,7 +366,7 @@ impl RelayDeliveryTelemetry {
     /// re-delivering a message is ignored; only the first sighting from each
     /// distinct relay contributes a spread sample. Pruning of the tracking
     /// window happens here so the table stays bounded without a timer.
-    pub fn record_sighting(&mut self, message_id: &MessageId, relay: RelayIndex, now_ms: u64) {
+    pub fn record_sighting(&mut self, message_id: &[u8; 32], relay: RelayIndex, now_ms: u64) {
         self.prune(now_ms);
 
         match self.pending.get_mut(message_id) {
@@ -377,7 +376,7 @@ impl RelayDeliveryTelemetry {
                 let mut relays = HashSet::new();
                 relays.insert(relay);
                 self.pending.insert(
-                    message_id.clone(),
+                    *message_id,
                     FirstSighting {
                         first_seen_ms: now_ms,
                         relays,
@@ -922,8 +921,8 @@ pub struct RelayRefusalStats {
 mod tests {
     use super::*;
 
-    fn msg(byte: u8) -> MessageId {
-        MessageId::new(vec![byte; 32])
+    fn msg(byte: u8) -> [u8; 32] {
+        [byte; 32]
     }
 
     const A: RelayIndex = RelayIndex(0);

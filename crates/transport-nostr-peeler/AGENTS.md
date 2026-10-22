@@ -43,7 +43,10 @@ skips content validation is a contract violation, not a style choice.
 - **No self-reported identifier is trusted before verification.** `to_transport_message` verifies the event `id`
   against the recomputed NIP-01 event hash before it becomes `TransportMessage.id` (which keys routing metrics,
   telemetry, and the forensic `wire_id`); a mismatch fails closed on every ingest path, including telemetry-only
-  observation. Signature verification still happens at peel time.
+  observation. Group peeling also binds the payload hash to `TransportMessage.id`, but does not verify signatures:
+  callers must authenticate inbound events before engine admission. Public DTO construction and hash validation
+  alone do not establish authenticity. The adapter verifies non-SDK inputs; alternate ingest paths must provide
+  the same guarantee. Welcome peeling delegates outer-event and seal verification to NIP-59 unwrap.
 - **Loose first-match helpers (`tag_value`, `tag_values`) are for non-routing, genuinely multi-valued fields only**,
   and any such field must carry explicit count/length bounds. Do not reach for them when wiring up a new tag.
 

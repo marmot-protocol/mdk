@@ -44,7 +44,7 @@ async fn local_publish_keeps_history() {
         for event in events[..180].iter().rev() {
             let mut event = event.clone();
             event.subscription_id = Some(id.clone());
-            adapter.observe_relay_event(&event).await;
+            adapter.observe_relay_event(&hex::decode(&event.event.id).unwrap(), &event.endpoint, event.subscription_id.as_deref(), event.event.created_at).await;
             adapter.handle_group_relay_copy(event, Some(&account)).await.unwrap();
         }
         // A newer real send is locally fanned out before the receiver's older
@@ -150,7 +150,14 @@ async fn queued_live_rejoins() {
         for event in &events[..180] {
             let mut event = event.clone();
             event.subscription_id = Some(old.clone());
-            adapter.observe_relay_event(&event).await;
+            adapter
+                .observe_relay_event(
+                    &hex::decode(&event.event.id).unwrap(),
+                    &event.endpoint,
+                    event.subscription_id.as_deref(),
+                    event.event.created_at,
+                )
+                .await;
             adapter
                 .handle_group_relay_copy(event, Some(&account))
                 .await
@@ -201,7 +208,14 @@ async fn queued_live_rejoins() {
             let mut event = event.clone();
             event.endpoint = b.clone();
             event.subscription_id = Some(current.clone());
-            adapter.observe_relay_event(&event).await;
+            adapter
+                .observe_relay_event(
+                    &hex::decode(&event.event.id).unwrap(),
+                    &event.endpoint,
+                    event.subscription_id.as_deref(),
+                    event.event.created_at,
+                )
+                .await;
             adapter
                 .handle_group_relay_copy(event, Some(&account))
                 .await
