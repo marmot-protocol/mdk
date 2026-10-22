@@ -83,7 +83,8 @@ ownership keeps unchanged sockets and connection epochs alive; final teardown
 passes an empty slice. Pending replacements remain reachable by account cleanup
 if setup is cancelled. Removed sockets also lose their notification monitors and
 frontier entries; re-adding a relay receives a fresh process-monotonic connection
-epoch.
+epoch. Notification-reader startup shares the relay lifecycle lock with eviction,
+so a stale pool snapshot cannot reattach a removed monitor.
 
 The app-runtime layer projects group subscriptions and group-message publish targets from
 `marmot.transport.nostr.routing.v1` and applies relay endpoint parsing/deduplication before subscription or publish.

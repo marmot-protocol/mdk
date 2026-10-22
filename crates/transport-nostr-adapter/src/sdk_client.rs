@@ -1084,7 +1084,7 @@ struct SdkFrontierReader {
     receiver: broadcast::Receiver<NostrSdkNotification>,
     buffered: Option<NostrSdkNotification>,
     frontier: Arc<SdkNotificationFrontier>,
-    client: Option<Client>,
+    relay_cache: Option<Arc<PublishRelayCache>>,
     cutovers: watch::Receiver<u64>,
     reader: u64,
     cursor: Option<RelayUrl>,
@@ -1809,7 +1809,7 @@ impl NostrSdkRelayClient {
             receiver,
             buffered: None,
             frontier: self.frontier.clone(),
-            client: Some(self.client.clone()),
+            relay_cache: Some(self.publish_relay_cache.clone()),
             cutovers: self.frontier.cutovers.subscribe(),
             reader: 0,
             cursor: None,
@@ -1820,8 +1820,10 @@ impl NostrSdkRelayClient {
             if reader.done {
                 return None;
             }
-            if let Some(client) = reader.client.take() {
-                for relay in client.relays().await.into_values() {
+            if let Some(cache) = reader.relay_cache.take() {
+                // A removed relay must not reattach from a stale pool snapshot.
+                let _lifecycle = cache.lifecycle.lock().await;
+                for relay in cache.client.relays().await.into_values() {
                     reader.frontier.attach(&relay, RelayMonitorAttach::Existing);
                 }
             }
@@ -6772,6 +6774,28 @@ mod tests {
         .expect("the live marker follows isolated acquisition replies");
         sdk.shutdown().await;
         relay.shutdown();
+    }
+
+    #[tokio::test]
+    async fn reader_respects_relay_removal() {
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let url = relay.url().await;
+        let sdk = NostrSdkRelayClient::new(Client::default());
+        sdk.add_subscription_relay(url.clone(), &SubscriptionId::new("startup"))
+            .await
+            .unwrap();
+        let mut notifications = sdk.notifications();
+        let lifecycle = sdk.publish_relay_cache.lifecycle.lock().await;
+        let mut next = Box::pin(notifications.next());
+        assert!(futures::poll!(next.as_mut()).is_pending());
+        sdk.client().remove_relay(url.clone()).await.unwrap();
+        sdk.frontier.detach(&url);
+        drop(lifecycle);
+        assert!(
+            timeout(Duration::from_millis(25), next).await.is_err(),
+            "reader startup must not revive a removed relay's replay boundary"
+        );
+        sdk.shutdown().await;
     }
 
     #[tokio::test]
