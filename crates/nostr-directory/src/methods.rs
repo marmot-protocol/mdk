@@ -1022,7 +1022,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         Ok(entries_by_id.into_values().collect())
     }
 
-    pub fn directory_sync_plan(&self) -> Result<DirectorySyncPlan, DirectoryError> {
+    pub(crate) fn directory_sync_plan(&self) -> Result<DirectorySyncPlan, DirectoryError> {
         let local_account_ids = self
             .resources
             .local_accounts()?

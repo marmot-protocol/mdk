@@ -25,7 +25,11 @@ MDK that host is [`marmot-app`](../marmot-app), which re-exports the directory's
 
 A host implements `DirectoryResources` (its accounts, the caches, shared storage), `BlockListSink` (block-list
 adoption and reconciliation) and `DirectoryObserver` (usage analytics), then builds a `Directory` over them with a
-`DirectoryConfig` and a shared `DirectoryState`. `marmot-app` does this in `src/directory_resources.rs`.
+`DirectoryConfig` and a shared `DirectoryState`. `marmot-app` does this in `src/directory_resources.rs` and hands the
+service out as `MarmotApp::directory()`.
+
+The crate's API is what its root re-exports, plus the `config` and `error` modules. The `test-support` feature adds
+the hooks `marmot-app`'s directory tests use; production builds never enable it.
 
 See the [directory brief](../../docs/marmot-architecture/review/brief-directory.md) for why the boundary sits where it
 does.

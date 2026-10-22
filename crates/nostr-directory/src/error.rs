@@ -123,7 +123,7 @@ impl ResourceError {
     }
 
     /// The wrapped error's privacy-safe kind, recorded when it was wrapped.
-    pub fn privacy_safe_kind(&self) -> &'static str {
+    pub(crate) fn privacy_safe_kind(&self) -> &'static str {
         self.kind
     }
 }

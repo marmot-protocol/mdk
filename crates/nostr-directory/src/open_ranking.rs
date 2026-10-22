@@ -28,7 +28,7 @@ pub(crate) const OPEN_RANKING_RESULT_LIMIT: usize = 20;
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RankedPubkey {
     pub(crate) account_id_hex: String,
-    pub rank: f64,
+    pub(crate) rank: f64,
 }
 
 #[derive(Serialize)]

@@ -612,7 +612,7 @@ pub(crate) struct UserRecordMatch {
 impl UserRecordMatch {
     /// Ranking key: quality first, then which field matched. Sorting by this
     /// orders best match first.
-    pub fn rank(&self) -> (MatchQuality, MatchedField) {
+    pub(crate) fn rank(&self) -> (MatchQuality, MatchedField) {
         (self.quality, self.field)
     }
 }

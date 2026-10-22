@@ -11,9 +11,20 @@ use crate::{AccountRelayListStatus, MarmotApp};
 use crate::{MatchQuality, MatchedField, UserProfileMetadata};
 use crate::{UserDirectoryRecord, UserDirectorySearchResult};
 use nostr_directory::error::DirectoryError;
-use nostr_directory::ids::npub_for_account_id_lossy;
-use nostr_directory::search::*;
+use nostr_directory::npub_for_account_id_lossy;
 use nostr_directory::{DirectorySearchGraphRecord, SEARCH_GRAPH_PROFILE_TTL_SECONDS};
+use nostr_directory::{
+    MAX_SUPPORTED_SEARCH_RADIUS, OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger, UserSearchParams,
+    UserSearchSubscription, UserSearchUpdate,
+};
+
+/// Wall-clock seconds for fixture timestamps.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
 
 /// A cached directory record for `account_id_hex` whose profile name is
 /// `name`, so it resolves entirely on-device.
@@ -312,7 +323,7 @@ async fn a_search_matches_a_stranger_cached_in_the_un_promoted_tier() {
     let stranger = format!("{:064x}", 77);
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
     let cache = app.directory_cache_for_account(&account).unwrap();
-    let now = nostr_directory::unix_now_seconds() as i64;
+    let now = unix_now();
 
     // The searcher's own follow list is promoted (it is the local account's
     // own contact list, not a stranger's), so radius 1 expands offline.
@@ -324,7 +335,7 @@ async fn a_search_matches_a_stranger_cached_in_the_un_promoted_tier() {
         })
         .unwrap();
     cache
-        .put_search_graph_record(
+        .put_search_graph_record_for_test(
             &DirectorySearchGraphRecord {
                 account_id_hex: stranger.clone(),
                 npub: npub_for_account_id_lossy(&stranger),
@@ -438,9 +449,9 @@ async fn a_profile_resolved_from_a_relay_is_cached_without_promoting_the_strange
     assert!(!result_profile.extra.contains_key("custom_blob"));
     assert_eq!(result_profile.extra.len(), 2);
 
-    let now = nostr_directory::unix_now_seconds() as i64;
+    let now = unix_now();
     let cached = cache
-        .search_record(&stranger.account_id_hex, now)
+        .search_record_for_test(&stranger.account_id_hex, now)
         .unwrap()
         .expect("the resolved profile must be cached for the next search");
     let cached_profile = cached.profile.expect("un-promoted cached profile");
@@ -465,7 +476,7 @@ async fn radius_two_expands_through_cached_follow_edges_without_a_relay() {
     let stranger = format!("{:064x}", 62);
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
     let cache = app.directory_cache_for_account(&account).unwrap();
-    let now = nostr_directory::unix_now_seconds() as i64;
+    let now = unix_now();
 
     // alice -> friend (promoted, her own contact list)
     cache
@@ -476,14 +487,14 @@ async fn radius_two_expands_through_cached_follow_edges_without_a_relay() {
         .unwrap();
     // friend -> stranger, cached un-promoted by an earlier traversal.
     cache
-        .remember_search_graph_follows(
+        .remember_search_graph_follows_for_test(
             &friend,
             &npub_for_account_id_lossy(&friend),
             std::slice::from_ref(&stranger),
         )
         .unwrap();
     cache
-        .put_search_graph_record(
+        .put_search_graph_record_for_test(
             &DirectorySearchGraphRecord {
                 account_id_hex: stranger.clone(),
                 npub: npub_for_account_id_lossy(&stranger),
@@ -545,7 +556,7 @@ async fn an_unanswered_contact_list_is_not_cached_as_following_nobody() {
     drain(subscription).await;
 
     assert_eq!(
-        cache.search_graph_follows(&friend).unwrap(),
+        cache.search_graph_follows_for_test(&friend).unwrap(),
         None,
         "an unanswered contact list must stay re-fetchable"
     );
@@ -563,10 +574,10 @@ async fn a_seeded_account_is_searchable_at_radius_one_without_being_followed() {
     let co_member = format!("{:064x}", 81);
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
     let cache = app.directory_cache_for_account(&account).unwrap();
-    let now = nostr_directory::unix_now_seconds() as i64;
+    let now = unix_now();
 
     cache
-        .put_search_graph_record(
+        .put_search_graph_record_for_test(
             &DirectorySearchGraphRecord {
                 account_id_hex: co_member.clone(),
                 npub: npub_for_account_id_lossy(&co_member),
@@ -733,18 +744,18 @@ async fn an_empty_graph_falls_back_to_the_configured_seed_and_says_so() {
             .with_open_ranking_provider(None, Vec::new()),
     );
     let cache = app.directory_cache_for_account(&account).unwrap();
-    let now = nostr_directory::unix_now_seconds() as i64;
+    let now = unix_now();
 
     // Alice follows nobody. The seed follows someone worth finding.
     cache
-        .remember_search_graph_follows(
+        .remember_search_graph_follows_for_test(
             &seed,
             &npub_for_account_id_lossy(&seed),
             std::slice::from_ref(&stranger),
         )
         .unwrap();
     cache
-        .put_search_graph_record(
+        .put_search_graph_record_for_test(
             &DirectorySearchGraphRecord {
                 account_id_hex: stranger.clone(),
                 npub: npub_for_account_id_lossy(&stranger),
@@ -796,7 +807,7 @@ async fn a_searcher_with_follows_never_reaches_the_fallback_seed() {
             .with_open_ranking_provider(None, Vec::new()),
     );
     let cache = app.directory_cache_for_account(&account).unwrap();
-    let now = nostr_directory::unix_now_seconds() as i64;
+    let now = unix_now();
 
     cache
         .put(&UserDirectoryRecord {
@@ -805,14 +816,14 @@ async fn a_searcher_with_follows_never_reaches_the_fallback_seed() {
         })
         .unwrap();
     cache
-        .remember_search_graph_follows(
+        .remember_search_graph_follows_for_test(
             &seed,
             &npub_for_account_id_lossy(&seed),
             std::slice::from_ref(&seeded_stranger),
         )
         .unwrap();
     cache
-        .put_search_graph_record(
+        .put_search_graph_record_for_test(
             &DirectorySearchGraphRecord {
                 account_id_hex: seeded_stranger.clone(),
                 npub: npub_for_account_id_lossy(&seeded_stranger),
@@ -876,7 +887,7 @@ async fn a_promoted_row_without_a_profile_does_not_mask_the_cached_one() {
     let stranger = format!("{:064x}", 101);
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.invalid");
     let cache = app.directory_cache_for_account(&account).unwrap();
-    let now = nostr_directory::unix_now_seconds() as i64;
+    let now = unix_now();
 
     cache
         .put(&UserDirectoryRecord {
@@ -894,7 +905,7 @@ async fn a_promoted_row_without_a_profile_does_not_mask_the_cached_one() {
         .unwrap();
     // The profile an earlier search resolved, cached un-promoted.
     cache
-        .put_search_graph_record(
+        .put_search_graph_record_for_test(
             &DirectorySearchGraphRecord {
                 account_id_hex: stranger.clone(),
                 npub: npub_for_account_id_lossy(&stranger),

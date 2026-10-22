@@ -3,8 +3,7 @@
 //! publish-endpoint selection. They hold no `MarmotApp` state.
 //!
 //! Parsing, validation and selection of other accounts' relay lists and
-//! KeyPackages live in [`nostr_directory::published_records`]; they are
-//! re-exported below so callers keep their paths.
+//! KeyPackages live in `nostr_directory::published_records`.
 
 use cgka_traits::TransportEndpoint;
 #[cfg(test)]
@@ -29,9 +28,6 @@ use crate::{AccountRelayListStatus, DirectoryKeyPackage, UserDirectoryRecord};
 use cgka_traits::engine::KeyPackage;
 #[cfg(test)]
 #[allow(unused_imports)]
-use nostr_directory::DirectoryFreshness;
-#[cfg(test)]
-#[allow(unused_imports)]
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
 #[cfg(test)]
 #[allow(unused_imports)]
@@ -42,24 +38,18 @@ use transport_nostr_adapter::{
 #[allow(unused_imports)]
 use transport_nostr_peeler::NostrTransportEvent;
 
-// The other-account half moved to the directory (step 3 of
-// docs/marmot-architecture/review/brief-directory.md); re-exported so callers
-// keep their paths.
+// The other-account half moved to `nostr_directory::published_records`. The
+// app's own KeyPackage paths still decode records through these two, and the
+// tests below still cover the rest through `super::*`.
 #[cfg(test)]
-#[allow(unused_imports)]
-pub(crate) use nostr_directory::published_records::validated_cached_key_package;
-#[allow(unused_imports)]
-pub(crate) use nostr_directory::published_records::{
-    KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, KeyPackageSelection, PreferredKeyPackage,
-    cached_key_package_from_entry, fresh_or_cached_key_package,
-    fresh_relay_list_status_from_records, is_legacy_key_package_record,
-    key_package_client_priority, key_package_event_id_from_hex, key_package_from_borrowed_record,
+pub(crate) use nostr_directory::{
+    fresh_or_cached_key_package, latest_fresh_key_package_from_records,
+    preferred_fresh_key_package_from_records, relay_list_queries, relay_list_status_from_records,
+    require_key_package_tag, require_multi_value_key_package_tag_matches,
+    validated_cached_key_package,
+};
+pub(crate) use nostr_directory::{
     key_package_from_hex_with_optional_source, key_package_from_record,
-    latest_fresh_key_package_from_records, merge_relay_list_status, package_is_deleted,
-    preferred_fresh_key_package_from_records, reject_duplicate_key_package_tag, relay_list_queries,
-    relay_list_status_from_records, require_key_package_tag,
-    require_multi_value_key_package_tag_matches, validated_cached_key_package_with_ref,
-    without_revoked_slot_winners,
 };
 
 pub(crate) fn account_key_package_record_from_fetched(

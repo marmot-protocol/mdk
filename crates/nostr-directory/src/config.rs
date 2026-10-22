@@ -58,7 +58,7 @@ pub struct KeyPackageClientPreference {
 impl KeyPackageClientPreference {
     /// 2 for a preferred client, 0 for one ranked last, 1 for any other or no
     /// tag.
-    pub fn rank(&self, client: Option<&str>) -> u8 {
+    pub(crate) fn rank(&self, client: Option<&str>) -> u8 {
         let Some(client) = client.map(str::trim) else {
             return 1;
         };

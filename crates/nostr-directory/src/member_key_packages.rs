@@ -264,7 +264,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
         .await
     }
 
-    pub async fn resolve_member_key_packages_for_purpose(
+    pub(crate) async fn resolve_member_key_packages_for_purpose(
         &self,
         member_refs: Vec<String>,
         purpose: MemberResolutionPurpose,

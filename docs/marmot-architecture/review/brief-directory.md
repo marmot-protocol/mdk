@@ -225,6 +225,9 @@ Each PR keeps behaviour unchanged and ships alone.
    - Narrow `nostr-directory`'s public surface to what those callers and the host traits need. PR 6 widened by
      compiler error and by name, so modules are `pub mod` and many internals are `pub`; once the delegates are gone,
      what `marmot-app` still names is the real surface, and the rest returns to `pub(crate)`.
+   - Modules other than `config` and `error` become private, so the root re-exports are the surface. What only
+     `marmot-app`'s directory tests reach sits behind `test-support`: `_for_test` wrappers for methods, gated
+     re-exports for free items.
 8. **Tracing targets.** `marmot_app::directory` becomes `nostr_directory::<module>`, as storage-boundaries PR 5 did
    (#2402).
 

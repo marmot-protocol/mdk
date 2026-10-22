@@ -55,10 +55,8 @@ use crate::key_package_records::{
 };
 use crate::messages::STREAM_ROUTE_QUIC;
 use crate::messages::{AppMessageIntent, build_inner_event};
-use nostr_directory::ids::npub_for_account_id_lossy;
-use nostr_directory::records::{
-    FetchedFollowList, profile_content_json, public_directory_user_record,
-};
+use nostr_directory::npub_for_account_id_lossy;
+use nostr_directory::{FetchedFollowList, profile_content_json, public_directory_user_record};
 
 fn one_pixel_png() -> Vec<u8> {
     use image::ImageEncoder;
@@ -8806,7 +8804,7 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
         .directory()
         .directory_entry_for_account_id(&account_id)
         .unwrap()
-        .unwrap_or_else(|| app.directory().empty_directory_record(&account_id));
+        .unwrap_or_else(|| app.directory().empty_directory_record_for_test(&account_id));
     entry.relay_lists.nip65.created_at = 1;
     entry.relay_lists.nip65.relays = vec![outbox.into()];
     entry.relay_lists.refresh();
@@ -9454,7 +9452,7 @@ async fn thirty_incremental_invites_with_large_directory_cache_converge_without_
     for _ in 0..256 {
         let account_id = Keys::generate().public_key().to_hex();
         app.directory()
-            .save_directory_entry(&app.directory().empty_directory_record(&account_id))
+            .save_directory_entry(&app.directory().empty_directory_record_for_test(&account_id))
             .unwrap();
     }
 
@@ -10800,7 +10798,7 @@ fn directory_search_uses_graph_cache_without_promoting_known_user() {
         })
         .unwrap();
     cache
-        .put_search_graph_record(
+        .put_search_graph_record_for_test(
             &nostr_directory::DirectorySearchGraphRecord {
                 account_id_hex: graph_user.clone(),
                 npub: npub_for_account_id_lossy(&graph_user),
@@ -10906,19 +10904,19 @@ fn duplicate_directory_entry_save_skips_cache_writes() {
 
     cache.reset_put_count_for_test();
     app.directory()
-        .save_directory_entry_with_reason(&entry, "message")
+        .save_directory_entry_with_reason_for_test(&entry, "message")
         .unwrap();
     assert_eq!(cache.put_count_for_test(), 1);
 
     cache.reset_put_count_for_test();
     app.directory()
-        .save_directory_entry_with_reason(&entry, "message")
+        .save_directory_entry_with_reason_for_test(&entry, "message")
         .unwrap();
     assert_eq!(cache.put_count_for_test(), 0);
 
     entry.profile.as_mut().unwrap().display_name = Some("cached peer".into());
     app.directory()
-        .save_directory_entry_with_reason(&entry, "message")
+        .save_directory_entry_with_reason_for_test(&entry, "message")
         .unwrap();
     assert_eq!(cache.put_count_for_test(), 1);
 }
@@ -10951,7 +10949,7 @@ fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
         ..UserProfileMetadata::default()
     };
     app.directory()
-        .remember_directory_profile_if_newer(&account_id, &stale_same_second)
+        .remember_directory_profile_if_newer_for_test(&account_id, &stale_same_second)
         .unwrap();
 
     // The local edit must survive the equal-timestamp refresh.
@@ -10972,7 +10970,7 @@ fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
         ..UserProfileMetadata::default()
     };
     app.directory()
-        .remember_directory_profile_if_newer(&account_id, &newer)
+        .remember_directory_profile_if_newer_for_test(&account_id, &newer)
         .unwrap();
     let entry = app
         .directory()
@@ -11790,7 +11788,7 @@ fn directory_entries_and_save_keep_newer_shared_record() {
     );
 
     app.directory()
-        .save_directory_entry_with_reason(&stale, "stale-cache")
+        .save_directory_entry_with_reason_for_test(&stale, "stale-cache")
         .unwrap();
     let entry = app
         .directory()
@@ -11840,10 +11838,10 @@ fn directory_sync_plan_watches_local_accounts_and_known_users() {
     let contact = format!("{:064x}", 42);
 
     app.directory()
-        .remember_directory_user_with_reason(&contact, "message")
+        .remember_directory_user_with_reason_for_test(&contact, "message")
         .unwrap();
 
-    let plan = app.directory().directory_sync_plan().unwrap();
+    let plan = app.directory().directory_sync_plan_for_test().unwrap();
     let watched = plan
         .batches
         .iter()
@@ -11871,10 +11869,10 @@ fn directory_sync_plan_does_not_subscribe_kind3_for_non_local_known_user() {
     // directory but must never have its kind-3 contact list subscribed: doing
     // so feeds the unbounded transitive social-graph crawl (mdk#687).
     app.directory()
-        .remember_directory_user_with_reason(&sender, "message")
+        .remember_directory_user_with_reason_for_test(&sender, "message")
         .unwrap();
 
-    let plan = app.directory().directory_sync_plan().unwrap();
+    let plan = app.directory().directory_sync_plan_for_test().unwrap();
 
     let local_kinds = plan
         .batches
@@ -11927,7 +11925,7 @@ fn contact_list_event(author_hex: &str, follows: &[String]) -> NostrTransportEve
 
 #[test]
 fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follows() {
-    use nostr_directory::records::MAX_FOLLOW_LIST_ENTRIES;
+    use nostr_directory::MAX_FOLLOW_LIST_ENTRIES;
 
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -11937,7 +11935,7 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
     // A remote, non-local user whose contact list arrives over a relay.
     let author = format!("{:064x}", 42);
     app.directory()
-        .remember_directory_user_with_reason(&author, "message")
+        .remember_directory_user_with_reason_for_test(&author, "message")
         .unwrap();
 
     // Build a contact list far larger than the per-list cap.
@@ -11979,7 +11977,7 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
 
     // The directory sync plan still watches only the author and local account,
     // never the discovered follows — so no transitive crawl is scheduled.
-    let plan = app.directory().directory_sync_plan().unwrap();
+    let plan = app.directory().directory_sync_plan_for_test().unwrap();
     let watched = plan
         .batches
         .iter()
@@ -11998,7 +11996,7 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
     // per-account search graph, even though the follows are not promoted.
     let cache = app.directory_cache_for_account(&account).unwrap();
     let search_record = cache
-        .search_record(&author, crate::unix_now_seconds() as i64)
+        .search_record_for_test(&author, crate::unix_now_seconds() as i64)
         .unwrap()
         .unwrap();
     assert_eq!(search_record.follows.len(), MAX_FOLLOW_LIST_ENTRIES);
@@ -12213,14 +12211,14 @@ fn local_account_directory_refresh_still_promotes_follows() {
     // from passive relay ingest) intentionally records its follows so they are
     // searchable and watched.
     app.directory()
-        .remember_directory_user_with_reason(&account.account_id_hex, "local")
+        .remember_directory_user_with_reason_for_test(&account.account_id_hex, "local")
         .unwrap();
     let follow_list = FetchedFollowList {
         follows: vec![follow.clone()],
         source_relays: vec!["wss://relay.example".to_owned()],
     };
     app.directory()
-        .remember_directory_follow_list(&account.account_id_hex, &follow_list)
+        .remember_directory_follow_list_for_test(&account.account_id_hex, &follow_list)
         .unwrap();
 
     let entry = app
@@ -12237,7 +12235,7 @@ fn local_account_directory_refresh_still_promotes_follows() {
         "an explicit follow-list refresh promotes follows into directory entries"
     );
 
-    let plan = app.directory().directory_sync_plan().unwrap();
+    let plan = app.directory().directory_sync_plan_for_test().unwrap();
     let local_batch = plan
         .batches
         .iter()
@@ -24581,7 +24579,7 @@ fn legacy_directory_label() {
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     app.directory()
-        .remember_directory_user_with_reason(&account.account_id_hex, "test")
+        .remember_directory_user_with_reason_for_test(&account.account_id_hex, "test")
         .unwrap();
     let entry = app
         .directory()

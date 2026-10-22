@@ -162,8 +162,8 @@ impl DirectoryFreshness {
 }
 
 #[derive(Debug)]
-pub struct DirectorySelection<T> {
-    pub value: T,
+pub(crate) struct DirectorySelection<T> {
+    pub(crate) value: T,
     pub(crate) rejected_future: bool,
 }
 
@@ -236,7 +236,7 @@ pub fn push_unique_strings(values: &mut Vec<String>, candidates: impl IntoIterat
 
 /// Evidence from a complete supplementary lookup, used only to restrict the
 /// direct diagnostic API's existing future-record cache fallback.
-pub struct KeyPackageRecoveryEvidence {
+pub(crate) struct KeyPackageRecoveryEvidence {
     account: String,
     winners: Vec<NostrTransportEvent>,
     deletions: Vec<NostrTransportEvent>,
@@ -244,7 +244,7 @@ pub struct KeyPackageRecoveryEvidence {
 
 /// Public lookup target metadata; deliberately excludes KeyPackage bytes.
 #[derive(Clone)]
-pub struct KeyPackageRecoveryTarget {
+pub(crate) struct KeyPackageRecoveryTarget {
     pub(crate) event_id: String,
     pub(crate) slot: String,
     pub(crate) created_at: u64,
@@ -288,7 +288,7 @@ impl KeyPackageRecoveryEvidence {
 
 /// Collapse fresh slot winners before applying deletions, retaining invalid,
 /// obsolete and incompatible replacements as barriers against older material.
-pub fn without_revoked_slot_winners(
+pub(crate) fn without_revoked_slot_winners(
     account: &str,
     mut records: Vec<RelayEventRecord>,
     deletions: &[RelayEventRecord],
@@ -342,7 +342,7 @@ pub fn without_revoked_slot_winners(
     )
 }
 
-pub fn package_is_deleted(
+pub(crate) fn package_is_deleted(
     account: &str,
     event_id: &str,
     slot: &str,
@@ -367,7 +367,7 @@ pub fn package_is_deleted(
     })
 }
 
-pub fn merge_relay_list_status(
+pub(crate) fn merge_relay_list_status(
     mut current: AccountRelayListStatus,
     candidate: AccountRelayListStatus,
 ) -> AccountRelayListStatus {
@@ -434,7 +434,7 @@ pub fn relay_list_status_from_records(
     status
 }
 
-pub fn fresh_relay_list_status_from_records(
+pub(crate) fn fresh_relay_list_status_from_records(
     account_id_hex: &str,
     mut records: Vec<RelayEventRecord>,
     freshness: DirectoryFreshness,
@@ -474,7 +474,7 @@ pub fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQuery> {
 /// rank candidates after admission checks and never relax cryptographic gates.
 /// The ranking is the deployment's [`KeyPackageClientPreference`]; an event
 /// with no single, valued `client` tag ranks as unlabelled.
-pub fn key_package_client_priority(
+pub(crate) fn key_package_client_priority(
     event: &NostrTransportEvent,
     preference: &KeyPackageClientPreference,
 ) -> u8 {
@@ -629,7 +629,7 @@ pub fn preferred_fresh_key_package_from_records(
 /// The author's MLS KeyPackage with a legacy-profile account proof. Current
 /// transport tag checks are skipped on purpose: deployed legacy publishers
 /// predate them (MDK 0.8 publishes no `app_components` tag).
-pub fn is_legacy_key_package_record(record: &RelayEventRecord) -> bool {
+pub(crate) fn is_legacy_key_package_record(record: &RelayEventRecord) -> bool {
     let Ok(bytes) = BASE64_STANDARD.decode(record.event.content.as_bytes()) else {
         return false;
     };
@@ -641,7 +641,7 @@ pub fn is_legacy_key_package_record(record: &RelayEventRecord) -> bool {
     })
 }
 
-pub fn cached_key_package_from_entry(
+pub(crate) fn cached_key_package_from_entry(
     entry: UserDirectoryRecord,
 ) -> Result<Option<FetchedKeyPackage>, DirectoryError> {
     let Some(key_package) = entry.key_package else {
@@ -670,7 +670,7 @@ pub fn validated_cached_key_package(
         .map(|(key_package, _)| key_package)
 }
 
-pub fn validated_cached_key_package_with_ref(
+pub(crate) fn validated_cached_key_package_with_ref(
     account_id_hex: &str,
     key_package: &DirectoryKeyPackage,
 ) -> Result<(KeyPackage, String), DirectoryError> {
@@ -721,7 +721,9 @@ pub fn key_package_from_hex_with_optional_source(
     )
 }
 
-pub fn key_package_event_id_from_hex(event_id_hex: &str) -> Result<MessageId, DirectoryError> {
+pub(crate) fn key_package_event_id_from_hex(
+    event_id_hex: &str,
+) -> Result<MessageId, DirectoryError> {
     let bytes = hex::decode(event_id_hex)?;
     if bytes.len() != 32 {
         return Err(DirectoryError::InvalidKeyPackageEvent(format!(
@@ -755,7 +757,7 @@ pub fn key_package_from_record(
     key_package_from_borrowed_record(&record)
 }
 
-pub fn key_package_from_borrowed_record(
+pub(crate) fn key_package_from_borrowed_record(
     record: &RelayEventRecord,
 ) -> Result<FetchedKeyPackage, DirectoryError> {
     let event = &record.event;
@@ -850,7 +852,7 @@ pub fn key_package_from_borrowed_record(
 /// tag. A consumer MUST reject an event that repeats an id-list tag name rather
 /// than silently reading the first occurrence (two consumers could otherwise
 /// pick different occurrences and disagree on advertised capabilities).
-pub fn reject_duplicate_key_package_tag(
+pub(crate) fn reject_duplicate_key_package_tag(
     event: &NostrTransportEvent,
     name: &str,
 ) -> Result<(), DirectoryError> {

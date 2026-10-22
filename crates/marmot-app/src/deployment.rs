@@ -326,13 +326,13 @@ mod tests {
     #[test]
     fn key_package_preference_ranks_by_client_tag() {
         let white_noise = MarmotDeployment::white_noise().key_package_client_preference;
-        assert_eq!(white_noise.rank(Some("WhiteNoise")), 2);
-        assert_eq!(white_noise.rank(Some(" amethyst ")), 0);
-        assert_eq!(white_noise.rank(Some("other")), 1);
-        assert_eq!(white_noise.rank(None), 1);
+        assert_eq!(white_noise.rank_for_test(Some("WhiteNoise")), 2);
+        assert_eq!(white_noise.rank_for_test(Some(" amethyst ")), 0);
+        assert_eq!(white_noise.rank_for_test(Some("other")), 1);
+        assert_eq!(white_noise.rank_for_test(None), 1);
         let neutral = KeyPackageClientPreference::default();
-        assert_eq!(neutral.rank(Some("whitenoise")), 1);
-        assert_eq!(neutral.rank(Some("amethyst")), 1);
+        assert_eq!(neutral.rank_for_test(Some("whitenoise")), 1);
+        assert_eq!(neutral.rank_for_test(Some("amethyst")), 1);
     }
 
     #[test]

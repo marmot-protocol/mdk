@@ -11,7 +11,10 @@ use nostr_sdk::local_relay::MockRelay;
 use nostr_sdk::prelude::Client;
 
 use crate::{AppError, MarmotApp};
-use nostr_directory::previews::*;
+use nostr_directory::{
+    EVENT_DELETION_QUERY_LIMIT, MAX_PUBLIC_EVENT_REFERENCES, PublicEventPreview,
+    PublicEventPreviewRead,
+};
 
 fn signed(keys: &Keys, kind: u16, created_at: u64, content: &str, tags: Vec<Tag>) -> Event {
     EventBuilder::new(Kind::from(kind), content)
@@ -305,7 +308,7 @@ fn relay_hints_pass_the_discovered_endpoint_safety_rule() {
     .map(|url| TransportEndpoint(url.to_owned()))
     .to_vec();
     assert_eq!(
-        app.directory().public_event_query_relays(hints),
+        app.directory().public_event_query_relays_for_test(hints),
         ["wss://hint.example", "wss://relay.example"]
             .map(|url| TransportEndpoint(RelayUrl::parse(url).unwrap().to_string()))
     );
@@ -318,13 +321,19 @@ fn refresh_cooldowns_outlive_the_service_that_started_them() {
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relays(dir.path(), vec!["wss://relay.example".to_owned()]);
     let key = "alice\nnote".to_owned();
-    assert!(!app.directory().public_event_refresh_cooling_down(&key));
+    assert!(
+        !app.directory()
+            .public_event_refresh_cooling_down_for_test(&key)
+    );
     app.directory()
-        .start_public_event_refresh_cooldown(key.clone());
-    assert!(app.directory().public_event_refresh_cooling_down(&key));
+        .start_public_event_refresh_cooldown_for_test(key.clone());
+    assert!(
+        app.directory()
+            .public_event_refresh_cooling_down_for_test(&key)
+    );
     assert!(
         app.clone()
             .directory()
-            .public_event_refresh_cooling_down(&key)
+            .public_event_refresh_cooling_down_for_test(&key)
     );
 }

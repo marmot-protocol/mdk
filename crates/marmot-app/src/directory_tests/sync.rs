@@ -10,7 +10,7 @@ use transport_nostr::MarmotRelayPlane;
 
 use crate::MarmotApp;
 use nostr_directory::DirectorySyncHandle;
-use nostr_directory::sync::{DirectorySyncCommand, run_directory_sync_worker};
+use nostr_directory::{DirectorySyncCommand, run_directory_sync_worker};
 
 async fn wait_for_background_rebuild_flag_to_clear(handle: &DirectorySyncHandle) {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -28,12 +28,12 @@ async fn worker_clears_background_rebuild_flag_when_dequeuing_command() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let relay_plane =
         MarmotRelayPlane::with_subscription_rebuild_lookback(std::time::Duration::from_secs(30));
-    let handle = DirectorySyncHandle::spawn(app.directory(), relay_plane);
+    let handle = DirectorySyncHandle::spawn_for_test(app.directory(), relay_plane);
 
-    handle.request_rebuild();
+    handle.request_rebuild_for_test();
     wait_for_background_rebuild_flag_to_clear(&handle).await;
 
-    handle.request_rebuild();
+    handle.request_rebuild_for_test();
     wait_for_background_rebuild_flag_to_clear(&handle).await;
 
     handle.shutdown().await;
@@ -107,7 +107,7 @@ async fn blocked_account_lock_does_not_stall_directory_drain_or_rebuild_completi
         loop {
             if app
                 .directory()
-                .directory_entry(&remote.public_key().to_hex())
+                .directory_entry_for_test(&remote.public_key().to_hex())
                 .unwrap()
                 .is_some_and(|entry| entry.profile.is_some())
             {

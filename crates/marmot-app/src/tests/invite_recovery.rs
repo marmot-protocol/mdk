@@ -1195,7 +1195,7 @@ async fn assert_recovery_keeps_checked_candidate_across_clock_boundary(membershi
         crate::key_package_records::preferred_fresh_key_package_from_records(
             &account.account_id_hex,
             &records,
-            app.directory().directory_freshness(),
+            app.directory().directory_freshness_for_test(),
             None,
             &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
@@ -1380,7 +1380,7 @@ async fn assert_recovery_does_not_switch_after_mls_expiry(membership: bool) {
         crate::key_package_records::preferred_fresh_key_package_from_records(
             &account.account_id_hex,
             &records,
-            app.directory().directory_freshness(),
+            app.directory().directory_freshness_for_test(),
             None,
             &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
@@ -1423,7 +1423,7 @@ async fn assert_recovery_does_not_switch_after_mls_expiry(membership: bool) {
         crate::key_package_records::preferred_fresh_key_package_from_records(
             &account.account_id_hex,
             &records,
-            app.directory().directory_freshness(),
+            app.directory().directory_freshness_for_test(),
             None,
             &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )

@@ -142,7 +142,7 @@ impl DirectoryRecoveryRebuildQueue {
 /// accounts); the non-local subset syncs only [`DIRECTORY_SYNC_KINDS`],
 /// which omits contact lists so transitively discovered users cannot feed
 /// new kind-3 subscriptions back into the plan (mdk#687).
-pub fn plan_directory_sync(
+pub(crate) fn plan_directory_sync(
     endpoints: Vec<TransportEndpoint>,
     local_account_ids: Vec<String>,
     known_user_ids: Vec<String>,
@@ -226,7 +226,7 @@ fn extend_directory_sync_batches(
 }
 
 impl DirectorySyncHandle {
-    pub fn spawn<R: DirectoryResources + DirectoryObserver + BlockListSink>(
+    pub(crate) fn spawn<R: DirectoryResources + DirectoryObserver + BlockListSink>(
         directory: Directory<R>,
         relay_plane: MarmotRelayPlane,
     ) -> Self {
@@ -248,7 +248,7 @@ impl DirectorySyncHandle {
         }
     }
 
-    pub fn request_rebuild(&self) {
+    pub(crate) fn request_rebuild(&self) {
         if self.rebuild_queued.swap(true, Ordering::SeqCst) {
             return;
         }

@@ -249,7 +249,7 @@ async fn rapid_profile_saves_cache_the_authored_timestamp() {
     // A late copy of the second save must not replace the third.
     let account_id_hex = app.account_home().account(&label).unwrap().account_id_hex;
     app.directory()
-        .remember_directory_profile_if_newer(
+        .remember_directory_profile_if_newer_for_test(
             &account_id_hex,
             &UserProfileMetadata {
                 name: Some("Second".into()),

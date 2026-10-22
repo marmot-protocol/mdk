@@ -104,7 +104,7 @@ fn prepare(app: &MarmotApp, page: TimelinePage) -> ConversationPresentationPage 
         .unwrap()
 }
 fn profile(app: &MarmotApp, id: &str, name: &str, at: u64) {
-    let mut record = app.directory().empty_directory_record(id);
+    let mut record = app.directory().empty_directory_record_for_test(id);
     record.profile = Some(UserProfileMetadata {
         display_name: Some(name.into()),
         picture: Some("https://example.com/avatar.png".into()),

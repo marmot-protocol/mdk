@@ -195,7 +195,8 @@ event, pre-cache direct follows, and cache profile metadata for those likely con
 directory subscriptions for local accounts and known users so profile, follow-list, relay-list, and KeyPackage updates
 keep warming the cache.
 
-**Profile sanitization.** Incoming kind `0` strings are sanitized in `directory/records.rs` before they are cached:
+**Profile sanitization.** Incoming kind `0` strings are sanitized in `nostr-directory`'s `src/records.rs` before they
+are cached:
 
 - `about` keeps normalized line breaks: adjacent CRLF and a lone CR become LF, U+2028 and U+2029 become LF, and interior
   blank lines stay. Every other known string (`name`, `display_name` / `displayName`, `picture`, `banner`, `nip05`,

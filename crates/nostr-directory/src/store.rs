@@ -51,7 +51,7 @@ impl<R: DirectoryResources> Directory<R> {
         Ok(local)
     }
 
-    pub fn directory_entry(
+    pub(crate) fn directory_entry(
         &self,
         account_id_hex: &str,
     ) -> Result<Option<UserDirectoryRecord>, DirectoryError> {
@@ -77,7 +77,7 @@ impl<R: DirectoryResources> Directory<R> {
             .unwrap_or_else(AccountRelayListStatus::empty))
     }
 
-    pub fn directory_freshness(&self) -> DirectoryFreshness {
+    pub(crate) fn directory_freshness(&self) -> DirectoryFreshness {
         if let Some(clock) = &self.config.test_clock {
             return DirectoryFreshness {
                 max_created_at: clock
@@ -147,7 +147,7 @@ impl<R: DirectoryResources> Directory<R> {
         self.remember_directory_user_with_reason(account_id_hex, "directory")
     }
 
-    pub fn remember_directory_user_with_reason(
+    pub(crate) fn remember_directory_user_with_reason(
         &self,
         account_id_hex: &str,
         reason: &str,
@@ -166,7 +166,7 @@ impl<R: DirectoryResources> Directory<R> {
         self.remember_directory_user_with_reason(sender_account_id_hex, "message")
     }
 
-    pub fn remember_directory_follow_list(
+    pub(crate) fn remember_directory_follow_list(
         &self,
         account_id_hex: &str,
         follow_list: &FetchedFollowList,
@@ -228,7 +228,7 @@ impl<R: DirectoryResources> Directory<R> {
         self.save_directory_entry(&entry)
     }
 
-    pub fn remember_directory_profile_if_newer(
+    pub(crate) fn remember_directory_profile_if_newer(
         &self,
         account_id_hex: &str,
         profile: &UserProfileMetadata,
@@ -329,7 +329,7 @@ impl<R: DirectoryResources> Directory<R> {
         self.save_directory_entry_with_reason(entry, "directory")
     }
 
-    pub fn save_directory_entry_with_reason(
+    pub(crate) fn save_directory_entry_with_reason(
         &self,
         entry: &UserDirectoryRecord,
         reason: &str,
@@ -394,7 +394,7 @@ impl<R: DirectoryResources> Directory<R> {
         }
     }
 
-    pub fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
+    pub(crate) fn empty_directory_record(&self, account_id_hex: &str) -> UserDirectoryRecord {
         UserDirectoryRecord {
             account_id_hex: account_id_hex.to_owned(),
             npub: npub_for_account_id_lossy(account_id_hex),

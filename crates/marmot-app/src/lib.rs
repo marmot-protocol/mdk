@@ -264,15 +264,8 @@ pub use nostr_directory::Directory;
 #[cfg(test)]
 use nostr_directory::USER_DIRECTORY_SEARCH_MAX_FRONTIER;
 pub use nostr_directory::error::DirectoryError;
-pub use nostr_directory::previews::{
-    MAX_PUBLIC_EVENT_REFERENCES, PublicEventPreview, PublicEventPreviewRead,
-};
 #[cfg(test)]
-pub(crate) use nostr_directory::published_records::relays_from_relay_list_event;
-pub(crate) use nostr_directory::published_records::{
-    push_unique_strings, relay_list_state_from_event, sort_directory_records,
-};
-pub(crate) use nostr_directory::records::{KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA};
+pub(crate) use nostr_directory::relays_from_relay_list_event;
 pub use nostr_directory::{
     AccountRelayListState, AccountRelayListStatus, FetchedKeyPackage, MissingRelayListKind,
 };
@@ -282,6 +275,13 @@ pub use nostr_directory::{
     UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch,
     UserDirectorySearchResult, UserProfileMetadata, UserSearchParams, UserSearchSubscription,
     UserSearchUpdate, sort_user_search_results,
+};
+pub(crate) use nostr_directory::{KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA};
+pub use nostr_directory::{
+    MAX_PUBLIC_EVENT_REFERENCES, PublicEventPreview, PublicEventPreviewRead,
+};
+pub(crate) use nostr_directory::{
+    push_unique_strings, relay_list_state_from_event, sort_directory_records,
 };
 pub use nostr_secret::is_nostr_secret;
 pub use nostr_verification::verify_public_nostr_event_json;
@@ -393,7 +393,7 @@ use key_package_records::{
     validated_cached_key_package,
 };
 use nostr_directory::DirectoryCache;
-use nostr_directory::records::display_name_for_profile;
+use nostr_directory::display_name_for_profile;
 use projection::LegacyAccountProjectionDb;
 
 const LEGACY_ACCOUNT_APP_DB_FILE: &str = "app.sqlite3";
@@ -2296,7 +2296,7 @@ impl MarmotApp {
                 account.account_id_hex.clone(),
                 KIND_NOSTR_METADATA,
                 Vec::new(),
-                serde_json::to_string(&nostr_directory::records::profile_content_json(profile))?,
+                serde_json::to_string(&nostr_directory::profile_content_json(profile))?,
             ),
             required_acks: 1,
         });
@@ -2511,7 +2511,7 @@ impl MarmotApp {
             account.account_id_hex.clone(),
             KIND_NOSTR_METADATA,
             Vec::new(),
-            serde_json::to_string(&nostr_directory::records::profile_content_json(profile))?,
+            serde_json::to_string(&nostr_directory::profile_content_json(profile))?,
         );
         events.push(
             self.sign_replaceable_identity_event(label, nostr_signer.clone(), &profile_event)
@@ -5788,7 +5788,7 @@ impl MarmotApp {
                     latest_fresh_key_package_from_records(
                         &account_id,
                         records,
-                        self.directory().directory_freshness(),
+                        self.directory().directory_freshness_for_test(),
                         &self.deployment().key_package_client_preference,
                     )?,
                     Some(entry.clone()),

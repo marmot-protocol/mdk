@@ -38,7 +38,7 @@ fn hydration_uses_one_catalog() {
     );
     let entry = app
         .directory()
-        .empty_directory_record(&alice.account_id_hex);
+        .empty_directory_record_for_test(&alice.account_id_hex);
     for label in ["alice", "z-alias"] {
         fs_private::write_private(&home.account_dir(label).join("account.json"), b"broken")
             .unwrap();

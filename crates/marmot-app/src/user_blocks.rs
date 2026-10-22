@@ -10,7 +10,7 @@ use storage_sqlite::{PendingBlockPublication, StoredBlockList};
 use transport_nostr::DirectoryEventQuery;
 use transport_nostr_peeler::{NostrTransportEvent, SdkSigner};
 
-use nostr_directory::records::MUTE_LIST_KIND;
+use nostr_directory::MUTE_LIST_KIND;
 pub use storage_sqlite::{BlockListSnapshot, BlockedUser};
 
 impl MarmotApp {

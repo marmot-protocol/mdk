@@ -786,7 +786,7 @@ impl<R: DirectoryResources> Directory<R> {
     }
 
     /// At most two safe reference hints, then the configured directory relays.
-    pub fn public_event_query_relays(
+    pub(crate) fn public_event_query_relays(
         &self,
         hints: Vec<TransportEndpoint>,
     ) -> Vec<TransportEndpoint> {
@@ -809,7 +809,7 @@ impl<R: DirectoryResources> Directory<R> {
         relays
     }
 
-    pub fn public_event_refresh_cooling_down(&self, key: &str) -> bool {
+    pub(crate) fn public_event_refresh_cooling_down(&self, key: &str) -> bool {
         self.state
             .public_event_refreshes
             .lock()
@@ -818,7 +818,7 @@ impl<R: DirectoryResources> Directory<R> {
             .is_some_and(|attempted| attempted.elapsed() < REFRESH_COOLDOWN)
     }
 
-    pub fn start_public_event_refresh_cooldown(&self, key: String) {
+    pub(crate) fn start_public_event_refresh_cooldown(&self, key: String) {
         let mut attempts = self
             .state
             .public_event_refreshes

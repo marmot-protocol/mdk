@@ -204,14 +204,17 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `src/user_blocks.rs` implements `BlockListSink`; publishing the account's own profile and follow list is
   `src/profile_publication.rs`. `directory()` builds a fresh service on each call with `DirectoryConfig` read from the
   app's configuration; anything the directory keeps between calls lives in `directory_state`, never in `directory()`.
-- `MarmotApp`'s directory methods are one-line delegates in `src/directory_delegates.rs` that return `AppError`
-  (PR 7 of `docs/marmot-architecture/review/brief-directory.md` repoints callers to `app.directory()`).
-  `From<DirectoryError> for AppError` in `src/error.rs` restores the variant, message and `privacy_safe_kind` the
-  directory reported before it had its own type; `error::directory_error_tests` covers every variant.
+- Callers reach the directory through `app.directory()`, whose methods return `DirectoryError`; `MarmotApp` has no
+  directory delegates. `From<DirectoryError> for AppError` in `src/error.rs` restores the variant, message and
+  `privacy_safe_kind` the directory reported before it had its own type, so app paths that return `AppError` convert
+  with `?`; `error::directory_error_tests` covers every variant. The CLI, agent connector and bindings convert
+  `DirectoryError` through `AppError` too, so their error codes don't depend on which layer failed.
 - Directory tests that need a real `MarmotApp` or runtime live in `src/directory_tests/`, one module per directory
-  file; tests that need only the directory live in `nostr-directory`. The account's own KeyPackage inventory, record
-  merge and publish-endpoint selection stay in `src/key_package_records.rs`, and the group-id helpers in `src/ids.rs`;
-  both re-export the directory's items so callers keep their paths.
+  file; tests that need only the directory live in `nostr-directory`. They reach directory internals through its
+  `test-support` feature (enabled here as a dev-dependency only): gated root re-exports and `_for_test` wrappers. The
+  account's own KeyPackage inventory, record merge and publish-endpoint selection stay in
+  `src/key_package_records.rs`, and the group-id helpers in `src/ids.rs`; both re-export only the directory helpers
+  the app's own code uses.
 - Keep the crate root focused on app construction, shared state, storage/projector wiring, account relay-list helpers,
   and public re-exports.
 - Keep CLI/TUI presentation out of this crate.

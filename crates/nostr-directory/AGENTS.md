@@ -26,6 +26,8 @@ The directory of other people's public Nostr data (step 3 of the 2026-10 archite
 
 | Path | Owns |
 | --- | --- |
+| `src/lib.rs` | The public surface: production re-exports, the crate-internal shorthands the moved code uses, and the `test-support`-gated re-exports. |
+| `src/test_support.rs` | `_for_test` wrappers over crate-private methods that `marmot-app`'s directory tests call; built only with `test-support`. |
 | `src/service.rs` | `Directory<R>`, the service, and `DirectoryState`, what it keeps between calls (preview cooldowns, the member prewarm cache, the sync worker's handle slot). The host builds a fresh `Directory` per call and shares one state. |
 | `src/resources.rs`, `src/observer.rs` | The three traits the host implements, and the `DirectoryAccount` view. |
 | `src/config.rs` | `DirectoryConfig` (relays, future-skew limit, KeyPackage client preference, Open Ranking provider, fallback seeds, proxy-aware HTTP builder, test clock) and the deployment's `OpenRankingProvider` and `KeyPackageClientPreference`. |
@@ -50,9 +52,12 @@ The directory of other people's public Nostr data (step 3 of the 2026-10 archite
   `Directory::sync_worker()` gets or spawns it and `take_sync_worker()` hands it to shutdown.
 - Do not change cache SQL, migration ids, file names, TTLs, timeouts or bounds as part of a move. `cache/v1.sql` and
   `cache/v2.sql` are frozen; schema changes add a numbered migration.
+- The public surface is what `src/lib.rs` re-exports, plus the `config` and `error` modules; every other module is
+  private. Make an item `pub` and re-export it only when another crate's production code names it.
 - Tests here use only the directory. A test that needs a real `MarmotApp` or runtime belongs in `marmot-app`'s
-  `src/directory_tests/`. Internals only those tests read sit behind the `test-support` feature, or are `pub` when
-  `marmot-app` already uses them; keep that surface minimal.
+  `src/directory_tests/`. What only those tests reach is built only with the `test-support` feature: a method stays
+  `pub(crate)` and gets a `_for_test` wrapper in `src/test_support.rs`; a free item is `pub` in its private module and
+  re-exported from the root's gated block. Never widen an item for a test alone.
 
 ## Verification
 

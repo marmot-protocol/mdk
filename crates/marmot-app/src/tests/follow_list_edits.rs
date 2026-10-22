@@ -7,7 +7,7 @@ use cgka_traits::TransportEndpoint;
 use marmot_account::AccountHome;
 
 use crate::{AccountRelayListBootstrap, AppError, MarmotApp, MarmotAppRuntime};
-use nostr_directory::records::MAX_FOLLOW_LIST_ENTRIES;
+use nostr_directory::MAX_FOLLOW_LIST_ENTRIES;
 
 struct Fixture {
     _relay: nostr_relay_builder::MockRelay,
@@ -47,7 +47,7 @@ impl Fixture {
     /// Publish a kind-3 event with exactly these tags and content, then step
     /// past its second so a later edit is the newer replaceable event.
     async fn seed(&self, tags: Vec<Vec<String>>, content: &str) {
-        let follows = nostr_directory::records::follows_from_tags(&tags);
+        let follows = nostr_directory::follows_from_tags(&tags);
         self.app
             .publish_account_follow_list_event(
                 &self.label,

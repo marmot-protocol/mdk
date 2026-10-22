@@ -3,8 +3,8 @@
 
 use std::time::{Duration, Instant};
 
+use nostr_directory::MEMBER_PREWARM_CACHE_TTL;
 use nostr_directory::MemberResolutionPurpose;
-use nostr_directory::member_key_packages::MEMBER_PREWARM_CACHE_TTL;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_recovery_refreshes_routes_for_fresh_commit_resolution() {
@@ -17,7 +17,7 @@ async fn discovery_recovery_refreshes_routes_for_fresh_commit_resolution() {
     fetcher.requests.lock().unwrap().clear();
     let result = app
         .directory()
-        .resolve_member_key_packages_for_purpose(
+        .resolve_member_key_packages_for_purpose_for_test(
             vec![accounts[0].account_id_hex.clone()],
             MemberResolutionPurpose::CommitFresh,
             None,
@@ -43,7 +43,7 @@ async fn composition_prewarm_route_reuse_preserves_original_freshness_deadline()
         .unwrap();
     let original = Instant::now() - Duration::from_secs(240);
     app.directory_state
-        .member_key_package_prewarm_cache
+        .member_key_package_prewarm_cache_for_test()
         .lock()
         .unwrap()
         .set_inserted_at(id, original);
@@ -59,7 +59,7 @@ async fn composition_prewarm_route_reuse_preserves_original_freshness_deadline()
     }
     let mut cache = app
         .directory_state
-        .member_key_package_prewarm_cache
+        .member_key_package_prewarm_cache_for_test()
         .lock()
         .unwrap();
     assert_eq!(cache.inserted_at(id), Some(original));

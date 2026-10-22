@@ -8,12 +8,12 @@ use crate::AppError;
 /// Convert a hex Nostr public key (account id) into its `npub...` bech32 form.
 /// Public so embedders (FFI/UI) can render npubs instead of raw hex.
 pub fn npub_for_account_id(account_id_hex: &str) -> Result<String, AppError> {
-    Ok(nostr_directory::ids::npub_for_account_id(account_id_hex)?)
+    Ok(nostr_directory::npub_for_account_id(account_id_hex)?)
 }
 
 /// Validate relay URL strings before encoding them into invite URIs.
 pub fn validate_relay_urls(relays: &[String]) -> Result<(), AppError> {
-    Ok(nostr_directory::ids::validate_relay_urls(relays)?)
+    Ok(nostr_directory::validate_relay_urls(relays)?)
 }
 
 /// Encode a hex account id and relay hints as an `nprofile1…` invite URI.
@@ -21,7 +21,7 @@ pub fn nprofile_for_account_id(
     account_id_hex: &str,
     relays: &[String],
 ) -> Result<String, AppError> {
-    Ok(nostr_directory::ids::nprofile_for_account_id(
+    Ok(nostr_directory::nprofile_for_account_id(
         account_id_hex,
         relays,
     )?)
@@ -41,9 +41,9 @@ pub fn nprofile_for_account_id(
 /// Whitespace and `marmot://profile/...` normalization belong to FFI.
 /// Failures return [`AppError::InvalidPublicKey`] without echoing the input.
 pub fn account_id_hex_from_ref(reference: &str) -> Result<String, AppError> {
-    Ok(nostr_directory::ids::account_id_hex_from_ref(reference)?)
+    Ok(nostr_directory::account_id_hex_from_ref(reference)?)
 }
-pub(crate) use nostr_directory::ids::{normalize_account_ids, parse_account_id_hex};
+pub(crate) use nostr_directory::{normalize_account_ids, parse_account_id_hex};
 
 pub(crate) fn normalize_group_id_hex_app(value: &str) -> Result<String, AppError> {
     let normalized = value.trim().to_ascii_lowercase();

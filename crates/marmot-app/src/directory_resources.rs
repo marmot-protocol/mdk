@@ -23,7 +23,7 @@ use crate::{
 use crate::{ProductFamily, ProductObservation, ProductUnit};
 use nostr_directory::error::DirectoryError;
 use nostr_directory::hydrate_directory_record;
-use nostr_directory::records::public_directory_user_record;
+use nostr_directory::public_directory_user_record;
 use nostr_directory::{
     Directory, DirectoryAccount, DirectoryCache, DirectoryConfig, DirectoryObservation,
     DirectoryObserver, DirectoryResources, ObservedFamily, ObservedUnit,

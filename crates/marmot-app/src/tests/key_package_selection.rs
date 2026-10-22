@@ -56,7 +56,7 @@ async fn client_preference_ranks_only_valid_current_slots_and_preserves_recency(
                     endpoints: vec![],
                 })
                 .collect::<Vec<_>>(),
-            app.directory().directory_freshness(),
+            app.directory().directory_freshness_for_test(),
             None,
             &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
@@ -158,7 +158,7 @@ async fn malformed_replacement_suppresses_older_package_in_the_same_slot() {
                     endpoints: vec![],
                 })
                 .collect::<Vec<_>>(),
-            app.directory().directory_freshness(),
+            app.directory().directory_freshness_for_test(),
             None,
             &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
@@ -722,7 +722,7 @@ async fn legacy_slots_never_select_or_mask_current_slots() {
         preferred_fresh_key_package_from_records(
             &account.account_id_hex,
             &records,
-            app.directory().directory_freshness(),
+            app.directory().directory_freshness_for_test(),
             None,
             &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )

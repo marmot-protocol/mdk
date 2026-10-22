@@ -235,7 +235,7 @@ impl DirectoryCache {
     /// has expired. It is a parameter rather than read from the clock here so
     /// one traversal resolves a whole layer against a single instant, and so
     /// expiry is directly testable.
-    pub fn search_record(
+    pub(crate) fn search_record(
         &self,
         account_id_hex: &str,
         now: i64,
@@ -437,7 +437,7 @@ impl DirectoryCache {
     /// different from `Some(vec![])` -- an observed list that follows nobody.
     /// Traversal needs the distinction: the first is a candidate to fetch, the
     /// second is a settled dead end.
-    pub fn search_graph_follows(
+    pub(crate) fn search_graph_follows(
         &self,
         account_id_hex: &str,
     ) -> Result<Option<Vec<String>>, DirectoryError> {
@@ -462,7 +462,7 @@ impl DirectoryCache {
     /// metadata: it never touches `directory_users`, so an account cached here
     /// stays invisible to `directory_sync_plan` and can never become a live
     /// per-author subscription (mdk#687).
-    pub fn put_search_graph_record(
+    pub(crate) fn put_search_graph_record(
         &self,
         record: &DirectorySearchGraphRecord,
         now: i64,
@@ -481,7 +481,7 @@ impl DirectoryCache {
     /// promoting every follow would trigger (mdk#687). The author's
     /// cached profile metadata in the search graph is preserved; only the
     /// follow edges are replaced.
-    pub fn remember_search_graph_follows(
+    pub(crate) fn remember_search_graph_follows(
         &self,
         account_id_hex: &str,
         npub: &str,
