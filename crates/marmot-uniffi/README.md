@@ -1053,7 +1053,8 @@ source revalidation, host buffer ownership and integration guidance. For an OS s
 that needs a real file (package installer, share sheet, "open with", Quick Look), use
 `openAttachmentHandoff` and release its lease when done; see
 [handoff leases](ATTACHMENT-ACCESS.md#handoff-leases). A Manage storage screen reads
-usage and largest-first listings and removes attachments in bulk; see
+usage and largest-first listings, removes attachments in bulk and sets the opt-in
+"Keep media" window; see
 [Manage storage](ATTACHMENT-ACCESS.md#manage-storage). Acquisition
 defaults on with bounded per-account policy. Native progress snapshots/subscriptions
 and durable cancellation, retry, remove and download-again controls use the same source slots.

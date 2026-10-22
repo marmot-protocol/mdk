@@ -19,6 +19,12 @@ const EXPLICIT_LEASE_SECONDS: u64 = 20 * 60;
 const MAX_COMPACTION_ROLLBACKS: u32 = 3;
 /// Rows, then file names, per media sweep batch.
 const MEDIA_SWEEP_BATCH: usize = 256;
+/// How often the "Keep media" sweep runs after worker start. Its windows are
+/// measured in days, so a sweep every tick would only rescan.
+const KEEP_MEDIA_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// How long one "Keep media" pass removes before leaving the rest to the
+/// next tick.
+const KEEP_MEDIA_SWEEP_BUDGET: Duration = Duration::from_millis(250);
 
 type PermitWait = std::pin::Pin<
     Box<
@@ -58,6 +64,12 @@ pub(super) struct Admission {
     /// owed (recorded nowhere): set only once a maintenance pass tried it,
     /// so a pass that failed before that leaves it for the next one.
     startup_wal_settled: Arc<std::sync::atomic::AtomicBool>,
+    /// When the "Keep media" sweep (mdk#2314 step 10) next runs: `None` at
+    /// worker start, then hourly.
+    keep_media_due: Option<std::time::Instant>,
+    /// A sweep stopped at its time budget with attachments still past the
+    /// window, or failed: the next tick runs it again.
+    keep_media_more: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Starts a media sweep on the blocking pool unless one is still running:
@@ -134,7 +146,9 @@ fn spawn_upload_promotion(
 /// then returns freed database pages to the filesystem once the database is
 /// incremental. The account worker calls this once per maintenance tick,
 /// after readiness. A batch that pauses for free space, resumes, finishes,
-/// or drops a corrupt body wakes attachment observers.
+/// or drops a corrupt body wakes attachment observers. At worker start and
+/// then hourly, the batch first applies the "Keep media" setting (mdk#2314
+/// step 10) for up to [`KEEP_MEDIA_SWEEP_BUDGET`].
 pub(super) fn spawn_legacy_migration(
     client: &AppClient,
     shared: &RuntimeSharedServices,
@@ -154,6 +168,15 @@ pub(super) fn spawn_legacy_migration(
     let startup_wal_settled = admission.startup_wal_settled.clone();
     let compaction_due = admission.compaction_due.clone();
     let check_compaction = !admission.compaction_attempted;
+    let now = std::time::Instant::now();
+    let sweep_keep_media = admission
+        .keep_media_more
+        .swap(false, std::sync::atomic::Ordering::AcqRel)
+        || admission.keep_media_due.is_none_or(|due| now >= due);
+    if sweep_keep_media {
+        admission.keep_media_due = Some(now + KEEP_MEDIA_SWEEP_INTERVAL);
+    }
+    let keep_media_more = admission.keep_media_more.clone();
     admission.legacy_migration = Some(tokio::task::spawn_blocking(move || {
         let started = (|| {
             let storage = app.account_storage(&label)?;
@@ -167,6 +190,9 @@ pub(super) fn spawn_legacy_migration(
             Ok::<_, AppError>((storage, media, reserve))
         })();
         let Ok((storage, media, reserve)) = started else {
+            if sweep_keep_media {
+                keep_media_more.store(true, std::sync::atomic::Ordering::Release);
+            }
             tracing::warn!(target: "marmot_app::storage_maintenance",
                 method = "migrate_legacy_attachments",
                 "legacy attachment migration batch deferred");
@@ -176,6 +202,34 @@ pub(super) fn spawn_legacy_migration(
         let free = || crate::media::attachment_resume::available_space(&account_dir);
         let progress = app.legacy_media_migration(&label);
         let app_storage = storage.app_storage();
+        // "Keep media" first, so bodies past the window are not moved only
+        // to be removed.
+        if sweep_keep_media {
+            let deadline = std::time::Instant::now() + KEEP_MEDIA_SWEEP_BUDGET;
+            match super::super::attachment_storage::clean_past_keep_window(
+                &app_storage,
+                &media,
+                Some(deadline),
+            ) {
+                Ok((removed, more)) => {
+                    if more {
+                        keep_media_more.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    if removed > 0 {
+                        tracing::info!(target: "marmot_app::storage_maintenance",
+                            method = "keep_media_sweep", removed, more,
+                            "attachments past the keep media window removed");
+                        updates.send_modify(|_| {});
+                    }
+                }
+                Err(_) => {
+                    keep_media_more.store(true, std::sync::atomic::Ordering::Release);
+                    tracing::warn!(target: "marmot_app::storage_maintenance",
+                        method = "keep_media_sweep",
+                        "keep media sweep deferred");
+                }
+            }
+        }
         let changed = crate::media::legacy_migration::run_batch(
             &app_storage,
             &media,
@@ -323,7 +377,7 @@ fn admit_demands(storage: &SqliteAppStorage, now: u64, loopback: bool) -> Result
             // One parser result supplies both the download reference and digest.
             // Claim reparses the exact source-fenced slot, never client metadata.
             let digest = crate::media::media_hash_from_reference(&reference)?;
-            storage.request_attachment_acquisition(
+            storage.request_automatic_acquisition(
                 &demand.group_id_hex,
                 &demand.entry,
                 digest,

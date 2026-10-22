@@ -987,6 +987,63 @@ async fn removal_by_age_covers_legacy_bodies() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+/// Choosing a "Keep media" window removes what is already past it before the
+/// call returns, freeing the file at once, and the attachment shows as
+/// cleaned by the setting. Forever removes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keep_media_cleans_past_the_window_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    // The fixture message was received at 10, long before any window.
+    seed_file_backed(&app, &store, &[6u8; 8192]);
+    let runtime = app.runtime();
+    let group = GroupId::new(vec![0xab; 16]);
+    assert_eq!(
+        runtime.attachment_keep_media("alice").await.unwrap(),
+        crate::AttachmentKeepMedia::Forever
+    );
+    assert_eq!(
+        runtime
+            .set_attachment_keep_media("alice", crate::AttachmentKeepMedia::Forever)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(media_files_on_disk(&app), 1);
+
+    assert_eq!(
+        runtime
+            .set_attachment_keep_media("alice", crate::AttachmentKeepMedia::SixMonths)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        runtime.attachment_keep_media("alice").await.unwrap(),
+        crate::AttachmentKeepMedia::SixMonths
+    );
+    assert_eq!(
+        media_files_on_disk(&app),
+        0,
+        "freed before the call returns"
+    );
+    let status = runtime
+        .attachment_transfer_snapshot("alice", &group, vec![target()])
+        .await
+        .unwrap()
+        .remove(0)
+        .unwrap();
+    assert_eq!(
+        status.state,
+        crate::AttachmentTransferState::CleanedBySetting
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 // Moving legacy bodies into the media store (mdk#2314 step 6).
 
 /// A second connection to alice's database, for damaging rows directly.

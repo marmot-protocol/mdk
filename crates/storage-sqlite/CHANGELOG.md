@@ -4,6 +4,10 @@
 
 ### Breaking changes
 
+- `AttachmentTransferState` adds `CleanedBySetting`: the account's "Keep
+  media" setting removed the body (mdk#2314 step 10). Update exhaustive
+  matches.
+
 - `record_reconciliation_items` replaces
   `record_transport_reconciliation_item`. It accepts a cloneable iterator of
   borrowed route/item pairs and commits the advisory inventory batch atomically,
@@ -93,6 +97,18 @@
   media store. `AttachmentStorageUsage` gains `cache_bytes`.
 
 ### Added
+
+- The opt-in "Keep media" setting (mdk#2314 step 10, migration 0116):
+  `AttachmentKeepMedia` (Forever by default, one year, six months, 30 days),
+  `attachment_keep_media` / `set_attachment_keep_media`, and
+  `clean_attachments_past_keep_window`, a bounded batch that removes retained
+  attachments past the window as explicit `Remove` does but records them as
+  cleaned by the setting. Age is the later of the message's received time and
+  the last explicit request for the body (`keep_from`, set by explicit
+  requests, retries and download-again). `request_automatic_acquisition` is
+  `request_attachment_acquisition` for automatic demand: a slot already past
+  the window and not yet requested is recorded as cleaned instead of fetched.
+  An explicit `Remove` of a cleaned slot records it as removed by you.
 
 - Moving avatars onto the media store (mdk#2314 step 9b):
   `AvatarPublication::for_acquisition` publishes a claimed fetch's image and

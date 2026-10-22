@@ -1012,6 +1012,7 @@ typedef enum MarmotAttachmentTransferState {
   MARMOT_ATTACHMENT_TRANSFER_STATE_COMPLETED_UNRETAINED,
   MARMOT_ATTACHMENT_TRANSFER_STATE_RETRY_EXHAUSTED,
   MARMOT_ATTACHMENT_TRANSFER_STATE_STORAGE_BLOCKED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_CLEANED_BY_SETTING,
 } MarmotAttachmentTransferState;
 
 typedef enum MarmotChatListView {
@@ -1063,6 +1064,17 @@ typedef enum MarmotAttachmentHistoryChange {
   MARMOT_ATTACHMENT_HISTORY_CHANGE_ADDITIONS,
   MARMOT_ATTACHMENT_HISTORY_CHANGE_RESTART_REQUIRED,
 } MarmotAttachmentHistoryChange;
+
+/**
+ * How long retained attachments are kept on this device, per account
+ * ("Keep media"). Forever is the default.
+ */
+typedef enum MarmotAttachmentKeepMedia {
+  MARMOT_ATTACHMENT_KEEP_MEDIA_FOREVER,
+  MARMOT_ATTACHMENT_KEEP_MEDIA_ONE_YEAR,
+  MARMOT_ATTACHMENT_KEEP_MEDIA_SIX_MONTHS,
+  MARMOT_ATTACHMENT_KEEP_MEDIA_THIRTY_DAYS,
+} MarmotAttachmentKeepMedia;
 
 typedef enum MarmotChatListPageDirection {
   MARMOT_CHAT_LIST_PAGE_DIRECTION_FORWARD,
@@ -6372,6 +6384,30 @@ MarmotStatus marmot_remove_attachments_older_than(const struct MarmotClient *cli
                                                   uint64_t received_before,
                                                   const char *group_id_hex,
                                                   uint64_t *out_removed);
+
+/**
+ * Writes the account's "Keep media" setting as a MarmotAttachmentKeepMedia
+ * discriminant. Blocking.
+ * # Safety
+ * Client and string must be live; out must be writable.
+ */
+MarmotStatus marmot_attachment_keep_media(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          uint32_t *out_keep);
+
+/**
+ * Sets the account's "Keep media" setting (a MarmotAttachmentKeepMedia
+ * discriminant), then removes every retained attachment already past the
+ * new window, writing how many it removed. They show as CleanedBySetting
+ * (download again allowed); media-store space is freed before this returns.
+ * Forever removes nothing. Blocking.
+ * # Safety
+ * Client and string must be live; out must be writable.
+ */
+MarmotStatus marmot_set_attachment_keep_media(const struct MarmotClient *client,
+                                              const char *account_ref,
+                                              uint32_t keep,
+                                              uint64_t *out_removed);
 
 /**
  * Read every effective sender/emoji pair for one visible message, off the UI thread.

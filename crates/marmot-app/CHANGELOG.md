@@ -4,6 +4,9 @@
 
 ### Breaking changes
 
+- `AttachmentTransferState` adds `CleanedBySetting` (mdk#2314 step 10).
+  Update exhaustive matches.
+
 - `RetentionSweepStatus::DeferredScanExhausted` is removed (mdk#2425): the
   retention sweep no longer pages wall-clock history, so there is no page
   cap to exhaust. Remove exhaustive handling of the variant.
@@ -123,6 +126,16 @@
   device backups.
 
 ### Added
+
+- Opt-in "Keep media" (mdk#2314 step 10):
+  `MarmotAppRuntime::attachment_keep_media` and `set_attachment_keep_media`
+  (`AttachmentKeepMedia`: Forever by default, one year, six months, 30 days).
+  Setting a window removes every retained attachment already past it before
+  returning, with the count; the account worker then applies it at start and
+  hourly, for at most 250 ms per maintenance tick, ahead of the legacy body
+  move. Removed attachments read `CleanedBySetting` and can be downloaded
+  again, which keeps them for the whole window from that request. Automatic
+  downloads skip attachments already past the window. Forever removes nothing.
 
 - The account database returns freed space to the filesystem (mdk#2314 step
   6). Once a quarter of it is free pages, the volume has room for two copies

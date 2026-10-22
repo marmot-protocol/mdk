@@ -145,7 +145,11 @@ Jobs and removal tombstones belong to raw source events. Deletion/expiry and
 source invalidation erase retained bytes; matching timeline repair preserves them.
 Explicit local removal cancels the job and survives restart, repair and later
 source revalidation. Only explicit download-again clears that suppression while
-the source remains retained. Already acquired left-group history remains readable.
+the source remains retained. The opt-in "Keep media" setting (mdk#2314 step 10)
+removes retained attachments older than its window the same way, recording the
+suppression as cleaned by the setting (`CleanedBySetting`) rather than removed by
+you; age is the later of the message's received time and the last explicit
+request, and automatic demand does not fetch a slot already past the window. Already acquired left-group history remains readable.
 Separate copies per slot avoid cross-message erasure ambiguity in this first slice.
 Account-store generation reset invalidates all handles and clears retained state.
 

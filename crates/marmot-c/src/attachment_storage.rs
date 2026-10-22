@@ -37,6 +37,17 @@ c_enum! {
     }
 }
 
+c_enum! {
+    /// How long retained attachments are kept on this device, per account
+    /// ("Keep media"). Forever is the default.
+    MarmotAttachmentKeepMedia from AttachmentKeepMediaFfi {
+        Forever,
+        OneYear,
+        SixMonths,
+        ThirtyDays,
+    }
+}
+
 /// Where the next page of chats starts. Borrowed from its page.
 pub struct MarmotChatStorageCursor {
     inner: Arc<ChatStorageCursor>,
@@ -330,6 +341,65 @@ pub unsafe extern "C" fn marmot_remove_attachments_older_than(
     })
 }
 
+/// Writes the account's "Keep media" setting as a MarmotAttachmentKeepMedia
+/// discriminant. Blocking.
+/// # Safety
+/// Client and string must be live; out must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_attachment_keep_media(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    out_keep: *mut u32,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out(out_keep) });
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        unsafe {
+            deliver_scalar(
+                client
+                    .block_on(client.marmot.attachment_keep_media(account))
+                    .map(|keep| MarmotAttachmentKeepMedia::from(keep) as u32),
+                out_keep,
+            )
+        }
+    })
+}
+
+/// Sets the account's "Keep media" setting (a MarmotAttachmentKeepMedia
+/// discriminant), then removes every retained attachment already past the
+/// new window, writing how many it removed. They show as CleanedBySetting
+/// (download again allowed); media-store space is freed before this returns.
+/// Forever removes nothing. Blocking.
+/// # Safety
+/// Client and string must be live; out must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn marmot_set_attachment_keep_media(
+    client: *const MarmotClient,
+    account_ref: *const c_char,
+    keep: u32,
+    out_removed: *mut u64,
+) -> MarmotStatus {
+    ffi_guard(|| {
+        try_arg!(unsafe { preflight_out(out_removed) });
+        let keep = try_arg!(MarmotAttachmentKeepMedia::from_c(keep));
+        let client = try_arg!(unsafe { client_ref(client) });
+        let account = try_arg!(unsafe { required_str(account_ref) });
+        let keep = match keep {
+            MarmotAttachmentKeepMedia::Forever => AttachmentKeepMediaFfi::Forever,
+            MarmotAttachmentKeepMedia::OneYear => AttachmentKeepMediaFfi::OneYear,
+            MarmotAttachmentKeepMedia::SixMonths => AttachmentKeepMediaFfi::SixMonths,
+            MarmotAttachmentKeepMedia::ThirtyDays => AttachmentKeepMediaFfi::ThirtyDays,
+        };
+        unsafe {
+            deliver_scalar(
+                client.block_on(client.marmot.set_attachment_keep_media(account, keep)),
+                out_removed,
+            )
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +512,32 @@ mod tests {
                 MarmotStatus::Ok
             );
             assert_eq!(removed, 0);
+            let mut keep = 9u32;
+            assert_eq!(
+                marmot_attachment_keep_media(client, ptr::null(), &mut keep),
+                MarmotStatus::NullPointer
+            );
+            assert_eq!(keep, 0, "cleared before the call");
+            assert_ne!(
+                marmot_attachment_keep_media(client, c"absent".as_ptr(), &mut keep),
+                MarmotStatus::Ok
+            );
+            removed = 9;
+            assert_eq!(
+                marmot_set_attachment_keep_media(client, c"absent".as_ptr(), 4, &mut removed),
+                MarmotStatus::InvalidArgument,
+                "an out-of-range setting is refused before any work"
+            );
+            assert_eq!(removed, 0);
+            assert_ne!(
+                marmot_set_attachment_keep_media(
+                    client,
+                    c"absent".as_ptr(),
+                    MarmotAttachmentKeepMedia::ThirtyDays as u32,
+                    &mut removed
+                ),
+                MarmotStatus::Ok
+            );
             assert_eq!(crate::marmot_client_shutdown(client), MarmotStatus::Ok);
             crate::marmot_client_free(client);
         }

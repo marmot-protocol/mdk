@@ -1878,3 +1878,82 @@ async fn evicted_database_handles_cannot_create_or_replace_media_stores() {
             .is_closed()
     );
 }
+
+/// Automatic demand does not fetch an attachment already past the "Keep
+/// media" window (mdk#2314 step 10): it shows as cleaned by the setting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keep_media_skips_automatic_demand_past_the_window() {
+    let (_dir, _client, store, _reference) = offline_fixture().await;
+    let app_storage = store.app_storage();
+    app_storage
+        .set_attachment_keep_media(storage_sqlite::AttachmentKeepMedia::ThirtyDays)
+        .unwrap();
+    let now = crate::unix_now_seconds();
+    admit_demands(&app_storage, now, false).unwrap();
+    assert!(
+        app_storage
+            .due_attachment_acquisitions(now, 1)
+            .unwrap()
+            .is_empty(),
+        "nothing to fetch"
+    );
+    let status = app_storage
+        .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status.state,
+        storage_sqlite::AttachmentTransferState::CleanedBySetting
+    );
+}
+
+/// The maintenance batch at worker start applies "Keep media" to retained
+/// attachments, then waits an hour before sweeping again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_maintenance_batch_cleans_past_the_keep_media_window() {
+    let (_dir, client, store, _reference) = offline_fixture().await;
+    let app_storage = store.app_storage();
+    let now = crate::unix_now_seconds();
+    admit_demands(&app_storage, now, false).unwrap();
+    let asset = app_storage
+        .due_attachment_acquisitions(now, 1)
+        .unwrap()
+        .remove(0);
+    let job = app_storage
+        .claim_attachment_acquisition(&asset, now, now + LEASE_SECONDS)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        app_storage
+            .complete_attachment_acquisition(&job, b"retained worker bytes", now, 10_000_000)
+            .unwrap(),
+        storage_sqlite::AttachmentPublishResult::Published
+    );
+    app_storage
+        .set_attachment_keep_media(storage_sqlite::AttachmentKeepMedia::OneYear)
+        .unwrap();
+
+    let shared = RuntimeSharedServices::default();
+    let updates = shared.attachment_updates.subscribe();
+    let mut admission = Admission::default();
+    spawn_legacy_migration(&client, &shared, &mut admission);
+    admission.legacy_migration.take().unwrap().await.unwrap();
+    let status = app_storage
+        .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status.state,
+        storage_sqlite::AttachmentTransferState::CleanedBySetting
+    );
+    assert!(updates.has_changed().unwrap(), "observers are woken");
+    assert!(
+        admission.keep_media_due.unwrap()
+            > std::time::Instant::now() + KEEP_MEDIA_SWEEP_INTERVAL - Duration::from_secs(60)
+    );
+    assert!(
+        !admission
+            .keep_media_more
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+}

@@ -105,8 +105,8 @@ pub use attachment_access::{
     MAX_ATTACHMENT_LOCAL_READ_BYTES, RetainedAttachmentAsset,
 };
 pub use attachment_storage::{
-    AttachmentMigrationState, AttachmentStorageUsage, ChatAttachmentUsage, ChatUsageCursor,
-    RetainedAttachmentSummary, RetainedSizeCursor,
+    AttachmentKeepMedia, AttachmentMigrationState, AttachmentStorageUsage, ChatAttachmentUsage,
+    ChatUsageCursor, RetainedAttachmentSummary, RetainedSizeCursor,
 };
 mod avatar;
 pub use attachment_history::{

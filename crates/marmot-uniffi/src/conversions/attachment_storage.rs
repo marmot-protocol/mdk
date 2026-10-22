@@ -78,6 +78,43 @@ pub enum AttachmentMigrationStateFfi {
     Compacting,
 }
 
+/// How long retained attachments are kept on this device, per account
+/// ("Keep media"). Attachments of messages older than the window are
+/// removed automatically and show as `CleanedBySetting`; download again
+/// stays allowed and keeps that attachment for the whole window from the
+/// request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum AttachmentKeepMediaFfi {
+    /// Nothing is removed automatically. The default.
+    Forever,
+    /// 365 days.
+    OneYear,
+    /// 183 days.
+    SixMonths,
+    /// 30 days.
+    ThirtyDays,
+}
+impl From<app::AttachmentKeepMedia> for AttachmentKeepMediaFfi {
+    fn from(v: app::AttachmentKeepMedia) -> Self {
+        match v {
+            app::AttachmentKeepMedia::Forever => Self::Forever,
+            app::AttachmentKeepMedia::OneYear => Self::OneYear,
+            app::AttachmentKeepMedia::SixMonths => Self::SixMonths,
+            app::AttachmentKeepMedia::ThirtyDays => Self::ThirtyDays,
+        }
+    }
+}
+impl From<AttachmentKeepMediaFfi> for app::AttachmentKeepMedia {
+    fn from(v: AttachmentKeepMediaFfi) -> Self {
+        match v {
+            AttachmentKeepMediaFfi::Forever => Self::Forever,
+            AttachmentKeepMediaFfi::OneYear => Self::OneYear,
+            AttachmentKeepMediaFfi::SixMonths => Self::SixMonths,
+            AttachmentKeepMediaFfi::ThirtyDays => Self::ThirtyDays,
+        }
+    }
+}
+
 /// Where the next page of chats starts.
 #[derive(Debug, uniffi::Object)]
 pub struct ChatStorageCursor {

@@ -69,7 +69,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - `runtime/attachment_storage.rs` is Manage storage (mdk#2314 step 5): usage and largest-first listings across both
   body layouts, and bulk removal that is exactly explicit `Remove`. Every removal path (bulk or `control_attachment`)
   unlinks the media files its transaction released through `unlink_released` before returning; never leave that to the
-  sweep.
+  sweep. The opt-in "Keep media" setting (mdk#2314 step 10) reuses that removal, recorded as cleaned by the setting:
+  its setter sweeps to completion before returning, and the worker's maintenance batch sweeps at start and hourly for
+  at most `KEEP_MEDIA_SWEEP_BUDGET`, before the legacy move. Automatic demand goes through
+  `request_automatic_acquisition` (which skips slots past the window); explicit requests never do.
 - `media/legacy_migration.rs` moves legacy database bodies into the media store (mdk#2314 step 6): one bounded batch per
   maintenance tick, started by the account worker on the blocking pool after readiness. Each body is admitted with
   `DiskPolicy::migration_need`, published, then its rows dropped; the smallest body that does not fit pauses the move

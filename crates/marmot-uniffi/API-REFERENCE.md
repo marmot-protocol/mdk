@@ -793,6 +793,30 @@ Removes retained attachments of messages received before `received_before` (Unix
 
 [Source](src/commands/attachment_storage.rs#L87)
 
+### `Marmot::attachment_keep_media`
+
+**Current.**
+
+```rust
+pub async fn attachment_keep_media( &self, account_ref: String, ) -> Result<AttachmentKeepMediaFfi, MarmotKitError>
+```
+
+Reads the account's "Keep media" setting for a settings screen: `Forever` (the default) unless the user chose `OneYear`, `SixMonths` or `ThirtyDays`. The setting is per account on this device and is not synced to the account's other devices. Local read; needs no started runtime.
+
+[Source](src/commands/attachment_storage.rs#L102)
+
+### `Marmot::set_attachment_keep_media`
+
+**Current.**
+
+```rust
+pub async fn set_attachment_keep_media( &self, account_ref: String, keep: AttachmentKeepMediaFfi, ) -> Result<u64, MarmotKitError>
+```
+
+Stores the account's "Keep media" setting, then removes every retained attachment already past the new window before returning, and returns how many it removed so the host can confirm what was freed. Age is the message's received time, or the user's last explicit download of that attachment when later. Removed attachments read `CleanedBySetting` in transfer snapshots, distinct from `Removed` (removed by you); `download_attachment_again` works for both. Media-store space is freed before this returns. While the runtime runs, the account worker applies the window at start and hourly as attachments age, and automatic downloads skip attachments already past it. `Forever` removes nothing. Ask the user to confirm before shortening the window: Blossom servers may no longer hold old media, so a removed attachment may not download again.
+
+[Source](src/commands/attachment_storage.rs#L119)
+
 </details>
 
 <details>

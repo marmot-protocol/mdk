@@ -74,6 +74,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("attachment_download_policy", Side::App),
     ("attachment_history", Side::App),
     ("attachment_history_versions", Side::App),
+    ("attachment_keep_media", Side::App),
     ("attachment_partial", Side::App),
     ("attachment_partial_chunk", Side::App),
     ("attachment_partial_usage", Side::App),

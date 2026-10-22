@@ -13,6 +13,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_attachment_keep_media` and `marmot_set_attachment_keep_media` with
+  `MarmotAttachmentKeepMedia`: the opt-in "Keep media" setting (mdk#2314
+  step 10). `MarmotAttachmentTransferState` appends
+  `MARMOT_ATTACHMENT_TRANSFER_STATE_CLEANED_BY_SETTING` (18) after
+  `STORAGE_BLOCKED`; earlier discriminants keep their values.
+
 - `MarmotAttachmentStorageUsage.cache_bytes`: the avatar and group-image
   cache, each stored image once (mdk#2314 step 9). Appended after
   `migration_bytes`.

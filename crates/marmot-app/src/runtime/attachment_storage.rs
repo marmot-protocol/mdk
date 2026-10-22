@@ -5,13 +5,42 @@
 //! removed, download-again allowed), and the media files it released are
 //! unlinked at once, so file-backed space returns immediately. Legacy bodies
 //! free database pages, which return to the filesystem at compaction.
+//!
+//! The opt-in "Keep media" setting (mdk#2314 step 10) removes retained
+//! attachments past its window the same way, recorded as cleaned by the
+//! setting rather than removed by you.
 use super::MarmotAppRuntime;
-use crate::AppError;
+use crate::{AccountMediaStore, AppError};
 use cgka_traits::GroupId;
+use std::time::Instant;
+use storage_sqlite::SqliteAppStorage;
 pub use storage_sqlite::{
-    AttachmentMigrationState, AttachmentStorageUsage, ChatAttachmentUsage, ChatUsageCursor,
-    RetainedSizeCursor,
+    AttachmentKeepMedia, AttachmentMigrationState, AttachmentStorageUsage, ChatAttachmentUsage,
+    ChatUsageCursor, RetainedSizeCursor,
 };
+
+/// Runs the "Keep media" sweep's bounded batches until none remain or
+/// `deadline` passes, unlinking the media files each batch released before
+/// the next. Returns how many attachments it removed and whether more remain
+/// past the window. Blocking pool only.
+pub(crate) fn clean_past_keep_window(
+    storage: &SqliteAppStorage,
+    media: &AccountMediaStore,
+    deadline: Option<Instant>,
+) -> Result<(u64, bool), AppError> {
+    let mut removed = 0u64;
+    loop {
+        let batch = storage.clean_attachments_past_keep_window(crate::unix_now_seconds())?;
+        media.unlink_released(&batch.released_files);
+        removed += batch.removed as u64;
+        if !batch.more || batch.removed == 0 {
+            return Ok((removed, false));
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Ok((removed, true));
+        }
+    }
+}
 
 /// One retained attachment in a largest-first listing. `target` feeds
 /// straight into `attachment_local_assets`, `open_attachment_handoff`, or a
@@ -165,6 +194,50 @@ impl MarmotAppRuntime {
             Some(received_before),
         )
         .await
+    }
+
+    /// The account's "Keep media" setting: Forever unless the user chose a
+    /// window. Needs no account worker.
+    pub async fn attachment_keep_media(
+        &self,
+        account_ref: &str,
+    ) -> Result<AttachmentKeepMedia, AppError> {
+        self.attachment_read(account_ref, |storage, _| {
+            Ok(storage.app_storage().attachment_keep_media()?)
+        })
+        .await
+    }
+
+    /// Sets the account's "Keep media" setting, then removes every retained
+    /// attachment already past the new window before returning, as the
+    /// account worker's sweep does: recorded as cleaned by the setting
+    /// (download again allowed), media-store space freed at once. Returns how
+    /// many it removed; Forever removes nothing. Afterwards the account
+    /// worker keeps applying the window as attachments age.
+    pub async fn set_attachment_keep_media(
+        &self,
+        account_ref: &str,
+        keep: AttachmentKeepMedia,
+    ) -> Result<u64, AppError> {
+        let removed = self
+            .attachment_read_with(account_ref, move |app, label, storage, _| {
+                let app_storage = storage.app_storage();
+                app_storage.set_attachment_keep_media(keep)?;
+                if keep == AttachmentKeepMedia::Forever {
+                    return Ok(0);
+                }
+                let media = app.account_media_store(label, &storage)?;
+                let (removed, _) = clean_past_keep_window(&app_storage, &media, None)?;
+                if removed > 0 {
+                    let _ = crate::media::storage_compaction::reclaim(&app_storage, false);
+                }
+                Ok(removed)
+            })
+            .await?;
+        if removed > 0 {
+            self.wake_attachment_work();
+        }
+        Ok(removed)
     }
 
     /// Bounded batches on the blocking pool, each one transaction followed

@@ -244,6 +244,8 @@ mod migration_0113_staged_media;
 mod migration_0114_avatar_media_files;
 #[path = "migrations/0115_recovery_replay_admission.rs"]
 mod migration_0115_recovery_replay_admission;
+#[path = "migrations/0116_attachment_keep_media.rs"]
+mod migration_0116_attachment_keep_media;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -954,6 +956,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0115_recovery_replay_admission",
         suspend_foreign_keys: migration_0115_recovery_replay_admission::SUSPEND_FOREIGN_KEYS,
         apply: migration_0115_recovery_replay_admission::apply,
+    },
+    Migration {
+        version: 116,
+        name: "0116_attachment_keep_media",
+        suspend_foreign_keys: &[],
+        apply: migration_0116_attachment_keep_media::apply,
     },
 ];
 

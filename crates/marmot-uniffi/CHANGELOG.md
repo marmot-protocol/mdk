@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- `AttachmentTransferStateFfi` adds `CleanedBySetting`: the account's "Keep
+  media" setting removed the body (mdk#2314 step 10); download again is
+  allowed, as for `Removed`. Update exhaustive Swift `switch` / Kotlin `when`
+  handling.
+
 - `AttachmentMigrationStateFfi` adds `Compacting`: the account database is
   being compacted to return its free pages to the filesystem (mdk#2314 step
   6), and the other usage figures are from just before it started. Update
@@ -47,6 +52,12 @@
 - `MarmotKitError` adds `GroupCommitUndelivered`: a group change was refused because the group's last change has not reached every group relay yet (mdk#2255). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 
 ### Added
+
+- `attachmentKeepMedia` and `setAttachmentKeepMedia` with
+  `AttachmentKeepMediaFfi` (`Forever`, `OneYear`, `SixMonths`, `ThirtyDays`):
+  the opt-in "Keep media" setting (mdk#2314 step 10). Setting a window removes
+  what is already past it and returns the count. See
+  [Manage storage](ATTACHMENT-ACCESS.md#manage-storage).
 
 - `AttachmentStorageUsageFfi::cache_bytes`: the avatar and group-image cache,
   each stored image once (mdk#2314 step 9). Show it next to a "Clear cache"

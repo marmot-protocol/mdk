@@ -222,7 +222,10 @@ run them off the UI thread. See the
 `marmot_largest_retained_attachments` read a Manage storage screen's usage and
 largest-first pages; `marmot_remove_chat_attachments` and
 `marmot_remove_attachments_older_than` remove in bulk, each removal being an
-ordinary Remove. Page cursors are borrowed from their page: keep the page alive
+ordinary Remove. `marmot_attachment_keep_media` and
+`marmot_set_attachment_keep_media` read and set the account's "Keep media"
+window as `MarmotAttachmentKeepMedia` discriminants; attachments it removes read
+`CleanedBySetting`. Page cursors are borrowed from their page: keep the page alive
 while passing its `next_cursor`, then free the page. Calls block. See the
 [shared contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#manage-storage).
 ## File-backed media upload
