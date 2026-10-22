@@ -1276,7 +1276,7 @@ pub fn cached_identity_projections( &self, account_id_hexes: Vec<String>, ) -> R
 
 Bounded local cached-identity page for many account IDs.
 
-[Source](src/commands/directory.rs#L98)
+[Source](src/commands/directory.rs#L101)
 
 ### `Marmot::user_profile_website`
 
@@ -1288,7 +1288,7 @@ pub fn user_profile_website( &self, account_id_hex: String, ) -> Result<Option<S
 
 Cached Nostr kind:0 `website` metadata for an account id, when it is a string. The generic profile record intentionally exposes the fields the host can publish; this read-only accessor preserves arbitrary kind:0 metadata while still making the standard website field available to profile presentation surfaces.
 
-[Source](src/commands/directory.rs#L120)
+[Source](src/commands/directory.rs#L124)
 
 ### `Marmot::refresh_profile`
 
@@ -1300,7 +1300,7 @@ pub async fn refresh_profile( &self, account_id_hex: String, relays: Vec<String>
 
 Fetch and cache an account's own Nostr kind:0 profile from `relays`. After this resolves, `user_profile` / `display_name` return the freshly-fetched metadata (name, picture, etc.) for that account.
 
-[Source](src/commands/directory.rs#L137)
+[Source](src/commands/directory.rs#L144)
 
 ### `Marmot::user_relay_lists`
 
@@ -1312,7 +1312,7 @@ pub fn user_relay_lists( &self, account_id_hex: String, ) -> Result<conversions:
 
 Cached NIP-65 and inbox relay lists for any account id — no network. An account with nothing cached yet returns an empty status with both kinds in `missing` rather than erroring; call `refresh_user_relay_lists` to fetch.
 
-[Source](src/commands/directory.rs#L152)
+[Source](src/commands/directory.rs#L160)
 
 ### `Marmot::refresh_user_relay_lists`
 
@@ -1324,7 +1324,7 @@ pub async fn refresh_user_relay_lists( &self, account_id_hex: String, relays: Ve
 
 Fetch an account's published NIP-65 and inbox relay lists from `relays`, updating the cache. An account with nothing published reports both kinds in `missing` rather than erroring.
 
-[Source](src/commands/directory.rs#L165)
+[Source](src/commands/directory.rs#L174)
 
 ### `Marmot::search_cached_users`
 
@@ -1336,7 +1336,7 @@ pub fn search_cached_users( &self, account_id_hex: String, query: String, limit:
 
 Search public identities cached through any connected account, without network or group-membership work. Follow flags refer only to the selected searcher. Call off the UI thread; zero limit returns no rows.
 
-[Source](src/commands/directory.rs#L180)
+[Source](src/commands/directory.rs#L190)
 
 ### `Marmot::search_users`
 
@@ -1348,7 +1348,7 @@ pub async fn search_users( &self, account_id_hex: String, query: String, radius_
 
 Stream cached public identities across accounts, then independent provider and graph results. The radius window bounds known social distances; cached/provider identities without a known distance remain discoverable. Those identities can recur when paging radii: deduplicate by account id across pages as well as within each subscription.
 
-[Source](src/commands/directory.rs#L206)
+[Source](src/commands/directory.rs#L217)
 
 </details>
 
