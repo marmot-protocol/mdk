@@ -32,6 +32,12 @@ verifies the secret-store write before scrubbing and removing the old file. If a
 existing database has neither credential, opening fails rather than generating a
 different key and losing access to the database.
 
+The database secret feeds the per-database HKDF derivation; the resulting 32 bytes
+use SQLCipher raw-key presentation. Existing passphrase-keyed databases undergo
+the same crash-safe rekey as local-signing accounts. Retain the secret-store
+credential and `.salt` sidecars for recovery or downgrade. See the
+[key-format migration and offline CLI/downgrade procedure](marmot-architecture/storage-format-v2.md#sqlcipher-key-presentation-and-kdf-work-factor-decision-record-mdk1791).
+
 ## Client Flow
 
 For a new external signer account, clients call `loginExternalSigner` with:

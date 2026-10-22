@@ -149,6 +149,10 @@ The production retention and retry limits remain unchanged.
 
 Same-database first opens now serialize SQLCipher key selection, schema migration
 and handle publication; salts cannot be overwritten by competing initializers.
+App-derived SQLCipher keys now use raw-key presentation, with a durable-marker
+rekey migration for old passphrase-keyed databases, including external-signer
+accounts. See [key presentation and offline downgrade](../storage-format-v2.md#sqlcipher-key-presentation-and-kdf-work-factor-decision-record-mdk1791).
+Android/iOS app-level open-latency evidence and security release sign-off remain outstanding.
 Android publishes key material with a per-destination file lock and atomic rename,
 preserving API 26 support without hard links; iOS and macOS retain hard-link publication.
 Generated identities remain unavailable to background attention and managed workers

@@ -370,14 +370,14 @@ pub struct AppPerformanceSnapshot {
     #[serde(default)]
     pub account_setup_network_ready: AppPerformanceOperationSnapshot,
     /// Interrupted-migration recovery probes executed since process start. Each
-    /// probe is a full keyed SQLCipher open paying the passphrase KDF; the
+    /// probe is a raw-key SQLCipher open; the
     /// healthy steady state skips it via the cached v2-open verdict (mdk#1439).
     /// Process-wide aggregate: no account, path, or key information.
     #[serde(default)]
     pub sqlcipher_migration_probe_runs: u64,
     /// Existing-database opens that skipped the recovery probe via a cached
-    /// v2-open verdict since process start. Each skip avoided one full
-    /// passphrase KDF derivation (mdk#1439).
+    /// v2-open verdict since process start. Each skip avoided one extra
+    /// raw-key database open (mdk#1439).
     #[serde(default)]
     pub sqlcipher_migration_probe_skips: u64,
     #[serde(default)]

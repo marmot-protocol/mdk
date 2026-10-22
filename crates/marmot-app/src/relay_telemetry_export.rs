@@ -289,10 +289,10 @@ pub mod metric_names {
     pub const APP_ACCOUNT_SETUP_NETWORK_READY_FAILURES: &str =
         "app_account_setup_network_ready_failures";
     /// Interrupted-migration recovery probes executed (each is one full keyed
-    /// SQLCipher open paying the passphrase KDF, mdk#1439).
+    /// raw-key SQLCipher open, mdk#1439).
     pub const APP_SQLCIPHER_MIGRATION_PROBE_RUNS: &str = "app_sqlcipher_migration_probe_runs";
     /// Existing-database opens that skipped the recovery probe via a cached
-    /// v2-open verdict (each avoided one passphrase KDF derivation, mdk#1439).
+    /// v2-open verdict (each avoided one extra raw-key open, mdk#1439).
     pub const APP_SQLCIPHER_MIGRATION_PROBE_SKIPS: &str = "app_sqlcipher_migration_probe_skips";
     /// Send command admission and worker queue wait.
     pub const APP_OUTBOUND_MESSAGE_QUEUE_WAIT_DURATION: &str =
@@ -1738,9 +1738,8 @@ fn append_app_performance_points(
             });
         }
     }
-    // Process-wide SQLCipher probe counters (mdk#1439): runs are keyed opens
-    // paying the passphrase KDF, skips are KDF derivations avoided via cached
-    // verdicts. Population-level only, no labels.
+    // Process-wide SQLCipher probe counters (mdk#1439): raw-key recovery opens
+    // and opens avoided via cached verdicts. Population-level only, no labels.
     for (name, value) in [
         (
             metric_names::APP_SQLCIPHER_MIGRATION_PROBE_RUNS,
