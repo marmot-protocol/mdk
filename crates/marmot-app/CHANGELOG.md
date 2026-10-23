@@ -252,10 +252,12 @@
 ### Fixed
 
 - Sends, media preparation and group changes continue when the pre-send group
-  subscription refresh fails (mdk#2562). When a group's relays were
-  unreachable, the refreshed REQ was refused and the send failed with it,
-  although publishing carries its own relays. The refresh stays armed for the
-  worker's retry.
+  subscription refresh fails, for example because a group's relays are
+  unreachable (mdk#2562). A token send no longer turns `Rejected` moments after
+  admission: publishing carries its own relays, and the refresh stays armed for
+  the worker's retry. Convergence retries still require the refresh, and an
+  inactive account still fails it, so its messages keep taking the
+  inactive-account queue.
 - `ctutils` 0.4.5 fixes non-constant-time mask generation and `u128`
   comparisons (RUSTSEC-2026-0385).
 - `shutdown_and_close` and `close_storage` now close every connection that
