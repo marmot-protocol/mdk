@@ -1224,15 +1224,22 @@ impl AppClient {
         method: &'static str,
     ) -> Result<(), AppError> {
         let result = self.sync_runtime_groups().await;
-        Self::tolerate_pre_send_sync_failure(method, result)
+        self.tolerate_pre_send_sync_failure(method, result)
     }
 
     /// The failure policy of [`Self::sync_runtime_groups_for_send`], for a
     /// caller that runs the refresh itself to time it.
     pub(crate) fn tolerate_pre_send_sync_failure(
+        &mut self,
         method: &'static str,
         result: Result<(), AppError>,
     ) -> Result<(), AppError> {
+        if result.is_err() {
+            // `sync_runtime_groups` arms the retry only once it has read the
+            // rebuild floor. The send no longer reports an earlier failure,
+            // so arm it here for every failure.
+            self.pending_runtime_group_subscription_refresh = true;
+        }
         match result {
             Err(error) if !error.is_account_not_active() => {
                 tracing::warn!(

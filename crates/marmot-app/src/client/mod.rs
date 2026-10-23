@@ -2830,7 +2830,7 @@ impl AppClient {
             pre_send_sync_started_at.elapsed(),
             pre_send_sync.is_ok(),
         );
-        Self::tolerate_pre_send_sync_failure("invite_members", pre_send_sync)?;
+        self.tolerate_pre_send_sync_failure("invite_members", pre_send_sync)?;
 
         let engine_publish_started_at = Instant::now();
         let commit = self
@@ -5898,8 +5898,10 @@ impl AppClient {
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
 
-        self.sync_runtime_groups_for_send("retry_group_convergence")
-            .await?;
+        // Unlike a send, a convergence retry needs live subscriptions, and its
+        // pass re-syncs routes before checkpointing. Refuse it up front rather
+        // than publish and then fail that checkpoint.
+        self.sync_runtime_groups().await?;
         let effects = self.runtime.advance_convergence(group_id).await?;
         self.observe_convergence_retry_effects(group_id, &effects)
             .await

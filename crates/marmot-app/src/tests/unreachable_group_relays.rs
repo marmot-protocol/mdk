@@ -61,3 +61,36 @@ async fn sends_and_group_changes_continue_while_the_group_subscription_is_refuse
         "the owed subscription registers once the relay accepts it"
     );
 }
+
+/// `sync_runtime_groups` arms its retry only once it reaches the adapter, so
+/// an earlier failure, such as reading the rebuild floor, must be armed by
+/// the send path that now continues past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tolerated_refresh_failure_arms_the_subscription_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    assert!(!client.pending_runtime_group_subscription_refresh);
+
+    client
+        .tolerate_pre_send_sync_failure(
+            "test",
+            Err(AppError::BlockingTask("rebuild floor read failed".into())),
+        )
+        .unwrap();
+    assert!(client.pending_runtime_group_subscription_refresh);
+
+    client.pending_runtime_group_subscription_refresh = false;
+    let inactive = AppError::Transport(cgka_traits::TransportAdapterError::AccountNotActive(
+        cgka_traits::MemberId::new(vec![7; 32]),
+    ));
+    let error = client
+        .tolerate_pre_send_sync_failure("test", Err(inactive))
+        .unwrap_err();
+    assert!(error.is_account_not_active());
+    assert!(client.pending_runtime_group_subscription_refresh);
+}
