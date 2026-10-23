@@ -23,8 +23,8 @@ use zeroize::Zeroizing;
 
 use crate::AGENT_SOCKET_DIR_MODE;
 use crate::bootstrap::{
-    BootstrapError, ControlClient, bootstrap_auth_token_file, resolve_bootstrap_home,
-    resolve_bootstrap_relays, resolve_bootstrap_socket,
+    BootstrapError, ControlClient, RelaySource, ResolvedRelays, bootstrap_auth_token_file,
+    resolve_bootstrap_home, resolve_bootstrap_socket, resolve_relays,
 };
 use crate::socket::{
     SocketDirViolation, SocketPathState, current_effective_uid, is_stale_socket_error,
@@ -157,14 +157,6 @@ impl DoctorReport {
     }
 }
 
-/// Where the relay list `serve` would use came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RelaySource {
-    Flag,
-    Environment,
-    Defaults,
-}
-
 /// The control token, resolved as `bootstrap` resolves it.
 enum DoctorAuth {
     /// `MARMOT_AGENT_AUTH_TOKEN` is set, possibly to an empty value.
@@ -180,19 +172,20 @@ pub struct DoctorOptions {
     socket: PathBuf,
     socket_dir_mode: u32,
     auth: DoctorAuth,
-    relays: Vec<String>,
-    relay_source: RelaySource,
+    relays: ResolvedRelays,
     request_timeout: Duration,
 }
 
 impl DoctorOptions {
-    /// Resolve flags, then `MARMOT_*` environment, then defaults, exactly as
-    /// `wn-agent bootstrap` does.
+    /// Resolve flags, then `MARMOT_*` environment, then defaults: the home,
+    /// socket and token as `wn-agent bootstrap` does, and the relays with the
+    /// resolver `serve` and `bootstrap` share.
     pub fn resolve(
         home: Option<PathBuf>,
         socket: Option<PathBuf>,
         auth_token_file: Option<PathBuf>,
         relays: Vec<String>,
+        use_default_relays: bool,
         socket_dir_mode: u32,
     ) -> Self {
         let home = resolve_bootstrap_home(home);
@@ -204,33 +197,14 @@ impl DoctorOptions {
                 DoctorAuth::File { path, explicit }
             }
         };
-        let relay_env = std::env::var("MARMOT_RELAYS")
-            .or_else(|_| std::env::var("MARMOT_RELAY"))
-            .ok();
-        let relay_source = relay_source(&relays, relay_env.as_deref());
         Self {
-            relays: resolve_bootstrap_relays(relays),
+            relays: resolve_relays(relays, use_default_relays),
             home,
             socket,
             socket_dir_mode,
             auth,
-            relay_source,
             request_timeout: DOCTOR_REQUEST_TIMEOUT,
         }
-    }
-}
-
-/// Where `resolve_bootstrap_relays` takes its list from, following its
-/// precedence: any nonempty flag list is final, even one that cleans to
-/// nothing; then a `MARMOT_RELAYS` (else `MARMOT_RELAY`) value with at least
-/// one entry; then the defaults.
-fn relay_source(flags: &[String], env: Option<&str>) -> RelaySource {
-    if !flags.is_empty() {
-        RelaySource::Flag
-    } else if env.is_some_and(|value| value.split(',').any(|part| !part.trim().is_empty())) {
-        RelaySource::Environment
-    } else {
-        RelaySource::Defaults
     }
 }
 
@@ -246,7 +220,7 @@ pub async fn run_doctor(options: &DoctorOptions) -> DoctorReport {
         check_socket_dir(options, effective_uid, auth.token.is_some()),
         check_socket_path(&socket),
         auth.check,
-        check_relays(&options.relays, options.relay_source),
+        check_relays(&options.relays),
         check_accounts(&accounts),
         check_account_files(&accounts),
     ];
@@ -472,6 +446,9 @@ fn check_socket_dir(
 /// What sits at the socket path, as the bind path would see it.
 enum SocketProbe {
     TooLong,
+    /// A symlink whose target does not exist. The bind path sees nothing
+    /// there, yet cannot create the socket over it.
+    DanglingSymlink,
     State(SocketPathState),
     Error(ErrorKind),
 }
@@ -483,6 +460,12 @@ async fn probe_socket(socket: &Path, timeout: Duration) -> SocketProbe {
         return SocketProbe::TooLong;
     }
     match socket_path_occupant(socket) {
+        Ok(Some(SocketPathState::Missing))
+            if std::fs::symlink_metadata(socket)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink()) =>
+        {
+            return SocketProbe::DanglingSymlink;
+        }
         Ok(Some(state)) => return SocketProbe::State(state),
         Ok(None) => {}
         Err(error) => return SocketProbe::Error(error.kind()),
@@ -500,6 +483,12 @@ async fn probe_socket(socket: &Path, timeout: Duration) -> SocketProbe {
 fn check_socket_path(socket: &SocketProbe) -> DoctorCheck {
     use DoctorStatus::*;
     match socket {
+        SocketProbe::DanglingSymlink => local(
+            "socket_path",
+            Fail,
+            "A dangling symlink is at the socket path; wn-agent cannot create its socket there and fails to start.",
+            "Remove that symlink (`rm <socket>`), then start wn-agent.",
+        ),
         SocketProbe::TooLong => local(
             "socket_path",
             Fail,
@@ -698,36 +687,27 @@ fn inspect_auth(auth: &DoctorAuth) -> AuthInspection {
     }
 }
 
-fn check_relays(relays: &[String], source: RelaySource) -> DoctorCheck {
-    use DoctorStatus::*;
-    let source = match source {
+/// How many relays `serve` would use and where they come from. URL checks
+/// belong to `serve` itself, which validates what it dials.
+fn check_relays(resolved: &ResolvedRelays) -> DoctorCheck {
+    let source = match resolved.source {
         RelaySource::Flag => "the --relay flag",
         RelaySource::Environment => "MARMOT_RELAYS or MARMOT_RELAY",
-        RelaySource::Defaults => "the built-in defaults",
+        RelaySource::Default => "the built-in defaults",
+        RelaySource::None => {
+            return local(
+                "relays",
+                DoctorStatus::Warn,
+                "No relays: --no-default-relays is set and neither --relay nor MARMOT_RELAYS names any, \
+                 so wn-agent runs offline.",
+                "Pass --relay or set MARMOT_RELAYS unless this wn-agent is meant to stay offline.",
+            );
+        }
     };
-    let count = u32::try_from(relays.len()).unwrap_or(u32::MAX);
-    if relays.is_empty() {
-        return local(
-            "relays",
-            Fail,
-            format!("No relays resolve from {source}."),
-            "Pass wss:// relay URLs with --relay or MARMOT_RELAYS.",
-        );
-    }
-    if marmot_app::validate_relay_urls(relays).is_err() {
-        return local(
-            "relays",
-            Fail,
-            format!(
-                "{} from {source}, and at least one is not a valid relay URL.",
-                plural(count, "relay", "relays")
-            ),
-            "Pass only wss:// relay URLs with --relay or MARMOT_RELAYS.",
-        );
-    }
+    let count = u32::try_from(resolved.relays.len()).unwrap_or(u32::MAX);
     local(
         "relays",
-        Ok,
+        DoctorStatus::Ok,
         format!("{} from {source}.", plural(count, "relay", "relays")),
         NO_ACTION,
     )
@@ -745,12 +725,9 @@ struct AccountScan {
     /// Local-signing accounts marked signed out, which wn-agent does not start.
     signed_out: u32,
     unreadable: u32,
-    /// Entries with any group or other permission bit, and symlinks.
+    /// Directories and files with any group or other permission bit.
     loose: u32,
-    /// Entries the group can read or change through the directories above them.
-    group_exposed: u32,
-    /// Entries other users can read or change through the directories above them.
-    world_exposed: u32,
+    symlinks: u32,
     /// Entries whose metadata or listing could not be read, or beyond the walk bounds.
     uninspected: u32,
     visited: u32,
@@ -759,44 +736,15 @@ struct AccountScan {
 const MAX_ACCOUNT_WALK_DEPTH: u32 = 8;
 const MAX_ACCOUNT_WALK_ENTRIES: u32 = 100_000;
 
-/// Which other users can traverse down to an entry: every directory from the
-/// home down must grant that class execute permission.
-#[derive(Clone, Copy)]
-struct Reach {
-    group: bool,
-    world: bool,
-}
-
-impl Reach {
-    fn through(self, mode: u32) -> Self {
-        Self {
-            group: self.group && mode & 0o010 != 0,
-            world: self.world && mode & 0o001 != 0,
-        }
-    }
-}
-
 impl AccountScan {
-    /// Count one entry that `reach` can get to; directories recurse.
-    fn walk(&mut self, path: &Path, metadata: &Metadata, reach: Reach, depth: u32) {
+    /// Count one entry's mode; directories recurse within the walk bounds.
+    fn walk(&mut self, path: &Path, metadata: &Metadata, depth: u32) {
         if metadata.file_type().is_symlink() {
-            self.loose += 1;
+            self.symlinks += 1;
             return;
         }
-        let mode = mode_of(metadata);
-        if mode & 0o077 != 0 {
+        if mode_of(metadata) & 0o077 != 0 {
             self.loose += 1;
-        }
-        // A file exposes its contents; a directory lets others replace entries.
-        let (group_exposes, world_exposes) = if metadata.is_dir() {
-            (mode & 0o030 == 0o030, mode & 0o003 == 0o003)
-        } else {
-            (mode & 0o060 != 0, mode & 0o006 != 0)
-        };
-        if reach.world && world_exposes {
-            self.world_exposed += 1;
-        } else if reach.group && group_exposes {
-            self.group_exposed += 1;
         }
         if !metadata.is_dir() {
             return;
@@ -809,7 +757,6 @@ impl AccountScan {
             self.uninspected += 1;
             return;
         };
-        let reach = reach.through(mode);
         for entry in entries {
             if self.visited >= MAX_ACCOUNT_WALK_ENTRIES {
                 self.uninspected += 1;
@@ -821,7 +768,7 @@ impl AccountScan {
                 std::fs::symlink_metadata(&path).map(|metadata| (path, metadata))
             });
             match child {
-                Ok((path, metadata)) => self.walk(&path, &metadata, reach, depth + 1),
+                Ok((path, metadata)) => self.walk(&path, &metadata, depth + 1),
                 Err(_) => self.uninspected += 1,
             }
         }
@@ -891,13 +838,13 @@ fn scan_accounts(home: &Path) -> AccountScan {
             Err(()) => scan.unreadable += 1,
         }
     }
-    let home_mode = std::fs::metadata(home).map_or(0, |metadata| mode_of(&metadata));
-    let reach = Reach {
-        group: true,
-        world: true,
+    // A symlinked `<home>/accounts` is flagged, and its target still walked.
+    if std::fs::symlink_metadata(&accounts_dir)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        scan.symlinks += 1;
     }
-    .through(home_mode);
-    scan.walk(&accounts_dir, &accounts_meta, reach, 0);
+    scan.walk(&accounts_dir, &accounts_meta, 0);
     scan
 }
 
@@ -994,40 +941,26 @@ fn check_account_files(scan: &AccountScan) -> DoctorCheck {
     } else {
         String::new()
     };
-    if scan.world_exposed > 0 {
-        return local(
-            "account_files",
-            Fail,
-            format!(
-                "Other users can read or change {}.{uninspected}",
-                plural(scan.world_exposed, "account entry", "account entries")
-            ),
-            TIGHTEN,
-        );
-    }
-    if scan.group_exposed > 0 {
-        return local(
-            "account_files",
-            Warn,
-            format!(
-                "The group can read or change {}.{uninspected}",
-                plural(scan.group_exposed, "account entry", "account entries")
-            ),
-            TIGHTEN,
-        );
-    }
-    if scan.loose > 0 {
+    if scan.loose > 0 || scan.symlinks > 0 {
+        let mut found = Vec::new();
+        if scan.loose > 0 {
+            found.push(plural(
+                scan.loose,
+                "account entry has group or other permission bits",
+                "account entries have group or other permission bits",
+            ));
+        }
+        if scan.symlinks > 0 {
+            found.push(plural(
+                scan.symlinks,
+                "account entry is a symlink",
+                "account entries are symlinks",
+            ));
+        }
         return local(
             "account_files",
             Warn,
-            format!(
-                "{}; no other user can reach them through the directories above.{uninspected}",
-                plural(
-                    scan.loose,
-                    "account entry has group or other permission bits or is a symlink",
-                    "account entries have group or other permission bits or are symlinks"
-                )
-            ),
+            format!("{}.{uninspected}", found.join(", and ")),
             TIGHTEN,
         );
     }
@@ -1359,17 +1292,6 @@ fn check_key_package(report: &AgentControlDiagnosticStatus) -> DoctorCheck {
                     REPUBLISH_KEY_PACKAGE,
                 );
             }
-            if accepted == 0 {
-                return live(
-                    "key_package",
-                    Warn,
-                    format!(
-                        "This device has a KeyPackage, but no relay has accepted it ({} failed).",
-                        failed
-                    ),
-                    "Check relay_health; if relays are connected, run `wn-agent bootstrap --home <home>`.",
-                );
-            }
             let unattempted = key_package.unattempted_fanout_targets;
             let prohibited = key_package.policy_prohibited_fanout_targets;
             if unattempted > 0 || prohibited > 0 {
@@ -1377,12 +1299,26 @@ fn check_key_package(report: &AgentControlDiagnosticStatus) -> DoctorCheck {
                     "key_package",
                     Warn,
                     format!(
-                        "This device's KeyPackage is current, but publication is incomplete: {} accepted, \
-                         {failed} failed, {unattempted} not yet attempted, {prohibited} refused by relay policy.",
-                        plural(accepted, "relay", "relays")
+                        "This device's KeyPackage is current, but publication is incomplete: {accepted} \
+                         accepted, {failed} failed, {unattempted} not yet attempted, {prohibited} refused by \
+                         relay policy."
                     ),
-                    "Rerun wn-agent doctor in a minute; if targets stay unattempted or refused, check \
-                     relay_health and the relay list.",
+                    if prohibited > 0 {
+                        "Some relays refuse this KeyPackage by policy, which bootstrap cannot change: check \
+                         those relays' rules or choose other relays."
+                    } else {
+                        "Rerun wn-agent doctor in a minute; if targets stay unattempted, check relay_health."
+                    },
+                );
+            }
+            if accepted == 0 {
+                return live(
+                    "key_package",
+                    Warn,
+                    format!(
+                        "This device has a KeyPackage, but no relay has accepted it ({failed} failed)."
+                    ),
+                    "Check relay_health; if relays are connected, run `wn-agent bootstrap --home <home>`.",
                 );
             }
             if failed > 0 {
@@ -1588,11 +1524,13 @@ mod tests {
                 socket: self.socket(),
                 socket_dir_mode: AGENT_SOCKET_DIR_MODE,
                 auth,
-                relays: DEFAULT_RELAYS
-                    .iter()
-                    .map(|relay| (*relay).to_owned())
-                    .collect(),
-                relay_source: RelaySource::Defaults,
+                relays: ResolvedRelays {
+                    relays: DEFAULT_RELAYS
+                        .iter()
+                        .map(|relay| (*relay).to_owned())
+                        .collect(),
+                    source: RelaySource::Default,
+                },
                 request_timeout: Duration::from_secs(5),
             }
         }
@@ -1961,12 +1899,18 @@ mod tests {
         let report = run_doctor(&fixture.options()).await;
         assert_check(&report, "account_files", DoctorStatus::Warn, "chmod 600");
 
-        // Every directory on the way down now lets other users in.
-        chmod(&fixture.home, 0o755);
+        // Loose directories are counted too; modes are reported, never changed.
         chmod(&fixture.home.join("accounts"), 0o755);
         chmod(&dir, 0o755);
         let report = run_doctor(&fixture.options()).await;
-        assert_check(&report, "account_files", DoctorStatus::Fail, "chmod 700");
+        assert_check(&report, "account_files", DoctorStatus::Warn, "chmod 700");
+        assert!(
+            find(&report, "account_files")
+                .summary
+                .starts_with("3 account entries have group or other permission bits"),
+            "{}",
+            find(&report, "account_files").summary
+        );
         assert_eq!(mode_of(&std::fs::metadata(&record).unwrap()), 0o644);
     }
 
@@ -1984,12 +1928,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn account_walk_covers_writable_dirs_nested_files_and_symlinks() {
+    async fn account_walk_counts_nested_files_and_symlinks() {
         let fixture = Fixture::new();
         fixture.account("agent", ACCOUNT_ID, true);
         let dir = fixture.home.join("accounts").join("agent");
 
-        // Private ancestors keep a symlink unreachable, but it is still flagged.
         std::os::unix::fs::symlink(dir.join("secret.json"), dir.join("alias.json")).unwrap();
         let report = run_doctor(&fixture.options()).await;
         assert_check(
@@ -1998,24 +1941,34 @@ mod tests {
             DoctorStatus::Warn,
             "replace any symlinks",
         );
+        assert!(
+            find(&report, "account_files")
+                .summary
+                .contains("1 account entry is a symlink")
+        );
         std::fs::remove_file(dir.join("alias.json")).unwrap();
 
-        chmod(&fixture.home, 0o755);
-        chmod(&fixture.home.join("accounts"), 0o755);
-        // A reachable world-writable account directory lets others replace files.
-        chmod(&dir, 0o777);
-        let report = run_doctor(&fixture.options()).await;
-        assert_check(&report, "account_files", DoctorStatus::Fail, "chmod 700");
-
-        // A world-readable file below a nested directory is found too.
-        chmod(&dir, 0o755);
         let nested = dir.join("handoff");
         std::fs::create_dir(&nested).unwrap();
-        chmod(&nested, 0o755);
+        chmod(&nested, 0o700);
         std::fs::write(nested.join("copy.bin"), b"x").unwrap();
         chmod(&nested.join("copy.bin"), 0o644);
         let report = run_doctor(&fixture.options()).await;
-        assert_check(&report, "account_files", DoctorStatus::Fail, "chmod 600");
+        assert_check(&report, "account_files", DoctorStatus::Warn, "chmod 600");
+        chmod(&nested.join("copy.bin"), 0o600);
+
+        // A symlinked `<home>/accounts` is flagged, and its private target walked.
+        let real = fixture.home.join("accounts-real");
+        std::fs::rename(fixture.home.join("accounts"), &real).unwrap();
+        std::os::unix::fs::symlink(&real, fixture.home.join("accounts")).unwrap();
+        let report = run_doctor(&fixture.options()).await;
+        assert_check(&report, "accounts", DoctorStatus::Ok, NO_ACTION);
+        assert_check(
+            &report,
+            "account_files",
+            DoctorStatus::Warn,
+            "replace any symlinks",
+        );
     }
 
     #[tokio::test]
@@ -2030,15 +1983,19 @@ mod tests {
     }
 
     #[test]
-    fn relay_source_follows_resolver_precedence() {
-        let defaults = DEFAULT_RELAYS.join(",");
-        assert_eq!(
-            relay_source(&[" ".to_owned()], Some(RELAY)),
-            RelaySource::Flag
-        );
-        assert_eq!(relay_source(&[], Some(&defaults)), RelaySource::Environment);
-        assert_eq!(relay_source(&[], Some(" , ")), RelaySource::Defaults);
-        assert_eq!(relay_source(&[], None), RelaySource::Defaults);
+    fn relays_report_count_and_source_only() {
+        let check = check_relays(&ResolvedRelays {
+            relays: vec!["not a relay".to_owned()],
+            source: RelaySource::Flag,
+        });
+        assert_eq!(check.status, DoctorStatus::Ok);
+        assert_eq!(check.summary, "1 relay from the --relay flag.");
+        let check = check_relays(&ResolvedRelays {
+            relays: Vec::new(),
+            source: RelaySource::None,
+        });
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert!(check.next_step.contains("MARMOT_RELAYS"));
     }
 
     #[tokio::test]
@@ -2076,22 +2033,6 @@ mod tests {
                 .summary
                 .contains("2 account records could not be read")
         );
-    }
-
-    #[test]
-    fn whitespace_relay_flag_stays_the_source() {
-        let fixture = Fixture::new();
-        let options = DoctorOptions::resolve(
-            Some(fixture.home.clone()),
-            None,
-            None,
-            vec![" ".to_owned()],
-            AGENT_SOCKET_DIR_MODE,
-        );
-        assert_eq!(options.relay_source, RelaySource::Flag);
-        let check = check_relays(&options.relays, options.relay_source);
-        assert_eq!(check.status, DoctorStatus::Fail);
-        assert!(check.summary.contains("--relay flag"), "{}", check.summary);
     }
 
     #[tokio::test]
@@ -2142,14 +2083,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_relay_flag_fails() {
+    async fn dangling_symlink_at_socket_path_fails() {
         let fixture = Fixture::new();
-        let mut options = fixture.options();
-        options.relays = vec!["not a relay".to_owned()];
-        options.relay_source = RelaySource::Flag;
-        let report = run_doctor(&options).await;
-        assert_check(&report, "relays", DoctorStatus::Fail, "--relay");
-        assert!(find(&report, "relays").summary.contains("--relay flag"));
+        fixture.dev_dir(0o700);
+        let socket = fixture.socket();
+        std::os::unix::fs::symlink(fixture.home.join("no-such-socket"), &socket).unwrap();
+        let report = run_doctor(&fixture.options()).await;
+        assert_check(
+            &report,
+            "socket_path",
+            DoctorStatus::Fail,
+            "Remove that symlink",
+        );
+        assert_check(&report, "daemon", DoctorStatus::Fail, "Start `wn-agent");
+        assert!(
+            std::fs::symlink_metadata(&socket).is_ok(),
+            "doctor must not remove it"
+        );
     }
 
     #[tokio::test]
@@ -2229,6 +2179,23 @@ mod tests {
             check.summary.contains("2 not yet attempted"),
             "{}",
             check.summary
+        );
+
+        // Nothing accepted yet: incomplete publication still reports every count.
+        let mut refused = current_key_package();
+        refused.accepted_fanout_targets = 0;
+        refused.policy_prohibited_fanout_targets = 3;
+        let check = check_key_package(&diagnostic(refused));
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert!(
+            check.summary.contains("3 refused by relay policy"),
+            "{}",
+            check.summary
+        );
+        assert!(
+            check.next_step.contains("bootstrap cannot change"),
+            "{}",
+            check.next_step
         );
     }
 
@@ -2402,8 +2369,10 @@ mod tests {
             path: token_path.clone(),
             explicit: true,
         });
-        options.relays = vec![RELAY.to_owned(), "not a relay".to_owned()];
-        options.relay_source = RelaySource::Flag;
+        options.relays = ResolvedRelays {
+            relays: vec![RELAY.to_owned(), "not a relay".to_owned()],
+            source: RelaySource::Flag,
+        };
         let mut status = diagnostic(current_key_package());
         status.replay.state = AgentControlReplayState::Failed;
         status.replay.last_reason = Some(ACCOUNT_ID.to_owned());

@@ -249,13 +249,13 @@ wn-agent doctor --home ~/.marmot-agent
 
 It prints one line per check, each with a status (`ok`, `warn`, `fail` or `unknown`) and a next step, and exits
 nonzero when any check fails. Local checks cover the home directory, the socket directory and socket path, the token
-file, the relays `wn-agent` would use, the local-signing accounts and the account file modes. When the daemon answers,
-it also reports the protocol version, this device's KeyPackage, relay health and inbound catch-up from
-`diagnostic_status`.
+file, how many relays `wn-agent` would use and where they come from, the local-signing accounts and the account file
+modes. When the daemon answers, it also reports the protocol version, this device's KeyPackage, relay health and
+inbound catch-up from `diagnostic_status`.
 
 `--home`, `--socket`, `--auth-token-file` and the `MARMOT_*` variables resolve as they do for `bootstrap`. Pass the same
-`--relay` and `--socket-dir-mode` values you give the daemon. `--json` prints the same checks for scripts; each check
-has a stable `id`.
+`--relay`, `--no-default-relays` and `--socket-dir-mode` values you give the daemon. `--json` prints the same checks for
+scripts; each check has a stable `id`.
 
 The output contains no paths, account ids, public keys, relay URLs, group ids or tokens, so you can paste it into a
 support chat. A passing doctor shows the connector is set up and reachable, not that messages are delivered: send a test

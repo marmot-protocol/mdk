@@ -281,9 +281,11 @@ struct DoctorArgs {
         long,
         value_name = "URL",
         value_delimiter = ',',
-        help = "Check these relay URLs as wn-agent would receive them"
+        help = "Relay URLs wn-agent is started with; may be repeated"
     )]
     relay: Vec<String>,
+    #[arg(long, help = "wn-agent is started with --no-default-relays")]
+    no_default_relays: bool,
     #[arg(
         long,
         value_name = "OCTAL",
@@ -676,6 +678,7 @@ async fn run_doctor_command(args: DoctorArgs) -> ExitCode {
         args.socket,
         args.auth_token_file,
         args.relay,
+        !args.no_default_relays,
         socket_dir_mode,
     );
     let report = run_doctor(&options).await;
