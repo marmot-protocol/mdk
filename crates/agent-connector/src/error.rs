@@ -79,6 +79,9 @@ impl ConnectorError {
             Self::App(AppError::AgentStreamSendFailed(_)) => "stream_send_failed",
             Self::App(AppError::InvalidGroupProfile(_)) => "invalid_group_profile",
             Self::App(AppError::InvalidEditTarget) => "invalid_edit_target",
+            Self::App(AppError::MissingRelayLists(_) | AppError::MissingDefaultRelays) => {
+                "missing_relay_lists"
+            }
             Self::App(error)
                 if matches!(
                     error.as_engine_error(),
@@ -138,6 +141,10 @@ impl ConnectorError {
             Self::App(AppError::InvalidEditTarget) => {
                 "edit target must be an available chat message this account sent"
             }
+            Self::App(AppError::MissingRelayLists(_) | AppError::MissingDefaultRelays) => {
+                "account relay lists are missing or empty; give wn-agent relays to publish them \
+                 (--relay or MARMOT_RELAYS), or publish non-empty lists from another client"
+            }
             Self::App(error)
                 if matches!(
                     error.as_engine_error(),
@@ -169,7 +176,9 @@ impl ConnectorError {
             Self::StreamPreviewIdempotencyConflict => {
                 "stream preview idempotency key was reused with different inputs"
             }
-            Self::Io(_) => "connector I/O failed",
+            Self::Io(error) => {
+                crate::socket::socket_rejection(error).unwrap_or("connector I/O failed")
+            }
             Self::App(AppError::ReactionNotFound) => "no matching reaction to remove",
             Self::App(AppError::MediaUploadTimedOut) => "media upload timed out before publication",
             Self::AccountHome(_) | Self::App(_) => "connector request failed",

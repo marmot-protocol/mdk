@@ -9,8 +9,7 @@ use agent_connector::{
     DEFAULT_BOOTSTRAP_LABEL, GroupProfileToolConfig, MAX_CONTROL_CONNECTIONS, MAX_IDENTITY_BYTES,
     default_socket_path, import_existing_identity_file, import_existing_identity_secret,
     read_bootstrap_auth_token, resolve_bootstrap_home, resolve_bootstrap_quic_candidates,
-    resolve_bootstrap_relays, resolve_bootstrap_socket, run_bootstrap, run_group_profile_tool,
-    serve_socket,
+    resolve_bootstrap_socket, resolve_relays, run_bootstrap, run_group_profile_tool, serve_socket,
 };
 use agent_control::AgentControlInvitePolicy;
 use clap::{Args, Parser, Subcommand};
@@ -63,9 +62,15 @@ struct ServeArgs {
         long,
         value_name = "URL",
         value_delimiter = ',',
-        help = "Default relay URLs for hosted app runtime state"
+        help = "Relay URL for hosted app runtime state; may be repeated \
+                (default: MARMOT_RELAYS, then the White Noise relays)"
     )]
     relay: Vec<String>,
+    #[arg(
+        long,
+        help = "Offline/test only: run with no relays unless --relay or MARMOT_RELAYS names some"
+    )]
+    no_default_relays: bool,
     #[arg(
         long,
         help = "Dev/test only: accept invites from any authenticated welcomer; requires --debug-controls"
@@ -590,7 +595,7 @@ async fn run_serve_command(args: ServeArgs) -> ExitCode {
         socket,
         socket_dir_mode,
         socket_mode,
-        relays: args.relay,
+        relays: resolve_relays(args.relay, !args.no_default_relays).relays,
         dev_allow_any_invites: args.dev_allow_any_invites,
         debug_controls: args.debug_controls,
         auth_token,
@@ -623,7 +628,7 @@ async fn run_bootstrap_command(args: BootstrapArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let relays = resolve_bootstrap_relays(args.relay);
+    let relays = resolve_relays(args.relay, true).relays;
     let quic_candidates =
         resolve_bootstrap_quic_candidates(args.quic_candidate, args.quic_candidates, args.no_quic);
     let options = BootstrapOptions {
@@ -734,22 +739,24 @@ fn which_qrencode() -> Option<String> {
     })
 }
 
+/// One startup failure line. `client_message` and the reasons below are fixed
+/// text the connector writes, so the line carries no path, account id or relay
+/// URL even though it names the cause.
 fn safe_error_message(err: &ConnectorError) -> String {
+    let mut message = format!(
+        "startup failed code={} detail={}",
+        err.privacy_safe_code(),
+        err.client_message()
+    );
     match err {
-        ConnectorError::SocketPathTooLong => format!(
-            "startup failed code={} detail={}",
-            err.privacy_safe_code(),
-            err.client_message()
-        ),
-        ConnectorError::Io(io) => {
-            format!(
-                "startup failed code={} io_kind={:?}",
-                err.privacy_safe_code(),
-                io.kind()
-            )
+        ConnectorError::Io(io) => message.push_str(&format!(" io_kind={:?}", io.kind())),
+        ConnectorError::UnsafeControlPlaneConfig(reason)
+        | ConnectorError::InvalidRelayUrl(reason) => {
+            message.push_str(&format!(" reason={reason}"));
         }
-        _ => format!("startup failed code={}", err.privacy_safe_code()),
+        _ => {}
     }
+    message
 }
 
 fn read_auth_token(path: Option<&PathBuf>) -> Result<Option<String>, String> {
