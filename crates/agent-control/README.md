@@ -16,6 +16,9 @@ protocol; `agent-connector` is the server.
 It does not contain engine, storage, account, or transport logic, the socket daemon or process lifecycle (see
 `agent-connector`), or QUIC preview composition (see `agent-stream-compose`).
 
+To write a client of this protocol, start with [Build your own client](../../integrations/custom-client.md): framing,
+group creation, sends and `subscribe_inbound`, with wire examples.
+
 ## Compatibility
 
 Version 2 is intentionally incompatible with version 1. The structured inbound-message, reply-context, and

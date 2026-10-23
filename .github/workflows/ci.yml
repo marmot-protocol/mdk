@@ -248,6 +248,9 @@ jobs:
           integrations/terminal-harness/tests/test_installer.sh opencode
           integrations/terminal-harness/tests/test_installer.sh goose
 
+      - name: Test the connector-only wn-agent installer
+        run: integrations/terminal-harness/tests/test_connector_only_installer.sh
+
   rust-wasm-check:
     name: Rust WASM check
     needs: changes

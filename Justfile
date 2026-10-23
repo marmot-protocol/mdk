@@ -272,6 +272,9 @@ pi-dev-e2e-connector:
 goose-installer-test:
     integrations/goose/marmot/tests/test_installer.sh
 
+wn-agent-installer-test:
+    integrations/terminal-harness/tests/test_connector_only_installer.sh
+
 goose-dev-e2e-connector:
     cargo test -p wn-goose --test e2e_connector -- --ignored --nocapture
 
