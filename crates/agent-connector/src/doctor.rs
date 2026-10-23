@@ -878,6 +878,16 @@ fn check_accounts(scan: &AccountScan) -> DoctorCheck {
             "Sign the account back in from the app that signed it out, or bootstrap a different agent account.",
         );
     }
+    if scan.local_signing == 0 && scan.unreadable > 0 {
+        // Bootstrap skips unreadable records, so it would create another account.
+        return local(
+            "accounts",
+            Fail,
+            format!("No readable local-signing account.{notes}"),
+            "Check that this user can read every account record under <home>/accounts (run doctor as the \
+             user that runs wn-agent) before creating any account.",
+        );
+    }
     let (status, summary, next_step) = match scan.local_signing {
         0 => (
             Fail,
@@ -1346,11 +1356,15 @@ fn check_key_package(report: &AgentControlDiagnosticStatus) -> DoctorCheck {
     }
 }
 
+/// Relay health from what the snapshot proves. Connected and disconnected
+/// counts cover every relay the daemon uses (configured, account and group
+/// relays) and leave out relays still connecting, so they are never compared
+/// with the configured count.
 fn check_relay_health(report: &AgentControlDiagnosticStatus) -> DoctorCheck {
     use DoctorStatus::*;
     let relays = &report.relays;
     let counts = format!(
-        "{} connected, {} disconnected, {} configured",
+        "{} connected and {} disconnected, not counting relays still connecting; {} configured",
         relays.connected, relays.disconnected, relays.configured
     );
     if relays.configured == 0 {
@@ -1365,10 +1379,8 @@ fn check_relay_health(report: &AgentControlDiagnosticStatus) -> DoctorCheck {
         return live(
             "relay_health",
             Warn,
-            format!(
-                "No relay connection has been made yet ({counts}); wn-agent connects once an account runs."
-            ),
-            "Resolve the daemon_accounts check, then rerun wn-agent doctor after the account starts.",
+            format!("No relay is reported connected or disconnected yet ({counts})."),
+            "Resolve the daemon_accounts check; once an account runs, rerun wn-agent doctor in a minute.",
         );
     }
     if relays.connected == 0 {
@@ -2036,6 +2048,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unreadable_only_record_does_not_advise_bootstrap() {
+        if current_effective_uid() == 0 {
+            return; // root reads every file
+        }
+        let fixture = Fixture::new();
+        fixture.account("agent", ACCOUNT_ID, true);
+        let record = fixture
+            .home
+            .join("accounts")
+            .join("agent")
+            .join("account.json");
+        chmod(&record, 0o000);
+        let report = run_doctor(&fixture.options()).await;
+        chmod(&record, 0o600);
+        assert_check(
+            &report,
+            "accounts",
+            DoctorStatus::Fail,
+            "can read every account record",
+        );
+        assert!(!find(&report, "accounts").next_step.contains("bootstrap"));
+    }
+
+    #[tokio::test]
     async fn unlistable_account_directory_is_not_reported_ok() {
         if current_effective_uid() == 0 {
             return; // root lists every directory
@@ -2279,6 +2315,8 @@ mod tests {
     fn relay_health_statuses() {
         for (connected, disconnected, configured, status) in [
             (2, 0, 2, DoctorStatus::Ok),
+            // Different populations: the other configured relay may still be connecting.
+            (1, 0, 2, DoctorStatus::Ok),
             (1, 1, 2, DoctorStatus::Warn),
             (0, 0, 2, DoctorStatus::Warn),
             (0, 2, 2, DoctorStatus::Fail),
@@ -2294,6 +2332,12 @@ mod tests {
                 check_relay_health(&status_report).status,
                 status,
                 "{connected}/{disconnected}/{configured}"
+            );
+            assert!(
+                configured == 0
+                    || check_relay_health(&status_report)
+                        .summary
+                        .contains("not counting relays still connecting")
             );
         }
     }
