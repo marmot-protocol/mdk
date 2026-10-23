@@ -297,8 +297,10 @@ with its own `--home`, `MARMOT_AGENT_SERVICE_NAME`, `MARMOT_AGENT_LAUNCHD_LABEL`
 
 ## Troubleshooting
 
-`wn-agent doctor` ([#2570](https://github.com/marmot-protocol/mdk/issues/2570)) will check these from one command once
-it ships. Until then:
+Start with `wn-agent doctor --home "$HOME/.marmot-agents/standalone"`. It checks the home, socket, token, relays and
+accounts, and asks the running daemon about its KeyPackage and relays, without changing anything; each check ends with
+a next step ([Check the setup](../crates/agent-connector/README.md#check-the-setup)). The table covers what it cannot
+see:
 
 | Symptom | Likely cause | What to do |
 | --- | --- | --- |

@@ -9,6 +9,16 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- `wn-agent doctor` checks a standalone connector setup without changing anything (mdk#2570). It prints one line per
+  check with `ok`, `warn`, `fail` or `unknown` and a next step: the home, socket directory and path, token file, how
+  many relays `wn-agent` would use and where they come from, local-signing accounts and account file modes, and, when
+  the daemon answers, its protocol, accounts, this device's KeyPackage, relay health and catch-up from
+  `diagnostic_status`. `--json` prints the same checks with stable ids. The output names no paths, account ids,
+  public keys, relay URLs or tokens, and the command exits nonzero when a check fails. A passing doctor does not show
+  that messages are delivered.
+
 ### Changed
 
 - `wn-agent` (serve) without `--relay` now reads `MARMOT_RELAYS` and then falls back to the White Noise relays, the

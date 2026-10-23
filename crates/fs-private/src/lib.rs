@@ -296,6 +296,32 @@ pub fn prepare_directory_path(
     mode: u32,
     policy: ExistingDirectoryMode,
 ) -> io::Result<PreparedDirectory> {
+    walk_directory_path(path, mode, policy, true)
+        .map(|prepared| prepared.expect("a creating walk returns the directory or an error"))
+}
+
+/// Check `path` as [`prepare_directory_path`] would, without creating or
+/// changing anything: the same platform-alias verification and no-follow walk,
+/// stopping at the first missing component. `Ok(None)` means the path does not
+/// exist yet and every existing component passed; preparing it would create
+/// the rest.
+#[cfg(unix)]
+pub fn inspect_directory_path(path: &Path) -> io::Result<Option<PreparedDirectory>> {
+    walk_directory_path(
+        path,
+        PRIVATE_DIR_MODE,
+        ExistingDirectoryMode::Preserve,
+        false,
+    )
+}
+
+#[cfg(unix)]
+fn walk_directory_path(
+    path: &Path,
+    mode: u32,
+    policy: ExistingDirectoryMode,
+    create_missing: bool,
+) -> io::Result<Option<PreparedDirectory>> {
     use std::ffi::{CString, OsString};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
@@ -421,6 +447,9 @@ pub fn prepare_directory_path(
         let mut created = false;
         let next = match open_directory_at(current.as_raw_fd(), &component) {
             Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !create_missing => {
+                return Ok(None);
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let result = unsafe {
                     libc::mkdirat(current.as_raw_fd(), component.as_ptr(), platform_mode)
@@ -553,7 +582,7 @@ pub fn prepare_directory_path(
         }
     }
 
-    Ok(prepared)
+    Ok(Some(prepared))
 }
 
 /// Pick the descriptor-walk anchor among the prefixes of `root` joined with
@@ -1850,6 +1879,32 @@ mod unix_tests {
         assert_eq!(mode_of(&target), 0o755);
         assert!(prepare_directory_path(&link, 0o700, ExistingDirectoryMode::Enforce).is_err());
         assert_eq!(mode_of(&target), 0o755);
+    }
+
+    #[test]
+    fn inspect_directory_path_checks_without_creating_or_changing() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let inspected = inspect_directory_path(&existing)
+            .expect("inspect existing directory")
+            .expect("existing directory is reported");
+        assert!(!inspected.was_created());
+        assert_eq!(inspected.mode() & 0o777, 0o777);
+        assert_eq!(mode_of(&existing), 0o777);
+
+        let missing = existing.join("first").join("second");
+        assert!(inspect_directory_path(&missing).unwrap().is_none());
+        assert!(!existing.join("first").exists());
+
+        let link = dir.path().join("link");
+        symlink(&existing, &link).unwrap();
+        assert!(inspect_directory_path(&link.join("child")).is_err());
+        assert!(inspect_directory_path(&link).is_err());
+        assert!(!existing.join("child").exists());
     }
 
     fn walk_anchor(root: &Path, components: &[&str]) -> io::Result<(usize, PathBuf)> {

@@ -26,6 +26,7 @@ Supported integrations, all speaking the same [`agent-control`](../agent-control
 - [What this crate owns](#what-this-crate-owns)
 - [First installation from a White Noise prompt](#first-installation-from-a-white-noise-prompt)
 - [Run locally](#run-locally)
+- [Check the setup](#check-the-setup)
 - [Invite policy](#invite-policy)
 - [Outbound media paths](#outbound-media-paths)
 - [Group profile updates](#group-profile-updates)
@@ -208,6 +209,9 @@ A failed start prints one line, `wn-agent: startup failed code=<code> detail=<me
 A daemon that starts and answers on its socket is running locally. That alone does not show that encrypted messages
 reach the phone.
 
+[`wn-agent doctor`](#check-the-setup) checks this setup without starting or changing anything, and names a next step for
+each problem it finds.
+
 In another terminal, create or reuse the local agent account and print the phone invite details:
 
 ```sh
@@ -237,6 +241,28 @@ Check the installed or locally built version with:
 ```sh
 wn-agent --version
 ```
+
+## Check the setup
+
+`wn-agent doctor` checks a connector setup without changing anything:
+
+```sh
+wn-agent doctor --home ~/.marmot-agent
+```
+
+It prints one line per check, each with a status (`ok`, `warn`, `fail` or `unknown`) and a next step, and exits
+nonzero when any check fails. Local checks cover the home directory, the socket directory and socket path, the token
+file, how many relays `wn-agent` would use and where they come from, the local-signing accounts and the account file
+modes. When the daemon answers, it also reports the protocol version, this device's KeyPackage, relay health and
+inbound catch-up from `diagnostic_status`.
+
+`--home`, `--socket`, `--auth-token-file` and the `MARMOT_*` variables resolve as they do for `bootstrap`. Pass the same
+`--relay`, `--no-default-relays` and `--socket-dir-mode` values you give the daemon. `--json` prints the same checks for
+scripts; each check has a stable `id`.
+
+The output contains no paths, account ids, public keys, relay URLs, group ids or tokens, so you can paste it into a
+support chat. A passing doctor shows the connector is set up and reachable, not that messages are delivered: send a test
+message from the phone app to confirm that.
 
 ## Invite policy
 
