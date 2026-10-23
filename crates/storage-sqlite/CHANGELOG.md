@@ -278,6 +278,12 @@ is unsupported. marmot-app also rekeys its databases once to raw SQLCipher keys
 
 ### Fixed
 
+- The timeline's modifier lookups (edits, reactions, deletions, reports), and
+  the deleted-reaction and poll-vote queries, write their constant event kind
+  into the SQL instead of binding it, so each kind keeps one cached statement.
+  A bound kind compared against the `content_report_labels` partial index made
+  SQLite re-plan the join on every call, about six times per received message
+  and 11% of offline catch-up CPU (#2585).
 - `list_messages_in_states` and `visit_messages_in_states` take row ids from
   the `(group_id, state, epoch)` index and read rows by id. Ordering by
   `insert_order` alone let SQLite walk every row of the group, so listing a
