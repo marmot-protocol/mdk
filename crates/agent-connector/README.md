@@ -209,6 +209,9 @@ A failed start prints one line, `wn-agent: startup failed code=<code> detail=<me
 A daemon that starts and answers on its socket is running locally. That alone does not show that encrypted messages
 reach the phone.
 
+[`wn-agent doctor`](#check-the-setup) checks this setup without starting or changing anything, and names a next step for
+each problem it finds.
+
 In another terminal, create or reuse the local agent account and print the phone invite details:
 
 ```sh

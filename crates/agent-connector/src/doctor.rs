@@ -1907,6 +1907,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_imported_account_files_are_owner_only() {
+        let fixture = Fixture::new();
+        crate::import_existing_identity_secret(&fixture.home, "agent", &"11".repeat(32), None)
+            .unwrap();
+        let report = run_doctor(&fixture.options()).await;
+        assert_check(&report, "accounts", DoctorStatus::Ok, NO_ACTION);
+        assert_check(&report, "account_files", DoctorStatus::Ok, NO_ACTION);
+    }
+
+    #[tokio::test]
     async fn account_file_modes() {
         let fixture = Fixture::new();
         fixture.account("agent", ACCOUNT_ID, true);
