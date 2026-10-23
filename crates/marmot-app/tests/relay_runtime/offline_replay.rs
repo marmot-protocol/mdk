@@ -420,6 +420,7 @@ async fn offline_sender_600_replay() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "1,600-message catch-up outruns slow queue runners (mdk#2538); runs in simulator-nightly.yml"]
 async fn offline_replay_crosses_queue() {
     offline_plaintext_replay(1, 1_600, Duration::ZERO).await;
 }

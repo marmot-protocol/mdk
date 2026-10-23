@@ -195,6 +195,69 @@ jobs:
             --title "Simulator nightly failed (${run_date})" \
             --body "The simulator nightly failed. Run: ${RUN_URL}"
 
+  relay-runtime-offline-replay:
+    # The merge queue's relay-runtime lane ignores this 1,600-message case
+    # because catch-up outruns its 60-second window on slow runners
+    # (mdk#2538). Run it here with that lane's features and flags, unchanged.
+    name: Relay runtime 1,600-message offline replay
+    if: ${{ !inputs.recovery_only }}
+    runs-on: ubuntu-latest
+    # Above the step budgets (40 + 15) plus setup, so a step timeout fails the
+    # job and files the issue instead of a job timeout cancelling it.
+    timeout-minutes: 75
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustup default "$toolchain"
+          rustc --version
+          cargo --version
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@b18fb392e1a1b90971f7c7572c92790fa54f23d5
+        with:
+          tool: cargo-nextest@0.9.132
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Reuse the queue lane's cache; master pushes in ci.yml refresh it.
+          save-if: false
+          shared-key: relay-runtime
+
+      - name: Build relay runtime tests
+        timeout-minutes: 40
+        run: cargo nextest run -p marmot-app --test relay_runtime --features test-policy-overrides --locked --no-run
+
+      - name: Run the 1,600-message offline replay
+        timeout-minutes: 15
+        env:
+          RUST_BACKTRACE: "1"
+        run: >-
+          cargo nextest run -p marmot-app --test relay_runtime --features test-policy-overrides --locked
+          --profile ci --retries 0 --test-threads 1 --run-ignored ignored-only --no-tests fail
+          -E 'test(=offline_replay::offline_replay_crosses_queue)'
+
+      - name: Report scheduled relay runtime failure
+        if: ${{ failure() && github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          run_date="$(date -u +%F)"
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Relay runtime offline replay nightly failed (${run_date})" \
+            --body "The 1,600-message offline replay (offline_replay_crosses_queue, mdk#2538) failed. Run: ${RUN_URL}"
+
   public-app-catchup:
     name: Public app 1024-message recovery
     runs-on: ubuntu-latest
