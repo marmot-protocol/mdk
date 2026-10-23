@@ -28,8 +28,8 @@ You need Linux (x86_64 or arm64) or macOS (Apple Silicon or Intel), `curl`, `tar
 Install with the connector-only installer, `install-wn-agent.sh`, using the verified helper in the
 [quickstart](README.md#wn-agent-only-your-own-client). It downloads the checksum-verified `wn-agent` from a
 `wn-agent-v*` release, creates a private home, and starts a same-user service with the default White Noise relays. It
-installs no harness or plugin. Releases up to 0.13.0 do not publish it; the quickstart shows how to run it from a
-checkout for those.
+installs no harness or plugin. Releases up to 0.13.0 do not publish it; for those, the quickstart shows how to run it
+from a clone of this repository.
 
 | Setting | Default | Override |
 | --- | --- | --- |

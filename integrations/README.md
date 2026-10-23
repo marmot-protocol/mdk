@@ -209,17 +209,22 @@ installer installs and starts `wn-agent` alone, without a harness or plugin.
 existing key instead. The connector's identity must not also be signed in on
 another client. Continue with [Build your own client](custom-client.md).
 
-Run this example in the same shell where `install_verified` above was defined.
+`install-wn-agent.sh` is published from the first WN Agent release after
+0.13.0. While `base_url` above is 0.13.0 or earlier, run the installer from a
+clone of this repository instead. It downloads and verifies that release's
+`wn-agent` bundle the same way:
+
+```sh
+bash scripts/install-wn-agent.sh --bootstrap
+```
+
+With a release that publishes it, run this example in the same shell where
+`install_verified` above was defined.
 
 ```sh
 install_verified "$base_url/install-wn-agent.sh" \
   "$base_url/install-wn-agent.sh.sha256" --bootstrap
 ```
-
-Releases up to 0.13.0 do not publish `install-wn-agent.sh`. For those, run the
-same installer from a clone of this repository with
-`bash scripts/install-wn-agent.sh --bootstrap`; it downloads and verifies that
-release's `wn-agent` bundle the same way.
 
 ### Finish In White Noise
 
