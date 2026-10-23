@@ -23,7 +23,7 @@ per feature.
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
   [Markdown rendering](#markdown-rendering), [identity references and pseudonyms](#identity-references-and-pseudonyms),
   [KeyPackage inventory](#keypackage-inventory), [invitation lookup outcomes](#invitation-lookup-outcomes), [selected chat-list presentation](#selected-chat-list-presentation),
-  [chat screens and avatars](#chat-screens-and-avatars), [complete chat selection](#complete-chat-selection),
+  [chat screens and avatars](#chat-screens-and-avatars),
   [history may be incomplete notices](#history-may-be-incomplete-notices), [group reporting](#group-reporting),
   [host-driven agent publishing](#host-driven-agent-publishing),
   [audit v5 recording and delivery](#audit-v5-recording-and-delivery), [legacy audit v4 upload](#legacy-audit-v4-upload)
@@ -222,7 +222,6 @@ lease. Both calls block, and the open holds the calling thread for the whole cop
 run them off the UI thread. See the
 [shared contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#handoff-leases).
 
-
 ## Attachment storage
 
 `marmot_attachment_storage_usage`, `marmot_attachment_storage_by_chat` and
@@ -235,6 +234,7 @@ window as `MarmotAttachmentKeepMedia` discriminants; attachments it removes read
 `CleanedBySetting`. Page cursors are borrowed from their page: keep the page alive
 while passing its `next_cursor`, then free the page. Calls block. See the
 [shared contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#manage-storage).
+
 ## File-backed media upload
 
 `marmot_upload_media_files` and its token-aware twin take borrowed
@@ -249,6 +249,10 @@ cannot hold returns `MARMOT_STATUS_STORAGE_FULL` before any upload.
 File-backed calls have no fixed worker-response timeout; per-endpoint network
 deadlines still apply. Cancellation observed before message admission starts
 prevents publication; admission is not interruptible once started.
+
+## Account attachment history
+
+`marmot_account_attachment_history_page` blocks off the UI thread and borrows its query arrays and cursor. Deep-free the result with `marmot_account_attachment_page_read_free`; its cursor and version are borrowed fields and must not be freed separately. Clone a version baseline with `marmot_account_attachment_version_clone` when it must outlive a page. Query flags use `uint8_t`, and arrays are capped at 100 before decoding. See the [shared contract](../marmot-uniffi/ACCOUNT-ATTACHMENT-HISTORY.md).
 
 ## Local sends
 
@@ -545,10 +549,6 @@ just c-header
 The mirror surface is macro-generated, so header generation runs cbindgen
 with macro expansion (`RUSTC_BOOTSTRAP=1` on the stable toolchain). CI
 diff-gates the checked-in header.
-
-## Account attachment history
-
-`marmot_account_attachment_history_page` blocks off the UI thread and borrows its query arrays and cursor. Deep-free the result with `marmot_account_attachment_page_read_free`; its cursor and version are borrowed fields and must not be freed separately. Clone a version baseline with `marmot_account_attachment_version_clone` when it must outlive a page. Query flags use `uint8_t`, and arrays are capped at 100 before decoding. See the [shared contract](../marmot-uniffi/ACCOUNT-ATTACHMENT-HISTORY.md).
 
 ## Complete chat selection
 

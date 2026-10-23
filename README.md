@@ -80,7 +80,7 @@ Apps embed MDK through the multi-account app runtime ([`marmot-app`](crates/marm
   [C guide](crates/marmot-c/README.md) and every symbol in its [reference](crates/marmot-c/API-REFERENCE.md).
 
 Each release ships a concise [release note](docs/release/) and a detailed [upgrade guide](docs/integration/README.md)
-with required changes, new defaults, and optional features. The latest is [0.12.0 → 0.13.0](docs/integration/0.13.0.md);
+with required changes, new defaults, and optional features. The latest is [0.13.0 → 0.14.0](docs/integration/0.14.0.md);
 read every intervening guide when skipping releases. Read docs at the tag matching your binaries — `master` may describe
 unreleased APIs.
 
@@ -180,7 +180,8 @@ no tests. The merge queue runs the full matrix on the exact commit it merges:
 every workspace test with the `ci` nextest profile, the CLI and relay end-to-end
 suites, simulator lanes, C bindings, iOS clippy, Windows filesystem contracts,
 Tamarin, Hermes and installer checks. `Required CI` must pass there before a
-change lands. Master pushes run CI only to refresh the Rust dependency caches
+change lands. A queue run stops at its first failed job, so the queue ejects a
+failing change within minutes rather than after the whole run. Master pushes run CI only to refresh the Rust dependency caches
 that pull requests and merge groups restore, and only when `Cargo.lock`, a
 `Cargo.toml`, the toolchain pin, Cargo config or `ci.yml` changes.
 
