@@ -58,8 +58,8 @@ the target, so a reader sees the whole previous file or the whole new one. Only 
 zeroes the replaced inode. It does so after the rename unlinks it, and `read_secret_json` re-reads when it finds its
 inode unlinked. Private account state such as the setup journal is never zeroed, because readiness polls read it
 while background setup rewrites it. Builds before mdk#2569 wrote `account.json` and `key-security.json` at the
-process umask, so `AccountHome` tightens each one it reads to 0600 with `tighten_existing_private_file` and fails the
-read when it cannot.
+process umask, so `read_private_json` opens each one without following symlinks, tightens that handle to 0600, and
+reads the same handle; a record it cannot tighten fails the read.
 
 ## Initializing encrypted account databases
 

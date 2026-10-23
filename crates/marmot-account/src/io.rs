@@ -29,27 +29,43 @@ pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(
 pub(crate) fn read_private_json<T: for<'de> Deserialize<'de>>(
     path: impl AsRef<Path>,
 ) -> AccountHomeResult<T> {
-    let path = path.as_ref();
-    if !is_owner_only_file(path) {
-        fs_private::tighten_existing_private_file(path)?;
+    let bytes = read_tightened_private_file(path.as_ref(), || {})?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Open `path` once without following symlinks, then tighten and read that
+/// handle, so a replacement after the open can neither skip the tightening
+/// nor redirect the read. An owner-only file is left alone, which keeps
+/// steady-state reads free of inode metadata writes. `after_open` lets tests
+/// replace the file inside that window.
+fn read_tightened_private_file(path: &Path, after_open: impl FnOnce()) -> io::Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
     }
-    read_json(path)
-}
+    let mut file = options.open(path)?;
+    after_open();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
 
-/// Lets reads of an already-private record skip the chmod and its inode
-/// metadata write. A symlink or a failed probe goes to the no-follow
-/// tightening, which reports it.
-#[cfg(unix)]
-fn is_owner_only_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::symlink_metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o077 == 0)
-}
-
-#[cfg(not(unix))]
-fn is_owner_only_file(_path: &Path) -> bool {
-    true
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private record must be a regular file",
+            ));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 pub(crate) fn read_secret_json<T: for<'de> Deserialize<'de>>(
@@ -442,6 +458,51 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    /// A symlink swapped in after the no-follow open is neither followed nor
+    /// tightened; the inode the open reached is.
+    #[test]
+    fn private_record_read_tightens_and_reads_the_inode_it_opened() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("account").join("account.json");
+        let opened = root.path().join("opened.json");
+        let elsewhere = root.path().join("elsewhere.json");
+        write_private_json(&path, &serde_json::json!({ "label": "opened" })).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(&path, &opened).unwrap();
+        fs::write(&elsewhere, br#"{"label":"elsewhere"}"#).unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let bytes = read_tightened_private_file(&path, || {
+            fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        })
+        .unwrap();
+
+        let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(record["label"], "opened");
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&opened), 0o600);
+        assert_eq!(mode(&elsewhere), 0o644);
+    }
+
+    #[test]
+    fn private_record_read_rejects_a_directory_without_tightening_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("account.json");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = read_private_json::<serde_json::Value>(&path).unwrap_err();
+
+        assert!(
+            matches!(error, AccountHomeError::Io(error) if error.kind() == io::ErrorKind::InvalidInput)
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
     }
 
     #[test]
