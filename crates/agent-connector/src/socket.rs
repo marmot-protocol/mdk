@@ -70,6 +70,32 @@ pub(crate) fn verify_control_socket_link(
     fs_private::verify_unix_socket_inode(socket, link_identity).map_err(ConnectorError::from)
 }
 
+/// A socket-setup refusal the connector writes itself: fixed text with no path
+/// or identifier, so startup can print it ([`socket_rejection`]).
+#[derive(Debug)]
+struct SocketRejection(&'static str);
+
+impl std::fmt::Display for SocketRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for SocketRejection {}
+
+fn socket_rejection_error(kind: ErrorKind, message: &'static str) -> std::io::Error {
+    std::io::Error::new(kind, SocketRejection(message))
+}
+
+/// The connector's own fixed socket-setup message carried by `error`, if any.
+/// Errors from the OS or `fs_private` return `None`: their text may name a path.
+pub(crate) fn socket_rejection(error: &std::io::Error) -> Option<&'static str> {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<SocketRejection>())
+        .map(|rejection| rejection.0)
+}
+
 fn remove_stale_socket(socket: &Path, bind_error: &std::io::Error) -> std::io::Result<()> {
     let metadata = match std::fs::metadata(socket) {
         Ok(metadata) => metadata,
@@ -77,15 +103,16 @@ fn remove_stale_socket(socket: &Path, bind_error: &std::io::Error) -> std::io::R
         Err(error) => return Err(error),
     };
     if !metadata.file_type().is_socket() {
-        return Err(std::io::Error::new(
+        return Err(socket_rejection_error(
             bind_error.kind(),
-            "agent connector socket path exists and is not a Unix socket",
+            "the control socket path exists and is not a Unix socket; \
+             move that file or choose another --socket",
         ));
     }
     match StdUnixStream::connect(socket) {
-        Ok(_) => Err(std::io::Error::new(
+        Ok(_) => Err(socket_rejection_error(
             bind_error.kind(),
-            "agent connector socket is already in use",
+            "the control socket is already in use; stop the other wn-agent or choose another --socket",
         )),
         Err(error)
             if matches!(
@@ -117,22 +144,24 @@ fn prepare_socket_dir(
     let prepared = fs_private::prepare_directory_path(parent, mode, policy)?;
     let actual_mode = prepared.mode();
     if actual_mode & 0o007 != 0 {
-        return Err(std::io::Error::new(
+        return Err(socket_rejection_error(
             ErrorKind::PermissionDenied,
-            "agent connector socket directory must not be world-accessible",
+            "the control socket directory must not be world-accessible; \
+             chmod it to 0700, or omit --socket to use <home>/dev",
         ));
     }
     if actual_mode & 0o020 != 0 && mode & 0o020 == 0 {
-        return Err(std::io::Error::new(
+        return Err(socket_rejection_error(
             ErrorKind::PermissionDenied,
-            "agent connector socket directory is unexpectedly group-writable",
+            "the control socket directory is group-writable but --socket-dir-mode is not; \
+             chmod it to 0700 or 0750, or pass --socket-dir-mode 0770 with --auth-token-file",
         ));
     }
     let effective_uid = current_effective_uid();
     if prepared.uid() != effective_uid && prepared.uid() != 0 {
-        return Err(std::io::Error::new(
+        return Err(socket_rejection_error(
             ErrorKind::PermissionDenied,
-            "agent connector socket directory must be owned by the service user or root",
+            "the control socket directory must be owned by the service user or root",
         ));
     }
     Ok(prepared)

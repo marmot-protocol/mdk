@@ -9,6 +9,25 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- `wn-agent` (serve) without `--relay` now reads `MARMOT_RELAYS` and then falls back to the White Noise relays, the
+  same order `wn-agent bootstrap` uses (mdk#2550). Before, it ran with no relays, so an account imported with
+  `import-identity` could not start. `--no-default-relays` keeps the old behavior for offline and test runs. A
+  relay that is not a `wss://` URL now stops startup with `code=invalid_relay_url` and a `reason=`.
+
+### Fixed
+
+- `wn-agent` no longer replaces an imported identity's published relay lists on its first start (mdk#2550). With no
+  cached copy of the account's kind 10002 or 10050 list, it published a new list naming only its own relays. It now
+  reads the published lists from its relays and adopts them. It publishes a list only when every relay answered and
+  none holds one, and stops with `code=relay_list_inconclusive` when a relay does not answer.
+- `wn-agent` startup failures name their cause (mdk#2550). An account with no relay lists on a daemon with no relays
+  reports `code=missing_relay_lists` instead of `app_error`. Every failure line now carries a fixed `detail=`
+  message, and the socket refusals (a world-accessible or group-writable socket directory, a file in the socket's
+  place, a socket already in use), which printed only an `io_kind=`, say what to change. The line still carries no
+  paths, account ids or relay URLs.
+
 ## [0.14.0] - 2026-10-23
 
 Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through

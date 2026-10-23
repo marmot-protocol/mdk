@@ -604,20 +604,71 @@ pub fn read_bootstrap_auth_token(
     Ok(Some(token))
 }
 
-pub fn resolve_bootstrap_relays(cli_relays: Vec<String>) -> Vec<String> {
-    if !cli_relays.is_empty() {
-        return clean_values(cli_relays);
+/// Where the relays a `wn-agent` command uses came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelaySource {
+    /// `--relay` values.
+    Flag,
+    /// `MARMOT_RELAYS`, or the older `MARMOT_RELAY`.
+    Environment,
+    /// [`DEFAULT_RELAYS`].
+    Default,
+    /// Nothing configured and the defaults were turned off.
+    None,
+}
+
+/// The relays one `wn-agent` command uses, and where they came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedRelays {
+    pub relays: Vec<String>,
+    pub source: RelaySource,
+}
+
+/// Resolve the relays for `wn-agent serve` and `wn-agent bootstrap`: `--relay`
+/// values, then `MARMOT_RELAYS` (or `MARMOT_RELAY`), then [`DEFAULT_RELAYS`]
+/// unless `use_defaults` is false. Both commands share this order, so a
+/// bootstrap's relay hints name the relays the daemon uses. URLs are not
+/// validated here; the daemon and bootstrap validate what they use.
+pub fn resolve_relays(cli_relays: Vec<String>, use_defaults: bool) -> ResolvedRelays {
+    let environment = std::env::var("MARMOT_RELAYS")
+        .or_else(|_| std::env::var("MARMOT_RELAY"))
+        .ok();
+    resolve_relays_from(cli_relays, environment.as_deref(), use_defaults)
+}
+
+fn resolve_relays_from(
+    cli_relays: Vec<String>,
+    environment: Option<&str>,
+    use_defaults: bool,
+) -> ResolvedRelays {
+    let relays = clean_values(cli_relays);
+    if !relays.is_empty() {
+        return ResolvedRelays {
+            relays,
+            source: RelaySource::Flag,
+        };
     }
-    if let Ok(value) = std::env::var("MARMOT_RELAYS").or_else(|_| std::env::var("MARMOT_RELAY")) {
-        let parsed = csv_values(&value);
-        if !parsed.is_empty() {
-            return parsed;
-        }
+    let relays = environment.map(csv_values).unwrap_or_default();
+    if !relays.is_empty() {
+        return ResolvedRelays {
+            relays,
+            source: RelaySource::Environment,
+        };
     }
-    DEFAULT_RELAYS
-        .iter()
-        .map(|relay| (*relay).to_owned())
-        .collect()
+    if !use_defaults {
+        return ResolvedRelays {
+            relays: Vec::new(),
+            source: RelaySource::None,
+        };
+    }
+    ResolvedRelays {
+        relays: DEFAULT_RELAYS
+            .iter()
+            .map(|relay| (*relay).to_owned())
+            .collect(),
+        source: RelaySource::Default,
+    }
 }
 
 pub fn resolve_bootstrap_quic_candidates(
@@ -677,6 +728,51 @@ mod tests {
 
     const ACCOUNT_ID: &str = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
     const WELCOMER_ID: &str = "bb4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b5";
+
+    #[test]
+    fn relay_resolution_prefers_flags_then_environment_then_defaults() {
+        let flag = resolve_relays_from(
+            vec![" wss://flag.example ".to_owned(), " ".to_owned()],
+            Some("wss://env.example"),
+            true,
+        );
+        assert_eq!(flag.relays, vec!["wss://flag.example".to_owned()]);
+        assert_eq!(flag.source, RelaySource::Flag);
+
+        let environment = resolve_relays_from(
+            Vec::new(),
+            Some(" wss://one.example, ,wss://two.example "),
+            true,
+        );
+        assert_eq!(
+            environment.relays,
+            vec![
+                "wss://one.example".to_owned(),
+                "wss://two.example".to_owned()
+            ]
+        );
+        assert_eq!(environment.source, RelaySource::Environment);
+
+        for blank in [None, Some(""), Some(" , ")] {
+            let defaults = resolve_relays_from(Vec::new(), blank, true);
+            assert_eq!(defaults.relays, DEFAULT_RELAYS);
+            assert_eq!(defaults.source, RelaySource::Default);
+        }
+    }
+
+    #[test]
+    fn relay_resolution_without_defaults_still_reads_flags_and_environment() {
+        let none = resolve_relays_from(Vec::new(), None, false);
+        assert!(none.relays.is_empty());
+        assert_eq!(none.source, RelaySource::None);
+
+        let environment = resolve_relays_from(Vec::new(), Some("wss://env.example"), false);
+        assert_eq!(environment.relays, vec!["wss://env.example".to_owned()]);
+        assert_eq!(environment.source, RelaySource::Environment);
+
+        let flag = resolve_relays_from(vec!["wss://flag.example".to_owned()], None, false);
+        assert_eq!(flag.source, RelaySource::Flag);
+    }
 
     #[tokio::test]
     async fn bootstrap_creates_agent_account_when_none_exists() {

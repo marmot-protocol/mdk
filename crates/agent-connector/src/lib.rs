@@ -31,9 +31,9 @@ mod tests;
 
 pub use bootstrap::{
     BootstrapError, BootstrapOptions, BootstrapResult, DEFAULT_BOOTSTRAP_LABEL,
-    DEFAULT_QUIC_CANDIDATE, DEFAULT_RELAYS, default_bootstrap_home, read_bootstrap_auth_token,
-    resolve_bootstrap_home, resolve_bootstrap_quic_candidates, resolve_bootstrap_relays,
-    resolve_bootstrap_socket, run_bootstrap,
+    DEFAULT_QUIC_CANDIDATE, DEFAULT_RELAYS, RelaySource, ResolvedRelays, default_bootstrap_home,
+    read_bootstrap_auth_token, resolve_bootstrap_home, resolve_bootstrap_quic_candidates,
+    resolve_bootstrap_socket, resolve_relays, run_bootstrap,
 };
 pub use error::ConnectorError;
 pub use group_profile_tool::{GroupProfileToolConfig, run_group_profile_tool};
@@ -50,8 +50,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use agent_control::AgentControlEvent;
-use marmot_account::AccountHome;
-use marmot_app::{MarmotApp, MarmotAppConfig, MarmotAppRuntime};
+use marmot_account::{AccountHome, AccountSummary};
+use marmot_app::{
+    AccountRelayListBootstrap, AppError, DirectoryError, MarmotApp, MarmotAppConfig,
+    MarmotAppRuntime,
+};
 use tokio::net::UnixListener;
 use tokio::sync::{Semaphore, broadcast};
 
@@ -64,7 +67,7 @@ use crate::allowlist::AllowlistStore;
 use crate::event_projection::InboundCatchUpDriver;
 use crate::socket::{bind_connector_socket_with_owned_home, verify_control_socket_link};
 use crate::stream_session::{DebugFinalSendStore, SendIdempotencyStore, StreamSessionStore};
-use crate::validation::{endpoint, validate_control_plane_config};
+use crate::validation::{endpoint, validate_control_plane_config, validate_relay_url};
 
 pub(crate) const AGENT_SOCKET_DIR_MODE: u32 = 0o700;
 pub(crate) const AGENT_SOCKET_MODE: u32 = 0o600;
@@ -347,8 +350,7 @@ impl AgentConnector {
     async fn ensure_agent_accounts_ready(&self) -> Result<(), ConnectorError> {
         let accounts = self.account_home.accounts()?;
         for account in accounts.into_iter().filter(|account| account.local_signing) {
-            self.ensure_agent_account_relay_lists(&account.label)
-                .await?;
+            self.ensure_agent_account_relay_lists(&account).await?;
             let has_key_package = !self
                 .runtime
                 .account_key_packages(&account.label, Vec::new())
@@ -361,26 +363,56 @@ impl AgentConnector {
         Ok(())
     }
 
+    /// Give a local agent account both relay lists before its KeyPackage is read.
+    ///
+    /// Both lists are replaceable, so a publish replaces whatever the identity
+    /// already published. The KeyPackage publish that follows replaces every list
+    /// the cache does not hold complete (a kind 10002 with no write relay counts
+    /// as missing), so this returns only once the cached lists are complete. An
+    /// identity imported offline has no cached copy, and an empty cache is not
+    /// absence: read the published lists first and adopt what the read finds (it
+    /// caches them). Publish the configured relays only for a list that a
+    /// complete read of those relays, and of the outboxes they advertise, proves
+    /// absent. Anything else publishes nothing and fails startup, again on every
+    /// later start, until the lists are complete.
     async fn ensure_agent_account_relay_lists(
         &self,
-        account_ref: &str,
+        account: &AccountSummary,
     ) -> Result<(), ConnectorError> {
-        let missing_nip65 = self.runtime.account_nip65_relays(account_ref)?.is_empty();
-        let missing_inbox = self.runtime.account_inbox_relays(account_ref)?.is_empty();
-        if self.relays.is_empty() || (!missing_nip65 && !missing_inbox) {
+        let cached = self.app.account_relay_list_status(&account.label)?;
+        if cached.complete {
             return Ok(());
+        }
+        if self.relays.is_empty() {
+            return Err(AppError::MissingRelayLists(cached.missing).into());
         }
 
         let relays = self.configured_relay_endpoints();
-        if missing_nip65 {
-            self.runtime
-                .set_account_nip65_relays(account_ref, relays.clone(), relays.clone())
-                .await?;
-        }
-        if missing_inbox {
-            self.runtime
-                .set_account_inbox_relays(account_ref, relays.clone(), relays)
-                .await?;
+        let published = match self
+            .app
+            .directory()
+            .resolve_account_relay_list_status_for_account_id(
+                &account.account_id_hex,
+                relays.clone(),
+            )
+            .await
+        {
+            Ok(status) => status,
+            Err(DirectoryError::DirectoryLookupIncomplete(_)) => {
+                return Err(ConnectorError::RelayListInconclusive("read_incomplete"));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let status = self
+            .app
+            .publish_missing_account_relay_lists_from_status(
+                &account.label,
+                AccountRelayListBootstrap::new(relays.clone(), relays),
+                published,
+            )
+            .await?;
+        if !status.complete {
+            return Err(AppError::MissingRelayLists(status.missing).into());
         }
         Ok(())
     }
@@ -392,6 +424,11 @@ impl AgentConnector {
 
 pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorError> {
     validate_control_plane_config(&config)?;
+    // A relay the relay plane would refuse fails startup here, with a reason,
+    // rather than failing every route that names it later.
+    for relay in &config.relays {
+        validate_relay_url(relay, config.allow_loopback_relays)?;
+    }
     if config.dev_allow_any_invites {
         tracing::warn!(
             target: "agent_connector",

@@ -40,7 +40,8 @@ several files in the same crate); methods shared across those files are `pub(cra
 
 - `src/lib.rs` — `serve_socket`, `AgentConnectorConfig`, the `AgentConnector` struct, and its core lifecycle `impl`
   (`open`, `serve_once`, `start`, agent-account readiness, `configured_relay_endpoints`). Crate-internal constants live
-  here as `pub(crate)`.
+  here as `pub(crate)`. Readiness never publishes a relay list from the cache alone: it adopts the published lists and
+  publishes only a kind a complete read proved absent (mdk#2550).
 - `src/connection.rs` — `AgentConnector::handle_connection`, peer authorization, the `error_response` projection, and
   the `AgentControlRequest` → handler dispatch.
 - `src/account.rs` — account list/create, group creation, profile publishing, `local_account_for_account_id`, and welcomer-allowlist
@@ -70,6 +71,7 @@ several files in the same crate); methods shared across those files are `pub(cra
   aggregates, relay/replay/home observations) using no-start runtime reads.
 - `src/error.rs` — `ConnectorError` and its `code`/`client_message`/`retryable`/`privacy_safe_code` projections.
 - `src/socket.rs` — socket path/bind/hardening (`default_socket_path`, `bind_connector_socket*`, stale-socket recovery).
+  The connector's own refusals carry fixed, path-free `SocketRejection` text that startup prints.
 - `src/allowlist.rs` — `AllowlistStore`/`AllowlistRecord` per-account invite-policy and welcomer-allowlist persistence.
 - `src/stream_session.rs` — `StreamSessionStore`/`ActiveStreamSession`, the shared runtime publisher handles, and persisted
   `SendIdempotencyStore` (`$MARMOT_HOME/dev/send-idempotency.json`, 1024-entry FIFO,
@@ -86,7 +88,8 @@ several files in the same crate); methods shared across those files are `pub(cra
   `AccountError`, which a failing pass could self-emit) resets the net and wakes a backed-off pass, never faster
   than the base cadence (mdk#1380). Subscription initial catch-ups stay prompt out-of-band requests.
 - `src/validation.rs` — control-plane/profile/hex validation helpers and the invite-policy retry-state holders.
-- `src/bootstrap.rs` — `wn-agent bootstrap` flow, default relays/QUIC candidate, and `MARMOT_*` env resolution.
+- `src/bootstrap.rs` — `wn-agent bootstrap` flow, default relays/QUIC candidate, and `MARMOT_*` env resolution,
+  including `resolve_relays`, the relay order `serve` and `bootstrap` share.
 - `src/identity.rs` — `wn-agent import-identity`: owner-only, single-link, size-bounded existing Nostr identity import.
 - `src/usage_diagnostics.rs` — `wn-agent usage-diagnostics` consent controls on a separate owner-only local socket,
   deliberately outside the agent-control protocol.

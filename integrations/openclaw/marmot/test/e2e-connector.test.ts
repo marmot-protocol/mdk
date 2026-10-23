@@ -130,10 +130,18 @@ maybeDescribe("OpenClaw Marmot connector E2E", () => {
           "--socket",
           socketPath,
           "--debug-controls",
+          // Stay offline: without relays from the flag or environment,
+          // `serve` would otherwise use the public default relays.
+          "--no-default-relays",
         ],
         {
           cwd: repoRoot(),
-          env: { ...process.env, RUST_LOG: process.env.RUST_LOG ?? "warn" },
+          env: {
+            ...process.env,
+            MARMOT_RELAYS: undefined,
+            MARMOT_RELAY: undefined,
+            RUST_LOG: process.env.RUST_LOG ?? "warn",
+          },
           stdio: ["ignore", "pipe", "pipe"],
         },
       );
