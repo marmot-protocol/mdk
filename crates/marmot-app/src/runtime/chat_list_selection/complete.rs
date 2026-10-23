@@ -905,6 +905,9 @@ impl CompleteState {
                 };
                 match result {
                     crate::client::SelectionApplyOutcome::NeedsPresentation(bound) => {
+                        // The worker proved that no mutation was attempted. A
+                        // failed follow-up capture cannot make that effect unknown.
+                        self.mutation_uncertain = false;
                         if !bound.owner.shares_connection_with(&self.reader.storage)
                             || bound.owner_epoch != self.owner_epoch
                         {
@@ -931,7 +934,6 @@ impl CompleteState {
                         self.prepared = full.prepared;
                         self.selected = None;
                         self.proof = None;
-                        self.mutation_uncertain = false;
                         return Err(ChatListSelectionError::IncompletePresentation);
                     }
                     crate::client::SelectionApplyOutcome::Applied {

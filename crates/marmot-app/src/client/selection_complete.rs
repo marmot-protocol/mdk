@@ -294,6 +294,23 @@ impl AppClient {
                 report.uncertain = true;
                 break;
             }
+            // Only these source-owned front guards prove no effect. Errors
+            // returned by an invoked primitive remain conservatively uncertain.
+            let refused_before_effect = match mutation {
+                SelectionMutation::Archive { .. } => !self
+                    .state
+                    .groups
+                    .iter()
+                    .any(|current| current.group_id_hex == id),
+                SelectionMutation::DeleteLocal => self
+                    .runtime
+                    .disbanding_in_progress(&group)
+                    .is_ok_and(|disbanding| disbanding),
+            };
+            if refused_before_effect {
+                report.failed_group_id = Some(id);
+                break;
+            }
             let result = match mutation {
                 SelectionMutation::Archive { archived } => tokio::task::block_in_place(|| {
                     self.set_group_archived(&group, archived).map(|_| true)

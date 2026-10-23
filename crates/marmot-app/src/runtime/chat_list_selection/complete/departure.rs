@@ -42,7 +42,8 @@ pub struct ChatSelectionDepartureReport {
     pub summary: Option<crate::SendSummary>,
     pub changed: bool,
     pub skipped: bool,
-    /// Only the two existing advisory refusals are a known pre-effect result.
+    /// Existing advisory refusals and explicit worker front guards are known
+    /// pre-effect results; errors after invoking a mutator stay conservative.
     pub refusal: Option<Arc<AppError>>,
     pub uncertain: bool,
 }
@@ -229,6 +230,9 @@ impl CompleteState {
         };
         match outcome {
             crate::client::SelectionDepartureOutcome::NeedsPresentation(bound) => {
+                // No departure effect ran; follow-up capture failure is known
+                // non-effect with a refused follow-up capture.
+                self.mutation_uncertain = false;
                 let bound = *bound;
                 if !bound.owner.shares_connection_with(&self.reader.storage)
                     || bound.owner_epoch != self.owner_epoch
@@ -257,7 +261,6 @@ impl CompleteState {
                 self.prepared = full.prepared;
                 self.selected = None;
                 self.proof = None;
-                self.mutation_uncertain = false;
                 Err(ChatListSelectionError::IncompletePresentation)
             }
             crate::client::SelectionDepartureOutcome::Effect {
@@ -265,8 +268,10 @@ impl CompleteState {
                 changed,
                 skipped,
                 error,
+                refused_before_effect,
             } => {
-                let known_refusal = error.as_ref().is_some_and(known_pre_effect_refusal);
+                let known_refusal =
+                    refused_before_effect || error.as_ref().is_some_and(known_pre_effect_refusal);
                 let report = ChatSelectionDepartureReport {
                     operation_id,
                     attempt_id,

@@ -206,3 +206,147 @@ async fn complete_capture_app_two_phase_union_and_keyed_shrink() {
     assert_eq!(captured.complete().unwrap(), vec![hex::encode([1; 4])]);
     app.close_storage().unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn complete_mutation_frontguards_are_known_non_effects_without_deleting_rows() {
+    use crate::chat_selection::capture::SelectionMutation;
+    use cgka_traits::storage::{DisbandRequest, DisbandRequestStatus, DisbandRequestStorage};
+    for case in 0..3 {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group = client.create_group("Front guard", &[]).await.unwrap();
+        let id = hex::encode(group.as_slice());
+        let store = app.account_storage("alice").unwrap();
+        store
+            .app_storage()
+            .refresh_chat_list_rows(&account.account_id_hex, &|_, _| false)
+            .unwrap();
+        let shared = app.shared_storage().unwrap();
+        let mut settled = false;
+        for _ in 0..32 {
+            if !crate::chat_presentation::maintenance::prepare_batch(
+                &store,
+                &shared,
+                &account.account_id_hex,
+            )
+            .unwrap()
+            {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled);
+        let mut input = request(&account.account_id_hex);
+        input.original_ids = Some(vec![id.clone()]);
+        let bound = client
+            .capture_complete_selection(input.clone(), &|| false)
+            .unwrap();
+        assert_eq!(bound.resolved_ids().unwrap(), vec![id.clone()]);
+        if case == 0 {
+            // Fresh native row still exists; the worker's actual archive source
+            // has no matching group. This is before the archive primitive.
+            client
+                .state
+                .groups
+                .retain(|current| current.group_id_hex != id);
+        } else {
+            store
+                .put_disband_request(&DisbandRequest {
+                    group_id: group.clone(),
+                    requested_at_ms: 1000,
+                    status: DisbandRequestStatus::Pending,
+                    last_prepared_epoch: None,
+                })
+                .unwrap();
+            assert!(client.runtime.disbanding_in_progress(&group).unwrap());
+        }
+        let probe = client
+            .capture_complete_selection(input.clone(), &|| false)
+            .unwrap();
+        eprintln!(
+            "selection frontguard diagnostic: case={} fresh_count={} state_has_group={} owner_current={} epoch_equal={}",
+            case,
+            probe.resolved_ids().unwrap().len(),
+            client
+                .state
+                .groups
+                .iter()
+                .any(|current| current.group_id_hex == id),
+            app.account_storage_is_current("alice", &bound.owner),
+            probe.owner_epoch == bound.owner_epoch,
+        );
+        if case < 2 {
+            let mutation = if case == 0 {
+                SelectionMutation::Archive { archived: true }
+            } else {
+                SelectionMutation::DeleteLocal
+            };
+            let outcome = client
+                .apply_complete_selection(
+                    input,
+                    None,
+                    bound.owner,
+                    bound.owner_epoch,
+                    mutation,
+                    1,
+                    902,
+                    &|| false,
+                )
+                .await
+                .unwrap();
+            let SelectionApplyOutcome::Applied {
+                report, changed, ..
+            } = outcome
+            else {
+                panic!("unexpected host presentation request")
+            };
+            assert!(report.applied_group_ids.is_empty());
+            assert!(changed.is_empty());
+            if case == 0 {
+                // Missing worker state reaches the explicit archive front guard.
+                assert_eq!(report.failed_group_id, Some(id.clone()));
+                assert_eq!(report.remaining, 1);
+            } else {
+                // The newly pending disband is already outside the fresh scope;
+                // it is removed before the local-delete primitive is considered.
+                assert_eq!(report.failed_group_id, None);
+                assert_eq!(report.remaining, 0);
+            }
+            assert!(!report.uncertain);
+        } else {
+            let outcome = client
+                .depart_complete_selection(
+                    input,
+                    None,
+                    bound.owner,
+                    bound.owner_epoch,
+                    id.clone(),
+                    crate::runtime::ChatSelectionDepartureStep::DeleteLocal,
+                    false,
+                    &|| false,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                super::departure::SelectionDepartureOutcome::Effect {
+                    changed: false,
+                    skipped: true,
+                    error: None,
+                    refused_before_effect: true,
+                    ..
+                }
+            ));
+        }
+        let row = store.app_storage().chat_list_row(&id).unwrap().unwrap();
+        assert!(!row.archived);
+        assert_eq!(store.get_group(&group).unwrap().id, group);
+        drop(client);
+        app.close_storage().unwrap();
+    }
+}

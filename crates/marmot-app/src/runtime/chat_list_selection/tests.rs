@@ -269,6 +269,17 @@ async fn complete_capture_worker_yields_one_thread_and_discards_aborted_response
         .set_timing_observer(Some(Arc::new(move |operation, duration, success| {
             if success
                 && operation == storage_sqlite::SqliteTimingOperation::ConnectionWait
+                && duration >= std::time::Duration::from_millis(5)
+            {
+                eprintln!(
+                    "selection connection-wait diagnostic: actual_worker={} async_task={} elapsed_ms={}",
+                    tokio::task::try_id() == Some(worker_id),
+                    tokio::task::try_id().is_some(),
+                    duration.as_millis(),
+                );
+            }
+            if success
+                && operation == storage_sqlite::SqliteTimingOperation::ConnectionWait
                 && tokio::task::try_id() == Some(worker_id)
                 && duration >= std::time::Duration::from_millis(5)
             {
@@ -2061,6 +2072,336 @@ async fn complete_reselect_reissues_presentation_and_removes_only_restored_tombs
             .revision,
         pending.revision
     );
+    handle.close();
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+// Inject only worker outcomes, not actor state or production capture hooks. The
+// first outcome is a known non-effect; failure of its follow-up must stay so.
+async fn assert_failed_reissue_is_known_non_effect(departure: bool) {
+    let f = Fixture::new(0);
+    f.runtime.accounts().catch_up_accounts().await.unwrap();
+    let group = f
+        .runtime
+        .create_group("alice", "Reissue test", &[], None)
+        .await
+        .unwrap();
+    let id = hex::encode(group.as_slice());
+    f.store
+        .app_storage()
+        .refresh_chat_list_rows(&f.account_id, &|_, _| false)
+        .unwrap();
+    settle_complete_created_fixture(&f).await;
+    let manager = f.runtime.accounts();
+    let open = complete_handle_open(&f.account_id);
+    let context = open.context.clone();
+    let handle = f
+        .runtime
+        .open_complete_chat_list_selection("alice", open)
+        .await
+        .unwrap();
+    let bound = manager
+        .capture_selection_context("alice", complete_capture_request(&f.account_id))
+        .await
+        .unwrap();
+    let before = handle.status().await.unwrap();
+    let original_ids = handle
+        .page(before.revision, 0, 200)
+        .await
+        .unwrap()
+        .group_ids;
+    let (commands, mut injected) = mpsc::channel(4);
+    let original = {
+        let mut workers = manager.workers.lock().await;
+        let worker = workers.get_mut(&f.account_id).unwrap();
+        std::mem::replace(&mut worker.commands, commands)
+    };
+    let forward = original.clone();
+    let responder = tokio::spawn(async move {
+        use super::super::AccountWorkerCommand;
+        loop {
+            match injected.recv().await.unwrap() {
+                AccountWorkerCommand::ApplySelection { respond, .. } if !departure => {
+                    assert!(
+                        respond
+                            .send(Ok(crate::client::SelectionApplyOutcome::NeedsPresentation(
+                                bound
+                            )))
+                            .is_ok()
+                    );
+                    break;
+                }
+                AccountWorkerCommand::DepartSelection { respond, .. } if departure => {
+                    assert!(
+                        respond
+                            .send(Ok(
+                                crate::client::SelectionDepartureOutcome::NeedsPresentation(
+                                    Box::new(bound)
+                                )
+                            ))
+                            .is_ok()
+                    );
+                    break;
+                }
+                AccountWorkerCommand::ApplySelection { .. }
+                | AccountWorkerCommand::DepartSelection { .. }
+                | AccountWorkerCommand::CaptureSelection { .. } => {
+                    panic!("unexpected selection command before reissue")
+                }
+                other => assert!(forward.send(other).await.is_ok()),
+            }
+        }
+        loop {
+            match injected.recv().await.unwrap() {
+                AccountWorkerCommand::CaptureSelection { respond, .. } => {
+                    assert!(
+                        respond
+                            .send(Err(
+                                crate::chat_selection::capture::CaptureError::ResourceExhausted
+                            ))
+                            .is_ok()
+                    );
+                    break;
+                }
+                AccountWorkerCommand::ApplySelection { .. }
+                | AccountWorkerCommand::DepartSelection { .. } => {
+                    panic!("expected full reissue capture before another effect")
+                }
+                other => assert!(forward.send(other).await.is_ok()),
+            }
+        }
+    });
+    let failed = if departure {
+        handle
+            .depart(
+                901,
+                1,
+                0,
+                id.clone(),
+                context.clone(),
+                ChatSelectionDepartureStep::DeleteLocal,
+            )
+            .await
+            .map(|_| ())
+    } else {
+        handle
+            .apply(
+                901,
+                1,
+                0,
+                context.clone(),
+                ChatSelectionMutation::Archive { archived: true },
+            )
+            .await
+            .map(|_| ())
+    };
+    responder.await.unwrap();
+    {
+        let mut workers = manager.workers.lock().await;
+        workers.get_mut(&f.account_id).unwrap().commands = original;
+    }
+    assert!(matches!(
+        failed,
+        Err(ChatListSelectionError::Capture(
+            crate::chat_selection::capture::CaptureError::ResourceExhausted
+        ))
+    ));
+    let status = handle.status().await.unwrap();
+    assert_eq!(status.operation_id, Some(901));
+    assert_eq!(status.last_attempt, Some(1));
+    assert_eq!(status.count, Some(1));
+    assert!(!status.mutation_uncertain);
+    assert_eq!(status.revision, before.revision);
+    assert_eq!(
+        handle
+            .page(status.revision, 0, 200)
+            .await
+            .unwrap()
+            .group_ids,
+        original_ids
+    );
+    assert!(
+        !f.store
+            .app_storage()
+            .chat_list_row(&id)
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+    // Same operation and attempt now reach the actual worker primitive once.
+    // No new intent, handle or arrival can be introduced to recover this refusal.
+    if departure {
+        let report = handle
+            .depart(
+                901,
+                1,
+                status.revision,
+                id.clone(),
+                context,
+                ChatSelectionDepartureStep::DeleteLocal,
+            )
+            .await
+            .unwrap();
+        assert!(!report.uncertain);
+        assert!(report.refusal.is_none());
+        assert!(report.changed);
+    } else {
+        let report = handle
+            .apply(
+                901,
+                1,
+                status.revision,
+                context,
+                ChatSelectionMutation::Archive { archived: true },
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.applied_group_ids, vec![id]);
+        assert!(!report.uncertain);
+    }
+    assert_eq!(handle.status().await.unwrap().count, Some(0));
+    handle.close();
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn complete_apply_known_reissue_failure_does_not_become_uncertain() {
+    assert_failed_reissue_is_known_non_effect(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn complete_departure_known_reissue_failure_does_not_become_uncertain() {
+    assert_failed_reissue_is_known_non_effect(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn complete_archive_projection_failure_retains_known_commit_and_dirty_recovery() {
+    let f = Fixture::new(0);
+    f.runtime.accounts().catch_up_accounts().await.unwrap();
+    let group = f
+        .runtime
+        .create_group("alice", "Projection fault", &[], None)
+        .await
+        .unwrap();
+    let id = hex::encode(group.as_slice());
+    f.store
+        .app_storage()
+        .refresh_chat_list_rows(&f.account_id, &|_, _| false)
+        .unwrap();
+    settle_complete_created_fixture(&f).await;
+    let account = f.app.account_home().account("alice").unwrap();
+    f.app.ensure_chat_list_projection(&account).unwrap();
+    assert!(
+        !f.app
+            .chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .contains("alice")
+    );
+    let open = complete_handle_open(&f.account_id);
+    let context = open.context.clone();
+    let handle = f
+        .runtime
+        .open_complete_chat_list_selection("alice", open)
+        .await
+        .unwrap();
+    // Existing SQLCipher fixture convention: a second connection installs a
+    // projection-only fault. Never print or retain this synthetic fixture key.
+    let path = f.app.account_storage_path("alice");
+    let keys = f.app.account_home().load_signing_keys("alice").unwrap();
+    let key = f
+        .app
+        .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    connection.execute_batch("CREATE TRIGGER selection_fail_archive_insert BEFORE INSERT ON chat_list_rows
+        WHEN NEW.archived = 1 BEGIN SELECT RAISE(ABORT, 'injected archive projection failure'); END;
+        CREATE TRIGGER selection_fail_archive_update BEFORE UPDATE ON chat_list_rows
+        WHEN NEW.archived = 1 BEGIN SELECT RAISE(ABORT, 'injected archive projection failure'); END;").unwrap();
+    let report = handle
+        .apply(
+            903,
+            1,
+            0,
+            context.clone(),
+            ChatSelectionMutation::Archive { archived: true },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.applied_group_ids, vec![id.clone()]);
+    assert!(!report.uncertain);
+    assert_eq!(report.remaining, 0);
+    let state = f
+        .store
+        .app_storage()
+        .load_account_projection_state("alice", 100)
+        .unwrap();
+    assert!(
+        state
+            .groups
+            .iter()
+            .find(|stored| stored.group_id_hex == id)
+            .unwrap()
+            .archived
+    );
+    assert!(f.app.refresh_chat_list_row("alice", &id).is_err());
+    assert!(
+        !f.store
+            .app_storage()
+            .chat_list_row(&id)
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+    assert!(
+        f.app
+            .chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .contains("alice")
+    );
+    assert!(f.app.ensure_chat_list_projection(&account).is_err());
+    assert!(
+        f.app
+            .chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .contains("alice"),
+        "failed refresh retains the existing source-owned stale marker"
+    );
+    connection.execute_batch("DROP TRIGGER selection_fail_archive_insert; DROP TRIGGER selection_fail_archive_update;").unwrap();
+    f.app.ensure_chat_list_projection(&account).unwrap();
+    assert!(
+        !f.app
+            .chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .contains("alice")
+    );
+    assert!(
+        f.store
+            .app_storage()
+            .chat_list_row(&id)
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+    let retained = handle
+        .apply(
+            903,
+            1,
+            0,
+            context,
+            ChatSelectionMutation::Archive { archived: true },
+        )
+        .await
+        .unwrap();
+    assert_eq!(retained.applied_group_ids, report.applied_group_ids);
+    assert!(!retained.uncertain);
     handle.close();
     f.runtime.shutdown_and_close().await.unwrap();
 }

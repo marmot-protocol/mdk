@@ -5376,7 +5376,7 @@ fn account_worker_command_future<'a>(
             operation_id,
             respond,
         } => Box::pin(async move {
-            let mut result = client
+            let result = client
                 .apply_complete_selection(
                     request,
                     proof,
@@ -5390,7 +5390,7 @@ fn account_worker_command_future<'a>(
                 .await;
             if let Ok(crate::client::SelectionApplyOutcome::Applied {
                 report, changed, ..
-            }) = &mut result
+            }) = &result
             {
                 for (id, did_change) in report.applied_group_ids.iter().zip(changed.iter()) {
                     if !did_change {
@@ -5403,18 +5403,20 @@ fn account_worker_command_future<'a>(
                         mutation,
                         crate::chat_selection::capture::SelectionMutation::Archive { .. }
                     ) {
-                        match tokio::task::block_in_place(|| {
+                        // The archive is already committed and recorded in
+                        // applied_group_ids. A projection refresh failure
+                        // must not turn a known effect into mutation uncertainty.
+                        if let Ok(row) = tokio::task::block_in_place(|| {
                             client.app.refresh_chat_list_row(account_label, id)
                         }) {
-                            Ok(row) => super::publish_chat_list_projection_update_event(
+                            super::publish_chat_list_projection_update_event(
                                 events,
                                 account_id_hex.to_owned(),
                                 account_label.to_owned(),
                                 id.clone(),
                                 row,
                                 crate::ChatListUpdateTrigger::ArchiveChanged,
-                            ),
-                            Err(_) => report.uncertain = true,
+                            );
                         }
                     }
                     publish_app_runtime_group_state_updated(

@@ -10,6 +10,7 @@ pub(crate) enum SelectionDepartureOutcome {
         changed: bool,
         skipped: bool,
         error: Option<crate::AppError>,
+        refused_before_effect: bool,
     },
 }
 impl AppClient {
@@ -72,6 +73,7 @@ impl AppClient {
                     changed: false,
                     skipped: true,
                     error: None,
+                    refused_before_effect: true,
                 });
             }
         }
@@ -124,6 +126,20 @@ impl AppClient {
         // Actual mutators retain current authoritative engine role/roster,
         // single-attempt acknowledgement and audit behavior. No folder recapture
         // is allowed between effects of this already-admitted target intent.
+        if matches!(step, ChatSelectionDepartureStep::DeleteLocal)
+            && self
+                .runtime
+                .disbanding_in_progress(&group)
+                .is_ok_and(|disbanding| disbanding)
+        {
+            return Ok(SelectionDepartureOutcome::Effect {
+                summary: None,
+                changed: false,
+                skipped: false,
+                error: Some(crate::AppError::GroupDisbanding(group_id)),
+                refused_before_effect: true,
+            });
+        }
         let result = match step {
             ChatSelectionDepartureStep::Promote { member_ref } => self
                 .promote_admin(&group, &member_ref)
@@ -152,12 +168,14 @@ impl AppClient {
                 changed,
                 skipped: false,
                 error: None,
+                refused_before_effect: false,
             },
             Err(error) => SelectionDepartureOutcome::Effect {
                 summary: None,
                 changed: false,
                 skipped: false,
                 error: Some(error),
+                refused_before_effect: false,
             },
         })
     }
