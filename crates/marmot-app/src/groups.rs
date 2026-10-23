@@ -115,6 +115,8 @@ pub struct AppCreateGroupOptions {
     /// Initial group routing relays. Omitted uses the app configuration.
     pub relays: Option<Vec<String>>,
     pub description: String,
+    /// Invited account references granted admin in the founding group state.
+    pub initial_admins: Vec<String>,
     pub initial_image: Option<AppInitialGroupImage>,
     pub disappearing_message_secs: u64,
 }

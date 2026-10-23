@@ -520,6 +520,7 @@ fn response_type_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::InvitePolicy { .. } => "invite_policy",
         AgentControlResponse::DiagnosticStatus { .. } => "diagnostic_status",
         AgentControlResponse::GroupCreated { .. } => "group_created",
+        AgentControlResponse::GroupCreateCapabilities { .. } => "group_create_capabilities",
         AgentControlResponse::GroupInfo { .. } => "group_info",
         AgentControlResponse::GroupProfileUpdated { .. } => "group_profile_updated",
         AgentControlResponse::MaintenanceStatus { .. } => "maintenance_status",

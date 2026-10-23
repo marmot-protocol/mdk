@@ -78,9 +78,59 @@ impl AgentConnector {
         description: Option<String>,
         relays: Option<Vec<String>>,
     ) -> Result<AgentControlResponse, ConnectorError> {
+        self.create_group_with_admins_response(
+            account_id_hex,
+            name,
+            members,
+            Vec::new(),
+            description,
+            relays,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_group_with_admins_response(
+        &self,
+        account_id_hex: &str,
+        name: String,
+        members: Vec<String>,
+        admins: Vec<String>,
+        description: Option<String>,
+        relays: Option<Vec<String>>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
         let account_id_hex = crate::validation::normalize_hex(account_id_hex)?;
         let account = self.local_account_for_account_id(&account_id_hex)?;
         crate::validation::validate_group_create(&name, &members, description.as_deref())?;
+        if admins.len() > members.len() {
+            return Err(ConnectorError::InvalidGroupCreate(
+                "admins must be invited members",
+            ));
+        }
+        let resolve = |reference: &str| {
+            self.account_home
+                .account(reference)
+                .map(|account| account.account_id_hex)
+                .or_else(|_| AccountHome::account_id_for_public_key(reference))
+        };
+        let admins = if admins.is_empty() {
+            Vec::new()
+        } else {
+            let member_ids = members
+                .iter()
+                .map(|member| resolve(member))
+                .collect::<Result<std::collections::HashSet<_>, _>>()?;
+            let admins = admins
+                .iter()
+                .map(|admin| resolve(admin))
+                .collect::<Result<Vec<_>, _>>()?;
+            if admins.iter().any(|admin| !member_ids.contains(admin)) {
+                return Err(ConnectorError::InvalidGroupCreate(
+                    "admins must be invited members",
+                ));
+            }
+            admins
+        };
         let group_id = self
             .runtime
             .create_group_with_options(
@@ -90,6 +140,7 @@ impl AgentConnector {
                 marmot_app::AppCreateGroupOptions {
                     description: description.unwrap_or_default(),
                     relays,
+                    initial_admins: admins,
                     ..Default::default()
                 },
             )

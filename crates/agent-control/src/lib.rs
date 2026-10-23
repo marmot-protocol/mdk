@@ -461,6 +461,19 @@ pub enum AgentControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         relays: Option<Vec<String>>,
     },
+    /// Read creation support before submitting a non-idempotent create.
+    GroupCreateCapabilities,
+    /// Create with selected invitees as founding admins; older connectors must refuse.
+    GroupCreateWithAdmins {
+        account_id_hex: String,
+        name: String,
+        members: Vec<String>,
+        admins: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relays: Option<Vec<String>>,
+    },
     /// Leave a group using the account runtime; returns Ack after success.
     GroupLeave {
         account_id_hex: String,
@@ -666,6 +679,9 @@ pub enum AgentControlResponse {
     },
     DiagnosticStatus {
         report: AgentControlDiagnosticStatus,
+    },
+    GroupCreateCapabilities {
+        initial_admins: bool,
     },
     GroupCreated {
         group_id_hex: String,
@@ -1284,6 +1300,43 @@ mod tests {
         assert_eq!(json["relay_lists"]["inbox"]["created_at"], 0);
         assert_eq!(
             decode_frame::<AgentControlResponse>(&encoded).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn founding_admin_creation_round_trips() {
+        let value = serde_json::json!({
+            "type": "group_create_with_admins", "account_id_hex": "11".repeat(32),
+            "name": "Team", "members": ["22".repeat(32)], "admins": ["22".repeat(32)]
+        });
+        let request: AgentControlRequest = serde_json::from_value(value.clone()).unwrap();
+        let encoded = encode_frame(&AgentControlEnvelope::request(
+            Some("create".into()),
+            request,
+        ))
+        .unwrap();
+        let decoded: Value = serde_json::from_slice(&encoded).unwrap();
+        for key in ["type", "members", "admins"] {
+            assert_eq!(decoded[key], value[key]);
+        }
+        let capabilities: AgentControlRequest =
+            serde_json::from_value(serde_json::json!({"type": "group_create_capabilities"}))
+                .unwrap();
+        assert!(matches!(
+            capabilities,
+            AgentControlRequest::GroupCreateCapabilities
+        ));
+        let response = AgentControlResponse::GroupCreateCapabilities {
+            initial_admins: true,
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"type": "group_create_capabilities", "initial_admins": true})
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentControlResponse>(value).unwrap(),
             response
         );
     }

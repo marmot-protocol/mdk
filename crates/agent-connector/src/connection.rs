@@ -287,6 +287,29 @@ impl AgentConnector {
                 )
                 .await
             }
+            AgentControlRequest::GroupCreateCapabilities => {
+                Ok(AgentControlResponse::GroupCreateCapabilities {
+                    initial_admins: true,
+                })
+            }
+            AgentControlRequest::GroupCreateWithAdmins {
+                account_id_hex,
+                name,
+                members,
+                admins,
+                description,
+                relays,
+            } => {
+                self.create_group_with_admins_response(
+                    &account_id_hex,
+                    name,
+                    members,
+                    admins,
+                    description,
+                    relays,
+                )
+                .await
+            }
             AgentControlRequest::GroupCreate {
                 account_id_hex,
                 name,

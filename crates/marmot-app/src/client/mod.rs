@@ -2045,6 +2045,7 @@ impl AppClient {
     ) -> Result<CanonicalCreatedGroup, AppError> {
         let AppCreateGroupOptions {
             description,
+            initial_admins,
             disappearing_message_secs,
             relays,
             ..
@@ -2088,7 +2089,10 @@ impl AppClient {
             members: Vec::new(),
             required_features: Vec::new(),
             app_components,
-            initial_admins: Vec::new(),
+            initial_admins: initial_admins
+                .iter()
+                .map(|admin| self.app.member_id(admin))
+                .collect::<Result<Vec<_>, _>>()?,
         };
         let requirements = self
             .runtime
