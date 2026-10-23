@@ -34,7 +34,7 @@ async fn token_sends_to_a_group_with_a_refused_subscription_are_never_rejected()
         .group_id;
     let group_hex = hex::encode(group.as_slice());
 
-    runtime
+    let text = runtime
         .submit_text("alice", &group, "text".into(), "text-token".into())
         .await
         .unwrap();
@@ -44,7 +44,7 @@ async fn token_sends_to_a_group_with_a_refused_subscription_are_never_rejected()
         .selected_message_draft("alice", &group_hex)
         .unwrap()
         .revision;
-    runtime
+    let draft = runtime
         .submit_message_draft("alice", &group, revision, vec![], "draft-token".into())
         .await
         .unwrap();
@@ -78,12 +78,16 @@ async fn token_sends_to_a_group_with_a_refused_subscription_are_never_rejected()
             },
         )
         .unwrap();
-    assert!(
-        timeline
+    for accepted in [&text, &draft] {
+        let row = timeline
             .messages
             .iter()
-            .all(|message| message.invalidation_status.is_none()),
-        "no sent row may read as a failed local publish"
-    );
+            .find(|message| message.message_id_hex == accepted.message_id_hex)
+            .expect("each admitted send keeps its timeline row");
+        assert!(
+            row.invalidation_status.is_none(),
+            "no sent row may read as a failed local publish"
+        );
+    }
     runtime.shutdown().await;
 }

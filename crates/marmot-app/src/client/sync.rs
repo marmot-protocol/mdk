@@ -1244,7 +1244,7 @@ impl AppClient {
             Err(error) if !error.is_account_not_active() => {
                 tracing::warn!(
                     target: "marmot_app::client",
-                    method,
+                    method = method,
                     error_kind = error.privacy_safe_kind(),
                     "group subscription refresh failed; the operation continues and the refresh retries"
                 );
