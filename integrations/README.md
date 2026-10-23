@@ -210,7 +210,7 @@ existing key instead. The connector's identity must not also be signed in on
 another client. Continue with [Build your own client](custom-client.md).
 
 `install-wn-agent.sh` is published from the first WN Agent release after
-0.13.0. While `base_url` above is 0.13.0 or earlier, run the installer from a
+0.14.0. While `base_url` above is 0.14.0 or earlier, run the installer from a
 clone of this repository instead. It downloads and verifies that release's
 `wn-agent` bundle the same way:
 

@@ -575,7 +575,7 @@ install_verified "$base_url/install-opencode-marmot.sh" "$base_url/install-openc
 install_verified "$base_url/install-pi-marmot.sh" "$base_url/install-pi-marmot.sh.sha256"
 # Goose terminal harness
 install_verified "$base_url/install-goose-marmot.sh" "$base_url/install-goose-marmot.sh.sha256"
-# wn-agent only, for your own agent-control client (published after 0.13.0)
+# wn-agent only, for your own agent-control client (published after 0.14.0)
 install_verified "$base_url/install-wn-agent.sh" "$base_url/install-wn-agent.sh.sha256"
 )
 ```
