@@ -405,6 +405,7 @@ pub(crate) async fn groups_command_with_runtime(
     .await
 }
 
+/// Execute one group command attempt using the selected local account.
 async fn groups_command_once(
     account_home: &AccountHome,
     app: &MarmotApp,
@@ -481,6 +482,7 @@ async fn groups_command_once(
                         initial_image,
                         disappearing_message_secs,
                         relays: None,
+                        ..Default::default()
                     },
                 )
                 .await?;

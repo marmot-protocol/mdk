@@ -231,6 +231,7 @@ impl AgentConnector {
         result
     }
 
+    /// Dispatch a one-shot control request without adding operation telemetry.
     async fn handle_request_unobserved(
         &self,
         request_id: Option<&str>,
@@ -284,6 +285,29 @@ impl AgentConnector {
                 self.diagnostic_status_response(
                     account_id_hex.as_deref(),
                     home_group_id_hex.as_deref(),
+                )
+                .await
+            }
+            AgentControlRequest::GroupCreateCapabilities => {
+                Ok(AgentControlResponse::GroupCreateCapabilities {
+                    initial_admins: true,
+                })
+            }
+            AgentControlRequest::GroupCreateWithAdmins {
+                account_id_hex,
+                name,
+                members,
+                admins,
+                description,
+                relays,
+            } => {
+                self.create_group_with_admins_response(
+                    &account_id_hex,
+                    name,
+                    members,
+                    admins,
+                    description,
+                    relays,
                 )
                 .await
             }

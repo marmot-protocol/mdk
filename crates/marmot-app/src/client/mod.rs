@@ -2035,6 +2035,11 @@ impl AppClient {
         .await
     }
 
+    /// Create a group with founding policy, optional image source, and telemetry.
+    ///
+    /// Explicit admins must resolve to founding members, including the implicit
+    /// creator. Validate this before member lookup, image upload, or MLS creation,
+    /// and include explicit admin grants in the creation audit context.
     pub(crate) async fn create_group_with_initial_source_and_optional_telemetry(
         &mut self,
         name: &str,
@@ -2045,6 +2050,7 @@ impl AppClient {
     ) -> Result<CanonicalCreatedGroup, AppError> {
         let AppCreateGroupOptions {
             description,
+            initial_admins,
             disappearing_message_secs,
             relays,
             ..
@@ -2088,8 +2094,27 @@ impl AppClient {
             members: Vec::new(),
             required_features: Vec::new(),
             app_components,
-            initial_admins: Vec::new(),
+            initial_admins: initial_admins
+                .iter()
+                .map(|admin| self.app.member_id(admin))
+                .collect::<Result<Vec<_>, _>>()?,
         };
+        if !request.initial_admins.is_empty() {
+            let mut founding_members = member_refs
+                .iter()
+                .map(|member| self.app.member_id(member))
+                .collect::<Result<HashSet<_>, _>>()?;
+            founding_members.insert(self.app.member_id(&self.state.label)?);
+            if request
+                .initial_admins
+                .iter()
+                .any(|admin| !founding_members.contains(admin))
+            {
+                return Err(AppError::InvalidGroupProfile(
+                    "initial admins must be founding members".into(),
+                ));
+            }
+        }
         let requirements = self
             .runtime
             .session()
@@ -2238,6 +2263,10 @@ impl AppClient {
                 .map(|component| component.component_id),
         );
         let mut changed_fields = vec!["name", "members"];
+        if !request.initial_admins.is_empty() {
+            changed_fields.push("admins");
+            touched_components.push(GROUP_ADMIN_POLICY_COMPONENT_ID);
+        }
         if !request.description.is_empty() {
             changed_fields.push("description");
         }
