@@ -302,8 +302,8 @@ name are stranded.
 Nothing an unset value configures falls back to White Noise's services. With no `newGroupMediaEndpoints`, new groups
 carry no encrypted-media component and stay text-only. With no group-image server, setting or fetching an encrypted
 group image fails; with no profile-image server, `uploadProfileImage` needs an explicit server. No recovery relays
-means every route's history needs all its relays to certify, no discovery indexers means onboarding searches only the
-discovery relays the host passes, no Open Ranking turns that directory-search tier off, no KeyPackage client
+means every route's history needs all its relays to certify, no discovery indexers means onboarding searches the
+discovery relays the host passes plus the account's declared relays, no Open Ranking turns that directory-search tier off, no KeyPackage client
 preference leaves candidates unranked by client tag, and no moderation label namespace leaves reporting unconfigured. The neutral keychain service
 is `org.marmot-protocol.mdk`.
 
