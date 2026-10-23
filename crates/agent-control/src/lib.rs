@@ -1881,6 +1881,7 @@ mod tests {
     }
 
     #[test]
+    /// Pin the serialized type name for each initial request fixture.
     fn all_initial_request_variants_have_stable_type_names() {
         let requests = vec![
             (
@@ -2262,6 +2263,8 @@ mod tests {
     }
 
     #[test]
+    /// Verify media opt-in round trips while legacy requests and empty replies
+    /// continue to omit the added fields.
     fn timeline_media_recovery_flag_round_trips_without_changing_legacy_requests() {
         let mut value = serde_json::json!({
             "type":"timeline_message_get", "account_id_hex":account(),
@@ -2294,6 +2297,7 @@ mod tests {
     }
 
     #[test]
+    /// Preserve distinct typed profile lookup outcomes across serialization.
     fn account_profile_lookup_has_typed_found_absent_and_indeterminate_outcomes() {
         let request = AgentControlRequest::AccountProfileLookup {
             account_id_hex: account(),

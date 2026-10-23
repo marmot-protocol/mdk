@@ -1793,6 +1793,7 @@ async fn connector_socket_requires_configured_auth_token() {
 }
 
 #[tokio::test]
+/// Verify own-message edits reach the timeline and invalid edits are refused.
 async fn connector_edit_message_replaces_own_text_and_reports_refusals() {
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
@@ -1904,6 +1905,8 @@ async fn connector_edit_message_replaces_own_text_and_reports_refusals() {
 }
 
 #[tokio::test]
+/// Exercise socket media recovery from a relay-backed chat, including defaults,
+/// missing messages, and deletion without exposing stale download references.
 async fn connector_timeline_media_lookup_is_opt_in_and_hides_deleted_references() {
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
@@ -2083,6 +2086,7 @@ async fn connector_timeline_media_lookup_is_opt_in_and_hides_deleted_references(
 }
 
 #[test]
+/// Pin invalid edit targets to a final, non-retryable connector error.
 fn invalid_edit_target_is_a_final_connector_error() {
     let error = crate::ConnectorError::App(AppError::InvalidEditTarget);
     assert_eq!(error.code(), "invalid_edit_target");

@@ -20,6 +20,10 @@ const TIMELINE_ATTACHMENT_FIELD_MAX_CHARS: usize = 512;
 const TIMELINE_REACTION_EMOJI_MAX_CHARS: usize = 64;
 
 impl AgentConnector {
+    /// Read a timeline row and, when requested, its non-secret media references.
+    ///
+    /// Unavailable rows expose no media. Size the complete response envelope,
+    /// including its request ID, before returning any download references.
     pub(crate) fn timeline_message_response(
         &self,
         request_id: Option<&str>,
@@ -142,6 +146,7 @@ fn bounded_timeline_page_response(
     }
 }
 
+/// Normalize a cursor's message ID while preserving its ordering timestamp.
 fn normalize_cursor(
     mut cursor: AgentControlTimelineCursor,
 ) -> Result<AgentControlTimelineCursor, ConnectorError> {
@@ -149,6 +154,8 @@ fn normalize_cursor(
     Ok(cursor)
 }
 
+/// Project validated download references only for opted-in, available chat rows.
+/// A source epoch is required; content keys are never part of this projection.
 fn timeline_media(record: &TimelineMessageRecord, include: bool) -> Vec<AgentControlMediaRef> {
     if !include
         || record.deleted
@@ -163,6 +170,8 @@ fn timeline_media(record: &TimelineMessageRecord, include: bool) -> Vec<AgentCon
     media_refs_from_tags(&record.tags, epoch)
 }
 
+/// Reject an oversized response, including its request ID and trailing newline.
+/// Download references remain complete rather than being silently truncated.
 fn checked_timeline_message_response(
     request_id: Option<&str>,
     response: AgentControlResponse,
@@ -178,6 +187,7 @@ fn checked_timeline_message_response(
     Ok(response)
 }
 
+/// Build a bounded summary, retaining row identity but hiding unavailable content.
 fn timeline_message(
     record: TimelineMessageRecord,
     self_account_id_hex: &str,
@@ -315,6 +325,7 @@ mod tests {
     }
 
     #[test]
+    /// Verify available summaries retain reply and reaction identities.
     fn available_timeline_message_keeps_durable_identity_and_reactions() {
         let message = timeline_message(record(), &"77".repeat(32));
         assert_eq!(
@@ -332,6 +343,7 @@ mod tests {
     }
 
     #[test]
+    /// Verify opt-in, availability, epoch, chat-kind, and locator-validation gates.
     fn full_media_recovery_is_opt_in_and_excludes_unavailable_records() {
         let mut stored = record();
         stored.tags = vec![vec![
@@ -370,6 +382,7 @@ mod tests {
     }
 
     #[test]
+    /// Verify media and the caller's request ID both count toward the frame limit.
     fn timeline_message_budget_includes_media_and_request_identity() {
         let response = AgentControlResponse::TimelineMessage {
             account_id_hex: "11".repeat(32),
@@ -400,6 +413,7 @@ mod tests {
     }
 
     #[test]
+    /// Verify deleted and invalidated summaries withhold message content and reactions.
     fn deleted_and_invalidated_timeline_messages_never_expose_content() {
         let mut deleted = record();
         deleted.deleted = true;
