@@ -9,6 +9,8 @@ and control-plane security model: [`README.md`](README.md).
   and `agent-stream-compose` previews to `MarmotApp`/`MarmotAppRuntime`.
 - Own `wn-agent bootstrap`, which creates or reuses a local agent account through the running control socket and prints
   phone invite details (`npub`, `nprofile`, optional terminal QR).
+- Own `wn-agent doctor`, which only reads: it never chmods, removes sockets, creates accounts, publishes KeyPackages or
+  writes relay lists, and prints no paths, identifiers, relay URLs or tokens.
 - Own connector socket binding and permission hardening (`bind_connector_socket`, `default_socket_path`).
 - Keep agent-facing wire types in `agent-control` and stream composition in `agent-stream-compose`; this crate is the
   process glue, not the protocol or composition owner.
@@ -90,6 +92,8 @@ several files in the same crate); methods shared across those files are `pub(cra
 - `src/validation.rs` — control-plane/profile/hex validation helpers and the invite-policy retry-state holders.
 - `src/bootstrap.rs` — `wn-agent bootstrap` flow, default relays/QUIC candidate, and `MARMOT_*` env resolution,
   including `resolve_relays`, the relay order `serve` and `bootstrap` share.
+- `src/doctor.rs` — read-only `wn-agent doctor`: local setup checks that evaluate the socket rules in `src/socket.rs`
+  without binding, plus one `diagnostic_status` request; output carries only counts, modes and statuses.
 - `src/identity.rs` — `wn-agent import-identity`: owner-only, single-link, size-bounded existing Nostr identity import.
 - `src/usage_diagnostics.rs` — `wn-agent usage-diagnostics` consent controls on a separate owner-only local socket,
   deliberately outside the agent-control protocol.
@@ -98,11 +102,12 @@ several files in the same crate); methods shared across those files are `pub(cra
 - `src/media_roots.rs` — `MediaAllowedRoots`, connector-enforced confinement for outbound plaintext media paths.
 - `src/agent_created_groups.rs` — per-account activation provenance store, independent of sender authorization.
 - `src/bin/wn-agent.rs` — the `wn-agent` binary entrypoint and clap CLI surface (`ServeArgs`, the `bootstrap`
-  subcommand and `BootstrapArgs`, octal socket-mode parsing, and terminal-QR rendering).
+  subcommand and `BootstrapArgs`, `doctor`, octal socket-mode parsing, and terminal-QR rendering).
 - `src/tests.rs` — white-box test suite exercising the above `pub(crate)` internals.
 - `src/test_support.rs` — test-only hooks and benchmark output (the file name is load-bearing for the workspace
   direct-output audit in `crates/cgka-conformance-simulator/tests/tracing_audit.rs`).
 - `tests/identity_security.rs` — black-box `import-identity` prompt/file security tests (Unix only).
+- `tests/doctor_cli.rs` — black-box `wn-agent doctor` exit code, JSON shape and redaction tests (Unix only).
 
 ## Verification
 

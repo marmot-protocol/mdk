@@ -153,7 +153,7 @@ still land on the same epoch and group state. The engine — not relay order or 
 | | [`marmot-uniffi-macros`](crates/marmot-uniffi-macros/README.md) | Runs MarmotKit's async exports on its own Tokio runtime |
 | | [`marmot-c`](crates/marmot-c/README.md) | C ABI bindings |
 | Front ends | [`cli`](crates/cli/README.md) (`wn-cli`) | `wn`, `wnd`, and `wn tui` |
-| Agents | [`agent-connector`](crates/agent-connector/README.md) | The `wn-agent` connector daemon |
+| Agents | [`agent-connector`](crates/agent-connector/README.md) | The `wn-agent` connector daemon and its `doctor` setup check |
 | | [`agent-control`](crates/agent-control/README.md) | Agent control protocol messages and framing |
 | | [`agent-stream-compose`](crates/agent-stream-compose/README.md) | Live-preview stream composition |
 | | [`integrations/`](integrations/README.md) | Per-runtime plugins and terminal harnesses |

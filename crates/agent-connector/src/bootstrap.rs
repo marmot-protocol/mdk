@@ -582,13 +582,9 @@ pub fn read_bootstrap_auth_token(
         return Ok(Some(token));
     }
 
-    let explicit_env = std::env::var_os("MARMOT_AGENT_AUTH_TOKEN_FILE").map(PathBuf::from);
-    let explicit_path = auth_token_file.or(explicit_env);
-    let token_path = explicit_path
-        .clone()
-        .unwrap_or_else(|| home.join("control.token"));
+    let (token_path, explicit) = bootstrap_auth_token_file(auth_token_file, home);
     if !token_path.exists() {
-        if explicit_path.is_some() {
+        if explicit {
             return Err(BootstrapError::AuthTokenFileNotFound(token_path));
         }
         return Ok(None);
@@ -602,6 +598,22 @@ pub fn read_bootstrap_auth_token(
         ));
     }
     Ok(Some(token))
+}
+
+/// The token file read when no inline token is set: the flag, then
+/// `MARMOT_AGENT_AUTH_TOKEN_FILE`, then `<home>/control.token`. The returned
+/// bool says whether a flag or the environment named the file, which makes a
+/// missing file an error.
+pub(crate) fn bootstrap_auth_token_file(
+    auth_token_file: Option<PathBuf>,
+    home: &Path,
+) -> (PathBuf, bool) {
+    match auth_token_file
+        .or_else(|| std::env::var_os("MARMOT_AGENT_AUTH_TOKEN_FILE").map(PathBuf::from))
+    {
+        Some(path) => (path, true),
+        None => (home.join("control.token"), false),
+    }
 }
 
 /// Where the relays a `wn-agent` command uses came from.

@@ -6,6 +6,7 @@ mod allowlist;
 mod bootstrap;
 mod connection;
 mod diagnostics;
+mod doctor;
 mod error;
 mod event_projection;
 mod group_profile_tool;
@@ -34,6 +35,9 @@ pub use bootstrap::{
     DEFAULT_QUIC_CANDIDATE, DEFAULT_RELAYS, RelaySource, ResolvedRelays, default_bootstrap_home,
     read_bootstrap_auth_token, resolve_bootstrap_home, resolve_bootstrap_quic_candidates,
     resolve_bootstrap_socket, resolve_relays, run_bootstrap,
+};
+pub use doctor::{
+    DoctorCheck, DoctorCounts, DoctorOptions, DoctorReport, DoctorScope, DoctorStatus, run_doctor,
 };
 pub use error::ConnectorError;
 pub use group_profile_tool::{GroupProfileToolConfig, run_group_profile_tool};
