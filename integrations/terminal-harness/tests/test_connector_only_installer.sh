@@ -284,7 +284,7 @@ assert_contains "$case_output" "No agent identity was created or imported."
 assert_contains "$case_output" "Rerun this installer with"
 assert_contains "$case_output" "wn-agent is running as a same-user service."
 assert_contains "$case_output" "export MARMOT_AGENT_SOCKET="
-assert_contains "$case_output" "integrations/custom-client.md"
+assert_line "$case_output" "Guide: $repo_root/integrations/custom-client.md"
 assert_excludes "$case_output" "account_id_hex:"
 assert_excludes "$case_output" "Terminal harness agent:"
 
@@ -463,6 +463,11 @@ stdin_output="$(
 case "$stdin_output" in
     *"install-wn-agent: platform="*"home: $HOME/.marmot-agents/standalone"*"Dry run complete."*) ;;
     *) printf '%s\n' "$stdin_output" >&2; fail "stdin dry run did not use connector-only defaults" ;;
+esac
+# Without a checkout beside it, the installer links the guide at its release tag.
+case "$stdin_output" in
+    *"Guide: https://github.com/marmot-protocol/mdk/blob/$release_tag/integrations/custom-client.md"*) ;;
+    *) printf '%s\n' "$stdin_output" >&2; fail "stdin dry run did not link the guide at its release tag" ;;
 esac
 unresolved_status=0
 env -u MARMOT_RELEASE_TAG -u MARMOT_RELEASE_TAG_DEFAULT \

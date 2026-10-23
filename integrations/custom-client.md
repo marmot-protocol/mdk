@@ -116,6 +116,9 @@ Each request is one JSON object on one line, at most 1 MiB, with these envelope 
 - `type`: the request type, with its fields beside it;
 - `auth_token`: only when the daemon runs with `--auth-token-file`.
 
+Optional request fields may be omitted or sent as `null`. The examples below send `null` explicitly, as the bundled
+connectors do.
+
 Open a new connection for each request. `wn-agent` writes one reply line and closes the connection.
 `subscribe_inbound` is the exception: it keeps the connection open and streams events. A failed request answers with
 `{"type": "error", "code": "...", "message": "...", "retryable": false}`. A request that does not parse, such as one
@@ -234,7 +237,7 @@ with an `idempotency_key`, so that retrying after a timeout returns the original
 
 ```sh
 python3 wn_agent_request.py <<EOF
-{"type": "send_final", "account_id_hex": "$MARMOT_ACCOUNT_ID_HEX", "group_id_hex": "$MARMOT_GROUP_ID_HEX", "text": "Build 42 finished", "idempotency_key": "build-42-finished"}
+{"type": "send_final", "account_id_hex": "$MARMOT_ACCOUNT_ID_HEX", "group_id_hex": "$MARMOT_GROUP_ID_HEX", "text": "Build 42 finished", "reply_to_message_id_hex": null, "idempotency_key": "build-42-finished"}
 EOF
 ```
 
@@ -242,7 +245,7 @@ EOF
 {"marmot_agent_control": "marmot.agent-control.v2", "id": "send-1", "type": "final_sent", "message_ids_hex": ["<message id hex>"], "maintenance_disposition": "ready"}
 ```
 
-- Add `reply_to_message_id_hex` to reply to a specific message.
+- Set `reply_to_message_id_hex` to a message id to reply to that message.
 - A key names one message. Reusing a key with different text sends a new message.
 - `final_sent` means `wn-agent` published the encrypted message. It does not prove a member received it; the
   [round trip](#check-a-full-round-trip) does.
@@ -252,11 +255,12 @@ EOF
 
 ## Receive messages
 
-Open one long-lived connection and send `subscribe_inbound`. `account_id_hex` and `group_id_hex` are optional filters:
+Open one long-lived connection and send `subscribe_inbound`. `account_id_hex` and `group_id_hex` are optional filters;
+`null` means no filter:
 
 ```sh
 python3 wn_agent_request.py <<EOF
-{"type": "subscribe_inbound", "account_id_hex": "$MARMOT_ACCOUNT_ID_HEX"}
+{"type": "subscribe_inbound", "account_id_hex": "$MARMOT_ACCOUNT_ID_HEX", "group_id_hex": null}
 EOF
 ```
 

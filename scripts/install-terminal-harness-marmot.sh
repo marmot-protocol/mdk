@@ -1387,9 +1387,14 @@ EOF
             printf '  export MARMOT_ACCOUNT_ID_HEX=%s\n' "$BOOTSTRAP_ACCOUNT_ID_HEX"
         fi
     fi
+    # A checkout run can predate the release tag's copy of the guide; point at the local file then.
+    local guide="https://github.com/$MARMOT_RELEASE_REPO/blob/$MARMOT_RELEASE_TAG/integrations/custom-client.md"
+    if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../integrations/custom-client.md" ]; then
+        guide="$(cd "$SCRIPT_DIR/.." && pwd)/integrations/custom-client.md"
+    fi
     cat <<EOF
 
-Guide: https://github.com/$MARMOT_RELEASE_REPO/blob/$MARMOT_RELEASE_TAG/integrations/custom-client.md
+Guide: $guide
 Build: ${MARMOT_RELEASE_REPO}@${MARMOT_RELEASE_TAG} (${WN_AGENT_VERSION})
 EOF
 }
