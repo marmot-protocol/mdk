@@ -23,6 +23,35 @@ pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Read an owner-only record that builds before mdk#2569 wrote at the process
+/// umask, tightening it to 0600 first. A record that cannot be tightened
+/// fails the read.
+pub(crate) fn read_private_json<T: for<'de> Deserialize<'de>>(
+    path: impl AsRef<Path>,
+) -> AccountHomeResult<T> {
+    let path = path.as_ref();
+    if !is_owner_only_file(path) {
+        fs_private::tighten_existing_private_file(path)?;
+    }
+    read_json(path)
+}
+
+/// Lets reads of an already-private record skip the chmod and its inode
+/// metadata write. A symlink or a failed probe goes to the no-follow
+/// tightening, which reports it.
+#[cfg(unix)]
+fn is_owner_only_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o077 == 0)
+}
+
+#[cfg(not(unix))]
+fn is_owner_only_file(_path: &Path) -> bool {
+    true
+}
+
 pub(crate) fn read_secret_json<T: for<'de> Deserialize<'de>>(
     path: impl AsRef<Path>,
 ) -> AccountHomeResult<T> {
@@ -66,11 +95,6 @@ fn still_linked(_file: &File) -> io::Result<bool> {
     Ok(true)
 }
 
-pub(crate) fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> AccountHomeResult<()> {
-    let bytes = serde_json::to_vec_pretty(value)?;
-    write_file_atomically(path.as_ref(), &bytes, FileMode::Public)
-}
-
 pub(crate) fn write_private_json<T: Serialize>(
     path: impl AsRef<Path>,
     value: &T,
@@ -92,11 +116,11 @@ pub(crate) fn write_secret_json<T: Serialize>(
     write_file_atomically(path.as_ref(), bytes.as_slice(), FileMode::Secret)
 }
 
-/// Every mode publishes by renaming a synced temp file over the target, so on
-/// Unix a reader sees the complete previous file or the complete new one.
+/// Every mode publishes by renaming a synced owner-only temp file over the
+/// target, so on Unix a reader sees the complete previous file or the complete
+/// new one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileMode {
-    Public,
     /// Owner-only. The replaced inode is left intact for readers that still
     /// hold it open.
     Private,
@@ -112,12 +136,12 @@ fn write_file_atomically(path: &Path, bytes: &[u8], mode: FileMode) -> AccountHo
     let parent = parent.unwrap_or_else(|| Path::new("."));
     fs_private::create_dir_all_private(parent)?;
 
-    let (mut file, temp_path) = create_temp_file(parent, path, mode)?;
+    let (mut file, temp_path) = create_temp_file(parent, path)?;
     let result = (|| -> AccountHomeResult<()> {
         file.write_all(bytes)?;
 
         #[cfg(unix)]
-        if mode != FileMode::Public {
+        {
             use std::os::unix::fs::PermissionsExt;
 
             let mut permissions = file.metadata()?.permissions();
@@ -229,11 +253,7 @@ fn overwrite_open_file_with_zeros(file: &mut File) -> io::Result<()> {
     Ok(())
 }
 
-fn create_temp_file(
-    parent: &Path,
-    path: &Path,
-    mode: FileMode,
-) -> AccountHomeResult<(File, PathBuf)> {
+fn create_temp_file(parent: &Path, path: &Path) -> AccountHomeResult<(File, PathBuf)> {
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -252,7 +272,7 @@ fn create_temp_file(
         options.write(true).create_new(true);
 
         #[cfg(unix)]
-        if mode != FileMode::Public {
+        {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }

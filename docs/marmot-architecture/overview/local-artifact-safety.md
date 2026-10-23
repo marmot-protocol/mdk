@@ -1,7 +1,7 @@
 ---
 title: "Local Artifact Safety"
 created: 2026-07-02
-updated: 2026-10-17
+updated: 2026-10-23
 tags: [marmot, overview, security, filesystem, permissions]
 status: overview
 ---
@@ -57,7 +57,9 @@ compliant-equivalent implementation that predates the shared crate. Both modes r
 the target, so a reader sees the whole previous file or the whole new one. Only `FileMode::Secret` (signing keys)
 zeroes the replaced inode. It does so after the rename unlinks it, and `read_secret_json` re-reads when it finds its
 inode unlinked. Private account state such as the setup journal is never zeroed, because readiness polls read it
-while background setup rewrites it.
+while background setup rewrites it. Builds before mdk#2569 wrote `account.json` and `key-security.json` at the
+process umask, so `AccountHome` tightens each one it reads to 0600 with `tighten_existing_private_file` and fails the
+read when it cannot.
 
 ## Initializing encrypted account databases
 
