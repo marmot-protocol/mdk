@@ -2358,6 +2358,8 @@ fn deleted_reaction_ids_for_target_tx(
     // even on hot messages with very many reactions (same pattern as
     // `delete_timeline_projection_rows_by_ids_tx`).
     let mut delete_pairs = Vec::<(String, String)>::new();
+    // A literal kind keeps one cached plan; see `app_events_targeting_message_tx`.
+    let delete_kind = u64_to_i64(MARMOT_APP_EVENT_KIND_DELETE)?;
     for chunk in reactions.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
         let placeholders = std::iter::repeat_n("?", chunk.len())
             .collect::<Vec<_>>()
@@ -2369,15 +2371,12 @@ fn deleted_reaction_ids_for_target_tx(
                ON app_events.group_id_hex = edges.group_id_hex
               AND app_events.message_id_hex = edges.modifier_message_id_hex
              WHERE edges.group_id_hex = ?
-               AND edges.kind = ?
+               AND edges.kind = {delete_kind}
                AND app_events.invalidated = 0
                AND edges.target_message_id_hex IN ({placeholders})"
         );
-        let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 2);
+        let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 1);
         values.push(rusqlite::types::Value::Text(group_id_hex.to_owned()));
-        values.push(rusqlite::types::Value::Integer(u64_to_i64(
-            MARMOT_APP_EVENT_KIND_DELETE,
-        )?));
         values.extend(
             chunk
                 .iter()
@@ -2422,8 +2421,12 @@ fn app_events_targeting_message_tx(
     // re-filter, without either. Ordering is preserved byte-for-byte.
     // Keep the target index outermost; scanning history to avoid a small
     // modifier sort makes even a message with no modifiers cost O(history).
+    // `kind` is a literal, not a parameter: the partial index
+    // `content_report_labels` (`WHERE kind=1985`) makes SQLite recompile a
+    // statement on every rebind of a parameter compared with its predicate.
+    // Callers pass constant kinds, so each kind keeps one cached plan.
     let mut stmt = tx
-        .prepare_cached(
+        .prepare_cached(&format!(
             "SELECT app_events.group_id_hex, app_events.message_id_hex, app_events.source_message_id_hex,
                     app_events.source_epoch, app_events.direction, app_events.sender,
                     app_events.plaintext, app_events.kind, app_events.tags_json,
@@ -2435,14 +2438,15 @@ fn app_events_targeting_message_tx(
                ON app_events.group_id_hex = edges.group_id_hex
               AND app_events.message_id_hex = edges.modifier_message_id_hex
              WHERE edges.group_id_hex = ?1
-               AND edges.kind = ?2
-               AND edges.target_message_id_hex = ?3
+               AND edges.kind = {}
+               AND edges.target_message_id_hex = ?2
                AND app_events.invalidated = 0
              ORDER BY app_events.recorded_at, app_events.message_id_hex, app_events.insert_order",
-        )
+            u64_to_i64(kind)?
+        ))
         .storage()?;
     stmt.query_map(
-        params![group_id_hex, u64_to_i64(kind)?, target_message_id_hex],
+        params![group_id_hex, target_message_id_hex],
         raw_event_from_row,
     )
     .storage()?
@@ -4186,6 +4190,9 @@ fn effective_poll_votes(
             .push(poll_id.clone());
     }
     let mut responses = Vec::new();
+    // Literal kinds keep one cached plan; see `app_events_targeting_message_tx`.
+    let response_kind = u64_to_i64(MARMOT_APP_EVENT_KIND_POLL_RESPONSE)?;
+    let delete_kind = u64_to_i64(MARMOT_APP_EVENT_KIND_DELETE)?;
     for (group, poll_ids) in by_group {
         for chunk in poll_ids.chunks(SQLITE_BIND_PARAMETER_CHUNK) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
@@ -4204,7 +4211,7 @@ fn effective_poll_votes(
                       ON app_events.group_id_hex = edges.group_id_hex
                      AND app_events.message_id_hex = edges.modifier_message_id_hex
                     WHERE edges.group_id_hex = ?
-                      AND edges.kind = ?
+                      AND edges.kind = {response_kind}
                       AND app_events.invalidated = 0
                       AND NOT EXISTS (
                           SELECT 1
@@ -4213,7 +4220,7 @@ fn effective_poll_votes(
                             ON delete_events.group_id_hex = delete_edges.group_id_hex
                            AND delete_events.message_id_hex = delete_edges.modifier_message_id_hex
                           WHERE delete_edges.group_id_hex = app_events.group_id_hex
-                            AND delete_edges.kind = ?
+                            AND delete_edges.kind = {delete_kind}
                             AND delete_edges.target_message_id_hex = app_events.message_id_hex
                             AND delete_events.invalidated = 0
                             AND (
@@ -4225,14 +4232,8 @@ fn effective_poll_votes(
                  )
                  WHERE voter_rank <= ?"
             );
-            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 4);
+            let mut values = Vec::<rusqlite::types::Value>::with_capacity(chunk.len() + 2);
             values.push(rusqlite::types::Value::Text(group.clone()));
-            values.push(rusqlite::types::Value::Integer(u64_to_i64(
-                MARMOT_APP_EVENT_KIND_POLL_RESPONSE,
-            )?));
-            values.push(rusqlite::types::Value::Integer(u64_to_i64(
-                MARMOT_APP_EVENT_KIND_DELETE,
-            )?));
             values.extend(chunk.iter().cloned().map(rusqlite::types::Value::Text));
             values.push(rusqlite::types::Value::Integer(
                 MAX_POLL_RESPONSES_PER_AUTHOR as i64,
