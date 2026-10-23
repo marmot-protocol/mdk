@@ -11,7 +11,8 @@ agnostic; the optional `sdk` feature adds a `nostr-sdk` backed `NostrSdkRelayCli
   to `GROUP_BATCH_ROUTES` (50) per REQ, so a 1,000-group account holds about 21 REQs per relay.
 - Keeps activation and group sync going when a relay is unreachable. The `sdk` client holds that relay's REQ and
   sends it when the relay reconnects; a subscription fails only when no relay took it or owes it. The adapter
-  metrics count full, degraded and failed activations and syncs.
+  metrics count full, degraded and failed activations and syncs, and opt-in telemetry exports them device-wide as
+  `relay_account_activations_*` and `relay_group_syncs_*`.
 - Converts relay-delivered `NostrTransportEvent` values into account-scoped `TransportDelivery` values.
 - Routes kind `445` group messages by endpoint + transport group id.
 - Routes signed kind `1059` giftwraps through the account-inbox plane.

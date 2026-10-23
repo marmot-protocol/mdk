@@ -127,6 +127,14 @@
 
 ### Added
 
+- Opt-in relay telemetry exports `relay_account_activations_full`,
+  `relay_account_activations_degraded` and `relay_account_activations_failed`,
+  and `relay_group_syncs_full`, `relay_group_syncs_degraded` and
+  `relay_group_syncs_failed`: device-wide, unlabeled counts of account
+  activations and group syncs whose REQs reached every relay, succeeded while
+  some relay owed or refused one, or failed (mdk#1951).
+  `RelayTelemetryRollup` gains the matching fields; struct literals need them
+  or `..Default::default()`.
 - Opt-in "Keep media" (mdk#2314 step 10):
   `MarmotAppRuntime::attachment_keep_media` and `set_attachment_keep_media`
   (`AttachmentKeepMedia`: Forever by default, one year, six months, 30 days).

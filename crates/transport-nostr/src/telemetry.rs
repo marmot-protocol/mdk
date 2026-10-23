@@ -73,6 +73,27 @@ pub struct RelayTelemetryRollup {
     /// covered the history they were missing.
     #[serde(default)]
     pub reconciliation_order_unproven_passes: u64,
+    /// Device-wide account activations whose every REQ reached every relay.
+    #[serde(default)]
+    pub activations_full: u64,
+    /// Device-wide account activations that succeeded while some relay owed
+    /// or refused a REQ.
+    #[serde(default)]
+    pub activations_degraded: u64,
+    /// Device-wide account activations that failed and rolled back.
+    #[serde(default)]
+    pub activations_failed: u64,
+    /// Device-wide group syncs that issued REQs, each of which reached every
+    /// relay.
+    #[serde(default)]
+    pub group_syncs_full: u64,
+    /// Device-wide group syncs that issued REQs and succeeded while some relay
+    /// owed or refused one.
+    #[serde(default)]
+    pub group_syncs_degraded: u64,
+    /// Device-wide group syncs whose REQs failed.
+    #[serde(default)]
+    pub group_syncs_failed: u64,
     /// Optional engine-side reorg metrics, folded in once the parallel
     /// `observed_reorg_rate` workstream lands. `None` until then.
     pub engine: Option<EngineReorgMetrics>,
@@ -200,6 +221,12 @@ pub fn rollup_from_snapshots(
         publish_cancellations: metrics.publish_cancellations as u64,
         reconciliation_attempts: metrics.reconciliation_attempts as u64,
         reconciliation_order_unproven_passes: metrics.reconciliation_order_unproven_passes as u64,
+        activations_full: metrics.activations_full as u64,
+        activations_degraded: metrics.activations_degraded as u64,
+        activations_failed: metrics.activations_failed as u64,
+        group_syncs_full: metrics.group_syncs_full as u64,
+        group_syncs_degraded: metrics.group_syncs_degraded as u64,
+        group_syncs_failed: metrics.group_syncs_failed as u64,
         engine,
     }
 }
