@@ -482,7 +482,7 @@ jobs:
 
       - name: Upload workspace compiler timings
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: workspace-compiler-timings
           path: target/cargo-timings/*.html
@@ -494,7 +494,7 @@ jobs:
 
       - name: Upload test archive
         if: needs.changes.outputs.ci_mode == 'full'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: rust-test
           path: tests.tar.zst
@@ -540,7 +540,7 @@ jobs:
           tool: cargo-nextest@0.9.132
 
       - name: Download test archive
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: rust-test
 
@@ -629,7 +629,7 @@ jobs:
 
       - name: Upload test archive
         if: needs.changes.outputs.ci_mode == 'full'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: cli-e2e
           path: tests.tar.zst
@@ -670,7 +670,7 @@ jobs:
           tool: cargo-nextest@0.9.132
 
       - name: Download test archive
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: cli-e2e
 
@@ -722,7 +722,7 @@ jobs:
 
       - name: Upload test archive
         if: needs.changes.outputs.ci_mode == 'full'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: relay-runtime
           path: tests.tar.zst
@@ -758,7 +758,7 @@ jobs:
           cargo --version
 
       - name: Download test archive
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: relay-runtime
 
@@ -805,7 +805,7 @@ jobs:
           tool: cargo-nextest@0.9.132
 
       - name: Download test archive
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: cli-e2e
 
@@ -876,7 +876,7 @@ jobs:
 
       - name: Upload simulator test archive
         if: needs.changes.outputs.ci_mode == 'full'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: simulator-tests
           path: simulator.tar.zst
@@ -930,7 +930,7 @@ jobs:
           tool: just
 
       - name: Download simulator test archive
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: simulator-tests
 
