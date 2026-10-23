@@ -8802,3 +8802,81 @@ async fn serve_socket_rejects_an_unusable_relay_url_before_binding() {
     assert_eq!(error.code(), "invalid_relay_url");
     assert!(!socket.exists());
 }
+
+#[tokio::test]
+async fn connector_restarts_keep_an_imported_read_only_relay_list() {
+    // A kind 10002 with only a read relay has no write route, so MDK counts it
+    // as missing. The first start caches it and stops; a restart must not then
+    // treat the cached read entry as a list and let the KeyPackage publish
+    // replace it with the daemon's relays.
+    let (_relay, relay_url) = mock_relay_url().await;
+    let (_read_relay, read_url) = mock_relay_url().await;
+    let (_inbox_relay, inbox_url) = mock_relay_url().await;
+    let relay_endpoint = crate::validation::endpoint(&relay_url);
+    let source = tempfile::tempdir().unwrap();
+    let source_account = AccountHome::open(source.path())
+        .import_account_idempotent("source", IMPORTED_IDENTITY_SECRET_HEX)
+        .unwrap();
+    let source_app = MarmotApp::with_relay(source.path(), relay_url.clone());
+    source_app
+        .publish_account_nip65_relay_set(
+            &source_account.label,
+            vec![crate::validation::endpoint(&read_url)],
+            Vec::new(),
+            vec![relay_endpoint.clone()],
+        )
+        .await
+        .unwrap();
+    source_app
+        .publish_account_relay_list_kind(
+            &source_account.label,
+            "inbox",
+            vec![crate::validation::endpoint(&inbox_url)],
+            vec![relay_endpoint.clone()],
+        )
+        .await
+        .unwrap();
+    let published = source_app
+        .account_relay_list_status(&source_account.label)
+        .unwrap();
+    assert_eq!(published.nip65.read_relays, vec![read_url.clone()]);
+    assert!(published.nip65.write_relays.is_empty());
+    sleep(Duration::from_millis(1_100)).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    crate::identity::import_existing_identity_secret(
+        dir.path(),
+        "agent",
+        IMPORTED_IDENTITY_SECRET_HEX,
+        None,
+    )
+    .unwrap();
+    for start in ["first", "restart"] {
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            dir.path().join("dev").join("wn-agent.sock"),
+            vec![relay_url.clone()],
+            false,
+            false,
+        ))
+        .unwrap();
+        let error = connector.start().await.unwrap_err();
+        assert_eq!(error.code(), "missing_relay_lists", "{start} start");
+        connector.runtime.shutdown_and_close().await.unwrap();
+    }
+
+    let on_relay = source_app
+        .directory()
+        .fetch_current_account_relay_list_status_for_account_id(
+            &source_account.account_id_hex,
+            vec![relay_endpoint],
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("published relay lists");
+    assert_eq!(on_relay.nip65.created_at, published.nip65.created_at);
+    assert_eq!(on_relay.nip65.read_relays, vec![read_url]);
+    assert!(on_relay.nip65.write_relays.is_empty());
+    assert_eq!(on_relay.inbox.created_at, published.inbox.created_at);
+}

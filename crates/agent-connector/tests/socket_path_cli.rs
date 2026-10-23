@@ -29,6 +29,8 @@ fn socket_path_too_long_cli_reports_actionable_error_without_private_path() {
         .arg(root.path())
         .arg("--socket")
         .arg(&socket)
+        .env_remove("MARMOT_RELAYS")
+        .env_remove("MARMOT_RELAY")
         .output()
         .unwrap();
     assert!(!output.status.success());

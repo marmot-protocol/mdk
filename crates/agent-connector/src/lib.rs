@@ -52,7 +52,8 @@ use std::time::Duration;
 use agent_control::AgentControlEvent;
 use marmot_account::{AccountHome, AccountSummary};
 use marmot_app::{
-    AccountRelayListBootstrap, DirectoryError, MarmotApp, MarmotAppConfig, MarmotAppRuntime,
+    AccountRelayListBootstrap, AppError, DirectoryError, MarmotApp, MarmotAppConfig,
+    MarmotAppRuntime,
 };
 use tokio::net::UnixListener;
 use tokio::sync::{Semaphore, broadcast};
@@ -365,26 +366,25 @@ impl AgentConnector {
     /// Give a local agent account both relay lists before its KeyPackage is read.
     ///
     /// Both lists are replaceable, so a publish replaces whatever the identity
-    /// already published. An identity imported offline has no cached copy, so an
-    /// empty cache is not absence: read the published lists first and adopt what
-    /// the read finds (it caches them). Publish the configured relays only for a
-    /// list that a complete read of those relays, and of the outboxes they
-    /// advertise, proves absent. A read that cannot prove absence publishes
-    /// nothing and fails startup; the next start reads again.
+    /// already published. The KeyPackage publish that follows replaces every list
+    /// the cache does not hold complete (a kind 10002 with no write relay counts
+    /// as missing), so this returns only once the cached lists are complete. An
+    /// identity imported offline has no cached copy, and an empty cache is not
+    /// absence: read the published lists first and adopt what the read finds (it
+    /// caches them). Publish the configured relays only for a list that a
+    /// complete read of those relays, and of the outboxes they advertise, proves
+    /// absent. Anything else publishes nothing and fails startup, again on every
+    /// later start, until the lists are complete.
     async fn ensure_agent_account_relay_lists(
         &self,
         account: &AccountSummary,
     ) -> Result<(), ConnectorError> {
-        let missing_nip65 = self
-            .runtime
-            .account_nip65_relays(&account.label)?
-            .is_empty();
-        let missing_inbox = self
-            .runtime
-            .account_inbox_relays(&account.label)?
-            .is_empty();
-        if self.relays.is_empty() || (!missing_nip65 && !missing_inbox) {
+        let cached = self.app.account_relay_list_status(&account.label)?;
+        if cached.complete {
             return Ok(());
+        }
+        if self.relays.is_empty() {
+            return Err(AppError::MissingRelayLists(cached.missing).into());
         }
 
         let relays = self.configured_relay_endpoints();
@@ -403,13 +403,17 @@ impl AgentConnector {
             }
             Err(error) => return Err(error.into()),
         };
-        self.app
+        let status = self
+            .app
             .publish_missing_account_relay_lists_from_status(
                 &account.label,
                 AccountRelayListBootstrap::new(relays.clone(), relays),
                 published,
             )
             .await?;
+        if !status.complete {
+            return Err(AppError::MissingRelayLists(status.missing).into());
+        }
         Ok(())
     }
 

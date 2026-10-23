@@ -191,7 +191,7 @@ A failed start prints one line, `wn-agent: startup failed code=<code> detail=<me
 
 | Code and detail | Cause | Fix |
 | --- | --- | --- |
-| `missing_relay_lists` | The account has no relay lists, or has published empty ones, and the daemon has no relays to publish lists with (`--no-default-relays` with no `--relay` or `MARMOT_RELAYS`). | Pass `--relay` or set `MARMOT_RELAYS`, or publish non-empty lists from another client. |
+| `missing_relay_lists` | The account has no usable relay lists and the daemon cannot publish them: it has no relays (`--no-default-relays` with no `--relay` or `MARMOT_RELAYS`), or the account published an empty list or a kind 10002 with no write relay, which the daemon will not replace. | Pass `--relay` or set `MARMOT_RELAYS`, or publish complete lists from another client. |
 | `relay_list_inconclusive` | An account with no cached relay lists started, and a relay did not answer the read, so the daemon could not tell whether the lists exist. Nothing was published. | Start again when the relays are reachable, or remove the relay that does not answer. |
 | `invalid_relay_url reason=<reason>` | A `--relay` or `MARMOT_RELAYS` value is not usable, for example `reason=unsupported_scheme` for a `ws://` URL. | Fix the value. Loopback `ws://` relays need `--allow-loopback-relays` (development only). |
 | `io_error detail=the control socket directory must not be world-accessible…` `io_kind=PermissionDenied` | `--socket` puts the socket in a directory other users can enter, such as a `0755` home. The daemon creates and restricts only `<home>/dev`, and keeps the mode of any other directory. | Omit `--socket` to use `<home>/dev/wn-agent.sock`, or `chmod 0700` the socket's directory. |

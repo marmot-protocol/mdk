@@ -143,7 +143,7 @@ impl ConnectorError {
             }
             Self::App(AppError::MissingRelayLists(_) | AppError::MissingDefaultRelays) => {
                 "account relay lists are missing or empty; give wn-agent relays to publish them \
-                 (--relay or MARMOT_RELAYS), or publish non-empty lists from another client"
+                 (--relay or MARMOT_RELAYS), or publish complete lists from another client"
             }
             Self::App(error)
                 if matches!(
