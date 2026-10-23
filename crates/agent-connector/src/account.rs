@@ -102,11 +102,6 @@ impl AgentConnector {
         let account_id_hex = crate::validation::normalize_hex(account_id_hex)?;
         let account = self.local_account_for_account_id(&account_id_hex)?;
         crate::validation::validate_group_create(&name, &members, description.as_deref())?;
-        if admins.len() > members.len() {
-            return Err(ConnectorError::InvalidGroupCreate(
-                "admins must be invited members",
-            ));
-        }
         let resolve = |reference: &str| {
             self.account_home
                 .account(reference)
@@ -123,7 +118,8 @@ impl AgentConnector {
             let admins = admins
                 .iter()
                 .map(|admin| resolve(admin))
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ConnectorError::InvalidGroupCreate("invalid admin reference"))?;
             if admins.iter().any(|admin| !member_ids.contains(admin)) {
                 return Err(ConnectorError::InvalidGroupCreate(
                     "admins must be invited members",
@@ -157,7 +153,7 @@ impl AgentConnector {
             Err(_) => {
                 tracing::warn!(
                     target: "agent_connector",
-                    method = "create_group_response",
+                    method = "create_group",
                     error_code = "agent_created_groups_write_failed",
                     "group created but activation provenance could not be persisted"
                 );

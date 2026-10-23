@@ -4,6 +4,10 @@
 
 ### Breaking changes
 
+- `AppCreateGroupOptions` adds `initial_admins` for founding co-admin selection.
+  Add the field to exhaustive struct literals, or use `..Default::default()`
+  to retain creator-only admin defaults.
+
 - `AttachmentTransferState` adds `CleanedBySetting` (mdk#2314 step 10).
   Update exhaustive matches.
 

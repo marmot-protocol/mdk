@@ -9119,11 +9119,14 @@ async fn runtime_group_create_resolves_local_member_aliases_with_fresh_relay_pac
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_group_create_sets_founding_admins_and_rejects_non_members() {
-    let (_directory, app, accounts, _fetcher) = member_resolution_fixture(1, false).await;
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
     let member = &accounts[0];
     let creator = app.account_home().create_account("creator").unwrap();
     let outsider = app.account_home().create_account("outsider").unwrap();
     let runtime = MarmotAppRuntime::new(app.clone());
+    let requests_before = fetcher.requests.lock().unwrap().len();
     let result = runtime
         .create_group_with_options(
             "creator",
@@ -9131,11 +9134,23 @@ async fn runtime_group_create_sets_founding_admins_and_rejects_non_members() {
             std::slice::from_ref(&member.account_id_hex),
             AppCreateGroupOptions {
                 initial_admins: vec![outsider.account_id_hex],
+                initial_image: Some(AppInitialGroupImage {
+                    plaintext: vec![1, 2, 3],
+                    media_type: "image/png".into(),
+                    source_url: None,
+                    dim: None,
+                    thumbhash: None,
+                }),
                 ..Default::default()
             },
         )
         .await;
-    assert!(result.is_err());
+    assert!(matches!(result, Err(AppError::InvalidGroupProfile(_))));
+    assert_eq!(
+        fetcher.requests.lock().unwrap().len(),
+        requests_before,
+        "Invalid admins must fail before member lookup, image upload, or MLS creation"
+    );
     assert!(app.groups("creator").unwrap().is_empty());
     for reference in [
         member.label.clone(),
@@ -9168,6 +9183,37 @@ async fn runtime_group_create_sets_founding_admins_and_rejects_non_members() {
                 creator.account_id_hex.clone(),
                 member.account_id_hex.clone()
             ])
+        );
+    }
+    let rows = app
+        .audit_log_files()
+        .unwrap()
+        .into_iter()
+        .flat_map(|file| {
+            std::fs::read_to_string(file.path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .filter(|row| row["event"]["type"] == "create_group_entry")
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        let context = &row["event"]["record_context"]["human_action"];
+        assert!(
+            context["fields"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("admins"))
+        );
+        assert!(
+            context["component_ids"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(
+                    cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID
+                ))
         );
     }
     runtime.shutdown_and_close().await.unwrap();

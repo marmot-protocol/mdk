@@ -7289,12 +7289,16 @@ async fn connector_creates_admin_in_founding_state() {
         }
     ));
     assert!(connector.app.groups(&agent.label).unwrap().is_empty());
-    for (valid, admin) in [
-        (false, outsider.account_id_hex.clone()),
-        (false, "invalid".to_owned()),
+    for (valid, admins) in [
+        (false, vec![outsider.account_id_hex.clone()]),
+        (false, vec!["invalid".to_owned()]),
+        (false, vec![String::new()]),
         (
             true,
-            marmot_app::npub_for_account_id(&owner.account_id_hex).unwrap(),
+            vec![
+                marmot_app::npub_for_account_id(&owner.account_id_hex).unwrap(),
+                owner.account_id_hex.clone(),
+            ],
         ),
     ] {
         let response = serve_control_request_once(
@@ -7306,17 +7310,16 @@ async fn connector_creates_admin_in_founding_state() {
                 account_id_hex: agent.account_id_hex.clone(),
                 name: "Team".into(),
                 members: vec![owner.account_id_hex.clone()],
-                admins: vec![admin],
+                admins,
                 description: None,
                 relays: None,
             },
         )
         .await;
         if !valid {
-            assert!(matches!(
-                response.payload,
-                AgentControlResponse::Error { .. }
-            ));
+            assert!(
+                matches!(response.payload, AgentControlResponse::Error { code, .. } if code == "invalid_group_create")
+            );
             assert!(connector.app.groups(&agent.label).unwrap().is_empty());
             continue;
         }
