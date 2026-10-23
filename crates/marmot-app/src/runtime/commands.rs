@@ -517,7 +517,10 @@ impl AccountManager {
             .send(AccountWorkerCommand::CaptureSelection { request, respond })
             .await
             .map_err(|_| CaptureError::Closed)?;
-        match tokio::time::timeout(super::APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT, response).await {
+        // Complete filtered capture can scan qualifying message bodies after FIFO
+        // queueing; use the existing bounded command budget rather than the
+        // short local-read deadline. Expiry still closes the receiver.
+        match tokio::time::timeout(super::APP_RUNTIME_WORKER_RESPONSE_WAIT, response).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(CaptureError::Closed),
             Err(_) => Err(CaptureError::TimedOut),
@@ -2414,6 +2417,95 @@ impl AccountManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn selection_capture_waits_past_local_limit_and_remains_bounded() {
+        use super::super::{ManagedAccountWorker, MarmotAppRuntime};
+        use crate::chat_selection::{
+            capture::{CaptureError, CaptureRequest, HostOverlays},
+            presentation::HostContextIdentity,
+            scope::ScopeRequest,
+        };
+        for (delay, expected) in [(11, CaptureError::NotReady), (121, CaptureError::TimedOut)] {
+            let dir = tempfile::tempdir().unwrap();
+            let account = marmot_account::AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let runtime = MarmotAppRuntime::new(crate::MarmotApp::with_relay(
+                dir.path(),
+                "wss://relay.example",
+            ));
+            let manager = runtime.accounts();
+            let (commands, mut received) = mpsc::channel(1);
+            let (shutdown, stopped) = oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let Some(AccountWorkerCommand::CaptureSelection { mut respond, .. }) =
+                    received.recv().await
+                else {
+                    panic!("expected complete selection capture");
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {
+                        assert!(respond.send(Err(CaptureError::NotReady)).is_ok());
+                    }
+                    _ = respond.closed() => {
+                        assert_eq!(expected, CaptureError::TimedOut);
+                    }
+                }
+                let _ = stopped.await;
+            });
+            manager.workers.lock().await.insert(
+                account.account_id_hex.clone(),
+                ManagedAccountWorker {
+                    ready: true,
+                    media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                        super::super::MEDIA_COMMAND_QUEUE_LIMIT,
+                    )),
+                    handle,
+                    commands,
+                    shutdown,
+                },
+            );
+            let request = CaptureRequest {
+                scope: ScopeRequest {
+                    selected_folder: None,
+                    filter_folders: None,
+                    named_chats: None,
+                    direct: false,
+                    groups: false,
+                    search: None,
+                },
+                base: storage_sqlite::SelectionBaseScope::View(crate::ChatListView::Chats),
+                original_ids: None,
+                action_hints: false,
+                excluded_cost: (0, 0),
+                host: HostContextIdentity {
+                    account_id_hex: account.account_id_hex.clone(),
+                    runtime_generation: 1,
+                    selection_generation: 1,
+                    presentation_context_id: 1,
+                },
+                overlays: HostOverlays::default(),
+                revision: 1,
+                capture_now_ms: 1000,
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let started = tokio::time::Instant::now();
+            let result = manager
+                .capture_selection_context(&account.label, request)
+                .await;
+            assert!(matches!(result, Err(error) if error == expected));
+            assert_eq!(
+                started.elapsed(),
+                std::time::Duration::from_secs(if expected == CaptureError::TimedOut {
+                    120
+                } else {
+                    11
+                }),
+            );
+            runtime.shutdown().await;
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn accept_waits_past_local_limit() {

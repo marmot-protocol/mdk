@@ -59,6 +59,7 @@ c_enum! { #[derive(Default)] MarmotChatSelectionDepartureRefusal from ChatSelect
 #[repr(C)]
 pub enum MarmotChatSelectionText {
     Literal {
+        /// JSON string literal; decode once to preserve embedded NULs. Not raw C text.
         text: *mut c_char,
     },
     UnnamedGroup {
@@ -90,23 +91,44 @@ impl CFree for MarmotChatSelectionText {
 }
 c_mirror! { MarmotChatSelectionGroupSystem from GroupSystemEventFfi {
 copy provenance: MarmotGroupSystemEventProvenance,
-json_opt_str actor_display_name, json_opt_str subject_display_name, json_str system_type, json_str text,
-opt_str actor_account_id_hex, opt_str subject_account_id_hex, json_opt_str name, json_opt_str old_name,
+#[doc = "Nullable JSON string literal; NULL means absent. Decode JSON once; not raw C text."]
+json_opt_str actor_display_name,
+#[doc = "Nullable JSON string literal; NULL means absent. Decode JSON once; not raw C text."]
+json_opt_str subject_display_name,
+#[doc = "JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text."]
+json_str system_type,
+#[doc = "JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text."]
+json_str text,
+opt_str actor_account_id_hex, opt_str subject_account_id_hex,
+#[doc = "Nullable JSON string literal; NULL means absent. Decode JSON once; not raw C text."]
+json_opt_str name,
+#[doc = "Nullable JSON string literal; NULL means absent. Decode JSON once; not raw C text."]
+json_opt_str old_name,
 opt_copy has_old_retention_seconds/old_retention_seconds: u64,
 opt_copy has_new_retention_seconds/new_retention_seconds: u64,
 } }
 c_mirror! { MarmotChatSelectionSearchScope from ChatSelectionSearchScopeFfi {
-json_str raw_query, json_opt_str sql_needle, copy message_only: bool,
+#[doc = "JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text."]
+json_str raw_query,
+#[doc = "Nullable JSON string literal; NULL means absent. Decode JSON once; not raw C text."]
+json_opt_str sql_needle, copy message_only: bool,
 } }
 c_mirror! { MarmotChatSelectionSearchPreviewMessage from ChatSelectionSearchPreviewMessageFfi {
-str message_id_hex, json_opt_str resolved_media_preview_fallback, json_str plaintext, copy kind: u64,
+str message_id_hex,
+#[doc = "Nullable JSON string literal; NULL means absent. Decode JSON once; not raw C text."]
+json_opt_str resolved_media_preview_fallback,
+#[doc = "JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text."]
+json_str plaintext, copy kind: u64,
 copy deleted: bool, opt_copy has_attachment_kind/attachment_kind: MarmotChatListAttachmentKind,
 copy attachment_count: u32, opt_rec group_system: MarmotChatSelectionGroupSystem,
 } }
 c_mirror! { MarmotChatSelectionSearchMessage from ChatSelectionSearchMessageFfi {
-str message_id_hex, str sender, json_str plaintext, copy kind: u64, copy timeline_at: u64,
+str message_id_hex, str sender,
+#[doc = "JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text."]
+json_str plaintext, copy kind: u64, copy timeline_at: u64,
 copy deleted: bool, opt_copy has_retention_seconds/retention_seconds: u64,
 opt_copy has_retention_expires_at/retention_expires_at: u64, copy retention_expired: bool,
+#[doc = "Array of JSON string literals; decode each element once, not as raw C text."]
 json_str_vec media_types/media_types_len,
 } }
 c_mirror! { MarmotChatSelectionSearchPresentation from ChatSelectionSearchPresentationFfi {
@@ -115,15 +137,24 @@ opt_rec last_message: MarmotChatSelectionSearchPreviewMessage,
 vec messages/messages_len: MarmotChatSelectionSearchMessage, copy capture_now_ms: i64,
 } }
 c_mirror! { MarmotChatSelectionLeaf from ChatSelectionLeafFfi {
-copy slot: u32, copy kind: MarmotChatSelectionLeafKind, json_str needle,
+copy slot: u32, copy kind: MarmotChatSelectionLeafKind,
+#[doc = "JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text."]
+json_str needle,
 } }
 c_mirror! { MarmotChatSelectionOperand from ChatSelectionOperandFfi, free marmot_chat_selection_operand_free, list(MarmotChatSelectionOperandList, marmot_chat_selection_operand_list_free) {
-copy candidate_slot: u64, str group_id_hex, json_str row_group_name, json_str fallback_group_name,
+copy candidate_slot: u64, str group_id_hex,
+#[doc = "JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text."]
+json_str row_group_name,
+#[doc = "JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text."]
+json_str fallback_group_name,
+#[doc = "Nullable JSON string literal; NULL means absent. Decode JSON once; not raw C text."]
 json_opt_str projected_title, opt_rec selected_title: MarmotChatSelectionText,
 opt_str selected_peer_id_hex, opt_str roster_peer_id_hex, copy roster_peer_present: bool,
 copy roster_member_count: i32, copy pending_confirmation: bool, opt_str welcomer_id_hex,
 opt_copy has_conversation_kind/conversation_kind: MarmotChatConversationKind,
-copy active_account_is_sole_member: bool, json_opt_str description,
+copy active_account_is_sole_member: bool,
+#[doc = "Nullable JSON string literal; NULL means absent. Decode JSON once; not raw C text."]
+json_opt_str description,
 vec leaves/leaves_len: MarmotChatSelectionLeaf, opt_rec search: MarmotChatSelectionSearchPresentation,
 } }
 c_mirror! { MarmotChatSelectionStatus from ChatSelectionStatusFfi, free marmot_chat_selection_status_free {
@@ -293,6 +324,7 @@ pub struct MarmotChatSelectionPredicateInput {
     pub children_len: usize,
     pub field: u32,
     pub mode: u32,
+    /// Array of JSON string literals, not raw C text; active for string-valued conditions.
     pub values: *const *const c_char,
     pub values_len: usize,
 }
@@ -397,6 +429,7 @@ impl MarmotChatSelectionAutomaticRuleInput {
 pub struct MarmotChatSelectionLegacyRuleInput {
     pub members: *const *const c_char,
     pub members_len: usize,
+    /// Nullable JSON string literal; NULL means absent. Not raw C text.
     pub keyword: *const c_char,
     pub include_all: u8,
     pub unread_only: u8,
@@ -467,7 +500,9 @@ impl MarmotChatSelectionBaseScopeInput {
 /// Borrowed input; all pointers remain caller-owned for the duration of the call.
 #[repr(C)]
 pub struct MarmotChatSelectionSearchScopeInput {
+    /// JSON string literal; decode once to preserve embedded NULs. Not raw C text.
     pub raw_query: *const c_char,
+    /// Nullable JSON string literal; NULL means absent. Not raw C text.
     pub sql_needle: *const c_char,
     pub message_only: u8,
 }
@@ -554,13 +589,19 @@ impl MarmotChatSelectionHostContextInput {
 #[repr(C)]
 pub struct MarmotChatSelectionGroupSystemInput {
     pub provenance: u32,
+    /// Nullable JSON string literal; NULL means absent. Not raw C text.
     pub actor_display_name: *const c_char,
+    /// Nullable JSON string literal; NULL means absent. Not raw C text.
     pub subject_display_name: *const c_char,
+    /// JSON string literal; decode once to preserve embedded NULs. Not raw C text.
     pub system_type: *const c_char,
+    /// JSON string literal; decode once to preserve embedded NULs. Not raw C text.
     pub text: *const c_char,
     pub actor_account_id_hex: *const c_char,
     pub subject_account_id_hex: *const c_char,
+    /// Nullable JSON string literal; NULL means absent. Not raw C text.
     pub name: *const c_char,
+    /// Nullable JSON string literal; NULL means absent. Not raw C text.
     pub old_name: *const c_char,
     pub has_old_retention_seconds: u8,
     pub old_retention_seconds: u64,
@@ -600,7 +641,9 @@ impl MarmotChatSelectionGroupSystemInput {
 #[repr(C)]
 pub struct MarmotChatSelectionSearchPreviewMessageInput {
     pub message_id_hex: *const c_char,
+    /// Nullable JSON string literal; NULL means absent. Not raw C text.
     pub resolved_media_preview_fallback: *const c_char,
+    /// JSON string literal; decode once to preserve embedded NULs. Not raw C text.
     pub plaintext: *const c_char,
     pub kind: u64,
     pub deleted: u8,
@@ -661,6 +704,7 @@ pub struct MarmotChatSelectionPreviewEntryInput {
 #[repr(C)]
 pub struct MarmotChatSelectionFallbackEntryInput {
     pub message_id_hex: *const c_char,
+    /// JSON string literal; decode once to preserve embedded NULs. Not raw C text.
     pub text: *const c_char,
 }
 #[repr(C)]

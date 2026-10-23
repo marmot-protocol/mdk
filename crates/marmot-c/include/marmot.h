@@ -5987,6 +5987,9 @@ typedef struct MarmotChatSelectionPredicateInput {
   uintptr_t children_len;
   uint32_t field;
   uint32_t mode;
+  /**
+   * Array of JSON string literals, not raw C text; active for string-valued conditions.
+   */
   const char *const *values;
   uintptr_t values_len;
 } MarmotChatSelectionPredicateInput;
@@ -5997,6 +6000,9 @@ typedef struct MarmotChatSelectionPredicateInput {
 typedef struct MarmotChatSelectionLegacyRuleInput {
   const char *const *members;
   uintptr_t members_len;
+  /**
+   * Nullable JSON string literal; NULL means absent. Not raw C text.
+   */
   const char *keyword;
   uint8_t include_all;
   uint8_t unread_only;
@@ -6032,7 +6038,13 @@ typedef struct MarmotChatSelectionFolderInput {
  * Borrowed input; all pointers remain caller-owned for the duration of the call.
  */
 typedef struct MarmotChatSelectionSearchScopeInput {
+  /**
+   * JSON string literal; decode once to preserve embedded NULs. Not raw C text.
+   */
   const char *raw_query;
+  /**
+   * Nullable JSON string literal; NULL means absent. Not raw C text.
+   */
   const char *sql_needle;
   uint8_t message_only;
 } MarmotChatSelectionSearchScopeInput;
@@ -6083,13 +6095,31 @@ typedef struct MarmotChatSelectionMutedEntryInput {
  */
 typedef struct MarmotChatSelectionGroupSystemInput {
   uint32_t provenance;
+  /**
+   * Nullable JSON string literal; NULL means absent. Not raw C text.
+   */
   const char *actor_display_name;
+  /**
+   * Nullable JSON string literal; NULL means absent. Not raw C text.
+   */
   const char *subject_display_name;
+  /**
+   * JSON string literal; decode once to preserve embedded NULs. Not raw C text.
+   */
   const char *system_type;
+  /**
+   * JSON string literal; decode once to preserve embedded NULs. Not raw C text.
+   */
   const char *text;
   const char *actor_account_id_hex;
   const char *subject_account_id_hex;
+  /**
+   * Nullable JSON string literal; NULL means absent. Not raw C text.
+   */
   const char *name;
+  /**
+   * Nullable JSON string literal; NULL means absent. Not raw C text.
+   */
   const char *old_name;
   uint8_t has_old_retention_seconds;
   uint64_t old_retention_seconds;
@@ -6102,7 +6132,13 @@ typedef struct MarmotChatSelectionGroupSystemInput {
  */
 typedef struct MarmotChatSelectionSearchPreviewMessageInput {
   const char *message_id_hex;
+  /**
+   * Nullable JSON string literal; NULL means absent. Not raw C text.
+   */
   const char *resolved_media_preview_fallback;
+  /**
+   * JSON string literal; decode once to preserve embedded NULs. Not raw C text.
+   */
   const char *plaintext;
   uint64_t kind;
   uint8_t deleted;
@@ -6119,6 +6155,9 @@ typedef struct MarmotChatSelectionPreviewEntryInput {
 
 typedef struct MarmotChatSelectionFallbackEntryInput {
   const char *message_id_hex;
+  /**
+   * JSON string literal; decode once to preserve embedded NULs. Not raw C text.
+   */
   const char *text;
 } MarmotChatSelectionFallbackEntryInput;
 
@@ -6222,6 +6261,9 @@ typedef enum MarmotChatSelectionText_Tag {
 } MarmotChatSelectionText_Tag;
 
 typedef struct MarmotChatSelectionText_Literal_Body {
+  /**
+   * JSON string literal; decode once to preserve embedded NULs. Not raw C text.
+   */
   char *text;
 } MarmotChatSelectionText_Literal_Body;
 
@@ -6241,24 +6283,51 @@ typedef struct MarmotChatSelectionText {
 typedef struct MarmotChatSelectionLeaf {
   uint32_t slot;
   enum MarmotChatSelectionLeafKind kind;
+  /**
+   *JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text.
+   */
   char *needle;
 } MarmotChatSelectionLeaf;
 
 typedef struct MarmotChatSelectionSearchScope {
+  /**
+   *JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text.
+   */
   char *raw_query;
+  /**
+   *Nullable JSON string literal; NULL means absent. Decode JSON once; not raw C text.
+   */
   char *sql_needle;
   bool message_only;
 } MarmotChatSelectionSearchScope;
 
 typedef struct MarmotChatSelectionGroupSystem {
   enum MarmotGroupSystemEventProvenance provenance;
+  /**
+   *Nullable JSON string literal; NULL means absent. Decode JSON once; not raw C text.
+   */
   char *actor_display_name;
+  /**
+   *Nullable JSON string literal; NULL means absent. Decode JSON once; not raw C text.
+   */
   char *subject_display_name;
+  /**
+   *JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text.
+   */
   char *system_type;
+  /**
+   *JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text.
+   */
   char *text;
   char *actor_account_id_hex;
   char *subject_account_id_hex;
+  /**
+   *Nullable JSON string literal; NULL means absent. Decode JSON once; not raw C text.
+   */
   char *name;
+  /**
+   *Nullable JSON string literal; NULL means absent. Decode JSON once; not raw C text.
+   */
   char *old_name;
   bool has_old_retention_seconds;
   /**
@@ -6274,7 +6343,13 @@ typedef struct MarmotChatSelectionGroupSystem {
 
 typedef struct MarmotChatSelectionSearchPreviewMessage {
   char *message_id_hex;
+  /**
+   *Nullable JSON string literal; NULL means absent. Decode JSON once; not raw C text.
+   */
   char *resolved_media_preview_fallback;
+  /**
+   *JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text.
+   */
   char *plaintext;
   uint64_t kind;
   bool deleted;
@@ -6290,6 +6365,9 @@ typedef struct MarmotChatSelectionSearchPreviewMessage {
 typedef struct MarmotChatSelectionSearchMessage {
   char *message_id_hex;
   char *sender;
+  /**
+   *JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text.
+   */
   char *plaintext;
   uint64_t kind;
   uint64_t timeline_at;
@@ -6305,6 +6383,9 @@ typedef struct MarmotChatSelectionSearchMessage {
    */
   uint64_t retention_expires_at;
   bool retention_expired;
+  /**
+   *Array of JSON string literals; decode each element once, not as raw C text.
+   */
   char **media_types;
   uintptr_t media_types_len;
 } MarmotChatSelectionSearchMessage;
@@ -6321,8 +6402,17 @@ typedef struct MarmotChatSelectionSearchPresentation {
 typedef struct MarmotChatSelectionOperand {
   uint64_t candidate_slot;
   char *group_id_hex;
+  /**
+   *JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text.
+   */
   char *row_group_name;
+  /**
+   *JSON string literal. Decode JSON once to preserve embedded NULs; not raw C text.
+   */
   char *fallback_group_name;
+  /**
+   *Nullable JSON string literal; NULL means absent. Decode JSON once; not raw C text.
+   */
   char *projected_title;
   struct MarmotChatSelectionText *selected_title;
   char *selected_peer_id_hex;
@@ -6337,6 +6427,9 @@ typedef struct MarmotChatSelectionOperand {
    */
   enum MarmotChatConversationKind conversation_kind;
   bool active_account_is_sole_member;
+  /**
+   *Nullable JSON string literal; NULL means absent. Decode JSON once; not raw C text.
+   */
   char *description;
   struct MarmotChatSelectionLeaf *leaves;
   uintptr_t leaves_len;
