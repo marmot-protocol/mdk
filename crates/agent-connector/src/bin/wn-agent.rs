@@ -158,6 +158,7 @@ struct BootstrapArgs {
     #[arg(
         long,
         value_name = "URL",
+        value_delimiter = ',',
         help = "Public Nostr relay used for invite output; may be repeated"
     )]
     relay: Vec<String>,
@@ -763,11 +764,12 @@ fn read_auth_token(path: Option<&PathBuf>) -> Result<Option<String>, String> {
     let Some(path) = path else {
         return Ok(None);
     };
+    // Fixed text only: this lands on the startup line, which never names a path.
     let token = std::fs::read_to_string(path)
-        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+        .map_err(|err| format!("could not read the auth token file ({:?})", err.kind()))?;
     let token = token.trim().to_owned();
     if token.is_empty() {
-        return Err(format!("{} is empty", path.display()));
+        return Err("the auth token file is empty".to_owned());
     }
     Ok(Some(token))
 }

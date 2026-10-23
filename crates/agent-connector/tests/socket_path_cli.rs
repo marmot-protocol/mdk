@@ -116,3 +116,65 @@ fn serve_reads_marmot_relays_and_prefers_the_relay_flag() {
     assert!(stderr.contains("code=io_error"), "{stderr}");
     assert!(stderr.contains("is not a Unix socket"), "{stderr}");
 }
+
+#[cfg(unix)]
+#[test]
+fn auth_token_file_failures_keep_the_path_off_the_startup_line() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let empty = root.path().join("empty.token");
+    std::fs::write(&empty, b"  \n").unwrap();
+    for (token_file, expected) in [
+        (
+            root.path().join("missing.token"),
+            "detail=could not read the auth token file (NotFound)",
+        ),
+        (empty, "detail=the auth token file is empty"),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_wn-agent"))
+            .arg("--home")
+            .arg(&home)
+            .arg("--auth-token-file")
+            .arg(&token_file)
+            .env_remove("MARMOT_RELAYS")
+            .env_remove("MARMOT_RELAY")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("code=auth_token_file"), "{stderr}");
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(!stderr.contains(root.path().to_str().unwrap()), "{stderr}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_splits_comma_separated_relays_like_serve() {
+    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_wn-agent"))
+        .arg("bootstrap")
+        .arg("--home")
+        .arg(root.path())
+        .arg("--socket")
+        .arg(root.path().join("missing.sock"))
+        .arg("--relay")
+        .arg("wss://one.example,wss://two.example")
+        .arg("--wait-for-socket")
+        .arg("0")
+        .env_remove("MARMOT_RELAYS")
+        .env_remove("MARMOT_RELAY")
+        .env_remove("MARMOT_AGENT_AUTH_TOKEN")
+        .env_remove("MARMOT_AGENT_AUTH_TOKEN_FILE")
+        .output()
+        .unwrap();
+    // Both relays pass validation, so bootstrap gets as far as the missing
+    // socket; one unsplit `a,b` value would fail relay validation first.
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("wn-agent socket not found"), "{stderr}");
+}
