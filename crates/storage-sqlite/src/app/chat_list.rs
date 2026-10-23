@@ -26,7 +26,12 @@ pub use pages::{
     ChatListView,
 };
 use rusqlite::{Connection, OptionalExtension, Params, params};
-pub use selection::{ChatListSelectionError, ChatListSelectionSnapshot};
+pub use selection::{
+    AcceptedSourceFacts, ChatListSelectionError, ChatListSelectionSnapshot, ContextCaptureError,
+    ContextError, ProjectionFacts, RequiredContext, SelectionBaseScope, SelectionContextRequest,
+    SelectionPresentation, SelectionSearchPreviewInput, SelectionSourceContext,
+    SelectionTitleInputs,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 pub use window::{ChatListWindowQuery, ChatListWindowRead};

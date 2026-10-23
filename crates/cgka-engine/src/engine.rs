@@ -2705,6 +2705,13 @@ impl<S: StorageProvider> Engine<S> {
     /// state can neither leak to the application nor keep evolving out of
     /// band (mdk#364 / #365). Ingest has its own gate that additionally
     /// retains the input for post-repair replay.
+    /// Pure source-owned gate for composing a projected-members read under an
+    /// already-held storage connection. No SQL, hydration, epoch or MLS reads.
+    /// This preserves members() readiness; it does not validate record provenance.
+    pub fn check_members_readiness(&self, group_id: &GroupId) -> Result<(), EngineError> {
+        self.ensure_group_live(group_id)
+    }
+
     pub(crate) fn ensure_group_live(&self, group_id: &GroupId) -> Result<(), EngineError> {
         if self.quarantined_groups.contains_key(group_id) {
             return Err(EngineError::UnknownGroup(group_id.clone()));

@@ -4757,3 +4757,296 @@ White Noise's deployment: its recovery relays, discovery indexers, media and ima
 
 </details>
 
+<details>
+<summary>commands/chat_selection.rs</summary>
+
+### `Marmot::open_chat_selection`
+
+**Current.**
+
+```rust
+pub async fn open_chat_selection( &self, account_ref: String, open: ChatSelectionOpenFfi, ) -> Result<Arc<ChatSelection>, MarmotKitError>
+```
+
+Open one native-owned complete offered scope for a captured account/runtime. Hosts provide closed scope DTOs and sparse context, never loaded IDs or SQL. Complete required presentation through the returned owner; actual CurrentThread account workers refuse capture.
+
+[Source](src/commands/chat_selection.rs#L10)
+
+</details>
+
+<details>
+<summary>commands/chat_selection/departure.rs</summary>
+
+### `Marmot::selection_delete_group_local`
+
+**Current.**
+
+```rust
+pub async fn selection_delete_group_local( &self, selection: Arc<ChatSelection>, account_ref: String, action: ChatSelectionActionFfi, ) -> Result<bool, MarmotKitError>
+```
+
+Fresh guarded local cleanup for the captured target/operation/attempt; retains MLS membership, unlike Leave or ForgetLocal. Exact retry reads the retained bool, and generic uncertainty blocks replay. Keep the existing local-removal journal.
+
+[Source](src/commands/chat_selection/departure.rs#L161)
+
+### `Marmot::selection_forget_group_local`
+
+**Current.**
+
+```rust
+pub async fn selection_forget_group_local( &self, selection: Arc<ChatSelection>, account_ref: String, action: ChatSelectionActionFfi, ) -> Result<bool, MarmotKitError>
+```
+
+Fresh guarded ForgetLocal for the captured target, preserving existing native policy and the host abandonment journal. It is distinct from local DeleteLocal. Exact retry reads the retained bool; do not retry generic uncertainty.
+
+[Source](src/commands/chat_selection/departure.rs#L143)
+
+### `Marmot::selection_leave_group`
+
+**Current.**
+
+```rust
+pub async fn selection_leave_group( &self, selection: Arc<ChatSelection>, account_ref: String, action: ChatSelectionActionFfi, ) -> Result<SendSummaryFfi, MarmotKitError>
+```
+
+Guarded Leave with existing management policy and actual SendSummary dispositions. First target effect needs fresh selection admission; admitted continuation does not re-filter its own preview. Preserve operation/attempt and read retained outcomes after lost waits.
+
+[Source](src/commands/chat_selection/departure.rs#L120)
+
+### `Marmot::selection_promote_admin_detailed`
+
+**Current.**
+
+```rust
+pub async fn selection_promote_admin_detailed( &self, selection: Arc<ChatSelection>, account_ref: String, action: ChatSelectionActionFfi, member_ref: String, ) -> Result<GroupMutationResultFfi, MarmotKitError>
+```
+
+Guarded departure handover step using the existing promotion policy. Keep one selected target and operation, a per-step attempt, existing acknowledgment and journal. Read retained step outcome before attempting a post-effect details refresh or retry.
+
+[Source](src/commands/chat_selection/departure.rs#L71)
+
+### `Marmot::selection_self_demote_admin_detailed`
+
+**Current.**
+
+```rust
+pub async fn selection_self_demote_admin_detailed( &self, selection: Arc<ChatSelection>, account_ref: String, action: ChatSelectionActionFfi, ) -> Result<GroupMutationResultFfi, MarmotKitError>
+```
+
+Guarded departure self-demotion using the existing role policy. Exact same-step retries read the admitted result; only explicit known pre-effect advisories permit a higher acknowledged attempt. Generic uncertainty prevents subsequent cleanup.
+
+[Source](src/commands/chat_selection/departure.rs#L97)
+
+</details>
+
+<details>
+<summary>subscriptions/chat_selection.rs</summary>
+
+### `ChatSelection::apply`
+
+**Current.**
+
+```rust
+pub async fn apply( &self, operation_id: u64, attempt_id: u64, revision: u64, context: ChatSelectionContextFfi, mutation: ChatSelectionMutationFfi, ) -> Result<ChatSelectionMutationReportFfi, MarmotKitError>
+```
+
+Freshly admit at most200 remaining original IDs for archive or local deletion. Keep operation/attempt identity across presentation refresh and abandoned waits; exact retries read retained results and uncertainty blocks further effects. Group departure uses the guarded steps instead.
+
+[Source](src/subscriptions/chat_selection.rs#L133)
+
+### `ChatSelection::cancel`
+
+**Current.**
+
+```rust
+pub fn cancel(&self)
+```
+
+Close this owner and discard late reads. Cancellation does not prove an already admitted mutation was interrupted; retain its host intent and uncertainty.
+
+[Source](src/subscriptions/chat_selection.rs#L170)
+
+
+### `ChatSelection::close_selection`
+
+**Current.**
+
+```rust
+pub fn close_selection(&self)
+```
+
+Retire this native selection on disposal or account/runtime/scope changes. Do not reuse its pages, answers or actions afterward; admitted effects can still complete. Kotlin calls `closeSelection()` for this command; generated `AutoCloseable.close()` separately releases the host object.
+
+[Source](src/subscriptions/chat_selection.rs#L167)
+
+
+### `ChatSelection::count`
+
+**Current.**
+
+```rust
+pub async fn count(&self) -> Result<ChatSelectionSummaryFfi, MarmotKitError>
+```
+
+Return the resolved complete native count and revision. While presentation is incomplete this fails rather than substituting zero; status exposes the resolving optional count.
+
+[Source](src/subscriptions/chat_selection.rs#L20)
+
+### `ChatSelection::exclude`
+
+**Current.**
+
+```rust
+pub async fn exclude( &self, revision: u64, group_ids: Vec<String>, ) -> Result<ChatSelectionStatusFfi, MarmotKitError>
+```
+
+Explicitly remove at most200 IDs from the resolved original set. Never adds IDs. Revision and unresolved-effect/departure guards prevent deselection from disguising a retry.
+
+[Source](src/subscriptions/chat_selection.rs#L55)
+
+### `ChatSelection::folder_assignment_page`
+
+**Current.**
+
+```rust
+pub async fn folder_assignment_page( &self, revision: u64, context: ChatSelectionContextFfi, after: Option<String>, limit: u32, ) -> Result<ChatSelectionFolderPageFfi, MarmotKitError>
+```
+
+Fresh bounded handoff for host-owned folder preferences, distinct from display pages. Advance by inspected-original next_after and explicit done, including empty eligible pages. Discard all prepared pages on a changed revision/presentation or actual host context, then restart before writing preferences.
+
+[Source](src/subscriptions/chat_selection.rs#L35)
+
+### `ChatSelection::last_departure`
+
+**Current.**
+
+```rust
+pub async fn last_departure( &self, ) -> Result<Option<ChatSelectionDepartureReportFfi>, MarmotKitError>
+```
+
+Read the retained last guarded step result without issuing another effect. Preserve its operation/attempt, original target, advisory classification and uncertainty in the existing departure journal.
+
+[Source](src/subscriptions/chat_selection.rs#L161)
+
+### `ChatSelection::last_mutation`
+
+**Current.**
+
+```rust
+pub async fn last_mutation( &self, ) -> Result<Option<ChatSelectionMutationReportFfi>, MarmotKitError>
+```
+
+Read the retained last archive/local-delete result after an abandoned wait. Absence is not proof of no effect; do not create a new operation to replay an unresolved attempt.
+
+[Source](src/subscriptions/chat_selection.rs#L152)
+
+### `ChatSelection::membership`
+
+**Current.**
+
+```rust
+pub async fn membership( &self, revision: u64, group_ids: Vec<String>, ) -> Result<Vec<bool>, MarmotKitError>
+```
+
+Display-only membership for at most200 visible IDs, preserving input order. Visible rows cannot nominate candidates or grant action authority.
+
+[Source](src/subscriptions/chat_selection.rs#L48)
+
+### `ChatSelection::page`
+
+**Current.**
+
+```rust
+pub async fn page( &self, revision: u64, offset: u64, limit: u32, ) -> Result<ChatSelectionPageFfi, MarmotKitError>
+```
+
+Page at most200 IDs from the frozen resolved original set. Offset is into this selection, not the moving display window. These IDs are display data; effects and folder preferences need their fresh admission APIs.
+
+[Source](src/subscriptions/chat_selection.rs#L23)
+
+### `ChatSelection::prepare_action_hints`
+
+**Current.**
+
+```rust
+pub async fn prepare_action_hints( &self, revision: u64, context: ChatSelectionContextFfi, ) -> Result<ChatSelectionStatusFfi, MarmotKitError>
+```
+
+Explicitly obtain complete-set type/lifecycle hints before a confirmation through the existing owner/revision flow. May require issued host presentation answers; failure preserves the previous compact selection. Refuses replacement during an admitted unfinished departure.
+
+[Source](src/subscriptions/chat_selection.rs#L111)
+
+### `ChatSelection::presentation_page`
+
+**Current.**
+
+```rust
+pub async fn presentation_page( &self, revision: u64, offset: u64, limit: u32, ) -> Result<Vec<ChatSelectionOperandFfi>, MarmotKitError>
+```
+
+Read bounded compact operands after native SQL release. Use existing pure host predicates and frozen localization/nickname/overlays; no profile fetch or reconstructed full row is required.
+
+[Source](src/subscriptions/chat_selection.rs#L76)
+
+### `ChatSelection::refresh_scope`
+
+**Current.**
+
+```rust
+pub async fn refresh_scope( &self, revision: u64, context: ChatSelectionContextFfi, ) -> Result<ChatSelectionStatusFfi, MarmotKitError>
+```
+
+Recompute the resolved remaining-original selection with current host context. Never adds arrivals or resets unresolved effect identity. A new revision invalidates prepared pages and old answers; unfinished admitted departure refuses replacement.
+
+[Source](src/subscriptions/chat_selection.rs#L121)
+
+### `ChatSelection::reselect`
+
+**Current.**
+
+```rust
+pub async fn reselect( &self, revision: u64, context: ChatSelectionContextFfi, group_ids: Vec<String>, ) -> Result<ChatSelectionStatusFfi, MarmotKitError>
+```
+
+Restore up to 200 explicitly unchecked native originals on the same complete-selection owner before an operation starts. Fresh scope, owner and presentation admission still apply; foreign IDs refuse the whole request and new arrivals never join. A returned unresolved count requires the ordinary presentation phase. Discard old pages and answers when the revision changes; never reopen the full scope to simulate a checkbox toggle. Once status.operation_id is present, re-selection is refused to preserve immutable operation targets.
+
+[Source](src/subscriptions/chat_selection.rs#L65)
+
+### `ChatSelection::resolve_presentation`
+
+**Current.**
+
+```rust
+pub async fn resolve_presentation( &self, revision: u64, ) -> Result<ChatSelectionSummaryFfi, MarmotKitError>
+```
+
+Finish one complete issued answer set and obtain its count/revision. Incomplete or invalid slots cannot publish a successful prefix; host values must still match the captured snapshot.
+
+[Source](src/subscriptions/chat_selection.rs#L105)
+
+### `ChatSelection::status`
+
+**Current.**
+
+```rust
+pub async fn status(&self) -> Result<ChatSelectionStatusFfi, MarmotKitError>
+```
+
+Observe optional complete count, independent optional archive/direct/abandonment hints, presentation work and retained effect identity. Missing hints are unresolved/unrequested, not false. These hints do not authorize commands.
+
+[Source](src/subscriptions/chat_selection.rs#L17)
+
+### `ChatSelection::submit_presentation`
+
+**Current.**
+
+```rust
+pub async fn submit_presentation( &self, revision: u64, host: ChatSelectionHostContextFfi, answers: Vec<ChatSelectionAnswerFfi>, ) -> Result<ChatSelectionStatusFfi, MarmotKitError>
+```
+
+Submit only issued leaf slots for the exact revision and frozen host identity. A batch is validated before consumption; duplicate/unissued slots and changed host context are refused.
+
+[Source](src/subscriptions/chat_selection.rs#L90)
+
+</details>
+

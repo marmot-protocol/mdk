@@ -13,6 +13,15 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- Complete chat-selection opaque handles, borrowed scope/context inputs, lossless JSON
+  presentation operands, original-only reselect, freshly revalidated folder pages and guarded
+  archive/departure entry points. Selection results own nested allocations and have matching
+  deep-free functions. Optional counts and action hints retain separate presence flags.
+  `MarmotStatus` appends selection outcomes 108–124 without renumbering existing values.
+  C hosts adopting this surface must use matching regenerated headers and libraries, retain
+  operation/attempt identity across waits, and distinguish unresolved effects from pre-effect
+  refusal. Existing chat-list APIs keep their contracts.
+
 - `marmot_attachment_keep_media` and `marmot_set_attachment_keep_media` with
   `MarmotAttachmentKeepMedia`: the opt-in "Keep media" setting (mdk#2314
   step 10). `MarmotAttachmentTransferState` appends

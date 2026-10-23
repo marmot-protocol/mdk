@@ -2,6 +2,22 @@ package dev.ipf.marmotkit
 
 /** Exercise generated record layout and enum discriminants, including presentation roles. */
 fun main() {
+    for (status in listOf(
+        ChatSelectionStatusFfi(0uL, null, null, null, null, 3uL, null, null, false),
+        ChatSelectionStatusFfi(1uL, 0uL, false, false, false, 0uL, 7uL, 9uL, true),
+    )) {
+        check(FfiConverterTypeChatSelectionStatusFfi.lift(FfiConverterTypeChatSelectionStatusFfi.lower(status)) == status)
+    }
+    val predicate = ChatSelectionPredicateFfi.Group(false, listOf(
+        ChatSelectionPredicateFfi.Condition(ChatSelectionFieldFfi.PARTICIPANTS, ChatSelectionModeFfi.ALL_OF, listOf("aa", "bb"), false),
+        ChatSelectionPredicateFfi.Group(true, listOf(ChatSelectionPredicateFfi.Condition(ChatSelectionFieldFfi.TITLE, ChatSelectionModeFfi.CONTAINS, listOf("title 🦀"), true)), true),
+    ), false)
+    check(FfiConverterTypeChatSelectionPredicateFfi.lift(FfiConverterTypeChatSelectionPredicateFfi.lower(predicate)) == predicate)
+    val folderPage = ChatSelectionFolderPageFfi(5uL, emptyList(), "inspected-original", false)
+    check(FfiConverterTypeChatSelectionFolderPageFfi.lift(FfiConverterTypeChatSelectionFolderPageFfi.lower(folderPage)) == folderPage)
+    val selectionOverlays = ChatSelectionHostOverlaysFfi(emptyMap(), emptyMap(), emptyList(), emptyList(), mapOf("group" to null), mapOf("message" to "fallback"))
+    val selectionOverlaysCopy = FfiConverterTypeChatSelectionHostOverlaysFfi.lift(FfiConverterTypeChatSelectionHostOverlaysFfi.lower(selectionOverlays))
+    check(selectionOverlaysCopy == selectionOverlays && selectionOverlaysCopy.previewOverrides.containsKey("group"))
     for (query in listOf(
         AccountAttachmentQueryFfi(emptyList(), emptyList(), null, null),
         AccountAttachmentQueryFfi(listOf("aa"), listOf("sender"), 0uL, ULong.MAX_VALUE),

@@ -1742,6 +1742,10 @@ async fn quarantined_group_accessors_all_report_unknown_group() {
     };
 
     unknown(alice.members(&group_id).map(drop), "members");
+    unknown(
+        alice.check_members_readiness(&group_id),
+        "members snapshot readiness",
+    );
     unknown(alice.epoch(&group_id).map(drop), "epoch");
     assert!(
         alice.epoch_state(&group_id).is_none(),

@@ -366,6 +366,40 @@ pub enum MarmotKitError {
     /// may have completed, so refresh authoritative state before retrying.
     #[error("marmot account worker response timed out; operation completion is unknown")]
     AccountWorkerResponseTimedOut,
+    #[error("chat selection effect is unresolved; do not retry")]
+    ChatSelectionUncertain,
+    #[error("target no longer belongs to this selection; no effect started")]
+    ChatSelectionNoLongerEligible,
+    #[error("chat selection base projection is not ready")]
+    ChatSelectionProjectionNotReady,
+    #[error("chat selection page is invalid")]
+    ChatSelectionInvalidPage,
+    #[error("chat selection belongs to a different account store")]
+    ChatSelectionOwnerChanged,
+    #[error("chat selection is closed")]
+    ChatSelectionClosed,
+    #[error("chat selection changed")]
+    ChatSelectionStale,
+    #[error("chat selection needs current presentation answers")]
+    ChatSelectionIncomplete,
+    #[error("operation is unsupported for this selection")]
+    ChatSelectionUnsupportedScope,
+    #[error("chat selection source is not ready")]
+    ChatSelectionNotReady,
+    #[error("chat selection capture was cancelled")]
+    ChatSelectionCancelled,
+    #[error("chat selection needs a multithread runtime")]
+    ChatSelectionUnsupportedRuntime,
+    #[error("chat selection scope is invalid")]
+    ChatSelectionInvalidScope,
+    #[error("chat selection exceeds its transient resource budget")]
+    ChatSelectionResourceExhausted,
+    #[error("chat selection capture timed out")]
+    ChatSelectionTimedOut,
+    #[error("chat selection slots or page are invalid")]
+    ChatSelectionInvalidSlots,
+    #[error("chat selection storage query failed")]
+    ChatSelectionQuery,
     #[error("chat window requests require 1 to 100 rows")]
     ChatWindowInvalidLimit,
     #[error("chat window changed; use the latest sequence")]
@@ -1355,5 +1389,75 @@ impl From<marmot_app::ConversationWindowError> for MarmotKitError {
                 details: e.to_string(),
             },
         }
+    }
+}
+
+impl From<marmot_app::ChatListSelectionError> for MarmotKitError {
+    fn from(value: marmot_app::ChatListSelectionError) -> Self {
+        use marmot_app::{
+            ChatListSelectionError as E, ChatSelectionCaptureError as C,
+            ChatSelectionPresentationError as P, ChatSelectionQueryError as Q,
+        };
+        match value {
+            E::Closed => Self::ChatSelectionClosed,
+            E::StaleRevision => Self::ChatSelectionStale,
+            E::IncompletePresentation => Self::ChatSelectionIncomplete,
+            E::UnsupportedScope => Self::ChatSelectionUnsupportedScope,
+            E::App(error) => Self::from(error),
+            E::Capture(error) => match error {
+                C::NotReady => Self::ChatSelectionNotReady,
+                C::Closed => Self::ChatSelectionClosed,
+                C::Cancelled => Self::ChatSelectionCancelled,
+                C::UnsupportedRuntime => Self::ChatSelectionUnsupportedRuntime,
+                C::InvalidScope => Self::ChatSelectionInvalidScope,
+                C::ResourceExhausted => Self::ChatSelectionResourceExhausted,
+                C::TimedOut => Self::ChatSelectionTimedOut,
+            },
+            E::Presentation(error) => match error {
+                P::ResourceExhausted => Self::ChatSelectionResourceExhausted,
+                P::Stale => Self::ChatSelectionStale,
+                P::InvalidSlots => Self::ChatSelectionInvalidSlots,
+                P::Incomplete => Self::ChatSelectionIncomplete,
+            },
+            E::Query(error) => match error {
+                Q::Cancelled => Self::ChatSelectionCancelled,
+                Q::InvalidPage => Self::ChatSelectionInvalidPage,
+                Q::StaleSelection => Self::ChatSelectionOwnerChanged,
+                Q::ProjectionNotReady => Self::ChatSelectionProjectionNotReady,
+                Q::Storage(_) => Self::ChatSelectionQuery,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod chat_selection_errors {
+    use super::*;
+    #[test]
+    fn chat_selection_error_boundary_retains_refusal_classes_without_private_storage_details() {
+        use marmot_app::{
+            ChatListSelectionError as E, ChatSelectionCaptureError as C,
+            ChatSelectionPresentationError as P,
+        };
+        assert!(matches!(
+            MarmotKitError::from(E::Capture(C::UnsupportedRuntime)),
+            MarmotKitError::ChatSelectionUnsupportedRuntime
+        ));
+        assert!(matches!(
+            MarmotKitError::from(E::Capture(C::ResourceExhausted)),
+            MarmotKitError::ChatSelectionResourceExhausted
+        ));
+        assert!(matches!(
+            MarmotKitError::from(E::Capture(C::NotReady)),
+            MarmotKitError::ChatSelectionNotReady
+        ));
+        assert!(matches!(
+            MarmotKitError::from(E::Presentation(P::InvalidSlots)),
+            MarmotKitError::ChatSelectionInvalidSlots
+        ));
+        assert!(matches!(
+            MarmotKitError::from(E::IncompletePresentation),
+            MarmotKitError::ChatSelectionIncomplete
+        ));
     }
 }

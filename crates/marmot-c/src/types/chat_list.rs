@@ -97,7 +97,9 @@ c_enum! {
 
 c_enum! {
     /// Coarse conversation classification.
+    #[derive(Default)]
     MarmotChatConversationKind from ChatConversationKindFfi {
+        #[default]
         Unknown,
         Direct,
         Group,

@@ -4,6 +4,25 @@ import Foundation
 struct ChatProjectionsSmoke {
     /// Exercise generated record layout and enum discriminants, including presentation roles.
     static func main() throws {
+        for status in [
+            ChatSelectionStatusFfi(revision: 0, count: nil, allArchived: nil, allDirect: nil, allAbandonable: nil, presentationOperands: 3, operationId: nil, lastAttempt: nil, mutationUncertain: false),
+            ChatSelectionStatusFfi(revision: 1, count: 0, allArchived: false, allDirect: false, allAbandonable: false, presentationOperands: 0, operationId: 7, lastAttempt: 9, mutationUncertain: true),
+        ] {
+            let copy = try FfiConverterTypeChatSelectionStatusFfi.lift(FfiConverterTypeChatSelectionStatusFfi.lower(status))
+            precondition(copy == status)
+        }
+        let predicate = ChatSelectionPredicateFfi.group(all: false, children: [
+            .condition(field: .participants, mode: .allOf, values: ["aa", "bb"], not: false),
+            .group(all: true, children: [.condition(field: .title, mode: .contains, values: ["title 🦀"], not: true)], not: true),
+        ], not: false)
+        let predicateCopy = try FfiConverterTypeChatSelectionPredicateFfi.lift(FfiConverterTypeChatSelectionPredicateFfi.lower(predicate))
+        precondition(predicateCopy == predicate)
+        let folderPage = ChatSelectionFolderPageFfi(revision: 5, groupIds: [], nextAfter: "inspected-original", done: false)
+        let folderCopy = try FfiConverterTypeChatSelectionFolderPageFfi.lift(FfiConverterTypeChatSelectionFolderPageFfi.lower(folderPage))
+        precondition(folderCopy == folderPage)
+        let selectionOverlays = ChatSelectionHostOverlaysFfi(sending: [:], muted: [:], removed: [], inviteConflicts: [], previewOverrides: ["group": nil], mediaPreviewFallbacks: ["message": "fallback"])
+        let overlaysCopy = try FfiConverterTypeChatSelectionHostOverlaysFfi.lift(FfiConverterTypeChatSelectionHostOverlaysFfi.lower(selectionOverlays))
+        precondition(overlaysCopy == selectionOverlays && overlaysCopy.previewOverrides.keys.contains("group"))
         for query in [
             AccountAttachmentQueryFfi(groups: [], senders: [], minTimelineAt: nil, maxTimelineAt: nil),
             AccountAttachmentQueryFfi(groups: ["aa"], senders: ["sender"], minTimelineAt: 0, maxTimelineAt: UInt64.max),

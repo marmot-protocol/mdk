@@ -389,6 +389,45 @@ pub(crate) enum AccountWorkerCommand {
         group_ids: Vec<GroupId>,
         respond: oneshot::Sender<Result<Vec<crate::AppGroupMemberIds>, AppError>>,
     },
+    DepartSelection {
+        request: crate::chat_selection::capture::CaptureRequest,
+        proof: Option<std::sync::Arc<crate::chat_selection::presentation::PresentationProof>>,
+        owner: storage_sqlite::SqliteAccountStorage,
+        owner_epoch: Vec<u8>,
+        group_id: String,
+        step: super::ChatSelectionDepartureStep,
+        admitted: bool,
+        respond: oneshot::Sender<
+            Result<
+                crate::client::SelectionDepartureOutcome,
+                crate::chat_selection::capture::CaptureError,
+            >,
+        >,
+    },
+    ApplySelection {
+        request: crate::chat_selection::capture::CaptureRequest,
+        proof: Option<std::sync::Arc<crate::chat_selection::presentation::PresentationProof>>,
+        owner: storage_sqlite::SqliteAccountStorage,
+        owner_epoch: Vec<u8>,
+        attempt_id: u64,
+        operation_id: u64,
+        mutation: crate::chat_selection::capture::SelectionMutation,
+        respond: oneshot::Sender<
+            Result<
+                crate::client::SelectionApplyOutcome,
+                crate::chat_selection::capture::CaptureError,
+            >,
+        >,
+    },
+    CaptureSelection {
+        request: crate::chat_selection::capture::CaptureRequest,
+        respond: oneshot::Sender<
+            Result<
+                crate::client::BoundSelectionCapture,
+                crate::chat_selection::capture::CaptureError,
+            >,
+        >,
+    },
     CaptureConversation {
         queued: Option<Observation>,
         group_id: GroupId,
@@ -846,6 +885,15 @@ fn handle_startup_sync_command(
                     AccountWorkerCommand::MemberIdsPage { group_ids, respond },
                 )));
             }
+        }
+        AccountWorkerCommand::CaptureSelection { respond, .. } => {
+            let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
+        }
+        AccountWorkerCommand::DepartSelection { respond, .. } => {
+            let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
+        }
+        AccountWorkerCommand::ApplySelection { respond, .. } => {
+            let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
         }
         AccountWorkerCommand::CaptureConversation {
             respond, queued, ..
@@ -3463,6 +3511,18 @@ async fn handle_account_worker_catch_up(
                         .expect("snapshot availability checked above");
                     let _ = respond.send(snapshot.member_ids_page(&group_ids));
                 }
+                AccountWorkerCommand::CaptureSelection { respond, .. } => {
+                    let _ =
+                        respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
+                }
+                AccountWorkerCommand::DepartSelection { respond, .. } => {
+                    let _ =
+                        respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
+                }
+                AccountWorkerCommand::ApplySelection { respond, .. } => {
+                    let _ =
+                        respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
+                }
                 AccountWorkerCommand::CaptureConversation {
                     respond, queued, ..
                 } => {
@@ -3993,6 +4053,15 @@ async fn handle_startup_hydration_command(
         }
         AccountWorkerCommand::MemberIdsPage { group_ids, respond } => {
             let _ = respond.send(member_ids_page_after_hydration(client, &group_ids));
+        }
+        AccountWorkerCommand::CaptureSelection { respond, .. } => {
+            let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
+        }
+        AccountWorkerCommand::DepartSelection { respond, .. } => {
+            let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
+        }
+        AccountWorkerCommand::ApplySelection { respond, .. } => {
+            let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
         }
         AccountWorkerCommand::CaptureConversation {
             queued,
@@ -4673,6 +4742,15 @@ where
                     .expect("snapshot availability checked above");
                 let _ = respond.send(snapshot.member_ids_page(&group_ids));
             }
+            AccountWorkerCommand::CaptureSelection { respond, .. } => {
+                let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
+            }
+            AccountWorkerCommand::DepartSelection { respond, .. } => {
+                let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
+            }
+            AccountWorkerCommand::ApplySelection { respond, .. } => {
+                let _ = respond.send(Err(crate::chat_selection::capture::CaptureError::NotReady));
+            }
             AccountWorkerCommand::CaptureConversation {
                 respond, queued, ..
             } => {
@@ -5233,6 +5311,131 @@ fn account_worker_command_future<'a>(
                 respond,
                 member_ids_page_after_hydration(client, &group_ids),
             );
+            true
+        }),
+        AccountWorkerCommand::DepartSelection {
+            request,
+            proof,
+            owner,
+            owner_epoch,
+            group_id,
+            step,
+            admitted,
+            respond,
+        } => Box::pin(async move {
+            let group = cgka_traits::GroupId::new(hex::decode(&group_id).unwrap_or_default());
+            let leave = matches!(step, super::ChatSelectionDepartureStep::Leave);
+            let forget = matches!(step, super::ChatSelectionDepartureStep::ForgetLocal);
+            let result = client
+                .depart_complete_selection(
+                    request,
+                    proof,
+                    owner,
+                    owner_epoch,
+                    group_id,
+                    step,
+                    admitted,
+                    &|| respond.is_closed(),
+                )
+                .await;
+            if let Ok(crate::client::SelectionDepartureOutcome::Effect {
+                changed,
+                skipped,
+                error,
+                ..
+            }) = &result
+            {
+                if !skipped && (leave || (error.is_none() && *changed)) {
+                    publish_client_pending_projection_updates(
+                        client,
+                        events,
+                        account_id_hex,
+                        account_label,
+                    );
+                    publish_app_runtime_group_state_updated(
+                        events,
+                        account_id_hex,
+                        account_label,
+                        &group,
+                    );
+                }
+                if forget && error.is_none() && !skipped {
+                    scheduled_convergence.note_success(&group);
+                }
+            }
+            let _ = respond.send(result);
+            true
+        }),
+        AccountWorkerCommand::ApplySelection {
+            request,
+            proof,
+            owner,
+            owner_epoch,
+            mutation,
+            attempt_id,
+            operation_id,
+            respond,
+        } => Box::pin(async move {
+            let mut result = client
+                .apply_complete_selection(
+                    request,
+                    proof,
+                    owner,
+                    owner_epoch,
+                    mutation,
+                    attempt_id,
+                    operation_id,
+                    &|| respond.is_closed(),
+                )
+                .await;
+            if let Ok(crate::client::SelectionApplyOutcome::Applied {
+                report, changed, ..
+            }) = &mut result
+            {
+                for (id, did_change) in report.applied_group_ids.iter().zip(changed.iter()) {
+                    if !did_change {
+                        continue;
+                    }
+                    let group = cgka_traits::GroupId::new(
+                        hex::decode(id).expect("native selected group hex"),
+                    );
+                    if matches!(
+                        mutation,
+                        crate::chat_selection::capture::SelectionMutation::Archive { .. }
+                    ) {
+                        match tokio::task::block_in_place(|| {
+                            client.app.refresh_chat_list_row(account_label, id)
+                        }) {
+                            Ok(row) => super::publish_chat_list_projection_update_event(
+                                events,
+                                account_id_hex.to_owned(),
+                                account_label.to_owned(),
+                                id.clone(),
+                                row,
+                                crate::ChatListUpdateTrigger::ArchiveChanged,
+                            ),
+                            Err(_) => report.uncertain = true,
+                        }
+                    }
+                    publish_app_runtime_group_state_updated(
+                        events,
+                        account_id_hex,
+                        account_label,
+                        &group,
+                    );
+                }
+            }
+            let _ = respond.send(result);
+            true
+        }),
+        AccountWorkerCommand::CaptureSelection { request, respond } => Box::pin(async move {
+            if !respond.is_closed() {
+                let result =
+                    super::chat_list_selection::capture_selection_ready(client, request, &|| {
+                        respond.is_closed()
+                    });
+                let _ = respond.send(result);
+            }
             true
         }),
         AccountWorkerCommand::CaptureConversation {

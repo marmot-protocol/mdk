@@ -86,6 +86,12 @@ fn native_view_predicates_exclude_ineligible_ids() {
     ] {
         seed(&store, id, archive, membership, unread, pending);
     }
+    seed(&store, "07", false, "member", 9, true);
+    store
+        .lock()
+        .unwrap()
+        .execute("INSERT INTO blocked_pending_invites VALUES ('07')", [])
+        .unwrap();
     for (view, expected) in [
         (ChatListView::Chats, vec!["01", "02", "06"]),
         (ChatListView::Unread, vec!["02"]),
@@ -234,4 +240,100 @@ fn caller_transaction_is_preserved() {
         ),
         ["01"]
     );
+}
+
+#[test]
+fn cancelled_capture_or_revalidation_returns_no_prefix_and_releases_transaction() {
+    use std::cell::Cell;
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for n in 0..500 {
+        seed(&store, &format!("{n:04x}"), false, "member", 0, false);
+    }
+    let app = store.app_storage();
+    let calls = Cell::new(0);
+    let cancelled = || {
+        calls.set(calls.get() + 1);
+        calls.get() > 51
+    };
+    assert!(matches!(
+        app.chat_list_selection_snapshot_cancellable(ChatListView::Chats, &cancelled),
+        Err(ChatListSelectionError::Cancelled)
+    ));
+    let selection = app
+        .chat_list_selection_snapshot(ChatListView::Chats)
+        .unwrap();
+    calls.set(0);
+    assert!(matches!(
+        app.revalidate_chat_list_selection_cancellable(&selection, &cancelled),
+        Err(ChatListSelectionError::Cancelled)
+    ));
+    assert_eq!(app.chat_list_selection_count(&selection).unwrap(), 500);
+    assert_eq!(
+        app.chat_list_selection_snapshot(ChatListView::Chats)
+            .and_then(|s| app.chat_list_selection_count(&s))
+            .unwrap(),
+        500
+    );
+}
+
+#[test]
+fn capture_count_page_and_revalidation_only_query_compact_navigation_state() {
+    static QUERIES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    fn record(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event {
+            QUERIES.lock().unwrap().push(sql.to_owned());
+        }
+    }
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    for id in [
+        "01",
+        "abcdef",
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345",
+    ] {
+        seed(&store, id, false, "member", 0, false);
+    }
+    store.lock().unwrap().trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(record),
+    );
+    let app = store.app_storage();
+    let selection = app
+        .chat_list_selection_snapshot(ChatListView::Chats)
+        .unwrap();
+    assert_eq!(app.chat_list_selection_count(&selection).unwrap(), 3);
+    assert_eq!(
+        app.chat_list_selection_page(&selection, 0, 200)
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        app.chat_list_selection_count(&app.revalidate_chat_list_selection(&selection).unwrap())
+            .unwrap(),
+        3
+    );
+    store
+        .lock()
+        .unwrap()
+        .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+    let queries = QUERIES.lock().unwrap();
+    let reads = queries
+        .iter()
+        .filter(|q| q.trim_start().starts_with("SELECT"))
+        .collect::<Vec<_>>();
+    assert!(!reads.is_empty());
+    for sql in reads {
+        assert!(
+            sql.contains("chat_presentation_meta")
+                || sql.contains("chat_presentation_row_work")
+                || sql.contains("SELECT group_id_hex FROM chat_list_rows"),
+            "unexpected read: {sql}"
+        );
+        assert!(
+            !sql.contains("profile")
+                && !sql.contains("message_timeline")
+                && !sql.contains("cgka_groups"),
+            "hydration: {sql}"
+        );
+    }
 }

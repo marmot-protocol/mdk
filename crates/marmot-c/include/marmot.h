@@ -227,6 +227,23 @@ enum MarmotStatus
    * MDK reads from one list; a follow or unfollow published nothing.
    */
   MARMOT_STATUS_FOLLOW_LIST_TOO_LARGE = 107,
+  MARMOT_STATUS_CHAT_SELECTION_UNCERTAIN = 108,
+  MARMOT_STATUS_CHAT_SELECTION_NO_LONGER_ELIGIBLE = 109,
+  MARMOT_STATUS_CHAT_SELECTION_PROJECTION_NOT_READY = 110,
+  MARMOT_STATUS_CHAT_SELECTION_INVALID_PAGE = 111,
+  MARMOT_STATUS_CHAT_SELECTION_OWNER_CHANGED = 112,
+  MARMOT_STATUS_CHAT_SELECTION_CLOSED = 113,
+  MARMOT_STATUS_CHAT_SELECTION_STALE = 114,
+  MARMOT_STATUS_CHAT_SELECTION_INCOMPLETE = 115,
+  MARMOT_STATUS_CHAT_SELECTION_UNSUPPORTED_SCOPE = 116,
+  MARMOT_STATUS_CHAT_SELECTION_NOT_READY = 117,
+  MARMOT_STATUS_CHAT_SELECTION_CANCELLED = 118,
+  MARMOT_STATUS_CHAT_SELECTION_UNSUPPORTED_RUNTIME = 119,
+  MARMOT_STATUS_CHAT_SELECTION_INVALID_SCOPE = 120,
+  MARMOT_STATUS_CHAT_SELECTION_RESOURCE_EXHAUSTED = 121,
+  MARMOT_STATUS_CHAT_SELECTION_TIMED_OUT = 122,
+  MARMOT_STATUS_CHAT_SELECTION_INVALID_SLOTS = 123,
+  MARMOT_STATUS_CHAT_SELECTION_QUERY = 124,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -1048,6 +1065,20 @@ typedef enum MarmotConversationAnchorKind {
   MARMOT_CONVERSATION_ANCHOR_KIND_RECOVERED_PREVIOUS,
 } MarmotConversationAnchorKind;
 
+typedef enum MarmotChatSelectionLeafKind {
+  MARMOT_CHAT_SELECTION_LEAF_KIND_TITLE_CONTAINS,
+  MARMOT_CHAT_SELECTION_LEAF_KIND_LEGACY_KEYWORD,
+  MARMOT_CHAT_SELECTION_LEAF_KIND_IS_DIRECT,
+  MARMOT_CHAT_SELECTION_LEAF_KIND_LEGACY_PEER_EQUALS,
+  MARMOT_CHAT_SELECTION_LEAF_KIND_CHAT_SEARCH,
+} MarmotChatSelectionLeafKind;
+
+typedef enum MarmotChatSelectionDepartureRefusal {
+  MARMOT_CHAT_SELECTION_DEPARTURE_REFUSAL_CATCHING_UP,
+  MARMOT_CHAT_SELECTION_DEPARTURE_REFUSAL_COMMIT_UNDELIVERED,
+  MARMOT_CHAT_SELECTION_DEPARTURE_REFUSAL_OTHER,
+} MarmotChatSelectionDepartureRefusal;
+
 typedef enum MarmotAttachmentAcquisitionMode {
   MARMOT_ATTACHMENT_ACQUISITION_MODE_NATIVE_AUTOMATIC,
   MARMOT_ATTACHMENT_ACQUISITION_MODE_HOST_MANAGED,
@@ -1080,6 +1111,36 @@ typedef enum MarmotChatListPageDirection {
   MARMOT_CHAT_LIST_PAGE_DIRECTION_FORWARD,
   MARMOT_CHAT_LIST_PAGE_DIRECTION_BACKWARD,
 } MarmotChatListPageDirection;
+
+typedef enum MarmotChatSelectionField {
+  MARMOT_CHAT_SELECTION_FIELD_UNREAD,
+  MARMOT_CHAT_SELECTION_FIELD_MENTIONS,
+  MARMOT_CHAT_SELECTION_FIELD_MUTED,
+  MARMOT_CHAT_SELECTION_FIELD_PINNED,
+  MARMOT_CHAT_SELECTION_FIELD_ARCHIVED,
+  MARMOT_CHAT_SELECTION_FIELD_TYPE,
+  MARMOT_CHAT_SELECTION_FIELD_ACCEPTED,
+  MARMOT_CHAT_SELECTION_FIELD_DRAFT,
+  MARMOT_CHAT_SELECTION_FIELD_PENDING_SEND,
+  MARMOT_CHAT_SELECTION_FIELD_TITLE,
+  MARMOT_CHAT_SELECTION_FIELD_PARTICIPANTS,
+} MarmotChatSelectionField;
+
+typedef enum MarmotChatSelectionMode {
+  MARMOT_CHAT_SELECTION_MODE_PRESENT,
+  MARMOT_CHAT_SELECTION_MODE_NONE,
+  MARMOT_CHAT_SELECTION_MODE_DIRECT,
+  MARMOT_CHAT_SELECTION_MODE_GROUP,
+  MARMOT_CHAT_SELECTION_MODE_ANY_OF,
+  MARMOT_CHAT_SELECTION_MODE_ALL_OF,
+  MARMOT_CHAT_SELECTION_MODE_EXCLUDES,
+  MARMOT_CHAT_SELECTION_MODE_CONTAINS,
+} MarmotChatSelectionMode;
+
+typedef enum MarmotChatSelectionSending {
+  MARMOT_CHAT_SELECTION_SENDING_SENDING,
+  MARMOT_CHAT_SELECTION_SENDING_SUPPRESS_NATIVE,
+} MarmotChatSelectionSending;
 
 typedef enum MarmotConversationOpenMode {
   MARMOT_CONVERSATION_OPEN_MODE_AUTOMATIC,
@@ -1332,6 +1393,12 @@ typedef struct MarmotChatListSubscription MarmotChatListSubscription;
  * Free before its client. Concurrent next and commands are supported; never free during a call.
  */
 typedef struct MarmotChatListWindowSubscription MarmotChatListWindowSubscription;
+
+/**
+ * One selection owner. Free before its client, with no calls in progress.
+ * The client runtime and the selected account store must remain live.
+ */
+typedef struct MarmotChatSelection MarmotChatSelection;
 
 /**
  * Where the next page of chats starts. Borrowed from its page.
@@ -5872,6 +5939,473 @@ typedef struct MarmotConversationWindowSnapshot {
   bool has_more_before;
   bool has_more_after;
 } MarmotConversationWindowSnapshot;
+
+/**
+ * Borrowed tagged predicate: tag0=Group, tag1=Condition. Only active fields are read.
+ */
+typedef struct MarmotChatSelectionPredicateInput {
+  uint32_t tag;
+  uint8_t all;
+  uint8_t negated;
+  const struct MarmotChatSelectionPredicateInput *children;
+  uintptr_t children_len;
+  uint32_t field;
+  uint32_t mode;
+  const char *const *values;
+  uintptr_t values_len;
+} MarmotChatSelectionPredicateInput;
+
+/**
+ * Borrowed input; all pointers remain caller-owned for the duration of the call.
+ */
+typedef struct MarmotChatSelectionLegacyRuleInput {
+  const char *const *members;
+  uintptr_t members_len;
+  const char *keyword;
+  uint8_t include_all;
+  uint8_t unread_only;
+  uint8_t unread_mentions_only;
+  uint8_t pinned_only;
+  uint8_t groups_only;
+  uint8_t direct_only;
+  uint8_t archived_only;
+  uint8_t include_muted;
+} MarmotChatSelectionLegacyRuleInput;
+
+/**
+ * tag0=ManualOnly,1=Smart,2=Legacy. NULL active records are invalid arguments.
+ */
+typedef struct MarmotChatSelectionAutomaticRuleInput {
+  uint32_t tag;
+  const struct MarmotChatSelectionPredicateInput *predicate;
+  const struct MarmotChatSelectionLegacyRuleInput *legacy;
+} MarmotChatSelectionAutomaticRuleInput;
+
+/**
+ * Borrowed input; all pointers remain caller-owned for the duration of the call.
+ */
+typedef struct MarmotChatSelectionFolderInput {
+  const char *const *manual;
+  uintptr_t manual_len;
+  const char *const *excluded;
+  uintptr_t excluded_len;
+  struct MarmotChatSelectionAutomaticRuleInput automatic;
+} MarmotChatSelectionFolderInput;
+
+/**
+ * Borrowed input; all pointers remain caller-owned for the duration of the call.
+ */
+typedef struct MarmotChatSelectionSearchScopeInput {
+  const char *raw_query;
+  const char *sql_needle;
+  uint8_t message_only;
+} MarmotChatSelectionSearchScopeInput;
+
+typedef struct MarmotChatSelectionScopeInput {
+  const struct MarmotChatSelectionFolderInput *selected_folder;
+  uint8_t has_filter_folders;
+  const struct MarmotChatSelectionFolderInput *filter_folders;
+  uintptr_t filter_folders_len;
+  uint8_t has_named_chats;
+  const char *const *named_chats;
+  uintptr_t named_chats_len;
+  uint8_t direct;
+  uint8_t groups;
+  const struct MarmotChatSelectionSearchScopeInput *search;
+} MarmotChatSelectionScopeInput;
+
+typedef struct MarmotChatSelectionBaseScopeInput {
+  uint32_t tag;
+  uint32_t view;
+} MarmotChatSelectionBaseScopeInput;
+
+/**
+ * Borrowed input; all pointers remain caller-owned for the duration of the call.
+ */
+typedef struct MarmotChatSelectionHostContextInput {
+  const char *account_id_hex;
+  int64_t runtime_generation;
+  uint64_t selection_generation;
+  uint64_t presentation_context_id;
+} MarmotChatSelectionHostContextInput;
+
+/**
+ * Map entries are unique by key; a present preview entry with NULL value is explicit None.
+ */
+typedef struct MarmotChatSelectionSendingEntryInput {
+  const char *group_id_hex;
+  uint32_t value;
+} MarmotChatSelectionSendingEntryInput;
+
+typedef struct MarmotChatSelectionMutedEntryInput {
+  const char *group_id_hex;
+  uint8_t value;
+} MarmotChatSelectionMutedEntryInput;
+
+/**
+ * Borrowed input; all pointers remain caller-owned for the duration of the call.
+ */
+typedef struct MarmotChatSelectionGroupSystemInput {
+  uint32_t provenance;
+  const char *actor_display_name;
+  const char *subject_display_name;
+  const char *system_type;
+  const char *text;
+  const char *actor_account_id_hex;
+  const char *subject_account_id_hex;
+  const char *name;
+  const char *old_name;
+  uint8_t has_old_retention_seconds;
+  uint64_t old_retention_seconds;
+  uint8_t has_new_retention_seconds;
+  uint64_t new_retention_seconds;
+} MarmotChatSelectionGroupSystemInput;
+
+/**
+ * Borrowed input; all pointers remain caller-owned for the duration of the call.
+ */
+typedef struct MarmotChatSelectionSearchPreviewMessageInput {
+  const char *message_id_hex;
+  const char *resolved_media_preview_fallback;
+  const char *plaintext;
+  uint64_t kind;
+  uint8_t deleted;
+  uint8_t has_attachment_kind;
+  uint32_t attachment_kind;
+  uint32_t attachment_count;
+  const struct MarmotChatSelectionGroupSystemInput *group_system;
+} MarmotChatSelectionSearchPreviewMessageInput;
+
+typedef struct MarmotChatSelectionPreviewEntryInput {
+  const char *group_id_hex;
+  const struct MarmotChatSelectionSearchPreviewMessageInput *value;
+} MarmotChatSelectionPreviewEntryInput;
+
+typedef struct MarmotChatSelectionFallbackEntryInput {
+  const char *message_id_hex;
+  const char *text;
+} MarmotChatSelectionFallbackEntryInput;
+
+typedef struct MarmotChatSelectionHostOverlaysInput {
+  const struct MarmotChatSelectionSendingEntryInput *sending;
+  uintptr_t sending_len;
+  const struct MarmotChatSelectionMutedEntryInput *muted;
+  uintptr_t muted_len;
+  const char *const *removed;
+  uintptr_t removed_len;
+  const char *const *invite_conflicts;
+  uintptr_t invite_conflicts_len;
+  const struct MarmotChatSelectionPreviewEntryInput *preview_overrides;
+  uintptr_t preview_overrides_len;
+  const struct MarmotChatSelectionFallbackEntryInput *media_preview_fallbacks;
+  uintptr_t media_preview_fallbacks_len;
+} MarmotChatSelectionHostOverlaysInput;
+
+/**
+ * Borrowed input; all pointers remain caller-owned for the duration of the call.
+ */
+typedef struct MarmotChatSelectionContextInput {
+  struct MarmotChatSelectionHostContextInput host;
+  struct MarmotChatSelectionHostOverlaysInput overlays;
+  int64_t capture_now_ms;
+} MarmotChatSelectionContextInput;
+
+/**
+ * Borrowed input; all pointers remain caller-owned for the duration of the call.
+ */
+typedef struct MarmotChatSelectionOpenInput {
+  struct MarmotChatSelectionScopeInput scope;
+  struct MarmotChatSelectionBaseScopeInput base;
+  struct MarmotChatSelectionContextInput context;
+} MarmotChatSelectionOpenInput;
+
+typedef struct MarmotChatSelectionStatus {
+  uint64_t revision;
+  bool has_count;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t count;
+  bool has_all_archived;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  bool all_archived;
+  bool has_all_direct;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  bool all_direct;
+  bool has_all_abandonable;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  bool all_abandonable;
+  uint64_t presentation_operands;
+  bool has_operation_id;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t operation_id;
+  bool has_last_attempt;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t last_attempt;
+  bool mutation_uncertain;
+} MarmotChatSelectionStatus;
+
+typedef struct MarmotChatSelectionSummary {
+  uint64_t revision;
+  uint64_t count;
+} MarmotChatSelectionSummary;
+
+typedef struct MarmotChatSelectionPage {
+  uint64_t revision;
+  char **group_ids;
+  uintptr_t group_ids_len;
+} MarmotChatSelectionPage;
+
+typedef struct MarmotChatSelectionFolderPage {
+  uint64_t revision;
+  char **group_ids;
+  uintptr_t group_ids_len;
+  char *next_after;
+  bool done;
+} MarmotChatSelectionFolderPage;
+
+typedef struct MarmotChatSelectionMembership {
+  bool *matches;
+  uintptr_t matches_len;
+} MarmotChatSelectionMembership;
+
+typedef enum MarmotChatSelectionText_Tag {
+  MARMOT_CHAT_SELECTION_TEXT_LITERAL,
+  MARMOT_CHAT_SELECTION_TEXT_UNNAMED_GROUP,
+  MARMOT_CHAT_SELECTION_TEXT_UNAVAILABLE_CONVERSATION,
+} MarmotChatSelectionText_Tag;
+
+typedef struct MarmotChatSelectionText_Literal_Body {
+  char *text;
+} MarmotChatSelectionText_Literal_Body;
+
+typedef struct MarmotChatSelectionText_UnnamedGroup_Body {
+  bool has_member_count;
+  uint64_t member_count;
+} MarmotChatSelectionText_UnnamedGroup_Body;
+
+typedef struct MarmotChatSelectionText {
+  MarmotChatSelectionText_Tag tag;
+  union {
+    MarmotChatSelectionText_Literal_Body LITERAL;
+    MarmotChatSelectionText_UnnamedGroup_Body UNNAMED_GROUP;
+  };
+} MarmotChatSelectionText;
+
+typedef struct MarmotChatSelectionLeaf {
+  uint32_t slot;
+  enum MarmotChatSelectionLeafKind kind;
+  char *needle;
+} MarmotChatSelectionLeaf;
+
+typedef struct MarmotChatSelectionSearchScope {
+  char *raw_query;
+  char *sql_needle;
+  bool message_only;
+} MarmotChatSelectionSearchScope;
+
+typedef struct MarmotChatSelectionGroupSystem {
+  enum MarmotGroupSystemEventProvenance provenance;
+  char *actor_display_name;
+  char *subject_display_name;
+  char *system_type;
+  char *text;
+  char *actor_account_id_hex;
+  char *subject_account_id_hex;
+  char *name;
+  char *old_name;
+  bool has_old_retention_seconds;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t old_retention_seconds;
+  bool has_new_retention_seconds;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t new_retention_seconds;
+} MarmotChatSelectionGroupSystem;
+
+typedef struct MarmotChatSelectionSearchPreviewMessage {
+  char *message_id_hex;
+  char *resolved_media_preview_fallback;
+  char *plaintext;
+  uint64_t kind;
+  bool deleted;
+  bool has_attachment_kind;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  enum MarmotChatListAttachmentKind attachment_kind;
+  uint32_t attachment_count;
+  struct MarmotChatSelectionGroupSystem *group_system;
+} MarmotChatSelectionSearchPreviewMessage;
+
+typedef struct MarmotChatSelectionSearchMessage {
+  char *message_id_hex;
+  char *sender;
+  char *plaintext;
+  uint64_t kind;
+  uint64_t timeline_at;
+  bool deleted;
+  bool has_retention_seconds;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retention_seconds;
+  bool has_retention_expires_at;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t retention_expires_at;
+  bool retention_expired;
+  char **media_types;
+  uintptr_t media_types_len;
+} MarmotChatSelectionSearchMessage;
+
+typedef struct MarmotChatSelectionSearchPresentation {
+  struct MarmotChatSelectionSearchScope scope;
+  char *nostr_group_id_hex;
+  struct MarmotChatSelectionSearchPreviewMessage *last_message;
+  struct MarmotChatSelectionSearchMessage *messages;
+  uintptr_t messages_len;
+  int64_t capture_now_ms;
+} MarmotChatSelectionSearchPresentation;
+
+typedef struct MarmotChatSelectionOperand {
+  uint64_t candidate_slot;
+  char *group_id_hex;
+  char *row_group_name;
+  char *fallback_group_name;
+  char *projected_title;
+  struct MarmotChatSelectionText *selected_title;
+  char *selected_peer_id_hex;
+  char *roster_peer_id_hex;
+  bool roster_peer_present;
+  int32_t roster_member_count;
+  bool pending_confirmation;
+  char *welcomer_id_hex;
+  bool has_conversation_kind;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  enum MarmotChatConversationKind conversation_kind;
+  bool active_account_is_sole_member;
+  char *description;
+  struct MarmotChatSelectionLeaf *leaves;
+  uintptr_t leaves_len;
+  struct MarmotChatSelectionSearchPresentation *search;
+} MarmotChatSelectionOperand;
+
+/**
+ *Owned list; free the root with its `_free` function only.
+ */
+typedef struct MarmotChatSelectionOperandList {
+  struct MarmotChatSelectionOperand *items;
+  uintptr_t len;
+} MarmotChatSelectionOperandList;
+
+/**
+ * Borrowed input; all pointers remain caller-owned for the duration of the call.
+ */
+typedef struct MarmotChatSelectionAnswerInput {
+  uint64_t candidate_slot;
+  uint32_t leaf_slot;
+  uint8_t matches;
+} MarmotChatSelectionAnswerInput;
+
+/**
+ * tag0=Archive,1=DeleteLocal. archived uses the shared nonzero boolean rule.
+ */
+typedef struct MarmotChatSelectionMutationInput {
+  uint32_t tag;
+  uint8_t archived;
+} MarmotChatSelectionMutationInput;
+
+typedef enum MarmotChatSelectionMutation_Tag {
+  MARMOT_CHAT_SELECTION_MUTATION_ARCHIVE,
+  MARMOT_CHAT_SELECTION_MUTATION_DELETE_LOCAL,
+} MarmotChatSelectionMutation_Tag;
+
+typedef struct MarmotChatSelectionMutation_Archive_Body {
+  bool archived;
+} MarmotChatSelectionMutation_Archive_Body;
+
+typedef struct MarmotChatSelectionMutation {
+  MarmotChatSelectionMutation_Tag tag;
+  union {
+    MarmotChatSelectionMutation_Archive_Body ARCHIVE;
+  };
+} MarmotChatSelectionMutation;
+
+typedef struct MarmotChatSelectionMutationReport {
+  struct MarmotChatSelectionMutation mutation;
+  uint64_t operation_id;
+  uint64_t attempt_id;
+  uint64_t revision;
+  char **applied_group_ids;
+  uintptr_t applied_group_ids_len;
+  char *failed_group_id;
+  bool uncertain;
+  uint64_t remaining;
+} MarmotChatSelectionMutationReport;
+
+typedef enum MarmotChatSelectionDepartureStep_Tag {
+  MARMOT_CHAT_SELECTION_DEPARTURE_STEP_PROMOTE,
+  MARMOT_CHAT_SELECTION_DEPARTURE_STEP_SELF_DEMOTE,
+  MARMOT_CHAT_SELECTION_DEPARTURE_STEP_LEAVE,
+  MARMOT_CHAT_SELECTION_DEPARTURE_STEP_FORGET_LOCAL,
+  MARMOT_CHAT_SELECTION_DEPARTURE_STEP_DELETE_LOCAL,
+} MarmotChatSelectionDepartureStep_Tag;
+
+typedef struct MarmotChatSelectionDepartureStep_Promote_Body {
+  char *member_ref;
+} MarmotChatSelectionDepartureStep_Promote_Body;
+
+typedef struct MarmotChatSelectionDepartureStep {
+  MarmotChatSelectionDepartureStep_Tag tag;
+  union {
+    MarmotChatSelectionDepartureStep_Promote_Body PROMOTE;
+  };
+} MarmotChatSelectionDepartureStep;
+
+typedef struct MarmotChatSelectionDepartureReport {
+  uint64_t operation_id;
+  uint64_t attempt_id;
+  uint64_t revision;
+  char *group_id_hex;
+  struct MarmotChatSelectionDepartureStep step;
+  struct MarmotSendSummary *summary;
+  bool changed;
+  bool skipped;
+  bool has_refusal;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  enum MarmotChatSelectionDepartureRefusal refusal;
+  bool uncertain;
+} MarmotChatSelectionDepartureReport;
+
+/**
+ * Borrowed input; all pointers remain caller-owned for the duration of the call.
+ */
+typedef struct MarmotChatSelectionActionInput {
+  uint64_t operation_id;
+  uint64_t attempt_id;
+  uint64_t revision;
+  const char *group_id_hex;
+  struct MarmotChatSelectionContextInput context;
+} MarmotChatSelectionActionInput;
 
 typedef struct MarmotAttachmentDownloadPolicy {
   bool automatic;
@@ -11706,6 +12240,252 @@ MarmotStatus marmot_send_message_draft_with_client_token(const struct MarmotClie
                                                          struct MarmotLocalSendAcceptance **out);
 
 /**
+ * Open a complete selection. A successful unresolved status is not an empty set.
+ * # Safety
+ * All input pointers must be readable; out must be writable. Inputs are borrowed.
+ */
+MarmotStatus marmot_open_chat_selection(const struct MarmotClient *client,
+                                        const char *account_ref,
+                                        const struct MarmotChatSelectionOpenInput *open,
+                                        struct MarmotChatSelection **out);
+
+/**
+ * Return count/hints as optional values, never treating unresolved as zero or false.
+ * # Safety
+ * selection must remain live; borrowed inputs readable and out writable throughout the call.
+ */
+MarmotStatus marmot_chat_selection_status(const struct MarmotChatSelection *selection,
+                                          struct MarmotChatSelectionStatus **out);
+
+/**
+ * Read or update the same selection owner; revision and uncertainty gates remain native.
+ * # Safety
+ * selection must remain live; borrowed inputs readable and out writable throughout the call.
+ */
+MarmotStatus marmot_chat_selection_count(const struct MarmotChatSelection *selection,
+                                         struct MarmotChatSelectionSummary **out);
+
+/**
+ * Display-only page; this is not mutation or folder-assignment authority.
+ * # Safety
+ * selection must remain live; borrowed inputs readable and out writable throughout the call.
+ */
+MarmotStatus marmot_chat_selection_page(const struct MarmotChatSelection *selection,
+                                        uint64_t revision,
+                                        uint64_t offset,
+                                        uint32_t limit,
+                                        struct MarmotChatSelectionPage **out);
+
+/**
+ * Fresh folder handoff. Discard prior pages when the returned revision changes; use done, not empty-page termination.
+ * # Safety
+ * selection must remain live; borrowed inputs readable and out writable throughout the call.
+ */
+MarmotStatus marmot_chat_selection_folder_assignment_page(const struct MarmotChatSelection *selection,
+                                                          uint64_t revision,
+                                                          const struct MarmotChatSelectionContextInput *context,
+                                                          const char *after,
+                                                          uint32_t limit,
+                                                          struct MarmotChatSelectionFolderPage **out);
+
+/**
+ * Read or update the same selection owner; revision and uncertainty gates remain native.
+ * # Safety
+ * selection must remain live; borrowed inputs readable and out writable throughout the call.
+ */
+MarmotStatus marmot_chat_selection_membership(const struct MarmotChatSelection *selection,
+                                              uint64_t revision,
+                                              const char *const *group_ids,
+                                              uintptr_t group_ids_len,
+                                              struct MarmotChatSelectionMembership **out);
+
+/**
+ * Read or update the same selection owner; revision and uncertainty gates remain native.
+ * # Safety
+ * selection must remain live; borrowed inputs readable and out writable throughout the call.
+ */
+MarmotStatus marmot_chat_selection_exclude(const struct MarmotChatSelection *selection,
+                                           uint64_t revision,
+                                           const char *const *group_ids,
+                                           uintptr_t group_ids_len,
+                                           struct MarmotChatSelectionStatus **out);
+
+/**
+ * Restore only explicitly unchecked original IDs before any operation has begun; never reopen a scope to retick.
+ * # Safety
+ * selection must remain live; borrowed inputs readable and out writable throughout the call.
+ */
+MarmotStatus marmot_chat_selection_reselect(const struct MarmotChatSelection *selection,
+                                            uint64_t revision,
+                                            const struct MarmotChatSelectionContextInput *context,
+                                            const char *const *group_ids,
+                                            uintptr_t group_ids_len,
+                                            struct MarmotChatSelectionStatus **out);
+
+/**
+ * Read or update the same selection owner; revision and uncertainty gates remain native.
+ * # Safety
+ * selection must remain live; borrowed inputs readable and out writable throughout the call.
+ */
+MarmotStatus marmot_chat_selection_presentation_page(const struct MarmotChatSelection *selection,
+                                                     uint64_t revision,
+                                                     uint64_t offset,
+                                                     uint32_t limit,
+                                                     struct MarmotChatSelectionOperandList **out);
+
+/**
+ * Read or update the same selection owner; revision and uncertainty gates remain native.
+ * # Safety
+ * selection must remain live; borrowed inputs readable and out writable throughout the call.
+ */
+MarmotStatus marmot_chat_selection_submit_presentation(const struct MarmotChatSelection *selection,
+                                                       uint64_t revision,
+                                                       const struct MarmotChatSelectionHostContextInput *host,
+                                                       const struct MarmotChatSelectionAnswerInput *answers,
+                                                       uintptr_t answers_len,
+                                                       struct MarmotChatSelectionStatus **out);
+
+/**
+ * Read or update the same selection owner; revision and uncertainty gates remain native.
+ * # Safety
+ * selection must remain live; borrowed inputs readable and out writable throughout the call.
+ */
+MarmotStatus marmot_chat_selection_resolve_presentation(const struct MarmotChatSelection *selection,
+                                                        uint64_t revision,
+                                                        struct MarmotChatSelectionSummary **out);
+
+/**
+ * Read or update the same selection owner; revision and uncertainty gates remain native.
+ * # Safety
+ * selection must remain live; borrowed inputs readable and out writable throughout the call.
+ */
+MarmotStatus marmot_chat_selection_prepare_action_hints(const struct MarmotChatSelection *selection,
+                                                        uint64_t revision,
+                                                        const struct MarmotChatSelectionContextInput *context,
+                                                        struct MarmotChatSelectionStatus **out);
+
+/**
+ * Read or update the same selection owner; revision and uncertainty gates remain native.
+ * # Safety
+ * selection must remain live; borrowed inputs readable and out writable throughout the call.
+ */
+MarmotStatus marmot_chat_selection_refresh_scope(const struct MarmotChatSelection *selection,
+                                                 uint64_t revision,
+                                                 const struct MarmotChatSelectionContextInput *context,
+                                                 struct MarmotChatSelectionStatus **out);
+
+/**
+ * Apply archive/local-delete with retained operation/attempt readback. Unknown effects must not be retried as a fresh operation.
+ * # Safety
+ * selection must remain live; borrowed inputs readable and out writable throughout the call.
+ */
+MarmotStatus marmot_chat_selection_apply(const struct MarmotChatSelection *selection,
+                                         uint64_t operation_id,
+                                         uint64_t attempt_id,
+                                         uint64_t revision,
+                                         const struct MarmotChatSelectionContextInput *context,
+                                         const struct MarmotChatSelectionMutationInput *mutation,
+                                         struct MarmotChatSelectionMutationReport **out);
+
+/**
+ * Read retained mutation result; OK with NULL means no result, not failure.
+ * # Safety
+ * selection must remain live; borrowed inputs readable and out writable throughout the call.
+ */
+MarmotStatus marmot_chat_selection_last_mutation(const struct MarmotChatSelection *selection,
+                                                 struct MarmotChatSelectionMutationReport **out);
+
+/**
+ * Read retained per-target departure result; OK with NULL means no result.
+ * # Safety
+ * selection must remain live; borrowed inputs readable and out writable throughout the call.
+ */
+MarmotStatus marmot_chat_selection_last_departure(const struct MarmotChatSelection *selection,
+                                                  struct MarmotChatSelectionDepartureReport **out);
+
+/**
+ * Retire this selection owner without freeing the handle. Idempotent.
+ * # Safety
+ * selection must remain live for this call.
+ */
+MarmotStatus marmot_chat_selection_close(const struct MarmotChatSelection *selection);
+
+/**
+ * Retire this selection owner without freeing the handle. Idempotent.
+ * # Safety
+ * selection must remain live for this call.
+ */
+MarmotStatus marmot_chat_selection_cancel(const struct MarmotChatSelection *selection);
+
+/**
+ * Retire and free one selection. NULL is a no-op; returned records remain caller-owned.
+ * # Safety
+ * selection must be NULL or a library-owned handle with no active calls.
+ */
+void marmot_chat_selection_free(struct MarmotChatSelection *selection);
+
+/**
+ * Run the existing guarded per-target departure step on this same selection owner.
+ * Retain operation/attempt identity and read back unresolved effects; do not replay them.
+ * # Safety
+ * client and selection must remain live; input records/strings readable, out writable.
+ */
+MarmotStatus marmot_selection_promote_admin_detailed(const struct MarmotClient *client,
+                                                     const struct MarmotChatSelection *selection,
+                                                     const char *account_ref,
+                                                     const struct MarmotChatSelectionActionInput *action,
+                                                     const char *member_ref,
+                                                     struct MarmotGroupMutationResult **out);
+
+/**
+ * Run the existing guarded per-target departure step on this same selection owner.
+ * Retain operation/attempt identity and read back unresolved effects; do not replay them.
+ * # Safety
+ * client and selection must remain live; input records/strings readable, out writable.
+ */
+MarmotStatus marmot_selection_self_demote_admin_detailed(const struct MarmotClient *client,
+                                                         const struct MarmotChatSelection *selection,
+                                                         const char *account_ref,
+                                                         const struct MarmotChatSelectionActionInput *action,
+                                                         struct MarmotGroupMutationResult **out);
+
+/**
+ * Run the existing guarded per-target departure step on this same selection owner.
+ * Retain operation/attempt identity and read back unresolved effects; do not replay them.
+ * # Safety
+ * client and selection must remain live; input records/strings readable, out writable.
+ */
+MarmotStatus marmot_selection_leave_group(const struct MarmotClient *client,
+                                          const struct MarmotChatSelection *selection,
+                                          const char *account_ref,
+                                          const struct MarmotChatSelectionActionInput *action,
+                                          struct MarmotSendSummary **out);
+
+/**
+ * Run the existing guarded per-target departure step on this same selection owner.
+ * Retain operation/attempt identity and read back unresolved effects; do not replay them.
+ * # Safety
+ * client and selection must remain live; input records/strings readable, out writable.
+ */
+MarmotStatus marmot_selection_forget_group_local(const struct MarmotClient *client,
+                                                 const struct MarmotChatSelection *selection,
+                                                 const char *account_ref,
+                                                 const struct MarmotChatSelectionActionInput *action,
+                                                 bool *out);
+
+/**
+ * Run the existing guarded per-target departure step on this same selection owner.
+ * Retain operation/attempt identity and read back unresolved effects; do not replay them.
+ * # Safety
+ * client and selection must remain live; input records/strings readable, out writable.
+ */
+MarmotStatus marmot_selection_delete_group_local(const struct MarmotClient *client,
+                                                 const struct MarmotChatSelection *selection,
+                                                 const char *account_ref,
+                                                 const struct MarmotChatSelectionActionInput *action,
+                                                 bool *out);
+
+/**
  * Free a value of this type returned by this library. NULL
  * is a no-op.
  *
@@ -12858,6 +13638,91 @@ void marmot_public_event_preview_list_free(struct MarmotPublicEventPreviewList *
  * this library.
  */
 void marmot_native_startup_snapshot_free(struct MarmotNativeStartupSnapshot *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_chat_selection_operand_free(struct MarmotChatSelectionOperand *ptr);
+
+/**
+ * Free a list returned by this library. NULL is a no-op.
+ *
+ * # Safety
+ * `list` must be NULL or an unfreed pointer returned by this
+ * library.
+ */
+void marmot_chat_selection_operand_list_free(struct MarmotChatSelectionOperandList *list);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_chat_selection_status_free(struct MarmotChatSelectionStatus *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_chat_selection_summary_free(struct MarmotChatSelectionSummary *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_chat_selection_page_free(struct MarmotChatSelectionPage *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_chat_selection_folder_page_free(struct MarmotChatSelectionFolderPage *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_chat_selection_mutation_report_free(struct MarmotChatSelectionMutationReport *ptr);
+
+/**
+ * Free a value of this type returned by this library. NULL
+ * is a no-op.
+ *
+ * # Safety
+ * The pointer must be NULL or an unfreed pointer returned by
+ * this library.
+ */
+void marmot_chat_selection_departure_report_free(struct MarmotChatSelectionDepartureReport *ptr);
+
+/**
+ * # Safety
+ * The pointer is NULL or a live membership result returned by this library.
+ */
+void marmot_chat_selection_membership_free(struct MarmotChatSelectionMembership *ptr);
 
 /**
  * Free a value of this type returned by this library. NULL

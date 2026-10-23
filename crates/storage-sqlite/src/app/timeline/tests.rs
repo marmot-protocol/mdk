@@ -4398,3 +4398,103 @@ fn system_reactions_survive_replay_reopen_and_retract_without_replacing_target()
     assert_eq!(list(&store.app_storage()), [baseline]);
     store.close().unwrap();
 }
+
+#[test]
+fn selection_messages_share_visibility_literal_like_and_borrow_complete_text_without_page_cap() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    for index in 0..205 {
+        store
+            .record_app_event(&chat(
+                &format!("selection-{index}"),
+                "alice",
+                index,
+                "literal %_\\ needle",
+            ))
+            .unwrap();
+    }
+    let mut other = chat("other-group", "alice", 300, "literal %_\\ needle");
+    other.group_id_hex = "22".repeat(32);
+    store.record_app_event(&other).unwrap();
+    store
+        .record_app_event(&chat("blocked", "bob", 400, "literal %_\\ needle"))
+        .unwrap();
+    store
+        .adopt_block_list(
+            &crate::StoredBlockList {
+                event_id: "selection-block".into(),
+                event_created_at: 1,
+                ..Default::default()
+            },
+            &[("bob".into(), true)],
+            1,
+            "local",
+            &no_mentions,
+        )
+        .unwrap();
+    let full = format!("{} needle https://example.org", "x".repeat(4500));
+    store
+        .record_app_event(&chat("full-text", "alice", 500, &full))
+        .unwrap();
+    let mut count = 0;
+    let mut complete = false;
+    store
+        .visit_selection_messages(
+            Some("needle"),
+            64 * 1024,
+            &|| false,
+            &|id, _, _| id == "11".repeat(32),
+            &mut |input| {
+                assert_ne!(input.sender, "bob");
+                assert_ne!(input.message_id_hex, "other-group");
+                if input.message_id_hex == "full-text" {
+                    assert_eq!(input.plaintext, full);
+                    complete = true;
+                }
+                assert!(!format!("{input:?}").contains("needle"));
+                count += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(count, 206);
+    assert!(complete);
+    let mut literal = 0;
+    store
+        .visit_selection_messages(
+            Some("%_\\"),
+            64 * 1024,
+            &|| false,
+            &|id, _, _| id == "11".repeat(32),
+            &mut |_| {
+                literal += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(literal, 205);
+    let mut copied = false;
+    assert!(matches!(
+        store.visit_selection_messages(Some("needle"), 1, &|| false, &|_, _, _| true, &mut |_| {
+            copied = true;
+            Ok(())
+        }),
+        Err(crate::ContextError::ResourceExhausted)
+    ));
+    assert!(
+        !copied,
+        "oversized source must fail before reading/publishing full input"
+    );
+
+    assert!(matches!(
+        store.visit_selection_messages(None, 64 * 1024, &|| true, &|_, _, _| true, &mut |_| Ok(())),
+        Err(crate::ContextError::Selection(
+            crate::ChatListSelectionError::Cancelled
+        ))
+    ));
+    assert!(matches!(
+        store.visit_selection_messages(None, 64 * 1024, &|| false, &|_, _, _| true, &mut |_| Err(
+            crate::ContextError::ResourceExhausted
+        )),
+        Err(crate::ContextError::ResourceExhausted)
+    ));
+}

@@ -3,7 +3,9 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_REMOVE, MARMOT_APP_EVENT_KIND_REPORT, MARMOT_APP_EVENT_KIND_REVIEW,
 };
 mod capture;
+mod selection;
 pub use capture::ConversationAccountSnapshot;
+pub use selection::SelectionMessageInput;
 mod edits;
 mod opening;
 mod presentation;
@@ -3515,6 +3517,33 @@ fn timeline_query_sql(
     canonical_group_order: bool,
     hide_blocked: bool,
 ) -> StorageResult<(String, Vec<rusqlite::types::Value>)> {
+    let projection = format!("timeline.message_id_hex, timeline.source_message_id_hex, timeline.source_epoch,
+                    source.retention_seconds, source.retention_expires_at,
+                    timeline.direction, timeline.group_id_hex, timeline.sender,
+                    timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
+                    timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
+                    timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
+                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
+                    {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
+                    (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token");
+    timeline_query_sql_projection(
+        query,
+        pagination,
+        canonical_group_order,
+        hide_blocked,
+        &projection,
+    )
+}
+
+// The complete-selection reader shares visibility, LIKE escaping and cursor
+// classification without materializing replies, reactions or attachment bodies.
+fn timeline_query_sql_projection(
+    query: &TimelineMessageQuery,
+    pagination: &ValidatedPagination,
+    canonical_group_order: bool,
+    hide_blocked: bool,
+    projection: &str,
+) -> StorageResult<(String, Vec<rusqlite::types::Value>)> {
     let source = if hide_blocked {
         "visible_message_timeline"
     } else {
@@ -3608,15 +3637,7 @@ fn timeline_query_sql(
     };
     Ok((
         format!(
-            "SELECT timeline.message_id_hex, timeline.source_message_id_hex, timeline.source_epoch,
-                    source.retention_seconds, source.retention_expires_at,
-                    timeline.direction, timeline.group_id_hex, timeline.sender,
-                    timeline.plaintext, timeline.kind, timeline.tags_json, timeline.timeline_at,
-                    timeline.received_at, timeline.reply_to_message_id_hex, timeline.media_json,
-                    timeline.agent_stream_json, timeline.reactions_json, timeline.deleted,
-                    timeline.deleted_by_message_id_hex, timeline.invalidation_status, timeline.edit_json, timeline.deletion_source,
-                    {AUTHENTICATED_TIMELINE_SYSTEM_SQL} AS authenticated_group_system,
-                    (SELECT local.client_token FROM local_message_submissions local WHERE local.group_id_hex=timeline.group_id_hex AND local.message_id_hex=timeline.message_id_hex) AS client_token
+            "SELECT {projection}
              FROM {source} AS timeline
              LEFT JOIN app_events AS source
                ON source.group_id_hex = timeline.group_id_hex

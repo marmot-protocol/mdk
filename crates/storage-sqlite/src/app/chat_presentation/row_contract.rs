@@ -8,6 +8,8 @@ use cgka_traits::GroupLifecycleState;
 
 pub const CHAT_LIST_DRAFT_PREVIEW_CHARS: usize = 1024;
 
+pub(crate) const NATIVE_TRIM_WHITESPACE: &str = "\u{0009}\u{000a}\u{000b}\u{000c}\u{000d}\u{0020}\u{0085}\u{00a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
+
 /// Message uses the existing `row.last_message`, including its prepared metadata.
 /// Invitation/Empty are localization keys, never English display strings.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,24 +81,56 @@ impl ChatListRowActions {
             can_archive: !row.archived,
             can_restore: row.archived,
             can_start_leave: attention && row.lifecycle_state != GroupLifecycleState::Unrecoverable,
-            can_delete_local: departed && !departing,
+            can_delete_local: can_delete_local_for_state(
+                row.self_membership,
+                row.lifecycle_state == GroupLifecycleState::Disbanded,
+                row.leave_requested_at_ms.is_some(),
+                row.disbanding,
+            ),
         }
     }
+}
+
+/// Shared scalar form of the existing row display hint, not authorization.
+pub(crate) fn can_delete_local_for_state(
+    membership: SelfMembership,
+    disbanded: bool,
+    leave_pending: bool,
+    disbanding: bool,
+) -> bool {
+    (membership != SelfMembership::Member || disbanded) && !leave_pending && !disbanding
 }
 
 pub(crate) fn selected_preview_tx(
     conn: &rusqlite::Connection,
     row: &ChatListRow,
 ) -> StorageResult<SelectedChatPreview> {
+    if let Some(draft) = selected_draft_preview_tx(conn, &row.group_id_hex)? {
+        return Ok(SelectedChatPreview::Draft(draft));
+    }
+    Ok(if row.last_message.is_some() {
+        SelectedChatPreview::Message
+    } else if row.pending_confirmation {
+        SelectedChatPreview::Invitation
+    } else {
+        SelectedChatPreview::Empty
+    })
+}
+
+/// The shared bounded selected-draft source; callers must retain its transaction.
+/// This returns no complete composer text or attachment bodies.
+pub(crate) fn selected_draft_preview_tx(
+    conn: &rusqlite::Connection,
+    group_id: &str,
+) -> StorageResult<Option<ChatListDraftPreview>> {
     // Unicode White_Space matches Rust str::trim. SQL bounds the returned text
     // before Rust allocation; even a huge selected draft never crosses this boundary whole.
-    const WHITE_SPACE: &str = "\u{0009}\u{000a}\u{000b}\u{000c}\u{000d}\u{0020}\u{0085}\u{00a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
     let bytes: Option<Vec<u8>> = conn
         .query_row_cached(
             "SELECT coalesce(substr(CAST(trim(content, ?2) AS BLOB), 1, ?3), x'') FROM message_drafts WHERE group_id_hex=?1",
             params![
-                row.group_id_hex,
-                WHITE_SPACE,
+                group_id,
+                NATIVE_TRIM_WHITESPACE,
                 ((CHAT_LIST_DRAFT_PREVIEW_CHARS + 1) * 4) as i64
             ],
             |r| r.get(0),
@@ -132,7 +166,7 @@ pub(crate) fn selected_preview_tx(
         let mut attachment_count = 0u64;
         let mut attachment_kind = None;
         let kinds = statement
-            .query_map([&row.group_id_hex], |r| {
+            .query_map([&group_id], |r| {
                 Ok((r.get::<_, u32>(0)?, super::nonnegative(r, 1)?))
             })
             .storage()?;
@@ -161,7 +195,7 @@ pub(crate) fn selected_preview_tx(
                         .0,
                 );
             }
-            return Ok(SelectedChatPreview::Draft(ChatListDraftPreview {
+            return Ok(Some(ChatListDraftPreview {
                 text,
                 text_truncated,
                 attachment_count,
@@ -169,13 +203,7 @@ pub(crate) fn selected_preview_tx(
             }));
         }
     }
-    Ok(if row.last_message.is_some() {
-        SelectedChatPreview::Message
-    } else if row.pending_confirmation {
-        SelectedChatPreview::Invitation
-    } else {
-        SelectedChatPreview::Empty
-    })
+    Ok(None)
 }
 
 #[cfg(test)]

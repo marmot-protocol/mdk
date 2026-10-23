@@ -23,7 +23,7 @@ per feature.
   [public event verification](#public-event-verification), [host performance stages](#host-performance-stages),
   [Markdown rendering](#markdown-rendering), [identity references and pseudonyms](#identity-references-and-pseudonyms),
   [KeyPackage inventory](#keypackage-inventory), [invitation lookup outcomes](#invitation-lookup-outcomes), [selected chat-list presentation](#selected-chat-list-presentation),
-  [chat screens and avatars](#chat-screens-and-avatars),
+  [chat screens and avatars](#chat-screens-and-avatars), [complete chat selection](#complete-chat-selection),
   [history may be incomplete notices](#history-may-be-incomplete-notices), [group reporting](#group-reporting),
   [host-driven agent publishing](#host-driven-agent-publishing),
   [audit v5 recording and delivery](#audit-v5-recording-and-delivery), [legacy audit v4 upload](#legacy-audit-v4-upload)
@@ -542,3 +542,31 @@ diff-gates the checked-in header.
 ## Account attachment history
 
 `marmot_account_attachment_history_page` blocks off the UI thread and borrows its query arrays and cursor. Deep-free the result with `marmot_account_attachment_page_read_free`; its cursor and version are borrowed fields and must not be freed separately. Clone a version baseline with `marmot_account_attachment_version_clone` when it must outlive a page. Query flags use `uint8_t`, and arrays are capped at 100 before decoding. See the [shared contract](../marmot-uniffi/ACCOUNT-ATTACHMENT-HISTORY.md).
+
+## Complete chat selection
+
+Use the [shared complete-selection contract](../marmot-uniffi/README.md#complete-chat-selection)
+for native candidate ownership, presentation answers, original-only reselect and guarded actions.
+`marmot_open_chat_selection` returns one opaque `MarmotChatSelection`; free it before its
+client, after all calls on the handle have returned. Commands block on that client's runtime.
+`marmot_chat_selection_close` retires the native intent; `marmot_chat_selection_free` also
+retires it and releases the C handle. Returned records remain independently caller-owned.
+
+Borrowed `*Input` records use `uint8_t` booleans (nonzero means true), validated `uint32_t`
+enum tags and pointer/length arrays. Inactive optional records are NULL. Input map entries
+must have unique keys; a present preview entry with NULL value is an explicit replacement
+with no message, distinct from an absent key. Text operands and input text fields are JSON
+string literals, including titles, descriptions, queries, message bodies, system-event labels
+and media fallback text. Decode or encode these once with a JSON string codec to preserve
+embedded NULs. Account, group, member and message identifiers remain ordinary C strings.
+
+Read `has_count` and each `has_all_*` flag before its payload. An unresolved count is not
+zero, and an unknown action hint is not false. `last_mutation` and `last_departure` return
+OK with NULL when no result exists. Free every non-NULL result with its matching root free;
+never free borrowed input fields or embedded records separately.
+
+Display pages and visible membership checks do not authorize mutations. Folder assignment
+uses freshly revalidated pages, follows `next_after` until `done`, and discards all accumulated
+IDs if the returned revision changes. Preserve operation/attempt identity for archive and
+per-target departure. `MARMOT_STATUS_CHAT_SELECTION_UNCERTAIN` means read back the retained
+result; a timeout or abandoned wait must not start a replacement operation.
