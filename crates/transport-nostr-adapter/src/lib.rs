@@ -240,10 +240,10 @@ pub enum NostrSubscription {
     /// The live REQ for up to [`GROUP_BATCH_ROUTES`] group routes that share
     /// endpoints and `since`: one filter whose `#h` values are their routing
     /// ids. Activation packs every group route into batches, and a group
-    /// sync that changes the routes repacks them all and closes the batches
-    /// it replaced. `batch` numbers the account's batches within its
-    /// activation attempt, never reused, so an id names one batch's REQ for
-    /// good.
+    /// sync that changes the routes repacks the families it touches and
+    /// closes the batches it replaced. `batch` numbers the account's batches
+    /// within its activation attempt, never reused, so an id names one
+    /// batch's REQ for good.
     GroupBatch {
         account_id: MemberId,
         routes: Vec<GroupBatchRoute>,
@@ -1316,6 +1316,20 @@ impl NostrTransportAdapter {
         caller: &'static str,
         subscriptions: &[NostrSubscription],
     ) -> Result<NostrSubscribeReport, TransportAdapterError> {
+        let mut report = NostrSubscribeReport::default();
+        for issued in self.subscribe_each(caller, subscriptions).await {
+            report.add(issued?);
+        }
+        Ok(report)
+    }
+
+    /// Issue every subscription concurrently and return each one's outcome,
+    /// in `subscriptions` order, once all of them have settled.
+    async fn subscribe_each(
+        &self,
+        caller: &'static str,
+        subscriptions: &[NostrSubscription],
+    ) -> Vec<Result<NostrSubscribeReport, TransportAdapterError>> {
         let mut tasks = DetachOnDrop(JoinSet::new());
         for (sub_index, subscription) in subscriptions.iter().cloned().enumerate() {
             let relay_client = self.relay_client.clone();
@@ -1376,32 +1390,42 @@ impl NostrTransportAdapter {
         // returning, and the caller's rollback `unsubscribe_account` would then
         // race that REQ. Subscribe calls queue REQs without waiting for relay
         // replies, so draining the rest is short.
-        let mut first_error = None;
-        let mut report = NostrSubscribeReport::default();
+        let mut outcomes = subscriptions.iter().map(|_| None).collect::<Vec<_>>();
+        let mut task_failure = None;
         while let Some(result) = tasks.join_next().await {
             match result {
-                Ok((_sub_index, Ok(issued))) => report.add(issued),
-                Ok((sub_index, Err(err))) => {
-                    tracing::warn!(
-                        target: "transport_nostr_adapter::adapter",
-                        method = caller,
-                        sub_index,
-                        issued_count = subscriptions.len(),
-                        "transport subscription failed"
-                    );
-                    first_error.get_or_insert(err);
+                Ok((sub_index, issued)) => {
+                    if issued.is_err() {
+                        tracing::warn!(
+                            target: "transport_nostr_adapter::adapter",
+                            method = caller,
+                            sub_index,
+                            issued_count = subscriptions.len(),
+                            "transport subscription failed"
+                        );
+                    }
+                    outcomes[sub_index] = Some(issued);
                 }
                 Err(err) => {
-                    first_error.get_or_insert_with(|| {
-                        TransportAdapterError::Subscription(format!(
-                            "subscription task failed: {err}"
-                        ))
-                    });
+                    task_failure.get_or_insert_with(|| format!("subscription task failed: {err}"));
                 }
             }
         }
 
-        first_error.map_or(Ok(report), Err)
+        // A task that panicked returned no index; every subscription without
+        // an outcome is one of those.
+        outcomes
+            .into_iter()
+            .map(|outcome| {
+                outcome.unwrap_or_else(|| {
+                    Err(TransportAdapterError::Subscription(
+                        task_failure
+                            .clone()
+                            .unwrap_or_else(|| "subscription task failed".to_owned()),
+                    ))
+                })
+            })
+            .collect()
     }
 
     /// Drain relay unsubscribes queued in `pending_unsubscribes`. A local
@@ -1532,8 +1556,8 @@ impl NostrTransportAdapter {
     /// batch REQs, with every endpoint retained as an independent proof
     /// obligation.
     ///
-    /// A group sync that changes the routes replaces the batch entries with
-    /// its repack's, staged before their REQs go out; a route it still wants
+    /// A group sync that changes the routes replaces the batch entries of the
+    /// families it repacks, staged before their REQs go out; a route it still wants
     /// is never owed from a later floor, and only a removed route stops being
     /// owed. This lets a caller draining an unfloored
     /// re-activation avoid mistaking a quiet or fast-empty relay for a finished
@@ -3131,7 +3155,7 @@ impl TransportAdapter for NostrTransportAdapter {
             }
         }
 
-        let (to_add, desired, batches) = {
+        let (to_add, repacks) = {
             let state = self.state.read().await;
             // The `AccountNotActive` guard above ran under the subscription
             // lock this call holds, and only activate/sync/deactivate can
@@ -3141,8 +3165,10 @@ impl TransportAdapter for NostrTransportAdapter {
                 .get(&sync.account_id)
                 .expect("the AccountNotActive guard above proved the account is active");
             // Sends repeat this sync. Keep the committed routes and telemetry
-            // intact when nothing changed; failed relay teardown still retries.
+            // intact when nothing changed; failed relay teardown and failed
+            // family repacks still retry.
             if routes.groups == sync.group_subscriptions
+                && !routes.retry_repacks
                 && state.pending_unsubscribes.is_empty()
                 && state.pending_scoped_unsubscribes.is_empty()
             {
@@ -3162,33 +3188,39 @@ impl TransportAdapter for NostrTransportAdapter {
             );
             if to_add.is_empty() && to_remove.is_empty() {
                 // Nothing to repack: only the teardown retries below run.
-                (Vec::new(), None, Vec::new())
+                (Vec::new(), None)
             } else {
-                // Any change of routes repacks every group batch (#2266):
-                // appending batches fragmented them past the relay's REQ
-                // limit, kept a removed route's events arriving to be dropped,
-                // and left sync-made batches outside replay coverage.
-                let desired = repacked_group_routes(
+                // A change of routes repacks only the batch families it
+                // touches (#2266): appending batches fragmented them past the
+                // relay's REQ limit, kept a removed route's events arriving to
+                // be dropped, and left sync-made batches outside replay
+                // coverage, while repacking every family re-sent and coupled
+                // relay sets the change never touched.
+                let repacks = plan_family_repacks(
                     &sync,
                     routes,
                     &to_add,
+                    &to_remove,
                     state.account_subscription_eose(&sync.account_id).complete(),
                 );
-                let batches =
-                    pack_group_batches(&sync.account_id, &desired, attempt, routes.next_batch);
-                (to_add, Some(desired), batches)
+                (to_add, Some(repacks))
             }
         };
-        let Some(desired) = desired else {
+        let Some(repacks) = repacks else {
             // The same routes, perhaps reordered: keep the order the caller
             // sent so its repeats return early above.
             if let Some(routes) = self.state.write().await.accounts.get_mut(&sync.account_id) {
                 routes.groups = sync.group_subscriptions;
+                routes.retry_repacks = false;
             }
             self.drain_pending_unsubscribes().await;
             drop(subscription_guard);
             return Ok(());
         };
+        let batches = repacks
+            .iter()
+            .flat_map(|repack| repack.batches.iter().cloned())
+            .collect::<Vec<_>>();
 
         // Stage new route coverage and a telemetry overlay BEFORE the relay REQs
         // go out. Existing routes and committed telemetry remain live until the
@@ -3241,59 +3273,99 @@ impl TransportAdapter for NostrTransportAdapter {
 
         // The new batches go out before the ones they replace close, so no
         // route is ever without a live REQ.
-        let report = match self.subscribe_all("sync_account_groups", &batches).await {
-            Ok(report) => report,
-            Err(error) => {
-                // The authoritative routes and committed telemetry were never
-                // replaced. Discard only this batch's staged callbacks and rebuild
-                // the derived route index to remove its temporary coverage, then
-                // close the REQs the batch's successful siblings installed.
-                {
-                    let mut state = self.state.write().await;
-                    state.rollback_staged_subscription_starts();
-                    state.retire_unlive_replay_batches(&sync.account_id, &batches);
-                    state.rebuild_transport_group_index();
-                    state.metrics.group_syncs_failed += 1;
+        let mut outcomes = self
+            .subscribe_each("sync_account_groups", &batches)
+            .await
+            .into_iter();
+        // A family commits once all of its batches went out; one whose batch
+        // failed keeps its live batches and retries on the next sync.
+        let mut report = NostrSubscribeReport::default();
+        let mut first_error = None;
+        let mut committed = Vec::with_capacity(repacks.len());
+        for repack in &repacks {
+            let mut family_report = NostrSubscribeReport::default();
+            let mut sent = true;
+            for outcome in outcomes.by_ref().take(repack.batches.len()) {
+                match outcome {
+                    Ok(issued) => family_report.add(issued),
+                    Err(error) => {
+                        sent = false;
+                        first_error.get_or_insert(error);
+                    }
                 }
-                close_abandoned_sync_batch(
-                    &self.relay_client,
-                    &self.state,
-                    &self.subscribe_tasks,
-                    batches,
-                )
-                .await;
-                let _ = staging_complete.send(());
-
-                return Err(error);
             }
-        };
+            if sent {
+                report.add(family_report);
+            }
+            committed.push(sent);
+        }
+        let abandoned = repacks
+            .iter()
+            .zip(&committed)
+            .filter(|(_, committed)| !**committed)
+            .flat_map(|(repack, _)| repack.batches.iter().cloned())
+            .collect::<Vec<_>>();
+        let committed_ids = repacks
+            .iter()
+            .zip(&committed)
+            .filter(|(_, committed)| **committed)
+            .flat_map(|(repack, _)| {
+                repack
+                    .batches
+                    .iter()
+                    .map(NostrSubscription::subscription_id)
+            })
+            .collect::<HashSet<_>>();
+        let families_failed = committed.iter().filter(|committed| !**committed).count();
 
         // Commit routing intent BEFORE relay teardown: a failed unsubscribe
         // must never leave the routing index serving the old group set.
         // Removals are queued and drained below (plus any left over from
         // earlier syncs); failures there are absorbed and retried, never
-        // surfaced as an error.
+        // surfaced as an error. A failed family's own batches leave replay
+        // coverage, and the routing index rebuilt from the committed routes
+        // drops the routes it would have added.
         {
             let mut state = self.state.write().await;
-            state.commit_staged_subscription_starts();
+            state.settle_staged_subscription_starts(|id| committed_ids.contains(id));
             let account_id = sync.account_id.clone();
-            let replaced = state.sync_groups(sync, &desired, &batches);
+            let replaced = state.commit_group_sync(sync, &repacks, &committed);
             state.retire_replay_batches(&account_id, &replaced);
             state.forget_subscription_starts(&replaced);
             state.queue_pending_unsubscribes(replaced);
-            if report.is_degraded() {
+            state.retire_replay_batches(&account_id, &abandoned);
+            if first_error.is_some() {
+                state.metrics.group_syncs_failed += 1;
+            } else if report.is_degraded() {
                 state.metrics.group_syncs_degraded += 1;
             } else {
                 state.metrics.group_syncs_full += 1;
             }
         };
+        if !abandoned.is_empty() {
+            // Close the REQs a failed family's successful siblings installed.
+            close_abandoned_sync_batch(
+                &self.relay_client,
+                &self.state,
+                &self.subscribe_tasks,
+                abandoned,
+            )
+            .await;
+        }
+        if let Some(error) = first_error.take_if(|_| families_failed == repacks.len()) {
+            // Nothing committed, so nothing was replaced.
+            let _ = staging_complete.send(());
+            return Err(error);
+        }
 
         let (confirmed, failed_unsubscribe_count) = self.drain_pending_unsubscribes().await;
 
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "sync_account_groups",
-            subscriptions_created = batches.len(),
+            subscriptions_created = committed_ids.len(),
+            families_committed = committed.len() - families_failed,
+            families_failed,
             owed_relay_count = report.owed_relays,
             refused_relay_count = report.refused_relays,
             unsubscribes_confirmed = confirmed,
@@ -3310,7 +3382,7 @@ impl TransportAdapter for NostrTransportAdapter {
             );
         }
         let _ = staging_complete.send(());
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn deactivate_account(&self, account_id: &MemberId) -> Result<(), TransportAdapterError> {
@@ -3510,6 +3582,11 @@ struct AccountRoutes {
     /// The number the next batch a group sync adds takes within `attempt`.
     /// Spent when a sync stages its batches, so numbers are never reused.
     next_batch: u32,
+    /// Whether the last group sync left a family repack uncommitted. A sync
+    /// that matches `groups` still diffs them while this is set, so the
+    /// failed families are tried again even when no route changed shape: a
+    /// route re-added to widen its floor can be equal to the one it replaces.
+    retry_repacks: bool,
 }
 
 /// Endpoint coverage for the account's live inbox and group batch REQs, as
@@ -5926,27 +6003,75 @@ impl AdapterState {
                 attempt,
                 batches: batches.to_vec(),
                 next_batch: u32::try_from(batches.len()).unwrap_or(u32::MAX),
+                retry_repacks: false,
             },
         );
         self.rebuild_transport_group_index();
     }
 
-    /// Commit a group sync that changed the route set: its routes, the floor
-    /// each was issued at, and the batches that now carry them all. Returns
-    /// the batches they replace, for the caller to close.
-    fn sync_groups(
+    /// Commit the family repacks of a group sync whose batches all went out
+    /// (`committed`, in `repacks` order): their routes, the floor each was
+    /// issued at, and the batches that now carry them. A repack that did not
+    /// commit leaves its families as they were: their live batches keep
+    /// carrying their routes at their floors, a route it removed among them,
+    /// and a route it would have added stays out. The account is then marked
+    /// for the next sync to try those repacks again. Returns the batches the
+    /// committed repacks replace, for the caller to close.
+    fn commit_group_sync(
         &mut self,
         sync: TransportGroupSync,
-        routes: &[NostrSubscription],
-        batches: &[NostrSubscription],
+        repacks: &[FamilyRepack],
+        committed: &[bool],
     ) -> Vec<NostrSubscription> {
         let Some(account) = self.accounts.get_mut(&sync.account_id) else {
             return Vec::new();
         };
-        account.groups = sync.group_subscriptions;
-        account.group_since = issued_group_since(routes).collect();
-        let replaced = std::mem::replace(&mut account.batches, batches.to_vec());
-        self.metrics.subscriptions_created += batches.len();
+        let account_id = &sync.account_id;
+        let mut replaced = Vec::new();
+        let mut created = 0;
+        let mut not_added = HashSet::new();
+        let mut not_removed = HashSet::new();
+        for (repack, committed) in repacks.iter().zip(committed) {
+            if !committed {
+                not_added.extend(repack.added.iter().cloned());
+                not_removed.extend(repack.removed.iter().cloned());
+                continue;
+            }
+            let replaced_ids = repack
+                .replaced
+                .iter()
+                .map(NostrSubscription::subscription_id)
+                .collect::<HashSet<_>>();
+            account
+                .batches
+                .retain(|batch| !replaced_ids.contains(&batch.subscription_id()));
+            account.batches.extend(repack.batches.iter().cloned());
+            account
+                .group_since
+                .extend(issued_group_since(&repack.routes));
+            replaced.extend(repack.replaced.iter().cloned());
+            created += repack.batches.len();
+        }
+        let mut groups = sync
+            .group_subscriptions
+            .into_iter()
+            .filter(|group| !not_added.contains(&group_route_key(account_id, group)))
+            .collect::<Vec<_>>();
+        groups.extend(
+            account
+                .groups
+                .iter()
+                .filter(|group| not_removed.contains(&group_route_key(account_id, group)))
+                .cloned(),
+        );
+        let live = groups
+            .iter()
+            .map(|group| group_route_key(account_id, group))
+            .collect::<HashSet<_>>();
+        account.group_since.retain(|route, _| live.contains(route));
+        account.groups = groups;
+        account.retry_repacks = committed.contains(&false);
+        self.metrics.subscriptions_created += created;
         self.rebuild_transport_group_index();
         replaced
     }
@@ -6228,13 +6353,15 @@ impl AdapterState {
         }
     }
 
-    fn commit_staged_subscription_starts(&mut self) {
-        self.sync.commit_staged_subscription_starts();
+    fn rollback_staged_subscription_starts(&mut self) {
+        self.sync.rollback_staged_subscription_starts();
         self.staged_group_subscriptions.clear();
     }
 
-    fn rollback_staged_subscription_starts(&mut self) {
-        self.sync.rollback_staged_subscription_starts();
+    /// Commit the staged subscriptions `committed` accepts and roll back the
+    /// rest, as one settled sync whose families committed independently.
+    fn settle_staged_subscription_starts(&mut self, committed: impl Fn(&str) -> bool) {
+        self.sync.settle_staged_subscription_starts(committed);
         self.staged_group_subscriptions.clear();
     }
 
@@ -6626,41 +6753,220 @@ fn group_subscription(
     }
 }
 
-/// Every route a changed group sync wants, each at the floor its repacked
-/// batch asks from. A route the sync adds or widens takes its diff's floor.
-/// A route already live keeps the floor it was issued at, unless the
-/// activation's replay coverage is complete: its live REQs then served
-/// everything up to now, so it starts where a fresh activation would, at the
-/// sync's floor, instead of replaying that history again.
-fn repacked_group_routes(
+/// The relay set and floor a group route's batch shares: normalized
+/// endpoints and `since`. Routes pack into batches only within a family.
+type BatchFamily = (Vec<TransportEndpoint>, Option<Timestamp>);
+
+/// The share of a group sync that commits on its own: one or more batch
+/// families that change together, the live batches they replace and the
+/// batches that replace them. A repack commits once all of its batches went
+/// out; one whose batch failed leaves its families' live batches as they
+/// were, and the next sync tries it again.
+#[derive(Debug, Default)]
+struct FamilyRepack {
+    /// Live batches the repack replaces.
+    replaced: Vec<NostrSubscription>,
+    /// Every route the repack issues, at the floor its batch asks from.
+    routes: Vec<NostrSubscription>,
+    /// The batches carrying `routes`, numbered from the account's next batch.
+    batches: Vec<NostrSubscription>,
+    /// Routes the repack makes live that no live batch carried.
+    added: HashSet<NostrSubscriptionRouteKey>,
+    /// Routes the repack drops from the batches it replaces.
+    removed: HashSet<NostrSubscriptionRouteKey>,
+}
+
+/// The family a group route's REQ packs into.
+fn batch_family(route: &NostrSubscription) -> Option<BatchFamily> {
+    match route {
+        NostrSubscription::Group {
+            endpoints, since, ..
+        } => Some((normalized_endpoints(endpoints), *since)),
+        _ => None,
+    }
+}
+
+/// Repack only the batch families a changed group sync touches, and leave
+/// every other family's live batches as they are.
+///
+/// A family is repacked when a route leaves it (removed, or added again to
+/// widen its floor), when a route the sync issues joins it, or when its
+/// routes, issued again, would join a family the sync issues: the routes it
+/// re-sends must not leave a fragment of their family behind. A repacked
+/// family's routes are issued at the floor they were issued at, or at the
+/// sync's floor once the activation's replay coverage is complete, since
+/// their live REQs then served everything up to now; an added route takes
+/// its diff's floor. Completed coverage alone changes no family: a family
+/// nothing touches keeps its issued floor and is not re-sent.
+///
+/// Families that share a route or a family key change together, so each
+/// returned repack is a connected set of them, numbered in the order the
+/// sync lists their routes from the account's next batch.
+fn plan_family_repacks(
     sync: &TransportGroupSync,
     routes: &AccountRoutes,
     added: &[NostrSubscription],
+    removed: &[NostrSubscription],
     replay_complete: bool,
-) -> Vec<NostrSubscription> {
+) -> Vec<FamilyRepack> {
     let account_id = &sync.account_id;
-    let prior_route_keys = prior_group_route_keys(account_id, &sync.group_subscriptions);
+    // The live families, and the one that carries each live route.
+    let mut live = HashMap::<BatchFamily, Vec<NostrSubscription>>::new();
+    let mut live_order = Vec::new();
+    let mut carried_by = HashMap::new();
+    for batch in &routes.batches {
+        let NostrSubscription::GroupBatch {
+            routes: members,
+            endpoints,
+            since,
+            ..
+        } = batch
+        else {
+            continue;
+        };
+        let family = (normalized_endpoints(endpoints), *since);
+        for member in members {
+            let key = NostrSubscriptionRouteKey::Group {
+                account_id: account_id.clone(),
+                group_id: member.group_id.clone(),
+                transport_group_id: member.transport_group_id.clone(),
+                endpoints: family.0.clone(),
+            };
+            carried_by.insert(key, family.clone());
+        }
+        live.entry(family.clone())
+            .or_insert_with(|| {
+                live_order.push(family);
+                Vec::new()
+            })
+            .push(batch.clone());
+    }
+
+    // Each wanted route, the family carrying it now, and the REQ that issues
+    // it if its family is repacked. A route no live batch carries is always
+    // issued.
     let added = added
         .iter()
         .map(|route| (route.route_key(), route.clone()))
         .collect::<HashMap<_, _>>();
-    sync.group_subscriptions
+    let prior_route_keys = prior_group_route_keys(account_id, &sync.group_subscriptions);
+    let wanted = sync
+        .group_subscriptions
         .iter()
         .map(|group| {
             let key = group_route_key(account_id, group);
-            if let Some(route) = added.get(&key) {
-                return route.clone();
-            }
-            let fresh = group_route_since(account_id, group, &prior_route_keys, sync.since);
-            let since = match routes.group_since.get(&key) {
-                Some(issued) if !replay_complete => issued
-                    .zip(fresh)
-                    .map(|(issued, requested)| issued.min(requested)),
-                _ => fresh,
-            };
-            group_subscription(account_id, group, since, routes.attempt)
+            let carrier = carried_by.get(&key).cloned();
+            let issue = added.get(&key).cloned().unwrap_or_else(|| {
+                let fresh = group_route_since(account_id, group, &prior_route_keys, sync.since);
+                let since = match &carrier {
+                    Some((_, issued)) if !replay_complete => issued
+                        .zip(fresh)
+                        .map(|(issued, requested)| issued.min(requested)),
+                    _ => fresh,
+                };
+                group_subscription(account_id, group, since, routes.attempt)
+            });
+            let target = batch_family(&issue).expect("a group route has a family");
+            let always = added.contains_key(&key) || carrier.is_none();
+            (key, carrier, issue, target, always)
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    let mut dirty = removed
+        .iter()
+        .chain(added.values())
+        .filter_map(|route| carried_by.get(&route.route_key()).cloned())
+        .collect::<HashSet<_>>();
+    let issued = |dirty: &HashSet<BatchFamily>, carrier: &Option<BatchFamily>, always: bool| {
+        always
+            || carrier
+                .as_ref()
+                .is_some_and(|family| dirty.contains(family))
+    };
+    loop {
+        let targets = wanted
+            .iter()
+            .filter(|(_, carrier, _, _, always)| issued(&dirty, carrier, *always))
+            .map(|(_, _, _, target, _)| target)
+            .collect::<HashSet<_>>();
+        let joined = wanted
+            .iter()
+            .filter_map(|(_, carrier, _, target, _)| {
+                let family = carrier.as_ref()?;
+                (!dirty.contains(family) && (targets.contains(family) || targets.contains(target)))
+                    .then(|| family.clone())
+            })
+            .collect::<Vec<_>>();
+        if joined.is_empty() {
+            break;
+        }
+        dirty.extend(joined);
+    }
+
+    // Join each issued route's family to the one it lands in.
+    let mut parent = dirty
+        .iter()
+        .map(|family| (family.clone(), family.clone()))
+        .collect::<HashMap<_, _>>();
+    fn root(parent: &HashMap<BatchFamily, BatchFamily>, family: &BatchFamily) -> BatchFamily {
+        let mut family = family;
+        while let Some(up) = parent.get(family).filter(|up| *up != family) {
+            family = up;
+        }
+        family.clone()
+    }
+    for (_, carrier, _, target, always) in &wanted {
+        if !issued(&dirty, carrier, *always) {
+            continue;
+        }
+        parent
+            .entry(target.clone())
+            .or_insert_with(|| target.clone());
+        if let Some(carrier) = carrier {
+            let (from, to) = (root(&parent, carrier), root(&parent, target));
+            if from != to {
+                parent.insert(from, to);
+            }
+        }
+    }
+
+    let mut repacks = Vec::<FamilyRepack>::new();
+    let mut slots = HashMap::new();
+    let mut slot = |root: BatchFamily, repacks: &mut Vec<FamilyRepack>| {
+        *slots.entry(root).or_insert_with(|| {
+            repacks.push(FamilyRepack::default());
+            repacks.len() - 1
+        })
+    };
+    for (key, carrier, issue, target, always) in &wanted {
+        if !issued(&dirty, carrier, *always) {
+            continue;
+        }
+        let index = slot(root(&parent, target), &mut repacks);
+        repacks[index].routes.push(issue.clone());
+        if carrier.is_none() {
+            repacks[index].added.insert(key.clone());
+        }
+    }
+    for family in live_order.iter().filter(|family| dirty.contains(*family)) {
+        let index = slot(root(&parent, family), &mut repacks);
+        repacks[index].replaced.extend(live[family].iter().cloned());
+    }
+    for route in removed {
+        let key = route.route_key();
+        if let Some(family) = carried_by.get(&key) {
+            let index = slot(root(&parent, family), &mut repacks);
+            repacks[index].removed.insert(key);
+        }
+    }
+
+    let mut next_batch = routes.next_batch;
+    for repack in &mut repacks {
+        repack.batches = pack_group_batches(account_id, &repack.routes, routes.attempt, next_batch);
+        next_batch =
+            next_batch.saturating_add(u32::try_from(repack.batches.len()).unwrap_or(u32::MAX));
+    }
+    repacks
 }
 
 /// Pack per-route group REQs into batches of at most [`GROUP_BATCH_ROUTES`]
@@ -6674,8 +6980,7 @@ fn pack_group_batches(
     attempt: SubscriptionAttempt,
     first_batch: u32,
 ) -> Vec<NostrSubscription> {
-    type BatchKey = (Vec<TransportEndpoint>, Option<Timestamp>);
-    let mut families: Vec<(BatchKey, Vec<TransportEndpoint>, Vec<GroupBatchRoute>)> = Vec::new();
+    let mut families: Vec<(BatchFamily, Vec<TransportEndpoint>, Vec<GroupBatchRoute>)> = Vec::new();
     for route in routes {
         let NostrSubscription::Group {
             group_id,
@@ -7171,34 +7476,252 @@ mod batch_tests {
     #[test]
     fn repack_keeps_requested_floor() {
         let account = MemberId::new(vec![0xA1; 32]);
-        let group = TransportGroupSubscription {
-            group_id: GroupId::new(vec![0; 16]),
-            transport_group_id: vec![1; 32],
+        let retained = |byte: u8| TransportGroupSubscription {
+            group_id: GroupId::new(vec![byte; 16]),
+            transport_group_id: vec![byte; 32],
             endpoints: vec![TransportEndpoint("wss://a.example".into())],
             retained_since: Some(Timestamp(900)),
         };
-        let key = group_route_key(&account, &group);
+        let (kept, left) = (retained(0), retained(1));
+        let live = [&kept, &left].map(|group| {
+            group_subscription(
+                &account,
+                group,
+                Some(Timestamp(900)),
+                SubscriptionAttempt::INITIAL,
+            )
+        });
         let routes = AccountRoutes {
             inbox_endpoints: Vec::new(),
-            groups: vec![group.clone()],
-            group_since: HashMap::from([(key, Some(Timestamp(900)))]),
+            groups: vec![kept.clone(), left.clone()],
+            group_since: issued_group_since(&live).collect(),
             attempt: SubscriptionAttempt::INITIAL,
-            batches: Vec::new(),
-            next_batch: 0,
+            batches: pack_group_batches(&account, &live, SubscriptionAttempt::INITIAL, 0),
+            next_batch: 1,
+            retry_repacks: false,
         };
+        // Leaving one route repacks its family; the route it keeps is issued
+        // no later than the floor the sync asks for, replay complete or not.
         for complete in [false, true] {
             for floor in [None, Some(Timestamp(100))] {
                 let sync = TransportGroupSync {
                     account_id: account.clone(),
-                    group_subscriptions: vec![group.clone()],
+                    group_subscriptions: vec![kept.clone()],
                     since: floor,
                 };
-                let packed = repacked_group_routes(&sync, &routes, &[], complete);
+                let repacks =
+                    plan_family_repacks(&sync, &routes, &[], &[live[1].clone()], complete);
+                assert_eq!(repacks.len(), 1);
                 assert!(
-                    matches!(&packed[0], NostrSubscription::Group { since, .. } if *since == floor)
+                    matches!(&repacks[0].routes[..], [NostrSubscription::Group { since, .. }] if *since == floor)
                 );
+                assert_eq!(repacks[0].replaced, routes.batches);
             }
         }
+    }
+
+    fn relay_group(index: u8, endpoint: &str) -> TransportGroupSubscription {
+        TransportGroupSubscription {
+            group_id: GroupId::new(vec![index; 16]),
+            transport_group_id: vec![index; 32],
+            endpoints: vec![TransportEndpoint(endpoint.to_owned())],
+            retained_since: None,
+        }
+    }
+
+    /// The routes of an account whose live batches carry each family of
+    /// current routes at its floor, numbered from 0.
+    fn live_families(families: &[(&[TransportGroupSubscription], u64)]) -> AccountRoutes {
+        let account = MemberId::new(vec![0xA1; 32]);
+        let issued = families
+            .iter()
+            .flat_map(|(groups, since)| {
+                groups.iter().map(|group| {
+                    group_subscription(
+                        &account,
+                        group,
+                        Some(Timestamp(*since)),
+                        SubscriptionAttempt::INITIAL,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let batches = pack_group_batches(&account, &issued, SubscriptionAttempt::INITIAL, 0);
+        AccountRoutes {
+            inbox_endpoints: Vec::new(),
+            groups: families
+                .iter()
+                .flat_map(|(groups, _)| groups.iter().cloned())
+                .collect(),
+            group_since: issued_group_since(&issued).collect(),
+            attempt: SubscriptionAttempt::INITIAL,
+            next_batch: u32::try_from(batches.len()).unwrap(),
+            batches,
+            retry_repacks: false,
+        }
+    }
+
+    fn plan(
+        routes: &AccountRoutes,
+        desired: Vec<TransportGroupSubscription>,
+        since: u64,
+        replay_complete: bool,
+    ) -> Vec<FamilyRepack> {
+        let account = MemberId::new(vec![0xA1; 32]);
+        let sync = TransportGroupSync {
+            account_id: account.clone(),
+            group_subscriptions: desired,
+            since: Some(Timestamp(since)),
+        };
+        let (added, removed) = diff_group_subscriptions(
+            &account,
+            &routes.groups,
+            &routes.group_since,
+            &sync.group_subscriptions,
+            sync.since,
+            routes.attempt,
+        );
+        plan_family_repacks(&sync, routes, &added, &removed, replay_complete)
+    }
+
+    /// `(route id byte, since)` of each route a repack issues.
+    fn issued_floors(repack: &FamilyRepack) -> Vec<(u8, Option<u64>)> {
+        repack
+            .routes
+            .iter()
+            .map(|route| match route {
+                NostrSubscription::Group {
+                    transport_group_id,
+                    since,
+                    ..
+                } => (transport_group_id[0], since.map(|since| since.0)),
+                _ => panic!("a repack issues group routes"),
+            })
+            .collect()
+    }
+
+    /// A completed replay alone changes no family. Joining a group on B
+    /// repacks B's family, moved to the sync's floor once replay is complete
+    /// and kept at its own floor beside the new one before then; A's family,
+    /// which the join never touches, is not repacked either way.
+    #[test]
+    fn a_repack_reaches_only_families_its_routes_land_in() {
+        let (a, b) = ("wss://a.example", "wss://b.example");
+        let routes = live_families(&[
+            (&[relay_group(1, a), relay_group(2, a)], 100),
+            (&[relay_group(3, b)], 100),
+        ]);
+        let joined = vec![
+            relay_group(1, a),
+            relay_group(2, a),
+            relay_group(3, b),
+            relay_group(4, b),
+        ];
+
+        let repacks = plan(&routes, joined.clone(), 200, true);
+        assert_eq!(repacks.len(), 1);
+        assert_eq!(
+            issued_floors(&repacks[0]),
+            vec![(3, Some(200)), (4, Some(200))]
+        );
+        assert_eq!(repacks[0].replaced, routes.batches[1..]);
+        assert_eq!(
+            repacks[0]
+                .batches
+                .iter()
+                .map(batch_shape)
+                .collect::<Vec<_>>(),
+            [(2, 2, Some(Timestamp(200)))]
+        );
+
+        let repacks = plan(&routes, joined, 200, false);
+        assert_eq!(repacks.len(), 1);
+        assert_eq!(issued_floors(&repacks[0]), vec![(4, Some(200))]);
+        assert!(
+            repacks[0].replaced.is_empty(),
+            "B's family keeps its floor until its replay is complete"
+        );
+    }
+
+    /// Once replay is complete, a repack takes in every family of its relays
+    /// that would land in its own, so it never leaves a fragment behind: a
+    /// join merges both of A's floors into one batch at the sync's floor.
+    #[test]
+    fn a_repack_merges_the_families_it_lands_in() {
+        let (a, b) = ("wss://a.example", "wss://b.example");
+        let routes = live_families(&[
+            (&[relay_group(1, a), relay_group(2, a)], 100),
+            (&[relay_group(5, a)], 150),
+            (&[relay_group(3, b)], 100),
+        ]);
+        let repacks = plan(
+            &routes,
+            vec![
+                relay_group(1, a),
+                relay_group(2, a),
+                relay_group(5, a),
+                relay_group(3, b),
+                relay_group(6, a),
+            ],
+            200,
+            true,
+        );
+        assert_eq!(repacks.len(), 1);
+        assert_eq!(
+            issued_floors(&repacks[0]),
+            vec![
+                (1, Some(200)),
+                (2, Some(200)),
+                (5, Some(200)),
+                (6, Some(200))
+            ]
+        );
+        assert_eq!(repacks[0].replaced, routes.batches[..2]);
+        assert_eq!(repacks[0].batches.len(), 1);
+        assert_eq!(
+            repacks[0].added,
+            HashSet::from([group_route_key(
+                &MemberId::new(vec![0xA1; 32]),
+                &relay_group(6, a)
+            )])
+        );
+    }
+
+    /// Changes to unrelated families are separate repacks, each committing
+    /// on its own, numbered in the order the sync lists their routes from the
+    /// account's next batch: leaving a group on A repacks A's family without
+    /// it, and joining one on B starts a family beside B's.
+    #[test]
+    fn unrelated_family_changes_repack_apart() {
+        let (a, b) = ("wss://a.example", "wss://b.example");
+        let account = MemberId::new(vec![0xA1; 32]);
+        let routes = live_families(&[
+            (&[relay_group(1, a), relay_group(2, a)], 100),
+            (&[relay_group(3, b)], 100),
+        ]);
+        let repacks = plan(
+            &routes,
+            vec![relay_group(1, a), relay_group(3, b), relay_group(4, b)],
+            200,
+            false,
+        );
+        assert_eq!(repacks.len(), 2);
+        assert_eq!(issued_floors(&repacks[0]), vec![(1, Some(100))]);
+        assert_eq!(repacks[0].replaced, routes.batches[..1]);
+        assert_eq!(
+            repacks[0].removed,
+            HashSet::from([group_route_key(&account, &relay_group(2, a))])
+        );
+        assert!(repacks[0].added.is_empty());
+        assert_eq!(issued_floors(&repacks[1]), vec![(4, Some(200))]);
+        assert!(repacks[1].replaced.is_empty());
+        assert_eq!(
+            repacks
+                .iter()
+                .flat_map(|repack| repack.batches.iter().map(batch_shape))
+                .collect::<Vec<_>>(),
+            [(2, 1, Some(Timestamp(100))), (3, 1, Some(Timestamp(200)))]
+        );
     }
 
     #[tokio::test]

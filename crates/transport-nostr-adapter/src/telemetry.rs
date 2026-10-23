@@ -490,8 +490,8 @@ struct SubscriptionProgress {
 #[derive(Clone, Debug, Default)]
 struct StagedSubscriptionProgress {
     subscriptions: HashMap<String, SubscriptionProgress>,
-    first_event: Vec<(RelayIndex, u64)>,
-    eose: Vec<(RelayIndex, u64)>,
+    first_event: Vec<(String, RelayIndex, u64)>,
+    eose: Vec<(String, RelayIndex, u64)>,
     rollback_first_event: HashMap<(String, RelayIndex), u64>,
     rollback_eose: HashMap<(String, RelayIndex), u64>,
 }
@@ -559,25 +559,44 @@ impl RelaySyncTelemetry {
     /// Atomically promote staged progress and its aggregate samples after the
     /// relay subscription batch succeeds.
     pub fn commit_staged_subscription_starts(&mut self) {
-        let staged = std::mem::take(&mut self.staged);
-        self.subscriptions.extend(staged.subscriptions);
-        for (relay, elapsed_ms) in staged.first_event {
-            self.first_event
-                .entry(relay)
-                .or_default()
-                .record(elapsed_ms);
-        }
-        for (relay, elapsed_ms) in staged.eose {
-            self.eose.entry(relay).or_default().record(elapsed_ms);
-        }
+        self.settle_staged_subscription_starts(|_| true);
     }
 
     /// Discard progress from a failed subscription batch. Callbacks for an ID
     /// that was both staged and already committed are applied to the retained
     /// committed progress, because they may have come from its still-live REQ.
     pub fn rollback_staged_subscription_starts(&mut self) {
+        self.settle_staged_subscription_starts(|_| false);
+    }
+
+    /// Commit the staged progress of the ids `committed` accepts, as
+    /// [`Self::commit_staged_subscription_starts`] does, and roll back every
+    /// other staged id, as [`Self::rollback_staged_subscription_starts`] does.
+    pub fn settle_staged_subscription_starts(&mut self, committed: impl Fn(&str) -> bool) {
         let staged = std::mem::take(&mut self.staged);
+        self.subscriptions.extend(
+            staged
+                .subscriptions
+                .into_iter()
+                .filter(|(subscription_id, _)| committed(subscription_id)),
+        );
+        for (subscription_id, relay, elapsed_ms) in staged.first_event {
+            if committed(&subscription_id) {
+                self.first_event
+                    .entry(relay)
+                    .or_default()
+                    .record(elapsed_ms);
+            }
+        }
+        for (subscription_id, relay, elapsed_ms) in staged.eose {
+            if committed(&subscription_id) {
+                self.eose.entry(relay).or_default().record(elapsed_ms);
+            }
+        }
         for ((subscription_id, relay), now_ms) in staged.rollback_first_event {
+            if committed(&subscription_id) {
+                continue;
+            }
             if let Some(elapsed_ms) =
                 mark_first_event(&mut self.subscriptions, &subscription_id, relay, now_ms)
             {
@@ -588,6 +607,9 @@ impl RelaySyncTelemetry {
             }
         }
         for ((subscription_id, relay), now_ms) in staged.rollback_eose {
+            if committed(&subscription_id) {
+                continue;
+            }
             if let Some(elapsed_ms) =
                 mark_eose(&mut self.subscriptions, &subscription_id, relay, now_ms)
             {
@@ -614,7 +636,9 @@ impl RelaySyncTelemetry {
                 relay,
                 now_ms,
             ) {
-                self.staged.first_event.push((relay, elapsed_ms));
+                self.staged
+                    .first_event
+                    .push((subscription_id.to_string(), relay, elapsed_ms));
             }
             return;
         }
@@ -646,7 +670,9 @@ impl RelaySyncTelemetry {
                 relay,
                 now_ms,
             ) {
-                self.staged.eose.push((relay, elapsed_ms));
+                self.staged
+                    .eose
+                    .push((subscription_id.to_string(), relay, elapsed_ms));
             }
             return;
         }
@@ -740,11 +766,11 @@ impl RelaySyncTelemetry {
                 .count();
 
         let mut first_event = self.first_event.clone();
-        for (relay, elapsed_ms) in &self.staged.first_event {
+        for (_, relay, elapsed_ms) in &self.staged.first_event {
             first_event.entry(*relay).or_default().record(*elapsed_ms);
         }
         let mut eose = self.eose.clone();
-        for (relay, elapsed_ms) in &self.staged.eose {
+        for (_, relay, elapsed_ms) in &self.staged.eose {
             eose.entry(*relay).or_default().record(*elapsed_ms);
         }
         let mut relays: Vec<RelayIndex> = first_event.keys().chain(eose.keys()).copied().collect();
@@ -1271,6 +1297,28 @@ mod tests {
         assert_eq!(snapshot.first_event.sum_ms, 110);
         assert_eq!(snapshot.eose.sample_count(), 1);
         assert_eq!(snapshot.eose.sum_ms, 120);
+    }
+
+    #[test]
+    fn settled_staged_starts_commit_and_roll_back_per_subscription() {
+        let mut telem = RelaySyncTelemetry::default();
+        let mut expected = telem.clone();
+        expected.record_subscription_start("kept", &[A], 100);
+        expected.record_first_event("kept", A, 110);
+        expected.record_eose("kept", A, 120);
+
+        telem.begin_staged_subscription_starts();
+        telem.stage_subscription_start("kept", &[A], 100);
+        telem.stage_subscription_start("dropped", &[B], 100);
+        telem.record_first_event("kept", A, 110);
+        telem.record_eose("kept", A, 120);
+        telem.record_first_event("dropped", B, 130);
+        telem.record_eose("dropped", B, 140);
+        telem.settle_staged_subscription_starts(|id| id == "kept");
+
+        assert_eq!(telem.snapshot(), expected.snapshot());
+        assert_eq!(telem.subscription_synced("kept"), Some(true));
+        assert_eq!(telem.subscription_synced("dropped"), None);
     }
 
     #[test]

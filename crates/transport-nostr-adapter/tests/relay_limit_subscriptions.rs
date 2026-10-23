@@ -3195,11 +3195,12 @@ fn group_sync(fx: &Fixture, groups: Vec<TransportGroupSubscription>) -> Transpor
     }
 }
 
-/// Any change of routes repacks every group batch: the new batches go out
-/// and then the ones they replace close. A left group leaves the filters at
-/// once, and the batch count stays the packed count however routes change.
+/// A change of routes repacks the family it touches in full, here every
+/// route on the one relay and floor: the new batches go out and then the
+/// ones they replace close. A left group leaves the filters at once, and the
+/// batch count stays the packed count however routes change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_group_sync_repacks_every_batch() {
+async fn a_group_sync_repacks_its_family_in_full() {
     let fx = Fixture::new(LimitConfig::default(), false).await;
     let url = fx.limit.url();
     let all = groups(GROUP_BATCH_ROUTES + 10, &url);
@@ -3250,6 +3251,65 @@ async fn a_group_sync_repacks_every_batch() {
         .unwrap();
     let after = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
     assert_eq!(after.total_reqs, unchanged.total_reqs);
+    fx.shutdown().await;
+}
+
+/// A group sync re-sends only the family it changes, so during the repack a
+/// relay holds the live REQs plus that family's new batches alone. Joining
+/// a current group re-sends the current routes' two batches, and the two
+/// batches of retained routes at their own floor on the same relay stay
+/// live as they are, replay complete or not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_sync_resends_only_the_changed_family() {
+    const ROUTES: usize = GROUP_BATCH_ROUTES + 10;
+    const FAMILY_BATCHES: usize = ROUTES.div_ceil(GROUP_BATCH_ROUTES);
+    let fx = Fixture::new(LimitConfig::default(), false).await;
+    let url = fx.limit.url();
+    let since = Some(cgka_traits::Timestamp(1_700_000_000));
+    let mut all = groups(2 * ROUTES + 1, &url);
+    let mut retained = all.split_off(ROUTES + 1);
+    for route in &mut retained {
+        route.retained_since = Some(cgka_traits::Timestamp(1_600_000_000));
+    }
+    let joined = all.split_off(ROUTES);
+    let current = all;
+    let activation = TransportAccountActivation {
+        since,
+        ..fx.activation(
+            std::slice::from_ref(&url),
+            [current.clone(), retained.clone()].concat(),
+        )
+    };
+    fx.adapter.activate_account(activation).await.unwrap();
+    let before = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    let live = 1 + 2 * FAMILY_BATCHES;
+    assert_eq!(before.active_now(), live);
+
+    fx.adapter
+        .sync_account_groups(TransportGroupSync {
+            since,
+            ..group_sync(&fx, [current, joined, retained].concat())
+        })
+        .await
+        .unwrap();
+    let after = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    eprintln!("[h] one family re-sent {}", after.summary());
+    assert_eq!(
+        after.total_reqs - before.total_reqs,
+        FAMILY_BATCHES,
+        "only the current family's batches go out"
+    );
+    assert_eq!(
+        after.closes - before.closes,
+        FAMILY_BATCHES,
+        "and only its old batches close"
+    );
+    assert_eq!(after.active_now(), live);
+    assert!(
+        after.peak_active() <= live + FAMILY_BATCHES,
+        "the repack holds the changed family's batches twice, no other"
+    );
+    assert_eq!(after.rejections_total(), 0);
     fx.shutdown().await;
 }
 

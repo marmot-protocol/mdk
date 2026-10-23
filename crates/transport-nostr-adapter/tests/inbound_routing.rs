@@ -1804,8 +1804,8 @@ async fn cancelled_reissues_preserve_live_gates_and_apply_eose_on_rollback() {
         .await
         .expect("widening relay subscribe started");
 
-    // The sync repacks every route into fresh batches per relay and floor: 2
-    // and 4 for the new routes, 3 and 5 for the widened old ones. The live
+    // The sync repacks each changed family into fresh batches per relay and
+    // floor: 2 and 4 for the new routes, 3 and 5 for the widened old ones. The live
     // batches carrying the old routes stay open until the sync commits, which
     // would close them.
     let staged_unsynced_widening_id =
@@ -2580,10 +2580,9 @@ async fn a_live_retained_route_is_reissued_only_to_widen_it() {
     relay.take_issued_subscriptions();
 
     // Route 1 was replaced after the REQ it is live on was issued. That REQ
-    // already reaches further back than the switch floor. The sync repacks
-    // every route, so route 1 goes out again, but at the floor it is live at:
-    // the activation's replay has not completed, so a narrower floor could
-    // cut off history the replaced REQ was still returning.
+    // already reaches further back than the switch floor, so the route is not
+    // added again, and its relay is not the new route's: its batch stays live
+    // as it is. A narrower floor could cut off history it is still returning.
     adapter
         .sync_account_groups(sync(
             vec![
@@ -2596,15 +2595,12 @@ async fn a_live_retained_route_is_reissued_only_to_widen_it() {
         .expect("route change sync succeeds");
     assert_eq!(
         issued_group_floors(&relay),
-        vec![
-            (2, Some(Timestamp(cursor + 900))),
-            (1, Some(Timestamp(cursor))),
-        ],
-        "the displaced route keeps its wider live floor"
+        vec![(2, Some(Timestamp(cursor + 900)))],
+        "the displaced route keeps its wider live REQ"
     );
 
     // Route 2 is displaced in turn, with a switch floor below the cursor its
-    // live REQ was issued with: the repack widens it. Route 1 keeps its floor.
+    // live REQ was issued with: the repack widens it. Route 1 keeps its REQ.
     let rotated = vec![
         floored_route(&group_id, 3, None),
         floored_route(&group_id, 2, Some(cursor + 300)),
@@ -2619,7 +2615,6 @@ async fn a_live_retained_route_is_reissued_only_to_widen_it() {
         vec![
             (3, Some(Timestamp(cursor + 1_200))),
             (2, Some(Timestamp(cursor + 300))),
-            (1, Some(Timestamp(cursor))),
         ]
     );
 
@@ -2632,6 +2627,479 @@ async fn a_live_retained_route_is_reissued_only_to_widen_it() {
         Vec::new(),
         "an unchanged retained route is not reissued"
     );
+}
+
+fn relay_route(id: u8, relay: &str) -> TransportGroupSubscription {
+    TransportGroupSubscription {
+        group_id: cgka_traits::GroupId::new(vec![id; 16]),
+        transport_group_id: vec![id; 32],
+        endpoints: vec![TransportEndpoint(relay.into())],
+        retained_since: None,
+    }
+}
+
+/// `(relay, route id bytes)` of each group batch REQ in `issued`.
+fn issued_batches(issued: &[NostrSubscription]) -> Vec<(String, Vec<u8>)> {
+    issued
+        .iter()
+        .filter_map(|subscription| match subscription {
+            NostrSubscription::GroupBatch {
+                routes, endpoints, ..
+            } => Some((
+                endpoints[0].as_str().to_owned(),
+                routes
+                    .iter()
+                    .map(|route| route.transport_group_id[0])
+                    .collect(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn subscription_ids(subscriptions: &[NostrSubscription]) -> Vec<String> {
+    subscriptions
+        .iter()
+        .map(NostrSubscription::subscription_id)
+        .collect()
+}
+
+/// A group sync repacks only the batch families its change touches. Joining
+/// a group on relay B re-sends B's family and closes its old batch, and
+/// sends or closes nothing on relay A; leaving a group on A repacks A's
+/// family alone, and the left route's events stop matching at once.
+#[tokio::test]
+async fn a_group_sync_repacks_only_the_families_it_changes() {
+    const A: &str = "wss://a.example";
+    const B: &str = "wss://b.example";
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let since = Some(Timestamp(1_700_000_000));
+    let (a1, a2, b1, b2) = (
+        relay_route(1, A),
+        relay_route(2, A),
+        relay_route(3, B),
+        relay_route(4, B),
+    );
+    let sync = |routes: Vec<TransportGroupSubscription>| TransportGroupSync {
+        account_id: account_id.clone(),
+        group_subscriptions: routes,
+        since,
+    };
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![a1.clone(), a2.clone(), b1.clone()],
+            since,
+        })
+        .await
+        .expect("activation succeeds");
+    let a_batch = group_subscription_id(&adapter, &account_id, &a1).await;
+    let b_batch = group_subscription_id(&adapter, &account_id, &b1).await;
+    relay.take_issued_subscriptions();
+
+    adapter
+        .sync_account_groups(sync(vec![a1.clone(), a2.clone(), b1.clone(), b2.clone()]))
+        .await
+        .expect("the join succeeds");
+    assert_eq!(
+        issued_batches(&relay.take_issued_subscriptions()),
+        vec![(B.to_owned(), vec![3, 4])],
+        "only B's family goes out again"
+    );
+    assert_eq!(
+        subscription_ids(&std::mem::take(&mut *relay.unsubscribed.lock().unwrap())),
+        vec![b_batch],
+        "only B's old batch closes"
+    );
+    assert_eq!(
+        group_subscription_id(&adapter, &account_id, &a1).await,
+        a_batch,
+        "A's batch stays live as it was"
+    );
+    let b_batch = group_subscription_id(&adapter, &account_id, &b1).await;
+
+    adapter
+        .sync_account_groups(sync(vec![a1.clone(), b1.clone(), b2.clone()]))
+        .await
+        .expect("the leave succeeds");
+    assert_eq!(
+        issued_batches(&relay.take_issued_subscriptions()),
+        vec![(A.to_owned(), vec![1])],
+        "only A's family goes out again, without the left route"
+    );
+    assert_eq!(
+        subscription_ids(&std::mem::take(&mut *relay.unsubscribed.lock().unwrap())),
+        vec![a_batch],
+        "only A's old batch closes"
+    );
+    assert_eq!(
+        group_subscription_id(&adapter, &account_id, &b1).await,
+        b_batch
+    );
+    let route_event = async |id: &str, route: &TransportGroupSubscription| {
+        adapter
+            .handle_relay_event(NostrRelayEvent {
+                endpoint: TransportEndpoint(A.into()),
+                subscription_id: Some("a-sub".into()),
+                event: group_event(id, &route.transport_group_id),
+            })
+            .await
+            .expect("the relay event is handled")
+    };
+    assert_eq!(
+        route_event("40", &a2).await,
+        0,
+        "the left route's events stop matching"
+    );
+    assert_eq!(route_event("41", &a1).await, 1);
+}
+
+/// Fails every group batch REQ to `failing` the way a relay refuses one for
+/// good, and records what it is asked to subscribe and close.
+#[derive(Default)]
+struct FamilyFailureRelayClient {
+    failing: Mutex<Option<TransportEndpoint>>,
+    subscriptions: Mutex<Vec<NostrSubscription>>,
+    unsubscribed: Mutex<Vec<NostrSubscription>>,
+}
+
+#[async_trait]
+impl NostrRelayClient for FamilyFailureRelayClient {
+    async fn subscribe(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        self.subscriptions
+            .lock()
+            .unwrap()
+            .push(subscription.clone());
+        let failing = self.failing.lock().unwrap().clone();
+        if subscription.is_group_route()
+            && failing.is_some_and(|failing| subscription.endpoints().contains(&failing))
+        {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "injected terminal relay refusal".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        self.unsubscribed.lock().unwrap().push(subscription);
+        Ok(())
+    }
+
+    async fn unsubscribe_account(
+        &self,
+        _account_id: &MemberId,
+        _replacements: &[NostrSubscription],
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        Ok(())
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        _event: &NostrTransportEvent,
+        _required_acks: usize,
+    ) -> Result<NostrPublishOutcome, cgka_traits::TransportAdapterError> {
+        Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
+    }
+}
+
+/// A hard failure in one family commits the others. A sync that joins a
+/// group on A and one on B, while B refuses its REQ, commits A's repack and
+/// leaves B's live batch, routes and coverage as they were, and closes the
+/// batch B refused. The next sync repacks B alone. Every batch number the
+/// failed sync staged stays spent, so no batch id repeats.
+#[tokio::test]
+async fn a_failed_family_leaves_the_other_families_committed() {
+    const A: &str = "wss://a.example";
+    const B: &str = "wss://b.example";
+    let relay = Arc::new(FamilyFailureRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let since = Some(Timestamp(1_700_000_000));
+    let (a1, a2, b1, b2) = (
+        relay_route(1, A),
+        relay_route(2, A),
+        relay_route(3, B),
+        relay_route(4, B),
+    );
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![a1.clone(), b1.clone()],
+            since,
+        })
+        .await
+        .expect("activation succeeds");
+    let a_batch = group_subscription_id(&adapter, &account_id, &a1).await;
+    let b_batch = group_subscription_id(&adapter, &account_id, &b1).await;
+    let take = |log: &Mutex<Vec<NostrSubscription>>| std::mem::take(&mut *log.lock().unwrap());
+    let mut issued = take(&relay.subscriptions);
+    let joined = TransportGroupSync {
+        account_id: account_id.clone(),
+        group_subscriptions: vec![a1.clone(), a2.clone(), b1.clone(), b2.clone()],
+        since,
+    };
+
+    *relay.failing.lock().unwrap() = Some(TransportEndpoint(B.into()));
+    adapter
+        .sync_account_groups(joined.clone())
+        .await
+        .expect_err("B's refusal fails the sync");
+    let failed = take(&relay.subscriptions);
+    let mut failed_batches = issued_batches(&failed);
+    failed_batches.sort();
+    assert_eq!(
+        failed_batches,
+        vec![(A.to_owned(), vec![1, 2]), (B.to_owned(), vec![3, 4])]
+    );
+    let refused = failed
+        .iter()
+        .find(|batch| batch.endpoints()[0].as_str() == B)
+        .expect("B's batch went out")
+        .subscription_id();
+    let a_repacked = group_subscription_id(&adapter, &account_id, &a2).await;
+    assert_eq!(
+        group_subscription_id(&adapter, &account_id, &a1).await,
+        a_repacked,
+        "A's join committed"
+    );
+    assert_eq!(
+        adapter
+            .group_route_subscription_id(&account_id, &b2.transport_group_id)
+            .await,
+        None,
+        "B's join did not"
+    );
+    assert_eq!(
+        group_subscription_id(&adapter, &account_id, &b1).await,
+        b_batch,
+        "B's live batch stays"
+    );
+    let mut closed = subscription_ids(&take(&relay.unsubscribed));
+    closed.sort();
+    let mut expected = vec![a_batch, refused];
+    expected.sort();
+    assert_eq!(closed, expected, "A's old batch and B's refused one close");
+    let b2_event = adapter
+        .handle_relay_event(NostrRelayEvent {
+            endpoint: TransportEndpoint(B.into()),
+            subscription_id: Some("b-sub".into()),
+            event: group_event("42", &b2.transport_group_id),
+        })
+        .await
+        .expect("the relay event is handled");
+    assert_eq!(b2_event, 0, "B's uncommitted route routes nothing");
+    let coverage = adapter.account_subscription_eose(&account_id).await;
+    assert_eq!(
+        coverage.subscriptions, 3,
+        "the inbox and the A and B batches"
+    );
+    issued.extend(failed);
+
+    *relay.failing.lock().unwrap() = None;
+    adapter
+        .sync_account_groups(joined)
+        .await
+        .expect("the retry succeeds");
+    let retried = take(&relay.subscriptions);
+    assert_eq!(
+        issued_batches(&retried),
+        vec![(B.to_owned(), vec![3, 4])],
+        "only B's family is tried again"
+    );
+    assert_eq!(subscription_ids(&take(&relay.unsubscribed)), vec![b_batch]);
+    assert_eq!(
+        group_subscription_id(&adapter, &account_id, &a1).await,
+        a_repacked
+    );
+    issued.extend(retried);
+    let batch_ids = subscription_ids(&issued);
+    assert_eq!(
+        batch_ids.iter().collect::<HashSet<_>>().len(),
+        batch_ids.len(),
+        "no batch id repeats across the partial commit and its retry"
+    );
+    let metrics = adapter.metrics().await;
+    assert_eq!(
+        (metrics.group_syncs_failed, metrics.group_syncs_full),
+        (1, 1)
+    );
+}
+
+/// A failed repack is tried again by the next sync even when every route
+/// the sync names is equal to one already live. Rotating a group's current
+/// route displaces the old one, which is re-added at a full-backfill floor
+/// without changing shape. Its relay refuses, while the new route's family
+/// commits; the next identical sync re-sends only the widened family, and
+/// once that commits a repeat sends nothing.
+#[tokio::test]
+async fn a_failed_widening_is_tried_again_by_the_next_sync() {
+    let relay = Arc::new(FamilyFailureRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let group_id = cgka_traits::GroupId::new(vec![0xB2; 16]);
+    let since = Some(Timestamp(1_800_000_000));
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![floored_route(&group_id, 1, None)],
+            since,
+        })
+        .await
+        .expect("activation succeeds");
+    let rotated = TransportGroupSync {
+        account_id: account_id.clone(),
+        group_subscriptions: vec![
+            floored_route(&group_id, 2, None),
+            floored_route(&group_id, 1, None),
+        ],
+        since,
+    };
+    let floors = || {
+        let mut floors = std::mem::take(&mut *relay.subscriptions.lock().unwrap())
+            .into_iter()
+            .filter_map(|subscription| match subscription {
+                NostrSubscription::GroupBatch { routes, since, .. } => {
+                    Some((routes[0].transport_group_id[0], since))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        floors.sort();
+        floors
+    };
+    floors();
+
+    *relay.failing.lock().unwrap() = Some(TransportEndpoint("wss://route-1.example".into()));
+    adapter
+        .sync_account_groups(rotated.clone())
+        .await
+        .expect_err("the displaced route's relay refuses its widened REQ");
+    assert_eq!(floors(), vec![(1, None), (2, since)]);
+    assert!(
+        adapter
+            .group_route_subscription_id(&account_id, &[2; 32])
+            .await
+            .is_some(),
+        "the new current route's family committed"
+    );
+
+    *relay.failing.lock().unwrap() = None;
+    adapter
+        .sync_account_groups(rotated.clone())
+        .await
+        .expect("the retry succeeds");
+    assert_eq!(
+        floors(),
+        vec![(1, None)],
+        "the same sync widens only the refused family again"
+    );
+    adapter
+        .sync_account_groups(rotated)
+        .await
+        .expect("the repeat succeeds");
+    assert!(
+        floors().is_empty(),
+        "once it committed, a repeat sends nothing"
+    );
+}
+
+/// A repacked family's new batch enters replay coverage before its REQ goes
+/// out, as at activation, so the stored events and EOSE a relay sends inside
+/// the subscribe window count for it. The family the sync left alone keeps
+/// the coverage its own batch earned.
+#[tokio::test]
+async fn a_repacked_family_counts_the_replay_inside_its_subscribe_window() {
+    const A: &str = "wss://a.example";
+    const B: &str = "wss://b.example";
+    let relay = Arc::new(StoredReplayRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    relay.attach(&adapter);
+    let account_id = MemberId::new(vec![0xA1; 32]);
+    let (a1, b1, b2) = (relay_route(1, A), relay_route(3, B), relay_route(4, B));
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account_id.clone(),
+            inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
+            group_subscriptions: vec![a1.clone(), b1.clone()],
+            since: None,
+        })
+        .await
+        .expect("activation succeeds");
+    for _ in 0..2 {
+        let delivery = adapter.receive().await.unwrap().unwrap();
+        adapter
+            .ack_replay_delivery(&account_id, &delivery.message.id)
+            .await;
+    }
+    let a_batch = group_subscription_id(&adapter, &account_id, &a1).await;
+    relay.replayed_deliveries.store(0, Ordering::SeqCst);
+
+    adapter
+        .sync_account_groups(TransportGroupSync {
+            account_id: account_id.clone(),
+            group_subscriptions: vec![a1.clone(), b1.clone(), b2.clone()],
+            since: None,
+        })
+        .await
+        .expect("the join succeeds");
+    let b_batch = group_subscription_id(&adapter, &account_id, &b2).await;
+    assert_eq!(
+        group_subscription_id(&adapter, &account_id, &b1).await,
+        b_batch
+    );
+    assert_eq!(
+        group_subscription_id(&adapter, &account_id, &a1).await,
+        a_batch,
+        "A's family is not repacked"
+    );
+    assert_eq!(
+        relay.replayed_deliveries.load(Ordering::SeqCst),
+        2,
+        "B's new batch replayed both of its routes inside the subscribe window"
+    );
+    // B's new batch serves its whole family from its own boundary, and
+    // nothing else is served again.
+    let mut delivered = HashSet::new();
+    while let Ok(delivery) =
+        tokio::time::timeout(Duration::from_millis(50), adapter.receive()).await
+    {
+        let delivery = delivery.unwrap().unwrap();
+        adapter
+            .ack_replay_delivery(&account_id, &delivery.message.id)
+            .await;
+        delivered.insert((delivery.group_id_hint, delivery.source.subscription_id));
+    }
+    assert_eq!(
+        delivered,
+        HashSet::from([
+            (Some(b1.group_id.clone()), Some(b_batch.clone())),
+            (Some(b2.group_id.clone()), Some(b_batch.clone())),
+        ])
+    );
+    for (batch, relay) in [(&b_batch, B), (&a_batch, A)] {
+        assert_eq!(
+            adapter
+                .subscription_endpoint_eose(batch, &TransportEndpoint(relay.into()))
+                .await,
+            Some(true),
+            "{relay}'s live batch counts its EOSE"
+        );
+    }
+    let coverage = adapter.account_subscription_eose(&account_id).await;
+    assert_eq!((coverage.subscriptions, coverage.with_eose), (3, 2));
 }
 
 // Regression for mdk#337: a failed relay unsubscribe must not fail the sync or
@@ -3816,7 +4284,7 @@ async fn account_subscription_eose_follows_the_latest_activation_snapshot() {
 /// still-wanted route has served the subscription carrying it. A fast, empty
 /// relay must not stand in for a slower relay that holds the missing history,
 /// and a mid-attempt group sync must not erase that obligation. Coverage is
-/// no longer frozen across a changed sync: the sync's repack moves each
+/// no longer frozen across a changed sync: the repack of a family moves each
 /// wanted route's obligation, on all of its relays, onto the batch that now
 /// carries it. The name is kept for grep-ability.
 #[tokio::test]
@@ -3925,13 +4393,13 @@ async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
         .handle_relay_eose(group_b_inbound.clone(), group_id.clone())
         .await;
 
-    // A sync that joins a group on relay A alone repacks every route. The
-    // still-wanted group keeps both relays, so A answering the repacked
-    // batches cannot substitute for B serving the successor request.
+    // A sync that joins a group on the same two relays repacks their
+    // family. The still-wanted group keeps both relays, so A answering the
+    // repacked batch cannot substitute for B serving the successor request.
     let joined = TransportGroupSubscription {
         group_id: cgka_traits::GroupId::new(vec![0x55; 16]),
         transport_group_id: vec![0x66; 32],
-        endpoints: vec![group_a.clone()],
+        endpoints: vec![group_b.clone(), group_a.clone()],
         retained_since: None,
     };
     adapter
@@ -3943,12 +4411,15 @@ async fn account_subscription_eose_requires_the_frozen_relay_coverage() {
         .await
         .expect("group join succeeds");
     let repacked_group_id = group_subscription_id(&adapter, &account_id, &group).await;
-    let joined_id = group_subscription_id(&adapter, &account_id, &joined).await;
     assert_ne!(repacked_group_id, group_id, "the sync repacks the route");
+    assert_eq!(
+        group_subscription_id(&adapter, &account_id, &joined).await,
+        repacked_group_id,
+        "the joined route shares the repacked batch"
+    );
     adapter
-        .handle_relay_eose(group_a.clone(), repacked_group_id.clone())
+        .handle_relay_eose(group_a, repacked_group_id.clone())
         .await;
-    adapter.handle_relay_eose(group_a, joined_id).await;
     let delivery = adapter
         .receive()
         .await
