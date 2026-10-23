@@ -51,6 +51,13 @@ else
   exit 64
 fi
 prompt="$(cat)"
+# Forwarded prompts end with the connector's control instructions; echo only the inbound text.
+instructions=$'\n\nConnector-provided Marmot control instructions:'
+if [[ "$prompt" != *"$instructions"* ]]; then
+  echo "prompt is missing the connector control instructions" >&2
+  exit 64
+fi
+prompt="${prompt%%"$instructions"*}"
 if [ "$mode" = "resume" ]; then
   printf '%s\n' '{"type":"thread.started","thread_id":"thread_e2e"}'
   printf '{"type":"item.completed","item":{"type":"agent_message","text":"marmot-e2e-resume-ok: %s"}}\n' "$prompt"

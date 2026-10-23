@@ -93,6 +93,7 @@ pub enum OnboardingIssueFfi {
     MultiDeviceUnsupported,
     OtherInstallationPossible,
     DiscoveryIncomplete,
+    InspectionCompleted,
 }
 impl From<marmot_app::OnboardingIssue> for OnboardingIssueFfi {
     fn from(value: marmot_app::OnboardingIssue) -> Self {
@@ -120,6 +121,7 @@ impl From<marmot_app::OnboardingIssue> for OnboardingIssueFfi {
                 Self::OtherInstallationPossible
             }
             marmot_app::OnboardingIssue::DiscoveryIncomplete => Self::DiscoveryIncomplete,
+            marmot_app::OnboardingIssue::InspectionCompleted => Self::InspectionCompleted,
         }
     }
 }
@@ -147,6 +149,7 @@ impl From<OnboardingIssueFfi> for marmot_app::OnboardingIssue {
             OnboardingIssueFfi::MultiDeviceUnsupported => Self::MultiDeviceUnsupported,
             OnboardingIssueFfi::OtherInstallationPossible => Self::OtherInstallationPossible,
             OnboardingIssueFfi::DiscoveryIncomplete => Self::DiscoveryIncomplete,
+            OnboardingIssueFfi::InspectionCompleted => Self::InspectionCompleted,
         }
     }
 }
@@ -201,16 +204,89 @@ impl From<OnboardingActionFfi> for marmot_app::OnboardingAction {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OnboardingFindingContextFfi {
+    Unknown,
+    RecordDiscovery,
+    PublishedDeclaration,
+    DeclaredRoute,
+    RepairApproval,
+    RepairPublication,
+}
+impl From<marmot_app::OnboardingFindingContext> for OnboardingFindingContextFfi {
+    fn from(value: marmot_app::OnboardingFindingContext) -> Self {
+        match value {
+            marmot_app::OnboardingFindingContext::Unknown => Self::Unknown,
+            marmot_app::OnboardingFindingContext::RecordDiscovery => Self::RecordDiscovery,
+            marmot_app::OnboardingFindingContext::PublishedDeclaration => {
+                Self::PublishedDeclaration
+            }
+            marmot_app::OnboardingFindingContext::DeclaredRoute => Self::DeclaredRoute,
+            marmot_app::OnboardingFindingContext::RepairApproval => Self::RepairApproval,
+            marmot_app::OnboardingFindingContext::RepairPublication => Self::RepairPublication,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OnboardingCheckPurposeFfi {
+    Unknown,
+    RecordLookup,
+    DeclarationValidation,
+    DirectoryQuery,
+    SourceFreshness,
+    EventPublication,
+}
+impl From<marmot_app::OnboardingCheckPurpose> for OnboardingCheckPurposeFfi {
+    fn from(value: marmot_app::OnboardingCheckPurpose) -> Self {
+        match value {
+            marmot_app::OnboardingCheckPurpose::Unknown => Self::Unknown,
+            marmot_app::OnboardingCheckPurpose::RecordLookup => Self::RecordLookup,
+            marmot_app::OnboardingCheckPurpose::DeclarationValidation => {
+                Self::DeclarationValidation
+            }
+            marmot_app::OnboardingCheckPurpose::DirectoryQuery => Self::DirectoryQuery,
+            marmot_app::OnboardingCheckPurpose::SourceFreshness => Self::SourceFreshness,
+            marmot_app::OnboardingCheckPurpose::EventPublication => Self::EventPublication,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OnboardingCheckOutcomeFfi {
+    Unknown,
+    Success,
+    Failure,
+}
+impl From<marmot_app::OnboardingCheckOutcome> for OnboardingCheckOutcomeFfi {
+    fn from(value: marmot_app::OnboardingCheckOutcome) -> Self {
+        match value {
+            marmot_app::OnboardingCheckOutcome::Unknown => Self::Unknown,
+            marmot_app::OnboardingCheckOutcome::Success => Self::Success,
+            marmot_app::OnboardingCheckOutcome::Failure => Self::Failure,
+        }
+    }
+}
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct OnboardingFindingFfi {
     pub issue: OnboardingIssueFfi,
     pub endpoint: Option<String>,
+    pub context: OnboardingFindingContextFfi,
+    pub purpose: OnboardingCheckPurposeFfi,
+    pub outcome: OnboardingCheckOutcomeFfi,
+    pub declared_capability: OnboardingRelayCapabilityFfi,
+    pub actions: Vec<OnboardingActionFfi>,
+    pub observed_revision: Option<u64>,
 }
 impl From<marmot_app::OnboardingFinding> for OnboardingFindingFfi {
     fn from(value: marmot_app::OnboardingFinding) -> Self {
         Self {
             issue: value.issue.into(),
             endpoint: value.endpoint,
+            context: value.context.into(),
+            purpose: value.purpose.into(),
+            outcome: value.outcome.into(),
+            declared_capability: value.declared_capability.into(),
+            actions: value.actions.into_iter().map(Into::into).collect(),
+            observed_revision: value.observed_revision,
         }
     }
 }

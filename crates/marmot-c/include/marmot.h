@@ -344,7 +344,40 @@ typedef enum MarmotOnboardingIssue {
   MARMOT_ONBOARDING_ISSUE_MULTI_DEVICE_UNSUPPORTED,
   MARMOT_ONBOARDING_ISSUE_OTHER_INSTALLATION_POSSIBLE,
   MARMOT_ONBOARDING_ISSUE_DISCOVERY_INCOMPLETE,
+  MARMOT_ONBOARDING_ISSUE_INSPECTION_COMPLETED,
 } MarmotOnboardingIssue;
+
+typedef enum MarmotOnboardingFindingContext {
+  MARMOT_ONBOARDING_FINDING_CONTEXT_UNKNOWN,
+  MARMOT_ONBOARDING_FINDING_CONTEXT_RECORD_DISCOVERY,
+  MARMOT_ONBOARDING_FINDING_CONTEXT_PUBLISHED_DECLARATION,
+  MARMOT_ONBOARDING_FINDING_CONTEXT_DECLARED_ROUTE,
+  MARMOT_ONBOARDING_FINDING_CONTEXT_REPAIR_APPROVAL,
+  MARMOT_ONBOARDING_FINDING_CONTEXT_REPAIR_PUBLICATION,
+} MarmotOnboardingFindingContext;
+
+typedef enum MarmotOnboardingCheckPurpose {
+  MARMOT_ONBOARDING_CHECK_PURPOSE_UNKNOWN,
+  MARMOT_ONBOARDING_CHECK_PURPOSE_RECORD_LOOKUP,
+  MARMOT_ONBOARDING_CHECK_PURPOSE_DECLARATION_VALIDATION,
+  MARMOT_ONBOARDING_CHECK_PURPOSE_DIRECTORY_QUERY,
+  MARMOT_ONBOARDING_CHECK_PURPOSE_SOURCE_FRESHNESS,
+  MARMOT_ONBOARDING_CHECK_PURPOSE_EVENT_PUBLICATION,
+} MarmotOnboardingCheckPurpose;
+
+typedef enum MarmotOnboardingCheckOutcome {
+  MARMOT_ONBOARDING_CHECK_OUTCOME_UNKNOWN,
+  MARMOT_ONBOARDING_CHECK_OUTCOME_SUCCESS,
+  MARMOT_ONBOARDING_CHECK_OUTCOME_FAILURE,
+} MarmotOnboardingCheckOutcome;
+
+typedef enum MarmotOnboardingRelayCapability {
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_NONE,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_READ,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_WRITE,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_READ_AND_WRITE,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_INBOX,
+} MarmotOnboardingRelayCapability;
 
 typedef enum MarmotOnboardingAction {
   MARMOT_ONBOARDING_ACTION_RETRY,
@@ -381,14 +414,6 @@ typedef enum MarmotOnboardingRelayTagDisposition {
   MARMOT_ONBOARDING_RELAY_TAG_DISPOSITION_REMOVED,
   MARMOT_ONBOARDING_RELAY_TAG_DISPOSITION_ADDED,
 } MarmotOnboardingRelayTagDisposition;
-
-typedef enum MarmotOnboardingRelayCapability {
-  MARMOT_ONBOARDING_RELAY_CAPABILITY_NONE,
-  MARMOT_ONBOARDING_RELAY_CAPABILITY_READ,
-  MARMOT_ONBOARDING_RELAY_CAPABILITY_WRITE,
-  MARMOT_ONBOARDING_RELAY_CAPABILITY_READ_AND_WRITE,
-  MARMOT_ONBOARDING_RELAY_CAPABILITY_INBOX,
-} MarmotOnboardingRelayCapability;
 
 typedef enum MarmotOnboardingDeviceDiscovery {
   MARMOT_ONBOARDING_DEVICE_DISCOVERY_NONE_FOUND,
@@ -1991,6 +2016,17 @@ typedef struct MarmotSignOutOutcome {
 typedef struct MarmotOnboardingFinding {
   enum MarmotOnboardingIssue issue;
   char *endpoint;
+  enum MarmotOnboardingFindingContext context;
+  enum MarmotOnboardingCheckPurpose purpose;
+  enum MarmotOnboardingCheckOutcome outcome;
+  enum MarmotOnboardingRelayCapability declared_capability;
+  enum MarmotOnboardingAction *actions;
+  uintptr_t actions_len;
+  bool has_observed_revision;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t observed_revision;
 } MarmotOnboardingFinding;
 
 typedef struct MarmotOnboardingStepState {

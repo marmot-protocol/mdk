@@ -1209,6 +1209,51 @@ impl AppClient {
         result
     }
 
+    /// Refresh group subscriptions before a send, or another operation that
+    /// does not use them, without making the operation depend on them
+    /// (mdk#2562).
+    ///
+    /// Publishing needs only an active account: each send carries its own
+    /// relays, and subscriptions only receive. A refresh that fails here,
+    /// typically because a group's relays are unreachable right now, stays
+    /// armed for the worker's retry, and a send goes on to the engine, which
+    /// owns its delivery. An inactive account still fails, so a caller can
+    /// take the inactive-account queue.
+    pub(crate) async fn sync_runtime_groups_for_send(
+        &mut self,
+        method: &'static str,
+    ) -> Result<(), AppError> {
+        let result = self.sync_runtime_groups().await;
+        self.tolerate_pre_send_sync_failure(method, result)
+    }
+
+    /// The failure policy of [`Self::sync_runtime_groups_for_send`], for a
+    /// caller that runs the refresh itself to time it.
+    pub(crate) fn tolerate_pre_send_sync_failure(
+        &mut self,
+        method: &'static str,
+        result: Result<(), AppError>,
+    ) -> Result<(), AppError> {
+        if result.is_err() {
+            // `sync_runtime_groups` arms the retry only once it has read the
+            // rebuild floor. The send no longer reports an earlier failure,
+            // so arm it here for every failure.
+            self.pending_runtime_group_subscription_refresh = true;
+        }
+        match result {
+            Err(error) if !error.is_account_not_active() => {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = method,
+                    error_kind = error.privacy_safe_kind(),
+                    "group subscription refresh failed; the operation continues and the refresh retries"
+                );
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
     async fn sync_runtime_groups_since(
         &mut self,
         rebuild_since: Option<cgka_traits::transport::Timestamp>,

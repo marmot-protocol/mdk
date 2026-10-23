@@ -13,6 +13,13 @@ downgrade is unsupported. See the
 
 ### Breaking changes
 
+- `OnboardingFindingFfi` adds `context`, `purpose`, `outcome`,
+  `declared_capability`, `actions`, and `observed_revision` (mdk#2565).
+  Update host record construction and use the typed provenance to distinguish
+  discovery failures from declared-route checks. `OnboardingIssueFfi` adds
+  `InspectionCompleted`; update exhaustive Swift `switch` / Kotlin `when`
+  handling. A successful directory query does not establish write support.
+
 - Every `Marmot` constructor requires a `MarmotDeploymentFfi`.
   `MarmotOptions.deployment` has no default, and `new`, `new_with_options`,
   `new_with_secret_store`, `new_with_cursor_persistence` and

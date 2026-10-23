@@ -10,11 +10,20 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 ## [0.14.0] - 2026-10-23
 
 Recompile against the matching `marmot.h` and library: every `marmot_client_new*` constructor takes a required
-`deployment`, `MarmotRetentionSweepStatus` values renumber, and new transfer-state and status values are appended.
-Existing record layouts are unchanged. See the [release notes](../../docs/release/0.14.0.md) and the
+`deployment`, `MarmotRetentionSweepStatus` values renumber, `MarmotOnboardingFinding` changes layout, and new
+transfer-state, onboarding-issue and status values are appended. Every other existing record layout is unchanged. See the [release notes](../../docs/release/0.14.0.md) and the
 [client upgrade guide](../../docs/integration/0.14.0.md).
 
 ### Breaking changes
+
+- `MarmotOnboardingFinding` adds typed `context`, `purpose`, `outcome`,
+  `declared_capability`, owned `actions`/`actions_len`, and optional
+  `has_observed_revision`/`observed_revision` (mdk#2565). Rebuild consumers
+  with the regenerated header and matching library; the finding layout and
+  array stride changed. Snapshot deep-free releases finding actions.
+  `MarmotOnboardingIssue` appends `InspectionCompleted` (21); all earlier
+  discriminants are unchanged. Directory-query success does not establish
+  write support or event publication.
 
 - Every `marmot_client_new*` constructor takes a required
   `const MarmotDeployment *deployment` just before `out_client` (#2408,

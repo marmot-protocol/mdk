@@ -7915,6 +7915,7 @@ mod tests {
     mod publication_progress_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod receive_comparison_resume_tests;
+    mod refused_subscription_send_tests;
     mod resource_bounds_tests;
     pub(super) mod secondary_retry_scheduler_tests;
     mod selective_history_tests;

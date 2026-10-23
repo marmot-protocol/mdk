@@ -1761,14 +1761,11 @@ pub(crate) fn recover_interrupted_rewind_guard<S: StorageProvider>(
 /// canonicalization core consumes (for delivery *and* app-witness scoring), so the
 /// pass falls back to a fresh full materialize.
 ///
-/// Perf note: re-admitting already-delivered (`Processed`) app messages as
-/// witnesses (see `canonicalize_stored_openmls_messages`) means `has_pending_apps`
-/// is true on any pass where a delivered app is still inside the retained window —
-/// so those passes pay the full-materialize cost instead of reusing. The cost is
-/// bounded by `max_rewind_commits` and convergence is not the per-message hot path,
-/// so it is negligible for small groups. If a benchmark ever shows it matters for
-/// large, busy groups, gate the witness re-admission on the presence of a contested
-/// fork (competing branches) rather than on any retained app.
+/// Perf note: a delivered (`Processed`) application re-admitted as a witness
+/// counts as pending too, so a pass holding one pays the full materialize.
+/// Seeding admits delivered applications only above the pass's witness floor,
+/// where they can weigh on selection, or when a pending application of the
+/// same epoch needs them for its receive ratchet (mdk#2330).
 fn can_reuse_bfs_materialization(
     has_pending_apps: bool,
     materialized_len: usize,

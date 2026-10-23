@@ -243,6 +243,13 @@
 
 ### Fixed
 
+- Sends, media preparation and group changes continue when the pre-send group
+  subscription refresh fails (mdk#2562). When a group's relays were
+  unreachable, the refreshed REQ was refused and the send failed with it,
+  although publishing carries its own relays. The refresh stays armed for the
+  worker's retry.
+- `ctutils` 0.4.5 fixes non-constant-time mask generation and `u128`
+  comparisons (RUSTSEC-2026-0385).
 - `shutdown_and_close` and `close_storage` now close every connection that
   can hold a lock in the Marmot root before releasing the root lease,
   including each account engine's own `session.sqlite` connection and opens
@@ -393,6 +400,15 @@
   coverage reports `DirectoryLookupIncomplete`; `RelayDirectory` remains for a fetch
   that failed.
 - Group changes fail with `AppError::GroupCatchingUp` while unresolved epoch-gap recovery (pending, parked or with its notice dismissed) covers the group's current local epoch. Before, a device that knew the group had moved on could still commit from its stale epoch and fork the group (mdk#2258). The check is advisory: after the user accepts the risk, `acknowledge_group_catching_up` lets the change through. Due self-updates wait up to 24 hours for the gap to close. Messages and leave are not affected.
+- One unreachable relay no longer fails an account's transport activation or
+  group sync (mdk#1951). Once a relay had failed two connection attempts, the
+  relay client refused new subscriptions to it, and when that was a route's
+  only relay the whole activation rolled back, taking the inbox and every
+  healthy group offline. The client now keeps such a relay's subscription and
+  sends it when the relay reconnects. `NostrAdapterMetrics` gains
+  `activations_full`, `activations_degraded`, `activations_failed`,
+  `group_syncs_full`, `group_syncs_degraded` and `group_syncs_failed`; struct
+  literals need the fields or `..Default::default()`.
 - A failed or cancelled transport activation no longer leaves untracked REQs
   live on the relay. They used to stay open until disconnect, be re-sent on
   every reconnect, and use up the relay's per-connection subscription limit

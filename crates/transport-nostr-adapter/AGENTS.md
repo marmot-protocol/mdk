@@ -65,6 +65,21 @@ for reconnect/backoff and relay status mechanics.
     neither can interleave with an activation mid-sweep or a retry re-registering the id.
   - A failed or cancelled group sync closes the REQs its batch installed once its subscribe tasks settle, except ids
     the committed routes still want (`close_abandoned_sync_batch`). Its guard holds the lifecycle lock throughout.
+- Never fail a subscription, activation or group sync because a relay is unreachable (#1951). nostr-sdk refuses a
+  REQ outright on a relay that failed more than one connect attempt, and its reconnect re-sends only the REQs it
+  registered:
+  - `subscribe_planned` records such a relay's REQ (id and original filter) in `OwedSubscriptions`. The relay's
+    frontier monitor re-sends it on the relay's next `Connected`, after emitting that connection's replay boundary,
+    and after a lag cutover; `subscribe_planned` re-sends at once when the relay connected before the entry existed.
+  - Only a refusal no reconnect cures counts against a plan (`relay_owes`: relay gone, banned, terminated or shut
+    down, unable to read, or already holding the id). A plan fails only when no relay registered or owes its REQ.
+  - Owed ids stay in `account_subscriptions`. `unsubscribe` and each id of `unsubscribe_account` forget the id under
+    the re-send lock before its CLOSE, and a re-send holds that lock across its check and registration, so a closed
+    REQ never comes back. A new CLOSE path must forget first too.
+  - Owing adds no replay-coverage state: an owed relay stays `RelayReplay::Awaiting` like one that queued the REQ
+    while disconnected, and restarts at its connection boundary.
+  - `NostrSubscribeReport` carries aggregate owed and refused relay counts into the `activations_*` and
+    `group_syncs_*` metrics. Clients that do not override `subscribe_reporting` report every success as full.
 - Never count a replay a relay may have clamped as coverage (#2263):
   - `observe_relay_event` takes an authenticated event id and counts each relay's stored events per activation,
     sync or maintenance REQ until that relay's EOSE, without materializing a DTO. Consumers must pass a relay's

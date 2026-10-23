@@ -516,6 +516,26 @@ pub struct NostrAdapterMetrics {
     /// history they were missing (`NostrReconciliationSummary::order_unproven`).
     #[serde(default)]
     pub reconciliation_order_unproven_passes: usize,
+    /// Account activations whose every REQ reached every relay.
+    #[serde(default)]
+    pub activations_full: usize,
+    /// Account activations that succeeded while some relay owed or refused a
+    /// REQ ([`NostrSubscribeReport::is_degraded`]).
+    #[serde(default)]
+    pub activations_degraded: usize,
+    /// Account activations that failed and rolled back.
+    #[serde(default)]
+    pub activations_failed: usize,
+    /// Group syncs that issued REQs, each of which reached every relay.
+    #[serde(default)]
+    pub group_syncs_full: usize,
+    /// Group syncs that issued REQs and succeeded while some relay owed or
+    /// refused one.
+    #[serde(default)]
+    pub group_syncs_degraded: usize,
+    /// Group syncs whose REQs failed, leaving the committed routes in place.
+    #[serde(default)]
+    pub group_syncs_failed: usize,
 }
 
 /// Successful/failed endpoint-level result from a relay client publish.
@@ -781,6 +801,33 @@ pub struct SubscriptionRefusalReports {
     pub dropped: u64,
 }
 
+/// Relays that could not take one subscription's REQ when it was issued.
+///
+/// Aggregate counts only, for degraded-activation telemetry (#1951). A
+/// subscription is still live when this is degraded: an owed relay gets the
+/// REQ on its next connection, and every other relay took it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NostrSubscribeReport {
+    /// Relays that refused the REQ because they were unreachable. The relay
+    /// client re-sends it, with the same id and filter, on each one's next
+    /// connection.
+    pub owed_relays: usize,
+    /// Connected relays that refused the REQ while another relay took it.
+    pub refused_relays: usize,
+}
+
+impl NostrSubscribeReport {
+    /// Whether any relay did not take the REQ when it was issued.
+    pub fn is_degraded(&self) -> bool {
+        self.owed_relays > 0 || self.refused_relays > 0
+    }
+
+    fn add(&mut self, other: Self) {
+        self.owed_relays += other.owed_relays;
+        self.refused_relays += other.refused_relays;
+    }
+}
+
 /// Boundary between this adapter and the actual Nostr relay implementation.
 #[async_trait]
 pub trait NostrRelayClient: Send + Sync {
@@ -820,6 +867,22 @@ pub trait NostrRelayClient: Send + Sync {
 
     async fn subscribe(&self, subscription: NostrSubscription)
     -> Result<(), TransportAdapterError>;
+
+    /// `subscribe`, reporting the relays that did not take the REQ yet.
+    ///
+    /// An unreachable relay must not fail the subscription: the client keeps
+    /// that relay's REQ owed and sends it on reconnect, under the same
+    /// tracking `unsubscribe` and `unsubscribe_account` close. Fail only when
+    /// no relay took the REQ or owes it. Clients without that distinction
+    /// report every successful subscribe as full.
+    async fn subscribe_reporting(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<NostrSubscribeReport, TransportAdapterError> {
+        self.subscribe(subscription)
+            .await
+            .map(|()| NostrSubscribeReport::default())
+    }
 
     async fn unsubscribe(
         &self,
@@ -1252,7 +1315,7 @@ impl NostrTransportAdapter {
         &self,
         caller: &'static str,
         subscriptions: &[NostrSubscription],
-    ) -> Result<(), TransportAdapterError> {
+    ) -> Result<NostrSubscribeReport, TransportAdapterError> {
         let mut tasks = DetachOnDrop(JoinSet::new());
         for (sub_index, subscription) in subscriptions.iter().cloned().enumerate() {
             let relay_client = self.relay_client.clone();
@@ -1262,7 +1325,7 @@ impl NostrTransportAdapter {
             let barrier = self.current_subscribe_tasks();
             let in_flight = barrier.clone().read_owned().await;
             tasks.0.spawn(async move {
-                let result = relay_client.subscribe(subscription.clone()).await;
+                let result = relay_client.subscribe_reporting(subscription.clone()).await;
                 // A lifecycle operation that gave up waiting for this task
                 // retired its barrier and may already have swept the account,
                 // so a REQ registered now could be live with nothing tracking
@@ -1314,9 +1377,10 @@ impl NostrTransportAdapter {
         // race that REQ. Subscribe calls queue REQs without waiting for relay
         // replies, so draining the rest is short.
         let mut first_error = None;
+        let mut report = NostrSubscribeReport::default();
         while let Some(result) = tasks.join_next().await {
             match result {
-                Ok((_sub_index, Ok(()))) => {}
+                Ok((_sub_index, Ok(issued))) => report.add(issued),
                 Ok((sub_index, Err(err))) => {
                     tracing::warn!(
                         target: "transport_nostr_adapter::adapter",
@@ -1337,7 +1401,7 @@ impl NostrTransportAdapter {
             }
         }
 
-        first_error.map_or(Ok(()), Err)
+        first_error.map_or(Ok(report), Err)
     }
 
     /// Drain relay unsubscribes queued in `pending_unsubscribes`. A local
@@ -2953,9 +3017,14 @@ impl TransportAdapter for NostrTransportAdapter {
         // double-delivers, because routing is content-keyed rather than
         // subscription-keyed. Transfer planned ownership before closing old
         // REQs so sockets needed by the replacement stay open.
-        self.relay_client
+        if let Err(error) = self
+            .relay_client
             .unsubscribe_account(&account_id, &issued)
-            .await?;
+            .await
+        {
+            self.state.write().await.metrics.activations_failed += 1;
+            return Err(error);
+        }
 
         // Register routing/telemetry state BEFORE the relay REQs go out: a
         // relay may stream stored events the moment it sees a subscription,
@@ -2988,38 +3057,52 @@ impl TransportAdapter for NostrTransportAdapter {
             tokio::spawn(owner.run());
         }
 
-        if let Err(error) = self.subscribe_all("activate_account", &issued).await {
-            // Some concurrent REQs may already have succeeded. Tear those
-            // down best-effort, then always remove the pre-registered local
-            // routes so callers never observe a half-active account.
-            //
-            // `state.activate` above already ran, so this activation's attempt
-            // is in the high-water map before `subscribe_all` was even tried.
-            // The retry depends on that ordering: `deactivate` below drops the
-            // routes but not the high-water mark, so the retry issues a fresh
-            // attempt rather than reusing the ids of REQs that did reach a
-            // relay and are still streaming.
-            let relay_cleanup_failed = self
-                .relay_client
-                .unsubscribe_account(&account_id, &[])
-                .await
-                .is_err();
+        let report = match self.subscribe_all("activate_account", &issued).await {
+            Ok(report) => report,
+            Err(error) => {
+                // Some concurrent REQs may already have succeeded. Tear those
+                // down best-effort, then always remove the pre-registered local
+                // routes so callers never observe a half-active account.
+                //
+                // `state.activate` above already ran, so this activation's attempt
+                // is in the high-water map before `subscribe_all` was even tried.
+                // The retry depends on that ordering: `deactivate` below drops the
+                // routes but not the high-water mark, so the retry issues a fresh
+                // attempt rather than reusing the ids of REQs that did reach a
+                // relay and are still streaming.
+                let relay_cleanup_failed = self
+                    .relay_client
+                    .unsubscribe_account(&account_id, &[])
+                    .await
+                    .is_err();
+                let mut state = self.state.write().await;
+                state.forget_account_subscription_starts(&account_id);
+                state.clear_pending_unsubscribes_for_account(&account_id);
+                state.deactivate(&account_id, issued.len());
+                state.metrics.activations_failed += 1;
+                tracing::warn!(
+                    target: "transport_nostr_adapter::adapter",
+                    method = "activate_account",
+                    relay_cleanup_failed,
+                    "rolled back transport account after subscription failure"
+                );
+                return Err(error);
+            }
+        };
+        {
             let mut state = self.state.write().await;
-            state.forget_account_subscription_starts(&account_id);
-            state.clear_pending_unsubscribes_for_account(&account_id);
-            state.deactivate(&account_id, issued.len());
-            tracing::warn!(
-                target: "transport_nostr_adapter::adapter",
-                method = "activate_account",
-                relay_cleanup_failed,
-                "rolled back transport account after subscription failure"
-            );
-            return Err(error);
+            if report.is_degraded() {
+                state.metrics.activations_degraded += 1;
+            } else {
+                state.metrics.activations_full += 1;
+            }
         }
         tracing::debug!(
             target: "transport_nostr_adapter::adapter",
             method = "activate_account",
             issued_count = issued.len(),
+            owed_relay_count = report.owed_relays,
+            refused_relay_count = report.refused_relays,
             "all transport subscriptions issued"
         );
         Ok(())
@@ -3158,28 +3241,32 @@ impl TransportAdapter for NostrTransportAdapter {
 
         // The new batches go out before the ones they replace close, so no
         // route is ever without a live REQ.
-        if let Err(error) = self.subscribe_all("sync_account_groups", &batches).await {
-            // The authoritative routes and committed telemetry were never
-            // replaced. Discard only this batch's staged callbacks and rebuild
-            // the derived route index to remove its temporary coverage, then
-            // close the REQs the batch's successful siblings installed.
-            {
-                let mut state = self.state.write().await;
-                state.rollback_staged_subscription_starts();
-                state.retire_unlive_replay_batches(&sync.account_id, &batches);
-                state.rebuild_transport_group_index();
-            }
-            close_abandoned_sync_batch(
-                &self.relay_client,
-                &self.state,
-                &self.subscribe_tasks,
-                batches,
-            )
-            .await;
-            let _ = staging_complete.send(());
+        let report = match self.subscribe_all("sync_account_groups", &batches).await {
+            Ok(report) => report,
+            Err(error) => {
+                // The authoritative routes and committed telemetry were never
+                // replaced. Discard only this batch's staged callbacks and rebuild
+                // the derived route index to remove its temporary coverage, then
+                // close the REQs the batch's successful siblings installed.
+                {
+                    let mut state = self.state.write().await;
+                    state.rollback_staged_subscription_starts();
+                    state.retire_unlive_replay_batches(&sync.account_id, &batches);
+                    state.rebuild_transport_group_index();
+                    state.metrics.group_syncs_failed += 1;
+                }
+                close_abandoned_sync_batch(
+                    &self.relay_client,
+                    &self.state,
+                    &self.subscribe_tasks,
+                    batches,
+                )
+                .await;
+                let _ = staging_complete.send(());
 
-            return Err(error);
-        }
+                return Err(error);
+            }
+        };
 
         // Commit routing intent BEFORE relay teardown: a failed unsubscribe
         // must never leave the routing index serving the old group set.
@@ -3194,6 +3281,11 @@ impl TransportAdapter for NostrTransportAdapter {
             state.retire_replay_batches(&account_id, &replaced);
             state.forget_subscription_starts(&replaced);
             state.queue_pending_unsubscribes(replaced);
+            if report.is_degraded() {
+                state.metrics.group_syncs_degraded += 1;
+            } else {
+                state.metrics.group_syncs_full += 1;
+            }
         };
 
         let (confirmed, failed_unsubscribe_count) = self.drain_pending_unsubscribes().await;
@@ -3202,6 +3294,8 @@ impl TransportAdapter for NostrTransportAdapter {
             target: "transport_nostr_adapter::adapter",
             method = "sync_account_groups",
             subscriptions_created = batches.len(),
+            owed_relay_count = report.owed_relays,
+            refused_relay_count = report.refused_relays,
             unsubscribes_confirmed = confirmed,
             "applied transport group subscription diff"
         );
@@ -7317,5 +7411,197 @@ mod batch_tests {
             "the batch may take more than one route allowance"
         );
         assert!(losses.pending.lock().unwrap().is_empty());
+    }
+
+    /// Reports every REQ on `owing` as owed by that unreachable relay.
+    struct OwingRelayClient {
+        owing: TransportEndpoint,
+    }
+
+    #[async_trait]
+    impl NostrRelayClient for OwingRelayClient {
+        async fn subscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
+            Ok(())
+        }
+
+        async fn subscribe_reporting(
+            &self,
+            subscription: NostrSubscription,
+        ) -> Result<NostrSubscribeReport, TransportAdapterError> {
+            Ok(NostrSubscribeReport {
+                owed_relays: usize::from(subscription.endpoints().contains(&self.owing)),
+                refused_relays: 0,
+            })
+        }
+
+        async fn unsubscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
+            Ok(())
+        }
+
+        async fn unsubscribe_account(
+            &self,
+            _: &MemberId,
+            _: &[NostrSubscription],
+        ) -> Result<(), TransportAdapterError> {
+            Ok(())
+        }
+
+        async fn publish_event(
+            &self,
+            _: &[TransportEndpoint],
+            _: &NostrTransportEvent,
+            _: usize,
+        ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+            unreachable!("replay coverage does not publish")
+        }
+    }
+
+    /// A relay that owes a REQ (#1951) replays exactly like one that queued it
+    /// while disconnected: `Awaiting` until its endpoint deadline, dormant
+    /// after it, waiting again from its first connection, then complete at
+    /// its EOSE. Owing adds no replay-coverage state.
+    #[tokio::test(start_paused = true)]
+    async fn owed_relay_replays_like_a_queued_one() {
+        let owed = TransportEndpoint("wss://owed.example".to_owned());
+        let queued = TransportEndpoint("wss://queued.example".to_owned());
+        let inbox = TransportEndpoint("wss://inbox.example".to_owned());
+        let adapter = NostrTransportAdapter::new(Arc::new(OwingRelayClient {
+            owing: owed.clone(),
+        }));
+        let account = MemberId::new(vec![0xA1; 32]);
+        let group = |index: u8, endpoint: &TransportEndpoint| TransportGroupSubscription {
+            group_id: GroupId::new(vec![index; 16]),
+            transport_group_id: vec![index; 32],
+            endpoints: vec![endpoint.clone()],
+            retained_since: None,
+        };
+        adapter
+            .activate_account(TransportAccountActivation {
+                account_id: account.clone(),
+                inbox_endpoints: vec![inbox.clone()],
+                group_subscriptions: vec![group(1, &owed), group(2, &queued)],
+                since: Some(Timestamp(100)),
+            })
+            .await
+            .unwrap();
+        let metrics = adapter.metrics().await;
+        assert_eq!(
+            (metrics.activations_degraded, metrics.activations_full),
+            (1, 0)
+        );
+        let batch_on = |endpoint: &TransportEndpoint| {
+            let adapter = adapter.clone();
+            let endpoint = endpoint.clone();
+            let account = account.clone();
+            async move {
+                adapter.state.read().await.accounts[&account]
+                    .batches
+                    .iter()
+                    .find(|batch| batch.endpoints() == [endpoint.clone()])
+                    .map(NostrSubscription::subscription_id)
+                    .expect("one batch per relay")
+            }
+        };
+        let sources = [
+            (batch_on(&owed).await, owed.clone()),
+            (batch_on(&queued).await, queued.clone()),
+        ];
+        let views = || async {
+            let state = adapter.state.read().await;
+            let coverage = &state.account_replay_coverage[&account];
+            sources
+                .iter()
+                .map(|(id, endpoint)| {
+                    let relay = state.relay_index.existing_index_for(endpoint).unwrap();
+                    let phases = coverage
+                        .groups
+                        .values()
+                        .flat_map(|group| &group.streams)
+                        .filter(|(owner, _)| *owner.request == **id && owner.relay == relay)
+                        .map(|(_, stream)| stream.phase)
+                        .collect::<Vec<_>>();
+                    (
+                        coverage.subscriptions[id][&relay],
+                        coverage.endpoint_deadlines[id][&relay].deadline,
+                        phases,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let assert_alike =
+            |views: Vec<(RelayReplay, Option<tokio::time::Instant>, Vec<_>)>,
+             expected: (RelayReplay, Option<tokio::time::Instant>, Vec<_>)| {
+                assert_eq!(
+                    views[0], views[1],
+                    "an owed relay replays like a queued one"
+                );
+                assert_eq!(views[0], expected);
+            };
+
+        let staged = tokio::time::Instant::now();
+        assert_alike(
+            views().await,
+            (
+                RelayReplay::Awaiting,
+                Some(staged + REPLAY_PAGE_LIMITS.max_duration),
+                vec![ReplayAdmission::Waiting],
+            ),
+        );
+
+        tokio::time::advance(REPLAY_PAGE_LIMITS.max_duration).await;
+        adapter
+            .state
+            .write()
+            .await
+            .account_replay_coverage
+            .get_mut(&account)
+            .unwrap()
+            .expire_replay(tokio::time::Instant::now());
+        assert_alike(
+            views().await,
+            (RelayReplay::Awaiting, None, vec![ReplayAdmission::Dormant]),
+        );
+
+        let connected = tokio::time::Instant::now();
+        for (_, endpoint) in &sources {
+            assert!(
+                adapter
+                    .observe_replay_epoch(
+                        Some(&account),
+                        endpoint,
+                        [1, 1],
+                        ReplayRestart::Connection
+                    )
+                    .await
+            );
+        }
+        assert_alike(
+            views().await,
+            (
+                RelayReplay::Awaiting,
+                Some(connected + REPLAY_PAGE_LIMITS.max_duration),
+                vec![ReplayAdmission::Waiting],
+            ),
+        );
+
+        let inbox_id = adapter
+            .state
+            .read()
+            .await
+            .account_subscription_ids(&account)[0]
+            .clone();
+        adapter.handle_relay_eose(inbox, inbox_id).await;
+        for (id, endpoint) in &sources {
+            adapter
+                .handle_relay_eose(endpoint.clone(), id.clone())
+                .await;
+        }
+        let views = views().await;
+        assert_eq!(
+            views[0], views[1],
+            "an owed relay replays like a queued one"
+        );
+        assert_eq!(views[0].0, RelayReplay::Eose);
+        assert!(adapter.account_subscription_eose(&account).await.complete());
     }
 }
