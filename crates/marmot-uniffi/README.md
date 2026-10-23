@@ -442,6 +442,21 @@ Imported identities can use the durable preflight API instead of `login`:
    initial KeyPackage. `account_setup_readiness` stays `Initializing` until the
    interactive workflow is complete.
 
+Findings carry typed `context`, `purpose`, `outcome`, `declared_capability`,
+`actions`, and `observed_revision` alongside `issue` and `endpoint`. Render
+each finding separately, even when endpoints match. Use its actions as the
+authoritative subset applicable to that finding; an empty list offers no
+finding-specific action. The step's `actions` remain the full set, including
+single-device consent and KeyPackage setup actions outside relay diagnostics.
+`InspectionCompleted` with `DirectoryQuery` success records only a successful
+directory inspection, not relay write support or event publication. Timeouts,
+incomplete discovery, and unreachable queries leave the outcome unknown.
+Retained findings keep their original observed revision and step `checked_at`;
+interpret revisions only within the snapshot's account and recovery epoch.
+Observations outside relay diagnostics may have unknown context/purpose/outcome
+and no finding actions. Legacy checkpoints also have no observed revision;
+rechecking supplies a fresh revision without upgrading retained evidence.
+
 ### Explicit recovery and checkpoint compatibility
 
 When `begin_*_onboarding` or cancellation returns `OnboardingActionUnavailable`,

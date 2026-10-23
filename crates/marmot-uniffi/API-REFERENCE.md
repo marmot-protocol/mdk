@@ -2782,6 +2782,11 @@ pub fn snapshot(&self) -> OnboardingSnapshotFfi
 
 Read the initial/current snapshot for this handle; follow its feature contract for one-shot versus repeatable reads.
 
+Each finding preserves typed context, check purpose/outcome, declared capability,
+allowed finding actions, and optional original observation revision. Keep rows
+with the same endpoint separate. See the [evidence limits](README.md#interactive-account-onboarding);
+`InspectionCompleted` directory-query success is not event-publication evidence.
+
 [Source](src/commands/onboarding.rs#L19)
 
 ### `OnboardingSubscription::next`

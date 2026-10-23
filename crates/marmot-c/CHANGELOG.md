@@ -9,6 +9,15 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Breaking changes
 
+- `MarmotOnboardingFinding` adds typed `context`, `purpose`, `outcome`,
+  `declared_capability`, owned `actions`/`actions_len`, and optional
+  `has_observed_revision`/`observed_revision` (mdk#2565). Rebuild consumers
+  with the regenerated header and matching library; the finding layout and
+  array stride changed. Snapshot deep-free releases finding actions.
+  `MarmotOnboardingIssue` appends `InspectionCompleted` (21); all earlier
+  discriminants are unchanged. Directory-query success does not establish
+  write support or event publication.
+
 - Every `marmot_client_new*` constructor takes a required `const MarmotDeployment *deployment` just before `out_client` (host-configuration brief, PRs 2 and 3). The opaque `MarmotDeployment` (`marmot_deployment_white_noise`, `marmot_deployment_neutral`, the `marmot_deployment_set_*` setters, `marmot_deployment_free`) carries the recovery relays, discovery indexers, media and image servers, Open Ranking, KeyPackage client preference, moderation label namespace and keychain service; the client copies it. A NULL deployment returns `MARMOT_STATUS_NULL_POINTER` before anything opens. White Noise hosts pass `marmot_deployment_white_noise()`, which keeps their behaviour and keychain unchanged; unset values fall back to nothing. `MarmotClientOptions` is unchanged. Use matching regenerated headers and libraries.
 
 ### Added

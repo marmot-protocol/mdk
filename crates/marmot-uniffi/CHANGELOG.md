@@ -4,6 +4,13 @@
 
 ### Breaking changes
 
+- `OnboardingFindingFfi` adds `context`, `purpose`, `outcome`,
+  `declared_capability`, `actions`, and `observed_revision` (mdk#2565).
+  Update host record construction and use the typed provenance to distinguish
+  discovery failures from declared-route checks. `OnboardingIssueFfi` adds
+  `InspectionCompleted`; update exhaustive Swift `switch` / Kotlin `when`
+  handling. A successful directory query does not establish write support.
+
 - `AttachmentTransferStateFfi` adds `CleanedBySetting`: the account's "Keep
   media" setting removed the body (mdk#2314 step 10); download again is
   allowed, as for `Removed`. Update exhaustive Swift `switch` / Kotlin `when`
