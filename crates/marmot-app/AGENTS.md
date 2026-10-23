@@ -220,6 +220,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the app's own code uses.
 - Keep the crate root focused on app construction, shared state, storage/projector wiring, account relay-list helpers,
   and public re-exports.
+- Never publish an account relay list from the cache alone. `ensure_local_account_relay_lists`, which every KeyPackage
+  publish, setup publish and rotation runs first, leaves an open generated setup's lists to that setup (mdk#2359);
+  otherwise it adopts the published lists through `resolve_account_relay_list_status_for_account_id` and publishes only
+  a kind a complete read proved absent (mdk#2550).
 - Keep CLI/TUI presentation out of this crate.
 - Keep the Nostr user directory app-facing and pubkey-keyed. It may cache local-account links, profile metadata, follow
   lists, relay lists, and KeyPackages. Web-of-trust search may traverse the live follow graph, but traversal is bounded

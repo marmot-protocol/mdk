@@ -2558,6 +2558,16 @@ impl MarmotApp {
             .await
     }
 
+    /// Give a local account both relay lists before a KeyPackage publish.
+    ///
+    /// Both lists are replaceable, so a publish replaces whatever the identity
+    /// already published. An identity imported offline has no cached copy, and
+    /// a kind 10002 with no write relay counts as missing, so an incomplete
+    /// cache is not absence: read the published lists first and adopt what the
+    /// read finds (it caches them). Publish the app's relays only for a list
+    /// that a complete read of those relays, and of the outboxes they
+    /// advertise, proves absent. An incomplete read or a published list with
+    /// no usable relay publishes nothing and fails (mdk#2550).
     async fn ensure_local_account_relay_lists(
         &self,
         label: &str,
@@ -2588,10 +2598,19 @@ impl MarmotApp {
         if default_relays.is_empty() {
             return Err(AppError::MissingRelayLists(status.missing));
         }
+        // Fails with `DirectoryLookupIncomplete` or `MissingRelayLists` rather
+        // than report a kind as missing that the read did not prove absent.
+        let published = self
+            .directory()
+            .resolve_account_relay_list_status_for_account_id(
+                &account.account_id_hex,
+                default_relays.clone(),
+            )
+            .await?;
         self.publish_missing_account_relay_lists_from_status(
             label,
             AccountRelayListBootstrap::new(default_relays.clone(), default_relays),
-            status,
+            published,
         )
         .await
     }

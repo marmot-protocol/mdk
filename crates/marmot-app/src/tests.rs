@@ -5,6 +5,7 @@ mod follow_list_edits;
 mod group_lookup;
 pub(crate) mod invite_recovery;
 mod key_package_inventory;
+mod key_package_relay_lists;
 mod key_package_selection;
 mod message_journeys;
 mod publication_progress;
@@ -1061,6 +1062,24 @@ impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
                 event,
             })
             .collect())
+    }
+
+    // The scripted relay holds every event published through it, so a read
+    // finishes unless a query's limit cut it short.
+    async fn fetch_directory_events_with_completion(
+        &self,
+        request: transport_nostr::DirectoryFetchRequest,
+    ) -> Result<transport_nostr::DirectoryFetchOutcome, String> {
+        let queries = request.queries.clone();
+        let records = self.fetch_directory_events(request).await?;
+        let complete = queries.iter().all(|query| {
+            records
+                .iter()
+                .filter(|record| query.matches(&record.event))
+                .count()
+                < query.limit
+        });
+        Ok(transport_nostr::DirectoryFetchOutcome { records, complete })
     }
 }
 
