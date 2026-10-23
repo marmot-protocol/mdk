@@ -772,7 +772,10 @@ jobs:
           tool: cargo-nextest@0.9.132
 
       - name: Run relay runtime tests serially
-        # Preserve the former cargo-test lane's no-retry behavior.
+        # Preserve the former cargo-test lane's no-retry behavior. Ignored
+        # tests stay out of the queue: the 1,600-message
+        # `offline_replay_crosses_queue` case outruns slow runners (mdk#2538)
+        # and runs nightly in simulator-nightly.yml with these same flags.
         env:
           RUST_BACKTRACE: "1"
         run: cargo nextest run --archive-file tests.tar.zst --extract-to "$GITHUB_WORKSPACE" --workspace-remap "$GITHUB_WORKSPACE" --profile ci --retries 0 --test-threads 1 --partition count:${{ matrix.partition }}/2 -E 'binary(relay_runtime)'
