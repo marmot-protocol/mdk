@@ -8,7 +8,9 @@ agnostic; the optional `sdk` feature adds a `nostr-sdk` backed `NostrSdkRelayCli
 
 - Activates account inbox subscriptions and group subscriptions, refreshes group subscriptions for an active account,
   and removes stale group subscriptions when an active account's group set changes. Group routes go out batched, up
-  to `GROUP_BATCH_ROUTES` (50) per REQ, so a 1,000-group account holds about 21 REQs per relay.
+  to `GROUP_BATCH_ROUTES` (50) per REQ, so a 1,000-group account holds about 21 REQs per relay. A group sync
+  re-sends only the batches of the relay sets and floors its change touches, and each of those commits on its own:
+  a relay set whose REQ fails keeps its live batches, and the next sync tries it again.
 - Keeps activation and group sync going when a relay is unreachable. The `sdk` client holds that relay's REQ and
   sends it when the relay reconnects; a subscription fails only when no relay took it or owes it. The adapter
   metrics count full, degraded and failed activations and syncs.
