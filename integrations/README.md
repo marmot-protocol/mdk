@@ -3,7 +3,8 @@
 Connectors that let you chat with an agent runtime you already run (Hermes, OpenClaw, Claude Code, Codex, OpenCode,
 Pi, or Goose) from White Noise, over end-to-end encrypted Marmot groups. Each connector runs next to the local `wn-agent`
 service on your Mac or Linux machine. Start with [Get Started](#get-started-white-noise--agents); the later sections
-explain topology, identities, and sharing for operators.
+explain topology, identities, and sharing for operators. To write your own client against `wn-agent` instead, such as a
+notifier bot, see [Build your own client](custom-client.md).
 
 ## Contents
 
@@ -53,6 +54,7 @@ Choose the runtime you already use:
 | OpenCode | Terminal harness | Repository and coding tasks through OpenCode |
 | Pi | Terminal harness | Repository and coding tasks through Pi |
 | Goose | Terminal harness | Repository and coding tasks through Goose |
+| Your own client | `wn-agent` only | Notifier bots, scripts and custom runtimes ([guide](custom-client.md)) |
 
 The guided installers prompt on the terminal for the White Noise account that
 may invite and message the agent. They install the selected WN Agent release, create
@@ -83,7 +85,7 @@ install_verified() (
   case "$installer_url" in
     *[!a-zA-Z0-9:/._-]*) echo "error: invalid installer URL" >&2; exit 1 ;;
   esac
-  if ! printf '%s\n' "$installer_url" | LC_ALL=C grep -Eq '^https://github[.]com/marmot-protocol/mdk/releases/download/wn-agent-v[0-9]+[.][0-9]+[.][0-9]+/install-(hermes|openclaw|claude|codex|opencode|pi|goose)-marmot[.]sh$'; then
+  if ! printf '%s\n' "$installer_url" | LC_ALL=C grep -Eq '^https://github[.]com/marmot-protocol/mdk/releases/download/wn-agent-v[0-9]+[.][0-9]+[.][0-9]+/install-((hermes|openclaw|claude|codex|opencode|pi|goose)-marmot|wn-agent)[.]sh$'; then
     echo "error: select a numeric WN Agent release before installing" >&2
     exit 1
   fi
@@ -197,6 +199,21 @@ Run this example in the same shell where `install_verified` above was defined.
 ```sh
 install_verified "$base_url/install-goose-marmot.sh" \
   "$base_url/install-goose-marmot.sh.sha256"
+```
+
+### wn-agent only (your own client)
+
+For your own client against the control socket, such as a notifier bot, this
+installer installs and starts `wn-agent` alone, without a harness or plugin.
+`--bootstrap` creates the agent identity; `--import-identity` imports an
+existing key instead. The connector's identity must not also be signed in on
+another client. Continue with [Build your own client](custom-client.md).
+
+Run this example in the same shell where `install_verified` above was defined.
+
+```sh
+install_verified "$base_url/install-wn-agent.sh" \
+  "$base_url/install-wn-agent.sh.sha256" --bootstrap
 ```
 
 ### Finish In White Noise
@@ -491,6 +508,7 @@ The release installers are published with the `wn-agent-v*` release family:
 - `scripts/install-opencode-marmot.sh`
 - `scripts/install-pi-marmot.sh`
 - `scripts/install-goose-marmot.sh`
+- `scripts/install-wn-agent.sh` (connector only, for your own client)
 
 By default the production-shaped installs create separate local agent identities
 per connector:
@@ -504,6 +522,7 @@ per connector:
 | OpenCode harness | `$HOME/.marmot-agents/harnesses` | `wn-agent-harnesses.service` / `org.marmot.wn-agent.harnesses` plus `wn-opencode.service` / `org.marmot.wn-opencode` |
 | Pi harness | `$HOME/.marmot-agents/pi` | `wn-agent-pi.service` / `org.marmot.wn-agent.pi` plus `wn-pi.service` / `org.marmot.wn-pi` |
 | Goose harness | `$HOME/.marmot-agents/goose` | `wn-agent-goose.service` / `org.marmot.wn-agent.goose` plus `wn-goose.service` / `org.marmot.wn-goose` |
+| `wn-agent` only | `$HOME/.marmot-agents/standalone` | `wn-agent-standalone.service` / `org.marmot.wn-agent.standalone` |
 
 Each home derives its own default socket at `$MARMOT_HOME/dev/wn-agent.sock` and
 uses the public relay defaults shared with the phone app pilot setup. Claude Code,
@@ -708,6 +727,8 @@ just pi-installer-test
 cargo test -p wn-goose
 just goose-dev-e2e-connector
 just goose-installer-test
+
+just wn-agent-installer-test
 ```
 
 For release-installer work, test dry-runs and real release assets from the

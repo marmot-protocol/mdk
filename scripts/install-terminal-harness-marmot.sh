@@ -2,7 +2,10 @@
 set -euo pipefail
 
 # Shared installer implementation for Marmot terminal harnesses.
-# MARMOT_TERMINAL_HARNESS must be `claude`, `codex`, `pi`, `opencode`, or `goose`.
+# MARMOT_TERMINAL_HARNESS must be `claude`, `codex`, `pi`, `opencode`, `goose`,
+# or `none`. `none` is the connector-only install (`install-wn-agent.sh`): it
+# installs and supervises wn-agent for a custom agent-control client, with no
+# harness.
 
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 SCRIPT_DIR=""
@@ -12,6 +15,8 @@ fi
 
 HARNESS_KIND="${MARMOT_TERMINAL_HARNESS:-}"
 HARNESS_AUTONOMOUS_SUPPORTED=1
+CONNECTOR_ONLY=0
+INSTALLER_NAME="install-$HARNESS_KIND-marmot"
 case "$HARNESS_KIND" in
     claude)
         HARNESS_DISPLAY_NAME="Claude Code"
@@ -70,25 +75,37 @@ case "$HARNESS_KIND" in
         # Goose has no non-interactive mode that keeps tool denies; wn-goose refuses it.
         HARNESS_AUTONOMOUS_SUPPORTED=0
         ;;
+    none)
+        CONNECTOR_ONLY=1
+        INSTALLER_NAME="install-wn-agent"
+        HARNESS_DEFAULT_HOME="$HOME/.marmot-agents/standalone"
+        HARNESS_DEFAULT_AGENT_LABEL="standalone-agent"
+        HARNESS_DEFAULT_AGENT_SERVICE="wn-agent-standalone"
+        HARNESS_DEFAULT_AGENT_LAUNCHD="org.marmot.wn-agent.standalone"
+        ;;
     *)
-        echo "error: MARMOT_TERMINAL_HARNESS must be claude, codex, pi, opencode, or goose" >&2
+        echo "error: MARMOT_TERMINAL_HARNESS must be claude, codex, pi, opencode, goose, or none" >&2
         exit 64
         ;;
 esac
-HARNESS_PROFILE_CHOICES="inherit, autonomous, or unrestricted"
-if [ "$HARNESS_AUTONOMOUS_SUPPORTED" -ne 1 ]; then
-    HARNESS_PROFILE_CHOICES="inherit or unrestricted"
+# Harness-only settings stay unset in connector-only mode, so `set -u` stops any
+# harness path that the connector-only flow reaches by mistake.
+if [ "$CONNECTOR_ONLY" -eq 0 ]; then
+    HARNESS_PROFILE_CHOICES="inherit, autonomous, or unrestricted"
+    if [ "$HARNESS_AUTONOMOUS_SUPPORTED" -ne 1 ]; then
+        HARNESS_PROFILE_CHOICES="inherit or unrestricted"
+    fi
+    HARNESS_BINARY="wn-$HARNESS_KIND"
+    HARNESS_BIN_ENV="${HARNESS_ENV_PREFIX}_BIN"
+    HARNESS_ALLOWED_SENDERS_ENV="${HARNESS_ENV_PREFIX}_ALLOWED_SENDERS_HEX"
+    HARNESS_ACCOUNT_ID_ENV="${HARNESS_ENV_PREFIX}_ACCOUNT_ID_HEX"
+    HARNESS_TIMEOUT_ENV="${HARNESS_ENV_PREFIX}_TIMEOUT_SECS"
+    HARNESS_IDLE_TIMEOUT_ENV="${HARNESS_ENV_PREFIX}_IDLE_TIMEOUT_SECS"
+    HARNESS_REQUEST_TIMEOUT_ENV="${HARNESS_ENV_PREFIX}_REQUEST_TIMEOUT_SECS"
+    HARNESS_MAX_REPLY_ENV="${HARNESS_ENV_PREFIX}_MAX_REPLY_BYTES"
+    HARNESS_MAX_PENDING_ENV="${HARNESS_ENV_PREFIX}_MAX_PENDING_PER_GROUP"
+    HARNESS_EXECUTION_PROFILE_ENV="MARMOT_HARNESS_EXECUTION_PROFILE"
 fi
-HARNESS_BINARY="wn-$HARNESS_KIND"
-HARNESS_BIN_ENV="${HARNESS_ENV_PREFIX}_BIN"
-HARNESS_ALLOWED_SENDERS_ENV="${HARNESS_ENV_PREFIX}_ALLOWED_SENDERS_HEX"
-HARNESS_ACCOUNT_ID_ENV="${HARNESS_ENV_PREFIX}_ACCOUNT_ID_HEX"
-HARNESS_TIMEOUT_ENV="${HARNESS_ENV_PREFIX}_TIMEOUT_SECS"
-HARNESS_IDLE_TIMEOUT_ENV="${HARNESS_ENV_PREFIX}_IDLE_TIMEOUT_SECS"
-HARNESS_REQUEST_TIMEOUT_ENV="${HARNESS_ENV_PREFIX}_REQUEST_TIMEOUT_SECS"
-HARNESS_MAX_REPLY_ENV="${HARNESS_ENV_PREFIX}_MAX_REPLY_BYTES"
-HARNESS_MAX_PENDING_ENV="${HARNESS_ENV_PREFIX}_MAX_PENDING_PER_GROUP"
-HARNESS_EXECUTION_PROFILE_ENV="MARMOT_HARNESS_EXECUTION_PROFILE"
 
 env_or_default() {
     local name="$1" default_value="$2"
@@ -127,17 +144,19 @@ MARMOT_AGENT_SOCKET="${MARMOT_AGENT_SOCKET_OVERRIDE:-$MARMOT_HOME/dev/wn-agent.s
 MARMOT_AGENT_LABEL="${MARMOT_AGENT_LABEL:-$HARNESS_DEFAULT_AGENT_LABEL}"
 MARMOT_AGENT_SERVICE_NAME="${MARMOT_AGENT_SERVICE_NAME:-$HARNESS_DEFAULT_AGENT_SERVICE}"
 MARMOT_AGENT_LAUNCHD_LABEL="${MARMOT_AGENT_LAUNCHD_LABEL:-$HARNESS_DEFAULT_AGENT_LAUNCHD}"
-MARMOT_HARNESS_SERVICE_NAME="${MARMOT_HARNESS_SERVICE_NAME:-$HARNESS_BINARY}"
-MARMOT_HARNESS_LAUNCHD_LABEL="${MARMOT_HARNESS_LAUNCHD_LABEL:-org.marmot.$HARNESS_BINARY}"
 MARMOT_RELAYS="${MARMOT_RELAYS:-wss://relay.eu.whitenoise.chat,wss://relay.us.whitenoise.chat}"
-HARNESS_BIN="$(env_or_default "$HARNESS_BIN_ENV" "$HARNESS_DEFAULT_BIN")"
-HARNESS_TIMEOUT_SECS="$(env_or_default "$HARNESS_TIMEOUT_ENV" 3600)"
-HARNESS_IDLE_TIMEOUT_SECS="$(env_or_default "$HARNESS_IDLE_TIMEOUT_ENV" 120)"
-HARNESS_REQUEST_TIMEOUT_SECS="$(env_or_default "$HARNESS_REQUEST_TIMEOUT_ENV" 30)"
-HARNESS_MAX_REPLY_BYTES="$(env_or_default "$HARNESS_MAX_REPLY_ENV" 30000)"
-HARNESS_MAX_PENDING_PER_GROUP="$(env_or_default "$HARNESS_MAX_PENDING_ENV" 4)"
-HARNESS_EXECUTION_PROFILE="$(env_or_default "$HARNESS_EXECUTION_PROFILE_ENV" inherit)"
-HARNESS_CONFIGURED_SENDERS_HEX="$(env_or_default "$HARNESS_ALLOWED_SENDERS_ENV" "")"
+if [ "$CONNECTOR_ONLY" -eq 0 ]; then
+    MARMOT_HARNESS_SERVICE_NAME="${MARMOT_HARNESS_SERVICE_NAME:-$HARNESS_BINARY}"
+    MARMOT_HARNESS_LAUNCHD_LABEL="${MARMOT_HARNESS_LAUNCHD_LABEL:-org.marmot.$HARNESS_BINARY}"
+    HARNESS_BIN="$(env_or_default "$HARNESS_BIN_ENV" "$HARNESS_DEFAULT_BIN")"
+    HARNESS_TIMEOUT_SECS="$(env_or_default "$HARNESS_TIMEOUT_ENV" 3600)"
+    HARNESS_IDLE_TIMEOUT_SECS="$(env_or_default "$HARNESS_IDLE_TIMEOUT_ENV" 120)"
+    HARNESS_REQUEST_TIMEOUT_SECS="$(env_or_default "$HARNESS_REQUEST_TIMEOUT_ENV" 30)"
+    HARNESS_MAX_REPLY_BYTES="$(env_or_default "$HARNESS_MAX_REPLY_ENV" 30000)"
+    HARNESS_MAX_PENDING_PER_GROUP="$(env_or_default "$HARNESS_MAX_PENDING_ENV" 4)"
+    HARNESS_EXECUTION_PROFILE="$(env_or_default "$HARNESS_EXECUTION_PROFILE_ENV" inherit)"
+    HARNESS_CONFIGURED_SENDERS_HEX="$(env_or_default "$HARNESS_ALLOWED_SENDERS_ENV" "")"
+fi
 
 ASSUME_YES=0
 DRY_RUN=0
@@ -152,6 +171,12 @@ BOOTSTRAP_ACCOUNT_ID_HEX=""
 BOOTSTRAP_ALLOWED_SENDERS_HEX=""
 BOOTSTRAP_NPUB=""
 BOOTSTRAP_NPROFILE=""
+BOOTSTRAP_WELCOMERS_HEX=""
+RUN_BOOTSTRAP=0
+IMPORT_IDENTITY=0
+EXPECTED_IDENTITY=""
+IMPORTED_ACCOUNT_ID_HEX=""
+WN_AGENT_SERVICE_INSTALLED=0
 MARMOT_AGENT_SOCKET_SET=0
 if [ -n "$MARMOT_AGENT_SOCKET_OVERRIDE" ]; then
     MARMOT_AGENT_SOCKET_SET=1
@@ -162,7 +187,7 @@ ALLOW_WELCOMERS=()
 
 usage() {
     cat <<USAGE
-Usage: install-$HARNESS_KIND-marmot.sh [options]
+Usage: $INSTALLER_NAME.sh [options]
 
 Install wn-agent and $HARNESS_BINARY from a WN Agent GitHub release. $HARNESS_DISPLAY_NAME
 itself must already be installed.
@@ -204,12 +229,75 @@ Environment:
   $HARNESS_BIN_ENV          $HARNESS_DISPLAY_NAME binary or command name
   MARMOT_HARNESS_EXECUTION_PROFILE Shared execution profile (default: inherit)
 
+USAGE
+    verified_download_usage
+    cat <<USAGE
+
+  bash "\$tmpdir/\$installer_script"
+
+  bash "\$tmpdir/\$installer_script" --yes --allow-welcomer npub1...
+USAGE
+}
+
+connector_usage() {
+    cat <<USAGE
+Usage: $INSTALLER_NAME.sh [options]
+
+Install wn-agent from a WN Agent GitHub release and run it as a same-user
+service for your own agent-control client. Installs no harness or gateway
+plugin. Give the connector an identity that no other client signs in with.
+
+Options:
+  --bootstrap              Create or reuse the agent account once wn-agent runs
+  --import-identity        Import an existing Nostr secret key through a masked
+                           /dev/tty prompt, then bootstrap that account
+  --expected-identity VALUE
+                           With --import-identity, fail unless the key matches
+                           this npub or hex public key (never a secret key)
+  --allow-welcomer VALUE   With --bootstrap or --import-identity, accept group
+                           invites from this npub or hex pubkey; may repeat
+  --yes, --non-interactive Accepted for scripted runs; only --import-identity prompts
+  --home PATH              wn-agent home (default: $HARNESS_DEFAULT_HOME)
+  --socket PATH            wn-agent socket (default: \$MARMOT_HOME/dev/wn-agent.sock)
+  --relay URL              Relay URL for wn-agent/bootstrap; may repeat
+  --no-service             Do not install/start a LaunchAgent or systemd user unit
+  --no-start-wn-agent      Install the service but do not start it
+  --system                 Install wn-agent to /usr/local/bin instead of ~/.local/bin
+  --dry-run                Print actions without installing
+  -h, --help               Show this help
+
+Environment:
+  MARMOT_RELEASE_REPO      GitHub repo (default: marmot-protocol/mdk)
+  MARMOT_RELEASE_TAG       Release tag (release assets default to their own tag)
+  WN_AGENT_VERSION         Asset version suffix (release assets default to their own version)
+  WN_AGENT_SHA             Legacy alias for WN_AGENT_VERSION
+  MARMOT_INSTALL_PREFIX    Install root for wn-agent (default: ~/.local)
+  MARMOT_HOME              wn-agent home (default: $HARNESS_DEFAULT_HOME)
+  MARMOT_AGENT_SOCKET      wn-agent socket (default: \$MARMOT_HOME/dev/wn-agent.sock)
+  MARMOT_AGENT_LABEL       Account label used by bootstrap (default: $HARNESS_DEFAULT_AGENT_LABEL)
+  MARMOT_AGENT_SERVICE_NAME Linux systemd user service name (default: $HARNESS_DEFAULT_AGENT_SERVICE)
+  MARMOT_AGENT_LAUNCHD_LABEL macOS LaunchAgent label (default: $HARNESS_DEFAULT_AGENT_LAUNCHD)
+  MARMOT_RELAYS            Relay CSV used by wn-agent and bootstrap
+  MARMOT_WELCOMER_ALLOWLIST Comma-separated npub or hex allowlist values
+
+USAGE
+    verified_download_usage
+    cat <<USAGE
+
+  bash "\$tmpdir/\$installer_script" --bootstrap
+
+  bash "\$tmpdir/\$installer_script" --import-identity --expected-identity npub1...
+USAGE
+}
+
+verified_download_usage() {
+    cat <<USAGE
 Verified download (then choose one invocation below):
   set -eu
   base_url=https://github.com/marmot-protocol/mdk/releases/download/$MARMOT_RELEASE_TAG
   tmpdir="\$(mktemp -d)"
   trap 'rm -rf "\$tmpdir"' 0 HUP INT TERM
-  installer_script=install-$HARNESS_KIND-marmot.sh
+  installer_script=$INSTALLER_NAME.sh
   installer_url="\$base_url/\$installer_script"
   checksum_url="\$installer_url.sha256"
   if ! curl -fsSL "\$installer_url" -o "\$tmpdir/\$installer_script"; then
@@ -236,19 +324,15 @@ Verified download (then choose one invocation below):
     echo "error: checksum mismatch for \$tmpdir/\$installer_script (\$installer_url): expected \$expected, actual \$actual" >&2
     exit 1
   fi
-
-  bash "\$tmpdir/\$installer_script"
-
-  bash "\$tmpdir/\$installer_script" --yes --allow-welcomer npub1...
 USAGE
 }
 
 log() {
-    printf 'install-%s-marmot: %s\n' "$HARNESS_KIND" "$*"
+    printf '%s: %s\n' "$INSTALLER_NAME" "$*"
 }
 
 warn() {
-    printf 'install-%s-marmot: warning: %s\n' "$HARNESS_KIND" "$*" >&2
+    printf '%s: warning: %s\n' "$INSTALLER_NAME" "$*" >&2
 }
 
 run() {
@@ -321,11 +405,15 @@ is_welcomer_ref_syntax() {
 }
 
 validate_welcomer_inputs() {
-    local welcomer
     if [ "${#ALLOW_WELCOMERS[@]}" -eq 0 ]; then
         echo "error: at least one --allow-welcomer/--allow-sender value is required" >&2
         exit 1
     fi
+    validate_welcomer_syntax
+}
+
+validate_welcomer_syntax() {
+    local welcomer
     for welcomer in ${ALLOW_WELCOMERS[@]+"${ALLOW_WELCOMERS[@]}"}; do
         if ! is_welcomer_ref_syntax "$welcomer"; then
             echo "error: invalid allowlist value: $welcomer" >&2
@@ -854,17 +942,22 @@ install_harness_service() {
     esac
 }
 
+print_wn_agent_serve_command() {
+    printf 'wn-agent --home %q --socket %q' "$MARMOT_HOME" "$MARMOT_AGENT_SOCKET"
+    local relay
+    for relay in ${RELAYS[@]+"${RELAYS[@]}"}; do
+        printf ' --relay %q' "$relay"
+    done
+    printf '\n'
+}
+
 start_temp_agent() {
     if [ "$NO_START_WN_AGENT" -eq 1 ]; then
         return 0
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        printf '[dry-run] wn-agent --home %q --socket %q' "$MARMOT_HOME" "$MARMOT_AGENT_SOCKET"
-        local relay
-        for relay in ${RELAYS[@]+"${RELAYS[@]}"}; do
-            printf ' --relay %q' "$relay"
-        done
-        printf '\n'
+        printf '[dry-run] '
+        print_wn_agent_serve_command
         return 0
     fi
     if [ -S "$MARMOT_AGENT_SOCKET" ]; then
@@ -895,6 +988,17 @@ bootstrap_agent() {
         start_temp_agent
     fi
 
+    run_wn_agent_bootstrap
+    BOOTSTRAP_ALLOWED_SENDERS_HEX="${HARNESS_CONFIGURED_SENDERS_HEX:-$BOOTSTRAP_WELCOMERS_HEX}"
+    if [ -z "$BOOTSTRAP_ALLOWED_SENDERS_HEX" ]; then
+        echo "error: bootstrap did not return any allowlisted sender hex ids" >&2
+        exit 1
+    fi
+}
+
+# Bootstrap the started wn-agent and record its reply in bootstrap.json. With
+# IMPORTED_ACCOUNT_ID_HEX set, reuse that imported account instead of creating one.
+run_wn_agent_bootstrap() {
     if [ "$DRY_RUN" -eq 0 ] && ! wait_for_socket; then
         warn "wn-agent socket did not appear before bootstrap wait; bootstrap will keep waiting briefly"
     fi
@@ -907,6 +1011,9 @@ bootstrap_agent() {
         --label "$MARMOT_AGENT_LABEL"
         --no-quic
     )
+    if [ -n "$IMPORTED_ACCOUNT_ID_HEX" ]; then
+        args+=(--no-create --account-id-hex "$IMPORTED_ACCOUNT_ID_HEX")
+    fi
     local relay
     for relay in ${RELAYS[@]+"${RELAYS[@]}"}; do
         args+=(--relay "$relay")
@@ -922,7 +1029,7 @@ bootstrap_agent() {
         printf ' %q' "${args[@]}"
         printf '\n'
         BOOTSTRAP_ACCOUNT_ID_HEX="<account-id-from-bootstrap>"
-        BOOTSTRAP_ALLOWED_SENDERS_HEX="${HARNESS_CONFIGURED_SENDERS_HEX:-<allowlist-from-bootstrap>}"
+        BOOTSTRAP_WELCOMERS_HEX="<allowlist-from-bootstrap>"
         BOOTSTRAP_NPUB="<agent-npub-from-bootstrap>"
         BOOTSTRAP_NPROFILE="<agent-nprofile-from-bootstrap>"
         return 0
@@ -940,12 +1047,10 @@ bootstrap_agent() {
         printf '%s\n' "$bootstrap_json" |
             python3 -c 'import json, sys; print(json.load(sys.stdin)["account_id_hex"])'
     )"
-    local bootstrap_welcomers_hex
-    bootstrap_welcomers_hex="$(
+    BOOTSTRAP_WELCOMERS_HEX="$(
         printf '%s\n' "$bootstrap_json" |
             python3 -c 'import json, sys; print(",".join(json.load(sys.stdin).get("welcomer_account_ids_hex", [])))'
     )"
-    BOOTSTRAP_ALLOWED_SENDERS_HEX="${HARNESS_CONFIGURED_SENDERS_HEX:-$bootstrap_welcomers_hex}"
     BOOTSTRAP_NPUB="$(
         printf '%s\n' "$bootstrap_json" |
             python3 -c 'import json, sys; print(json.load(sys.stdin).get("npub", ""))'
@@ -956,10 +1061,6 @@ bootstrap_agent() {
     )"
     if [ -z "$BOOTSTRAP_ACCOUNT_ID_HEX" ]; then
         echo "error: bootstrap did not return an account id" >&2
-        exit 1
-    fi
-    if [ -z "$BOOTSTRAP_ALLOWED_SENDERS_HEX" ]; then
-        echo "error: bootstrap did not return any allowlisted sender hex ids" >&2
         exit 1
     fi
     log "bootstrap details -> $MARMOT_HOME/bootstrap.json"
@@ -1115,6 +1216,287 @@ cleanup() {
     fi
 }
 
+resolve_common_inputs() {
+    local relay welcomer
+    if [ "$MARMOT_RELEASE_TAG" = "wn-agent-vlatest" ]; then
+        echo "error: could not resolve a release version; set MARMOT_RELEASE_TAG or WN_AGENT_VERSION" >&2
+        exit 1
+    fi
+    if [ "${#RELAYS[@]}" -eq 0 ]; then
+        while IFS= read -r relay; do
+            RELAYS+=("$relay")
+        done < <(append_csv "$MARMOT_RELAYS")
+    fi
+    if [ -n "${MARMOT_WELCOMER_ALLOWLIST:-}" ]; then
+        while IFS= read -r welcomer; do
+            ALLOW_WELCOMERS+=("$welcomer")
+        done < <(append_csv "$MARMOT_WELCOMER_ALLOWLIST")
+    fi
+}
+
+# Connector-only mode (install-wn-agent.sh): wn-agent, a private home and its
+# same-user service, with an optional identity step and no harness.
+
+validate_connector_inputs() {
+    if [ "${#RELAYS[@]}" -eq 0 ]; then
+        echo "error: at least one --relay or MARMOT_RELAYS entry is required" >&2
+        exit 1
+    fi
+    if [ "${#ALLOW_WELCOMERS[@]}" -gt 0 ] && [ "$RUN_BOOTSTRAP" -eq 0 ]; then
+        echo "error: --allow-welcomer and MARMOT_WELCOMER_ALLOWLIST need --bootstrap or --import-identity" >&2
+        exit 1
+    fi
+    validate_welcomer_syntax
+    if [ -n "$EXPECTED_IDENTITY" ]; then
+        if [ "$IMPORT_IDENTITY" -eq 0 ]; then
+            echo "error: --expected-identity needs --import-identity" >&2
+            exit 1
+        fi
+        if ! is_welcomer_ref_syntax "$EXPECTED_IDENTITY"; then
+            echo "error: --expected-identity must be an npub or 64-character hex public key" >&2
+            exit 1
+        fi
+    fi
+    if [ "$RUN_BOOTSTRAP" -eq 1 ] && [ "$NO_START_WN_AGENT" -eq 1 ]; then
+        echo "error: --bootstrap and --import-identity need a running wn-agent; drop --no-start-wn-agent" >&2
+        exit 1
+    fi
+}
+
+prepare_private_home() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "would create private home $MARMOT_HOME (mode 0700)"
+        return 0
+    fi
+    (umask 077 && mkdir -p "$MARMOT_HOME")
+    chmod 700 "$MARMOT_HOME"
+    log "private home -> $MARMOT_HOME"
+}
+
+import_existing_identity() {
+    local -a args=(
+        import-identity
+        --json
+        --home "$MARMOT_HOME"
+        --label "$MARMOT_AGENT_LABEL"
+        --prompt
+    )
+    if [ -n "$EXPECTED_IDENTITY" ]; then
+        args+=(--expected-identity "$EXPECTED_IDENTITY")
+    fi
+    log "importing an existing Nostr identity; wn-agent prompts on this terminal"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '[dry-run] wn-agent'
+        printf ' %q' "${args[@]}"
+        printf '\n'
+        IMPORTED_ACCOUNT_ID_HEX="<account-id-from-identity-import>"
+        return 0
+    fi
+    local imported_json
+    imported_json="$(wn-agent "${args[@]}")"
+    IMPORTED_ACCOUNT_ID_HEX="$(
+        printf '%s\n' "$imported_json" |
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["account_id_hex"])'
+    )"
+    if [ -z "$IMPORTED_ACCOUNT_ID_HEX" ]; then
+        echo "error: identity import did not return an account id" >&2
+        exit 1
+    fi
+}
+
+start_connector_wn_agent() {
+    if [ "$INSTALL_SERVICE" -eq 1 ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            printf '[dry-run] service command: '
+            print_wn_agent_serve_command
+        fi
+        if install_wn_agent_service; then
+            WN_AGENT_SERVICE_INSTALLED=1
+            return 0
+        fi
+        warn "the wn-agent service was not installed and started; start wn-agent manually"
+    fi
+    if [ "$RUN_BOOTSTRAP" -eq 1 ]; then
+        start_temp_agent
+    fi
+}
+
+print_connector_identity() {
+    if [ "$RUN_BOOTSTRAP" -eq 0 ]; then
+        cat <<EOF
+
+No agent identity was created or imported. Once wn-agent runs, create or reuse
+one with:
+  wn-agent bootstrap --home $(printf '%q' "$MARMOT_HOME") --socket $(printf '%q' "$MARMOT_AGENT_SOCKET") --label $(printf '%q' "$MARMOT_AGENT_LABEL")
+EOF
+        return
+    fi
+    printf '\nAgent identity:\n'
+    printf '  account_id_hex: %s\n' "$BOOTSTRAP_ACCOUNT_ID_HEX"
+    if [ -n "$BOOTSTRAP_NPUB" ]; then
+        printf '  npub: %s\n' "$BOOTSTRAP_NPUB"
+    fi
+    if [ -n "$BOOTSTRAP_NPROFILE" ]; then
+        printf '  nprofile: %s\n' "$BOOTSTRAP_NPROFILE"
+    fi
+    printf '  details: %s\n' "$MARMOT_HOME/bootstrap.json"
+    cat <<EOF
+
+This identity belongs to this connector alone. Do not also sign it in to White
+Noise or any other client.
+EOF
+}
+
+print_connector_service_state() {
+    if [ "$WN_AGENT_SERVICE_INSTALLED" -eq 1 ] && [ "$NO_START_WN_AGENT" -eq 0 ]; then
+        printf '\nwn-agent is running as a same-user service.\n'
+        return
+    fi
+    if [ "$WN_AGENT_SERVICE_INSTALLED" -eq 1 ]; then
+        cat <<EOF
+
+The wn-agent service is installed but was not started. Start it with:
+  systemctl --user start $MARMOT_AGENT_SERVICE_NAME.service (Linux)
+  launchctl bootstrap gui/$UID $HOME/Library/LaunchAgents/$MARMOT_AGENT_LAUNCHD_LABEL.plist (macOS)
+EOF
+        return
+    fi
+    if [ "$RUN_BOOTSTRAP" -eq 1 ]; then
+        printf '\nThe temporary wn-agent used for bootstrap stops when this installer exits.\n'
+    fi
+    printf '\nwn-agent is not supervised. Run it under your own supervisor with:\n  '
+    print_wn_agent_serve_command
+}
+
+print_connector_next_steps() {
+    cat <<EOF
+
+wn-agent connector (no harness):
+  label: $MARMOT_AGENT_LABEL
+  home: $MARMOT_HOME
+  socket: $MARMOT_AGENT_SOCKET
+  service: $MARMOT_AGENT_SERVICE_NAME.service (Linux) / $MARMOT_AGENT_LAUNCHD_LABEL (macOS)
+EOF
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '\nDry run complete. Nothing was installed or started, and no identity was created or imported.\n'
+    else
+        print_connector_identity
+        print_connector_service_state
+        printf '\nClient environment:\n'
+        printf '  export MARMOT_AGENT_SOCKET=%q\n' "$MARMOT_AGENT_SOCKET"
+        if [ -n "$BOOTSTRAP_ACCOUNT_ID_HEX" ]; then
+            printf '  export MARMOT_ACCOUNT_ID_HEX=%s\n' "$BOOTSTRAP_ACCOUNT_ID_HEX"
+        fi
+    fi
+    cat <<EOF
+
+Guide: https://github.com/$MARMOT_RELEASE_REPO/blob/$MARMOT_RELEASE_TAG/integrations/custom-client.md
+Build: ${MARMOT_RELEASE_REPO}@${MARMOT_RELEASE_TAG} (${WN_AGENT_VERSION})
+EOF
+}
+
+connector_only_main() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --bootstrap)
+                RUN_BOOTSTRAP=1
+                shift
+                ;;
+            --import-identity)
+                IMPORT_IDENTITY=1
+                RUN_BOOTSTRAP=1
+                shift
+                ;;
+            --expected-identity)
+                EXPECTED_IDENTITY="${2:?missing value for --expected-identity}"
+                shift 2
+                ;;
+            --yes | --non-interactive)
+                ASSUME_YES=1
+                shift
+                ;;
+            --home)
+                MARMOT_HOME="${2:?missing value for --home}"
+                if [ "$MARMOT_AGENT_SOCKET_SET" -eq 0 ]; then
+                    MARMOT_AGENT_SOCKET="$MARMOT_HOME/dev/wn-agent.sock"
+                fi
+                shift 2
+                ;;
+            --socket)
+                MARMOT_AGENT_SOCKET="${2:?missing value for --socket}"
+                MARMOT_AGENT_SOCKET_SET=1
+                shift 2
+                ;;
+            --allow-welcomer)
+                ALLOW_WELCOMERS+=("${2:?missing value for --allow-welcomer}")
+                shift 2
+                ;;
+            --relay)
+                RELAYS+=("${2:?missing value for --relay}")
+                shift 2
+                ;;
+            --no-service)
+                INSTALL_SERVICE=0
+                shift
+                ;;
+            --no-start-wn-agent)
+                NO_START_WN_AGENT=1
+                shift
+                ;;
+            --system)
+                SYSTEM_INSTALL=1
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            -h | --help)
+                connector_usage
+                exit 0
+                ;;
+            *)
+                echo "error: unknown option: $1" >&2
+                connector_usage >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    resolve_common_inputs
+    validate_connector_inputs
+    need_cmd curl
+    need_cmd tar
+    if [ "$DRY_RUN" -eq 0 ] && [ "$RUN_BOOTSTRAP" -eq 1 ]; then
+        need_cmd python3
+    fi
+
+    platform="$(detect_platform)"
+    tmpdir="$(mktemp -d)"
+    trap 'cleanup; rm -rf "$tmpdir"' EXIT
+
+    log "platform=$platform repo=$MARMOT_RELEASE_REPO tag=$MARMOT_RELEASE_TAG version=$WN_AGENT_VERSION"
+    install_binary_bundle "wn-agent" "$platform" "$tmpdir"
+    prepare_private_home
+    ensure_path
+    if [ "$DRY_RUN" -eq 0 ] && [ "$RUN_BOOTSTRAP" -eq 1 ]; then
+        need_cmd wn-agent
+    fi
+    if [ "$IMPORT_IDENTITY" -eq 1 ]; then
+        import_existing_identity
+    fi
+    start_connector_wn_agent
+    if [ "$RUN_BOOTSTRAP" -eq 1 ]; then
+        run_wn_agent_bootstrap
+    fi
+    print_connector_next_steps
+}
+
+if [ "$CONNECTOR_ONLY" -eq 1 ]; then
+    connector_only_main "$@"
+    exit 0
+fi
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --bootstrap)
@@ -1188,21 +1570,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-if [ "$MARMOT_RELEASE_TAG" = "wn-agent-vlatest" ]; then
-    echo "error: could not resolve a release version; set MARMOT_RELEASE_TAG or WN_AGENT_VERSION" >&2
-    exit 1
-fi
-
-if [ "${#RELAYS[@]}" -eq 0 ]; then
-    while IFS= read -r relay; do
-        RELAYS+=("$relay")
-    done < <(append_csv "$MARMOT_RELAYS")
-fi
-if [ -n "${MARMOT_WELCOMER_ALLOWLIST:-}" ]; then
-    while IFS= read -r welcomer; do
-        ALLOW_WELCOMERS+=("$welcomer")
-    done < <(append_csv "$MARMOT_WELCOMER_ALLOWLIST")
-fi
+resolve_common_inputs
 if [ "$ASSUME_YES" -eq 0 ] && have_tty && [ "${#ALLOW_WELCOMERS[@]}" -eq 0 ]; then
     INTERACTIVE=1
     prompt_attempts=0

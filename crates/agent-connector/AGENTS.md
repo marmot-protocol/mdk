@@ -118,11 +118,13 @@ sender_hex="$(awk 'BEGIN { for (i = 0; i < 32; i++) printf "11" }')"
 bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --codex-bin /bin/echo
 bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --opencode-bin /bin/echo
 bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --pi-bin /bin/echo
+bash scripts/install-wn-agent.sh --dry-run --yes --bootstrap --allow-welcomer "$sender_hex"
 integrations/hermes/tests/marmot/test_dev_scripts.sh
 just claude-installer-test
 just codex-installer-test
 just opencode-installer-test
 just pi-installer-test
+just wn-agent-installer-test
 ```
 
 When editing `README.md`, run `just agent-install-docs-gate`.
