@@ -28,7 +28,8 @@ You need Linux (x86_64 or arm64) or macOS (Apple Silicon or Intel), `curl`, `tar
 Install with the connector-only installer, `install-wn-agent.sh`, using the verified helper in the
 [quickstart](README.md#wn-agent-only-your-own-client). It downloads the checksum-verified `wn-agent` from a
 `wn-agent-v*` release, creates a private home, and starts a same-user service with the default White Noise relays. It
-installs no harness or plugin.
+installs no harness or plugin. Releases up to 0.13.0 do not publish it; the quickstart shows how to run it from a
+checkout for those.
 
 | Setting | Default | Override |
 | --- | --- | --- |
@@ -58,11 +59,14 @@ Pick one of these when you install:
 Either way, the installer prints the agent's `account_id_hex`, `npub` and `nprofile`, and saves them to
 `<home>/bootstrap.json` (mode `0600`). Your client passes `account_id_hex` in every request.
 
-If you installed without either flag, run `bootstrap` yourself once the service is up:
+If you installed without either flag, rerun the installer with `--bootstrap` or `--import-identity`. To bootstrap by
+hand instead, save the JSON reply where the installer would, adding any custom `--relay` values you installed with so
+the printed `nprofile` matches:
 
 ```sh
-wn-agent bootstrap --home ~/.marmot-agents/standalone \
-  --socket ~/.marmot-agents/standalone/dev/wn-agent.sock --label standalone-agent
+home="$HOME/.marmot-agents/standalone"
+(umask 077 && wn-agent bootstrap --json --home "$home" --socket "$home/dev/wn-agent.sock" \
+  --label standalone-agent > "$home/bootstrap.json.tmp" && mv "$home/bootstrap.json.tmp" "$home/bootstrap.json")
 ```
 
 Invites are refused by default. If people should be able to add the agent to their own groups, pass

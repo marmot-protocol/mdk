@@ -1325,9 +1325,8 @@ print_connector_identity() {
     if [ "$RUN_BOOTSTRAP" -eq 0 ]; then
         cat <<EOF
 
-No agent identity was created or imported. Once wn-agent runs, create or reuse
-one with:
-  wn-agent bootstrap --home $(printf '%q' "$MARMOT_HOME") --socket $(printf '%q' "$MARMOT_AGENT_SOCKET") --label $(printf '%q' "$MARMOT_AGENT_LABEL")
+No agent identity was created or imported. Rerun this installer with
+--bootstrap to create or reuse one, or with --import-identity to import one.
 EOF
         return
     fi
