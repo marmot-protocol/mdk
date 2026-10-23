@@ -1670,7 +1670,7 @@ async fn complete_selection_affordances_cover_unloaded_mixed_archive_set_and_exp
     assert_eq!(hints.count, Some(50));
     assert_eq!(hints.all_archived, Some(true));
     assert_eq!(hints.all_direct, Some(false));
-    assert_eq!(hints.all_abandonable, Some(false));
+    assert_eq!(hints.all_abandonable, Some(true));
     handle.close();
     f.runtime.shutdown_and_close().await.unwrap();
 }

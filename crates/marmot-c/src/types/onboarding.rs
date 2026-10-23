@@ -17,9 +17,12 @@ impl MarmotOnboardingStep {
     }
 }
 c_enum! { MarmotOnboardingStatus from OnboardingStatusFfi {  Pending, Checking, Passed, NeedsInput, RetryableFailure, WaitingForSigner, Skipped  } }
-c_enum! { MarmotOnboardingIssue from OnboardingIssueFfi {  Missing, Malformed, FutureDated, InvalidRelay, RetiredRelay, UnsafeRelay, Unreachable, TimedOut, AuthenticationRequired, PaymentRequired, AccessRestricted, NoUsableRoute, PublicationFailed, SignerUnavailable, SignerRejected, RecordChanged, Interrupted, TooManyRelays, MultiDeviceUnsupported, OtherInstallationPossible, DiscoveryIncomplete  } }
+c_enum! { MarmotOnboardingIssue from OnboardingIssueFfi {  Missing, Malformed, FutureDated, InvalidRelay, RetiredRelay, UnsafeRelay, Unreachable, TimedOut, AuthenticationRequired, PaymentRequired, AccessRestricted, NoUsableRoute, PublicationFailed, SignerUnavailable, SignerRejected, RecordChanged, Interrupted, TooManyRelays, MultiDeviceUnsupported, OtherInstallationPossible, DiscoveryIncomplete, InspectionCompleted  } }
 c_enum! { MarmotOnboardingAction from OnboardingActionFfi {  Retry, ContinueWithout, UseRecommendedRelays, EditRelays, EditProfile, EditFollows, ApproveRepair, CancelRepair, ReconnectSigner, EditDiscoveryRelays, ContinueAnyway, CancelOnboarding  } }
-c_mirror! { MarmotOnboardingFinding from OnboardingFindingFfi { copy issue: MarmotOnboardingIssue, opt_str endpoint, } }
+c_enum! { MarmotOnboardingFindingContext from OnboardingFindingContextFfi { Unknown, RecordDiscovery, PublishedDeclaration, DeclaredRoute, RepairApproval, RepairPublication } }
+c_enum! { MarmotOnboardingCheckPurpose from OnboardingCheckPurposeFfi { Unknown, RecordLookup, DeclarationValidation, DirectoryQuery, SourceFreshness, EventPublication } }
+c_enum! { MarmotOnboardingCheckOutcome from OnboardingCheckOutcomeFfi { Unknown, Success, Failure } }
+c_mirror! { MarmotOnboardingFinding from OnboardingFindingFfi { copy issue: MarmotOnboardingIssue, opt_str endpoint, copy context: MarmotOnboardingFindingContext, copy purpose: MarmotOnboardingCheckPurpose, copy outcome: MarmotOnboardingCheckOutcome, copy declared_capability: MarmotOnboardingRelayCapability, vec actions/actions_len: MarmotOnboardingAction, opt_copy has_observed_revision/observed_revision: u64, } }
 c_mirror! { MarmotOnboardingStepState from OnboardingStepStateFfi { copy step: MarmotOnboardingStep, copy status: MarmotOnboardingStatus, vec findings/findings_len: MarmotOnboardingFinding, vec actions/actions_len: MarmotOnboardingAction, opt_copy has_checked_at/checked_at: u64, } }
 c_enum! { MarmotOnboardingRelayTagRole from OnboardingRelayTagRoleFfi { Other, Unmarked, Read, Write, Inbox } }
 c_enum! { MarmotOnboardingRelayTagDisposition from OnboardingRelayTagDispositionFfi { Retained, Removed, Added } }
@@ -55,6 +58,12 @@ mod tests {
                 findings: vec![OnboardingFindingFfi {
                     issue: OnboardingIssueFfi::Malformed,
                     endpoint: Some("wss://example.com".into()),
+                    context: OnboardingFindingContextFfi::PublishedDeclaration,
+                    purpose: OnboardingCheckPurposeFfi::DeclarationValidation,
+                    outcome: OnboardingCheckOutcomeFfi::Failure,
+                    declared_capability: OnboardingRelayCapabilityFfi::ReadAndWrite,
+                    actions: vec![OnboardingActionFfi::ApproveRepair],
+                    observed_revision: Some(3),
                 }],
                 actions: vec![OnboardingActionFfi::ApproveRepair],
                 checked_at: Some(42),
@@ -132,6 +141,28 @@ mod tests {
         };
         let value = boxed(MarmotOnboardingSnapshot::from(ffi));
         assert!(audit::live_allocations() > before);
+        let step = unsafe { &*(*value).steps };
+        let finding = unsafe { &*step.findings };
+        assert_eq!(
+            finding.context,
+            MarmotOnboardingFindingContext::PublishedDeclaration
+        );
+        assert_eq!(
+            finding.purpose,
+            MarmotOnboardingCheckPurpose::DeclarationValidation
+        );
+        assert_eq!(finding.outcome, MarmotOnboardingCheckOutcome::Failure);
+        assert_eq!(
+            finding.declared_capability,
+            MarmotOnboardingRelayCapability::ReadAndWrite
+        );
+        assert_eq!(finding.actions_len, 1);
+        assert_eq!(
+            unsafe { *finding.actions },
+            MarmotOnboardingAction::ApproveRepair
+        );
+        assert!(finding.has_observed_revision);
+        assert_eq!(finding.observed_revision, 3);
         let proposal = unsafe { &*(*value).proposal };
         let repair = unsafe { &*proposal.relay_repair };
         assert_eq!(
@@ -169,6 +200,8 @@ mod tests {
     }
     #[test]
     fn onboarding_step_input_rejects_invalid_discriminants() {
+        assert_eq!(MarmotOnboardingIssue::DiscoveryIncomplete as u32, 20);
+        assert_eq!(MarmotOnboardingIssue::InspectionCompleted as u32, 21);
         assert!(MarmotOnboardingStep::from_c(u32::MAX).is_err());
         assert_eq!(
             MarmotOnboardingStep::from_c(4).unwrap().to_ffi(),

@@ -257,7 +257,6 @@ impl CaptureBuilder {
                     && !nonmember(s.account_self_membership)
                     && !s.disbanded
                     && !nonmember(s.row_self_membership)
-                    && s.row_can_delete_local
             }),
         });
         // The builder owns compact IDs; do not duplicate them in storage's return.

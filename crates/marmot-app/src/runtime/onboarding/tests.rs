@@ -109,7 +109,24 @@ async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_packa
     let (directory, first, network, _keys, id) = fixture().await;
     let manager = first.accounts();
     let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
-    c.set(OnboardingStep::Profile, OnboardingStatus::Passed, vec![]);
+    let legacy_finding: OnboardingFinding = serde_json::from_value(serde_json::json!({
+        "issue": "TimedOut", "endpoint": "wss://index.example"
+    }))
+    .unwrap();
+    assert_eq!(legacy_finding.context, OnboardingFindingContext::Unknown);
+    assert_eq!(legacy_finding.purpose, OnboardingCheckPurpose::Unknown);
+    assert_eq!(legacy_finding.outcome, OnboardingCheckOutcome::Unknown);
+    assert_eq!(
+        legacy_finding.declared_capability,
+        OnboardingRelayCapability::None
+    );
+    assert!(legacy_finding.actions.is_empty());
+    assert_eq!(legacy_finding.observed_revision, None);
+    c.set(
+        OnboardingStep::Profile,
+        OnboardingStatus::Passed,
+        vec![legacy_finding],
+    );
     c.set(OnboardingStep::Follows, OnboardingStatus::Skipped, vec![]);
     c.snapshot.single_device_notice = Some(OnboardingSingleDeviceNotice {
         discovery: OnboardingDeviceDiscovery::OtherInstallationPossible,
@@ -125,6 +142,19 @@ async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_packa
         acknowledged_at: None,
     });
     let mut old = serde_json::to_value(&c).unwrap();
+    let legacy = old["snapshot"]["steps"][0]["findings"][0]
+        .as_object_mut()
+        .unwrap();
+    for field in [
+        "context",
+        "purpose",
+        "outcome",
+        "declared_capability",
+        "actions",
+        "observed_revision",
+    ] {
+        legacy.remove(field);
+    }
     for index in 0..2 {
         old["snapshot"]["steps"][index]["actions"] = serde_json::json!([]);
     }
@@ -141,6 +171,14 @@ async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_packa
     let reopened = runtime(directory.path(), network);
     let manager = reopened.accounts();
     let snapshot = manager.onboarding_snapshot(&id).unwrap().unwrap();
+    let legacy = &snapshot.steps[0].findings[0];
+    assert_eq!(legacy.issue, OnboardingIssue::TimedOut);
+    assert_eq!(legacy.context, OnboardingFindingContext::Unknown);
+    assert_eq!(legacy.purpose, OnboardingCheckPurpose::Unknown);
+    assert_eq!(legacy.outcome, OnboardingCheckOutcome::Unknown);
+    assert_eq!(legacy.declared_capability, OnboardingRelayCapability::None);
+    assert!(legacy.actions.is_empty());
+    assert_eq!(legacy.observed_revision, None);
     assert!(!snapshot.single_device_notice.unwrap().other_packages[0].usable);
     for step in &snapshot.steps[..2] {
         assert!(step.actions.contains(&OnboardingAction::Retry));
@@ -433,7 +471,16 @@ async fn mixed_health_relay_declarations_pass_without_rewriting_signed_metadata(
         *network.events.lock() = vec![declaration.clone()];
         let (status, findings, observed) = manager.check_onboarding_step(&c, step).await;
         assert_eq!(status, OnboardingStatus::Passed, "step {step:?}");
-        assert!(findings.iter().any(|f| f.issue == expected_issue));
+        assert!(findings.iter().any(|finding| {
+            finding.issue == expected_issue
+                && finding.context == OnboardingFindingContext::PublishedDeclaration
+                && finding.purpose == OnboardingCheckPurpose::DeclarationValidation
+                && finding.outcome == OnboardingCheckOutcome::Failure
+        }));
+        assert!(!findings.iter().any(|finding| {
+            finding.issue == expected_issue
+                && finding.context == OnboardingFindingContext::DeclaredRoute
+        }));
         assert_eq!(observed, Some(declaration));
         assert!(network.attempts.lock().is_empty());
         assert!(
@@ -584,13 +631,46 @@ async fn a_completed_read_route_can_prove_inspection_when_the_declared_write_rou
         .check_onboarding_step(&c, OnboardingStep::Relays)
         .await;
     assert_eq!(status, OnboardingStatus::Passed);
-    assert!(
-        findings
-            .iter()
-            .any(|f| f.issue == OnboardingIssue::TimedOut)
+    let timed_out = findings
+        .iter()
+        .find(|finding| finding.issue == OnboardingIssue::TimedOut)
+        .unwrap();
+    assert_eq!(timed_out.context, OnboardingFindingContext::DeclaredRoute);
+    assert_eq!(timed_out.purpose, OnboardingCheckPurpose::DirectoryQuery);
+    assert_eq!(timed_out.outcome, OnboardingCheckOutcome::Unknown);
+    assert_eq!(
+        timed_out.declared_capability,
+        OnboardingRelayCapability::Write
     );
+    let completed = findings
+        .iter()
+        .find(|finding| finding.issue == OnboardingIssue::InspectionCompleted)
+        .unwrap();
+    assert_eq!(completed.context, OnboardingFindingContext::DeclaredRoute);
+    assert_eq!(completed.purpose, OnboardingCheckPurpose::DirectoryQuery);
+    assert_eq!(completed.outcome, OnboardingCheckOutcome::Success);
+    assert_eq!(
+        completed.declared_capability,
+        OnboardingRelayCapability::Read
+    );
+    assert_eq!(completed.endpoint.as_deref(), Some("wss://read.example"));
+    assert!(completed.actions.is_empty());
+    assert!(!findings.iter().any(|finding| {
+        finding.purpose == OnboardingCheckPurpose::EventPublication
+            && finding.outcome == OnboardingCheckOutcome::Success
+    }));
     assert_eq!(observed, Some(declaration));
     assert!(network.attempts.lock().is_empty());
+    network.inspection_errors.lock().remove("write.example");
+    let (status, recovered, _) = manager
+        .check_onboarding_step(&c, OnboardingStep::Relays)
+        .await;
+    assert_eq!(status, OnboardingStatus::Passed);
+    assert!(recovered.iter().any(|finding| {
+        finding.issue == OnboardingIssue::InspectionCompleted
+            && finding.endpoint == timed_out.endpoint
+            && finding.declared_capability == OnboardingRelayCapability::Write
+    }));
     assert!(
         network
             .inspected_endpoints
@@ -599,6 +679,166 @@ async fn a_completed_read_route_can_prove_inspection_when_the_declared_write_rou
             .any(|endpoint| endpoint.contains("read.example"))
     );
     runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn contextual_timeout_roles() {
+    use transport_nostr::DirectoryInspectionError;
+
+    for (declared, failed, discovery_timeout, route_timeout) in [
+        ("wss://write.example", "index.example", true, false),
+        ("wss://write.example", "write.example", false, true),
+        ("wss://index.example", "index.example", true, true),
+    ] {
+        let (_directory, runtime, network, keys, id) = fixture().await;
+        let manager = runtime.accounts();
+        let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        checkpoint.set(OnboardingStep::Profile, OnboardingStatus::Skipped, vec![]);
+        checkpoint.set(OnboardingStep::Follows, OnboardingStatus::Skipped, vec![]);
+        manager.save_onboarding(&mut checkpoint).unwrap();
+        *network.events.lock() = vec![signed(
+            &keys,
+            10002,
+            vec![
+                vec!["r".into(), "wss://read.example".into(), "read".into()],
+                vec!["r".into(), declared.into(), "write".into()],
+            ],
+            "unchanged",
+            unix_now_seconds(),
+        )];
+        network
+            .inspection_errors
+            .lock()
+            .insert(failed.into(), DirectoryInspectionError::TimedOut);
+        let snapshot = manager.run_onboarding(&id).await.unwrap();
+        let state = &snapshot.steps[OnboardingStep::Relays.index()];
+        assert_eq!(state.status, OnboardingStatus::Passed);
+        assert!(!snapshot.ready);
+        let timeouts: Vec<_> = state
+            .findings
+            .iter()
+            .filter(|finding| finding.issue == OnboardingIssue::TimedOut)
+            .collect();
+        assert_eq!(
+            timeouts.len(),
+            usize::from(discovery_timeout) + usize::from(route_timeout)
+        );
+        assert_eq!(
+            timeouts.iter().any(|finding| {
+                finding.context == OnboardingFindingContext::RecordDiscovery
+                    && finding.purpose == OnboardingCheckPurpose::RecordLookup
+                    && finding.declared_capability == OnboardingRelayCapability::None
+            }),
+            discovery_timeout
+        );
+        assert_eq!(
+            timeouts.iter().any(|finding| {
+                finding.context == OnboardingFindingContext::DeclaredRoute
+                    && finding.purpose == OnboardingCheckPurpose::DirectoryQuery
+                    && finding.declared_capability == OnboardingRelayCapability::Write
+            }),
+            route_timeout
+        );
+        for finding in &timeouts {
+            assert_eq!(finding.outcome, OnboardingCheckOutcome::Unknown);
+            assert!(finding.endpoint.as_ref().unwrap().contains(failed));
+        }
+        assert!(state.findings.iter().any(|finding| {
+            finding.issue == OnboardingIssue::InspectionCompleted
+                && finding.context == OnboardingFindingContext::DeclaredRoute
+                && finding.purpose == OnboardingCheckPurpose::DirectoryQuery
+                && finding.outcome == OnboardingCheckOutcome::Success
+                && finding.declared_capability == OnboardingRelayCapability::Read
+        }));
+        for step in &snapshot.steps {
+            for finding in &step.findings {
+                assert!(
+                    finding
+                        .actions
+                        .iter()
+                        .all(|action| step.actions.contains(action))
+                );
+            }
+        }
+        for finding in &state.findings {
+            assert!(!finding.actions.contains(&OnboardingAction::ApproveRepair));
+            assert!(!finding.actions.contains(&OnboardingAction::EditRelays));
+            assert!(
+                !finding
+                    .actions
+                    .contains(&OnboardingAction::UseRecommendedRelays)
+            );
+        }
+        assert!(!state.findings.iter().any(|finding| {
+            finding.purpose == OnboardingCheckPurpose::EventPublication
+                && finding.outcome == OnboardingCheckOutcome::Success
+        }));
+        let retried = manager
+            .retry_onboarding_step(&id, OnboardingStep::Relays)
+            .await
+            .unwrap();
+        assert_eq!(
+            retried.steps[OnboardingStep::Relays.index()].status,
+            OnboardingStatus::Passed
+        );
+        assert!(!retried.ready);
+        assert!(network.attempts.lock().is_empty());
+        assert!(network.published_endpoints.lock().is_empty());
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observations_survive_resume() {
+    let (directory, first, network, keys, id) = fixture().await;
+    let manager = first.accounts();
+    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    checkpoint.set(OnboardingStep::Profile, OnboardingStatus::Skipped, vec![]);
+    checkpoint.set(OnboardingStep::Follows, OnboardingStatus::Skipped, vec![]);
+    manager.save_onboarding(&mut checkpoint).unwrap();
+    *network.events.lock() = vec![signed(
+        &keys,
+        10002,
+        vec![vec!["r".into(), "wss://healthy.example".into()]],
+        "",
+        unix_now_seconds(),
+    )];
+    let initial = manager.run_onboarding(&id).await.unwrap();
+    let evidence = initial.steps[OnboardingStep::Relays.index()].clone();
+    assert!(!evidence.findings.is_empty());
+    for finding in &evidence.findings {
+        assert!(
+            finding
+                .observed_revision
+                .is_some_and(|revision| revision <= initial.revision)
+        );
+    }
+    let retried = manager
+        .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
+        .await
+        .unwrap();
+    assert!(retried.revision > initial.revision);
+    assert_eq!(retried.steps[OnboardingStep::Relays.index()], evidence);
+    assert!(!retried.ready);
+    first.shutdown_and_close().await.unwrap();
+    let reopened = runtime(directory.path(), network.clone());
+    let manager = reopened.accounts();
+    let restored = manager.onboarding_snapshot(&id).unwrap().unwrap();
+    assert_eq!(restored.steps[OnboardingStep::Relays.index()], evidence);
+    let rechecked = manager
+        .retry_onboarding_step(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    let new_evidence = &rechecked.steps[OnboardingStep::Relays.index()];
+    assert_eq!(new_evidence.status, OnboardingStatus::Passed);
+    for finding in &new_evidence.findings {
+        assert!(finding.observed_revision.is_some_and(|revision| {
+            revision > restored.revision && revision <= rechecked.revision
+        }));
+    }
+    assert!(!rechecked.ready);
+    assert!(network.attempts.lock().is_empty());
+    reopened.shutdown_and_close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1622,9 +1862,10 @@ async fn cancel_removal_only_cleanup(restart: bool) {
     for step in &mut checkpoint.snapshot.steps {
         step.status = OnboardingStatus::Passed;
     }
-    checkpoint.set(OnboardingStep::Relays, status, findings.clone());
+    checkpoint.set(OnboardingStep::Relays, status, findings);
     checkpoint.records[OnboardingStep::Relays.index()] = record;
     manager.save_onboarding(&mut checkpoint).unwrap();
+    let evidence = checkpoint.snapshot.steps[OnboardingStep::Relays.index()].clone();
     let preview = manager
         .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
         .await
@@ -1658,7 +1899,8 @@ async fn cancel_removal_only_cleanup(restart: bool) {
     assert!(canceled.ready);
     let step = &canceled.steps[OnboardingStep::Relays.index()];
     assert_eq!(step.status, OnboardingStatus::Passed);
-    assert_eq!(step.findings, findings);
+    assert_eq!(step.findings, evidence.findings);
+    assert_eq!(step.checked_at, evidence.checked_at);
     assert!(!step.actions.contains(&OnboardingAction::ApproveRepair));
     assert!(network.attempts.lock().is_empty());
     assert!(active.accounts().require_onboarding_complete(&id).is_ok());
@@ -2042,6 +2284,22 @@ async fn approved_unsigned_relay_repair_rejects_modified_checkpoint_before_signi
             rejected.snapshot.steps[OnboardingStep::Relays.index()].status,
             OnboardingStatus::RetryableFailure
         );
+        let finding = &rejected.snapshot.steps[OnboardingStep::Relays.index()].findings[0];
+        assert_eq!(finding.issue, OnboardingIssue::RecordChanged);
+        assert_eq!(finding.context, OnboardingFindingContext::RepairApproval);
+        assert_eq!(
+            finding.purpose,
+            OnboardingCheckPurpose::DeclarationValidation
+        );
+        assert_eq!(finding.outcome, OnboardingCheckOutcome::Failure);
+        assert_eq!(
+            finding.actions,
+            [
+                OnboardingAction::Retry,
+                OnboardingAction::EditDiscoveryRelays
+            ]
+        );
+        assert_eq!(finding.observed_revision, Some(rejected.snapshot.revision));
     }
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -2209,12 +2467,23 @@ async fn minimal_relay_repair_rejects_changed_source_without_publication() {
         .await
         .unwrap();
     assert!(result.proposal.is_none());
+    let state = &result.steps[OnboardingStep::InboxRelays.index()];
+    let changed = state
+        .findings
+        .iter()
+        .find(|finding| finding.issue == OnboardingIssue::RecordChanged)
+        .unwrap();
+    assert_eq!(changed.context, OnboardingFindingContext::RepairApproval);
+    assert_eq!(changed.purpose, OnboardingCheckPurpose::SourceFreshness);
+    assert_eq!(changed.outcome, OnboardingCheckOutcome::Failure);
+    assert_eq!(changed.declared_capability, OnboardingRelayCapability::None);
     assert!(
-        result.steps[OnboardingStep::InboxRelays.index()]
-            .findings
+        changed
+            .actions
             .iter()
-            .any(|finding| finding.issue == OnboardingIssue::RecordChanged)
+            .all(|action| state.actions.contains(action))
     );
+    assert!(!changed.actions.contains(&OnboardingAction::ApproveRepair));
     assert!(network.attempts.lock().is_empty());
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -2801,6 +3070,36 @@ async fn partial_lookup_is_not_fresh() {
                 OnboardingIssue::RecordChanged
             };
             assert!(state.findings.iter().any(|f| f.issue == issue));
+            let diagnostic = state
+                .findings
+                .iter()
+                .find(|finding| finding.issue == issue)
+                .unwrap();
+            assert_eq!(diagnostic.context, OnboardingFindingContext::RepairApproval);
+            assert_eq!(diagnostic.purpose, OnboardingCheckPurpose::SourceFreshness);
+            assert_eq!(
+                diagnostic.outcome,
+                if fail_index {
+                    OnboardingCheckOutcome::Unknown
+                } else {
+                    OnboardingCheckOutcome::Failure
+                }
+            );
+            assert_eq!(
+                diagnostic.declared_capability,
+                OnboardingRelayCapability::None
+            );
+            assert!(
+                diagnostic
+                    .actions
+                    .iter()
+                    .all(|action| state.actions.contains(action))
+            );
+            assert!(
+                !diagnostic
+                    .actions
+                    .contains(&OnboardingAction::ApproveRepair)
+            );
             if !fail_index {
                 let current = manager.onboarding_checkpoint(&id).unwrap().unwrap();
                 assert_eq!(current.records[step.index()].as_ref().unwrap().id, newer.id);
@@ -2878,6 +3177,36 @@ async fn declared_lookup_is_not_fresh() {
             };
             assert!(state.findings.iter().any(|f| f.issue == issue));
             let current = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+            let diagnostic = state
+                .findings
+                .iter()
+                .find(|finding| finding.issue == issue)
+                .unwrap();
+            assert_eq!(diagnostic.context, OnboardingFindingContext::RepairApproval);
+            assert_eq!(diagnostic.purpose, OnboardingCheckPurpose::SourceFreshness);
+            assert_eq!(
+                diagnostic.outcome,
+                if fail_index {
+                    OnboardingCheckOutcome::Unknown
+                } else {
+                    OnboardingCheckOutcome::Failure
+                }
+            );
+            assert_eq!(
+                diagnostic.declared_capability,
+                OnboardingRelayCapability::None
+            );
+            assert!(
+                diagnostic
+                    .actions
+                    .iter()
+                    .all(|action| state.actions.contains(action))
+            );
+            assert!(
+                !diagnostic
+                    .actions
+                    .contains(&OnboardingAction::ApproveRepair)
+            );
             assert!(!current.approved);
             assert!(current.signed_repair.is_none());
             if !fail_index {
@@ -3239,6 +3568,26 @@ async fn failed_discovery_never_authorizes_default_replacement() {
             .is_err()
     );
     assert!(network.attempts.lock().is_empty());
+    network.fail_reads.store(false, Ordering::SeqCst);
+    let missing = runtime
+        .accounts()
+        .retry_onboarding_step(&id, OnboardingStep::Relays)
+        .await
+        .unwrap();
+    let finding = missing.steps[OnboardingStep::Relays.index()]
+        .findings
+        .iter()
+        .find(|finding| finding.issue == OnboardingIssue::Missing)
+        .unwrap();
+    assert_eq!(finding.context, OnboardingFindingContext::RecordDiscovery);
+    assert!(finding.actions.contains(&OnboardingAction::EditRelays));
+    assert!(
+        finding
+            .actions
+            .contains(&OnboardingAction::UseRecommendedRelays)
+    );
+    assert!(!finding.actions.contains(&OnboardingAction::ApproveRepair));
+    assert!(network.attempts.lock().is_empty());
     runtime.shutdown_and_close().await.unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3298,6 +3647,13 @@ async fn zero_ack_repair_survives_restart_and_retries_exact_signed_bytes() {
         .await
         .unwrap();
     assert_eq!(result.steps[2].status, OnboardingStatus::RetryableFailure);
+    let finding = &result.steps[OnboardingStep::Relays.index()].findings[0];
+    assert_eq!(finding.issue, OnboardingIssue::PublicationFailed);
+    assert_eq!(finding.context, OnboardingFindingContext::RepairPublication);
+    assert_eq!(finding.purpose, OnboardingCheckPurpose::EventPublication);
+    assert_eq!(finding.outcome, OnboardingCheckOutcome::Unknown);
+    assert_eq!(finding.actions, [OnboardingAction::Retry]);
+    assert_eq!(finding.observed_revision, Some(result.revision));
     let expected = network.attempts.lock()[0].clone();
     assert!(expected.sig.is_some());
     first.shutdown_and_close().await.unwrap();
@@ -3570,6 +3926,10 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
         c.snapshot.steps[OnboardingStep::SingleDevice.index()].status,
         OnboardingStatus::NeedsInput
     );
+    manager.save_onboarding(&mut c).unwrap();
+    for finding in &c.snapshot.steps[OnboardingStep::SingleDevice.index()].findings {
+        assert_eq!(finding.observed_revision, Some(c.snapshot.revision));
+    }
     assert!(
         c.snapshot.steps[OnboardingStep::SingleDevice.index()]
             .actions
@@ -4170,6 +4530,98 @@ impl cgka_engine::account_identity_proof::AccountIdentityProofSigner for Blockin
             .proof_event()
             .and_then(|event| event.finalize(&self.keys).map_err(|err| err.to_string()))?;
         request.signature_from_signed_event(event)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signer_diagnostic_recovery() {
+    for approved in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let network = Arc::new(Network::default());
+        let first = runtime(directory.path(), network.clone());
+        let keys = nostr::prelude::Keys::generate();
+        let id = keys.public_key().to_hex();
+        let block = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Notify::new());
+        first
+            .accounts()
+            .begin_external_signer_onboarding(
+                id.clone(),
+                BlockingSigner {
+                    keys: keys.clone(),
+                    block: block.clone(),
+                    started: started.clone(),
+                },
+                options(),
+            )
+            .await
+            .unwrap();
+        missing_relays(&first, &id).await;
+        let (step, context, purpose) = if approved {
+            let preview = first
+                .accounts()
+                .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
+                .await
+                .unwrap();
+            block.store(true, Ordering::SeqCst);
+            let task = tokio::spawn({
+                let manager = first.accounts();
+                let id = id.clone();
+                async move {
+                    manager
+                        .approve_onboarding_repair(&id, preview.revision)
+                        .await
+                }
+            });
+            timeout(Duration::from_secs(2), started.notified())
+                .await
+                .unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            (
+                OnboardingStep::Relays,
+                OnboardingFindingContext::RepairPublication,
+                OnboardingCheckPurpose::EventPublication,
+            )
+        } else {
+            let manager = first.accounts();
+            let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+            checkpoint.set(OnboardingStep::Relays, OnboardingStatus::Passed, vec![]);
+            checkpoint.records[OnboardingStep::Relays.index()] = Some(signed(
+                &keys,
+                10002,
+                vec![vec!["r".into(), "wss://healthy.example".into()]],
+                "",
+                unix_now_seconds(),
+            ));
+            manager.save_onboarding(&mut checkpoint).unwrap();
+            (
+                OnboardingStep::InboxRelays,
+                OnboardingFindingContext::RecordDiscovery,
+                OnboardingCheckPurpose::RecordLookup,
+            )
+        };
+        first.shutdown_and_close().await.unwrap();
+        let reopened = runtime(directory.path(), network.clone());
+        let snapshot = reopened.accounts().run_onboarding(&id).await.unwrap();
+        let state = &snapshot.steps[step.index()];
+        assert_eq!(state.status, OnboardingStatus::WaitingForSigner);
+        let finding = &state.findings[0];
+        assert_eq!(finding.issue, OnboardingIssue::SignerUnavailable);
+        assert_eq!(finding.context, context);
+        assert_eq!(finding.purpose, purpose);
+        assert_eq!(finding.outcome, OnboardingCheckOutcome::Unknown);
+        assert!(finding.actions.contains(&OnboardingAction::ReconnectSigner));
+        assert!(finding.actions.contains(&OnboardingAction::Retry));
+        assert!(
+            finding
+                .actions
+                .iter()
+                .all(|action| state.actions.contains(action))
+        );
+        assert_eq!(finding.observed_revision, Some(snapshot.revision));
+        assert!(network.attempts.lock().is_empty());
+        reopened.shutdown_and_close().await.unwrap();
     }
 }
 

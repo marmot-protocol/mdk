@@ -141,6 +141,8 @@ pub enum OnboardingIssue {
     MultiDeviceUnsupported,
     OtherInstallationPossible,
     DiscoveryIncomplete,
+    /// A bounded declared-route query completed; not publication evidence.
+    InspectionCompleted,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OnboardingAction {
@@ -182,10 +184,61 @@ pub struct OnboardingSingleDeviceNotice {
     pub discovery_complete: bool,
     pub acknowledged_at: Option<u64>,
 }
+/// The operation that produced an observation. Independent operations retain
+/// separate findings even when they concern the same endpoint.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OnboardingFindingContext {
+    /// No relay-operation provenance, including historical checkpoints and
+    /// notices outside relay diagnostics.
+    #[default]
+    Unknown,
+    RecordDiscovery,
+    PublishedDeclaration,
+    DeclaredRoute,
+    RepairApproval,
+    RepairPublication,
+}
+/// What was actually checked, independently of a relay's declared role.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OnboardingCheckPurpose {
+    #[default]
+    Unknown,
+    RecordLookup,
+    DeclarationValidation,
+    DirectoryQuery,
+    SourceFreshness,
+    EventPublication,
+}
+/// Evidence for the checked purpose, not a permanent relay-health verdict.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OnboardingCheckOutcome {
+    #[default]
+    Unknown,
+    Success,
+    Failure,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OnboardingFinding {
     pub issue: OnboardingIssue,
     pub endpoint: Option<String>,
+    #[serde(default)]
+    pub context: OnboardingFindingContext,
+    #[serde(default)]
+    pub purpose: OnboardingCheckPurpose,
+    #[serde(default)]
+    pub outcome: OnboardingCheckOutcome,
+    /// Signed role, never evidence that publication will be accepted.
+    #[serde(default)]
+    pub declared_capability: OnboardingRelayCapability,
+    /// Applicable current step actions. Empty means no finding-specific action;
+    /// these never bypass proposal approval or authorize endpoint removal.
+    #[serde(default)]
+    pub actions: Vec<OnboardingAction>,
+    /// First snapshot exposing this observation, scoped by account/recovery
+    /// epoch. Retention/resume never refreshes it; use the step's checked_at for
+    /// observation time. It is not a live-health certificate.
+    #[serde(default)]
+    pub observed_revision: Option<u64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OnboardingStepState {
@@ -224,8 +277,9 @@ pub enum OnboardingRelayTagDisposition {
 }
 
 /// The missing route capability supplied by an added tag.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OnboardingRelayCapability {
+    #[default]
     None,
     Read,
     Write,
@@ -484,7 +538,7 @@ impl OnboardingCheckpoint {
         &mut self,
         step: OnboardingStep,
         status: OnboardingStatus,
-        findings: Vec<OnboardingFinding>,
+        mut findings: Vec<OnboardingFinding>,
     ) {
         let actions = match status {
             OnboardingStatus::NeedsInput if step == OnboardingStep::SingleDevice => vec![
@@ -524,12 +578,32 @@ impl OnboardingCheckpoint {
             OnboardingStatus::Passed | OnboardingStatus::Skipped => vec![OnboardingAction::Retry],
             _ => Vec::new(),
         };
+        // Updating consent/actions must not make retained evidence look new.
+        let retained =
+            !findings.is_empty() && findings == self.snapshot.steps[step.index()].findings;
+        let checked_at = if retained {
+            self.snapshot.steps[step.index()].checked_at
+        } else if matches!(
+            status,
+            OnboardingStatus::Pending | OnboardingStatus::Checking
+        ) {
+            None
+        } else {
+            Some(unix_now_seconds())
+        };
+        if !retained {
+            for finding in &mut findings {
+                if finding.observed_revision.is_none() {
+                    finding.observed_revision = self.snapshot.revision.checked_add(1);
+                }
+            }
+        }
         self.snapshot.steps[step.index()] = OnboardingStepState {
             step,
             status,
             findings,
             actions,
-            checked_at: Some(unix_now_seconds()),
+            checked_at,
         };
         self.snapshot.ready = self.snapshot.steps.iter().all(|s| {
             matches!(
@@ -543,6 +617,140 @@ fn finding(issue: OnboardingIssue) -> OnboardingFinding {
     OnboardingFinding {
         issue,
         endpoint: None,
+        context: OnboardingFindingContext::Unknown,
+        purpose: OnboardingCheckPurpose::Unknown,
+        outcome: OnboardingCheckOutcome::Unknown,
+        declared_capability: OnboardingRelayCapability::None,
+        actions: Vec::new(),
+        observed_revision: None,
+    }
+}
+
+impl OnboardingFinding {
+    fn in_context(
+        mut self,
+        context: OnboardingFindingContext,
+        purpose: OnboardingCheckPurpose,
+    ) -> Self {
+        self.context = context;
+        self.purpose = purpose;
+        self.outcome = match self.issue {
+            OnboardingIssue::InspectionCompleted => OnboardingCheckOutcome::Success,
+            OnboardingIssue::TimedOut
+            | OnboardingIssue::Unreachable
+            | OnboardingIssue::Interrupted
+            | OnboardingIssue::DiscoveryIncomplete
+            | OnboardingIssue::TooManyRelays
+            | OnboardingIssue::SignerUnavailable
+            | OnboardingIssue::SignerRejected
+            | OnboardingIssue::PublicationFailed => OnboardingCheckOutcome::Unknown,
+            _ => OnboardingCheckOutcome::Failure,
+        };
+        self
+    }
+}
+
+fn declared_capabilities(
+    event: &NostrTransportEvent,
+    step: OnboardingStep,
+) -> HashMap<String, OnboardingRelayCapability> {
+    use OnboardingRelayCapability::*;
+    let name = if step == OnboardingStep::InboxRelays {
+        "relay"
+    } else {
+        "r"
+    };
+    let mut capabilities = HashMap::new();
+    for tag in &event.tags {
+        if !tag.first().is_some_and(|field| field == name) {
+            continue;
+        }
+        let Some(endpoint) = tag.get(1) else {
+            continue;
+        };
+        let capability = if step == OnboardingStep::InboxRelays {
+            Inbox
+        } else {
+            match tag.get(2).map(String::as_str) {
+                std::option::Option::None => ReadAndWrite,
+                Some(marker) if marker.eq_ignore_ascii_case("read") => Read,
+                Some(marker) if marker.eq_ignore_ascii_case("write") => Write,
+                _ => None,
+            }
+        };
+        let existing = capabilities.entry(relay_key(endpoint)).or_insert(None);
+        *existing = match (*existing, capability) {
+            (Read, Write) | (Write, Read) | (ReadAndWrite, _) | (_, ReadAndWrite) => ReadAndWrite,
+            (None, role) => role,
+            (role, _) => role,
+        };
+    }
+    capabilities
+}
+
+fn refresh_finding_actions(snapshot: &mut OnboardingSnapshot) {
+    for step in &mut snapshot.steps {
+        for finding in &mut step.findings {
+            finding.actions.clear();
+            if finding.outcome == OnboardingCheckOutcome::Success {
+                continue;
+            }
+            let applicable: &[OnboardingAction] = match finding.context {
+                OnboardingFindingContext::Unknown
+                    if finding.observed_revision.is_some()
+                        && matches!(
+                            finding.issue,
+                            OnboardingIssue::SignerUnavailable | OnboardingIssue::SignerRejected
+                        ) =>
+                {
+                    &[OnboardingAction::Retry, OnboardingAction::ReconnectSigner]
+                }
+                OnboardingFindingContext::Unknown => &[],
+                OnboardingFindingContext::RecordDiscovery
+                    if finding.issue == OnboardingIssue::Missing =>
+                {
+                    &[
+                        OnboardingAction::Retry,
+                        OnboardingAction::EditDiscoveryRelays,
+                        OnboardingAction::EditRelays,
+                        OnboardingAction::UseRecommendedRelays,
+                        OnboardingAction::EditProfile,
+                        OnboardingAction::EditFollows,
+                        OnboardingAction::ContinueWithout,
+                    ]
+                }
+                OnboardingFindingContext::RecordDiscovery
+                | OnboardingFindingContext::RepairApproval => &[
+                    OnboardingAction::Retry,
+                    OnboardingAction::EditDiscoveryRelays,
+                    OnboardingAction::ContinueWithout,
+                    OnboardingAction::ReconnectSigner,
+                ],
+                OnboardingFindingContext::PublishedDeclaration => &[
+                    OnboardingAction::Retry,
+                    OnboardingAction::EditRelays,
+                    OnboardingAction::EditProfile,
+                    OnboardingAction::EditFollows,
+                    OnboardingAction::UseRecommendedRelays,
+                    OnboardingAction::ApproveRepair,
+                    OnboardingAction::CancelRepair,
+                    OnboardingAction::ContinueWithout,
+                ],
+                // A failed read query does not nominate a route for removal.
+                OnboardingFindingContext::DeclaredRoute => {
+                    &[OnboardingAction::Retry, OnboardingAction::ReconnectSigner]
+                }
+                OnboardingFindingContext::RepairPublication => {
+                    &[OnboardingAction::Retry, OnboardingAction::ReconnectSigner]
+                }
+            };
+            finding.actions.extend(
+                applicable
+                    .iter()
+                    .copied()
+                    .filter(|action| step.actions.contains(action)),
+            );
+        }
     }
 }
 
@@ -740,6 +948,7 @@ impl AccountManager {
                 }
             }
         }
+        refresh_finding_actions(&mut checkpoint.snapshot);
         Ok(Some(checkpoint))
     }
     fn read_cancelled_onboarding_checkpoint_for(
@@ -1104,6 +1313,7 @@ impl AccountManager {
             .revision
             .checked_add(1)
             .ok_or_else(onboarding_error)?;
+        refresh_finding_actions(&mut checkpoint.snapshot);
         self.app.account_home().set_account_onboarding(
             &checkpoint.snapshot.account_id_hex,
             &serde_json::to_vec(checkpoint)?,
@@ -1721,7 +1931,15 @@ fn set_operation_error(c: &mut OnboardingCheckpoint, step: OnboardingStep, error
             OnboardingIssue::PublicationFailed,
         ),
     };
-    c.set(step, status, vec![finding(issue)]);
+    let failure = if c.approved {
+        finding(issue).in_context(
+            OnboardingFindingContext::RepairPublication,
+            OnboardingCheckPurpose::EventPublication,
+        )
+    } else {
+        finding(issue)
+    };
+    c.set(step, status, vec![failure]);
 }
 
 impl AccountManager {
@@ -1733,7 +1951,7 @@ impl AccountManager {
     ) -> (
         Vec<NostrTransportEvent>,
         Vec<OnboardingFinding>,
-        HashSet<String>,
+        HashMap<String, String>,
     ) {
         let signer = self
             .resolve(account_id)
@@ -1766,16 +1984,16 @@ impl AccountManager {
             };
             if let Some(issue) = issue {
                 failures.push(OnboardingFinding {
-                    issue,
                     endpoint: Some(c.endpoint),
+                    ..finding(issue)
                 });
                 continue;
             }
             let endpoint = c.normalized_endpoint.unwrap_or(c.endpoint);
             let Ok(url) = nostr::prelude::RelayUrl::parse(&endpoint) else {
                 failures.push(OnboardingFinding {
-                    issue: OnboardingIssue::InvalidRelay,
                     endpoint: Some(endpoint),
+                    ..finding(OnboardingIssue::InvalidRelay)
                 });
                 continue;
             };
@@ -1813,11 +2031,11 @@ impl AccountManager {
             });
         }
         let mut records = Vec::new();
-        let mut completed = HashSet::new();
+        let mut completed = HashMap::new();
         while let Some(result) = tasks.join_next().await {
             match result {
                 Ok((endpoint, Ok(events))) => {
-                    completed.insert(relay_key(&endpoint));
+                    completed.insert(relay_key(&endpoint), endpoint);
                     // A full bounded page may omit another installation's slot.
                     if kind == 30443
                         && events
@@ -1841,8 +2059,8 @@ impl AccountManager {
                         InvalidRequest => OnboardingIssue::InvalidRelay,
                     };
                     failures.push(OnboardingFinding {
-                        issue,
                         endpoint: Some(endpoint),
+                        ..finding(issue)
                     });
                 }
                 Err(_) => failures.push(finding(OnboardingIssue::Interrupted)),
@@ -1861,6 +2079,15 @@ impl AccountManager {
         });
         records.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
         records.dedup_by(|a, b| a.id == b.id);
+        let failures = failures
+            .into_iter()
+            .map(|finding| {
+                finding.in_context(
+                    OnboardingFindingContext::RecordDiscovery,
+                    OnboardingCheckPurpose::RecordLookup,
+                )
+            })
+            .collect();
         (records, failures, completed)
     }
     async fn onboarding_sources(
@@ -1933,7 +2160,10 @@ impl AccountManager {
         {
             return (
                 OnboardingStatus::WaitingForSigner,
-                vec![finding(OnboardingIssue::SignerUnavailable)],
+                vec![finding(OnboardingIssue::SignerUnavailable).in_context(
+                    OnboardingFindingContext::RecordDiscovery,
+                    OnboardingCheckPurpose::RecordLookup,
+                )],
                 c.records[step.index()].clone(),
             );
         }
@@ -1946,7 +2176,10 @@ impl AccountManager {
                 (
                     OnboardingStatus::RetryableFailure,
                     if failures.is_empty() {
-                        vec![finding(OnboardingIssue::Unreachable)]
+                        vec![finding(OnboardingIssue::Unreachable).in_context(
+                            OnboardingFindingContext::RecordDiscovery,
+                            OnboardingCheckPurpose::RecordLookup,
+                        )]
                     } else {
                         failures
                     },
@@ -1955,7 +2188,10 @@ impl AccountManager {
             } else {
                 (
                     OnboardingStatus::NeedsInput,
-                    vec![finding(OnboardingIssue::Missing)],
+                    vec![finding(OnboardingIssue::Missing).in_context(
+                        OnboardingFindingContext::RecordDiscovery,
+                        OnboardingCheckPurpose::RecordLookup,
+                    )],
                     None,
                 )
             };
@@ -1963,13 +2199,25 @@ impl AccountManager {
         if event.created_at > unix_now_seconds() + FUTURE_CLOCK_SKEW {
             return (
                 OnboardingStatus::RetryableFailure,
-                vec![finding(OnboardingIssue::FutureDated)],
+                vec![finding(OnboardingIssue::FutureDated).in_context(
+                    OnboardingFindingContext::PublishedDeclaration,
+                    OnboardingCheckPurpose::DeclarationValidation,
+                )],
                 Some(event),
             );
         }
-        let mut findings = validate_onboarding_record(&event);
+        let mut findings: Vec<_> = validate_onboarding_record(&event)
+            .into_iter()
+            .map(|finding| {
+                finding.in_context(
+                    OnboardingFindingContext::PublishedDeclaration,
+                    OnboardingCheckPurpose::DeclarationValidation,
+                )
+            })
+            .collect();
         let mut relay_status = None;
         if step.relay() {
+            let capabilities = declared_capabilities(&event, step);
             let name = if step == OnboardingStep::Relays {
                 "r"
             } else {
@@ -2008,8 +2256,15 @@ impl AccountManager {
                     RelayEndpointPolicy::Unsafe => OnboardingIssue::UnsafeRelay,
                 };
                 findings.push(OnboardingFinding {
-                    issue,
+                    declared_capability: capabilities
+                        .get(&relay_key(&classified.endpoint))
+                        .copied()
+                        .unwrap_or_default(),
                     endpoint: Some(classified.endpoint),
+                    ..finding(issue).in_context(
+                        OnboardingFindingContext::PublishedDeclaration,
+                        OnboardingCheckPurpose::DeclarationValidation,
+                    )
                 });
             }
             let state = crate::relay_list_state_from_event(&event);
@@ -2025,7 +2280,10 @@ impl AccountManager {
                     .iter()
                     .any(|endpoint| allowed.contains(&relay_key(endpoint)));
                 if !has_read_route || !has_write_or_inbox_route {
-                    findings.push(finding(OnboardingIssue::NoUsableRoute));
+                    findings.push(finding(OnboardingIssue::NoUsableRoute).in_context(
+                        OnboardingFindingContext::PublishedDeclaration,
+                        OnboardingCheckPurpose::DeclarationValidation,
+                    ));
                     relay_status = Some(OnboardingStatus::NeedsInput);
                 } else {
                     let mut endpoints = state.relays;
@@ -2038,6 +2296,9 @@ impl AccountManager {
                             }
                         }
                     }
+                    // Policy rejections already have declaration-validation
+                    // findings; they are not attempted directory queries.
+                    endpoints.retain(|endpoint| allowed.contains(&relay_key(endpoint)));
                     let defaults = c
                         .options
                         .defaults_for(step)
@@ -2061,23 +2322,63 @@ impl AccountManager {
                             endpoints,
                         )
                         .await;
-                    findings.extend(failures);
+                    findings.extend(failures.into_iter().map(|failure| {
+                        let mut failure = failure.in_context(
+                            OnboardingFindingContext::DeclaredRoute,
+                            OnboardingCheckPurpose::DirectoryQuery,
+                        );
+                        failure.declared_capability = failure
+                            .endpoint
+                            .as_deref()
+                            .and_then(|endpoint| capabilities.get(&relay_key(endpoint)))
+                            .copied()
+                            .unwrap_or_default();
+                        failure
+                    }));
                     // Inspection only dials allowed routes from this declaration.
                     if completed.is_empty() {
-                        findings.push(finding(OnboardingIssue::NoUsableRoute));
+                        let mut failure = finding(OnboardingIssue::NoUsableRoute).in_context(
+                            OnboardingFindingContext::DeclaredRoute,
+                            OnboardingCheckPurpose::DirectoryQuery,
+                        );
+                        failure.outcome = OnboardingCheckOutcome::Unknown;
+                        findings.push(failure);
                         relay_status = Some(OnboardingStatus::RetryableFailure);
                     } else {
+                        // The declared role is not the checked capability: EOSE
+                        // proves a read query, never acceptance of a future write.
+                        let mut completed: Vec<_> = completed.into_iter().collect();
+                        completed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                        findings.extend(completed.into_iter().map(|(key, endpoint)| {
+                            OnboardingFinding {
+                                declared_capability: capabilities
+                                    .get(&key)
+                                    .copied()
+                                    .unwrap_or_default(),
+                                endpoint: Some(endpoint),
+                                ..finding(OnboardingIssue::InspectionCompleted).in_context(
+                                    OnboardingFindingContext::DeclaredRoute,
+                                    OnboardingCheckPurpose::DirectoryQuery,
+                                )
+                            }
+                        }));
                         relay_status = Some(OnboardingStatus::Passed);
                     }
                 }
             } else {
-                findings.push(finding(OnboardingIssue::Malformed));
+                findings.push(finding(OnboardingIssue::Malformed).in_context(
+                    OnboardingFindingContext::PublishedDeclaration,
+                    OnboardingCheckPurpose::DeclarationValidation,
+                ));
                 relay_status = Some(OnboardingStatus::NeedsInput);
             }
         }
         let status = evaluated_onboarding_status(&findings, relay_status);
         if !failures.is_empty() {
-            findings.push(finding(OnboardingIssue::DiscoveryIncomplete));
+            findings.push(finding(OnboardingIssue::DiscoveryIncomplete).in_context(
+                OnboardingFindingContext::RecordDiscovery,
+                OnboardingCheckPurpose::RecordLookup,
+            ));
             findings.extend(failures);
         }
         (status, findings, Some(event))
@@ -2400,10 +2701,27 @@ impl AccountManager {
         if completed.is_empty()
             || sources
                 .iter()
-                .any(|endpoint| !completed.contains(&relay_key(endpoint)))
+                .any(|endpoint| !completed.contains_key(&relay_key(endpoint)))
             || (records.is_empty() && !failures.is_empty())
         {
-            c.set(proposal.step, OnboardingStatus::RetryableFailure, failures);
+            let failures = if failures.is_empty() {
+                vec![finding(OnboardingIssue::DiscoveryIncomplete)]
+            } else {
+                failures
+            };
+            c.set(
+                proposal.step,
+                OnboardingStatus::RetryableFailure,
+                failures
+                    .into_iter()
+                    .map(|failure| {
+                        failure.in_context(
+                            OnboardingFindingContext::RepairApproval,
+                            OnboardingCheckPurpose::SourceFreshness,
+                        )
+                    })
+                    .collect(),
+            );
             c.snapshot.proposal = None;
         } else if records.first().map(|e| &e.id) != proposal.previous_event_id.as_ref() {
             c.records[proposal.step.index()] = records.first().cloned();
@@ -2411,7 +2729,10 @@ impl AccountManager {
             c.set(
                 proposal.step,
                 OnboardingStatus::RetryableFailure,
-                vec![finding(OnboardingIssue::RecordChanged)],
+                vec![finding(OnboardingIssue::RecordChanged).in_context(
+                    OnboardingFindingContext::RepairApproval,
+                    OnboardingCheckPurpose::SourceFreshness,
+                )],
             );
         } else {
             c.approved = true;
@@ -2516,7 +2837,10 @@ impl AccountManager {
                 c.set(
                     proposal.step,
                     OnboardingStatus::RetryableFailure,
-                    vec![finding(OnboardingIssue::RecordChanged)],
+                    vec![finding(OnboardingIssue::RecordChanged).in_context(
+                        OnboardingFindingContext::RepairApproval,
+                        OnboardingCheckPurpose::DeclarationValidation,
+                    )],
                 );
                 self.save_onboarding(c)?;
                 return Err(error);
@@ -2656,7 +2980,10 @@ impl AccountManager {
                 c.set(
                     proposal.step,
                     OnboardingStatus::RetryableFailure,
-                    vec![finding(OnboardingIssue::PublicationFailed)],
+                    vec![finding(OnboardingIssue::PublicationFailed).in_context(
+                        OnboardingFindingContext::RepairPublication,
+                        OnboardingCheckPurpose::EventPublication,
+                    )],
                 );
                 self.save_onboarding(c)?;
                 Ok(false)

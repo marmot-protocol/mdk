@@ -65,6 +65,21 @@ for reconnect/backoff and relay status mechanics.
     neither can interleave with an activation mid-sweep or a retry re-registering the id.
   - A failed or cancelled group sync closes the REQs its batch installed once its subscribe tasks settle, except ids
     the committed routes still want (`close_abandoned_sync_batch`). Its guard holds the lifecycle lock throughout.
+- Never fail a subscription, activation or group sync because a relay is unreachable (#1951). nostr-sdk refuses a
+  REQ outright on a relay that failed more than one connect attempt, and its reconnect re-sends only the REQs it
+  registered:
+  - `subscribe_planned` records such a relay's REQ (id and original filter) in `OwedSubscriptions`. The relay's
+    frontier monitor re-sends it on the relay's next `Connected`, after emitting that connection's replay boundary,
+    and after a lag cutover; `subscribe_planned` re-sends at once when the relay connected before the entry existed.
+  - Only a refusal no reconnect cures counts against a plan (`relay_owes`: relay gone, banned, terminated or shut
+    down, unable to read, or already holding the id). A plan fails only when no relay registered or owes its REQ.
+  - Owed ids stay in `account_subscriptions`. `unsubscribe` and each id of `unsubscribe_account` forget the id under
+    the re-send lock before its CLOSE, and a re-send holds that lock across its check and registration, so a closed
+    REQ never comes back. A new CLOSE path must forget first too.
+  - Owing adds no replay-coverage state: an owed relay stays `RelayReplay::Awaiting` like one that queued the REQ
+    while disconnected, and restarts at its connection boundary.
+  - `NostrSubscribeReport` carries aggregate owed and refused relay counts into the `activations_*` and
+    `group_syncs_*` metrics. Clients that do not override `subscribe_reporting` report every success as full.
 - Never count a replay a relay may have clamped as coverage (#2263):
   - `observe_relay_event` takes an authenticated event id and counts each relay's stored events per activation,
     sync or maintenance REQ until that relay's EOSE, without materializing a DTO. Consumers must pass a relay's
@@ -165,18 +180,26 @@ for reconnect/backoff and relay status mechanics.
 - Send group routes as batched REQs, never one REQ per route (#2266): `NostrSubscription::GroupBatch` carries up to
   `GROUP_BATCH_ROUTES` routes that share normalized endpoints and `since` as one `#h` filter, so an account stays far
   under a relay's per-connection REQ limit and recovery's one-shot fetches find room. That holds while the routes'
-  batches, counted per relay-set and floor family, stay well under the limit: a repack briefly holds both its old and
-  new batches, so one relay's co-floored routes near 4,900 can reach strfry's 200 during it. `AccountRoutes::batches`
-  always carries exactly `AccountRoutes::groups`. Activation packs every route (`pack_group_batches`) and numbers
-  batches from 0. A group sync that changes the route set repacks every batch (`repacked_group_routes`): each route
-  keeps the floor it was issued at, or starts at the sync's floor when the activation's replay coverage is complete;
-  the new batches enter replay coverage before their REQs go out (`stage_replay_batches`, as activation does, so an
-  early EOSE or stored page counts), go out before the replaced ones close, and the replaced ones leave coverage on
-  commit (`retire_replay_batches`); a failed or cancelled sync retires only its own uncommitted batches. A sync's
+  batches, counted per relay-set and floor family, stay well under the limit: a repack briefly holds both the old and
+  new batches of the families it changes, so one relay's co-floored routes near 4,900 can reach strfry's 200 during
+  it. `AccountRoutes::batches` always carries exactly `AccountRoutes::groups`, after a partial commit too. Activation
+  packs every route (`pack_group_batches`) and numbers batches from 0. A group sync that changes the route set repacks
+  only the families it touches, each in full (`plan_family_repacks`): one a route leaves (removed, or re-added to
+  widen its floor) or joins, and one whose routes, issued again, would land in a family the sync issues. Every other
+  family's live REQs stay as they are, so one relay set's churn never re-sends another's. A repacked route keeps the
+  floor it was issued at, or starts at the sync's floor when the activation's replay coverage is complete; completed
+  coverage alone repacks nothing. Families that share a route or a family key form one `FamilyRepack`, which commits
+  once all of its batches went out (`commit_group_sync`). A repack whose batch failed keeps its families' live
+  batches, routes (a route it removed among them) and coverage, closes the REQs its batches installed, and is tried
+  again by the next sync, which `AccountRoutes::retry_repacks` keeps from returning early as unchanged; the sync
+  commits the rest and then returns the error. The new batches enter replay
+  coverage before their REQs go out (`stage_replay_batches`, as activation does, so an early EOSE or stored page
+  counts), go out before the replaced ones close, and the replaced ones leave coverage on commit
+  (`retire_replay_batches`); a failed or cancelled repack retires only its own uncommitted batches. A sync's
   batches page like an activation's. Never append batches or leave a removed route in a live filter: that
   fragments batches back to the REQ limit, and a removed route's events still reach the relay client, which then
   suppresses the re-added route's replay of them. Batch numbers come from `AccountRoutes::next_batch`, which staging
-  spends whether or not the sync commits, so no id is reused within an attempt. Coverage, refusals, lag repair and
+  spends whether or not a repack commits, so no id is reused within an attempt. Coverage, refusals, lag repair and
   `account_subscription_ids` are per batch; clamped replay pages per route from the outset
   (`NostrAcquisitionScope::GroupsWindow`), up to `REPLAY_PAGE_MAX_PAGES` per route. Finish every route of one MLS group
   before releasing it, use canonical group order across REQs, and wait for its pooled history to drain before the
