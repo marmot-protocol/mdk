@@ -46,6 +46,8 @@ const BOOTSTRAP_ACCOUNT: &str = "With wn-agent running, run `wn-agent bootstrap 
                                  an identity first with `wn-agent import-identity`.";
 const REPUBLISH_KEY_PACKAGE: &str = "With wn-agent running, run `wn-agent bootstrap --home <home>`; it \
                                      publishes or repairs this account's KeyPackage.";
+const READ_RECORDS: &str = "Check that this user can read every account record under <home>/accounts (run doctor as \
+                            the user that runs wn-agent) before creating any account.";
 const SAME_RELEASE: &str = "Run the same wn-agent release for the daemon and this CLI, then restart \
                             the daemon.";
 const BUSY_DAEMON: &str = "Check the daemon's log, restart wn-agent, then rerun wn-agent doctor.";
@@ -884,8 +886,7 @@ fn check_accounts(scan: &AccountScan) -> DoctorCheck {
             "accounts",
             Fail,
             format!("No readable local-signing account.{notes}"),
-            "Check that this user can read every account record under <home>/accounts (run doctor as the \
-             user that runs wn-agent) before creating any account.",
+            READ_RECORDS,
         );
     }
     let (status, summary, next_step) = match scan.local_signing {
@@ -1219,6 +1220,12 @@ fn check_daemon_accounts(
     use DoctorStatus::*;
     let count = report.local_signing_account_count;
     let (status, summary, next_step) = match report.selection {
+        // Bootstrap skips unreadable records, so it would create another account.
+        AgentControlAccountSelection::None if accounts.unreadable > 0 => (
+            Fail,
+            "The daemon has no local-signing account it can read.".to_owned(),
+            READ_RECORDS,
+        ),
         AgentControlAccountSelection::None => (
             Fail,
             "The daemon has no local-signing account.".to_owned(),
@@ -2060,7 +2067,20 @@ mod tests {
             .join("agent")
             .join("account.json");
         chmod(&record, 0o000);
+        // A daemon on the same home skips the record too and reports none.
+        fixture.dev_dir(0o700);
+        let mut status = diagnostic(AgentControlDiagnosticKeyPackage::unavailable());
+        status.selection = AgentControlAccountSelection::None;
+        status.account_count = 0;
+        status.local_signing_account_count = 0;
+        let server = serve_daemon(
+            fixture.socket(),
+            None,
+            AgentControlResponse::DiagnosticStatus { report: status },
+        )
+        .await;
         let report = run_doctor(&fixture.options()).await;
+        server.abort();
         chmod(&record, 0o600);
         assert_check(
             &report,
@@ -2068,7 +2088,19 @@ mod tests {
             DoctorStatus::Fail,
             "can read every account record",
         );
-        assert!(!find(&report, "accounts").next_step.contains("bootstrap"));
+        assert_check(
+            &report,
+            "daemon_accounts",
+            DoctorStatus::Fail,
+            "can read every account record",
+        );
+        for check in &report.checks {
+            assert!(
+                !check.next_step.contains("bootstrap"),
+                "{} advises bootstrap",
+                check.id
+            );
+        }
     }
 
     #[tokio::test]
