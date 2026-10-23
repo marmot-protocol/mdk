@@ -138,6 +138,7 @@ pub(crate) fn unsupported_request_message(request: &AgentControlRequest) -> &'st
     }
 }
 
+/// Return the stable request name for diagnostics without inspecting its payload.
 pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'static str {
     match request {
         AgentControlRequest::SubscribeInbound { .. } => "subscribe_inbound",

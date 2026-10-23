@@ -231,6 +231,7 @@ impl AgentConnector {
         result
     }
 
+    /// Dispatch a one-shot control request without adding operation telemetry.
     async fn handle_request_unobserved(
         &self,
         request_id: Option<&str>,

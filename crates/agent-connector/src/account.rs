@@ -70,6 +70,7 @@ impl AgentConnector {
         })
     }
 
+    /// Create a group with the legacy creator-only admin policy.
     pub(crate) async fn create_group_response(
         &self,
         account_id_hex: &str,
@@ -89,6 +90,10 @@ impl AgentConnector {
         .await
     }
 
+    /// Create a group with invited co-admins included in its founding state.
+    ///
+    /// The creator is implicit. Resolve co-admin references against invited
+    /// members and reject invalid selections before calling the app runtime.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_group_with_admins_response(
         &self,

@@ -9086,6 +9086,7 @@ async fn future_dated_inbox_is_unknown_for_account_and_member_resolution() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// Verify local member aliases resolve to fresh relay-published KeyPackages.
 async fn runtime_group_create_resolves_local_member_aliases_with_fresh_relay_packages() {
     let (directory, app, accounts, _fetcher) = member_resolution_fixture(1, false).await;
     let member = &accounts[0];
@@ -9118,6 +9119,7 @@ async fn runtime_group_create_resolves_local_member_aliases_with_fresh_relay_pac
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// Reject non-member admins before lookup and verify valid grants and audit context.
 async fn runtime_group_create_sets_founding_admins_and_rejects_non_members() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })

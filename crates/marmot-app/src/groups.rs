@@ -116,6 +116,8 @@ pub struct AppCreateGroupOptions {
     pub relays: Option<Vec<String>>,
     pub description: String,
     /// Invited account references granted admin in the founding group state.
+    /// Accepts local aliases and public-key references. The creator remains an
+    /// admin and may be listed redundantly; an empty list keeps creator-only rights.
     pub initial_admins: Vec<String>,
     pub initial_image: Option<AppInitialGroupImage>,
     pub disappearing_message_secs: u64,

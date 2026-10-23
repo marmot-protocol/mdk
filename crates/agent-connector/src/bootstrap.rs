@@ -502,6 +502,7 @@ fn unexpected_response(expected: &'static str, response: &AgentControlResponse) 
     }
 }
 
+/// Return the stable response name without exposing payloads in bootstrap errors.
 fn response_type_name(response: &AgentControlResponse) -> &'static str {
     match response {
         AgentControlResponse::Ack => "ack",

@@ -467,7 +467,10 @@ pub enum AgentControlRequest {
     GroupCreateWithAdmins {
         account_id_hex: String,
         name: String,
+        /// Invited local account or public-key references, as in legacy creation.
         members: Vec<String>,
+        /// Invited co-admin references only; the creator is already an admin.
+        /// Each reference must resolve to an entry in `members`.
         admins: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
@@ -1305,6 +1308,7 @@ mod tests {
     }
 
     #[test]
+    /// Pin the wire shapes of founding-admin creation and its capability probe.
     fn founding_admin_creation_round_trips() {
         let value = serde_json::json!({
             "type": "group_create_with_admins", "account_id_hex": "11".repeat(32),
@@ -1342,6 +1346,7 @@ mod tests {
     }
 
     #[test]
+    /// Preserve legacy group-creation frames with optional description and relays.
     fn group_create_frames_round_trip_with_optional_fields() {
         for optional in [false, true] {
             let request = AgentControlEnvelope::request(

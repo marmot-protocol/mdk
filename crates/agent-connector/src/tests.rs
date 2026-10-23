@@ -7199,6 +7199,7 @@ async fn bench_idle_reconciliation_scaling() {
 }
 
 #[tokio::test]
+/// Verify management-socket failures leave ordinary control requests available.
 async fn optional_management_socket_cannot_interrupt_regular_control() {
     for blocked_bind in [true, false] {
         let dir = tempfile::Builder::new()
@@ -7253,6 +7254,7 @@ async fn optional_management_socket_cannot_interrupt_regular_control() {
 }
 
 #[tokio::test]
+/// Verify co-admin validation, alias deduplication, and rights in the initial Welcome.
 async fn connector_creates_admin_in_founding_state() {
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
@@ -7364,6 +7366,7 @@ async fn connector_creates_admin_in_founding_state() {
 }
 
 #[tokio::test]
+/// Verify legacy socket creation resolves members and preserves creator-only admins.
 async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();

@@ -2035,6 +2035,11 @@ impl AppClient {
         .await
     }
 
+    /// Create a group with founding policy, optional image source, and telemetry.
+    ///
+    /// Explicit admins must resolve to founding members, including the implicit
+    /// creator. Validate this before member lookup, image upload, or MLS creation,
+    /// and include explicit admin grants in the creation audit context.
     pub(crate) async fn create_group_with_initial_source_and_optional_telemetry(
         &mut self,
         name: &str,

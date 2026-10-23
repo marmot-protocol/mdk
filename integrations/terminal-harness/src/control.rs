@@ -450,6 +450,7 @@ fn unexpected_response(method: &'static str, response: &AgentControlResponse) ->
     }
 }
 
+/// Name a control response for errors without exposing account or message data.
 fn response_name(response: &AgentControlResponse) -> &'static str {
     match response {
         AgentControlResponse::Ack => "ack",
