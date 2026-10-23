@@ -2937,35 +2937,38 @@ async fn a_failed_family_leaves_the_other_families_committed() {
     );
 }
 
-/// A failed repack keeps its routes as the sync found them, so the next sync
-/// tries it again even when the change it carried was only a wider floor for
-/// a route that stayed live.
+/// A failed repack is tried again by the next sync even when every route
+/// the sync names is equal to one already live. Rotating a group's current
+/// route displaces the old one, which is re-added at a full-backfill floor
+/// without changing shape. Its relay refuses, while the new route's family
+/// commits; the next identical sync re-sends only the widened family, and
+/// once that commits a repeat sends nothing.
 #[tokio::test]
 async fn a_failed_widening_is_tried_again_by_the_next_sync() {
     let relay = Arc::new(FamilyFailureRelayClient::default());
     let adapter = NostrTransportAdapter::new(relay.clone());
     let account_id = MemberId::new(vec![0xA1; 32]);
     let group_id = cgka_traits::GroupId::new(vec![0xB2; 16]);
-    let cursor = 1_800_000_000;
-    let sync = |retained_since: u64| TransportGroupSync {
-        account_id: account_id.clone(),
-        group_subscriptions: vec![
-            floored_route(&group_id, 2, None),
-            floored_route(&group_id, 1, Some(retained_since)),
-        ],
-        since: Some(Timestamp(cursor)),
-    };
+    let since = Some(Timestamp(1_800_000_000));
     adapter
         .activate_account(TransportAccountActivation {
             account_id: account_id.clone(),
             inbox_endpoints: vec![TransportEndpoint("wss://inbox.example".into())],
-            group_subscriptions: sync(cursor + 600).group_subscriptions,
-            since: Some(Timestamp(cursor)),
+            group_subscriptions: vec![floored_route(&group_id, 1, None)],
+            since,
         })
         .await
         .expect("activation succeeds");
-    let floors = |subscriptions: Vec<NostrSubscription>| {
-        subscriptions
+    let rotated = TransportGroupSync {
+        account_id: account_id.clone(),
+        group_subscriptions: vec![
+            floored_route(&group_id, 2, None),
+            floored_route(&group_id, 1, None),
+        ],
+        since,
+    };
+    let floors = || {
+        let mut floors = std::mem::take(&mut *relay.subscriptions.lock().unwrap())
             .into_iter()
             .filter_map(|subscription| match subscription {
                 NostrSubscription::GroupBatch { routes, since, .. } => {
@@ -2973,37 +2976,43 @@ async fn a_failed_widening_is_tried_again_by_the_next_sync() {
                 }
                 _ => None,
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        floors.sort();
+        floors
     };
-    relay.subscriptions.lock().unwrap().clear();
+    floors();
 
     *relay.failing.lock().unwrap() = Some(TransportEndpoint("wss://route-1.example".into()));
     adapter
-        .sync_account_groups(sync(cursor - 300))
+        .sync_account_groups(rotated.clone())
         .await
-        .expect_err("the widened route's relay refuses it");
-    assert_eq!(
-        floors(std::mem::take(&mut *relay.subscriptions.lock().unwrap())),
-        vec![(1, Some(Timestamp(cursor - 300)))]
+        .expect_err("the displaced route's relay refuses its widened REQ");
+    assert_eq!(floors(), vec![(1, None), (2, since)]);
+    assert!(
+        adapter
+            .group_route_subscription_id(&account_id, &[2; 32])
+            .await
+            .is_some(),
+        "the new current route's family committed"
     );
 
     *relay.failing.lock().unwrap() = None;
     adapter
-        .sync_account_groups(sync(cursor - 300))
+        .sync_account_groups(rotated.clone())
         .await
         .expect("the retry succeeds");
     assert_eq!(
-        floors(std::mem::take(&mut *relay.subscriptions.lock().unwrap())),
-        vec![(1, Some(Timestamp(cursor - 300)))],
-        "the same sync widens the route again"
+        floors(),
+        vec![(1, None)],
+        "the same sync widens only the refused family again"
     );
     adapter
-        .sync_account_groups(sync(cursor - 300))
+        .sync_account_groups(rotated)
         .await
         .expect("the repeat succeeds");
     assert!(
-        relay.subscriptions.lock().unwrap().is_empty(),
-        "and once it committed, a repeat sends nothing"
+        floors().is_empty(),
+        "once it committed, a repeat sends nothing"
     );
 }
 

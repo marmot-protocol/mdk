@@ -3165,8 +3165,10 @@ impl TransportAdapter for NostrTransportAdapter {
                 .get(&sync.account_id)
                 .expect("the AccountNotActive guard above proved the account is active");
             // Sends repeat this sync. Keep the committed routes and telemetry
-            // intact when nothing changed; failed relay teardown still retries.
+            // intact when nothing changed; failed relay teardown and failed
+            // family repacks still retry.
             if routes.groups == sync.group_subscriptions
+                && !routes.retry_repacks
                 && state.pending_unsubscribes.is_empty()
                 && state.pending_scoped_unsubscribes.is_empty()
             {
@@ -3209,6 +3211,7 @@ impl TransportAdapter for NostrTransportAdapter {
             // sent so its repeats return early above.
             if let Some(routes) = self.state.write().await.accounts.get_mut(&sync.account_id) {
                 routes.groups = sync.group_subscriptions;
+                routes.retry_repacks = false;
             }
             self.drain_pending_unsubscribes().await;
             drop(subscription_guard);
@@ -3579,6 +3582,11 @@ struct AccountRoutes {
     /// The number the next batch a group sync adds takes within `attempt`.
     /// Spent when a sync stages its batches, so numbers are never reused.
     next_batch: u32,
+    /// Whether the last group sync left a family repack uncommitted. A sync
+    /// that matches `groups` still diffs them while this is set, so the
+    /// failed families are tried again even when no route changed shape: a
+    /// route re-added to widen its floor can be equal to the one it replaces.
+    retry_repacks: bool,
 }
 
 /// Endpoint coverage for the account's live inbox and group batch REQs, as
@@ -5995,6 +6003,7 @@ impl AdapterState {
                 attempt,
                 batches: batches.to_vec(),
                 next_batch: u32::try_from(batches.len()).unwrap_or(u32::MAX),
+                retry_repacks: false,
             },
         );
         self.rebuild_transport_group_index();
@@ -6003,12 +6012,11 @@ impl AdapterState {
     /// Commit the family repacks of a group sync whose batches all went out
     /// (`committed`, in `repacks` order): their routes, the floor each was
     /// issued at, and the batches that now carry them. A repack that did not
-    /// commit leaves its families exactly as they were: their live batches
-    /// keep carrying their routes as the sync found them, a route it removed
-    /// among them, and a route it would have added stays out, so the account
-    /// no longer matches the sync and the next one tries the repack again.
-    /// Returns the batches the committed repacks replace, for the caller to
-    /// close.
+    /// commit leaves its families as they were: their live batches keep
+    /// carrying their routes at their floors, a route it removed among them,
+    /// and a route it would have added stays out. The account is then marked
+    /// for the next sync to try those repacks again. Returns the batches the
+    /// committed repacks replace, for the caller to close.
     fn commit_group_sync(
         &mut self,
         sync: TransportGroupSync,
@@ -6022,12 +6030,10 @@ impl AdapterState {
         let mut replaced = Vec::new();
         let mut created = 0;
         let mut not_added = HashSet::new();
-        let mut not_reissued = HashSet::new();
         let mut not_removed = HashSet::new();
         for (repack, committed) in repacks.iter().zip(committed) {
             if !committed {
                 not_added.extend(repack.added.iter().cloned());
-                not_reissued.extend(repack.routes.iter().map(NostrSubscription::route_key));
                 not_removed.extend(repack.removed.iter().cloned());
                 continue;
             }
@@ -6046,24 +6052,10 @@ impl AdapterState {
             replaced.extend(repack.replaced.iter().cloned());
             created += repack.batches.len();
         }
-        let previous = account
-            .groups
-            .iter()
-            .map(|group| (group_route_key(account_id, group), group))
-            .collect::<HashMap<_, _>>();
         let mut groups = sync
             .group_subscriptions
             .into_iter()
-            .filter_map(|group| {
-                let key = group_route_key(account_id, &group);
-                if not_added.contains(&key) {
-                    return None;
-                }
-                match previous.get(&key) {
-                    Some(previous) if not_reissued.contains(&key) => Some((*previous).clone()),
-                    _ => Some(group),
-                }
-            })
+            .filter(|group| !not_added.contains(&group_route_key(account_id, group)))
             .collect::<Vec<_>>();
         groups.extend(
             account
@@ -6078,6 +6070,7 @@ impl AdapterState {
             .collect::<HashSet<_>>();
         account.group_since.retain(|route, _| live.contains(route));
         account.groups = groups;
+        account.retry_repacks = committed.contains(&false);
         self.metrics.subscriptions_created += created;
         self.rebuild_transport_group_index();
         replaced
@@ -7505,6 +7498,7 @@ mod batch_tests {
             attempt: SubscriptionAttempt::INITIAL,
             batches: pack_group_batches(&account, &live, SubscriptionAttempt::INITIAL, 0),
             next_batch: 1,
+            retry_repacks: false,
         };
         // Leaving one route repacks its family; the route it keeps is issued
         // no later than the floor the sync asks for, replay complete or not.
@@ -7563,6 +7557,7 @@ mod batch_tests {
             attempt: SubscriptionAttempt::INITIAL,
             next_batch: u32::try_from(batches.len()).unwrap(),
             batches,
+            retry_repacks: false,
         }
     }
 

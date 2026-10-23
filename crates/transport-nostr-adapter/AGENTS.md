@@ -191,7 +191,8 @@ for reconnect/backoff and relay status mechanics.
   coverage alone repacks nothing. Families that share a route or a family key form one `FamilyRepack`, which commits
   once all of its batches went out (`commit_group_sync`). A repack whose batch failed keeps its families' live
   batches, routes (a route it removed among them) and coverage, closes the REQs its batches installed, and is tried
-  again by the next sync; the sync commits the rest and then returns the error. The new batches enter replay
+  again by the next sync, which `AccountRoutes::retry_repacks` keeps from returning early as unchanged; the sync
+  commits the rest and then returns the error. The new batches enter replay
   coverage before their REQs go out (`stage_replay_batches`, as activation does, so an early EOSE or stored page
   counts), go out before the replaced ones close, and the replaced ones leave coverage on commit
   (`retire_replay_batches`); a failed or cancelled repack retires only its own uncommitted batches. A sync's
