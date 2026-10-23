@@ -151,6 +151,9 @@ a path the connector can read.
 
 ## Run locally
 
+To run a released `wn-agent` for your own client without building from source, follow
+[Build your own client](../../integrations/custom-client.md).
+
 Start the connector with the same public relay set the phone app uses (`--home` is required):
 
 ```sh
@@ -332,5 +335,6 @@ unconfirmed transport or protocol outcome is unknown, never an automatic retry.
 
 The canonical [White Noise + Agents quickstart](../../integrations/README.md#get-started-white-noise--agents) owns the
 current release URLs, runtime chooser, phone onboarding, and repeatable agent/CI example for Hermes, OpenClaw,
-Claude Code, Codex, OpenCode, Pi, and Goose. Connector-specific configuration, manual setup, security notes, and development
-workflows live in each integration README under [`integrations/`](../../integrations/README.md).
+Claude Code, Codex, OpenCode, Pi, and Goose, plus the connector-only install for your own client. Connector-specific
+configuration, manual setup, security notes, and development workflows live in each integration README under
+[`integrations/`](../../integrations/README.md).

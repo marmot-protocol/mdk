@@ -27,6 +27,7 @@ on:
       - integrations/pi/marmot/**
       - scripts/install-goose-marmot.sh
       - integrations/goose/marmot/**
+      - scripts/install-wn-agent.sh
       - integrations/terminal-harness/**
       - Cargo.toml
       - Cargo.lock
@@ -678,6 +679,14 @@ jobs:
                 > "dist/install/install-$harness-marmot.sh"
             chmod 0755 "dist/install/install-$harness-marmot.sh"
           done
+          # Connector-only mode of the same installer, for custom agent-control clients.
+          awk 'NR == 1 { print; print "export MARMOT_TERMINAL_HARNESS=none"; next } { print }' \
+            scripts/install-terminal-harness-marmot.sh | \
+            sed \
+              -e "s/^MARMOT_RELEASE_TAG_DEFAULT=.*/MARMOT_RELEASE_TAG_DEFAULT=\"${tag}\"/" \
+              -e "s/^WN_AGENT_VERSION_DEFAULT=.*/WN_AGENT_VERSION_DEFAULT=\"${version}\"/" \
+              > dist/install/install-wn-agent.sh
+          chmod 0755 dist/install/install-wn-agent.sh
           for installer in dist/install/install-*.sh; do
             shasum -a 256 "$installer" | \
               awk -v name="$(basename "$installer")" '{print $1 "  " name}' \
@@ -737,6 +746,8 @@ jobs:
           install_verified "\$base_url/install-pi-marmot.sh" "\$base_url/install-pi-marmot.sh.sha256"
           # Goose terminal harness
           install_verified "\$base_url/install-goose-marmot.sh" "\$base_url/install-goose-marmot.sh.sha256"
+          # wn-agent only, for your own agent-control client
+          install_verified "\$base_url/install-wn-agent.sh" "\$base_url/install-wn-agent.sh.sha256"
           \`\`\`
 
           Assets:
@@ -755,6 +766,7 @@ jobs:
           - \`install-opencode-marmot.sh\`: installer for testers with OpenCode already installed.
           - \`install-pi-marmot.sh\`: installer for testers with Pi already installed.
           - \`install-goose-marmot.sh\`: installer for testers with Goose already installed.
+          - \`install-wn-agent.sh\`: connector-only installer for your own agent-control client; installs no harness.
 
           Verify downloads with the accompanying \`.sha256\` files.
           EOF
@@ -826,6 +838,8 @@ jobs:
             dist/install/install-pi-marmot.sh.sha256
             dist/install/install-goose-marmot.sh
             dist/install/install-goose-marmot.sh.sha256
+            dist/install/install-wn-agent.sh
+            dist/install/install-wn-agent.sh.sha256
           )
 
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
