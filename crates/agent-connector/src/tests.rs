@@ -1866,6 +1866,7 @@ async fn connector_edit_message_replaces_own_text_and_reports_refusals() {
             account_id_hex: account_id_hex.clone(),
             group_id_hex: group_id_hex.clone(),
             message_id_hex: status_id.clone(),
+            include_media: None,
         },
     )
     .await;
@@ -1900,6 +1901,185 @@ async fn connector_edit_message_replaces_own_text_and_reports_refusals() {
     };
     assert_eq!(code, "invalid_hex");
     server.abort();
+}
+
+#[tokio::test]
+async fn connector_timeline_media_lookup_is_opt_in_and_hides_deleted_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay.url().await.to_string()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let account = connector.account_home.create_account("agent").unwrap();
+    let recipient = connector.account_home.create_account("recipient").unwrap();
+    connector
+        .runtime
+        .publish_key_package(&recipient.label)
+        .await
+        .unwrap();
+    let group_id = connector
+        .runtime
+        .create_group(
+            &account.label,
+            "Media recovery",
+            std::slice::from_ref(&recipient.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    timeout(Duration::from_secs(30), async {
+        while connector
+            .app
+            .group(&recipient.label, &group_id_hex)
+            .unwrap()
+            .is_none()
+        {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    accept_group_invite_retrying_busy(&connector.runtime, &recipient.label, &group_id).await;
+    let tag = vec![
+        "imeta".into(),
+        "v encrypted-media-v1".into(),
+        format!(
+            "locator blossom-v1 https://blossom.example.com/{}.bin",
+            "cd".repeat(32)
+        ),
+        format!("ciphertext_sha256 {}", "cd".repeat(32)),
+        format!("plaintext_sha256 {}", "ab".repeat(32)),
+        format!("nonce {}", "0".repeat(24)),
+        "m image/png".into(),
+        "filename example.png".into(),
+    ];
+    let epoch = connector
+        .runtime
+        .group_mls_state(&account.label, &group_id)
+        .await
+        .unwrap()
+        .epoch;
+    let reference = marmot_app::media_attachment_from_imeta_tag(&tag, Some(epoch), false).unwrap();
+    let sent = connector
+        .runtime
+        .send_tagged_media(
+            &account.label,
+            &group_id,
+            vec![reference],
+            Some("attachment".into()),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let message_id_hex = sent.message_ids[0].clone();
+    timeout(Duration::from_secs(30), async {
+        loop {
+            connector.runtime.catch_up_accounts().await.unwrap();
+            if connector
+                .runtime
+                .timeline_message(&recipient.label, &group_id_hex, &message_id_hex)
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+    let lookup = |include_media, message: &str| AgentControlRequest::TimelineMessageGet {
+        account_id_hex: recipient.account_id_hex.clone(),
+        group_id_hex: group_id_hex.clone(),
+        message_id_hex: message.into(),
+        include_media,
+    };
+    for flag in [None, Some(false), Some(true)] {
+        let response = serve_control_request_once(
+            &connector,
+            &listener,
+            &socket,
+            "lookup",
+            lookup(flag, &message_id_hex),
+        )
+        .await;
+        let AgentControlResponse::TimelineMessage {
+            message: Some(message),
+            media,
+            ..
+        } = response.payload
+        else {
+            panic!("Expected materialized chat message");
+        };
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(media.len(), usize::from(flag == Some(true)));
+        if let Some(reference) = media.first() {
+            assert_eq!(reference.plaintext_sha256, "ab".repeat(32));
+        }
+    }
+    let missing = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "missing",
+        lookup(Some(true), &"ef".repeat(32)),
+    )
+    .await;
+    assert!(
+        matches!(missing.payload, AgentControlResponse::TimelineMessage { message: None, media, .. } if media.is_empty())
+    );
+    connector
+        .runtime
+        .delete_message(&account.label, &group_id, &message_id_hex)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(30), async {
+        loop {
+            connector.runtime.catch_up_accounts().await.unwrap();
+            if connector
+                .runtime
+                .timeline_message(&recipient.label, &group_id_hex, &message_id_hex)
+                .unwrap()
+                .is_some_and(|record| record.deleted)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let deleted = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "deleted",
+        lookup(Some(true), &message_id_hex),
+    )
+    .await;
+    let AgentControlResponse::TimelineMessage {
+        message: Some(message),
+        media,
+        ..
+    } = deleted.payload
+    else {
+        panic!("Expected deleted timeline row");
+    };
+    assert_eq!(
+        message.availability,
+        agent_control::AgentControlTimelineMessageAvailability::Deleted
+    );
+    assert!(media.is_empty());
+    assert!(message.attachments.is_empty());
+    connector.runtime.shutdown().await;
 }
 
 #[test]

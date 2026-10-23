@@ -212,6 +212,9 @@ pub enum AgentControlRequest {
         account_id_hex: String,
         group_id_hex: String,
         message_id_hex: String,
+        /// Opt in to non-secret download references; omitted keeps summaries only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        include_media: Option<bool>,
     },
     /// Page through the materialized, user-visible timeline in stable
     /// `(recorded_at, message_id_hex)` order. `before` and `after` are mutually
@@ -617,6 +620,9 @@ pub enum AgentControlResponse {
         message_id_hex: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<AgentControlTimelineMessage>,
+        /// Opt-in download references. Content keys remain inside MDK.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        media: Vec<AgentControlMediaRef>,
     },
     TimelinePage {
         account_id_hex: String,
@@ -1889,6 +1895,7 @@ mod tests {
                     account_id_hex: account(),
                     group_id_hex: group(),
                     message_id_hex: message(),
+                    include_media: None,
                 },
                 "timeline_message_get",
             ),
@@ -2252,6 +2259,38 @@ mod tests {
             let value = serde_json::to_value(request).unwrap();
             assert_eq!(value["type"], expected_type);
         }
+    }
+
+    #[test]
+    fn timeline_media_recovery_flag_round_trips_without_changing_legacy_requests() {
+        let mut value = serde_json::json!({
+            "type":"timeline_message_get", "account_id_hex":account(),
+            "group_id_hex":group(), "message_id_hex":message()
+        });
+        let legacy: AgentControlRequest = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            serde_json::to_value(legacy)
+                .unwrap()
+                .get("include_media")
+                .is_none()
+        );
+        value["include_media"] = Value::Bool(true);
+        let request: AgentControlRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["include_media"],
+            true
+        );
+        let response: AgentControlResponse = serde_json::from_value(serde_json::json!({
+            "type":"timeline_message", "account_id_hex":account(), "group_id_hex":group(),
+            "message_id_hex":message(), "message":null
+        }))
+        .unwrap();
+        assert!(
+            serde_json::to_value(response)
+                .unwrap()
+                .get("media")
+                .is_none()
+        );
     }
 
     #[test]
