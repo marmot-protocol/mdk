@@ -235,6 +235,39 @@ fn build_export_batch_includes_unlabeled_reconciliation_counters() {
 }
 
 #[test]
+fn build_export_batch_includes_unlabeled_activation_and_group_sync_counters() {
+    let rollup = RelayTelemetryRollup {
+        activations_full: 11,
+        activations_degraded: 3,
+        activations_failed: 1,
+        group_syncs_full: 17,
+        group_syncs_degraded: 5,
+        group_syncs_failed: 2,
+        ..Default::default()
+    };
+    let batch = build_export_batch(&rollup, &RelayLabelResolution::default());
+
+    for (name, value) in [
+        (metric_names::ACCOUNT_ACTIVATIONS_FULL, 11),
+        (metric_names::ACCOUNT_ACTIVATIONS_DEGRADED, 3),
+        (metric_names::ACCOUNT_ACTIVATIONS_FAILED, 1),
+        (metric_names::GROUP_SYNCS_FULL, 17),
+        (metric_names::GROUP_SYNCS_DEGRADED, 5),
+        (metric_names::GROUP_SYNCS_FAILED, 2),
+    ] {
+        let matching: Vec<_> = batch
+            .points
+            .iter()
+            .filter(|point| point.name == name)
+            .collect();
+        assert_eq!(matching.len(), 1, "{name} is one device-wide point");
+        assert!(matching[0].relay.is_none());
+        assert!(matching[0].failure.is_none());
+        assert_eq!(matching[0].value, ExportMetricValue::Counter(value));
+    }
+}
+
+#[test]
 fn build_export_batch_appends_unlabeled_app_performance_metrics() {
     let app_performance = AppPerformanceSnapshot {
         app_start: AppPerformanceOperationSnapshot {
@@ -939,6 +972,43 @@ async fn account_publish_counters_are_unlabeled_population_points() {
     assert_eq!(counter(metric_names::PUBLISH_SUCCESSES), 1);
     assert_eq!(counter(metric_names::PUBLISH_FAILURES), 1);
     assert_eq!(counter(metric_names::PUBLISH_CANCELLATIONS), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_activation_counters_reach_the_export_batch() {
+    use transport_nostr::test_support::AccountPublishFixture;
+
+    let fixture = AccountPublishFixture::activate().await;
+    let exporter = RelayTelemetryExporter::new(
+        &fixture.plane,
+        RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
+            .with_runtime_config(runtime_config()),
+        crate::product_analytics::test_permit(),
+    )
+    .expect("opted-in exporter");
+    let batch = exporter.build_batch(None).await;
+    let counter = |name: &str| {
+        let point = batch
+            .points
+            .iter()
+            .find(|point| point.name == name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        assert!(point.relay.is_none(), "{name} must not carry a relay label");
+        assert!(
+            point.failure.is_none(),
+            "{name} must not carry a failure classification"
+        );
+        match point.value {
+            ExportMetricValue::Counter(value) => value,
+            ref other => panic!("{name} should be a counter, got {other:?}"),
+        }
+    };
+    assert_eq!(counter(metric_names::ACCOUNT_ACTIVATIONS_FULL), 1);
+    assert_eq!(counter(metric_names::ACCOUNT_ACTIVATIONS_DEGRADED), 0);
+    assert_eq!(counter(metric_names::ACCOUNT_ACTIVATIONS_FAILED), 0);
+    assert_eq!(counter(metric_names::GROUP_SYNCS_FULL), 0);
+    assert_eq!(counter(metric_names::GROUP_SYNCS_DEGRADED), 0);
+    assert_eq!(counter(metric_names::GROUP_SYNCS_FAILED), 0);
 }
 
 #[test]
