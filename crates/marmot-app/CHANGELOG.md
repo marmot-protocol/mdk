@@ -285,6 +285,15 @@
   never hide a current package's rejection, and an incomplete lookup still reports
   `RelayDirectory`.
 - Group changes fail with `AppError::GroupCatchingUp` while unresolved epoch-gap recovery (pending, parked or with its notice dismissed) covers the group's current local epoch. Before, a device that knew the group had moved on could still commit from its stale epoch and fork the group (mdk#2258). The check is advisory: after the user accepts the risk, `acknowledge_group_catching_up` lets the change through. Due self-updates wait up to 24 hours for the gap to close. Messages and leave are not affected.
+- One unreachable relay no longer fails an account's transport activation or
+  group sync (mdk#1951). Once a relay had failed two connection attempts, the
+  relay client refused new subscriptions to it, and when that was a route's
+  only relay the whole activation rolled back, taking the inbox and every
+  healthy group offline. The client now keeps such a relay's subscription and
+  sends it when the relay reconnects. `NostrAdapterMetrics` gains
+  `activations_full`, `activations_degraded`, `activations_failed`,
+  `group_syncs_full`, `group_syncs_degraded` and `group_syncs_failed`; struct
+  literals need the fields or `..Default::default()`.
 - A failed or cancelled transport activation no longer leaves untracked REQs
   live on the relay. They used to stay open until disconnect, be re-sent on
   every reconnect, and use up the relay's per-connection subscription limit
