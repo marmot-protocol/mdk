@@ -1,7 +1,8 @@
 name: CI
 
-# The merge queue is the merge gate and runs the full matrix. Pull requests run
-# a fast pre-check (format, static gates, audit, clippy, WASM build) unless
+# The merge queue is the merge gate and runs the full matrix, stopping at the
+# first failed job so the queue ejects that PR at once. Pull requests run a
+# fast pre-check (format, static gates, audit, clippy, WASM build) unless
 # labelled `ci:full`. The queue fast-forwards master to the commit it tested, so
 # master pushes only refresh the Rust caches pull requests and merge groups
 # restore: GitHub scopes a cache saved by a merge-group run to its temporary
@@ -1233,8 +1234,58 @@ jobs:
           cargo nextest run --locked -p marmot-app --lib
           -E 'test(root_runtime_lease)'
 
+  # A merge-group run stops at its first failed job. `Required CI` waits for
+  # every job, so without this one failure would hold the PR, and every group
+  # built on top of it, in the queue until the slowest job finished. Cancelling
+  # the run cancels the jobs still running; `Required CI` still runs, sees
+  # them cancelled and fails, and the queue ejects the PR. This is the only
+  # job with `actions: write` and runs no repository code. It is not one of
+  # `Required CI`'s needs, since it waits for that job to appear, and it must
+  # never fail a run whose required jobs passed.
+  merge-group-fail-fast:
+    name: Merge-group fail-fast
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 160
+    continue-on-error: true
+    permissions:
+      actions: write
+
+    steps:
+      - name: Cancel the run when a job fails
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          # Stop watching before the job timeout. One poll a minute keeps a
+          # run to about 40 requests of the token's hourly budget.
+          deadline=$((SECONDS + 150 * 60))
+          while (( SECONDS < deadline )); do
+            # One line per job: name, status, conclusion. A failed request is
+            # retried on the next poll.
+            if jobs="$(gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/jobs?per_page=100" \
+                --jq '.jobs[] | [.name, .status, .conclusion // ""] | @tsv')"; then
+              # Required CI starts only once every other job has finished.
+              if awk -F '\t' '$1 == "Required CI" { found = 1 } END { exit !found }' <<<"$jobs"; then
+                exit 0
+              fi
+              # Merge groups accept only success, so any other conclusion
+              # already fails Required CI.
+              failed="$(awk -F '\t' '$2 == "completed" && $3 != "success" && $3 != "skipped"' <<<"$jobs")"
+              if [[ -n "$failed" ]]; then
+                printf 'Cancelling the run after:\n%s\n' "$failed"
+                gh run cancel "$RUN_ID" && exit 0
+              fi
+            fi
+            sleep 60
+          done
+
   required-ci:
     name: Required CI
+    # `always()`, not `!cancelled()`: this must also run, and fail, after
+    # merge-group-fail-fast cancels the run.
     if: always()
     needs:
       - changes
@@ -1265,7 +1316,8 @@ jobs:
 
     steps:
       # A full run selects every job, so a skip there means a broken condition
-      # rather than an unaffected lane. Merge groups must be full runs.
+      # rather than an unaffected lane. Merge groups must be full runs, and a
+      # job cancelled by merge-group-fail-fast fails them like a failure.
       - name: Require every selected core CI job to succeed
         env:
           NEEDS: ${{ toJSON(needs) }}

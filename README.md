@@ -180,7 +180,8 @@ no tests. The merge queue runs the full matrix on the exact commit it merges:
 every workspace test with the `ci` nextest profile, the CLI and relay end-to-end
 suites, simulator lanes, C bindings, iOS clippy, Windows filesystem contracts,
 Tamarin, Hermes and installer checks. `Required CI` must pass there before a
-change lands. Master pushes run CI only to refresh the Rust dependency caches
+change lands. A queue run stops at its first failed job, so the queue ejects a
+failing change within minutes rather than after the whole run. Master pushes run CI only to refresh the Rust dependency caches
 that pull requests and merge groups restore, and only when `Cargo.lock`, a
 `Cargo.toml`, the toolchain pin, Cargo config or `ci.yml` changes.
 

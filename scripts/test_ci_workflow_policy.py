@@ -114,12 +114,15 @@ class MergeGatePolicyTests(unittest.TestCase):
         passed = {"changes": {"result": "success"}, "rust-test": {"result": "success"}}
         skipped = {**passed, "rust-test": {"result": "skipped"}}
         failed = {**passed, "rust-test": {"result": "failure"}}
+        cancelled = {**passed, "rust-test": {"result": "cancelled"}}
         for event, mode, needs, expected in [
             ("pull_request", "precheck", skipped, True),
             ("pull_request", "precheck", failed, False),
+            ("pull_request", "precheck", cancelled, False),
             ("pull_request", "full", skipped, False),
             ("merge_group", "full", passed, True),
             ("merge_group", "full", skipped, False),
+            ("merge_group", "full", cancelled, False),
             ("merge_group", "precheck", skipped, False),
             ("merge_group", "", skipped, False),
             ("push", "warm", skipped, True),
@@ -150,7 +153,84 @@ class MergeGatePolicyTests(unittest.TestCase):
         jobs = set(re.findall(r"(?m)^  ([a-z0-9-]+):$", workflow.split("\njobs:\n", 1)[1]))
         required = workflow.split("\n  required-ci:\n", 1)[1].split("\n    needs:\n", 1)[1]
         needs = set(re.findall(r"(?m)^      - ([a-z0-9-]+)$", required.split("\n    runs-on:", 1)[0]))
-        self.assertEqual(needs, jobs - {"required-ci"})
+        # The fail-fast watcher waits for Required CI to appear, so it cannot be a need.
+        self.assertEqual(needs, jobs - {"required-ci", "merge-group-fail-fast"})
+
+    def test_only_the_merge_group_watcher_can_cancel_and_it_cannot_fail_the_run(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        watcher = workflow.split("\n  merge-group-fail-fast:\n", 1)[1].split("\n  required-ci:\n", 1)[0]
+        self.assertIn("    if: github.event_name == 'merge_group'\n", watcher)
+        self.assertIn("    continue-on-error: true\n    permissions:\n      actions: write\n\n", watcher)
+        # Build and test jobs run third-party code; none of them may cancel or dispatch runs.
+        self.assertEqual(len(re.findall(r"(?m)^ +actions: write$", workflow)), 1)
+        # A job-level continue-on-error reads as success in `needs` but as a failed job to the watcher.
+        self.assertEqual(len(re.findall(r"(?m)^ +continue-on-error:", workflow)), 1)
+        timeout = int(re.search(r"(?m)^    timeout-minutes: (\d+)$", watcher).group(1))
+        watch = int(re.search(r"deadline=\$\(\(SECONDS \+ (\d+) \* 60\)\)", watcher).group(1))
+        self.assertLess(watch, timeout)
+        # Required CI must still run, and fail, once the watcher cancels the run.
+        self.assertIn("\n  required-ci:\n    name: Required CI\n", workflow)
+        required = workflow.split("\n  required-ci:\n", 1)[1].split("\n    needs:\n", 1)[0]
+        self.assertRegex(required, r"(?m)^    if: always\(\)$")
+
+    def test_merge_group_watcher_cancels_the_run_at_the_first_failed_job(self):
+        script = workflow_step("ci.yml", "Cancel the run when a job fails")
+        # gh applies the trailing --jq filter itself; the fake runs it with jq.
+        # Poll n reads response n, and later polls repeat the last response.
+        fakes = textwrap.dedent("""\
+            gh() {
+              if [[ "$1" == api ]]; then
+                echo "gh ${*:1:$#-1}" >> "$STATE/calls"
+                local poll=$(( $(cat "$STATE/polls") + 1 ))
+                echo "$poll" > "$STATE/polls"
+                local response="$STATE/$(( poll < RESPONSES ? poll : RESPONSES )).json"
+                [[ "$(cat "$response")" != error ]] || return 1
+                jq -r "${@: -1}" "$response"
+              else
+                echo "gh $*" >> "$STATE/calls"
+                local cancels=$(( $(cat "$STATE/cancels") + 1 ))
+                echo "$cancels" > "$STATE/cancels"
+                (( cancels > REFUSED_CANCELS ))
+              fi
+            }
+            sleep() { echo "sleep $1" >> "$STATE/calls"; SECONDS=$((SECONDS + $1)); }
+        """)
+
+        def job(name, status, conclusion=None):
+            return {"name": name, "status": status, "conclusion": conclusion}
+
+        running = [job("Classify CI changes", "completed", "success"),
+                   job("Rust tests (1/7)", "in_progress"), job("Rust WASM check", "completed", "skipped")]
+        failed = running + [job("Relay runtime tests (2/2)", "completed", "failure")]
+        finished = [job("Rust tests (1/7)", "completed", "success"), job("Required CI", "queued")]
+        poll = "gh api --paginate repos/o/r/actions/runs/42/jobs?per_page=100 --jq"
+        wait, cancel = "sleep 60", "gh run cancel 42"
+        for name, responses, refused, expected in [
+            ("failure cancels at once", [failed], 0, [poll, cancel]),
+            ("timeout or cancellation counts as a failure",
+             [running + [job("Windows filesystem contracts", "completed", "cancelled")]], 0, [poll, cancel]),
+            ("success, skips and running jobs keep watching", [running, finished], 0, [poll, wait, poll]),
+            ("Required CI means nothing is left to stop",
+             [finished + [job("Rust tests (2/7)", "completed", "failure")]], 0, [poll]),
+            ("failed request is retried", ["error", failed], 0, [poll, wait, poll, cancel]),
+            ("refused cancel is retried", [failed], 1, [poll, cancel, wait, poll, cancel]),
+            ("watching stops at the deadline", [running], 0, [poll, wait] * 150),
+        ]:
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                state = Path(tmp)
+                (state / "calls").write_text("")
+                (state / "polls").write_text("0")
+                (state / "cancels").write_text("0")
+                for index, response in enumerate(responses, 1):
+                    body = response if response == "error" else json.dumps({"jobs": response})
+                    (state / f"{index}.json").write_text(body)
+                # GitHub runs `run:` steps with `bash -e`.
+                result = subprocess.run(["bash", "-e", "-c", fakes + script], capture_output=True, text=True,
+                                        timeout=60, env={**os.environ, "STATE": tmp, "GH_REPO": "o/r",
+                                                         "RUN_ID": "42", "RESPONSES": str(len(responses)),
+                                                         "REFUSED_CANCELS": str(refused)})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((state / "calls").read_text().splitlines(), expected)
 
 
 def semver_key(version: str):
