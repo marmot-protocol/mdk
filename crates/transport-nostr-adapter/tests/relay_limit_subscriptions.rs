@@ -1736,6 +1736,23 @@ async fn dead_relay(sdk: &NostrSdkRelayClient) -> String {
     url
 }
 
+/// A relay the account's pool has banned. nostr-sdk refuses every REQ for it,
+/// and no reconnect cures that, so its route's subscribe fails. An
+/// unreachable relay would not: the client keeps its REQ owed (#1951).
+async fn banned_relay(sdk: &NostrSdkRelayClient) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    drop(listener);
+    sdk.client().add_relay(url.as_str()).await.unwrap();
+    sdk.client()
+        .relay(url.as_str())
+        .await
+        .unwrap()
+        .expect("the relay was just added")
+        .ban();
+    url
+}
+
 // Fields are read through `Debug` in the failure messages.
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -1796,8 +1813,8 @@ async fn leak_check(fx: &Fixture, group_count: usize, label: &str) -> LeakCheck 
     check
 }
 
-/// One group route that nostr-sdk cannot operate fails `subscribe_all`: its own
-/// batch, since its endpoints differ. Every REQ its sibling tasks handed to
+/// One group route that nostr-sdk refuses for good fails `subscribe_all`: its
+/// own batch, since its endpoints differ. Every REQ its sibling tasks handed to
 /// the SDK must be closed by the rollback, and
 /// none may come back on reconnect (#2262). Before the fix `subscribe_all`
 /// aborted the siblings mid-flight and tracked ids only after the SDK call, so
@@ -1807,7 +1824,7 @@ async fn failed_activation_rollback_leaves_no_untracked_reqs() {
     const G: usize = 150;
     const ATTEMPTS: usize = 12;
     let fx = Fixture::new(LimitConfig::default(), true).await;
-    let dead = dead_relay(&fx.sdk).await;
+    let banned = banned_relay(&fx.sdk).await;
     let url = fx.limit.url();
     let mut failures = 0;
     let mut active_after_rollback = Vec::new();
@@ -1816,7 +1833,7 @@ async fn failed_activation_rollback_leaves_no_untracked_reqs() {
         // Move the failing route through the batch so the abort lands at
         // different points in the siblings' progress.
         let failing = (attempt * 37 + 11) % G;
-        routes[failing].endpoints = vec![TransportEndpoint(dead.clone())];
+        routes[failing].endpoints = vec![TransportEndpoint(banned.clone())];
         let result = fx
             .adapter
             .activate_account(fx.activation(std::slice::from_ref(&url), routes))
@@ -1829,7 +1846,7 @@ async fn failed_activation_rollback_leaves_no_untracked_reqs() {
         "[d] failed activations={failures}/{ATTEMPTS} live REQs after each rollback={active_after_rollback:?} {}",
         fx.limit.stats().summary()
     );
-    assert_eq!(failures, ATTEMPTS, "the dead route fails each activation");
+    assert_eq!(failures, ATTEMPTS, "the banned route fails each activation");
     let check = leak_check(&fx, G, "after failed activations").await;
     assert!(
         active_after_rollback.iter().all(|&active| active == 0),
