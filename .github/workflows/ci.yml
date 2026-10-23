@@ -505,15 +505,17 @@ jobs:
 
   # Seven shards keep the slowest one near 20 minutes. Each shard's tests run
   # about four at a time, so its time tracks its total test time, and a slow
-  # runner adds up to a quarter to that. Downloading the 2 GB test archive takes
-  # anywhere from 20 seconds to 7 minutes on top. Five shards ran 15-28 minutes
-  # and one was cancelled at the 30-minute limit.
+  # runner adds up to a quarter to that; the slowest test run took 25 minutes.
+  # The 2 GB test archive downloads in under a minute on East US runners but
+  # has taken up to 20 minutes on central and western ones (#2568), so the
+  # download and the tests get separate budgets and a slow download cannot cut
+  # the test run short.
   rust-test:
     name: Rust tests (${{ matrix.partition }}/7)
     needs: [changes, rust-test-build]
     if: needs.changes.outputs.ci_mode == 'full'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -540,11 +542,13 @@ jobs:
           tool: cargo-nextest@0.9.132
 
       - name: Download test archive
+        timeout-minutes: 25
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: rust-test
 
       - name: Run workspace tests
+        timeout-minutes: 30
         # The subprocess-heavy `wn-cli::cli` suite runs in its own
         # `cli-e2e` job so its fan-out never starves these fast unit tests
         # (issue #103). `relay_runtime` keeps its own serial job.
