@@ -5988,7 +5988,8 @@ typedef struct MarmotChatSelectionPredicateInput {
   uint32_t field;
   uint32_t mode;
   /**
-   * Array of JSON string literals, not raw C text; active for string-valued conditions.
+   * Title: one JSON string literal. Participants: 1..=64 plain NUL-terminated
+   * account-ID strings. Other fields: NULL with length 0.
    */
   const char *const *values;
   uintptr_t values_len;

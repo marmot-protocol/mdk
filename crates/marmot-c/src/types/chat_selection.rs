@@ -324,7 +324,8 @@ pub struct MarmotChatSelectionPredicateInput {
     pub children_len: usize,
     pub field: u32,
     pub mode: u32,
-    /// Array of JSON string literals, not raw C text; active for string-valued conditions.
+    /// Title: one JSON string literal. Participants: 1..=64 plain NUL-terminated
+    /// account-ID strings. Other fields: NULL with length 0.
     pub values: *const *const c_char,
     pub values_len: usize,
 }
