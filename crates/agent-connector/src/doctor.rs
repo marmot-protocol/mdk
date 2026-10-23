@@ -1249,10 +1249,25 @@ fn check_daemon_accounts(
     };
     let same_home = accounts.error.is_some() || accounts.local_signing == count;
     if !same_home {
+        let status = if status == Fail { Fail } else { Warn };
+        // Records this user cannot read explain the gap better than another instance.
+        if accounts.unreadable > 0 {
+            return live(
+                "daemon_accounts",
+                status,
+                format!(
+                    "The daemon reports {count} local-signing accounts but this user can read {} here; {} \
+                     could not be read.",
+                    accounts.local_signing,
+                    plural(accounts.unreadable, "account record", "account records")
+                ),
+                READ_RECORDS,
+            );
+        }
         // Repairing either side would act on the wrong instance.
         return live(
             "daemon_accounts",
-            if status == Fail { Fail } else { Warn },
+            status,
             format!(
                 "The daemon reports {count} local-signing accounts but this home has {}.",
                 accounts.local_signing
@@ -2275,6 +2290,19 @@ mod tests {
             "{}",
             check.next_step
         );
+    }
+
+    #[test]
+    fn daemon_count_gap_from_unreadable_records_points_at_read_access() {
+        let status = diagnostic(current_key_package());
+        let accounts = AccountScan {
+            present: true,
+            unreadable: 1,
+            ..AccountScan::default()
+        };
+        let check = check_daemon_accounts(&status, &accounts);
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert_eq!(check.next_step, READ_RECORDS);
     }
 
     #[test]
