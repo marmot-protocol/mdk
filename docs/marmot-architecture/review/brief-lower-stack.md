@@ -50,8 +50,17 @@ crate move at the end is mechanical.
   - 2 are storage-only app concerns, the draft-commit observer and legacy message promotion, with one call each;
   - 23 are other session reads and writes, with 39 calls. The runtime already forwards one of them,
     `new_protocol_profile`, and offers none of the other 22.
-- `marmot-app` also opens the session itself and passes it to `AccountDeviceRuntime::new`
-  (`crates/marmot-app/src/lib.rs:4682`, `:4747`).
+- `marmot-app` also handles the session itself in three ways those 69 calls do not count:
+  - it opens the session and passes it to `AccountDeviceRuntime::new` (`crates/marmot-app/src/lib.rs:4682`, `:4747`);
+  - the runtime's publication-progress observer receives `&AccountDeviceSession`
+    (`crates/marmot-account/src/runtime.rs:405-406`, used by `advance_convergence_with_publication_progress`), and
+    `marmot-app` passes one such observer (`crates/marmot-app/src/client/sync.rs:5963`);
+  - two conversation-window helpers take the session by reference
+    (`crates/marmot-app/src/runtime/conversation_window.rs:272`, `:355`).
+  The last two reach the session only through `with_group_authority_snapshot`: the observer calls the first helper,
+  which calls the second.
+- These counts come from searching source at the baseline. In PR 3 the compiler is the authority: once `session()`
+  and `session_mut()` leave the production surface, it lists every reach that remains.
 
 **`marmot-account` is two crates that share nothing.**
 - The two halves share no module. The identity half uses `crate::{error, io, nip49_export, secret_store}`, and the
@@ -100,9 +109,15 @@ crate move at the end is mechanical.
   `AccountDeviceSession`.
 - The app calls the runtime for all 23 session methods it uses. The runtime gains forwards for the 22 it lacks.
 - **Errors keep their shape here too.**
-  - The new forwards and `open` return the session's `SessionResult` unchanged. They do not follow the existing
-    forwards' `AccountResult` (for example `group_record`), so the app's `?` still produces `AppError::Session`, not
+  - Each new forward keeps the forwarded method's signature exactly: return type, error type and generic parameters.
+    They do not follow the existing forwards' `AccountResult` (for example `group_record`).
+  - Most of the 22 return `SessionResult`, so the app's `?` still produces `AppError::Session`, not
     `AppError::Account(AccountError::Session(_))`.
+  - Four return `Result<_, EngineError>`: `invite_key_package_requirements`, `create_key_package_requirements`,
+    `key_package_metadata` and `leave_in_progress`. Callers match on that type. Superseded-invite recovery, for
+    example, returns on `EngineError::Storage` and on any other error ends this pass over the pending records,
+    leaving them for the next pass (`crates/marmot-app/src/client/invite_recovery.rs:284-293`).
+  - `open` returns `SessionResult`, as `AccountDeviceSession::open` does.
   - `marmot-app` keeps applying `external_signer_session_error` to the result of `open` (`crates/marmot-app/src/lib.rs:4682`,
     `:7638-7644`). The identity proof is signed inside session open, and the signer hook returns a plain `String`,
     so a cancelled external-signer prompt arrives only as the `EXTERNAL_SIGNER_REJECTED` sentinel.
@@ -113,6 +128,14 @@ crate move at the end is mechanical.
     among them;
   - `marmot-app`'s tests use them too.
   Dev-dependency features do not reach normal builds, so a production use still fails `cargo build -p marmot-app`.
+- **A narrow read view replaces the session where it is handed out.**
+  - The publication-progress observer and the two conversation-window helpers receive a `GroupAuthorityReader`. It
+    is a borrowed view whose one method is `with_group_authority_snapshot`, with the same generic signature
+    (`crates/cgka-session/src/lib.rs:1400-1416`).
+  - The runtime builds the view from its session. The view keeps the method's bound,
+    `E: From<StorageError> + From<SessionError>`, so the window's own conversions still decide its outcomes. A store
+    change still closes the window, and an unknown group is still terminal
+    (`crates/marmot-app/src/runtime/conversation_window.rs:65-74`, `:94-105`).
 - The session type itself stays public until the runtime and the session share a crate. Until then the runtime, in
   `marmot-account`, imports and stores it. After the move, PR 5 makes it a private module that `test-support`
   re-exports.
@@ -232,7 +255,7 @@ PR 4 moves, PR 5 finishes the narrowing that needs one crate, and PR 6 renames.
 | 0 | Clear the engine's in-flight audit context with a drop guard, so a cancelled send or create-group cannot leave it set | The cancellation test (§3) |
 | 1 | Audit ownership: the shared recorder handle; the engine, runtime and app record into clones; close the file at the end of `finish_audit_recording`; delete the session's 8 audit forwards and the engine's 8 audit methods; the lifecycle benchmark installs its recorder with `EngineBuilder::recorder` before `build` | The tests below; existing audit suites; `cargo bench -p cgka-engine --bench group_lifecycle --no-run` |
 | 2 | Account records: move the 18 engine forwards onto the session's handle; add `Engine::check_group_live`; delete the engine's 18 methods | Quarantine and storage-error table test (below); `hydration_quarantine` unchanged; `publish_lifecycle` unchanged except that its one engine setup write (`:1893`) goes to the storage handle the test already holds |
-| 3 | One public layer: `AccountDeviceRuntime::open`; runtime forwards for the 22 session methods the app calls that the runtime lacks; the app's own clone of the engine connection for the two storage-only calls; `session()`, `session_mut()` and `AccountDeviceRuntime::new` only under `marmot-account`'s `test-support` | `cargo build -p marmot-app` without dev-dependencies; a new test that a session-open error carrying the external-signer sentinel still becomes `AppError::ExternalSignerRejected`; `marmot-app` and `marmot-account` suites |
+| 3 | One public layer: `AccountDeviceRuntime::open`; runtime forwards for the 22 session methods the app calls that the runtime lacks; the app's own clone of the engine connection for the two storage-only calls; `GroupAuthorityReader` for the publication observer and the conversation-window helpers; `session()`, `session_mut()` and `AccountDeviceRuntime::new` only under `marmot-account`'s `test-support` | `cargo build -p marmot-app` without dev-dependencies; new tests that a session-open error carrying the external-signer sentinel still becomes `AppError::ExternalSignerRejected`, and that superseded-invite recovery still ends its pass on a non-storage `EngineError` and returns `EngineError::Storage`; the conversation-window suite; `marmot-app` and `marmot-account` suites |
 | 4 | The move: `git mv crates/cgka-session crates/marmot-session`; move the runtime half and `AccountError` into it; repoint `marmot-app`, the simulator and the tests; the re-exports from item 4; CI, README and AGENTS updates | Rename-only diff (`git diff -M`); same test list per moved binary |
 | 5 | Make the session a private module, re-exported only under `test-support`; delete the session forwards that `dead_code` then reports | The compiler, with and without `test-support`; `marmot-session` and `marmot-app` suites |
 | 6 | Name the tracing targets after their modules: `cgka_session::session` becomes `marmot_session::session`, and `marmot_account::runtime` becomes `marmot_session::runtime`; update `docs/marmot-architecture/telemetry.md:775` and the current architecture docs that describe these crates | `tracing_audit`; a docs link check |
@@ -269,9 +292,14 @@ PR 4 moves, PR 5 finishes the narrowing that needs one crate, and PR 6 renames.
   Otherwise the non-group accessors return what `MaintenanceStorage` returns. SQLite always provides that storage, so the
   engine's "maintenance storage is unavailable" error could not occur on this path.
 - **PR 3:**
-  - Every new runtime method is a forward of an existing session method that returns the session's error type
-    unchanged. The app's calls change receiver, not arguments or error variant.
+  - Every new runtime method is a forward of an existing session method with the same signature. The app's calls
+    change receiver, not arguments or error type.
   - Opening keeps the external-signer mapping. The new sentinel test pins it, because nothing pinned it before.
+  - The invite-recovery test pins the one production caller that branches on an `EngineError` variant from a
+    forwarded method. No existing test asserts which way it goes: the one recovery-failure test
+    (`crates/marmot-app/src/tests.rs:19122`) checks only `is_err()`.
+  - The conversation-window suite already covers closed, not-ready and terminal windows through the two helpers that
+    take the view.
 - **PR 4:** no code changes except paths. `git diff -M` shows renames, and `cargo nextest list` shows the same tests
   per moved binary before and after.
 - **All PRs:** the `marmot-app`, `marmot-account` (later `marmot-session`) and `cgka-engine` suites, and
