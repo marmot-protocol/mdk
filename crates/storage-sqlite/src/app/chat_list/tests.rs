@@ -2127,6 +2127,51 @@ fn ensure_chat_list_rows_rebuilds_stale_message_rows() {
     assert_eq!(last_message.plaintext, "new preview");
 }
 
+/// Migration 0117 adds `last_message_tags_json` as nullable. Existing rows with
+/// a last message have NULL until rebuilt; the completeness check must detect
+/// them and force a rebuild so tags are populated.
+#[test]
+fn ensure_chat_list_rows_rebuilds_when_last_message_tags_json_is_null() {
+    let store = setup_store().app_storage();
+    store
+        .record_app_event(&chat_with_tags(
+            "tagged",
+            REMOTE,
+            10,
+            "hello",
+            vec![vec!["p".to_owned(), LOCAL.to_owned()]],
+        ))
+        .unwrap();
+    store
+        .refresh_chat_list_row(LOCAL, GROUP, &no_mentions)
+        .unwrap();
+
+    // Simulate the post-migration state: tags_json is NULL for a row that has
+    // a last message.
+    {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE chat_list_rows SET last_message_tags_json = NULL WHERE group_id_hex = ?1",
+            params![GROUP],
+        )
+        .unwrap();
+    }
+
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let row = store
+        .chat_list_rows(crate::ChatListQuery::default())
+        .unwrap()
+        .pop()
+        .expect("chat row");
+
+    let last_message = row.last_message.expect("last message");
+    assert_eq!(
+        last_message.tags,
+        vec![vec!["p".to_owned(), LOCAL.to_owned()]],
+        "tags should be rebuilt from the timeline after the NULL-tag rebuild"
+    );
+}
+
 #[test]
 fn ensure_chat_list_rows_rebuilds_stale_read_state_rows() {
     let store = setup_store();
@@ -5001,6 +5046,123 @@ fn authenticated_system_preview_without_commit_attribution_keeps_subject() {
     assert_eq!(
         captured.page().messages[0].group_system.as_ref(),
         Some(&system)
+    );
+}
+
+fn sticker_tags() -> Vec<Vec<String>> {
+    vec![vec![
+        "sticker".to_owned(),
+        format!("30031:{}:cats", "ab".repeat(32)),
+        "wave".to_owned(),
+        "11".repeat(32),
+    ]]
+}
+
+fn latest_preview(store: &SqliteAppStorage) -> ChatListMessagePreview {
+    store
+        .chat_list_row(GROUP)
+        .unwrap()
+        .unwrap()
+        .last_message
+        .expect("last message")
+}
+
+fn assert_projection_complete(store: &SqliteAppStorage, why: &str) {
+    let conn = store.lock().unwrap();
+    assert!(chat_list_projection_complete_tx(&conn).unwrap(), "{why}");
+}
+
+/// Deletion keeps the raw tags for reversible withdrawal, but a deleted
+/// preview must not expose them, and that masked state must read as complete
+/// so ensure does not rebuild it forever.
+#[test]
+fn deleted_chat_preview_hides_retained_tags() {
+    let store = setup_store().app_storage();
+    let target = "02".repeat(32);
+    store
+        .record_app_event(&chat_with_tags(&target, REMOTE, 1, "", sticker_tags()))
+        .unwrap();
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    assert_eq!(latest_preview(&store).tags, sticker_tags());
+
+    let mut deletion = reaction("author-delete", REMOTE, &target, 2);
+    deletion.kind = 5;
+    store.record_app_event(&deletion).unwrap();
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+
+    let preview = latest_preview(&store);
+    assert!(preview.deleted);
+    assert!(
+        preview.tags.is_empty(),
+        "deleted preview exposed {:?}",
+        preview.tags
+    );
+    let retained: String = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT tags_json FROM message_timeline WHERE message_id_hex = ?1",
+            params![target],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_ne!(retained, "[]", "the timeline keeps tags for withdrawal");
+    assert_projection_complete(&store, "a masked deleted preview is current");
+}
+
+/// A non-null but stale tag column is drift, not just a NULL one.
+#[test]
+fn ensure_chat_list_rows_rebuilds_stale_last_message_tags() {
+    let store = setup_store().app_storage();
+    store
+        .record_app_event(&chat_with_tags("tagged", REMOTE, 10, "", sticker_tags()))
+        .unwrap();
+    store.refresh_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    assert_projection_complete(&store, "a fresh preview is current");
+
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            r#"UPDATE chat_list_rows SET last_message_tags_json = '[["stale"]]'
+               WHERE group_id_hex = ?1"#,
+            params![GROUP],
+        )
+        .unwrap();
+    {
+        let conn = store.lock().unwrap();
+        assert!(!chat_list_projection_complete_tx(&conn).unwrap());
+    }
+
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    assert_eq!(latest_preview(&store).tags, sticker_tags());
+    assert_projection_complete(&store, "the rebuilt tags are current");
+}
+
+/// Unread membership tolerates unreadable timeline tags; the chat-list
+/// preview must too, instead of failing every rebuild of the account.
+#[test]
+fn unreadable_timeline_tags_preview_without_aborting_rebuild() {
+    let store = setup_store().app_storage();
+    store
+        .record_app_event(&chat_with_tags("tagged", REMOTE, 10, "hi", sticker_tags()))
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE message_timeline SET tags_json = 'not json' WHERE message_id_hex = 'tagged'",
+            [],
+        )
+        .unwrap();
+
+    store.ensure_chat_list_rows(LOCAL, &no_mentions).unwrap();
+    let preview = latest_preview(&store);
+    assert_eq!(preview.plaintext, "hi");
+    assert!(preview.tags.is_empty());
+    assert_projection_complete(
+        &store,
+        "an unreadable tag list previews as empty, not as drift",
     );
 }
 

@@ -355,6 +355,16 @@ pub enum MarmotKitError {
     /// repair arrives on a remote member's schedule.
     #[error("group {group_id_hex} is unrecoverable and needs to be re-joined before sending")]
     GroupUnrecoverableRepairRequired { group_id_hex: String },
+    #[error("invalid sticker data: {details}")]
+    InvalidSticker { details: String },
+    #[error("sticker pack or asset is unavailable")]
+    StickerNotFound,
+    #[error("sticker network operation failed: {details}")]
+    StickerNetwork { details: String },
+    #[error("sticker import failed: {details}")]
+    StickerImport { details: String },
+    #[error("Signal sticker import is unavailable for external-signing accounts")]
+    StickerImportUnsupported,
     #[error("marmot runtime error: {details}")]
     Runtime { details: String },
     /// The account worker is completing an exclusive catch-up and definitely
@@ -633,6 +643,17 @@ impl From<&AppError> for MarmotKitError {
             },
             AppError::ExternalSignerMismatch => Self::ExternalSignerMismatch,
             AppError::ExternalSignerRejected => Self::ExternalSignerRejected,
+            AppError::InvalidSticker(details) => Self::InvalidSticker {
+                details: details.clone(),
+            },
+            AppError::StickerNotFound => Self::StickerNotFound,
+            AppError::StickerRelay(details) => Self::StickerNetwork {
+                details: details.clone(),
+            },
+            AppError::StickerImport(details) => Self::StickerImport {
+                details: details.clone(),
+            },
+            AppError::StickerExternalSignerImportUnsupported => Self::StickerImportUnsupported,
             other => Self::Runtime {
                 details: other.to_string(),
             },
@@ -1112,6 +1133,38 @@ mod tests {
             matches!(wrapped, MarmotKitError::Io { .. }),
             "AccountHome IO failure must map to Io, got {wrapped:?}"
         );
+    }
+
+    /// Each sticker failure crosses the FFI as its own variant; none may
+    /// fall through to the generic `Runtime` arm.
+    #[test]
+    fn sticker_errors_map_to_their_typed_variants() {
+        type Expected = fn(&MarmotKitError) -> bool;
+        let cases: Vec<(AppError, Expected)> = vec![
+            (
+                AppError::InvalidSticker("bad hash".into()),
+                |e| matches!(e, MarmotKitError::InvalidSticker { details } if details == "bad hash"),
+            ),
+            (AppError::StickerNotFound, |e| {
+                matches!(e, MarmotKitError::StickerNotFound)
+            }),
+            (
+                AppError::StickerRelay("offline".into()),
+                |e| matches!(e, MarmotKitError::StickerNetwork { details } if details == "offline"),
+            ),
+            (
+                AppError::StickerImport("refused".into()),
+                |e| matches!(e, MarmotKitError::StickerImport { details } if details == "refused"),
+            ),
+            (AppError::StickerExternalSignerImportUnsupported, |e| {
+                matches!(e, MarmotKitError::StickerImportUnsupported)
+            }),
+        ];
+        for (app_err, expected) in cases {
+            let label = format!("{app_err:?}");
+            let ffi = MarmotKitError::from(app_err);
+            assert!(expected(&ffi), "{label} mapped to {ffi:?}");
+        }
     }
 
     #[test]
