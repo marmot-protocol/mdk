@@ -71,8 +71,9 @@ crate move at the end is mechanical.
   - group evolutions;
   - transport fanouts;
   - the periodic maintenance policy.
-- Each of the 18 has exactly one caller, a forward in `cgka-session`. Neither the engine itself nor the simulator
-  calls them. Engine tests reach the same records through storage, not the engine.
+- Each of the 18 has one production caller, a forward in `cgka-session`. Neither the engine itself nor the simulator
+  calls them. Engine tests reach the same records through storage, except for one setup write:
+  `engine.put_key_package_lifecycle` (`crates/cgka-engine/tests/publish_lifecycle.rs:1893`).
 - Four of the 18 first check that the group is live (`ensure_group_live`, `crates/cgka-engine/src/engine.rs:2708`).
   That check enforces the quarantine contract. A quarantined group fails as `UnknownGroup`, and a seeded but
   unhydrated group fails with the retryable `GroupNotHydrated`.
@@ -120,6 +121,16 @@ crate move at the end is mechanical.
 - The session already holds a clone of the engine's storage handle (`crates/cgka-session/src/lib.rs:243-247`).
   `SqliteAccountStorage` implements `MaintenanceStorage` directly (`crates/storage-sqlite/src/protocol/storage/maintenance.rs:12`).
 - The 18 forwards move to the session over that handle, and the engine's 18 methods are deleted.
+- **Errors keep their shape.**
+  - Today a storage failure on these records reaches callers as `SessionError::Engine(EngineError::Storage(_))`.
+  - A bare `?` on `MaintenanceStorage` in the session would produce `SessionError::Storage(_)` instead. Then
+    `AppError::as_engine_error()` (`crates/marmot-app/src/error.rs:671-678`) would stop matching it, and hosts would
+    see the difference:
+    - MarmotKit maps a busy, closed or full engine storage error to `StorageBusy`, `StorageClosed` or `StorageFull`
+      (`crates/marmot-uniffi/src/errors.rs:702-714`), but the other variant to `Runtime`;
+    - the CLI reports `engine_error` instead of `command_failed`.
+    `periodic_maintenance_policy` and its setter reach hosts directly (`crates/marmot-app/src/client/mod.rs:1304-1314`).
+  - So the moved forwards convert through `EngineError::from` first.
 - The engine gains one public check, `Engine::check_group_live`, which wraps `ensure_group_live` unchanged. The four
   group-scoped accessors call it first, so quarantined and unhydrated groups fail with the same errors as today. The
   runtime depends on that difference: its maintenance sweep skips both (`crates/marmot-account/src/runtime.rs:5656`),
@@ -212,7 +223,7 @@ PR 4 moves, PR 5 finishes the narrowing that needs one crate, and PR 6 renames.
 | --- | --- | --- |
 | 0 | Clear the engine's in-flight audit context with a drop guard, so a cancelled send or create-group cannot leave it set | The cancellation test (§3) |
 | 1 | Audit ownership: the shared recorder handle; the engine, runtime and app record into clones; close the file at the end of `finish_audit_recording`; delete the session's 8 audit forwards and the engine's 8 audit methods; the lifecycle benchmark installs its recorder with `EngineBuilder::recorder` before `build` | The tests below; existing audit suites; `cargo bench -p cgka-engine --bench group_lifecycle --no-run` |
-| 2 | Account records: move the 18 engine forwards onto the session's handle; add `Engine::check_group_live`; delete the engine's 18 methods | Quarantine table test (below); `hydration_quarantine` and `publish_lifecycle` unchanged |
+| 2 | Account records: move the 18 engine forwards onto the session's handle; add `Engine::check_group_live`; delete the engine's 18 methods | Quarantine and storage-error table test (below); `hydration_quarantine` unchanged; `publish_lifecycle` unchanged except that its one engine setup write (`:1893`) goes to the storage handle the test already holds |
 | 3 | One public layer: `AccountDeviceRuntime::open`; runtime forwards for the 22 session methods the app calls that the runtime lacks; the app's own clone of the engine connection for the two storage-only calls; `session()`, `session_mut()` and `AccountDeviceRuntime::new` only under `marmot-account`'s `test-support` | `cargo build -p marmot-app` without dev-dependencies; `marmot-app` and `marmot-account` suites |
 | 4 | The move: `git mv crates/cgka-session crates/marmot-session`; move the runtime half and `AccountError` into it; repoint `marmot-app`, the simulator and the tests; the re-exports from item 4; CI, README and AGENTS updates | Rename-only diff (`git diff -M`); same test list per moved binary |
 | 5 | Make the session a private module, re-exported only under `test-support`; delete the session forwards that `dead_code` then reports | The compiler, with and without `test-support`; `marmot-session` and `marmot-app` suites |
@@ -244,8 +255,10 @@ PR 4 moves, PR 5 finishes the narrowing that needs one crate, and PR 6 renames.
   - quarantined → `SessionError::Engine(UnknownGroup)`;
   - unhydrated → `SessionError::Engine(GroupNotHydrated)`;
   - live → the stored record for the three reads, and `Ok(())` with the row stored for `put_group_maintenance`.
-  The write is in the table too, so a write that skipped the check would fail it. The non-group accessors return
-  what `MaintenanceStorage` returns. SQLite always provides that storage, so the
+  The write is in the table too, so a write that skipped the check would fail it. A fourth row, run against a closed
+  connection, covers all 18 forwards: each must fail as `SessionError::Engine(EngineError::Storage(_))`, as today, and
+  `AppError::as_engine_error()` must still return the storage error for the app's maintenance-policy calls.
+  Otherwise the non-group accessors return what `MaintenanceStorage` returns. SQLite always provides that storage, so the
   engine's "maintenance storage is unavailable" error could not occur on this path.
 - **PR 3:** every new runtime method is a forward of an existing session method. The app's calls change receiver, not
   arguments.
