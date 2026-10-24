@@ -402,6 +402,49 @@ class NightlyReleasePolicyTests(unittest.TestCase):
         self.assertIn("  group: marmotkit-bindings-${{ inputs.nightly_version || inputs.source_sha || github.ref }}-",
                       bindings)
 
+    def test_a_failed_scheduled_nightly_reports_to_one_open_issue(self):
+        workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
+        jobs = re.findall(r"^  ([a-z][a-z-]*):\n", workflow.split("\njobs:\n", 1)[1], re.MULTILINE)
+        report = workflow.split("\n  report:\n", 1)[1].split("\n    steps:\n", 1)[0]
+        # Skipped nights exit 0, so only real failures in any other job report. A job timeout
+        # leaves that job cancelled rather than failed; a cancelled run reports nothing.
+        self.assertIn(f"    needs: [{', '.join(job for job in jobs if job != 'report')}]\n", report)
+        self.assertIn("    if: github.event_name == 'schedule' && !cancelled() && "
+                      "(failure() || contains(needs.*.result, 'cancelled'))\n", report)
+        self.assertIn("    permissions:\n      issues: write\n", report)
+        self.assertEqual(workflow.count("issues: write"), 1)
+
+        script = workflow_step("nightly-releases.yml", "Open or update the nightly failure issue")
+        fake_gh = textwrap.dedent("""\
+            gh() {
+              if [[ "$1 $2" == "issue list" ]]; then
+                while [[ "$1" != --jq ]]; do shift; done
+                jq -r "$2" <<<"$ISSUES"
+                return
+              fi
+              printf '%s\\n' "$*" >>"$LOG"
+            }
+        """)
+        needs = json.dumps({"plan": {"result": "success"}, "marmotc": {"result": "failure"},
+                            "wn-agent": {"result": "cancelled"}, "publish": {"result": "skipped"},
+                            "retention": {"result": "failure"}})
+        body = ("--body The scheduled nightly failed for abc123 "
+                "(failed jobs: marmotc, wn-agent (cancelled), retention). Run: https://run")
+        for issues, expected in [
+            ([{"number": 9, "title": "Nightly release failed twice"}],
+             f"issue create --repo o/r --title Nightly release failed {body}"),
+            ([{"number": 9, "title": "Nightly release failed twice"}, {"number": 12, "title": "Nightly release failed"}],
+             f"issue comment 12 --repo o/r {body}"),
+        ]:
+            with self.subTest(issues=issues), tempfile.TemporaryDirectory() as tmp:
+                log = Path(tmp) / "gh.log"
+                subprocess.run(
+                    ["bash", "-c", fake_gh + script], check=True, timeout=10,
+                    env={**os.environ, "ISSUES": json.dumps(issues), "LOG": str(log), "NEEDS": needs,
+                         "REPO": "o/r", "RUN_URL": "https://run", "SOURCE_SHA": "abc123"},
+                )
+                self.assertEqual(log.read_text(), expected + "\n")
+
     def test_tag_pushed_release_workflows_ignore_nightly_tags(self):
         for workflow, prefix in [("bindings.yaml", "marmotkit"), ("c-bindings.yml", "marmotc"),
                                  ("wn-agent-binaries.yml", "wn-agent")]:
