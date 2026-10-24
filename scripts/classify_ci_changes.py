@@ -108,7 +108,6 @@ SPECIALIST_EXACT_PATHS = {
     ".github/workflows/bindings.yaml",
     ".github/workflows/bindings-profile.yml",
     ".github/workflows/bindings-profile-measurement.yml",
-    ".github/workflows/c-smoke-nightly.yml",
     ".github/workflows/convergence-hardening.yml",
     ".github/workflows/simulator-nightly.yml",
     "Dockerfile.convergence-campaign",
@@ -198,7 +197,6 @@ def classify(paths: list[str], *, force_all: bool = False) -> dict[str, bool]:
 
     run_c = unclassified_path or workflow_changed or root_build_changed or any(
         _touches_crates(path, C_WORKSPACE_CRATES)
-        or path == ".github/workflows/c-smoke-nightly.yml"
         or path == "scripts/check_c_binding_parity.py"
         for path in normalized
     )

@@ -1265,10 +1265,11 @@ explicitly selected, including for changes to the UniFFI crate.
 Matching `master` pushes always build the complete matrix and open an issue
 when it fails; later pushes do not cancel running or queued candidate builds.
 Pull requests restore the trusted release
-cache read-only; only runs using the workflow from `master` may update it. A
-weekly scheduled exact-head run on `master` provides drift detection and
-refreshes those trusted cache seeds; it intentionally executes the complete
-packaging matrix.
+cache read-only; only runs using the workflow from `master` may update it.
+The workflow has no schedule of its own: the
+[nightly release](../../release.md#nightly-builds) builds and validates the
+same Android and Apple packages from `master` every night, which provides
+drift detection.
 
 Baseline-versus-candidate measurements are intentionally manual. Run the
 `MarmotKit Release Profile Measurements` workflow from `master` with the full

@@ -189,7 +189,9 @@ clippy lane and Apple packaging, and `ci:android` adds Android packaging; for
 packaging, re-run all candidate-workflow jobs or push a new commit. Ordinary PRs
 skip complete native candidate packaging, including Android target compilation
 and linking; use the opt-in when a change needs that signal before merging.
-Candidate packaging also runs on master when its inputs change, and weekly.
+Candidate packaging also runs on master when its inputs change, and the
+[nightly release](release.md#nightly-builds) builds and validates the same
+packages every night.
 Existing nightly and weekly campaigns retain their wider coverage. Broker image
 publishing stays serialized per ref so an older build cannot overwrite a newer
 `latest` image.

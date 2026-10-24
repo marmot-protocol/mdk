@@ -2,7 +2,9 @@ name: Simulator Nightly
 
 on:
   schedule:
-    - cron: "17 3 * * *"
+    # GitHub has started scheduled runs 4.5-7.5 hours late since late August
+    # 2026, so this fires at 21:17 UTC for a start around 02:00-05:00 UTC.
+    - cron: "17 21 * * *"
   workflow_dispatch:
     inputs:
       recovery_only:
