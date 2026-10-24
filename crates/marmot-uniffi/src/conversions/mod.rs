@@ -696,3 +696,6 @@ mod account_attachment_history;
 pub use account_attachment_history::*;
 mod startup_diagnostics;
 pub use startup_diagnostics::*;
+
+pub(crate) mod chat_selection;
+pub use chat_selection::*;

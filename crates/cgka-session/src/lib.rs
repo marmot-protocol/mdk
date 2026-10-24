@@ -1415,6 +1415,25 @@ impl AccountDeviceSession {
         })
     }
 
+    /// Compose synchronous native reads with this session's actual members gate
+    /// and exact store. The checker performs no storage access and must not escape
+    /// this callback. No await, host callback, hydration or mutation is admitted.
+    pub fn with_members_read_snapshot<T, E>(
+        &self,
+        read: impl for<'capture> FnOnce(
+            &'capture SqliteAccountStorage,
+            &'capture dyn Fn(&GroupId) -> Result<(), EngineError>,
+        ) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<cgka_traits::StorageError>,
+    {
+        use cgka_traits::StorageProvider;
+        let check = |group: &GroupId| self.engine.check_members_readiness(group);
+        self.storage
+            .with_read_snapshot(|storage| read(storage, &check))
+    }
+
     pub fn disband_request(
         &self,
         group_id: &GroupId,

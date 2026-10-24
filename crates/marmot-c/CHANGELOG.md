@@ -7,6 +7,17 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- Complete chat-selection opaque handles, borrowed scope/context inputs, lossless JSON
+  presentation operands, original-only reselect, freshly revalidated folder pages and guarded
+  archive/departure entry points. Selection results own nested allocations and have matching
+  deep-free functions. Optional counts and action hints retain separate presence flags.
+  `MarmotStatus` appends selection outcomes 108–124 without renumbering existing values.
+  C hosts adopting this surface must use matching regenerated headers and libraries, retain
+  operation/attempt identity across waits, and distinguish unresolved effects from pre-effect
+  refusal. Existing chat-list APIs keep their contracts.
+
 ## [0.14.0] - 2026-10-23
 
 Recompile against the matching `marmot.h` and library: every `marmot_client_new*` constructor takes a required

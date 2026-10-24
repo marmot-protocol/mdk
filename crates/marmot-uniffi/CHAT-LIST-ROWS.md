@@ -153,3 +153,63 @@ empty/whitespace/reply-only drafts, incoming messages while a draft is selected,
 clear/failure/newer-edit races, invite indicators, mute expiry, archived/Left gestures,
 offline reopen, paging/anchor retention and live changes on both clients. Keep the
 C9 device performance/adoption record separate from host binding round trips.
+
+
+## Complete selection ownership
+
+`open_chat_selection` captures one closed default/folder/filter/search scope for one account/runtime owner. Native
+storage enumerates the complete active/archive scope in one snapshot, retains compact original IDs, and refuses
+unsupported, unavailable or over-budget context without a successful prefix. Loaded rows are display data. New
+arrivals never join the original selection; `exclude` only shrinks it. Ordinary `page` and `membership` do not
+authorize mutations. Missing `status.count` means resolving; successful zero means an empty complete set.
+
+Freeze the host's localized copy, nickname snapshot and relevant sparse controller overrides. Render only issued
+`presentation_page` operands through the same pure title, preview and message predicates as visible rows, without
+profile requests or callbacks under SQL. Submit each issued leaf once, then `resolve_presentation`. Recheck the
+actual captured host values before completing or acting; a reused context number is not permission to substitute
+changed values. Native fresh admission compares required raw inputs and derived retention-expiry truth before
+reusing answers. Changed inputs require a new revision and presentation. Never broaden an unsupported constraint.
+
+Archive/direct/abandonment summaries are optional display hints over the complete frozen selection, not command
+authorization. Compact default counting can leave unrequested type/lifecycle hints absent. `prepare_action_hints`
+uses the same owner/revision flow to obtain them before a confirmation. A failed preparation preserves the previous
+compact selection. Unknown type uses the existing host presentation predicate; it is not classified as a group.
+Empty selections expose false hints and offer no action.
+
+`folder_assignment_page` freshly checks bounded original-ID batches for the host's idempotent preference union.
+Its exclusive `next_after` follows inspected originals, including those that became ineligible: an empty eligible
+page is not end-of-selection; use `done`. Collect under one handle/revision and unchanged actual host context. If any
+call requires new presentation or a revision, discard every prepared old page and restart, rather than committing a
+prefix or concatenating revisions. Any failed/refused page aborts the handoff; never write the collected prefix.
+The host preference/account owner must still be current before writing.
+
+Archive/local-delete operations keep an immutable operation ID and explicit attempt IDs independent of presentation
+revision. Exact retries read retained results. Generic uncertain outcomes block further effects; abandoning a wait
+is not evidence that an admitted effect stopped. Guarded promotion/self-demotion/Leave/cleanup exports retain existing
+role checks, SendSummary dispositions, and the host's departure dialog, commit lock and local-removal journal. Once a
+target is admitted, its own committed system preview does not require a second folder grant. An admitted unfinished
+departure refuses selection replacement and hint preparation. Only the existing next-effect catch-up/undelivered
+advisories permit an explicit higher acknowledged attempt. Local DeleteLocal remains distinct from Leave and ForgetLocal.
+
+Retained text is limited to 16 MiB and the conservative capture estimate to 64 MiB. Exhaustion is recoverable, with no
+truncation or partial selection. These bound retained capture state, not total process memory or constant work:
+participant/presentation scopes can decode one existing full typed Group at a time; a required existing Envelope
+can transiently allocate validated avatar metadata within its 64 KiB input limit, then drops it. No avatar assets,
+attachment bodies, profile acquisition or network work are requested by capture. Cooperative cancellation is checked
+between steps; a SQLite call or typed decode already running is not preempted. Compact default scopes skip those decoders. Keep large captures off the UI thread.
+
+Close/cancel on owner/account/runtime/scope retirement or disposal and reject late replies. Actual CurrentThread
+account workers explicitly refuse these blocking captures. A plain foreign caller uses the normal async UniFFI
+wrapper; caller runtime flavor alone does not identify the account worker's flavor. Match generated source to the
+native artifact and verify actual worker cancellation, count/membership beyond the rendered window, fresh action
+readback, host-value changes, scope parity and partial/uncertain outcomes before adopting the handle.
+
+Explicit checkbox re-selection uses `reselect(revision, context, group_ids)` on the same complete-selection owner.
+At most 200 requested IDs must already be selected or have been explicitly unchecked from that native original
+set. Native scope, current owner and presentation checks still apply; new arrivals and action-consumed IDs cannot
+be restored. A changed revision invalidates old pages and answers. Required host leaves use the existing resolving
+phase. Failed capture preserves the previous selection. Once `status.operation_id` is present, freeze re-selection:
+restoring unchecked rows would widen an already prepared operation. Shrink-only `exclude` retains its existing
+uncertainty/admitted-departure guards. Never reopen the full scope to simulate a row toggle or retry a lost mutation.
+Native retained-exclusion text and vector headers are charged against the same conservative transient budget;
+strings move when explicitly unchecked, and successful restoration compacts the retained exclusions.

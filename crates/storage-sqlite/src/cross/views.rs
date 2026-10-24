@@ -93,3 +93,61 @@ pub(crate) const MESSAGE_NEWER_THAN_FRONTIER_SQL: &str = "SELECT EXISTS(
 pub(crate) const DELIVERY_ALREADY_SEEN_SQL: &str =
     "SELECT EXISTS(SELECT 1 FROM seen_events WHERE event_id=?1)
             AND NOT EXISTS(SELECT 1 FROM cgka_released_transport_receipts WHERE id=?2)";
+
+/// Compact engine-owned lifecycle gates for one selection candidate. Call only
+/// inside the app's existing read transaction; never open or hydrate an account.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SelectionGroupGates {
+    pub leave_request_pending: bool,
+    pub disbanding: bool,
+    pub disbanded: bool,
+}
+
+pub(crate) fn selection_group_gates_tx(
+    conn: &rusqlite::Connection,
+    group_id: &[u8],
+) -> cgka_traits::storage::StorageResult<SelectionGroupGates> {
+    use crate::SqliteResultExt;
+    use crate::base::connection::CachedSql;
+    use cgka_traits::storage::{DisbandRequest, DisbandRequestStatus};
+    use rusqlite::OptionalExtension;
+    let leave_request_pending = conn
+        .query_row_cached(
+            "SELECT EXISTS(SELECT 1 FROM cgka_leave_requests WHERE group_id=?1)",
+            [group_id],
+            |r| r.get(0),
+        )
+        .storage()?;
+    let candidate: bool = conn
+        .query_row_cached(
+            "SELECT EXISTS(SELECT 1 FROM cgka_disband_candidates WHERE group_id=?1)",
+            [group_id],
+            |r| r.get(0),
+        )
+        .storage()?;
+    let disbanded = conn
+        .query_row_cached(
+            "SELECT EXISTS(SELECT 1 FROM cgka_disband_tombstones WHERE group_id=?1)",
+            [group_id],
+            |r| r.get(0),
+        )
+        .storage()?;
+    // Only this small protocol metadata record is decoded; candidate/tombstone
+    // existence must not deserialize unrelated records or any message bodies.
+    let record: Option<Vec<u8>> = conn
+        .query_row_cached(
+            "SELECT record FROM cgka_disband_requests WHERE group_id=?1",
+            [group_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .storage()?;
+    let request = record
+        .map(|bytes| crate::deserialize::<DisbandRequest>(&bytes))
+        .transpose()?;
+    Ok(SelectionGroupGates {
+        leave_request_pending,
+        disbanding: candidate || request.is_some_and(|r| r.status == DisbandRequestStatus::Pending),
+        disbanded,
+    })
+}

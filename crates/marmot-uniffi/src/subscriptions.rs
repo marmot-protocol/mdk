@@ -507,3 +507,6 @@ pub use chat_window::{AccountAttentionSubscription, ChatListWindowSubscription};
 
 pub(crate) mod conversation_window;
 pub use conversation_window::ConversationWindowSubscription;
+
+mod chat_selection;
+pub use chat_selection::ChatSelection;

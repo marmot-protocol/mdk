@@ -10,5 +10,6 @@ pub(crate) mod outbound;
 pub(crate) mod projection;
 pub(crate) mod release;
 pub(crate) mod routes;
+pub(crate) mod selection_roster;
 pub(crate) mod views;
 mod wipe;

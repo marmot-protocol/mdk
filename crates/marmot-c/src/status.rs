@@ -165,6 +165,23 @@ pub enum MarmotStatus {
     /// The current kind-3 contact list has at least 2,048 follows, more than
     /// MDK reads from one list; a follow or unfollow published nothing.
     FollowListTooLarge = 107,
+    ChatSelectionUncertain = 108,
+    ChatSelectionNoLongerEligible = 109,
+    ChatSelectionProjectionNotReady = 110,
+    ChatSelectionInvalidPage = 111,
+    ChatSelectionOwnerChanged = 112,
+    ChatSelectionClosed = 113,
+    ChatSelectionStale = 114,
+    ChatSelectionIncomplete = 115,
+    ChatSelectionUnsupportedScope = 116,
+    ChatSelectionNotReady = 117,
+    ChatSelectionCancelled = 118,
+    ChatSelectionUnsupportedRuntime = 119,
+    ChatSelectionInvalidScope = 120,
+    ChatSelectionResourceExhausted = 121,
+    ChatSelectionTimedOut = 122,
+    ChatSelectionInvalidSlots = 123,
+    ChatSelectionQuery = 124,
 }
 
 thread_local! {
@@ -185,6 +202,33 @@ pub(crate) fn take_last_error() -> Option<String> {
 pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
     set_last_error(err.to_string());
     match err {
+        MarmotKitError::ChatSelectionUncertain => MarmotStatus::ChatSelectionUncertain,
+        MarmotKitError::ChatSelectionNoLongerEligible => {
+            MarmotStatus::ChatSelectionNoLongerEligible
+        }
+        MarmotKitError::ChatSelectionProjectionNotReady => {
+            MarmotStatus::ChatSelectionProjectionNotReady
+        }
+        MarmotKitError::ChatSelectionInvalidPage => MarmotStatus::ChatSelectionInvalidPage,
+        MarmotKitError::ChatSelectionOwnerChanged => MarmotStatus::ChatSelectionOwnerChanged,
+        MarmotKitError::ChatSelectionClosed => MarmotStatus::ChatSelectionClosed,
+        MarmotKitError::ChatSelectionStale => MarmotStatus::ChatSelectionStale,
+        MarmotKitError::ChatSelectionIncomplete => MarmotStatus::ChatSelectionIncomplete,
+        MarmotKitError::ChatSelectionUnsupportedScope => {
+            MarmotStatus::ChatSelectionUnsupportedScope
+        }
+        MarmotKitError::ChatSelectionNotReady => MarmotStatus::ChatSelectionNotReady,
+        MarmotKitError::ChatSelectionCancelled => MarmotStatus::ChatSelectionCancelled,
+        MarmotKitError::ChatSelectionUnsupportedRuntime => {
+            MarmotStatus::ChatSelectionUnsupportedRuntime
+        }
+        MarmotKitError::ChatSelectionInvalidScope => MarmotStatus::ChatSelectionInvalidScope,
+        MarmotKitError::ChatSelectionResourceExhausted => {
+            MarmotStatus::ChatSelectionResourceExhausted
+        }
+        MarmotKitError::ChatSelectionTimedOut => MarmotStatus::ChatSelectionTimedOut,
+        MarmotKitError::ChatSelectionInvalidSlots => MarmotStatus::ChatSelectionInvalidSlots,
+        MarmotKitError::ChatSelectionQuery => MarmotStatus::ChatSelectionQuery,
         MarmotKitError::ConversationWindowMessageNotRetained => {
             MarmotStatus::ConversationWindowMessageNotRetained
         }
@@ -552,10 +596,27 @@ mod tests {
             },
             MarmotKitError::AccountWorkerBusy,
             MarmotKitError::AccountWorkerResponseTimedOut,
+            MarmotKitError::ChatSelectionUncertain,
+            MarmotKitError::ChatSelectionNoLongerEligible,
+            MarmotKitError::ChatSelectionProjectionNotReady,
+            MarmotKitError::ChatSelectionInvalidPage,
+            MarmotKitError::ChatSelectionOwnerChanged,
+            MarmotKitError::ChatSelectionClosed,
+            MarmotKitError::ChatSelectionStale,
+            MarmotKitError::ChatSelectionIncomplete,
+            MarmotKitError::ChatSelectionUnsupportedScope,
+            MarmotKitError::ChatSelectionNotReady,
+            MarmotKitError::ChatSelectionCancelled,
+            MarmotKitError::ChatSelectionUnsupportedRuntime,
+            MarmotKitError::ChatSelectionInvalidScope,
+            MarmotKitError::ChatSelectionResourceExhausted,
+            MarmotKitError::ChatSelectionTimedOut,
+            MarmotKitError::ChatSelectionInvalidSlots,
+            MarmotKitError::ChatSelectionQuery,
         ];
         assert_eq!(
             variants.len(),
-            98,
+            115,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);

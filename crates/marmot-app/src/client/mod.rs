@@ -79,6 +79,11 @@ mod push;
 mod receipts;
 pub(crate) mod recovery;
 mod retention;
+mod selection_complete;
+pub(crate) use selection_complete::{
+    BoundSelectionCapture, SelectionApplyOutcome, SelectionDepartureOutcome,
+};
+mod selection_context;
 mod sync;
 #[cfg(test)]
 mod upload_cleanup_tests;
