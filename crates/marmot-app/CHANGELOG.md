@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- The OpenMLS RustCrypto provider moves to the elliptic-curve 0.14 crates
+  (crypto-bigint 0.7.6) and HPKE 0.8, fixing RUSTSEC-2026-0387. MDK's single
+  X25519/Ed25519 ciphersuite never ran the affected arithmetic on secret data.
+  HPKE 0.8 carries `libcrux-kem` 0.0.10, so the local HPKE compatibility patch
+  for RUSTSEC-2026-0330 and RUSTSEC-2026-0331 is removed.
+
 ## 0.14.0 - 2026-10-23
 
 ### Breaking changes
