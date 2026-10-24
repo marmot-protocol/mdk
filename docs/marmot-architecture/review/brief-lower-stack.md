@@ -93,8 +93,9 @@ configuration and signer, because the session exposes them without re-exporting 
 
 1. **An error's outcome depends on what it is.** After PR 0, code may change which layer wraps an error, but never
    what the error is: a storage failure stays a storage failure of the same kind, and an engine error the same variant.
-   The one deliberate exception is PR 0's own. The engine carries an external-signer rejection as a generic error
-   holding the sentinel string, and PR 0 turns it into `ExternalSignerRejected` however it is wrapped.
+   The one deliberate exception is PR 0's own: an external-signer rejection becomes `ExternalSignerRejected` however
+   it is wrapped. Production signs the identity proof only at session open, where the engine carries a rejection as a
+   generic `EngineError::Other` whose text holds the sentinel (`crates/cgka-engine/src/engine.rs:560-567`).
 2. **A forward keeps the forwarded method's signature**: return type, error type and generic parameters. A caller's
    code changes only its receiver.
 3. **The compiler lists the sites.** Each PR removes or narrows a surface and fixes what the compiler then reports.
@@ -114,7 +115,7 @@ configuration and signer, because the session exposes them without re-exporting 
 - Code above the engine asks an error what it is through `as_engine_error` or a session-level equivalent. It never
   matches wrapper paths. The hand-written matchers in the app and the runtime switch to these helpers.
 - The external-signer sentinel is recognised when any session or account error converts into `AppError`, the way it
-  already is for transport errors. Nothing depends on the open call site.
+  already is for transport errors: by the sentinel text, not by error variant. Nothing depends on the open call site.
 - **This changes behaviour, on purpose:**
   - a storage failure that reaches a host in the session's form becomes typed, as the engine's form is today;
   - in the CLI it reports `engine_error` instead of `command_failed`;
@@ -226,6 +227,9 @@ Each PR ships alone. PRs 0 and 1 change behaviour on purpose; PRs 2–8 preserve
     form gives today.
   - The signer sentinel must give the answer a transport-path rejection gives today: `ExternalSignerRejected` in
     MarmotKit and C, `command_failed` in the CLI, `Cancelled` sync class and the `external_signer_rejected` kind.
+    It is tested in two forms: the open-time `EngineError::Other`, and the signing hook's own
+    `EngineError::InvalidAccountIdentityProof`. A remap of one variant therefore fails.
+  - An identity-proof failure whose text lacks the sentinel keeps the answer it gets today.
   The test then guards every later PR.
 - **PR 1:** a test drops a pending send and a pending create-group, then checks that the next context-less row
   carries no operation context.
