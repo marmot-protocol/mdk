@@ -1244,10 +1244,13 @@ jobs:
   # every job, so without this one failure would hold the PR, and every group
   # built on top of it, in the queue until the slowest job finished. Cancelling
   # the run cancels the jobs still running; `Required CI` still runs, sees
-  # them cancelled and fails, and the queue ejects the PR. This is the only
-  # job with `actions: write` and runs no repository code. It is not one of
-  # `Required CI`'s needs, since it waits for that job to appear, and it must
-  # never fail a run whose required jobs passed.
+  # them cancelled and fails, and the queue ejects the PR. The run also stops
+  # once the queue drops its group, for example to rebuild it after a group
+  # ahead failed; GitHub leaves that run going, holding runners the rebuilt
+  # groups need, and its `Required CI` reports on a commit the queue no longer
+  # tracks. This is the only job with `actions: write` and runs no repository
+  # code. It is not one of `Required CI`'s needs, since it waits for that job
+  # to appear, and it must never fail a run whose required jobs passed.
   merge-group-fail-fast:
     name: Merge-group fail-fast
     if: github.event_name == 'merge_group'
@@ -1256,6 +1259,7 @@ jobs:
     continue-on-error: true
     permissions:
       actions: write
+      contents: read
 
     steps:
       - name: Cancel the run when a job fails
@@ -1263,11 +1267,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
+          HEAD_REF: ${{ github.ref }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
           set -uo pipefail
-          # Stop watching before the job timeout. One poll a minute keeps a
-          # run to about 40 requests of the token's hourly budget.
+          # Stop watching before the job timeout. Two requests a minute keep
+          # a run to about 80 of the token's hourly budget.
           deadline=$((SECONDS + 150 * 60))
+          # Look up the group's branch only when the event names one;
+          # otherwise watch for failed jobs alone.
+          if [[ "$HEAD_REF" != refs/heads/?* || ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            HEAD_REF=""
+          fi
+          dropped=0
           while (( SECONDS < deadline )); do
             # One line per job: name, status, conclusion. A failed request is
             # retried on the next poll.
@@ -1283,6 +1295,23 @@ jobs:
               if [[ -n "$failed" ]]; then
                 printf 'Cancelling the run after:\n%s\n' "$failed"
                 gh run cancel "$RUN_ID" && exit 0
+              elif [[ -n "$HEAD_REF" ]]; then
+                # The queue deletes a dropped group's branch and may give its
+                # name to a later group on the same base. A passed group's
+                # branch is deleted only after Required CI has run, so the
+                # check above exits first. Cancel only once two lookups in a
+                # row, a minute apart, succeed without finding this commit; a
+                # failed lookup proves nothing.
+                if sha="$(gh api "repos/$GH_REPO/git/matching-refs/${HEAD_REF#refs/}" \
+                    --jq '.[] | select(.ref == env.HEAD_REF) | .object.sha')" && [[ "$sha" != "$HEAD_SHA" ]]; then
+                  dropped=$((dropped + 1))
+                else
+                  dropped=0
+                fi
+                if (( dropped >= 2 )); then
+                  printf 'Cancelling the run: the merge queue dropped %s at %s\n' "$HEAD_REF" "$HEAD_SHA"
+                  gh run cancel "$RUN_ID" && exit 0
+                fi
               fi
             fi
             sleep 60
