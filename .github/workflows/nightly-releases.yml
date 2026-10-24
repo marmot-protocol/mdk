@@ -196,8 +196,10 @@ jobs:
     name: Report scheduled failure
     needs: [plan, lane, marmotkit, marmotc, wn-agent, publish, retention]
     # Skipped nights (unchanged source, non-dev version, busy lane) exit 0, so only real
-    # failures get here. Dispatches file nothing: whoever started one is watching it.
-    if: failure() && github.event_name == 'schedule'
+    # failures get here. A job timeout cancels that job instead of failing it, so cancelled
+    # jobs count too, but a cancelled run does not. Dispatches file nothing: whoever started
+    # one is watching it.
+    if: github.event_name == 'schedule' && !cancelled() && (failure() || contains(needs.*.result, 'cancelled'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -214,7 +216,8 @@ jobs:
         run: |
           set -euo pipefail
           title="Nightly release failed"
-          failed="$(jq -r '[to_entries[] | select(.value.result == "failure") | .key] | join(", ")' <<<"$NEEDS")"
+          failed="$(jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled")
+            | if .value.result == "cancelled" then "\(.key) (cancelled)" else .key end] | join(", ")' <<<"$NEEDS")"
           body="The scheduled nightly failed for ${SOURCE_SHA} (failed jobs: ${failed}). Run: ${RUN_URL}"
           existing="$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number,title \
             --jq "map(select(.title == \"$title\")) | .[0].number // empty")"

@@ -364,9 +364,11 @@ class NightlyReleasePolicyTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
         jobs = re.findall(r"^  ([a-z][a-z-]*):\n", workflow.split("\njobs:\n", 1)[1], re.MULTILINE)
         report = workflow.split("\n  report:\n", 1)[1].split("\n    steps:\n", 1)[0]
-        # Skipped nights exit 0, so failure() sees only real failures, in every other job.
+        # Skipped nights exit 0, so only real failures in any other job report. A job timeout
+        # leaves that job cancelled rather than failed; a cancelled run reports nothing.
         self.assertIn(f"    needs: [{', '.join(job for job in jobs if job != 'report')}]\n", report)
-        self.assertIn("    if: failure() && github.event_name == 'schedule'\n", report)
+        self.assertIn("    if: github.event_name == 'schedule' && !cancelled() && "
+                      "(failure() || contains(needs.*.result, 'cancelled'))\n", report)
         self.assertIn("    permissions:\n      issues: write\n", report)
         self.assertEqual(workflow.count("issues: write"), 1)
 
@@ -382,8 +384,10 @@ class NightlyReleasePolicyTests(unittest.TestCase):
             }
         """)
         needs = json.dumps({"plan": {"result": "success"}, "marmotc": {"result": "failure"},
-                            "publish": {"result": "skipped"}, "retention": {"result": "failure"}})
-        body = "--body The scheduled nightly failed for abc123 (failed jobs: marmotc, retention). Run: https://run"
+                            "wn-agent": {"result": "cancelled"}, "publish": {"result": "skipped"},
+                            "retention": {"result": "failure"}})
+        body = ("--body The scheduled nightly failed for abc123 "
+                "(failed jobs: marmotc, wn-agent (cancelled), retention). Run: https://run")
         for issues, expected in [
             ([{"number": 9, "title": "Nightly release failed twice"}],
              f"issue create --repo o/r --title Nightly release failed {body}"),
