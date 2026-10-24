@@ -2736,7 +2736,7 @@ pub(crate) mod tests {
             hasher.update(b"cgka-engine-seen-id-unit-test");
             hasher.update(counter.to_be_bytes());
             material.copy_from_slice(&hasher.finalize());
-            if let Ok(sk) = k256::schnorr::SigningKey::from_bytes(&material) {
+            if let Ok(sk) = k256::schnorr::SigningKey::from_slice(&material) {
                 return sk;
             }
             counter += 1;
