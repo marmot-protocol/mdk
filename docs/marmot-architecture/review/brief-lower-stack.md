@@ -93,6 +93,8 @@ configuration and signer, because the session exposes them without re-exporting 
 
 1. **An error's outcome depends on what it is.** After PR 0, code may change which layer wraps an error, but never
    what the error is: a storage failure stays a storage failure of the same kind, and an engine error the same variant.
+   The one deliberate exception is PR 0's own. The engine carries an external-signer rejection as a generic error
+   holding the sentinel string, and PR 0 turns it into `ExternalSignerRejected` however it is wrapped.
 2. **A forward keeps the forwarded method's signature**: return type, error type and generic parameters. A caller's
    code changes only its receiver.
 3. **The compiler lists the sites.** Each PR removes or narrows a surface and fixes what the compiler then reports.
@@ -101,7 +103,7 @@ configuration and signer, because the session exposes them without re-exporting 
    keeps the engine's check and its exact errors.
 5. **Every audit row goes to one recorder, in one sequence, and the file closes when the app says so,** not when the
    last owner happens to drop.
-6. **Narrow in place, then move.** The crate move is rename-only.
+6. **Narrow in place, then move.** The crate move changes only paths.
 
 ## What changes
 
@@ -116,7 +118,9 @@ configuration and signer, because the session exposes them without re-exporting 
 - **This changes behaviour, on purpose:**
   - a storage failure that reaches a host in the session's form becomes typed, as the engine's form is today;
   - in the CLI it reports `engine_error` instead of `command_failed`;
-  - a signer rejection inside any session or account error becomes `ExternalSignerRejected`.
+  - a signer rejection inside any session or account error becomes `ExternalSignerRejected`, as a transport-path
+    rejection is today. Today only the open call site maps it; on any other path it would surface as a generic engine
+    error.
 
 ### 1. One public layer
 
@@ -174,7 +178,8 @@ configuration and signer, because the session exposes them without re-exporting 
 
 ### 4. Hosts stop naming the lower stack
 
-- `marmot-session` re-exports the engine types its configuration and signer expose.
+- This happens before the move, so the move only changes where the re-exports come from.
+- The session crate re-exports the engine types its configuration and signer expose.
 - `marmot-app` re-exports what hosts need: the account and session error types and the identity-proof signer types.
 - `marmot-app` and `marmot-uniffi` then import nothing from `cgka-engine` in production, and `marmot-uniffi` drops the
   dependency.
@@ -199,7 +204,7 @@ crates/marmot-account/           home, io, keyring, nip49_export, secret_store, 
 
 ## PR sequence
 
-Each PR ships alone. PRs 0 and 1 change behaviour on purpose; PRs 2–7 preserve it.
+Each PR ships alone. PRs 0 and 1 change behaviour on purpose; PRs 2–8 preserve it.
 
 | PR | Change | Check |
 | --- | --- | --- |
@@ -208,16 +213,20 @@ Each PR ships alone. PRs 0 and 1 change behaviour on purpose; PRs 2–7 preserve
 | 2 | Audit ownership (item 3) | The recorder tests; audit suites; the lifecycle bench builds |
 | 3 | Account records (item 2) | The liveness table test; `hydration_quarantine` |
 | 4 | One public layer (item 1), with the session type still public | `marmot-app` builds without `test-support`; app and account suites |
-| 5 | The move (item 5) and the re-exports (item 4) | Rename-only diff; the same test list per moved binary |
-| 6 | The session becomes a private module; dead session forwards go | The compiler with and without `test-support` |
-| 7 | Tracing targets named after their new modules; the telemetry and architecture docs that name them | `tracing_audit`; a docs link check |
+| 5 | Hosts stop naming the lower stack (item 4) | `marmot-uniffi` builds without `cgka-engine`; the PR 0 table |
+| 6 | The move (item 5) | Path-only diff; the same tests per moved binary and per CI lane |
+| 7 | The session becomes a private module; dead session forwards go | The compiler with and without `test-support` |
+| 8 | Tracing targets named after their new modules; the telemetry and architecture docs that name them | `tracing_audit`; a docs link check |
 
 ## Proof
 
-- **PR 0:** a table test. It builds each storage kind (busy, closed, full, other), an engine variant and the signer
-  sentinel in every wrapping the lower stack can produce. For each, it checks that MarmotKit, the C status, the CLI
-  code, the sync class and the privacy kind give the same answer as for the engine's form. The test then guards every
-  later PR.
+- **PR 0:** a table test over every wrapping the lower stack can produce. Each row checks MarmotKit, the C status,
+  the CLI code, the sync class and the privacy kind.
+  - Each storage kind (busy, closed, full, other) and an ordinary engine variant must give the answer the engine's
+    form gives today.
+  - The signer sentinel must give the answer a transport-path rejection gives today: `ExternalSignerRejected` in
+    MarmotKit and C, `command_failed` in the CLI, `Cancelled` sync class and the `external_signer_rejected` kind.
+  The test then guards every later PR.
 - **PR 1:** a test drops a pending send and a pending create-group, then checks that the next context-less row
   carries no operation context.
 - **PR 2:**
@@ -232,7 +241,9 @@ Each PR ships alone. PRs 0 and 1 change behaviour on purpose; PRs 2–7 preserve
   - one row against a closed connection for every moved accessor, which PR 0's rule makes one shape.
 - **PR 4:** rules 2 and 3. The production build is the inventory. The app's suites, the conversation-window suite
   among them, run unchanged.
-- **PR 5:** `git diff -M` shows renames only, and `cargo nextest list` shows the same tests per moved binary.
+- **PR 6:** the diff changes only paths: file renames, manifests, import paths, and the CI scripts and filters that
+  name the crates. `cargo nextest list` shows the same tests per moved binary, and each CI lane, Windows included,
+  selects the same tests as before.
 - **All PRs:** the `marmot-app`, `marmot-account` (later `marmot-session`) and `cgka-engine` suites, plus
   `just simulator-smoke` for PRs 2–4, which touch the publish and convergence paths.
 
@@ -240,8 +251,11 @@ Each PR ships alone. PRs 0 and 1 change behaviour on purpose; PRs 2–7 preserve
 
 - **A recorder clone outliving shutdown.** Rule 5 closes the file at the app's explicit finish. The one stop path that
   does not finish today (a failed stop) keeps today's behaviour: no stop row, and the file closes when the client drops.
-- **PR 0 is visible.** The few session-form storage failures that reach hosts change from generic to typed errors,
-  and the CLI code changes for them. The changelogs say so.
+- **PR 0 is visible.** The changelogs say so.
+  - The few session-form storage failures that reach hosts change from generic to typed errors. Their CLI code
+    changes from `command_failed` to `engine_error`.
+  - A signer rejection on any path the open call site does not cover would change the other way: from a generic
+    engine error (`Runtime`, `engine_error`) to `ExternalSignerRejected` (`command_failed` in the CLI).
 - **Hot-path cost of the shared handle.** Each `is_enabled` and `record` call takes an uncontended read lock. Audit is
   off by default (hypothesis: not measurable; check with `cgka-engine/tests/apply_history_cost.rs`).
 - **`test-support` hides production misuse in test builds.** The normal build still rejects it. `nostr-directory` and
@@ -274,7 +288,7 @@ Each PR ships alone. PRs 0 and 1 change behaviour on purpose; PRs 2–7 preserve
 
 1. **Classify errors by kind first (PR 0).** Recommended: it removes the class of change that four review rounds kept
    finding, and protects steps 6–8 too. The alternative leaves each later PR to preserve every wrapping by hand.
-2. **Narrow in place first, then move.** Recommended: the move PR stays rename-only. Moving first would put real
+2. **Narrow in place first, then move.** Recommended: the move PR changes only paths. Moving first would put real
    changes inside a large rename diff.
 3. **The session type, its accessors and `AccountDeviceRuntime::new` are public only under `test-support`.**
    Recommended: production sees one layer, and about 13k lines of tests keep working. The alternative leaves a second
