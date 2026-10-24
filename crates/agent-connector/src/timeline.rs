@@ -3,7 +3,7 @@
 use agent_control::{
     AGENT_CONTROL_TIMELINE_DEFAULT_LIMIT, AGENT_CONTROL_TIMELINE_MAX_LIMIT,
     AGENT_CONTROL_TIMELINE_REACTIONS_MAX, AGENT_CONTROL_TIMELINE_TEXT_MAX_CHARS,
-    AgentControlEnvelope, AgentControlResponse, AgentControlTimelineCursor,
+    AgentControlEnvelope, AgentControlMediaRef, AgentControlResponse, AgentControlTimelineCursor,
     AgentControlTimelineMessage, AgentControlTimelineMessageAvailability,
     AgentControlTimelineReaction, MAX_AGENT_CONTROL_FRAME_BYTES,
 };
@@ -11,32 +11,48 @@ use marmot_app::{TimelineMessageQuery, TimelineMessageRecord, TimelinePagination
 
 use crate::AgentConnector;
 use crate::error::ConnectorError;
-use crate::event_projection::{attachment_summaries_from_tags, control_actor};
+use crate::event_projection::{
+    attachment_summaries_from_tags, control_actor, media_refs_from_tags,
+};
 use crate::validation::normalize_hex;
 
 const TIMELINE_ATTACHMENT_FIELD_MAX_CHARS: usize = 512;
 const TIMELINE_REACTION_EMOJI_MAX_CHARS: usize = 64;
 
 impl AgentConnector {
+    /// Read a timeline row and, when requested, its non-secret media references.
+    ///
+    /// Unavailable rows expose no media. Size the complete response envelope,
+    /// including its request ID, before returning any download references.
     pub(crate) fn timeline_message_response(
         &self,
+        request_id: Option<&str>,
         account_id_hex: &str,
         group_id_hex: &str,
         message_id_hex: &str,
+        include_media: bool,
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
         let group_id_hex = normalize_hex(group_id_hex)?;
         let message_id_hex = normalize_hex(message_id_hex)?;
-        let message = self
-            .runtime
-            .timeline_message(&account.label, &group_id_hex, &message_id_hex)?
-            .map(|record| timeline_message(record, &account.account_id_hex));
-        Ok(AgentControlResponse::TimelineMessage {
-            account_id_hex: account.account_id_hex,
-            group_id_hex,
-            message_id_hex,
-            message,
-        })
+        let record =
+            self.runtime
+                .timeline_message(&account.label, &group_id_hex, &message_id_hex)?;
+        let media = record
+            .as_ref()
+            .map(|record| timeline_media(record, include_media))
+            .unwrap_or_default();
+        let message = record.map(|record| timeline_message(record, &account.account_id_hex));
+        checked_timeline_message_response(
+            request_id,
+            AgentControlResponse::TimelineMessage {
+                account_id_hex: account.account_id_hex,
+                group_id_hex,
+                message_id_hex,
+                message,
+                media,
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -130,6 +146,7 @@ fn bounded_timeline_page_response(
     }
 }
 
+/// Normalize a cursor's message ID while preserving its ordering timestamp.
 fn normalize_cursor(
     mut cursor: AgentControlTimelineCursor,
 ) -> Result<AgentControlTimelineCursor, ConnectorError> {
@@ -137,6 +154,40 @@ fn normalize_cursor(
     Ok(cursor)
 }
 
+/// Project validated download references only for opted-in, available chat rows.
+/// A source epoch is required; content keys are never part of this projection.
+fn timeline_media(record: &TimelineMessageRecord, include: bool) -> Vec<AgentControlMediaRef> {
+    if !include
+        || record.deleted
+        || record.invalidation_status.is_some()
+        || record.kind != cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT
+    {
+        return Vec::new();
+    }
+    let Some(epoch) = record.source_epoch else {
+        return Vec::new();
+    };
+    media_refs_from_tags(&record.tags, epoch)
+}
+
+/// Reject an oversized response, including its request ID and trailing newline.
+/// Download references remain complete rather than being silently truncated.
+fn checked_timeline_message_response(
+    request_id: Option<&str>,
+    response: AgentControlResponse,
+) -> Result<AgentControlResponse, ConnectorError> {
+    // Refuse oversize references as a control error, never silently truncate a locator.
+    let frame = agent_control::encode_frame(&AgentControlEnvelope::new(
+        request_id.map(str::to_owned),
+        &response,
+    ))?;
+    if frame.len() > MAX_AGENT_CONTROL_FRAME_BYTES {
+        return Err(agent_control::AgentControlError::FrameTooLarge(frame.len()).into());
+    }
+    Ok(response)
+}
+
+/// Build a bounded summary, retaining row identity but hiding unavailable content.
 fn timeline_message(
     record: TimelineMessageRecord,
     self_account_id_hex: &str,
@@ -274,6 +325,7 @@ mod tests {
     }
 
     #[test]
+    /// Verify available summaries retain reply and reaction identities.
     fn available_timeline_message_keeps_durable_identity_and_reactions() {
         let message = timeline_message(record(), &"77".repeat(32));
         assert_eq!(
@@ -291,6 +343,77 @@ mod tests {
     }
 
     #[test]
+    /// Verify opt-in, availability, epoch, chat-kind, and locator-validation gates.
+    fn full_media_recovery_is_opt_in_and_excludes_unavailable_records() {
+        let mut stored = record();
+        stored.tags = vec![vec![
+            "imeta".into(),
+            "v encrypted-media-v1".into(),
+            format!(
+                "locator blossom-v1 https://blossom.example.com/{}.bin",
+                "cd".repeat(32)
+            ),
+            format!("ciphertext_sha256 {}", "cd".repeat(32)),
+            format!("plaintext_sha256 {}", "ab".repeat(32)),
+            format!("nonce {}", "0".repeat(24)),
+            "m image/png".into(),
+            "filename example.png".into(),
+        ]];
+        assert!(timeline_media(&stored, false).is_empty());
+        let media = timeline_media(&stored, true);
+        assert_eq!(media, media_refs_from_tags(&stored.tags, 7));
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].source_epoch, 7);
+        assert_eq!(media[0].plaintext_sha256, "ab".repeat(32));
+        stored.deleted = true;
+        assert!(timeline_media(&stored, true).is_empty());
+        stored.deleted = false;
+        stored.invalidation_status = Some("LosingBranch".into());
+        assert!(timeline_media(&stored, true).is_empty());
+        stored.invalidation_status = None;
+        stored.kind = 7;
+        assert!(timeline_media(&stored, true).is_empty());
+        stored.kind = 9;
+        stored.source_epoch = None;
+        assert!(timeline_media(&stored, true).is_empty());
+        stored.source_epoch = Some(7);
+        stored.tags[0][2] = "locator blossom-v1 http://127.0.0.1/file.bin".into();
+        assert!(timeline_media(&stored, true).is_empty());
+    }
+
+    #[test]
+    /// Verify media and the caller's request ID both count toward the frame limit.
+    fn timeline_message_budget_includes_media_and_request_identity() {
+        let response = AgentControlResponse::TimelineMessage {
+            account_id_hex: "11".repeat(32),
+            group_id_hex: "22".repeat(16),
+            message_id_hex: "33".repeat(32),
+            message: None,
+            media: vec![AgentControlMediaRef {
+                media_type: "image/png".into(),
+                file_name: "f".repeat(MAX_AGENT_CONTROL_FRAME_BYTES / 2),
+                ciphertext_sha256: "cd".repeat(32),
+                plaintext_sha256: "ab".repeat(32),
+                nonce_hex: "0".repeat(24),
+                version: "encrypted-media-v1".into(),
+                source_epoch: 7,
+                locators: Vec::new(),
+                dim: None,
+                thumbhash: None,
+            }],
+        };
+        assert!(checked_timeline_message_response(Some("short"), response.clone()).is_ok());
+        let long_id = "r".repeat(MAX_AGENT_CONTROL_FRAME_BYTES / 2);
+        assert_eq!(
+            checked_timeline_message_response(Some(&long_id), response)
+                .expect_err("Oversize media lookup must be refused")
+                .code(),
+            "control_error"
+        );
+    }
+
+    #[test]
+    /// Verify deleted and invalidated summaries withhold message content and reactions.
     fn deleted_and_invalidated_timeline_messages_never_expose_content() {
         let mut deleted = record();
         deleted.deleted = true;

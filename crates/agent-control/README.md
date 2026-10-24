@@ -92,6 +92,17 @@ Connectors use the same API both to attach a recent ID-bearing chat window to an
 on-demand history tool. This is also the recovery path after `resync_required`; clients should re-page the
 materialized timeline rather than attempting to reconstruct history from the lossy event stream.
 
+### Media recovery
+
+For media recovery, `timeline_message_get` accepts optional `include_media: true`.
+The response adds a `media` array with the same non-secret download references as
+live inbound events. Pass each reference to `download_media`; content keys stay
+inside MDK. Missing, deleted, invalidated, non-chat records and records without a
+source epoch return no media. Without the flag, lookups and timeline pages retain
+their summary-only projection, and empty `media` arrays are omitted on the wire.
+The existing frame-size limit applies, including the request ID; an oversized
+lookup returns a `control_error` instead of truncated download references.
+
 ## Run the tests
 
 ```sh

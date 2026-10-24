@@ -231,6 +231,7 @@ impl AgentConnector {
         result
     }
 
+    /// Dispatch a one-shot control request without adding operation telemetry.
     async fn handle_request_unobserved(
         &self,
         request_id: Option<&str>,
@@ -242,7 +243,14 @@ impl AgentConnector {
                 account_id_hex,
                 group_id_hex,
                 message_id_hex,
-            } => self.timeline_message_response(&account_id_hex, &group_id_hex, &message_id_hex),
+                include_media,
+            } => self.timeline_message_response(
+                request_id,
+                &account_id_hex,
+                &group_id_hex,
+                &message_id_hex,
+                include_media.unwrap_or(false),
+            ),
             AgentControlRequest::TimelineList {
                 account_id_hex,
                 group_id_hex,
