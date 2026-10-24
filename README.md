@@ -191,7 +191,7 @@ skip complete native candidate packaging, including Android target compilation
 and linking; use the opt-in when a change needs that signal before merging.
 Candidate packaging also runs on master when its inputs change, and the
 [nightly release](release.md#nightly-builds) builds and validates the same
-packages every night.
+packages on nights it does not skip.
 Existing nightly and weekly campaigns retain their wider coverage. Broker image
 publishing stays serialized per ref so an older build cannot overwrite a newer
 `latest` image.
