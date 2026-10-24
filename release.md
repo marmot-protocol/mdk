@@ -157,6 +157,11 @@ back to an older nightly (for example across a storage migration) is not support
   then skips the night. Once a nightly is building, MarmotKit tag and snapshot runs and `just release-all` wait up to
   three hours for it. The check is best effort: a release started in the seconds while a nightly passes its wait can
   still overlap it.
+- **Failures.** When a scheduled run fails, its last job opens an issue titled "Nightly release failed", or comments on
+  the open one, with the source SHA, the failed jobs and the run URL. Skipped nights (an unchanged source, a version
+  that is not `X.Y.Z-dev`, a lane still busy after three hours) are not failures and file nothing. Manual dispatches
+  file nothing either: whoever starts one watches it, and rehearsals can run from any branch. Close the issue once a
+  nightly publishes again.
 
 Rehearse with a manual dispatch; a dispatch that publishes must run the workflow from `master`:
 

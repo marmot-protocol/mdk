@@ -1271,9 +1271,8 @@ The workflow has no schedule of its own. The
 same Android and Apple packages from `master`, but only on nights it does not
 skip: it skips when master has no new green commit or is not on an
 `X.Y.Z-dev` version, and when releases or snapshots keep the macOS runners busy
-for three hours. It opens no issue when it fails, and it does not run
-`test-native-archive.py` or refresh this workflow's cache seeds; matching
-`master` pushes do both.
+for three hours. It does not run `test-native-archive.py` or refresh this
+workflow's cache seeds; matching `master` pushes do both.
 
 Baseline-versus-candidate measurements are intentionally manual. Run the
 `MarmotKit Release Profile Measurements` workflow from `master` with the full
