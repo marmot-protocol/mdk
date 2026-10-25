@@ -295,10 +295,11 @@ All six were approved as recommended.
 1. **Classify errors by kind first (PR 0).** It removes the class of change that four review rounds kept finding, and
    protects steps 6–8 too. Without it, each later PR would have to preserve every wrapping by hand.
 2. **Narrow in place first, then move.**
-   - Each narrowing PR delivers its value on its own, so the work can pause between PRs. The move is the cheapest
-     step, and it comes last.
-   - The cost is a temporary `test-support` feature on `marmot-account`, and a session type that stays public until
-     PR 7.
+   - Each narrowing PR delivers its value on its own, so the work can pause between PRs. The move (PR 6) follows the
+     in-place narrowing of PRs 0–5. After it come only the step that needs one crate (PR 7) and the tracing rename
+     (PR 8).
+   - The cost is that the session type stays public until PR 7: it cannot become a private module while it lives in
+     a different crate from the runtime.
    - Moving first could also change only paths, but it would rename the crates before any boundary improves.
 3. **The session type, its accessors and `AccountDeviceRuntime::new` are public only under `test-support`.**
    Production sees one layer, and about 13k lines of tests keep working. Keeping the session public would leave a
