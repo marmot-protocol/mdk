@@ -137,9 +137,10 @@ configuration and signer, because the session exposes them without re-exporting 
   them behind a `test-support` feature, because they drive the session directly to set up scenarios. Dev-dependency
   features do not reach normal builds, so a production use still fails to compile. `nostr-directory` uses the same
   pattern.
-- The session type stays public until it shares a crate with the runtime. Then it becomes a private module that
-  `test-support` re-exports. Session forwards that nothing calls are then deleted: in a normal build the module is
-  private, so the `dead_code` lint finds them.
+- The session type stays public through the move (PR 6), which changes only paths. PR 7 then makes it a private
+  module that `test-support` re-exports.
+- In a normal build the module is then private, so the `dead_code` lint lists candidate forwards to delete. A method
+  that tests still call through the re-export stays, with the lint allowed for it in the normal build.
 
 ### 2. Account records on the session's own handle
 
@@ -192,7 +193,7 @@ configuration and signer, because the session exposes them without re-exporting 
 ```text
 crates/marmot-session/           (git mv crates/cgka-session)
   src/lib.rs                     facade: the runtime, its effects, SessionConfig, errors, re-exports
-  src/session.rs                 private: today's cgka-session lib.rs
+  src/session.rs                 today's cgka-session lib.rs (private from PR 7)
   src/runtime.rs routing.rs key_package.rs time.rs   from marmot-account
   tests/                         cgka-session's tests plus marmot-account's runtime tests
 crates/marmot-account/           home, io, keyring, nip49_export, secret_store, AccountHomeError
@@ -217,7 +218,7 @@ Each PR ships alone. PRs 0 and 1 change behaviour on purpose; PRs 2–8 preserve
 | 4 | One public layer (item 1), with the session type still public | `marmot-app` builds without `test-support`; app and account suites |
 | 5 | Hosts stop naming the lower stack (item 4) | `marmot-uniffi` builds without `cgka-engine`; the PR 0 table |
 | 6 | The move (item 5) | Path-only diff; the same tests per moved binary and per CI lane |
-| 7 | The session becomes a private module, re-exported only under `test-support`; dead session forwards go | The compiler with and without `test-support` |
+| 7 | The session becomes a private module, re-exported only under `test-support`; dead session forwards go | The compiler with and without `test-support`; the session, runtime and app suites |
 | 8 | Tracing targets named after their new modules; the telemetry and architecture docs that name them | `tracing_audit`; a docs link check |
 
 ## Proof
