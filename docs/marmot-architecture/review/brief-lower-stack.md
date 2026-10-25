@@ -1,9 +1,9 @@
 ---
 title: "Extraction Brief — The Lower Stack into marmot-session"
 created: 2026-10-24
-updated: 2026-10-24
+updated: 2026-10-25
 tags: [marmot, architecture, review, extraction-brief, session, account, engine]
-status: proposed
+status: proposed; product-owner decisions made 2026-10-25
 ---
 
 # Extraction Brief — The Lower Stack into `marmot-session`
@@ -288,17 +288,24 @@ Each PR ships alone. PRs 0 and 1 change behaviour on purpose; PRs 2–8 preserve
 - What a host sees for an error does not depend on its wrapping, and PR 0's table pins that.
 - Every suite that ran before runs with the same tests.
 
-## Product-owner decisions (proposed)
+## Product-owner decisions (2026-10-25)
 
-1. **Classify errors by kind first (PR 0).** Recommended: it removes the class of change that four review rounds kept
-   finding, and protects steps 6–8 too. The alternative leaves each later PR to preserve every wrapping by hand.
-2. **Narrow in place first, then move.** Recommended: the move PR changes only paths. Moving first would put real
-   changes inside a large rename diff.
+All six were approved as recommended.
+
+1. **Classify errors by kind first (PR 0).** It removes the class of change that four review rounds kept finding, and
+   protects steps 6–8 too. Without it, each later PR would have to preserve every wrapping by hand.
+2. **Narrow in place first, then move.**
+   - Each narrowing PR delivers its value on its own, so the work can pause between PRs. The move is the cheapest
+     step, and it comes last.
+   - The cost is a temporary `test-support` feature on `marmot-account`, and a session type that stays public until
+     PR 7.
+   - Moving first could also change only paths, but it would rename the crates before any boundary improves.
 3. **The session type, its accessors and `AccountDeviceRuntime::new` are public only under `test-support`.**
-   Recommended: production sees one layer, and about 13k lines of tests keep working. The alternative leaves a second
-   public layer for tests.
+   Production sees one layer, and about 13k lines of tests keep working. Keeping the session public would leave a
+   second public layer for tests.
 4. **The outbound-fanout accessors and pending references stay in the engine,** for the reasons in item 2. This
    corrects core-structure's count of proxy methods.
-5. **Hosts get the error and signer types from `marmot-app`.** Recommended: it keeps the rule that hosts depend only on
+5. **Hosts get the error and signer types from `marmot-app`.** This keeps the rule that hosts depend only on
    `marmot-app` and `marmot-account`, and lets `marmot-uniffi` drop `cgka-engine`.
-6. **Type names stay through the move.** Recommended: renames are churn in every caller and change no boundary.
+6. **Type names stay through the move.** Renames are churn in every caller and change no boundary. A rename can follow
+   as its own PR.
