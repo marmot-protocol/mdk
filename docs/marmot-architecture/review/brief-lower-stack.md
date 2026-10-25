@@ -137,8 +137,9 @@ configuration and signer, because the session exposes them without re-exporting 
   them behind a `test-support` feature, because they drive the session directly to set up scenarios. Dev-dependency
   features do not reach normal builds, so a production use still fails to compile. `nostr-directory` uses the same
   pattern.
-- The session type stays public until it shares a crate with the runtime, then becomes private. Session forwards
-  that nothing calls are then deleted, and the `dead_code` lint finds them.
+- The session type stays public until it shares a crate with the runtime. Then it becomes a private module that
+  `test-support` re-exports. Session forwards that nothing calls are then deleted: in a normal build the module is
+  private, so the `dead_code` lint finds them.
 
 ### 2. Account records on the session's own handle
 
@@ -216,7 +217,7 @@ Each PR ships alone. PRs 0 and 1 change behaviour on purpose; PRs 2–8 preserve
 | 4 | One public layer (item 1), with the session type still public | `marmot-app` builds without `test-support`; app and account suites |
 | 5 | Hosts stop naming the lower stack (item 4) | `marmot-uniffi` builds without `cgka-engine`; the PR 0 table |
 | 6 | The move (item 5) | Path-only diff; the same tests per moved binary and per CI lane |
-| 7 | The session becomes a private module; dead session forwards go | The compiler with and without `test-support` |
+| 7 | The session becomes a private module, re-exported only under `test-support`; dead session forwards go | The compiler with and without `test-support` |
 | 8 | Tracing targets named after their new modules; the telemetry and architecture docs that name them | `tracing_audit`; a docs link check |
 
 ## Proof
@@ -302,8 +303,11 @@ All six were approved as recommended.
      a different crate from the runtime.
    - Moving first could also change only paths, but it would rename the crates before any boundary improves.
 3. **The session type, its accessors and `AccountDeviceRuntime::new` are public only under `test-support`.**
-   Production sees one layer, and about 13k lines of tests keep working. Keeping the session public would leave a
-   second public layer for tests.
+   - The accessors and `new` move behind the feature in PR 4.
+   - The session type follows in PR 7, as a private module that the feature re-exports. Until then it stays public,
+     as decision 2 explains.
+   - Production sees one layer, and about 13k lines of tests keep working. Keeping the session public would leave a
+     second public layer for tests.
 4. **The outbound-fanout accessors and pending references stay in the engine,** for the reasons in item 2. This
    corrects core-structure's count of proxy methods.
 5. **Hosts get the error and signer types from `marmot-app`.** This keeps the rule that hosts depend only on
