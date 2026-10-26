@@ -7,6 +7,15 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Added
+
+- Add `MARMOT_STATUS_MEDIA_REFERENCE_STALE_EPOCH` (108): the group left the
+  epoch an attachment was encrypted under, so upload it again; and
+  `MARMOT_STATUS_MEDIA_REFERENCE_EPOCH_UNSETTLED` (109): the group's epoch is
+  settling, so sync and send again. Both previously returned
+  `MARMOT_STATUS_INVALID_MEDIA_REFERENCE`. Existing status values are
+  unchanged. Use matching regenerated headers and libraries (#2158).
+
 ### Changed
 
 - `marmot_attachment_transfer_subscription_next` returns a replacement that

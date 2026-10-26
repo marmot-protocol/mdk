@@ -107,6 +107,25 @@ pub enum MarmotKitError {
     /// is unusable (empty batch, oversized, no endpoint).
     #[error("invalid media reference: {details}")]
     InvalidMediaReference { details: String },
+    /// An attachment was encrypted at `source_epoch`, but the group moved to
+    /// `current_epoch` before it could be sent (mdk#2158). Its media key is bound
+    /// to the epoch it was encrypted under, so it cannot be sent; upload the
+    /// file again. Nothing was published.
+    #[error(
+        "media reference was encrypted at epoch {source_epoch} but the group is at epoch {current_epoch}; upload it again"
+    )]
+    MediaReferenceStaleEpoch {
+        source_epoch: u64,
+        current_epoch: u64,
+    },
+    /// The group's epoch is unsettled, so an attachment encrypted at
+    /// `source_epoch` cannot be sent right now. Nothing was published. Sync
+    /// and send again; if the epoch moved, that send fails with
+    /// `MediaReferenceStaleEpoch` and the file must be uploaded again.
+    #[error(
+        "the group's epoch is unsettled, so media encrypted at epoch {source_epoch} cannot be sent yet; sync and send again"
+    )]
+    MediaReferenceEpochUnsettled { source_epoch: u64 },
     /// An encrypted-media `imeta` reference failed MDK's shared strict parser
     /// (mdk#1787): `parse_media_imeta_tag` on an inbound tag, or a host-built
     /// reference passed to build/send/upload/download whose fields are
@@ -540,12 +559,16 @@ impl From<&AppError> for MarmotKitError {
             AppError::InvalidEncryptedMedia(details) => Self::InvalidMediaReference {
                 details: details.clone(),
             },
-            stale @ AppError::MediaReferenceStaleEpoch { .. } => Self::InvalidMediaReference {
-                details: stale.to_string(),
+            AppError::MediaReferenceStaleEpoch {
+                source_epoch,
+                current_epoch,
+            } => Self::MediaReferenceStaleEpoch {
+                source_epoch: *source_epoch,
+                current_epoch: *current_epoch,
             },
-            unsettled @ AppError::MediaReferenceEpochUnsettled { .. } => {
-                Self::InvalidMediaReference {
-                    details: unsettled.to_string(),
+            AppError::MediaReferenceEpochUnsettled { source_epoch } => {
+                Self::MediaReferenceEpochUnsettled {
+                    source_epoch: *source_epoch,
                 }
             }
             AppError::MediaAttachmentRejected(rejection) => Self::MediaAttachmentRejected {
@@ -959,6 +982,37 @@ mod tests {
         assert!(
             matches!(ffi, MarmotKitError::Runtime { .. }),
             "InvalidTransition denotes an engine bug and stays untyped; got {ffi:?}"
+        );
+    }
+
+    /// mdk#2158: an attachment whose epoch the group left, or whose group is
+    /// mid-epoch-change, crosses the FFI as its own typed error with both
+    /// epochs, not as a generic invalid reference a host can only string-match.
+    #[test]
+    fn media_epoch_failures_cross_ffi_as_typed_variants() {
+        let stale: MarmotKitError = AppError::MediaReferenceStaleEpoch {
+            source_epoch: 2,
+            current_epoch: 3,
+        }
+        .into();
+        assert!(
+            matches!(
+                stale,
+                MarmotKitError::MediaReferenceStaleEpoch {
+                    source_epoch: 2,
+                    current_epoch: 3
+                }
+            ),
+            "{stale:?}"
+        );
+        let unsettled: MarmotKitError =
+            AppError::MediaReferenceEpochUnsettled { source_epoch: 4 }.into();
+        assert!(
+            matches!(
+                unsettled,
+                MarmotKitError::MediaReferenceEpochUnsettled { source_epoch: 4 }
+            ),
+            "{unsettled:?}"
         );
     }
 

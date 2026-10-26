@@ -227,6 +227,16 @@ enum MarmotStatus
    * MDK reads from one list; a follow or unfollow published nothing.
    */
   MARMOT_STATUS_FOLLOW_LIST_TOO_LARGE = 107,
+  /**
+   * An attachment was encrypted at an epoch the group has left, so it cannot
+   * be sent; upload the file again (mdk#2158).
+   */
+  MARMOT_STATUS_MEDIA_REFERENCE_STALE_EPOCH = 108,
+  /**
+   * The group's epoch is unsettled, so an attachment cannot be sent yet;
+   * sync and send again (mdk#2158).
+   */
+  MARMOT_STATUS_MEDIA_REFERENCE_EPOCH_UNSETTLED = 109,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L

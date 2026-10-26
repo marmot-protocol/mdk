@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `MarmotKitError` adds `MediaReferenceStaleEpoch { source_epoch, current_epoch }`
+  and `MediaReferenceEpochUnsettled { source_epoch }`. They replace the
+  generic `InvalidMediaReference` for these two cases: the first means the
+  group left the epoch the attachment was encrypted under, so upload the file
+  again; the second means the epoch is settling, so sync and send again. Update
+  exhaustive Swift/Kotlin handling and regenerate bindings with the matching
+  native library (#2158).
+
 ### Changed
 
 - `AttachmentTransferSubscription.next()` returns a replacement that changes a

@@ -165,6 +165,12 @@ pub enum MarmotStatus {
     /// The current kind-3 contact list has at least 2,048 follows, more than
     /// MDK reads from one list; a follow or unfollow published nothing.
     FollowListTooLarge = 107,
+    /// An attachment was encrypted at an epoch the group has left, so it cannot
+    /// be sent; upload the file again (mdk#2158).
+    MediaReferenceStaleEpoch = 108,
+    /// The group's epoch is unsettled, so an attachment cannot be sent yet;
+    /// sync and send again (mdk#2158).
+    MediaReferenceEpochUnsettled = 109,
 }
 
 thread_local! {
@@ -270,6 +276,10 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::InvalidMessageDraft { .. } => MarmotStatus::InvalidMessageDraft,
         MarmotKitError::InvalidAppComponent { .. } => MarmotStatus::InvalidAppComponent,
         MarmotKitError::InvalidMediaReference { .. } => MarmotStatus::InvalidMediaReference,
+        MarmotKitError::MediaReferenceStaleEpoch { .. } => MarmotStatus::MediaReferenceStaleEpoch,
+        MarmotKitError::MediaReferenceEpochUnsettled { .. } => {
+            MarmotStatus::MediaReferenceEpochUnsettled
+        }
         MarmotKitError::MediaAttachmentRejected { .. } => MarmotStatus::MediaAttachmentRejected,
         MarmotKitError::MediaUnfetchable { .. } => MarmotStatus::MediaUnfetchable,
         MarmotKitError::MediaDownloadFailed { .. } => MarmotStatus::MediaDownloadFailed,
@@ -424,6 +434,11 @@ mod tests {
             MarmotKitError::InvalidMediaReference {
                 details: "d".into(),
             },
+            MarmotKitError::MediaReferenceStaleEpoch {
+                source_epoch: 2,
+                current_epoch: 3,
+            },
+            MarmotKitError::MediaReferenceEpochUnsettled { source_epoch: 2 },
             MarmotKitError::MediaAttachmentRejected {
                 kind: marmot_uniffi::conversions::MediaAttachmentRejectionKindFfi::MissingField,
                 details: "d".into(),
@@ -555,7 +570,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            98,
+            100,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -588,6 +603,18 @@ mod tests {
         assert_eq!(
             status_from_error(&MarmotKitError::FollowListTooLarge) as i32,
             107
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::MediaReferenceStaleEpoch {
+                source_epoch: 2,
+                current_epoch: 3,
+            }) as i32,
+            108
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::MediaReferenceEpochUnsettled { source_epoch: 2 })
+                as i32,
+            109
         );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,
