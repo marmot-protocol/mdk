@@ -920,7 +920,7 @@ fn identity(seed: &[u8]) -> Vec<u8> {
         hasher.update(seed);
         hasher.update(counter.to_be_bytes());
         material.copy_from_slice(&hasher.finalize());
-        if let Ok(key) = SigningKey::from_bytes(&material) {
+        if let Ok(key) = SigningKey::from_slice(&material) {
             return key.verifying_key().to_bytes().to_vec();
         }
         counter = counter.checked_add(1).expect("identity search exhausted");

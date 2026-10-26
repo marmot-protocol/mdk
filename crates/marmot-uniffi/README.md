@@ -302,8 +302,8 @@ name are stranded.
 Nothing an unset value configures falls back to White Noise's services. With no `newGroupMediaEndpoints`, new groups
 carry no encrypted-media component and stay text-only. With no group-image server, setting or fetching an encrypted
 group image fails; with no profile-image server, `uploadProfileImage` needs an explicit server. No recovery relays
-means every route's history needs all its relays to certify, no discovery indexers means onboarding searches only the
-discovery relays the host passes, no Open Ranking turns that directory-search tier off, no KeyPackage client
+means every route's history needs all its relays to certify, no discovery indexers means onboarding searches the
+discovery relays the host passes plus the account's declared relays, no Open Ranking turns that directory-search tier off, no KeyPackage client
 preference leaves candidates unranked by client tag, and no moderation label namespace leaves reporting unconfigured. The neutral keychain service
 is `org.marmot-protocol.mdk`.
 
@@ -331,6 +331,11 @@ lease while the `Marmot` object or one of its runtime handles is still alive.
 Await `shutdownAndClose()` before suspension or root handoff; it terminally closes
 storage and releases the lease without waiting for every host reference to disappear.
 Reconstruct the runtime and its handles for the next foreground session.
+
+Exclude each account directory under `rootPath`, including its `media/` and `handoff/`
+folders, from iCloud and Android auto-backup. Attachment files are encrypted with
+device-bound keys, so a restored copy cannot be read, and `handoff/` holds plaintext
+copies lent to OS surfaces.
 
 ## Threading model
 
@@ -441,6 +446,21 @@ Imported identities can use the durable preflight API instead of `login`:
    commands reject unfinished onboarding; the workflow alone can publish its
    initial KeyPackage. `account_setup_readiness` stays `Initializing` until the
    interactive workflow is complete.
+
+Findings carry typed `context`, `purpose`, `outcome`, `declared_capability`,
+`actions`, and `observed_revision` alongside `issue` and `endpoint`. Render
+each finding separately, even when endpoints match. Use its actions as the
+authoritative subset applicable to that finding; an empty list offers no
+finding-specific action. The step's `actions` remain the full set, including
+single-device consent and KeyPackage setup actions outside relay diagnostics.
+`InspectionCompleted` with `DirectoryQuery` success records only a successful
+directory inspection, not relay write support or event publication. Timeouts,
+incomplete discovery, and unreachable queries leave the outcome unknown.
+Retained findings keep their original observed revision and step `checked_at`;
+interpret revisions only within the snapshot's account and recovery epoch.
+Observations outside relay diagnostics may have unknown context/purpose/outcome
+and no finding actions. Legacy checkpoints also have no observed revision;
+rechecking supplies a fresh revision without upgrading retained evidence.
 
 ### Explicit recovery and checkpoint compatibility
 
@@ -1245,10 +1265,14 @@ explicitly selected, including for changes to the UniFFI crate.
 Matching `master` pushes always build the complete matrix and open an issue
 when it fails; later pushes do not cancel running or queued candidate builds.
 Pull requests restore the trusted release
-cache read-only; only runs using the workflow from `master` may update it. A
-weekly scheduled exact-head run on `master` provides drift detection and
-refreshes those trusted cache seeds; it intentionally executes the complete
-packaging matrix.
+cache read-only; only runs using the workflow from `master` may update it.
+The workflow has no schedule of its own. The
+[nightly release](../../release.md#nightly-builds) builds and validates the
+same Android and Apple packages from `master`, but only on nights it does not
+skip: it skips when master has no new green commit or is not on an
+`X.Y.Z-dev` version, and when releases or snapshots keep the macOS runners busy
+for three hours. It does not run `test-native-archive.py` or refresh this
+workflow's cache seeds; matching `master` pushes do both.
 
 Baseline-versus-candidate measurements are intentionally manual. Run the
 `MarmotKit Release Profile Measurements` workflow from `master` with the full

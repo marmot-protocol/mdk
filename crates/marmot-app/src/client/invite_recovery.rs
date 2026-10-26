@@ -257,9 +257,16 @@ impl AppClient {
             };
             let group = match self.runtime.group_record(&record.group_id) {
                 Ok(group) => Some(group),
-                Err(marmot_account::AccountError::Session(cgka_session::SessionError::Engine(
-                    cgka_traits::EngineError::Storage(cgka_traits::storage::StorageError::NotFound),
-                ))) => None,
+                Err(error)
+                    if matches!(
+                        error.as_engine_error(),
+                        Some(cgka_traits::EngineError::Storage(
+                            cgka_traits::storage::StorageError::NotFound
+                        ))
+                    ) =>
+                {
+                    None
+                }
                 Err(error) => return Err(error.into()),
             };
             let mut members = Vec::new();
@@ -317,9 +324,12 @@ impl AppClient {
                     self.pending_superseded_change_events.push(report);
                 }
                 Ok(None) => {}
-                Err(cgka_session::SessionError::Engine(cgka_traits::EngineError::Storage(
-                    error,
-                ))) => {
+                Err(error)
+                    if matches!(
+                        error.as_engine_error(),
+                        cgka_traits::EngineError::Storage(_)
+                    ) =>
+                {
                     return Err(error.into());
                 }
                 Err(_) => {

@@ -38,8 +38,8 @@ use crate::{
     NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult,
     NostrAcquisitionScope, NostrAcquisitionStats, NostrEventPublishRequest, NostrNotificationLoss,
     NostrNotificationLossFloor, NostrNotificationLossScope, NostrPublishBatch, NostrPublishOutcome,
-    NostrRelayClient, NostrRelayEvent, NostrSubscription, NostrTransportAdapter, ReplayRestart,
-    SubscriptionRefusal, SubscriptionRefusalDisposition,
+    NostrRelayClient, NostrRelayEvent, NostrSubscribeReport, NostrSubscription,
+    NostrTransportAdapter, ReplayRestart, SubscriptionRefusal, SubscriptionRefusalDisposition,
 };
 
 const SDK_RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
@@ -748,6 +748,115 @@ impl SubscriptionFloors {
     }
 }
 
+/// REQs that relays of one account context refused only because they were
+/// unreachable (#1951).
+///
+/// nostr-sdk refuses to register a REQ on a relay that has failed more than one
+/// connect attempt, and its reconnect re-sends only the REQs it registered. So
+/// such a relay owes the REQ instead: the relay's frontier monitor re-sends it,
+/// with its original id and filter, on the relay's next `Connected`. Replay
+/// coverage cannot tell an owed relay from one that queued the REQ while
+/// disconnected, and needs no state of its own for it.
+///
+/// An owed id stays in `account_subscriptions` like any other REQ. Every CLOSE
+/// path forgets the id before its CLOSE goes out, and a re-send holds the same
+/// lock across its check and registration, so a closed REQ is never re-sent.
+#[derive(Default)]
+struct OwedSubscriptions {
+    /// Held by each re-send for its whole run and by each [`Self::forget`].
+    resend: Mutex<()>,
+    /// Owed REQ filters by relay, then id. A std lock, never held across an
+    /// await.
+    relays: StdMutex<HashMap<RelayUrl, HashMap<SubscriptionId, Filter>>>,
+}
+
+impl OwedSubscriptions {
+    fn relays(&self) -> MutexGuard<'_, HashMap<RelayUrl, HashMap<SubscriptionId, Filter>>> {
+        self.relays.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Record one subscribe: the `owed` relays owe the REQ, and the relays
+    /// that registered it no longer do.
+    fn record<'a>(
+        &self,
+        id: &SubscriptionId,
+        filter: &Filter,
+        registered: impl IntoIterator<Item = &'a RelayUrl>,
+        owed: &[RelayUrl],
+    ) {
+        let mut relays = self.relays();
+        for relay in registered {
+            settle_owed(&mut relays, relay, id);
+        }
+        for relay in owed {
+            relays
+                .entry(relay.clone())
+                .or_default()
+                .insert(id.clone(), filter.clone());
+        }
+    }
+
+    fn owes(&self, relay: &RelayUrl) -> bool {
+        self.relays().contains_key(relay)
+    }
+
+    /// Stop owing `id` anywhere. Call before its CLOSE goes out: a re-send
+    /// that already registered it finished first, so the CLOSE reaches it.
+    async fn forget(&self, id: &SubscriptionId) {
+        let _resend = self.resend.lock().await;
+        self.relays().retain(|_, owed| {
+            owed.remove(id);
+            !owed.is_empty()
+        });
+    }
+
+    /// Re-send every REQ `relay` owes. One it still refuses, because it lost
+    /// the connection again, stays owed for the next one.
+    async fn resend(&self, relay: &Relay) {
+        let _resend = self.resend.lock().await;
+        let owed = self.relays().get(relay.url()).cloned().unwrap_or_default();
+        if owed.is_empty() {
+            return;
+        }
+        let mut resent = 0usize;
+        for (id, filter) in &owed {
+            let registered = match relay
+                .subscribe(vec![filter.clone()])
+                .with_id(id.clone())
+                .await
+            {
+                Ok(_) => true,
+                // A later subscribe of the same id already registered it here.
+                Err(_) => relay.subscription(id).await.is_some(),
+            };
+            if registered {
+                resent += 1;
+                settle_owed(&mut self.relays(), relay.url(), id);
+            }
+        }
+        tracing::debug!(
+            target: "transport_nostr_adapter::sdk_client",
+            method = "resend_owed_subscriptions",
+            resent_count = resent,
+            owed_count = owed.len() - resent,
+            "re-sent owed SDK relay subscriptions"
+        );
+    }
+}
+
+fn settle_owed(
+    relays: &mut HashMap<RelayUrl, HashMap<SubscriptionId, Filter>>,
+    relay: &RelayUrl,
+    id: &SubscriptionId,
+) {
+    if let Some(owed) = relays.get_mut(relay) {
+        owed.remove(id);
+        if owed.is_empty() {
+            relays.remove(relay);
+        }
+    }
+}
+
 /// An ordered transport notification from a relay's own SDK receive lane.
 ///
 /// Every payload retains its reader and connection generation through frontend
@@ -812,6 +921,7 @@ struct SdkNotificationFrontier {
     cutovers: watch::Sender<u64>,
     loss: watch::Sender<Option<NostrNotificationLoss>>,
     subscription_floors: Arc<StdMutex<SubscriptionFloors>>,
+    owed: Arc<OwedSubscriptions>,
     state: StdMutex<FrontierState>,
 }
 
@@ -831,6 +941,7 @@ impl SdkNotificationFrontier {
     fn new(
         loss: watch::Sender<Option<NostrNotificationLoss>>,
         subscription_floors: Arc<StdMutex<SubscriptionFloors>>,
+        owed: Arc<OwedSubscriptions>,
     ) -> Self {
         let (sender, receiver) = broadcast::channel(SDK_NOTIFICATION_CAPACITY);
         let reader = next_reader_epoch();
@@ -839,6 +950,7 @@ impl SdkNotificationFrontier {
             cutovers: watch::channel(reader).0,
             loss,
             subscription_floors,
+            owed,
             state: StdMutex::new(FrontierState {
                 reader,
                 pending_skipped: 0,
@@ -969,6 +1081,16 @@ impl SdkNotificationFrontier {
             .contains_key(id)
     }
 
+    /// Re-send the REQs `relay` owes, off the monitor's receive loop.
+    fn resend_owed(&self, relay: &Relay) {
+        if !self.owed.owes(relay.url()) {
+            return;
+        }
+        let owed = self.owed.clone();
+        let relay = relay.clone();
+        tokio::spawn(async move { owed.resend(&relay).await });
+    }
+
     fn detach(&self, endpoint: &RelayUrl) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = state.relays.remove(endpoint) {
@@ -1011,6 +1133,10 @@ impl SdkNotificationFrontier {
                         if !frontier.cutover_relay(&monitor_url, monitor_id, skipped) {
                             return;
                         }
+                        // The skipped notifications may hold its `Connected`.
+                        if relay.status() == RelayStatus::Connected {
+                            frontier.resend_owed(&relay);
+                        }
                     }
                     NotificationUpdate::Notification(notification) => {
                         if !frontier.tracked_notification(&notification) {
@@ -1039,6 +1165,9 @@ impl SdkNotificationFrontier {
                                     epoch: [reader, entry.connection],
                                     reason: entry.reason,
                                 });
+                                // After the boundary, so the re-sent REQs'
+                                // replay belongs to this connection.
+                                frontier.resend_owed(&relay);
                                 continue;
                             }
                             // AUTH only restores REQs the relay closed. Active
@@ -1155,6 +1284,9 @@ pub struct NostrSdkRelayClient {
     /// Floors of the REQs this client issued, read at a receiver lag. A
     /// std lock, never held across an await.
     subscription_floors: Arc<StdMutex<SubscriptionFloors>>,
+    /// REQs unreachable relays owe, shared with the frontier that re-sends
+    /// them on reconnect.
+    owed: Arc<OwedSubscriptions>,
     publish_relay_cache: Arc<PublishRelayCache>,
     #[cfg(test)]
     publish_connect_attempts: Arc<Mutex<HashMap<RelayUrl, usize>>>,
@@ -1162,6 +1294,10 @@ pub struct NostrSdkRelayClient {
     publish_release_attempts: Arc<Mutex<HashMap<RelayUrl, usize>>>,
     #[cfg(test)]
     publish_relay_pin_failure_stage: Arc<AtomicU8>,
+    /// Test-only: the reconnect interval new relays get in place of
+    /// [`SDK_RELAY_RETRY_INTERVAL`], so unreachable-relay tests run faster.
+    #[cfg(test)]
+    relay_retry_interval: Duration,
     /// Per-account, per-relay subscription-registration outcomes accumulated
     /// since that account's last
     /// [`take_subscription_registrations`](Self::take_subscription_registrations)
@@ -1586,9 +1722,11 @@ impl NostrSdkRelayClient {
     pub fn new(client: Client) -> Self {
         let notification_loss_tx = watch::channel(None).0;
         let subscription_floors = Arc::new(StdMutex::new(SubscriptionFloors::default()));
+        let owed = Arc::new(OwedSubscriptions::default());
         let frontier = Arc::new(SdkNotificationFrontier::new(
             notification_loss_tx.clone(),
             subscription_floors.clone(),
+            owed.clone(),
         ));
         Self {
             publish_relay_cache: Arc::new(PublishRelayCache {
@@ -1606,12 +1744,15 @@ impl NostrSdkRelayClient {
             publication: SdkPublication::OpaqueClient,
             account_subscriptions: Arc::new(RwLock::new(HashMap::new())),
             subscription_floors,
+            owed,
             #[cfg(test)]
             publish_connect_attempts: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             publish_release_attempts: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             publish_relay_pin_failure_stage: Arc::new(AtomicU8::new(0)),
+            #[cfg(test)]
+            relay_retry_interval: SDK_RELAY_RETRY_INTERVAL,
             registration_log: Arc::new(Mutex::new(HashMap::new())),
             acquisition_memory: Arc::default(),
             neg_credits: Arc::default(),
@@ -3522,11 +3663,38 @@ impl NostrSdkRelayClient {
         }
     }
 
-    /// Issue one planned REQ on this client and record where it registered.
+    async fn subscribe_scoped_reporting(
+        &self,
+        subscription: NostrSubscription,
+        subscription_id: String,
+    ) -> Result<NostrSubscribeReport, TransportAdapterError> {
+        if let Some(account_client) = self.account_client(subscription.account_id()).await? {
+            return Box::pin(
+                account_client.subscribe_scoped_reporting(subscription, subscription_id),
+            )
+            .await;
+        }
+        let mut plan = Self::plan_subscription(&subscription)?;
+        plan.subscription_id = SubscriptionId::new(subscription_id);
+        // Record the floor before any relay can answer, as the adapter records
+        // routes before the REQ: a lag can lose the very first reply.
+        let id = plan.subscription_id.clone();
+        let since = plan.filter.since.map(|since| since.as_secs());
+        let replaced = self.subscription_floors().open(&id, since);
+        let result = self.subscribe_planned(plan).await;
+        if result.is_err() {
+            // The REQ may have reached a relay before the failure.
+            self.subscription_floors().abandon(&id, replaced);
+        }
+        result
+    }
+
+    /// Issue one planned REQ on this client and record where it registered,
+    /// and which unreachable relays owe it.
     async fn subscribe_planned(
         &self,
         plan: NostrSdkSubscriptionPlan,
-    ) -> Result<(), TransportAdapterError> {
+    ) -> Result<NostrSubscribeReport, TransportAdapterError> {
         tracing::debug!(
             target: "transport_nostr_adapter::sdk_client",
             method = "subscribe",
@@ -3570,30 +3738,60 @@ impl NostrSdkRelayClient {
             .with_id(plan.subscription_id.clone())
             .await
         {
-            Ok(output) if !output.success.is_empty() => output,
+            Ok(output) => output,
+            Err(_) => {
+                return Err(TransportAdapterError::Subscription(
+                    "subscribe failed".to_owned(),
+                ));
+            }
+        };
+
+        // An unreachable relay owes the REQ rather than failing it (#1951).
+        let mut owed = Vec::new();
+        for endpoint in output.failed.keys() {
+            if self.relay_owes(endpoint, &plan.subscription_id).await {
+                owed.push(endpoint.clone());
+            }
+        }
+        let report = NostrSubscribeReport {
+            owed_relays: owed.len(),
+            refused_relays: output.failed.len() - owed.len(),
+        };
+        if output.success.is_empty() && owed.is_empty() {
             // A failed call registered nothing of its own: nostr-sdk reports
             // each relay's failure, including an id another live REQ already
             // holds, without registering it there. So it closes nothing. A
             // group sync reuses its activation's ids, and closing one here
             // would end the REQ that holds it. The early-tracked id stays
             // tracked; a sweep's CLOSE for it is harmless.
-            result => {
-                return Err(TransportAdapterError::Subscription(match result {
-                    Ok(_) => format!(
-                        "subscribe registered on 0 of {} relays",
-                        plan.endpoints.len()
-                    ),
-                    Err(_) => "subscribe failed".to_owned(),
-                }));
+            return Err(TransportAdapterError::Subscription(format!(
+                "subscribe registered on 0 of {} relays",
+                plan.endpoints.len()
+            )));
+        }
+        self.owed.record(
+            &plan.subscription_id,
+            &plan.filter,
+            output.success.keys(),
+            &owed,
+        );
+        // A relay that connected since it refused may have passed its
+        // `Connected` to the frontier before this entry existed.
+        for endpoint in &owed {
+            if let Some(relay) = self.client.relay(endpoint.clone()).await.ok().flatten()
+                && relay.status() == RelayStatus::Connected
+            {
+                self.owed.resend(&relay).await;
             }
-        };
+        }
 
-        if !output.failed.is_empty() {
+        if report.is_degraded() {
             tracing::warn!(
                 target: "transport_nostr_adapter::sdk_client",
                 method = "subscribe",
                 registered_count = output.success.len(),
-                failed_count = output.failed.len(),
+                owed_count = report.owed_relays,
+                refused_count = report.refused_relays,
                 "SDK relay subscription partially registered"
             );
         }
@@ -3608,8 +3806,9 @@ impl NostrSdkRelayClient {
 
         // Record which of the requested endpoints acknowledged the registration
         // so the app can surface it in the `subscription_rebuild` audit row.
-        // Only reached on the success path (>=1 relay registered): a total
+        // Only reached once some relay registered or owes the REQ: a total
         // failure returned above, aborting activation before any audit row.
+        // An owed relay has not acknowledged it.
         let outcomes = plan
             .endpoints
             .iter()
@@ -3622,7 +3821,27 @@ impl NostrSdkRelayClient {
                 .or_default(),
             outcomes,
         );
-        Ok(())
+        Ok(report)
+    }
+
+    /// Whether `endpoint` refused REQ `id` only for want of a connection, which
+    /// nostr-sdk's reconnect will cure. A relay that is gone, banned,
+    /// terminated or shut down, cannot read, or already holds `id` under
+    /// another REQ refused it for good. A connected relay can take a fresh
+    /// readable id in this client's configuration (no latency limit, no
+    /// sleep), so one connected now refused it just before it connected.
+    async fn relay_owes(&self, endpoint: &RelayUrl, id: &SubscriptionId) -> bool {
+        let Some(relay) = self.client.relay(endpoint.clone()).await.ok().flatten() else {
+            return false;
+        };
+        matches!(
+            relay.status(),
+            RelayStatus::Pending
+                | RelayStatus::Connecting
+                | RelayStatus::Connected
+                | RelayStatus::Disconnected
+        ) && relay.capabilities().can_read()
+            && relay.subscription(id).await.is_none()
     }
 
     async fn event_for_publish(
@@ -4145,10 +4364,14 @@ impl NostrSdkRelayClient {
             .cloned()
             .ok_or(())?;
         let capabilities = relay.capabilities().load();
+        #[cfg(not(test))]
+        let retry_interval = SDK_RELAY_RETRY_INTERVAL;
+        #[cfg(test)]
+        let retry_interval = self.relay_retry_interval;
         let options = relay
             .opts()
             .clone()
-            .retry_interval(SDK_RELAY_RETRY_INTERVAL)
+            .retry_interval(retry_interval)
             .adjust_retry_interval(false);
         self.client
             .remove_relay(endpoint.clone())
@@ -4682,8 +4905,15 @@ impl NostrRelayClient for NostrSdkRelayClient {
         &self,
         subscription: NostrSubscription,
     ) -> Result<(), TransportAdapterError> {
+        self.subscribe_reporting(subscription).await.map(drop)
+    }
+
+    async fn subscribe_reporting(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<NostrSubscribeReport, TransportAdapterError> {
         let id = subscription.subscription_id();
-        self.subscribe_scoped(subscription, id).await
+        self.subscribe_scoped_reporting(subscription, id).await
     }
 
     async fn subscribe_scoped(
@@ -4691,22 +4921,9 @@ impl NostrRelayClient for NostrSdkRelayClient {
         subscription: NostrSubscription,
         subscription_id: String,
     ) -> Result<(), TransportAdapterError> {
-        if let Some(account_client) = self.account_client(subscription.account_id()).await? {
-            return Box::pin(account_client.subscribe_scoped(subscription, subscription_id)).await;
-        }
-        let mut plan = Self::plan_subscription(&subscription)?;
-        plan.subscription_id = SubscriptionId::new(subscription_id);
-        // Record the floor before any relay can answer, as the adapter records
-        // routes before the REQ: a lag can lose the very first reply.
-        let id = plan.subscription_id.clone();
-        let since = plan.filter.since.map(|since| since.as_secs());
-        let replaced = self.subscription_floors().open(&id, since);
-        let result = self.subscribe_planned(plan).await;
-        if result.is_err() {
-            // The REQ may have reached a relay before the failure.
-            self.subscription_floors().abandon(&id, replaced);
-        }
-        result
+        self.subscribe_scoped_reporting(subscription, subscription_id)
+            .await
+            .map(drop)
     }
 
     async fn unsubscribe(
@@ -4733,6 +4950,7 @@ impl NostrRelayClient for NostrSdkRelayClient {
             method = "unsubscribe",
             "unsubscribing SDK relay plan"
         );
+        self.owed.forget(&plan.subscription_id).await;
         self.client
             .unsubscribe(&plan.subscription_id)
             .await
@@ -4840,6 +5058,7 @@ impl NostrRelayClient for NostrSdkRelayClient {
         // re-sent on every reconnect, with nothing left to close them.
         let mut failed = Vec::new();
         for id in ids {
+            self.owed.forget(&id).await;
             if self.client.unsubscribe(&id).await.is_err() {
                 failed.push(id);
                 continue;
@@ -11816,5 +12035,413 @@ mod tests {
             }
         });
         format!("ws://{addr}")
+    }
+
+    /// A loopback endpoint with nothing listening on it.
+    async fn unreachable_endpoint() -> (std::net::SocketAddr, RelayUrl) {
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+        (addr, RelayUrl::parse(&format!("ws://{addr}")).unwrap())
+    }
+
+    /// A client whose new relays retry every 200 ms instead of every five
+    /// seconds, so nostr-sdk refuses an unreachable relay's REQs sooner.
+    fn fast_retry_sdk() -> NostrSdkRelayClient {
+        let mut sdk = NostrSdkRelayClient::new(Client::default());
+        sdk.relay_retry_interval = Duration::from_millis(200);
+        sdk
+    }
+
+    /// Add `endpoint` and wait until nostr-sdk refuses REQs for it, which it
+    /// does once a relay that never connected has failed two attempts.
+    async fn wait_until_refusing(sdk: &NostrSdkRelayClient, endpoint: &RelayUrl) {
+        sdk.add_subscription_relay(endpoint.clone(), &SubscriptionId::new("warm-up"))
+            .await
+            .unwrap();
+        sdk.client().connect().await;
+        let relay = sdk.client().relay(endpoint.clone()).await.unwrap().unwrap();
+        timeout(Duration::from_secs(10), async {
+            while relay.stats().attempts() < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the unreachable relay fails two connect attempts");
+        assert_ne!(relay.status(), RelayStatus::Connected);
+    }
+
+    /// Serve `events` from a relay bound to `addr`.
+    async fn relay_on(
+        addr: std::net::SocketAddr,
+        events: &[Event],
+    ) -> nostr_relay_builder::LocalRelay {
+        use nostr_relay_builder::prelude::{MemoryDatabase, MemoryDatabaseOptions, NostrDatabase};
+        let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+            events: true,
+            max_events: Some(16),
+        });
+        for event in events {
+            database
+                .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+                .await
+                .unwrap();
+        }
+        let relay = nostr_relay_builder::LocalRelay::new(
+            nostr_relay_builder::RelayBuilder::default()
+                .addr(addr.ip())
+                .port(addr.port())
+                .database(database),
+        );
+        relay.run().await.unwrap();
+        relay
+    }
+
+    fn group_event(transport_group_id: u8) -> Event {
+        EventBuilder::new(Kind::MlsGroupMessage, "stored while the relay was owed")
+            .tag(Tag::custom("h", [hex::encode([transport_group_id; 32])]))
+            .finalize(&Keys::generate())
+            .unwrap()
+    }
+
+    fn group_subscription(
+        account: u8,
+        transport_group_id: u8,
+        endpoints: &[RelayUrl],
+    ) -> NostrSubscription {
+        NostrSubscription::Group {
+            account_id: MemberId::new(vec![account; 32]),
+            group_id: cgka_traits::GroupId::new(vec![transport_group_id; 16]),
+            transport_group_id: vec![transport_group_id; 32],
+            endpoints: endpoints
+                .iter()
+                .map(|endpoint| TransportEndpoint(endpoint.to_string()))
+                .collect(),
+            since: None,
+            attempt: SubscriptionAttempt::INITIAL,
+        }
+    }
+
+    /// Wait for `endpoint` to serve REQ `id`'s stored `event`, then its EOSE.
+    async fn receive_owed_replay(
+        notifications: &mut Pin<
+            Box<dyn Stream<Item = NotificationUpdate<NostrSdkNotification>> + Send>,
+        >,
+        endpoint: &RelayUrl,
+        id: &SubscriptionId,
+        event: EventId,
+    ) {
+        let mut stored = false;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let Some(NotificationUpdate::Notification(NostrSdkNotification::Payload {
+                    notification: ClientNotification::Message { relay_url, message },
+                    ..
+                })) = notifications.next().await
+                else {
+                    continue;
+                };
+                if relay_url != *endpoint {
+                    continue;
+                }
+                match message.as_ref() {
+                    RelayMessage::Event {
+                        subscription_id,
+                        event: received,
+                    } if subscription_id.as_ref() == id && received.id == event => stored = true,
+                    RelayMessage::EndOfStoredEvents(subscription_id)
+                        if subscription_id.as_ref() == id =>
+                    {
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the recovered relay serves the owed REQ");
+        assert!(stored, "the owed REQ replays its stored event before EOSE");
+    }
+
+    /// nostr-sdk refuses a REQ outright on a relay that failed two connect
+    /// attempts, and its reconnect re-sends only the REQs it registered. The
+    /// client keeps that relay's REQ owed instead of failing the subscription
+    /// and sends it, with its id and filter, once the relay is up (#1951).
+    #[tokio::test]
+    async fn unreachable_relay_gets_its_owed_req_on_reconnect() {
+        let (addr, endpoint) = unreachable_endpoint().await;
+        let sdk = fast_retry_sdk();
+        wait_until_refusing(&sdk, &endpoint).await;
+        let mut notifications = sdk.notifications();
+        let subscription = group_subscription(0xa1, 0xc3, std::slice::from_ref(&endpoint));
+        let id = SubscriptionId::new(subscription.subscription_id());
+        let report = sdk
+            .subscribe_reporting(subscription)
+            .await
+            .expect("an unreachable relay owes the REQ instead of failing it");
+        assert_eq!(
+            report,
+            NostrSubscribeReport {
+                owed_relays: 1,
+                refused_relays: 0
+            }
+        );
+        // Without the owed entry the REQ would be lost: the refusal left
+        // nothing for nostr-sdk's reconnect to re-send.
+        let relay = sdk.client().relay(endpoint.clone()).await.unwrap().unwrap();
+        assert!(relay.subscription(&id).await.is_none());
+        let bypassed = SubscriptionId::new("refused-without-owing");
+        let refused = sdk
+            .client()
+            .subscribe(ReqTarget::manual([(
+                endpoint.clone(),
+                vec![Filter::new().kind(Kind::MlsGroupMessage)],
+            )]))
+            .with_id(bypassed.clone())
+            .await
+            .unwrap();
+        assert!(refused.success.is_empty());
+
+        let event = group_event(0xc3);
+        let server = relay_on(addr, std::slice::from_ref(&event)).await;
+        receive_owed_replay(&mut notifications, &endpoint, &id, event.id).await;
+        assert!(relay.subscription(&id).await.is_some());
+        assert!(!sdk.owed.owes(&endpoint));
+        assert!(
+            relay.subscription(&bypassed).await.is_none(),
+            "nostr-sdk never re-sends a REQ it refused"
+        );
+        sdk.shutdown().await;
+        server.shutdown();
+    }
+
+    /// One unreachable relay of three: the two up take the REQ at once, and
+    /// the third gets it when it recovers.
+    #[tokio::test]
+    async fn one_unreachable_relay_of_three_gets_its_req_on_reconnect() {
+        let up = [
+            nostr_sdk::local_relay::MockRelay::run().await.unwrap(),
+            nostr_sdk::local_relay::MockRelay::run().await.unwrap(),
+        ];
+        let (addr, down) = unreachable_endpoint().await;
+        let sdk = fast_retry_sdk();
+        wait_until_refusing(&sdk, &down).await;
+        let mut notifications = sdk.notifications();
+        let endpoints = [up[0].url().await, up[1].url().await, down.clone()];
+        let subscription = group_subscription(0xa1, 0xc3, &endpoints);
+        let id = SubscriptionId::new(subscription.subscription_id());
+        assert_eq!(
+            sdk.subscribe_reporting(subscription).await.unwrap(),
+            NostrSubscribeReport {
+                owed_relays: 1,
+                refused_relays: 0
+            }
+        );
+        for endpoint in &endpoints[..2] {
+            let relay = sdk.client().relay(endpoint.clone()).await.unwrap().unwrap();
+            assert!(relay.subscription(&id).await.is_some());
+        }
+
+        let event = group_event(0xc3);
+        let server = relay_on(addr, std::slice::from_ref(&event)).await;
+        receive_owed_replay(&mut notifications, &down, &id, event.id).await;
+        assert!(!sdk.owed.owes(&down));
+        sdk.shutdown().await;
+        server.shutdown();
+        for relay in up {
+            relay.shutdown();
+        }
+    }
+
+    /// Records the id of every REQ a relay at `addr` receives, answering each
+    /// with EOSE.
+    async fn recording_relay(
+        addr: std::net::SocketAddr,
+    ) -> (JoinHandle<()>, Arc<StdMutex<Vec<String>>>) {
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let received = Arc::new(StdMutex::new(Vec::new()));
+        let recorder = received.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let recorder = recorder.clone();
+                tokio::spawn(async move {
+                    let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    while let Some(Ok(message)) = socket.next().await {
+                        let Ok(text) = message.into_text() else {
+                            continue;
+                        };
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            continue;
+                        };
+                        if value[0] != "REQ" {
+                            continue;
+                        }
+                        recorder
+                            .lock()
+                            .unwrap()
+                            .push(value[1].as_str().unwrap_or_default().to_owned());
+                        let eose = serde_json::json!(["EOSE", value[1]]);
+                        if socket.send(eose.to_string().into()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (server, received)
+    }
+
+    /// A REQ closed while its relay owed it is never sent when the relay
+    /// recovers, whether `unsubscribe` closed it or `unsubscribe_account`
+    /// swept its account.
+    #[tokio::test]
+    async fn closed_owed_req_is_not_sent_on_reconnect() {
+        let (addr, endpoint) = unreachable_endpoint().await;
+        let sdk = fast_retry_sdk();
+        wait_until_refusing(&sdk, &endpoint).await;
+        let endpoints = std::slice::from_ref(&endpoint);
+        let kept = group_subscription(0xa1, 0xc1, endpoints);
+        let unsubscribed = group_subscription(0xa2, 0xc2, endpoints);
+        let swept = group_subscription(0xa3, 0xc3, endpoints);
+        for subscription in [&kept, &unsubscribed, &swept] {
+            assert_eq!(
+                sdk.subscribe_reporting(subscription.clone())
+                    .await
+                    .unwrap()
+                    .owed_relays,
+                1
+            );
+        }
+        sdk.unsubscribe(unsubscribed.clone()).await.unwrap();
+        sdk.unsubscribe_account(swept.account_id(), &[])
+            .await
+            .unwrap();
+        assert!(sdk.owed.owes(&endpoint), "the kept REQ is still owed");
+
+        let (server, received) = recording_relay(addr).await;
+        timeout(Duration::from_secs(10), async {
+            while !received.lock().unwrap().contains(&kept.subscription_id()) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the recovered relay gets the kept REQ");
+        // Every owed REQ goes out in the same re-send; allow stragglers.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(*received.lock().unwrap(), vec![kept.subscription_id()]);
+        assert!(!sdk.owed.owes(&endpoint));
+        sdk.shutdown().await;
+        server.abort();
+    }
+
+    /// #1951: one unreachable route no longer rolls back the account. Beside
+    /// a healthy inbox and group, activation succeeds degraded, the healthy
+    /// REQs replay at once, the unreachable route's relay waits like one that
+    /// queued its REQ while disconnected, and its REQ replays once the relay
+    /// recovers. An unreachable inbox degrades activation the same way as an
+    /// unreachable group.
+    #[tokio::test]
+    async fn unreachable_route_degrades_activation_until_its_relay_recovers() {
+        for inbox_down in [false, true] {
+            let up = [
+                nostr_sdk::local_relay::MockRelay::run().await.unwrap(),
+                nostr_sdk::local_relay::MockRelay::run().await.unwrap(),
+            ];
+            let up_urls = [up[0].url().await, up[1].url().await];
+            let (addr, down) = unreachable_endpoint().await;
+            let sdk = fast_retry_sdk();
+            wait_until_refusing(&sdk, &down).await;
+            let adapter = NostrTransportAdapter::new(Arc::new(sdk.clone()));
+            let forwarder = sdk.spawn_notification_forwarder(adapter.clone());
+            let account_id = MemberId::new(Keys::generate().public_key().to_bytes().to_vec());
+            let endpoints = |url: &RelayUrl| vec![TransportEndpoint(url.to_string())];
+            let group = |index: u8, url: &RelayUrl| cgka_traits::TransportGroupSubscription {
+                group_id: cgka_traits::GroupId::new(vec![index; 16]),
+                transport_group_id: vec![index; 32],
+                endpoints: endpoints(url),
+                retained_since: None,
+            };
+            let (inbox_endpoints, group_subscriptions) = if inbox_down {
+                (
+                    endpoints(&down),
+                    vec![group(1, &up_urls[0]), group(2, &up_urls[1])],
+                )
+            } else {
+                (
+                    endpoints(&up_urls[0]),
+                    vec![group(1, &up_urls[1]), group(2, &down)],
+                )
+            };
+            adapter
+                .activate_account(crate::TransportAccountActivation {
+                    account_id: account_id.clone(),
+                    inbox_endpoints,
+                    group_subscriptions,
+                    since: Some(Timestamp(100)),
+                })
+                .await
+                .expect("an unreachable route leaves the account active");
+            let metrics = adapter.metrics().await;
+            assert_eq!(
+                (
+                    metrics.active_accounts,
+                    metrics.activations_full,
+                    metrics.activations_degraded,
+                    metrics.activations_failed
+                ),
+                (1, 0, 1, 0)
+            );
+
+            let progress = || async { adapter.account_subscription_eose(&account_id).await };
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    let eose = progress().await;
+                    if eose.relay_subscription_attempts_with_eose + 1
+                        == eose.relay_subscription_attempts
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the healthy inbox and group REQs replay at once");
+            assert_eq!(progress().await.relay_subscription_attempts, 3);
+            {
+                let state = adapter.state.read().await;
+                let relay = state
+                    .relay_index
+                    .existing_index_for(&TransportEndpoint(down.to_string()))
+                    .unwrap();
+                let owed = state.account_replay_coverage[&account_id]
+                    .subscriptions
+                    .values()
+                    .filter_map(|relays| relays.get(&relay))
+                    .collect::<Vec<_>>();
+                assert_eq!(owed, [&crate::RelayReplay::Awaiting]);
+            }
+
+            let server = relay_on(addr, &[]).await;
+            timeout(Duration::from_secs(10), async {
+                while !progress().await.complete() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the owed REQ replays once its relay recovers");
+
+            adapter.deactivate_account(&account_id).await.unwrap();
+            sdk.shutdown().await;
+            timeout(Duration::from_secs(2), forwarder)
+                .await
+                .unwrap()
+                .unwrap();
+            server.shutdown();
+            for relay in up {
+                relay.shutdown();
+            }
+        }
     }
 }

@@ -271,7 +271,9 @@ impl MarmotAppRuntime {
             .await
             .map(|frame| frame.rows)
     }
-    /// Initial snapshot followed by coalesced replacement snapshots, at most four
+    /// Initial snapshot followed by replacement snapshots. A row that appears,
+    /// disappears or enters another transfer state is delivered as soon as the
+    /// transfer is reported; progress-only changes are coalesced to at most four
     /// per second. No unbounded event queue or per-byte FFI callback. Drop/close
     /// terminates observation; it does not cancel the underlying download.
     pub async fn subscribe_attachment_transfers(
@@ -303,7 +305,15 @@ impl MarmotAppRuntime {
                 rows,
                 initial: true,
                 last: tokio::time::Instant::now(),
+                read: tokio::time::Instant::now(),
+                owed: None,
+                held: None,
+                reading: None,
             }),
+            #[cfg(test)]
+            read_gate: Default::default(),
+            #[cfg(test)]
+            waits: watch::channel(None).0,
         }))
     }
 }
@@ -314,7 +324,52 @@ struct TransferSubscriptionState {
     next_expiry: Option<u64>,
     rows: Vec<Option<AttachmentTransferStatus>>,
     initial: bool,
+    /// When the last frame was delivered: progress-only frames keep their spacing from it.
     last: tokio::time::Instant,
+    /// When the frame was last read: wakes keep their spacing from it.
+    read: tokio::time::Instant,
+    /// When a read, or the delivery of held rows, is owed: set by a wake or by
+    /// progress waiting out the window, and cleared once it happens. It
+    /// outlives a cancelled `next()` — a C timeout drops the future — so the
+    /// next call acts on it instead of waiting for another wake.
+    owed: Option<tokio::time::Instant>,
+    /// Progress rows read while the window was still open, delivered when it
+    /// ends without reading them again. A transfer notification before then
+    /// drops them, since the rows may have moved on. Like `owed`, they outlive
+    /// a cancelled `next()`.
+    held: Option<Vec<Option<AttachmentTransferStatus>>>,
+    /// The read in flight. A `next()` cancelled mid-read leaves it running, and
+    /// the next call collects it first, before it waits or consumes a
+    /// notification, rather than starting another, so caller timeouts never
+    /// stack reads or lose a notification that came after the read began.
+    reading: Option<FrameRead>,
+}
+
+type FrameRead = tokio::task::JoinHandle<Result<storage_sqlite::AttachmentTransferFrame, AppError>>;
+
+/// Holds a subscription's reads until `open` is true, before they touch the
+/// database or, with `after_read`, once they have taken their snapshot, and
+/// records when each one started, so a test can cancel `next()` mid-read or
+/// check how far apart reads start.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct ReadGateForTest {
+    pub(crate) starts: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+    pub(crate) open: Arc<watch::Sender<bool>>,
+    after_read: bool,
+}
+
+/// What a pending `next()` waits for, published as the wait begins so a test
+/// acts once it is in place rather than after a sleep.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransferWaitForTest {
+    /// A wake: a transfer notification, presentation churn or the idle fallback.
+    Wake,
+    /// A read owed this long after the previous read.
+    Read(Duration),
+    /// Progress rows held until the window ends.
+    Held,
 }
 pub struct RuntimeAttachmentTransferSubscription {
     runtime: MarmotAppRuntime,
@@ -324,10 +379,87 @@ pub struct RuntimeAttachmentTransferSubscription {
     identity: Vec<u8>,
     closed: watch::Sender<bool>,
     state: Mutex<TransferSubscriptionState>,
+    #[cfg(test)]
+    read_gate: std::sync::Mutex<Option<ReadGateForTest>>,
+    #[cfg(test)]
+    waits: watch::Sender<Option<TransferWaitForTest>>,
 }
 impl RuntimeAttachmentTransferSubscription {
     pub fn close(&self) {
         self.closed.send_replace(true);
+    }
+
+    /// Hold this subscription's later reads, before they touch the database,
+    /// until the returned gate opens.
+    #[cfg(test)]
+    pub(crate) fn gate_reads_for_test(&self) -> ReadGateForTest {
+        self.install_read_gate(false)
+    }
+
+    /// Hold the results of this subscription's later reads, snapshot already
+    /// taken, until the returned gate opens.
+    #[cfg(test)]
+    pub(crate) fn gate_read_results_for_test(&self) -> ReadGateForTest {
+        self.install_read_gate(true)
+    }
+
+    /// Installs a read gate that holds reads before or after their snapshot.
+    #[cfg(test)]
+    fn install_read_gate(&self, after_read: bool) -> ReadGateForTest {
+        let gate = ReadGateForTest {
+            starts: Default::default(),
+            open: Arc::new(watch::channel(false).0),
+            after_read,
+        };
+        *self.read_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    /// The waits a pending `next()` enters, latest first.
+    #[cfg(test)]
+    pub(crate) fn waits_for_test(&self) -> watch::Receiver<Option<TransferWaitForTest>> {
+        self.waits.subscribe()
+    }
+
+    /// Read the current frame, resuming the read a cancelled call left in
+    /// flight instead of starting another: one handle never runs two reads.
+    async fn read_frame(
+        &self,
+        reading: &mut Option<FrameRead>,
+    ) -> Result<storage_sqlite::AttachmentTransferFrame, AppError> {
+        let read = reading.get_or_insert_with(|| {
+            let runtime = self.runtime.clone();
+            let (account, group, targets) = (
+                self.account.clone(),
+                self.group.clone(),
+                self.targets.clone(),
+            );
+            #[cfg(test)]
+            let gate = self.read_gate.lock().unwrap().clone();
+            tokio::spawn(async move {
+                #[cfg(test)]
+                if let Some(gate) = &gate {
+                    gate.starts
+                        .lock()
+                        .unwrap()
+                        .push(tokio::time::Instant::now());
+                    if !gate.after_read {
+                        let _ = gate.open.subscribe().wait_for(|open| *open).await;
+                    }
+                }
+                let frame = runtime
+                    .attachment_transfer_frame(&account, &group, targets)
+                    .await;
+                #[cfg(test)]
+                if let Some(gate) = gate.filter(|gate| gate.after_read) {
+                    let _ = gate.open.subscribe().wait_for(|open| *open).await;
+                }
+                frame
+            })
+        });
+        let frame = read.await;
+        *reading = None;
+        frame.map_err(|error| AppError::BlockingTask(error.to_string()))?
     }
     pub async fn next(&self) -> Result<Option<Vec<Option<AttachmentTransferStatus>>>, AppError> {
         let mut closed = self.closed.subscribe();
@@ -343,10 +475,7 @@ impl RuntimeAttachmentTransferSubscription {
                 store_epoch: identity,
                 rows,
                 next_expiry,
-            } = self
-                .runtime
-                .attachment_transfer_frame(&self.account, &self.group, self.targets.clone())
-                .await?;
+            } = self.read_frame(&mut state.reading).await?;
             if identity != self.identity
                 || *closed.borrow()
                 || self.runtime.shared.lifecycle().ensure_running().is_err()
@@ -358,40 +487,95 @@ impl RuntimeAttachmentTransferSubscription {
             state.next_expiry = next_expiry;
             state.initial = false;
             state.last = tokio::time::Instant::now();
+            state.read = state.last;
             return Ok(Some(state.rows.clone()));
         }
         loop {
-            let interval =
-                refresh_interval(&state.rows, state.next_expiry, crate::unix_now_seconds());
-            let TransferSubscriptionState {
-                updates,
-                presentation,
-                ..
-            } = &mut *state;
-            tokio::select! {
-                biased;
-                _ = closed.changed()=>return Ok(None),
-                _ = wait_for_runtime_shutdown(&mut stopping)=>return Ok(None),
-                _ = updates.changed()=>{},
-                _ = presentation.recv()=>{},
-                // Slow idle fallback covers external writers; known expiry gets
-                // its own deadline even when every row is already ready.
-                _ = tokio::time::sleep(interval)=>{},
-            }
-            tokio::select! {
-                biased;
-                _ = closed.changed()=>return Ok(None),
-                _ = wait_for_runtime_shutdown(&mut stopping)=>return Ok(None),
-                _ = tokio::time::sleep_until(state.last+Duration::from_millis(250))=>{},
+            // A read a cancelled call left in flight is collected before this
+            // call waits for anything: its snapshot may predate notifications
+            // that arrived since, and consuming them first would leave a state
+            // change behind stale rows until another wake.
+            if state.reading.is_none() {
+                let mut at = match state.owed {
+                    Some(at) => at,
+                    None => {
+                        #[cfg(test)]
+                        self.waits.send_replace(Some(TransferWaitForTest::Wake));
+                        let interval = refresh_interval(
+                            &state.rows,
+                            state.next_expiry,
+                            crate::unix_now_seconds(),
+                        );
+                        let TransferSubscriptionState {
+                            updates,
+                            presentation,
+                            ..
+                        } = &mut *state;
+                        // Both senders live in the runtime this handle holds, so
+                        // neither channel can close under it.
+                        let spacing = tokio::select! {
+                            biased;
+                            _ = closed.changed()=>return Ok(None),
+                            _ = wait_for_runtime_shutdown(&mut stopping)=>return Ok(None),
+                            _ = updates.changed()=>TRANSFER_READ_FLOOR,
+                            // Presentation churn and the idle fallback keep the
+                            // window before they read, so they never read more than
+                            // four times a second.
+                            _ = presentation.recv()=>TRANSFER_FRAME_INTERVAL,
+                            // Slow idle fallback covers external writers; known
+                            // expiry gets its own deadline even when every row is
+                            // already ready.
+                            _ = tokio::time::sleep(interval)=>TRANSFER_FRAME_INTERVAL,
+                        };
+                        state.owed = Some(state.read + spacing);
+                        state.read + spacing
+                    }
+                };
+                #[cfg(test)]
+                self.waits.send_replace(Some(match state.held {
+                    Some(_) => TransferWaitForTest::Held,
+                    None => TransferWaitForTest::Read(at.saturating_duration_since(state.read)),
+                }));
+                // A transfer notification moves the read to the read floor: forward,
+                // so a state change is never held behind presentation churn or
+                // behind progress waiting out the window, and never closer to the
+                // previous read than the floor.
+                loop {
+                    let TransferSubscriptionState { updates, .. } = &mut *state;
+                    let notified = tokio::select! {
+                        biased;
+                        _ = closed.changed()=>return Ok(None),
+                        _ = wait_for_runtime_shutdown(&mut stopping)=>return Ok(None),
+                        // Ahead of the deadline, so a notification that lands as
+                        // it passes still counts: held rows are delivered only
+                        // when nothing was reported since.
+                        _ = updates.changed()=>true,
+                        _ = tokio::time::sleep_until(at)=>false,
+                    };
+                    if !notified {
+                        break;
+                    }
+                    state.held = None;
+                    at = state.read + TRANSFER_READ_FLOOR;
+                    state.owed = Some(at);
+                }
+                if let Some(rows) = state.held.take() {
+                    if *closed.borrow() || self.runtime.shared.lifecycle().ensure_running().is_err()
+                    {
+                        self.close();
+                        return Ok(None);
+                    }
+                    state.owed = None;
+                    state.last = tokio::time::Instant::now();
+                    state.rows = rows.clone();
+                    return Ok(Some(rows));
+                }
             }
             let storage_sqlite::AttachmentTransferFrame {
                 store_epoch: identity,
                 rows,
                 next_expiry,
-            } = self
-                .runtime
-                .attachment_transfer_frame(&self.account, &self.group, self.targets.clone())
-                .await?;
+            } = self.read_frame(&mut state.reading).await?;
             if identity != self.identity
                 || *closed.borrow()
                 || self.runtime.shared.lifecycle().ensure_running().is_err()
@@ -399,14 +583,52 @@ impl RuntimeAttachmentTransferSubscription {
                 self.close();
                 return Ok(None);
             }
-            state.last = tokio::time::Instant::now();
+            state.read = tokio::time::Instant::now();
+            state.owed = None;
             state.next_expiry = next_expiry;
-            if rows != state.rows {
+            if rows == state.rows {
+                continue;
+            }
+            let deadline = state.last + TRANSFER_FRAME_INTERVAL;
+            if changes_transfer_state(&state.rows, &rows) || state.read >= deadline {
+                state.last = state.read;
                 state.rows = rows.clone();
                 return Ok(Some(rows));
             }
+            // Progress alone waits out the window: the rows are delivered at its
+            // end, or read again on a transfer notification before then.
+            state.held = Some(rows);
+            state.owed = Some(deadline);
         }
     }
+}
+
+/// Minimum spacing of frames that only advance progress (byte counts,
+/// totals, attempts or retry times): at most four per second.
+const TRANSFER_FRAME_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Minimum spacing of the reads transfer notifications trigger. Workers
+/// throttle their progress writes, but every account's transfers wake every
+/// subscription, so a handle bounds its own reads rather than rely on that.
+const TRANSFER_READ_FLOOR: Duration = Duration::from_millis(25);
+
+/// Whether a replacement frame changes what a row is rather than how far it
+/// has got: a row appearing, disappearing or entering another transfer state.
+/// Such frames skip the progress coalescing window. A transfer that restarts
+/// in the state it was in, such as a new download attempt, counts as progress.
+fn changes_transfer_state(
+    previous: &[Option<AttachmentTransferStatus>],
+    next: &[Option<AttachmentTransferStatus>],
+) -> bool {
+    previous.len() != next.len()
+        || previous
+            .iter()
+            .zip(next)
+            .any(|(previous, next)| match (previous, next) {
+                (Some(previous), Some(next)) => previous.state != next.state,
+                (None, None) => false,
+                _ => true,
+            })
 }
 
 fn refresh_interval(
@@ -434,6 +656,35 @@ fn refresh_interval(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Only a row appearing, disappearing or changing transfer state skips the
+    /// progress window; bytes, totals, attempts and retry times do not.
+    #[test]
+    fn only_state_and_presence_changes_skip_the_progress_window() {
+        let row = |state, received| {
+            Some(AttachmentTransferStatus {
+                reference: None,
+                automatic_media_type: None,
+                state,
+                attempt: 1,
+                received,
+                total: Some(100),
+                retry_at: None,
+            })
+        };
+        let downloading = vec![row(AttachmentTransferState::Downloading, 10)];
+        let mut progressed = vec![row(AttachmentTransferState::Downloading, 90)];
+        assert!(!changes_transfer_state(&downloading, &progressed));
+        progressed[0].as_mut().unwrap().attempt = 2;
+        progressed[0].as_mut().unwrap().retry_at = Some(5);
+        assert!(!changes_transfer_state(&downloading, &progressed));
+        let ready = vec![row(AttachmentTransferState::Ready, 100)];
+        assert!(changes_transfer_state(&downloading, &ready));
+        assert!(changes_transfer_state(&downloading, &[None]));
+        assert!(changes_transfer_state(&[None], &downloading));
+        assert!(!changes_transfer_state(&[None], &[None]));
+        assert!(changes_transfer_state(&downloading, &[]));
+    }
+
     #[test]
     fn attachment_idle_refresh_is_slow_but_never_misses_known_expiry() {
         let mut rows = vec![Some(AttachmentTransferStatus {

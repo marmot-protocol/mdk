@@ -44,25 +44,38 @@ const TRACE_TARGET: &str = "cgka_session::session";
 
 pub type SessionResult<T> = Result<T, SessionError>;
 
+/// A session failure. Every one is an engine error, so callers classify it by
+/// what it is rather than by the layer that met it.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
-    #[error(transparent)]
-    Storage(#[from] StorageError),
     #[error(transparent)]
     Engine(#[from] EngineError),
 }
 
+/// A storage failure the session meets itself, such as opening the database,
+/// is the engine's storage failure of the same kind (mdk#2602).
+impl From<StorageError> for SessionError {
+    fn from(error: StorageError) -> Self {
+        Self::Engine(EngineError::Storage(error))
+    }
+}
+
 impl SessionError {
+    /// The engine error this session failure is.
+    #[must_use]
+    pub fn as_engine_error(&self) -> &EngineError {
+        match self {
+            SessionError::Engine(e) => e,
+        }
+    }
+
     /// Whether this error reflects transient backend contention worth retrying
     /// (a `SQLITE_BUSY` that survived the backend's own retries) rather than a
     /// durable failure. Used by the account layer to retry the retry-safe
     /// `confirm_published` path instead of surfacing a lock blip as fatal.
     #[must_use]
     pub fn is_transient(&self) -> bool {
-        match self {
-            SessionError::Storage(e) => e.is_transient(),
-            SessionError::Engine(e) => e.is_transient(),
-        }
+        self.as_engine_error().is_transient()
     }
 }
 

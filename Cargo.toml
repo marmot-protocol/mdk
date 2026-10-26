@@ -1,6 +1,5 @@
 [workspace]
 resolver = "3"
-exclude = ["vendor/hpke-rs-libcrux"]
 members = [
     "crates/fs-private",
     "crates/media-store",
@@ -38,22 +37,24 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.14.0-dev"
+version = "0.15.0-dev"
 license = "MIT"
 publish = false
 
 [workspace.dependencies]
 # Offline audit-schema validation; never enable remote reference resolution.
 jsonschema = { version = "0.56.0", default-features = false }
-# OpenMLS family — exact-pinned to the draft-10 last-resort KeyPackage fix.
+# OpenMLS family — exact-pinned to a fork commit carrying the draft-10 last-resort
+# KeyPackage fix and the RustCrypto 0.14 / HPKE 0.8 provider backport (upstream
+# openmls#2249 and #2261; fixes RUSTSEC-2026-0387 and RUSTSEC-2026-0330/0331).
 # Keep every companion crate on the same repository commit to prevent source skew.
-# Migration: once an upstream OpenMLS release contains this fix, replace all five
+# Migration: once an upstream OpenMLS release contains both, replace all five
 # git entries together with one matching upstream release series and remove the fork pin.
-openmls = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada", features = ["extensions-draft"] }
-openmls_basic_credential = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada" }
-openmls_memory_storage = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada", features = ["extensions-draft"] }
-openmls_rust_crypto = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada" }
-openmls_traits = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada", features = ["extensions-draft"] }
+openmls = { git = "https://github.com/erskingardner/openmls.git", rev = "94f57b829d95840fc5b415b7a86f547f5c1f65ba", features = ["extensions-draft"] }
+openmls_basic_credential = { git = "https://github.com/erskingardner/openmls.git", rev = "94f57b829d95840fc5b415b7a86f547f5c1f65ba" }
+openmls_memory_storage = { git = "https://github.com/erskingardner/openmls.git", rev = "94f57b829d95840fc5b415b7a86f547f5c1f65ba", features = ["extensions-draft"] }
+openmls_rust_crypto = { git = "https://github.com/erskingardner/openmls.git", rev = "94f57b829d95840fc5b415b7a86f547f5c1f65ba" }
+openmls_traits = { git = "https://github.com/erskingardner/openmls.git", rev = "94f57b829d95840fc5b415b7a86f547f5c1f65ba", features = ["extensions-draft"] }
 tls_codec = "~0.5"
 
 # async
@@ -169,10 +170,6 @@ marmot-terminal-harness = { path = "integrations/terminal-harness" }
 # dependency under cfg(hax). Pin the upstream removal until the next hax
 # release contains it, then remove this patch and update the libcrux path.
 [patch.crates-io]
-# HPKE 0.7 pins vulnerable libcrux-kem 0.0.9. This unchanged 0.7 provider
-# selects fixed KEM 0.0.10; remove once a compatible published HPKE provider
-# carries the fix. Provenance and regression commands: vendor/hpke-rs-libcrux/BACKPORT.md.
-hpke-rs-libcrux = { path = "vendor/hpke-rs-libcrux" }
 hax-lib-macros = { git = "https://github.com/cryspen/hax.git", rev = "8f9cb576e58f6cc7e9ed249a7d4439b0f7ed0da7" }
 # libsqlite3-sys 0.38.2 still bundles SQLCipher 4.14.0, whose enhanced
 # memory-security allocator emits one WARN for every mlock failure. Pin the

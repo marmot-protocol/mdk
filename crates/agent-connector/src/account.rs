@@ -70,32 +70,7 @@ impl AgentConnector {
         })
     }
 
-    /// Create a group with the legacy creator-only admin policy.
     pub(crate) async fn create_group_response(
-        &self,
-        account_id_hex: &str,
-        name: String,
-        members: Vec<String>,
-        description: Option<String>,
-        relays: Option<Vec<String>>,
-    ) -> Result<AgentControlResponse, ConnectorError> {
-        self.create_group_with_admins_response(
-            account_id_hex,
-            name,
-            members,
-            Vec::new(),
-            description,
-            relays,
-        )
-        .await
-    }
-
-    /// Create a group with invited co-admins included in its founding state.
-    ///
-    /// The creator is implicit. Resolve co-admin references against invited
-    /// members and reject invalid selections before calling the app runtime.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn create_group_with_admins_response(
         &self,
         account_id_hex: &str,
         name: String,
@@ -107,31 +82,6 @@ impl AgentConnector {
         let account_id_hex = crate::validation::normalize_hex(account_id_hex)?;
         let account = self.local_account_for_account_id(&account_id_hex)?;
         crate::validation::validate_group_create(&name, &members, description.as_deref())?;
-        let resolve = |reference: &str| {
-            self.account_home
-                .account(reference)
-                .map(|account| account.account_id_hex)
-                .or_else(|_| AccountHome::account_id_for_public_key(reference))
-        };
-        let admins = if admins.is_empty() {
-            Vec::new()
-        } else {
-            let member_ids = members
-                .iter()
-                .map(|member| resolve(member))
-                .collect::<Result<std::collections::HashSet<_>, _>>()?;
-            let admins = admins
-                .iter()
-                .map(|admin| resolve(admin))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| ConnectorError::InvalidGroupCreate("invalid admin reference"))?;
-            if admins.iter().any(|admin| !member_ids.contains(admin)) {
-                return Err(ConnectorError::InvalidGroupCreate(
-                    "admins must be invited members",
-                ));
-            }
-            admins
-        };
         let group_id = self
             .runtime
             .create_group_with_options(
@@ -158,7 +108,7 @@ impl AgentConnector {
             Err(_) => {
                 tracing::warn!(
                     target: "agent_connector",
-                    method = "create_group",
+                    method = "create_group_response",
                     error_code = "agent_created_groups_write_failed",
                     "group created but activation provenance could not be persisted"
                 );

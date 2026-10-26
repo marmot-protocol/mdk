@@ -1413,6 +1413,15 @@ fn build_group_system_projection(
 }
 
 fn read_marker_error_code(error: &AppError) -> &'static str {
+    // An engine failure gets one code whichever lower-stack layer carried it
+    // (mdk#2602).
+    if let Some(engine) = error.as_engine_error() {
+        return match engine {
+            cgka_traits::EngineError::Storage(_) => "read_marker_failed:storage",
+            cgka_traits::EngineError::UnknownGroup(_) => "read_marker_failed:unknown_group",
+            _ => "read_marker_failed:session",
+        };
+    }
     match error {
         AppError::InvalidAppComponent(_) => "read_marker_failed:invalid_app_component",
         AppError::ProductAnalytics(_) => "read_marker_failed:usage_diagnostics",
@@ -1429,6 +1438,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::MissingMemberInboxRoute(_) => "read_marker_failed:missing_member_inbox_route",
         AppError::DirectoryLookupIncomplete(_) => "read_marker_failed:directory_lookup_incomplete",
         AppError::GroupCreateIncludesCreator => "read_marker_failed:group_create_includes_creator",
+        AppError::GroupCreateAdminNotMember => "read_marker_failed:group_create_admin_not_member",
         AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",
         AppError::GroupInviteNotPending => "read_marker_failed:group_invite_not_pending",
         AppError::CreatedGroupProjectionUnavailable(_) => {
@@ -1585,5 +1595,24 @@ impl super::AppClient {
         let updates = updates?;
         self.pending_projection_updates.extend(updates);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod read_marker_error_code_tests {
+    use super::read_marker_error_code;
+    use crate::error_kind_table::lower_stack_rows;
+
+    #[test]
+    fn read_marker_codes_follow_the_error_not_its_wrapping() {
+        let mismatches: Vec<String> = lower_stack_rows()
+            .into_iter()
+            .filter_map(|row| {
+                let actual = read_marker_error_code(&row.error);
+                let expected = row.expected.read_marker_code;
+                (actual != expected).then(|| format!("{}: {actual}, expected {expected}", row.name))
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     }
 }

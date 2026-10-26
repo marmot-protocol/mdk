@@ -50,6 +50,13 @@ if [ "$#" -ne 0 ]; then
   exit 64
 fi
 prompt="$(cat)"
+# Forwarded prompts end with the connector's control instructions; echo only the inbound text.
+instructions=$'\n\nConnector-provided Marmot control instructions:'
+if [[ "$prompt" != *"$instructions"* ]]; then
+  echo "prompt is missing the connector control instructions" >&2
+  exit 64
+fi
+prompt="${prompt%%"$instructions"*}"
 tail=""
 for _ in $(seq 1 40); do
   tail="${tail}chunk "

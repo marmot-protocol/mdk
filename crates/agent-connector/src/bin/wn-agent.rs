@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use agent_connector::{
     AgentConnectorConfig, BootstrapOptions, BootstrapResult, ConnectorError,
-    DEFAULT_BOOTSTRAP_LABEL, GroupProfileToolConfig, MAX_CONTROL_CONNECTIONS, MAX_IDENTITY_BYTES,
-    default_socket_path, import_existing_identity_file, import_existing_identity_secret,
-    read_bootstrap_auth_token, resolve_bootstrap_home, resolve_bootstrap_quic_candidates,
-    resolve_bootstrap_relays, resolve_bootstrap_socket, run_bootstrap, run_group_profile_tool,
-    serve_socket,
+    DEFAULT_BOOTSTRAP_LABEL, DoctorOptions, GroupProfileToolConfig, MAX_CONTROL_CONNECTIONS,
+    MAX_IDENTITY_BYTES, default_socket_path, import_existing_identity_file,
+    import_existing_identity_secret, read_bootstrap_auth_token, resolve_bootstrap_home,
+    resolve_bootstrap_quic_candidates, resolve_bootstrap_socket, resolve_relays, run_bootstrap,
+    run_doctor, run_group_profile_tool, serve_socket,
 };
 use agent_control::AgentControlInvitePolicy;
 use clap::{Args, Parser, Subcommand};
@@ -47,6 +47,8 @@ enum Commands {
     Bootstrap(BootstrapArgs),
     /// Securely import an existing local-signing Nostr identity
     ImportIdentity(ImportIdentityArgs),
+    /// Check this connector's setup without changing anything; exits nonzero when a check fails
+    Doctor(DoctorArgs),
 }
 
 #[derive(Debug, Args)]
@@ -63,9 +65,15 @@ struct ServeArgs {
         long,
         value_name = "URL",
         value_delimiter = ',',
-        help = "Default relay URLs for hosted app runtime state"
+        help = "Relay URL for hosted app runtime state; may be repeated \
+                (default: MARMOT_RELAYS, then the White Noise relays)"
     )]
     relay: Vec<String>,
+    #[arg(
+        long,
+        help = "Offline/test only: run with no relays unless --relay or MARMOT_RELAYS names some"
+    )]
+    no_default_relays: bool,
     #[arg(
         long,
         help = "Dev/test only: accept invites from any authenticated welcomer; requires --debug-controls"
@@ -153,6 +161,7 @@ struct BootstrapArgs {
     #[arg(
         long,
         value_name = "URL",
+        value_delimiter = ',',
         help = "Public Nostr relay used for invite output; may be repeated"
     )]
     relay: Vec<String>,
@@ -247,6 +256,47 @@ struct ImportIdentityArgs {
     json: bool,
 }
 
+/// Read-only setup checks. Mirrors the `serve` flags those checks evaluate.
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Use this Marmot agent home directory"
+    )]
+    home: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Check this wn-agent Unix control socket"
+    )]
+    socket: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Check this full-control bearer token file"
+    )]
+    auth_token_file: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "URL",
+        value_delimiter = ',',
+        help = "Relay URLs wn-agent is started with; may be repeated"
+    )]
+    relay: Vec<String>,
+    #[arg(long, help = "wn-agent is started with --no-default-relays")]
+    no_default_relays: bool,
+    #[arg(
+        long,
+        value_name = "OCTAL",
+        default_value = "0700",
+        help = "Socket directory mode wn-agent is started with"
+    )]
+    socket_dir_mode: String,
+    #[arg(long, help = "Print machine-readable JSON only")]
+    json: bool,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -289,6 +339,7 @@ fn main() -> ExitCode {
         Some(Commands::GroupProfile) => run_async(run_group_profile_command()),
         Some(Commands::Bootstrap(args)) => run_async(run_bootstrap_command(args)),
         Some(Commands::ImportIdentity(args)) => run_import_identity_command(args),
+        Some(Commands::Doctor(args)) => run_async(run_doctor_command(args)),
         None => run_async(run_serve_command(cli.serve)),
     }
 }
@@ -590,7 +641,7 @@ async fn run_serve_command(args: ServeArgs) -> ExitCode {
         socket,
         socket_dir_mode,
         socket_mode,
-        relays: args.relay,
+        relays: resolve_relays(args.relay, !args.no_default_relays).relays,
         dev_allow_any_invites: args.dev_allow_any_invites,
         debug_controls: args.debug_controls,
         auth_token,
@@ -613,6 +664,42 @@ async fn run_serve_command(args: ServeArgs) -> ExitCode {
     }
 }
 
+async fn run_doctor_command(args: DoctorArgs) -> ExitCode {
+    let socket_dir_mode = match fs_private::parse_octal_mode(&args.socket_dir_mode) {
+        Ok(mode) => mode,
+        // The parse error echoes its input; keep doctor output free of it.
+        Err(_) => {
+            eprintln!("error: --socket-dir-mode must be an octal mode such as 0700");
+            return ExitCode::FAILURE;
+        }
+    };
+    let options = DoctorOptions::resolve(
+        args.home,
+        args.socket,
+        args.auth_token_file,
+        args.relay,
+        !args.no_default_relays,
+        socket_dir_mode,
+    );
+    let report = run_doctor(&options).await;
+    if args.json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{json}"),
+            Err(error) => {
+                eprintln!("error: failed to encode doctor report: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        print!("{}", report.render_text());
+    }
+    if report.has_failures() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
 async fn run_bootstrap_command(args: BootstrapArgs) -> ExitCode {
     let home = resolve_bootstrap_home(args.home);
     let socket = resolve_bootstrap_socket(&home, args.socket);
@@ -623,7 +710,7 @@ async fn run_bootstrap_command(args: BootstrapArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let relays = resolve_bootstrap_relays(args.relay);
+    let relays = resolve_relays(args.relay, true).relays;
     let quic_candidates =
         resolve_bootstrap_quic_candidates(args.quic_candidate, args.quic_candidates, args.no_quic);
     let options = BootstrapOptions {
@@ -734,33 +821,36 @@ fn which_qrencode() -> Option<String> {
     })
 }
 
+/// One startup failure line. `client_message` and the reasons below are fixed
+/// text the connector writes, so the line carries no path, account id or relay
+/// URL even though it names the cause.
 fn safe_error_message(err: &ConnectorError) -> String {
+    let mut message = format!(
+        "startup failed code={} detail={}",
+        err.privacy_safe_code(),
+        err.client_message()
+    );
     match err {
-        ConnectorError::SocketPathTooLong => format!(
-            "startup failed code={} detail={}",
-            err.privacy_safe_code(),
-            err.client_message()
-        ),
-        ConnectorError::Io(io) => {
-            format!(
-                "startup failed code={} io_kind={:?}",
-                err.privacy_safe_code(),
-                io.kind()
-            )
+        ConnectorError::Io(io) => message.push_str(&format!(" io_kind={:?}", io.kind())),
+        ConnectorError::UnsafeControlPlaneConfig(reason)
+        | ConnectorError::InvalidRelayUrl(reason) => {
+            message.push_str(&format!(" reason={reason}"));
         }
-        _ => format!("startup failed code={}", err.privacy_safe_code()),
+        _ => {}
     }
+    message
 }
 
 fn read_auth_token(path: Option<&PathBuf>) -> Result<Option<String>, String> {
     let Some(path) = path else {
         return Ok(None);
     };
+    // Fixed text only: this lands on the startup line, which never names a path.
     let token = std::fs::read_to_string(path)
-        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+        .map_err(|err| format!("could not read the auth token file ({:?})", err.kind()))?;
     let token = token.trim().to_owned();
     if token.is_empty() {
-        return Err(format!("{} is empty", path.display()));
+        return Err("the auth token file is empty".to_owned());
     }
     Ok(Some(token))
 }

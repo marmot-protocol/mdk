@@ -2596,6 +2596,12 @@ fn telemetry_rollup_reshapes_and_joins_per_relay_snapshots() {
         publish_failures: 1,
         reconciliation_attempts: 7,
         reconciliation_order_unproven_passes: 2,
+        activations_full: 8,
+        activations_degraded: 3,
+        activations_failed: 1,
+        group_syncs_full: 13,
+        group_syncs_degraded: 5,
+        group_syncs_failed: 2,
         ..NostrAdapterMetrics::default()
     };
     let health = RelayPlaneHealth {
@@ -2644,6 +2650,12 @@ fn telemetry_rollup_reshapes_and_joins_per_relay_snapshots() {
     assert_eq!(rollup.publish_successes, 3);
     assert_eq!(rollup.reconciliation_attempts, 7);
     assert_eq!(rollup.reconciliation_order_unproven_passes, 2);
+    assert_eq!(rollup.activations_full, 8);
+    assert_eq!(rollup.activations_degraded, 3);
+    assert_eq!(rollup.activations_failed, 1);
+    assert_eq!(rollup.group_syncs_full, 13);
+    assert_eq!(rollup.group_syncs_degraded, 5);
+    assert_eq!(rollup.group_syncs_failed, 2);
     assert_eq!(rollup.observed_reorg_rate(), None);
 }
 

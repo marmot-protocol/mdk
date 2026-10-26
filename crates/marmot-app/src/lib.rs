@@ -103,6 +103,8 @@ mod drafts;
 mod local_submissions;
 pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
 mod error;
+#[cfg(any(test, feature = "test-support"))]
+pub mod error_kind_table;
 mod external_signer;
 mod groups;
 mod history_notices;
@@ -160,7 +162,8 @@ pub use runtime::{
     AgentPublisherRouting, AgentStreamWatchOptions, AgentTextStreamCryptoContext,
     AuditOtlpAttemptOutcome, CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure,
     LocalCleanupReport, ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction,
-    OnboardingDeviceDiscovery, OnboardingDevicePackage, OnboardingFinding, OnboardingIssue,
+    OnboardingCheckOutcome, OnboardingCheckPurpose, OnboardingDeviceDiscovery,
+    OnboardingDevicePackage, OnboardingFinding, OnboardingFindingContext, OnboardingIssue,
     OnboardingOptions, OnboardingRelayCapability, OnboardingRelayRepair, OnboardingRelayRepairMode,
     OnboardingRelayTag, OnboardingRelayTagChange, OnboardingRelayTagDisposition,
     OnboardingRelayTagRole, OnboardingRepairProposal, OnboardingSingleDeviceNotice,
@@ -2557,6 +2560,16 @@ impl MarmotApp {
             .await
     }
 
+    /// Give a local account both relay lists before a KeyPackage publish.
+    ///
+    /// Both lists are replaceable, so a publish replaces whatever the identity
+    /// already published. An identity imported offline has no cached copy, and
+    /// a kind 10002 with no write relay counts as missing, so an incomplete
+    /// cache is not absence: read the published lists first and adopt what the
+    /// read finds (it caches them). Publish the app's relays only for a list
+    /// that a complete read of those relays, and of the outboxes they
+    /// advertise, proves absent. An incomplete read or a published list with
+    /// no usable relay publishes nothing and fails (mdk#2550).
     async fn ensure_local_account_relay_lists(
         &self,
         label: &str,
@@ -2587,10 +2600,19 @@ impl MarmotApp {
         if default_relays.is_empty() {
             return Err(AppError::MissingRelayLists(status.missing));
         }
+        // Fails with `DirectoryLookupIncomplete` or `MissingRelayLists` rather
+        // than report a kind as missing that the read did not prove absent.
+        let published = self
+            .directory()
+            .resolve_account_relay_list_status_for_account_id(
+                &account.account_id_hex,
+                default_relays.clone(),
+            )
+            .await?;
         self.publish_missing_account_relay_lists_from_status(
             label,
             AccountRelayListBootstrap::new(default_relays.clone(), default_relays),
-            status,
+            published,
         )
         .await
     }
@@ -4658,8 +4680,7 @@ impl MarmotApp {
             session_config = session_config.recorder(recorder);
         }
         self.ensure_strict_cutover_replacement_intent_before_session_open(label)?;
-        let session =
-            AccountDeviceSession::open(session_config).map_err(external_signer_session_error)?;
+        let session = AccountDeviceSession::open(session_config)?;
 
         let publish_client =
             self.relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone());
@@ -7603,23 +7624,6 @@ pub(crate) fn external_signer_error(
         AppError::ExternalSignerRejected
     } else {
         AppError::Publish(format!("{context}: {error}"))
-    }
-}
-
-/// Recover a cancelled external-signer proof from a session-open failure.
-///
-/// The account-identity proof is signed synchronously through the external
-/// signer while the device session is opened (the engine builds it during
-/// `AccountDeviceSession::open`). That signing hook returns `String`, so a
-/// user-cancelled Amber prompt travels up as an opaque engine error carrying
-/// the `EXTERNAL_SIGNER_REJECTED` sentinel — recover the typed rejection here so
-/// callers see `AppError::ExternalSignerRejected` instead of a generic session
-/// error, matching `external_signer_error` on the other signer paths.
-pub(crate) fn external_signer_session_error(error: cgka_session::SessionError) -> AppError {
-    if error.to_string().contains(EXTERNAL_SIGNER_REJECTED) {
-        AppError::ExternalSignerRejected
-    } else {
-        AppError::from(error)
     }
 }
 

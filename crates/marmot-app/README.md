@@ -159,6 +159,12 @@ requires acknowledgements from its operational relays.
 - Import flows can check whether those lists already exist before writing local account state. The same status API can
   fetch relay-list events from supplied bootstrap relays and store discovered user relay/KeyPackage data for
   deterministic CLI/TUI development.
+- A KeyPackage publish or rotation never replaces lists the identity already published. When the cached lists are
+  incomplete (an identity imported offline, or a kind `10002` with read relays only), it first reads the published
+  lists from the app's relays and the outboxes they advertise, and adopts what it finds. It publishes the app's relays
+  only for a list that read proved absent. A read that could not finish fails with `DirectoryLookupIncomplete`, and a
+  published list with no usable relay fails with `MissingRelayLists`; neither publishes anything. An open generated
+  setup still owns its lists.
 
 **Publication.** KeyPackage publication keeps a stable replaceable `d` tag per account and tracks the decoded
 KeyPackage ref separately. Normal publish reuses only a cached current-profile last-resort package; explicit rotate, a

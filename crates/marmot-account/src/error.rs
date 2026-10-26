@@ -73,3 +73,16 @@ pub enum AccountError {
     #[error("transport delivery was addressed to a different account")]
     WrongAccountDelivery,
 }
+
+impl AccountError {
+    /// The engine error inside this one, whether the runtime met it directly
+    /// or through the session.
+    #[must_use]
+    pub fn as_engine_error(&self) -> Option<&EngineError> {
+        match self {
+            Self::Engine(error) => Some(error),
+            Self::Session(error) => Some(error.as_engine_error()),
+            _ => None,
+        }
+    }
+}

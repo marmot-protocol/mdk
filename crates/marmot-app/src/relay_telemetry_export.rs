@@ -84,6 +84,21 @@ pub mod metric_names {
     /// no time order covered the missing history (monotonic).
     pub const RECONCILIATION_ORDER_UNPROVEN_PASSES: &str =
         "relay_reconciliation_order_unproven_passes";
+    /// Device-wide account activations whose every REQ reached every relay
+    /// (monotonic).
+    pub const ACCOUNT_ACTIVATIONS_FULL: &str = "relay_account_activations_full";
+    /// Device-wide account activations that succeeded while some relay owed
+    /// or refused a REQ (monotonic).
+    pub const ACCOUNT_ACTIVATIONS_DEGRADED: &str = "relay_account_activations_degraded";
+    /// Device-wide account activations that failed and rolled back (monotonic).
+    pub const ACCOUNT_ACTIVATIONS_FAILED: &str = "relay_account_activations_failed";
+    /// Device-wide group syncs whose REQs all reached every relay (monotonic).
+    pub const GROUP_SYNCS_FULL: &str = "relay_group_syncs_full";
+    /// Device-wide group syncs that succeeded while some relay owed or refused
+    /// a REQ (monotonic).
+    pub const GROUP_SYNCS_DEGRADED: &str = "relay_group_syncs_degraded";
+    /// Device-wide group syncs whose REQs failed (monotonic).
+    pub const GROUP_SYNCS_FAILED: &str = "relay_group_syncs_failed";
     /// Engine settle episodes (monotonic).
     pub const SETTLES: &str = "relay_settles";
     /// Engine post-settle reorgs (monotonic).
@@ -994,6 +1009,24 @@ pub fn build_export_batch(
             metric_names::RECONCILIATION_ORDER_UNPROVEN_PASSES,
             rollup.reconciliation_order_unproven_passes,
         ),
+        (
+            metric_names::ACCOUNT_ACTIVATIONS_FULL,
+            rollup.activations_full,
+        ),
+        (
+            metric_names::ACCOUNT_ACTIVATIONS_DEGRADED,
+            rollup.activations_degraded,
+        ),
+        (
+            metric_names::ACCOUNT_ACTIVATIONS_FAILED,
+            rollup.activations_failed,
+        ),
+        (metric_names::GROUP_SYNCS_FULL, rollup.group_syncs_full),
+        (
+            metric_names::GROUP_SYNCS_DEGRADED,
+            rollup.group_syncs_degraded,
+        ),
+        (metric_names::GROUP_SYNCS_FAILED, rollup.group_syncs_failed),
         (metric_names::MESSAGE_OBSERVED, rollup.messages_observed),
         (
             metric_names::MESSAGE_CORROBORATED,

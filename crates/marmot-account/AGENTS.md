@@ -17,6 +17,8 @@ relay auth, or transport-specific relay discovery.
 `marmot_account::Item` path. Source is split into focused modules:
 
 - `error.rs` — `AccountError`/`AccountHomeError` enums and the `AccountResult`/`AccountHomeResult` aliases.
+  `AccountError::as_engine_error` finds the engine error whether the runtime met it directly or through the session;
+  ask it instead of matching `Engine(..)` or `Session(..)`.
 - `home.rs` — `AccountHome` and `AccountSummary`; owns the account-record layout and signing-key lifecycle.
 - `nip49_export.rs` — NIP-49 `ncryptsec` export policy (fixed scrypt cost, non-empty passphrase, key-security byte);
   crypto is delegated to the upstream `nostr` crate. Do not hand-roll NIP-49 here.

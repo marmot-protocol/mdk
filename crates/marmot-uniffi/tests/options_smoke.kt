@@ -11,6 +11,24 @@ private class OptionsStore : SecretStore {
 }
 
 fun main() {
+    val findings = listOf(
+        OnboardingFindingFfi(OnboardingIssueFfi.TIMED_OUT, "wss://example.com",
+            OnboardingFindingContextFfi.RECORD_DISCOVERY, OnboardingCheckPurposeFfi.RECORD_LOOKUP,
+            OnboardingCheckOutcomeFfi.UNKNOWN, OnboardingRelayCapabilityFfi.NONE,
+            listOf(OnboardingActionFfi.RETRY), 7uL),
+        OnboardingFindingFfi(OnboardingIssueFfi.TIMED_OUT, "wss://example.com",
+            OnboardingFindingContextFfi.DECLARED_ROUTE, OnboardingCheckPurposeFfi.DIRECTORY_QUERY,
+            OnboardingCheckOutcomeFfi.UNKNOWN, OnboardingRelayCapabilityFfi.WRITE,
+            listOf(OnboardingActionFfi.RETRY), 7uL),
+        OnboardingFindingFfi(OnboardingIssueFfi.INSPECTION_COMPLETED, "wss://read.example.com",
+            OnboardingFindingContextFfi.DECLARED_ROUTE, OnboardingCheckPurposeFfi.DIRECTORY_QUERY,
+            OnboardingCheckOutcomeFfi.SUCCESS, OnboardingRelayCapabilityFfi.READ,
+            emptyList(), 7uL),
+    )
+    for (finding in findings) {
+        val diagnostic = FfiConverterTypeOnboardingFindingFfi.lift(FfiConverterTypeOnboardingFindingFfi.lower(finding))
+        check(diagnostic == finding)
+    }
     // The deployment is the one required field.
     val defaults = MarmotOptions(deployment = marmotDeploymentNeutral())
     check(defaults.relayPolicy == null && defaults.cursorPersistence == null)
@@ -36,5 +54,5 @@ fun main() {
     } finally {
         root.deleteRecursively()
     }
-    println("Kotlin runtime options defaults and host-store construction passed")
+    println("Kotlin onboarding diagnostics, runtime options and host-store construction passed")
 }

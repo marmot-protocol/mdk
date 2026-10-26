@@ -2842,6 +2842,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::UnknownGroup(_)
         | AppError::GroupInviteNotPending
         | AppError::GroupCreateIncludesCreator
+        | AppError::GroupCreateAdminNotMember
         | AppError::GroupDisbanding(_)
         | AppError::GroupRemoved(_)
         | AppError::AgentStreamPublisher(_)

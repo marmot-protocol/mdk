@@ -74,6 +74,13 @@ if [[ ! "$session" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
   exit 64
 fi
 prompt="$(cat)"
+# Forwarded prompts end with the connector's control instructions; echo only the inbound text.
+instructions=$'\n\nConnector-provided Marmot control instructions:'
+if [[ "$prompt" != *"$instructions"* ]]; then
+  echo "prompt is missing the connector control instructions" >&2
+  exit 64
+fi
+prompt="${prompt%%"$instructions"*}"
 printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$session"
 if [ "$mode" = resume ]; then
   printf '{"type":"assistant","session_id":"%s","parent_tool_use_id":null,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"ignore"},{"type":"text","text":"marmot-e2e-resume-ok: %s"},{"type":"tool_use","name":"Read"}]}}\n' "$session" "$prompt"

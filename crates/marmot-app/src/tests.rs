@@ -5,6 +5,7 @@ mod follow_list_edits;
 mod group_lookup;
 pub(crate) mod invite_recovery;
 mod key_package_inventory;
+mod key_package_relay_lists;
 mod key_package_selection;
 mod message_journeys;
 mod publication_progress;
@@ -13,6 +14,7 @@ mod relay_plane_runtime;
 mod replaceable_delivery;
 mod report_backfill;
 mod suspension_close;
+mod unreachable_group_relays;
 mod user_blocks;
 
 use super::*;
@@ -524,6 +526,7 @@ pub(crate) struct ScriptedPushRelayClient {
     group_subscribe_attempts: std::sync::atomic::AtomicUsize,
     fail_blocked_subscribe: std::sync::atomic::AtomicBool,
     fail_next_subscribe: std::sync::atomic::AtomicBool,
+    refuse_group_subscribes: std::sync::atomic::AtomicBool,
     block_next_unsubscribe: std::sync::atomic::AtomicBool,
     block_next_publish: std::sync::atomic::AtomicBool,
     block_publish_count: std::sync::atomic::AtomicUsize,
@@ -855,6 +858,13 @@ impl ScriptedPushRelayClient {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Refuse every group-route `subscribe` until cleared, as the SDK relay
+    /// client does for a relay it currently considers unreachable (mdk#2562).
+    pub(crate) fn refuse_group_subscribes(&self, refuse: bool) {
+        self.refuse_group_subscribes
+            .store(refuse, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub(crate) fn subscription_count(&self) -> usize {
         self.subscriptions.lock().unwrap().len()
     }
@@ -1053,6 +1063,24 @@ impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
             })
             .collect())
     }
+
+    // The scripted relay holds every event published through it, so a read
+    // finishes unless a query's limit cut it short.
+    async fn fetch_directory_events_with_completion(
+        &self,
+        request: transport_nostr::DirectoryFetchRequest,
+    ) -> Result<transport_nostr::DirectoryFetchOutcome, String> {
+        let queries = request.queries.clone();
+        let records = self.fetch_directory_events(request).await?;
+        let complete = queries.iter().all(|query| {
+            records
+                .iter()
+                .filter(|record| query.matches(&record.event))
+                .count()
+                < query.limit
+        });
+        Ok(transport_nostr::DirectoryFetchOutcome { records, complete })
+    }
 }
 
 #[async_trait]
@@ -1186,6 +1214,15 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         {
             return Err(cgka_traits::TransportAdapterError::Subscription(
                 "injected subscribe failure".to_owned(),
+            ));
+        }
+        if subscription.is_group_route()
+            && self
+                .refuse_group_subscribes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "subscribe registered on 0 of 1 relays".to_owned(),
             ));
         }
         let block_for_account = {
@@ -9086,7 +9123,6 @@ async fn future_dated_inbox_is_unknown_for_account_and_member_resolution() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-/// Verify local member aliases resolve to fresh relay-published KeyPackages.
 async fn runtime_group_create_resolves_local_member_aliases_with_fresh_relay_packages() {
     let (directory, app, accounts, _fetcher) = member_resolution_fixture(1, false).await;
     let member = &accounts[0];
@@ -9118,8 +9154,8 @@ async fn runtime_group_create_resolves_local_member_aliases_with_fresh_relay_pac
     drop(directory);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// Reject non-member admins before lookup and verify valid grants and audit context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_group_create_sets_founding_admins_and_rejects_non_members() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
@@ -9147,7 +9183,10 @@ async fn runtime_group_create_sets_founding_admins_and_rejects_non_members() {
             },
         )
         .await;
-    assert!(matches!(result, Err(AppError::InvalidGroupProfile(_))));
+    assert_eq!(
+        result.unwrap_err().privacy_safe_kind(),
+        "group_create_admin_not_member"
+    );
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
         requests_before,

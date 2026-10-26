@@ -114,12 +114,15 @@ class MergeGatePolicyTests(unittest.TestCase):
         passed = {"changes": {"result": "success"}, "rust-test": {"result": "success"}}
         skipped = {**passed, "rust-test": {"result": "skipped"}}
         failed = {**passed, "rust-test": {"result": "failure"}}
+        cancelled = {**passed, "rust-test": {"result": "cancelled"}}
         for event, mode, needs, expected in [
             ("pull_request", "precheck", skipped, True),
             ("pull_request", "precheck", failed, False),
+            ("pull_request", "precheck", cancelled, False),
             ("pull_request", "full", skipped, False),
             ("merge_group", "full", passed, True),
             ("merge_group", "full", skipped, False),
+            ("merge_group", "full", cancelled, False),
             ("merge_group", "precheck", skipped, False),
             ("merge_group", "", skipped, False),
             ("push", "warm", skipped, True),
@@ -150,8 +153,127 @@ class MergeGatePolicyTests(unittest.TestCase):
         jobs = set(re.findall(r"(?m)^  ([a-z0-9-]+):$", workflow.split("\njobs:\n", 1)[1]))
         required = workflow.split("\n  required-ci:\n", 1)[1].split("\n    needs:\n", 1)[1]
         needs = set(re.findall(r"(?m)^      - ([a-z0-9-]+)$", required.split("\n    runs-on:", 1)[0]))
-        self.assertEqual(needs, jobs - {"required-ci"})
+        # The fail-fast watcher waits for Required CI to appear, so it cannot be a need.
+        self.assertEqual(needs, jobs - {"required-ci", "merge-group-fail-fast"})
 
+    def test_only_the_merge_group_watcher_can_cancel_and_it_cannot_fail_the_run(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        watcher = workflow.split("\n  merge-group-fail-fast:\n", 1)[1].split("\n  required-ci:\n", 1)[0]
+        self.assertIn("    if: github.event_name == 'merge_group'\n", watcher)
+        self.assertIn("    continue-on-error: true\n    permissions:\n      actions: write\n      contents: read\n\n",
+                      watcher)
+        # The branch lookup must name this run's own group and commit.
+        self.assertIn("          HEAD_REF: ${{ github.ref }}\n          HEAD_SHA: ${{ github.sha }}\n", watcher)
+        # Build and test jobs run third-party code; none of them may cancel or dispatch runs.
+        self.assertEqual(len(re.findall(r"(?m)^ +actions: write$", workflow)), 1)
+        # A job-level continue-on-error reads as success in `needs` but as a failed job to the watcher.
+        self.assertEqual(len(re.findall(r"(?m)^ +continue-on-error:", workflow)), 1)
+        timeout = int(re.search(r"(?m)^    timeout-minutes: (\d+)$", watcher).group(1))
+        watch = int(re.search(r"deadline=\$\(\(SECONDS \+ (\d+) \* 60\)\)", watcher).group(1))
+        self.assertLess(watch, timeout)
+        # Required CI must still run, and fail, once the watcher cancels the run.
+        self.assertIn("\n  required-ci:\n    name: Required CI\n", workflow)
+        required = workflow.split("\n  required-ci:\n", 1)[1].split("\n    needs:\n", 1)[0]
+        self.assertRegex(required, r"(?m)^    if: always\(\)$")
+
+    def test_merge_group_watcher_cancels_a_failed_or_dropped_group(self):
+        script = workflow_step("ci.yml", "Cancel the run when a job fails")
+        # gh applies the trailing --jq filter itself; the fake runs it with jq.
+        # Request n to an endpoint reads its response n, and later requests
+        # repeat its last response.
+        fakes = textwrap.dedent("""\
+            gh() {
+              if [[ "$1" == api ]]; then
+                echo "gh ${*:1:$#-1}" >> "$STATE/calls"
+                local kind=jobs
+                [[ "$*" != *matching-refs* ]] || kind=refs
+                local count=$(( $(cat "$STATE/$kind") + 1 ))
+                echo "$count" > "$STATE/$kind"
+                local last=$(ls "$STATE/$kind".*.json | wc -l)
+                local response="$STATE/$kind.$(( count < last ? count : last )).json"
+                [[ "$(cat "$response")" != error ]] || return 1
+                jq -r "${@: -1}" "$response"
+              else
+                echo "gh $*" >> "$STATE/calls"
+                local cancels=$(( $(cat "$STATE/cancels") + 1 ))
+                echo "$cancels" > "$STATE/cancels"
+                (( cancels > REFUSED_CANCELS ))
+              fi
+            }
+            sleep() { echo "sleep $1" >> "$STATE/calls"; SECONDS=$((SECONDS + $1)); }
+        """)
+
+        def job(name, status, conclusion=None):
+            return {"name": name, "status": status, "conclusion": conclusion}
+
+        group = "refs/heads/gh-readonly-queue/master/pr-7-" + "b" * 40
+        commit = "c" * 40
+
+        def branch(sha, ref=group):
+            return [{"ref": ref, "object": {"type": "commit", "sha": sha}}]
+
+        live, gone, reused = branch(commit), [], branch("d" * 40)
+        running = [job("Classify CI changes", "completed", "success"),
+                   job("Rust tests (1/7)", "in_progress"), job("Rust WASM check", "completed", "skipped")]
+        failed = running + [job("Relay runtime tests (2/2)", "completed", "failure")]
+        finished = [job("Rust tests (1/7)", "completed", "success"), job("Required CI", "queued")]
+        poll = "gh api --paginate repos/o/r/actions/runs/42/jobs?per_page=100 --jq"
+        look = f"gh api repos/o/r/git/matching-refs/{group.removeprefix('refs/')} --jq"
+        wait, cancel = "sleep 60", "gh run cancel 42"
+        for name, jobs, refs, refused, expected, env in [
+            ("failure cancels at once", [failed], [live], 0, [poll, cancel], {}),
+            ("timeout or cancellation counts as a failure",
+             [running + [job("Windows filesystem contracts", "completed", "cancelled")]], [live], 0,
+             [poll, cancel], {}),
+            ("success, skips and running jobs on a live branch keep watching", [running, finished], [live], 0,
+             [poll, look, wait, poll], {}),
+            ("Required CI means nothing is left to stop",
+             [finished + [job("Rust tests (2/7)", "completed", "failure")]], [gone], 0, [poll], {}),
+            ("failed request is retried", ["error", failed], [live], 0, [poll, wait, poll, cancel], {}),
+            ("refused cancel is retried", [failed], [live], 1, [poll, cancel, wait, poll, cancel], {}),
+            ("watching stops at the deadline", [running], [live], 0, [poll, look, wait] * 150, {}),
+            # The queue deleted the group's branch, or gave its name to a later group on the same base.
+            ("a branch gone for two lookups cancels", [running], [gone], 0,
+             [poll, look, wait, poll, look, cancel], {}),
+            ("a branch reused by another group cancels", [running], [reused], 0,
+             [poll, look, wait, poll, look, cancel], {}),
+            ("another branch sharing the prefix is not this group", [running],
+             [branch(commit, group + "-other")], 0, [poll, look, wait, poll, look, cancel], {}),
+            ("refused cancel of a dropped group is retried", [running], [gone], 1,
+             [poll, look, wait, poll, look, cancel, wait, poll, look, cancel], {}),
+            # A passed group's branch is deleted after Required CI appears, which wins.
+            ("a passed group's deleted branch never cancels", [running, finished], [gone], 0,
+             [poll, look, wait, poll], {}),
+            ("one missing lookup is not enough", [running, running, running, finished], [gone, live, gone], 0,
+             [poll, look, wait, poll, look, wait, poll, look, wait, poll], {}),
+            ("a failed lookup proves nothing", [running, running, running, finished], [gone, "error", gone], 0,
+             [poll, look, wait, poll, look, wait, poll, look, wait, poll], {}),
+            ("a failed jobs request skips the lookup", [running, "error", finished], [gone], 0,
+             [poll, look, wait, poll, wait, poll], {}),
+            ("no group branch, no lookups", [running, finished], [gone], 0, [poll, wait, poll],
+             {"HEAD_REF": ""}),
+            ("a tag is not a group branch", [running, finished], [gone], 0, [poll, wait, poll],
+             {"HEAD_REF": "refs/tags/v1"}),
+            ("a malformed commit disables lookups", [running, finished], [gone], 0, [poll, wait, poll],
+             {"HEAD_SHA": "HEAD"}),
+        ]:
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                state = Path(tmp)
+                (state / "calls").write_text("")
+                for counter in ("jobs", "refs", "cancels"):
+                    (state / counter).write_text("0")
+                for kind, responses in (("jobs", [{"jobs": r} if r != "error" else r for r in jobs]),
+                                        ("refs", refs)):
+                    for index, response in enumerate(responses, 1):
+                        body = response if response == "error" else json.dumps(response)
+                        (state / f"{kind}.{index}.json").write_text(body)
+                # GitHub runs `run:` steps with `bash -e`.
+                result = subprocess.run(["bash", "-e", "-c", fakes + script], capture_output=True, text=True,
+                                        timeout=60, env={**os.environ, "STATE": tmp, "GH_REPO": "o/r",
+                                                         "RUN_ID": "42", "HEAD_REF": group, "HEAD_SHA": commit,
+                                                         "REFUSED_CANCELS": str(refused), **env})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((state / "calls").read_text().splitlines(), expected)
 
 def semver_key(version: str):
     """Semver 2.0 precedence key for X.Y.Z[-pre] (no build metadata)."""
@@ -279,6 +401,49 @@ class NightlyReleasePolicyTests(unittest.TestCase):
         # A nightly must not share a same-SHA snapshot's group, which waits for the nightly.
         self.assertIn("  group: marmotkit-bindings-${{ inputs.nightly_version || inputs.source_sha || github.ref }}-",
                       bindings)
+
+    def test_a_failed_scheduled_nightly_reports_to_one_open_issue(self):
+        workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
+        jobs = re.findall(r"^  ([a-z][a-z-]*):\n", workflow.split("\njobs:\n", 1)[1], re.MULTILINE)
+        report = workflow.split("\n  report:\n", 1)[1].split("\n    steps:\n", 1)[0]
+        # Skipped nights exit 0, so only real failures in any other job report. A job timeout
+        # leaves that job cancelled rather than failed; a cancelled run reports nothing.
+        self.assertIn(f"    needs: [{', '.join(job for job in jobs if job != 'report')}]\n", report)
+        self.assertIn("    if: github.event_name == 'schedule' && !cancelled() && "
+                      "(failure() || contains(needs.*.result, 'cancelled'))\n", report)
+        self.assertIn("    permissions:\n      issues: write\n", report)
+        self.assertEqual(workflow.count("issues: write"), 1)
+
+        script = workflow_step("nightly-releases.yml", "Open or update the nightly failure issue")
+        fake_gh = textwrap.dedent("""\
+            gh() {
+              if [[ "$1 $2" == "issue list" ]]; then
+                while [[ "$1" != --jq ]]; do shift; done
+                jq -r "$2" <<<"$ISSUES"
+                return
+              fi
+              printf '%s\\n' "$*" >>"$LOG"
+            }
+        """)
+        needs = json.dumps({"plan": {"result": "success"}, "marmotc": {"result": "failure"},
+                            "wn-agent": {"result": "cancelled"}, "publish": {"result": "skipped"},
+                            "retention": {"result": "failure"}})
+        body = ("--body The scheduled nightly failed for abc123 "
+                "(failed jobs: marmotc, wn-agent (cancelled), retention). Run: https://run")
+        for issues, expected in [
+            ([{"number": 9, "title": "Nightly release failed twice"}],
+             f"issue create --repo o/r --title Nightly release failed {body}"),
+            ([{"number": 9, "title": "Nightly release failed twice"}, {"number": 12, "title": "Nightly release failed"}],
+             f"issue comment 12 --repo o/r {body}"),
+        ]:
+            with self.subTest(issues=issues), tempfile.TemporaryDirectory() as tmp:
+                log = Path(tmp) / "gh.log"
+                subprocess.run(
+                    ["bash", "-c", fake_gh + script], check=True, timeout=10,
+                    env={**os.environ, "ISSUES": json.dumps(issues), "LOG": str(log), "NEEDS": needs,
+                         "REPO": "o/r", "RUN_URL": "https://run", "SOURCE_SHA": "abc123"},
+                )
+                self.assertEqual(log.read_text(), expected + "\n")
 
     def test_tag_pushed_release_workflows_ignore_nightly_tags(self):
         for workflow, prefix in [("bindings.yaml", "marmotkit"), ("c-bindings.yml", "marmotc"),

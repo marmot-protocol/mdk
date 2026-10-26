@@ -157,6 +157,11 @@ back to an older nightly (for example across a storage migration) is not support
   then skips the night. Once a nightly is building, MarmotKit tag and snapshot runs and `just release-all` wait up to
   three hours for it. The check is best effort: a release started in the seconds while a nightly passes its wait can
   still overlap it.
+- **Failures.** When a job in a scheduled run fails or times out, the run's last job opens an issue titled "Nightly
+  release failed", or comments on the open one, with the source SHA, the failed jobs and the run URL. Skipped nights
+  (an unchanged source, a version that is not `X.Y.Z-dev`, a lane still busy after three hours) are not failures and
+  file nothing. Neither do cancelled runs or manual dispatches: whoever starts or cancels a run is watching it, and
+  rehearsals can run from any branch. Close the issue once a nightly publishes again.
 
 Rehearse with a manual dispatch; a dispatch that publishes must run the workflow from `master`:
 
@@ -395,8 +400,8 @@ platforms plus adapter/harness install assets: the Hermes Marmot plugin + `insta
 Marmot channel plugin + `install-openclaw-marmot.sh`, the `wn-claude` harness +
 `install-claude-marmot.sh`, the `wn-codex` harness +
 `install-codex-marmot.sh`, the `wn-opencode` harness +
-`install-opencode-marmot.sh`, the `wn-pi` harness + `install-pi-marmot.sh`, and the `wn-goose` harness +
-`install-goose-marmot.sh`.
+`install-opencode-marmot.sh`, the `wn-pi` harness + `install-pi-marmot.sh`, the `wn-goose` harness +
+`install-goose-marmot.sh`, and the connector-only `install-wn-agent.sh` for custom agent-control clients.
 
 The workflow lives at:
 
@@ -426,6 +431,7 @@ bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$sender_h
 bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --opencode-bin /bin/echo
 bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --pi-bin /bin/echo
 bash scripts/install-goose-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --goose-bin /bin/echo
+bash scripts/install-wn-agent.sh --dry-run --yes --bootstrap --allow-welcomer "$sender_hex"
 ```
 
 Bridge and control logs for all terminal harnesses use the
@@ -524,6 +530,8 @@ The release job creates these assets:
 - `install-pi-marmot.sh.sha256`
 - `install-goose-marmot.sh`
 - `install-goose-marmot.sh.sha256`
+- `install-wn-agent.sh`
+- `install-wn-agent.sh.sha256`
 
 Each binary/plugin tarball carries a `manifest.json` recording the release tag, artifact version, source commit, and
 workspace version (the OpenClaw tarball's `package.json` version is also stamped to the cohort version at release time).
@@ -535,7 +543,7 @@ not create or update a mutable latest alias. A verified install for the current 
 ```sh
 (
 set -eu
-base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.13.0"
+base_url="https://github.com/marmot-protocol/mdk/releases/download/wn-agent-v0.14.0"
 
 install_verified() (
   set -eu
@@ -572,6 +580,8 @@ install_verified "$base_url/install-opencode-marmot.sh" "$base_url/install-openc
 install_verified "$base_url/install-pi-marmot.sh" "$base_url/install-pi-marmot.sh.sha256"
 # Goose terminal harness
 install_verified "$base_url/install-goose-marmot.sh" "$base_url/install-goose-marmot.sh.sha256"
+# wn-agent only, for your own agent-control client (published after 0.14.0)
+install_verified "$base_url/install-wn-agent.sh" "$base_url/install-wn-agent.sh.sha256"
 )
 ```
 
@@ -584,6 +594,12 @@ Marmot agent home, and patch only the Marmot-specific gateway config when a gate
 `--no-start-wn-agent`, `--no-configure-hermes`, `--no-configure-openclaw`, or `--no-start-wn-opencode` when you need a
 partial/manual install. Terminal-harness installers also accept the matching
 `--no-start-wn-claude`, `--no-start-wn-codex`, `--no-start-wn-pi`, or `--no-start-wn-goose` option.
+
+`install-wn-agent.sh` is the shared terminal-harness installer in its connector-only mode
+(`MARMOT_TERMINAL_HARNESS=none`). It installs `wn-agent`, creates a private `~/.marmot-agents/standalone` home and
+starts the `wn-agent-standalone.service` / `org.marmot.wn-agent.standalone` service with the default relays. It runs
+`bootstrap` or `import-identity` only when asked, and installs no harness. See
+[Build your own client](integrations/custom-client.md).
 
 ## MarmotKit Binding Release
 

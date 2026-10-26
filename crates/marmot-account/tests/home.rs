@@ -407,6 +407,116 @@ fn strict_catalog_does_not_treat_a_metadata_probe_error_as_an_empty_home() {
     ));
 }
 
+#[cfg(unix)]
+fn file_mode(path: &std::path::Path) -> u32 {
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+#[cfg(unix)]
+fn loosen_to_umask_default(path: &std::path::Path) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn account_records_and_key_security_markers_are_written_owner_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let nsec = "nsec1j4c6269y9w0q2er2xjw8sv2ehyrtfxq3jwgdlxj6qfn8z4gjsq5qfvfk99";
+    let accounts = [
+        home.create_nostr_account().unwrap(),
+        home.create_account("labelled").unwrap(),
+        // The `wn-agent import-identity` path.
+        home.import_account_idempotent("agent", nsec).unwrap(),
+        home.add_external_signer_account(&nostr::prelude::Keys::generate().public_key().to_hex())
+            .unwrap(),
+        home.add_public_account(&nostr::prelude::Keys::generate().public_key().to_hex())
+            .unwrap(),
+    ];
+    for account in &accounts {
+        let account_dir = home.account_dir(&account.label);
+        assert_eq!(file_mode(&account_dir), 0o700);
+        assert_eq!(file_mode(&account_dir.join("account.json")), 0o600);
+    }
+
+    home.mark_key_handled_insecurely("agent").unwrap();
+
+    assert_eq!(
+        file_mode(&home.account_dir("agent").join("key-security.json")),
+        0o600
+    );
+}
+
+/// Builds before mdk#2569 wrote both records at the process umask.
+#[cfg(unix)]
+#[test]
+fn reading_legacy_umask_records_tightens_them_owner_only() {
+    use nostr::nips::nip19::ToBech32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let labelled = home.create_account("labelled").unwrap();
+    let generated = home.create_nostr_account().unwrap();
+    home.mark_key_handled_insecurely("labelled").unwrap();
+    let listed = home.accounts().unwrap();
+    let record = |label: &str| home.account_dir(label).join("account.json");
+    let marker = home.account_dir("labelled").join("key-security.json");
+    for path in [record("labelled"), record(&generated.label), marker.clone()] {
+        loosen_to_umask_default(&path);
+    }
+
+    assert_eq!(home.accounts().unwrap(), listed);
+    assert_eq!(file_mode(&record("labelled")), 0o600);
+    assert_eq!(file_mode(&record(&generated.label)), 0o600);
+
+    loosen_to_umask_default(&record("labelled"));
+    assert_eq!(home.account("labelled").unwrap(), labelled);
+    assert_eq!(file_mode(&record("labelled")), 0o600);
+
+    loosen_to_umask_default(&record(&generated.label));
+    let npub = nostr::prelude::PublicKey::from_hex(&generated.account_id_hex)
+        .unwrap()
+        .to_bech32()
+        .unwrap();
+    assert_eq!(home.account(&npub).unwrap(), generated);
+    assert_eq!(file_mode(&record(&generated.label)), 0o600);
+
+    assert_eq!(home.key_security_byte("labelled").unwrap(), 0x00);
+    assert_eq!(file_mode(&marker), 0o600);
+}
+
+/// The no-follow tightening cannot reach a symlinked record, so reading it
+/// fails instead of skipping the tightening; the best-effort catalog skips
+/// and reports it like any other unreadable record.
+#[cfg(unix)]
+#[test]
+fn untightenable_account_record_fails_the_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let good = home.create_account("good").unwrap();
+    home.create_account("linked").unwrap();
+    let record = home.account_dir("linked").join("account.json");
+    let target = dir.path().join("elsewhere.json");
+    std::fs::rename(&record, &target).unwrap();
+    loosen_to_umask_default(&target);
+    std::os::unix::fs::symlink(&target, &record).unwrap();
+
+    assert_eq!(home.accounts().unwrap(), vec![good]);
+    assert!(matches!(
+        home.accounts_strict(),
+        Err(AccountHomeError::Io(_))
+    ));
+    assert!(matches!(
+        home.account("linked"),
+        Err(AccountHomeError::Io(_))
+    ));
+    assert_eq!(file_mode(&target), 0o644);
+}
+
 #[test]
 fn account_home_rejects_path_like_labels() {
     let dir = tempfile::tempdir().unwrap();

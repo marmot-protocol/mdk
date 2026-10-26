@@ -11,6 +11,21 @@ private final class OptionsStore: SecretStore, @unchecked Sendable {
 @main
 struct OptionsSmoke {
     static func main() throws {
+        let findings = [
+            OnboardingFindingFfi(issue: .timedOut, endpoint: "wss://example.com",
+                context: .recordDiscovery, purpose: .recordLookup, outcome: .unknown,
+                declaredCapability: .none, actions: [.retry], observedRevision: 7),
+            OnboardingFindingFfi(issue: .timedOut, endpoint: "wss://example.com",
+                context: .declaredRoute, purpose: .directoryQuery, outcome: .unknown,
+                declaredCapability: .write, actions: [.retry], observedRevision: 7),
+            OnboardingFindingFfi(issue: .inspectionCompleted, endpoint: "wss://read.example.com",
+                context: .declaredRoute, purpose: .directoryQuery, outcome: .success,
+                declaredCapability: .read, actions: [], observedRevision: 7),
+        ]
+        for finding in findings {
+            let diagnostic = try FfiConverterTypeOnboardingFindingFfi.lift(FfiConverterTypeOnboardingFindingFfi.lower(finding))
+            precondition(diagnostic == finding)
+        }
         // The deployment is the one required field.
         let defaults = MarmotOptions(deployment: marmotDeploymentNeutral())
         precondition(defaults.relayPolicy == nil && defaults.cursorPersistence == nil)
@@ -36,6 +51,6 @@ struct OptionsSmoke {
         )
         let accounts = try kit.listAccounts()
         precondition(accounts.isEmpty)
-        print("Swift runtime options defaults and host-store construction passed")
+        print("Swift onboarding diagnostics, runtime options and host-store construction passed")
     }
 }

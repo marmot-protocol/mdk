@@ -42,7 +42,7 @@ web-time.workspace = true
 # is a well-formed BIP-340 x-only public key (foundation/identity.md). Already
 # resolved transitively via openmls_rust_crypto -> hpke-rs-rust-crypto -> k256;
 # enabling the `schnorr` feature here pulls in BIP-340 x-only point validation.
-k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
+k256 = { version = "0.14", default-features = false, features = ["schnorr"] }
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 tokio = { workspace = true, features = ["time"] }
@@ -62,7 +62,7 @@ insta.workspace = true
 tempfile.workspace = true
 # Integration tests derive deterministic, spec-valid x-only secp256k1 identities
 # from ergonomic seed labels (see the `pad32` helper in tests/).
-k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
+k256 = { version = "0.14", default-features = false, features = ["schnorr"] }
 sha2.workspace = true
 # Tier-2 tests model the real transport's per-epoch sealing (see
 # `tests/support/epoch_sealed_peeler.rs`) with the same AEAD the Nostr kind-445

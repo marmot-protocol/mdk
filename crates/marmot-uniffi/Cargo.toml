@@ -34,6 +34,7 @@ uniffi = "0.29.4"
 zeroize.workspace = true
 
 [dev-dependencies]
+marmot-app = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util"] }
 keyring-core.workspace = true

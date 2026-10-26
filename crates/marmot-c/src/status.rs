@@ -610,4 +610,19 @@ mod tests {
         assert!(take_last_error().is_some());
         assert!(take_last_error().is_none());
     }
+
+    /// The C status column of `marmot-app`'s lower-stack error table: the
+    /// status follows what the error is, however the lower stack wrapped it.
+    #[test]
+    fn lower_stack_errors_get_a_status_by_kind_not_by_wrapping() {
+        let mismatches: Vec<String> = marmot_app::error_kind_table::lower_stack_rows()
+            .into_iter()
+            .filter_map(|row| {
+                let status = format!("{:?}", status_from_error(&MarmotKitError::from(&row.error)));
+                (status != row.expected.c_status)
+                    .then(|| format!("{}: {status}, expected {}", row.name, row.expected.c_status))
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
 }

@@ -16,7 +16,8 @@ these helpers is
 - Prepares SQLite databases without disturbing live connections (`ensure_private_db_files`): it never opens an
   existing database or sidecar, because closing that descriptor would drop the connection's POSIX locks.
 - Creates directories atomically at mode `0700` (`create_dir_all_private`), and prepares directory paths
-  descriptor-relatively without following symlinks (`prepare_directory_path`).
+  descriptor-relatively without following symlinks (`prepare_directory_path`). `inspect_directory_path` runs the same
+  checks without creating or changing anything, for read-only diagnostics.
 - Acquires nonblocking, kernel-released exclusive leases on private lock files
   (`try_acquire_private_exclusive_file_lease`).
 - Binds Unix sockets through a private staging directory and hard-links them into the final path

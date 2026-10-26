@@ -16,6 +16,9 @@ protocol; `agent-connector` is the server.
 It does not contain engine, storage, account, or transport logic, the socket daemon or process lifecycle (see
 `agent-connector`), or QUIC preview composition (see `agent-stream-compose`).
 
+To write a client of this protocol, start with [Build your own client](../../integrations/custom-client.md): framing,
+group creation, sends and `subscribe_inbound`, with wire examples.
+
 ## Compatibility
 
 Version 2 is intentionally incompatible with version 1. The structured inbound-message, reply-context, and
@@ -34,6 +37,7 @@ Invite-policy values serialize on the wire as `deny`, `allowlist`, `any_authenti
 
 `group_create_capabilities` reports founding-admin support before creation is submitted.
 `group_create_with_admins` accepts the same fields as `group_create`, plus an `admins` list of invited member references.
+The creator may also be listed redundantly; all other admins must be invited members.
 The creator remains an admin. Selected invitees receive admin rights in the founding state and initial Welcome.
 Non-member admins are rejected before creation. The response is `group_created`; creation remains non-idempotent.
 Older connectors reject this distinct operation rather than silently dropping admin rights. Legacy `group_create`

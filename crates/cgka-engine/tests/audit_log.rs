@@ -7,9 +7,14 @@
 //!      (`IngestEntry` + `IngestOutcome`).
 //!   3. Default engine construction (no recorder) is a no-op — the audit
 //!      paths cost nothing when forensics is off.
+//!   4. A send or group creation dropped mid-await leaves no operation
+//!      context behind for later rows that carry none of their own.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use cgka_engine::EngineBuilder;
+use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::CgkaEngine;
 use cgka_traits::engine::{CreateGroupRequest, SendResult};
 use cgka_traits::error::PeelerError;
@@ -40,7 +45,7 @@ fn valid_identity(seed: &[u8]) -> Vec<u8> {
         hasher.update(seed);
         hasher.update(counter.to_be_bytes());
         material.copy_from_slice(&hasher.finalize());
-        if let Ok(sk) = SigningKey::from_bytes(&material) {
+        if let Ok(sk) = SigningKey::from_slice(&material) {
             return sk.verifying_key().to_bytes().to_vec();
         }
         counter += 1;
@@ -77,6 +82,165 @@ impl TransportPeeler for StubPeeler {
         _recipient: &MemberId,
     ) -> Result<TransportMessage, PeelerError> {
         Err(PeelerError::Backend("test peeler".into()))
+    }
+}
+
+/// Parks every outbound wrap forever once the engine reaches it, so a test can
+/// stop a send or a group creation at the transport await deterministically.
+struct ParkingPeeler {
+    reached: Arc<AtomicBool>,
+}
+
+impl ParkingPeeler {
+    async fn park(&self) -> Result<TransportMessage, PeelerError> {
+        self.reached.store(true, Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+#[async_trait]
+impl TransportPeeler for ParkingPeeler {
+    async fn peel_group_message(
+        &self,
+        _msg: &TransportMessage,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        Err(PeelerError::Backend("test peeler".into()))
+    }
+
+    async fn peel_welcome(&self, _msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        Err(PeelerError::Backend("test peeler".into()))
+    }
+
+    async fn wrap_group_message(
+        &self,
+        _payload: &EncryptedPayload,
+        _ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.park().await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        _payload: &EncryptedPayload,
+        _recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.park().await
+    }
+}
+
+fn current_profile_engine(
+    seed: &[u8],
+    peeler: Box<dyn TransportPeeler>,
+    recorder: Option<JsonlRecorder>,
+) -> Engine<SqliteAccountStorage> {
+    let builder = EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+        .identity(valid_identity(seed))
+        .account_identity_proof_signer(proof_signer(seed))
+        .peeler(peeler);
+    let builder = match recorder {
+        Some(recorder) => builder.recorder(Box::new(recorder)),
+        None => builder,
+    };
+    builder.build().expect("build current-profile engine")
+}
+
+fn human_action_context(action: &str) -> AuditEventContext {
+    AuditEventContext {
+        human_action: Some(AuditHumanActionContext {
+            action: action.into(),
+            origin: "local_user".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn group_request(members: Vec<cgka_traits::engine::KeyPackage>) -> CreateGroupRequest {
+    CreateGroupRequest {
+        name: "audit scope".into(),
+        description: String::new(),
+        members,
+        required_features: vec![],
+        app_components: vec![],
+        initial_admins: vec![],
+    }
+}
+
+/// Record the two kinds of row that carry no context of their own: the
+/// engine's recorder-health row and an app row forwarded without a context.
+fn record_context_free_rows(engine: &Engine<SqliteAccountStorage>) {
+    engine.audit_recorder_health();
+    engine.audit_external(
+        None,
+        None,
+        AuditEventKind::SyncDrain {
+            duration_ms: 0,
+            deliveries: 0,
+            skipped: None,
+            refused: None,
+            cursor_before_secs: None,
+            cursor_after_secs: None,
+        },
+    );
+}
+
+fn read_events(path: &std::path::Path) -> Vec<AuditEvent> {
+    std::fs::read_to_string(path)
+        .expect("read audit log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse audit event"))
+        .collect()
+}
+
+fn human_action(event: &AuditEvent) -> Option<&str> {
+    event
+        .context
+        .as_ref()
+        .and_then(|context| context.human_action.as_ref())
+        .map(|human_action| human_action.action.as_str())
+}
+
+/// The operation's entry row carries its context, and the two rows recorded
+/// after the operation ended carry no operation context: only the `system`
+/// human action the recorder stamps on a row that arrives without one.
+fn assert_operation_context_ends_with_operation(
+    events: &[AuditEvent],
+    is_entry: impl Fn(&AuditEventKind) -> bool,
+    action: &str,
+) {
+    let entry = events
+        .iter()
+        .find(|event| is_entry(&event.kind))
+        .expect("operation entry row recorded");
+    assert_eq!(human_action(entry), Some(action));
+    assert!(
+        entry
+            .context
+            .as_ref()
+            .is_some_and(|context| context.operation_id.is_some()),
+        "the entry row carries the operation id"
+    );
+
+    let [.., health, app_row] = events else {
+        panic!("expected the two context-free rows at the end of the log");
+    };
+    assert!(matches!(health.kind, AuditEventKind::RecorderHealth { .. }));
+    assert!(matches!(app_row.kind, AuditEventKind::SyncDrain { .. }));
+    for row in [health, app_row] {
+        let system_stamp = AuditEventContext {
+            human_action: Some(AuditHumanActionContext {
+                action: row.kind.type_tag().into(),
+                origin: "system".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            row.context,
+            Some(system_stamp),
+            "a row without its own context must not inherit the ended operation's"
+        );
     }
 }
 
@@ -594,4 +758,140 @@ async fn queued_application_audit_correlates_preparation_after_restart() {
     }
     assert_ne!(operation(queued[0]), operation(application[2]));
     assert_ne!(operation(queued[1]), operation(application[2]));
+}
+
+/// A send dropped while suspended at the transport await must not leave its
+/// audit context behind: the next rows without a context of their own (an
+/// engine row and an app row) carry none.
+#[tokio::test]
+async fn dropping_a_suspended_send_leaves_no_operation_context_behind() {
+    use cgka_traits::{MarmotAppEvent, SendIntent};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let recorder = JsonlRecorder::open(&path, "test-engine-dropped-send".to_string()).unwrap();
+    let reached = Arc::new(AtomicBool::new(false));
+    let mut engine = current_profile_engine(
+        b"dropped-send",
+        Box::new(ParkingPeeler {
+            reached: reached.clone(),
+        }),
+        Some(recorder),
+    );
+    // A founding group with no invitees wraps nothing, so it completes.
+    let (group_id, _) = engine
+        .create_group(group_request(vec![]))
+        .await
+        .expect("create group");
+    assert!(!reached.load(Ordering::SeqCst));
+
+    let payload = MarmotAppEvent::new(hex::encode(engine.self_id().as_slice()), 1, 9, vec![], "hi")
+        .encode()
+        .unwrap();
+    let mut send = Box::pin(engine.send_with_audit_context(
+        SendIntent::AppMessage {
+            group_id,
+            payload,
+            expected_epoch: None,
+        },
+        Some(human_action_context("send_message")),
+    ));
+    assert!(
+        futures::poll!(send.as_mut()).is_pending(),
+        "the send must suspend at the parked wrap"
+    );
+    assert!(
+        reached.load(Ordering::SeqCst),
+        "the send is suspended at the transport await, not before it"
+    );
+    drop(send);
+
+    record_context_free_rows(&engine);
+    drop(engine);
+
+    assert_operation_context_ends_with_operation(
+        &read_events(&path),
+        |kind| matches!(kind, AuditEventKind::SendEntry { .. }),
+        "send_message",
+    );
+}
+
+/// A group creation dropped while suspended at the Welcome wrap must not leave
+/// its audit context behind.
+#[tokio::test]
+async fn dropping_a_suspended_group_creation_leaves_no_operation_context_behind() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let recorder = JsonlRecorder::open(&path, "test-engine-dropped-create".to_string()).unwrap();
+    let mut bob = current_profile_engine(b"dropped-create-bob", Box::new(StubPeeler), None);
+    let bob_kp = bob.fresh_key_package().await.expect("bob key package");
+    let reached = Arc::new(AtomicBool::new(false));
+    let mut engine = current_profile_engine(
+        b"dropped-create",
+        Box::new(ParkingPeeler {
+            reached: reached.clone(),
+        }),
+        Some(recorder),
+    );
+
+    let mut create = Box::pin(engine.create_group_with_audit_context(
+        group_request(vec![bob_kp]),
+        Some(human_action_context("create_group")),
+    ));
+    assert!(
+        futures::poll!(create.as_mut()).is_pending(),
+        "the creation must suspend at the parked Welcome wrap"
+    );
+    assert!(
+        reached.load(Ordering::SeqCst),
+        "the creation is suspended at the transport await, not before it"
+    );
+    drop(create);
+
+    record_context_free_rows(&engine);
+    drop(engine);
+
+    assert_operation_context_ends_with_operation(
+        &read_events(&path),
+        |kind| matches!(kind, AuditEventKind::CreateGroupEntry { .. }),
+        "create_group",
+    );
+}
+
+/// On a completed creation the operation context still covers every row up to
+/// and including the trailing `group_context` row, which is recorded without a
+/// context of its own after the outcome, and nothing after the call returns.
+#[tokio::test]
+async fn completed_group_creation_keeps_its_context_until_it_returns() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let recorder = JsonlRecorder::open(&path, "test-engine-completed-create".to_string()).unwrap();
+    let mut engine =
+        current_profile_engine(b"completed-create", Box::new(StubPeeler), Some(recorder));
+    engine
+        .create_group_with_audit_context(
+            group_request(vec![]),
+            Some(human_action_context("create_group")),
+        )
+        .await
+        .expect("create group");
+    record_context_free_rows(&engine);
+    drop(engine);
+
+    let events = read_events(&path);
+    let trailing_group_context = events
+        .iter()
+        .rfind(|event| {
+            matches!(
+                &event.kind,
+                AuditEventKind::GroupContext { reason, .. } if reason == "create_group"
+            )
+        })
+        .expect("create_group group_context row recorded");
+    assert_eq!(human_action(trailing_group_context), Some("create_group"));
+    assert_operation_context_ends_with_operation(
+        &events,
+        |kind| matches!(kind, AuditEventKind::CreateGroupEntry { .. }),
+        "create_group",
+    );
 }

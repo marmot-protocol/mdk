@@ -186,7 +186,9 @@ C hosts use `marmot_attachment_storage_usage`, `marmot_attachment_storage_by_cha
 
 `attachmentTransferSnapshot` and `subscribeAttachmentTransfers` accept the same bounded
 original-slot targets as local access. `next()` returns an initial snapshot then complete
-replacements in target order (maximum four per second). `cancel()` stops observation only;
+replacements in target order. A replacement that changes a row's transfer state, or adds or
+removes a row, arrives as soon as the engine reports it; progress-only replacements are coalesced
+to at most four per second. `cancel()` stops observation only;
 call it to wake pending receivers, then drop/destroy the subscription when its screen leaves. Recreate it when the visible target set
 changes. C provides blocking `next` with a timeout; call off the UI thread. A timeout does not
 consume an update. Close/error/runtime shutdown ends observation. No transfer is requested by lookup.
@@ -212,8 +214,8 @@ missing or otherwise permanently unusable, the job reports `Failed` at once. Oth
 timeouts and connection failures stay retryable. When the group's decryption key for the
 attachment's source epoch is not available locally, the job waits as `RetryScheduled` without
 spending an attempt (15 seconds, doubling) and reports `Failed` on the sixth consecutive miss,
-about eight minutes after the first. Retained-quota pressure still defers without
-that limit; disk-reserve pressure parks the job as `StorageBlocked` (below). `Failed`
+about eight minutes after the first. Disk-reserve pressure does not count toward that
+limit; it parks the job as `StorageBlocked` (below). `Failed`
 survives restart and repeated demand; render a download action. Explicit
 work (Retry, download-again) starts a fresh window and derives a missing key from the group's
 retained MLS state for that epoch (the newest five epochs), so Retry recovers attachments whose
@@ -238,16 +240,15 @@ policy. In `NativeAutomatic` mode automatic acquisition defaults on: 2 GiB retai
 SQLite/WAL headroom, 64 MiB automatic ciphertext ceiling, one runtime-wide acquisition at a time.
 Explicit queued downloads keep the existing 512 MiB hard limit and 15-minute transfer deadline;
 bodies above the automatic cap stream through a private file sink instead of a whole-file
-array, so receiving never buffers more than the automatic cap in memory. Initial disk/quota
-admission reserves the automatic cap (64 MiB by default). As soon as a response declares the
-body size, as the body grows, and again before publication, the job needs the disk reserve
-plus four times the body free, counting the staging, checkpoint and decrypted-file bytes the
-attempt itself still has to write: about four bodies for the in-memory sink (five with a
-strong validator, for its checkpoint), five for the file sink and six for the file sink with
-a strong validator. Automatic transfers have a two-minute deadline. Policy requires retained quota at
-least equal to the automatic cap. Retained-quota pressure appears as `RetryScheduled` with a
-retry time; a body the device cannot publish parks as `StorageBlocked` (see the state table);
-an intentionally high disk reserve can pause work.
+array, so receiving never buffers more than the automatic cap in memory. Initial admission
+needs the disk reserve plus twice the automatic cap (64 MiB by default) free, less any saved
+checkpoint. As soon as a response declares the body size, as the body grows, and again before
+publication, the job needs the disk reserve plus twice the body free: its ciphertext
+checkpoint and its stored file, with bytes already checkpointed counted once and never less
+than the body. Automatic transfers have a two-minute deadline. The policy still requires the
+retained quota to be at least the automatic cap, but the quota no longer limits downloads:
+free disk is the only gate. A body the device cannot publish parks as `StorageBlocked` (see
+the state table); an intentionally high disk reserve can pause work.
 Disable stops active automatic work and pauses automatic queues; explicit work and cached files
 remain. Re-enable preserves individual cancellations/removals. No automatic retained-byte eviction.
 Raising the cap readmits size-policy failures with remaining retry budget, never cryptographic failures. The legacy

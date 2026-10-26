@@ -7,90 +7,236 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Changed
+
+- `marmot_attachment_transfer_subscription_next` returns a replacement that
+  changes a row's transfer state as soon as the engine reports it; progress-only
+  replacements still arrive at most four per second. A timeout no longer loses
+  a replacement that was waiting out that window (#2157).
+- The status a call returns now depends on what the error is, not on which MDK
+  layers wrapped it (mdk#2602). Three answers change:
+  - A busy, closed or full store that the account session reported itself now
+    returns `MARMOT_STATUS_STORAGE_BUSY`, `MARMOT_STATUS_STORAGE_CLOSED` or
+    `MARMOT_STATUS_STORAGE_FULL`, as it does when the engine reports it.
+    Before, it returned `MARMOT_STATUS_RUNTIME`.
+  - An external-signer rejection now returns
+    `MARMOT_STATUS_EXTERNAL_SIGNER_REJECTED` on every path. Before, a rejection
+    on paths other than transport publishes and account open, such as signing
+    an identity proof, returned `MARMOT_STATUS_RUNTIME`.
+  - Wipe outcome reasons follow the same rule. An engine storage failure reads
+    `local storage error`, an unknown engine group `unknown local group`, and
+    any other engine failure `session error`. Account failures outside the
+    engine still read `account error`.
+
+## [0.14.0] - 2026-10-23
+
+Recompile against the matching `marmot.h` and library: every `marmot_client_new*` constructor takes a required
+`deployment`, `MarmotRetentionSweepStatus` values renumber, `MarmotOnboardingFinding` changes layout, and new
+transfer-state, onboarding-issue and status values are appended. Every other existing record layout is unchanged. See the [release notes](../../docs/release/0.14.0.md) and the
+[client upgrade guide](../../docs/integration/0.14.0.md).
+
 ### Breaking changes
 
-- Every `marmot_client_new*` constructor takes a required `const MarmotDeployment *deployment` just before `out_client` (host-configuration brief, PRs 2 and 3). The opaque `MarmotDeployment` (`marmot_deployment_white_noise`, `marmot_deployment_neutral`, the `marmot_deployment_set_*` setters, `marmot_deployment_free`) carries the recovery relays, discovery indexers, media and image servers, Open Ranking, KeyPackage client preference, moderation label namespace and keychain service; the client copies it. A NULL deployment returns `MARMOT_STATUS_NULL_POINTER` before anything opens. White Noise hosts pass `marmot_deployment_white_noise()`, which keeps their behaviour and keychain unchanged; unset values fall back to nothing. `MarmotClientOptions` is unchanged. Use matching regenerated headers and libraries.
+- `MarmotOnboardingFinding` adds typed `context`, `purpose`, `outcome`,
+  `declared_capability`, owned `actions`/`actions_len`, and optional
+  `has_observed_revision`/`observed_revision` (mdk#2565). Rebuild consumers
+  with the regenerated header and matching library; the finding layout and
+  array stride changed. Snapshot deep-free releases finding actions.
+  `MarmotOnboardingIssue` appends `InspectionCompleted` (21); all earlier
+  discriminants are unchanged. Directory-query success does not establish
+  write support or event publication.
+
+- Every `marmot_client_new*` constructor takes a required
+  `const MarmotDeployment *deployment` just before `out_client` (#2408,
+  #2493). Create one with `marmot_deployment_white_noise(&deployment)` or
+  `marmot_deployment_neutral(&deployment)`, change what differs with the
+  `marmot_deployment_set_*` setters, construct, then free it with
+  `marmot_deployment_free`; the client keeps its own copy. A NULL deployment
+  returns `MARMOT_STATUS_NULL_POINTER` before anything opens and leaves a
+  passed secret store with its owner. The deployment carries the recovery
+  relays, discovery indexers, media and image servers, Open Ranking,
+  KeyPackage client preference, moderation label namespace and keychain
+  service. The White Noise preset keeps White Noise's services and keychain
+  unchanged. Neutral configures none and nothing falls back to White Noise's:
+  new groups are text-only, setting or loading a group image fails, a
+  profile-image upload needs an explicit server, and
+  `marmot_configure_moderation_reporting` returns
+  `MARMOT_STATUS_INVALID_MODERATION_REPORT_CONFIG`. Its keychain service is
+  `org.marmot-protocol.mdk`, whereas 0.13.0 used `com.marmot.whitenoise` for
+  every host: a host off the White Noise preset that keeps account secrets in
+  the platform keychain must set that name with
+  `marmot_deployment_set_keychain_service`, or its existing secrets are
+  stranded. The build-time
+  `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` override is gone; use
+  `marmot_deployment_set_new_group_media_endpoints`. `MarmotClientOptions` is
+  unchanged.
+- `MarmotRetentionSweepStatus` drops `DEFERRED_SCAN_EXHAUSTED` with the
+  sweep's page scan (#2469, mdk#2425), so
+  `MARMOT_RETENTION_SWEEP_STATUS_FAILED` moves from 5 to 4. A host built
+  against the 0.13.0 header reads a failed sweep as scan exhaustion.
 
 ### Added
 
-- `marmot_attachment_keep_media` and `marmot_set_attachment_keep_media` with
-  `MarmotAttachmentKeepMedia`: the opt-in "Keep media" setting (mdk#2314
-  step 10). `MarmotAttachmentTransferState` appends
-  `MARMOT_ATTACHMENT_TRANSFER_STATE_CLEANED_BY_SETTING` (18) after
-  `STORAGE_BLOCKED`; earlier discriminants keep their values.
-
-- `MarmotAttachmentStorageUsage.cache_bytes`: the avatar and group-image
-  cache, each stored image once (mdk#2314 step 9). Appended after
-  `migration_bytes`.
-
-- `MarmotAttachmentMigrationState` adds `MARMOT_ATTACHMENT_MIGRATION_STATE_COMPACTING`
-  (the account database is being compacted; mdk#2314 step 6). Existing values
-  keep their numbers. Use matching regenerated headers and libraries.
-
-- `MarmotAttachmentStorageUsage` adds `migration`
-  (`MarmotAttachmentMigrationState`) and `migration_bytes`: where the
-  background move of legacy database bodies into the media store stands
-  (mdk#2314 step 6). The struct layout changes; use matching regenerated
-  headers and libraries.
-
-- Add Manage storage calls (mdk#2314 step 5): `marmot_attachment_storage_usage`,
+- Add Manage storage calls (#2424, mdk#2314): `marmot_attachment_storage_usage`,
   `marmot_attachment_storage_by_chat`, `marmot_largest_retained_attachments`,
   `marmot_remove_chat_attachments` and `marmot_remove_attachments_older_than`,
   with records freed by `marmot_attachment_storage_usage_free`,
-  `marmot_chat_storage_page_free` and `marmot_retained_attachments_page_free`
-  (page cursors are borrowed from their page). Use matching regenerated headers
-  and libraries.
+  `marmot_chat_storage_page_free` and `marmot_retained_attachments_page_free`.
+  The two listings take 1..=256 rows per page. Page cursors are borrowed from
+  their page: keep it alive while passing its `next_cursor`.
+  `MarmotAttachmentStorageUsage` holds `media_bytes`, `legacy_bytes`,
+  `attachment_count`, `database_bytes`, `database_free_bytes`, `migration`,
+  `migration_bytes` and `cache_bytes` (the avatar and group-image cache, each
+  image once). `migration` is a
+  `MarmotAttachmentMigrationState` (`NOT_NEEDED` 0, `RUNNING` 1, `PAUSED` 2,
+  `COMPLETE` 3, `COMPACTING` 4) for the background move of legacy database
+  bodies into the media store and the compaction after it (#2467, #2496,
+  #2527); `migration_bytes` is what remains to move while `RUNNING` and the
+  free space needed while `PAUSED`, otherwise 0.
+
+- `marmot_attachment_keep_media` and `marmot_set_attachment_keep_media` read
+  and set the opt-in per-account "Keep media" window as a
+  `MarmotAttachmentKeepMedia` discriminant (`FOREVER` 0, the default,
+  `ONE_YEAR` 1, `SIX_MONTHS` 2, `THIRTY_DAYS` 3) (#2541, mdk#2314). Setting a
+  window removes the retained attachments already past it before returning
+  and writes their count; the runtime then applies it at start and hourly.
 
 - Add `marmot_open_attachment_handoff` and `marmot_release_attachment_handoff`
   (record `MarmotAttachmentHandoff`, freed with `marmot_attachment_handoff_free`,
-  which does not release the lease) for handoff copies of retained attachments
-  (mdk#2314 step 4). Use matching regenerated headers and libraries.
+  which does not release the lease) for plaintext handoff copies of retained
+  attachments (#2398, mdk#2314). Release every lease: removing the attachment
+  does not revoke its copy. Copies are unsupported on Windows; an unsupported
+  or cancelled copy returns `MARMOT_STATUS_INVALID_MEDIA_REFERENCE`.
 
-- Add `marmot_cached_public_event_previews` and `marmot_resolve_public_event_preview` (record `MarmotPublicEventPreview`, enum `MarmotPublicEventPreviewState`, freed with `marmot_public_event_preview_free` / `marmot_public_event_preview_list_free`) for cached public Nostr event previews (mdk#1547), and `MARMOT_STATUS_INVALID_PUBLIC_EVENT_REFERENCES` (103) for a read of more than 16 references. Use matching regenerated headers and libraries.
+- Add account-wide attachment history (#2233):
+  `marmot_account_attachment_history_page` takes a borrowed
+  `MarmotAccountAttachmentQuery` (group and sender arrays of at most 100
+  entries, `uint8_t`-flagged timeline bounds), 1..=100 candidates and an
+  optional borrowed cursor, and returns a `MarmotAccountAttachmentPageRead`
+  freed with `marmot_account_attachment_page_read_free`. The page's `version`
+  and `next_cursor` are borrowed from it; `marmot_account_attachment_version_clone`
+  makes a baseline that outlives it, `marmot_account_attachment_history_version`
+  reads the current one, `marmot_account_attachment_version_change_since`
+  compares them and `marmot_account_attachment_version_free` frees standalone
+  versions. Reads start no acquisition or relay work; group history remains
+  supported.
+
+- Add `marmot_cached_public_event_previews` (local cache only) and
+  `marmot_resolve_public_event_preview` (fetches when missing or stale), with
+  record `MarmotPublicEventPreview`, enum `MarmotPublicEventPreviewState` and
+  frees `marmot_public_event_preview_free` /
+  `marmot_public_event_preview_list_free`, for cached public Nostr event
+  previews (#2304, mdk#1547). `MARMOT_STATUS_INVALID_PUBLIC_EVENT_REFERENCES`
+  (103) reports a read of more than 16 references. The account's directory
+  cache gains migration 2, which older libraries refuse.
 
 - Add `MARMOT_STATUS_FOLLOW_LIST_TOO_LARGE` (107): `marmot_follow_user` and
   `marmot_unfollow_user` published nothing because the account's kind-3 list
-  has 2,048 follows or more, the most MDK reads from one list (mdk#2268). Both
-  now keep the list's petnames, relay hints, other tags and content. Use
-  matching regenerated headers and libraries.
+  has 2,048 follows or more, the most MDK reads from one list (#2529,
+  mdk#2268). Both now keep the list's petnames, relay hints, other tags and
+  content; before, they rebuilt it from bare `p` tags.
 
-- Add `MARMOT_STATUS_STORAGE_FULL` (106): the device has no room for the operation (mdk#2314).
-  Media uploads return it when an attachment cannot be stored locally beyond the disk reserve,
-  before anything is uploaded; a full disk or database elsewhere also returns it instead of the
-  generic runtime status. Use matching regenerated headers and libraries.
+- Add `MARMOT_STATUS_STORAGE_FULL` (106): the device has no room for the
+  operation (#2384, mdk#2314). A media upload returns it before anything is
+  uploaded when the disk cannot hold the body beyond the disk reserve, and so
+  does a handoff copy; a full disk or database elsewhere also returns it
+  instead of the generic runtime status.
 
-- Add `MARMOT_STATUS_DIRECTORY_LOOKUP_INCOMPLETE` (104): a relay-list or KeyPackage lookup for an
-  account ran out of time or relay coverage, so nothing is known to be missing (mdk#2302). Offer
-  retry. These failures previously returned the generic runtime status. Use matching regenerated
-  headers and libraries.
+- Add `MARMOT_STATUS_DIRECTORY_LOOKUP_INCOMPLETE` (104): a relay-list or
+  KeyPackage lookup for an account ran out of time or relay coverage, so
+  nothing is known to be missing (#2308, mdk#2302). Offer retry. These
+  failures previously returned the generic runtime status.
 
-- Account attachment pages, bounded borrowed query inputs and opaque cursor/version handles with deep-free and version-clone functions. New records/symbols require matching headers and libraries; existing group history remains supported.
+- Add `marmot_send_prepared_media_with_client_token` for captured
+  ordinary-media admission and conditional draft consumption (#2229). Inputs
+  are borrowed; the nullable captured revision remains owned by its
+  selected-draft root. The owned result uses the existing
+  `marmot_local_send_acceptance_free`.
 
-- Add `marmot_send_prepared_media_with_client_token` for captured ordinary-media admission and conditional draft consumption. Inputs are borrowed; the nullable captured revision remains owned by its selected-draft root. The owned result uses the existing `marmot_local_send_acceptance_free`; layouts and status values are unchanged. Use matching regenerated headers and libraries.
+- Add `MARMOT_STATUS_GROUP_CATCHING_UP` (101): a group change was refused
+  because unresolved epoch-gap recovery covers the group's current local
+  epoch (#2273, mdk#2258). Retry after it syncs, or call the new
+  `marmot_acknowledge_group_catching_up` once the user accepts that the change
+  may split the group, then retry. Messages and `marmot_leave_group` are not
+  held.
 
-- Add `MARMOT_STATUS_GROUP_CATCHING_UP` (101): a group change was refused because unresolved epoch-gap recovery covers the group's current local epoch (mdk#2258). Retry after it syncs, or call the new `marmot_acknowledge_group_catching_up` once the user accepts that the change may split the group, then retry. Use matching regenerated headers and libraries.
+- Add `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED` (102): a group change was
+  refused because the group's last change has been owed to a group relay for
+  two minutes (#2288, mdk#2255). Add `marmot_group_commit_delivery` (record
+  `MarmotGroupCommitDelivery`, freed with `marmot_group_commit_delivery_free`)
+  to list the owed relays, and `marmot_acknowledge_group_commit_undelivered`
+  to let one change through once the user accepts the risk.
 
-- Add `MARMOT_STATUS_GROUP_COMMIT_UNDELIVERED` (102): a group change was refused because the group's last change has not reached every group relay yet (mdk#2255). Add `marmot_group_commit_delivery` (record `MarmotGroupCommitDelivery`, freed with `marmot_group_commit_delivery_free`) to list the owed relays, and `marmot_acknowledge_group_commit_undelivered` to let one change through once the user accepts the risk. Use matching regenerated headers and libraries.
-
-- Add `MARMOT_STATUS_INVALID_EDIT_TARGET` (105), returned by `marmot_edit_message`: an edit is refused, publishing nothing, unless its target is an available chat message this account sent. Before, it was published and then ignored by every recipient. Existing status values are unchanged. Use matching regenerated headers and libraries.
+- Add `MARMOT_STATUS_INVALID_EDIT_TARGET` (105), returned by
+  `marmot_edit_message` unless its target is an available chat message this
+  account sent, and by `marmot_edit_local_message_with_client_token` when the
+  original was deleted or withdrawn (#2299). Nothing is published. Before, the
+  edit was published and then ignored by every recipient.
 
 ### Changed
 
-- `MarmotRetentionSweepStatus` drops `DeferredScanExhausted` with the sweep's
-  page scan (mdk#2425). `MARMOT_RETENTION_SWEEP_STATUS_FAILED` moves from 5
-  to 4; a host built against the old header reads a failed sweep as scan
-  exhaustion. Recompile against the regenerated `marmot.h` with the matching
-  library.
-- Recipients with only obsolete KeyPackages now return `MARMOT_STATUS_MISSING_KEY_PACKAGE` (15)
-  instead of `MARMOT_STATUS_INVALID_KEY_PACKAGE_EVENT`; the error detail ends in
-  `[obsolete_only]` (or `[not_found]`) (mdk#1975). Status values are unchanged.
 - `MarmotAttachmentTransferState` appends
-  `MARMOT_ATTACHMENT_TRANSFER_STATE_STORAGE_BLOCKED`; existing discriminants
-  are unchanged. Recompile against the regenerated `marmot.h` with the matching
-  library and handle the new value as "free up storage", not as a retry timer.
+  `MARMOT_ATTACHMENT_TRANSFER_STATE_STORAGE_BLOCKED` (17; #2249) and
+  `MARMOT_ATTACHMENT_TRANSFER_STATE_CLEANED_BY_SETTING` (18; #2541); earlier
+  discriminants keep their values. Handle `STORAGE_BLOCKED` as "free up
+  storage", not as a retry timer; `CLEANED_BY_SETTING` marks an attachment
+  "Keep media" removed, and downloading it again is allowed.
+- Attachment bodies are encrypted files under the account's `media/`
+  directory instead of account-database rows: downloads, their checkpoints
+  and the bodies a send stages before uploading (#2329, #2349, #2353, #2384,
+  mdk#2314). Avatars and group images follow as cache files (#2504, #2527),
+  and legacy bodies move in the background. Exclude the whole account
+  directory from cloud and device backups. `marmot_read_attachment_asset`
+  reads either layout. Download checkpoints from 0.13.0 are discarded, so
+  interrupted downloads restart. `MarmotAttachmentDownloadPolicy.retained_bytes`
+  no longer gates downloads: a download needs the disk reserve plus twice the
+  body. A full table of 256 uploads awaiting publication fails the send,
+  publishing nothing.
+- Account, cache and external-signer databases move to raw SQLCipher keys on
+  first open through a one-time, crash-safe rekey (#2549, mdk#1791). Older
+  libraries cannot open a migrated database. Keep the `.salt` sidecars and
+  secret-store credentials; see the
+  [offline downgrade](../../docs/marmot-architecture/storage-format-v2.md#offline-downgrade)
+  procedure.
+- `marmot_watch_agent_text_stream` and `marmot_agent_publisher_new` given no
+  `server_cert_der` verify the QUIC broker against the bundled Mozilla roots
+  (`webpki-roots`) instead of the OS trust store (#2331, mdk#2324). Pin a
+  broker behind a private or enterprise CA by passing that CA's root
+  certificate.
+- `marmot_control_attachment` Remove unlinks the released media file before
+  returning (#2410), and fails before removing anything when the media store
+  cannot open (#2424).
+- Account maintenance publishes a self-update for each group whose own leaf
+  does not advertise every supported component, at a persisted random time
+  within five days, so existing groups can adopt new components (#2292). These
+  commits wait behind the same group-change holds.
+- Recipients with only obsolete KeyPackages now return
+  `MARMOT_STATUS_MISSING_KEY_PACKAGE` (15) instead of
+  `MARMOT_STATUS_INVALID_KEY_PACKAGE_EVENT`; the error detail ends in
+  `[obsolete_only]` (or `[not_found]`) (#2305, mdk#1975).
 - On OpenBSD, `c-bindings.sh` builds SQLCipher without `mlock` and with
-  concealed allocations, so hosts can run under `pledge(2)`. Other platforms
-  are unchanged.
+  concealed allocations, so hosts can run under `pledge(2)` (#2468). Other
+  platforms are unchanged.
+
+### Fixed
+
+- `marmot_sweep_expired_retention` no longer prunes an expired message the
+  unread count still shows (#2469, mdk#2425).
+- `marmot_approve_onboarding_repair` and its `_in_epoch` form approve a
+  replacement only once every onboarding source, including the relays in the
+  signed relay declaration, has completed its freshness query; otherwise the
+  step reports a retryable failure (#2545).
+- C hosts receive `marmot-app`'s 0.14.0 runtime fixes without code changes,
+  among them batched live group REQs (#2310), closed leaked REQs and paged
+  relay-clamped replays (#2274), ordered offline catch-up (#2513), epoch-gap
+  fallback paging (#2298, #2500), self-update fanout retries (#2275),
+  storage-blocked downloads that no longer retry forever (#2249) and stall
+  detection after notification wakes (#2343). Events a relay rejected
+  terminally are not resent (#2523), and strict directory fetches use at most
+  three filters per REQ (#2525). See the
+  [marmot-app changelog](../marmot-app/CHANGELOG.md).
+- Dependency updates fix RUSTSEC-2026-0365 in `negentropy` (#2377) and
+  RUSTSEC-2026-0381/0382 in `webpki-roots` and `rustls-webpki` (#2516).
 
 ## [0.13.0] - 2026-10-12
 
@@ -573,7 +719,8 @@ downgrade is unsupported. See the [cohort upgrade notes](../cli/CHANGELOG.md#092
   just a local account's. Both return `MarmotAccountRelayLists`.
   ([#1605](https://github.com/marmot-protocol/mdk/pull/1605))
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.13.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.14.0...HEAD
+[0.14.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.13.0...marmotc-v0.14.0
 [0.13.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.12.0...marmotc-v0.13.0
 [0.12.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.11.0...marmotc-v0.12.0
 [0.11.0]: https://github.com/marmot-protocol/mdk/compare/marmotc-v0.10.4...marmotc-v0.11.0

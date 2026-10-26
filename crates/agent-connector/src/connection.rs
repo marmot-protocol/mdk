@@ -231,7 +231,6 @@ impl AgentConnector {
         result
     }
 
-    /// Dispatch a one-shot control request without adding operation telemetry.
     async fn handle_request_unobserved(
         &self,
         request_id: Option<&str>,
@@ -301,7 +300,7 @@ impl AgentConnector {
                 description,
                 relays,
             } => {
-                self.create_group_with_admins_response(
+                self.create_group_response(
                     &account_id_hex,
                     name,
                     members,
@@ -318,8 +317,15 @@ impl AgentConnector {
                 description,
                 relays,
             } => {
-                self.create_group_response(&account_id_hex, name, members, description, relays)
-                    .await
+                self.create_group_response(
+                    &account_id_hex,
+                    name,
+                    members,
+                    Vec::new(),
+                    description,
+                    relays,
+                )
+                .await
             }
             AgentControlRequest::GroupLeave {
                 account_id_hex,
