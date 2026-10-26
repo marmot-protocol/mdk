@@ -15,7 +15,9 @@ owns the local account home, account records, signing-key storage, and the coord
   (patterned after White Noise) and a local file backend for deterministic tests and development.
 - Journals account setup and onboarding so an interrupted setup can resume or be cancelled cleanly.
 - Exports a signing key as a NIP-49 `ncryptsec` backup.
-- Activates the transport account for one local `AccountDeviceSession`.
+- Opens one local `AccountDeviceSession` from a `SessionConfig` (`AccountDeviceRuntime::open`) and is the host's only
+  way to it. The `test-support` feature exposes the session itself, for tests that drive it directly.
+- Activates the transport account for that session.
 - Publishes fresh KeyPackages through an injected boundary, and drives KeyPackage generator upgrades.
 - Turns `SessionEffects.publish` work into `TransportPublishRequest`s, then confirms or rolls back pending session state
   from the adapter's publish reports.

@@ -8,7 +8,7 @@ use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
-use cgka_session::{AccountDeviceSession, PublishWork, SessionConfig};
+use cgka_session::{AccountDeviceSession, PublishWork, SessionConfig, SessionError};
 use cgka_traits::app_components::{
     AppComponentData, GROUP_MESSAGE_RETENTION_COMPONENT_ID, default_group_components,
 };
@@ -1021,6 +1021,61 @@ async fn activate_transport_uses_session_identity_and_policy() {
         vec![TransportEndpoint("wss://inbox.example".into())]
     );
     assert_eq!(activations[0].since, Some(Timestamp(10)));
+}
+
+/// The host's transport is built only once the session is open, and never
+/// when the open fails: building it can register the account's delivery route.
+#[tokio::test]
+async fn open_builds_the_transport_only_after_the_session_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot account open key").unwrap();
+    let config = || {
+        SessionConfig::new(
+            path.clone(),
+            SqlCipherKey::new(key.as_secret_str()).unwrap(),
+            pad32(b"alice"),
+            Box::new(MockPeeler),
+        )
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+            keys: deterministic_nostr_keys(b"alice"),
+        }))
+    };
+    let transport = || {
+        (
+            RecordingAdapter::default(),
+            StaticTransportRouting::new(vec![TransportEndpoint("wss://inbox.example".into())]),
+            RecordingKeyPackages::default(),
+        )
+    };
+
+    // Strict cutover refuses a legacy-profile session before storage opens.
+    let mut built = false;
+    let refused =
+        AccountDeviceRuntime::open(config().protocol_profile(ProtocolProfile::Legacy), || {
+            built = true;
+            Ok::<_, SessionError>(transport())
+        });
+    assert!(matches!(
+        refused,
+        Err(SessionError::Engine(cgka_traits::EngineError::Other(_)))
+    ));
+    assert!(!built, "a failed open must not build the transport");
+
+    let mut opened_first = false;
+    let (adapter, routing, key_packages) = transport();
+    let runtime =
+        AccountDeviceRuntime::open(config().protocol_profile(ProtocolProfile::Current), || {
+            opened_first = path.exists();
+            Ok::<_, SessionError>((adapter.clone(), routing, key_packages))
+        })
+        .unwrap();
+    assert!(
+        opened_first,
+        "the session opens before the transport is built"
+    );
+    runtime.activate_transport(None).await.unwrap();
+    assert_eq!(adapter.activations()[0].account_id, runtime.self_id());
 }
 
 #[tokio::test]

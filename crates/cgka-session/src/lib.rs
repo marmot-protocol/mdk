@@ -7,10 +7,13 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+pub use cgka_engine::KeyPackageMetadata;
 use cgka_engine::account_identity_proof::AccountIdentityProofSigner;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 pub use cgka_engine::engine::WelcomeDeliveryIndex;
 use cgka_engine::feature_registry::FeatureRegistry;
+pub use cgka_engine::group_authority::CanonicalGroupMembership;
+pub use cgka_engine::key_package::KeyPackageRequirements;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
 use cgka_traits::engine::{
@@ -266,6 +269,31 @@ pub struct AccountDeviceSession {
     /// the runtime and the app take their own from [`Self::audit_recorder`].
     audit: SharedRecorder,
     open_timings: SessionOpenTimings,
+}
+
+/// A session lent for one read: a group's live authority alongside the
+/// session's own store, in one snapshot. It reaches nothing else, so code a
+/// host hands it to cannot skip the runtime that owns the session (mdk#2602).
+#[derive(Clone, Copy)]
+pub struct GroupAuthorityView<'a> {
+    session: &'a AccountDeviceSession,
+}
+
+impl GroupAuthorityView<'_> {
+    /// See [`AccountDeviceSession::with_group_authority_snapshot`].
+    pub fn with_group_authority_snapshot<T, E>(
+        &self,
+        group_id: &GroupId,
+        read: impl FnOnce(
+            &SqliteAccountStorage,
+            cgka_engine::group_authority::GroupAuthoritySnapshot,
+        ) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<cgka_traits::StorageError> + From<SessionError>,
+    {
+        self.session.with_group_authority_snapshot(group_id, read)
+    }
 }
 
 /// Aggregate progress of one background hydration batch (mdk#1161).
@@ -1449,6 +1477,12 @@ impl AccountDeviceSession {
             let authority = self.group_authority(group_id).map_err(E::from)?;
             read(storage, authority)
         })
+    }
+
+    /// A read view whose one method is [`Self::with_group_authority_snapshot`],
+    /// for code a host hands the session to rather than calls it through.
+    pub fn group_authority_view(&self) -> GroupAuthorityView<'_> {
+        GroupAuthorityView { session: self }
     }
 
     pub fn disband_request(

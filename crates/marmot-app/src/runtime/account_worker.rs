@@ -1081,7 +1081,7 @@ async fn run_app_runtime_account_worker(
     // separately below).
 
     {
-        let open_timings = client.runtime.session().open_timings();
+        let open_timings = client.runtime.open_timings();
         let telemetry = shared.app_performance_telemetry();
         telemetry.record(
             AppPerformanceOperation::AccountSessionOpen,
@@ -3682,7 +3682,10 @@ fn run_legacy_message_promotion_batch(
     schedule: &mut LegacyMessagePromotionSchedule,
 ) {
     run_legacy_message_promotion_batch_with(schedule, |limit| {
-        client.runtime.session().promote_legacy_message_rows(limit)
+        client
+            .engine_storage
+            .promote_legacy_message_rows(limit)
+            .map_err(cgka_session::SessionError::from)
     });
 }
 
@@ -3771,7 +3774,7 @@ async fn run_startup_hydration_pipeline(
     shutdown: &mut oneshot::Receiver<()>,
     lifecycle: &RuntimeLifecycle,
 ) -> StartupHydrationOutcome {
-    if client.runtime.session().unhydrated_group_ids().is_empty() {
+    if client.runtime.unhydrated_group_ids().is_empty() {
         finish_deferred_hydration_reconciliation(client);
         return StartupHydrationOutcome::Completed;
     }
@@ -3866,7 +3869,6 @@ async fn run_startup_hydration_pipeline(
         }
         let progress = match client
             .runtime
-            .session_mut()
             .hydrate_next_groups(&hydration_order, STARTUP_HYDRATION_BATCH_SIZE)
         {
             Ok(progress) => progress,
@@ -3931,7 +3933,6 @@ pub(crate) async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(
     loop {
         let progress = client
             .runtime
-            .session_mut()
             .hydrate_next_groups(&[], STARTUP_HYDRATION_BATCH_SIZE)?;
         if progress.remaining == 0 {
             client.record_v5_baselines(marmot_forensics::v5::BaselineReason::Opened);
@@ -3990,10 +3991,7 @@ async fn handle_startup_hydration_command(
             let _ = respond.send(result);
         }
         AccountWorkerCommand::Members { group_id, respond } => {
-            let _ = client
-                .runtime
-                .session_mut()
-                .ensure_group_hydrated(&group_id);
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
             let _ = respond.send(client.members(&group_id));
         }
         AccountWorkerCommand::MemberIdsPage { group_ids, respond } => {
@@ -4028,10 +4026,7 @@ async fn handle_startup_hydration_command(
             }
         }
         AccountWorkerCommand::GroupMlsState { group_id, respond } => {
-            let _ = client
-                .runtime
-                .session_mut()
-                .ensure_group_hydrated(&group_id);
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
             let _ = respond.send(client.group_mls_state(&group_id));
         }
         AccountWorkerCommand::GroupRoster { group_id, respond } => {
@@ -5221,10 +5216,7 @@ fn account_worker_command_future<'a>(
             // pipeline hydrated everything), but if the pipeline aborted on a
             // storage error the leftover groups must still promote on first
             // read instead of surfacing GroupHydrationPending forever.
-            let _ = client
-                .runtime
-                .session_mut()
-                .ensure_group_hydrated(&group_id);
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
             let result = client.members(&group_id);
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
@@ -5272,10 +5264,7 @@ fn account_worker_command_future<'a>(
         AccountWorkerCommand::GroupMlsState { group_id, respond } => Box::pin(async move {
             // See the Members arm: on-demand promotion for pipeline-abort
             // leftovers.
-            let _ = client
-                .runtime
-                .session_mut()
-                .ensure_group_hydrated(&group_id);
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
             let result = client.group_mls_state(&group_id);
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
@@ -5374,10 +5363,7 @@ fn account_worker_command_future<'a>(
             respond,
         } => Box::pin(async move {
             let result = (|| {
-                client
-                    .runtime
-                    .session_mut()
-                    .ensure_group_hydrated(&group_id)?;
+                client.runtime.ensure_group_hydrated(&group_id)?;
                 client.group_app_component(&group_id, component_id)
             })();
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
@@ -6460,10 +6446,7 @@ fn group_recovery_after_hydration(
     client: &mut AppClient,
     group_id: &GroupId,
 ) -> Result<crate::GroupRecoveryStatus, AppError> {
-    client
-        .runtime
-        .session_mut()
-        .ensure_group_hydrated(group_id)?;
+    client.runtime.ensure_group_hydrated(group_id)?;
     client.group_recovery_status(group_id)
 }
 
@@ -6633,10 +6616,7 @@ pub(super) fn group_roster_after_hydration(
     client: &mut AppClient,
     group_id: &GroupId,
 ) -> Result<crate::groups::AppGroupRosterSession, AppError> {
-    client
-        .runtime
-        .session_mut()
-        .ensure_group_hydrated(group_id)?;
+    client.runtime.ensure_group_hydrated(group_id)?;
     client.group_roster_session(group_id)
 }
 
@@ -6649,10 +6629,7 @@ fn member_ids_page_after_hydration(
     // UnknownGroup. Build the response only after all requested rosters pass
     // that gate so callers never receive a partial page.
     for group_id in group_ids {
-        let _live = client
-            .runtime
-            .session_mut()
-            .ensure_group_hydrated(group_id)?;
+        let _live = client.runtime.ensure_group_hydrated(group_id)?;
     }
     client.member_ids_page(group_ids)
 }

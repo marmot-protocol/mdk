@@ -24,8 +24,17 @@ thiserror.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
 
+[features]
+# The session accessors and `AccountDeviceRuntime::new`, for tests that drive
+# the session directly to set up scenarios. Production opens the runtime with
+# `AccountDeviceRuntime::open` and reaches the session only through it.
+# Enable only as a dev-dependency.
+test-support = []
+
 [dev-dependencies]
 cgka-engine.workspace = true
+# This crate's own integration tests reach the session accessors.
+marmot-account = { workspace = true, features = ["test-support"] }
 rusqlite.workspace = true
 storage-sqlite.workspace = true
 tempfile.workspace = true

@@ -839,13 +839,13 @@ impl AppClient {
     /// immediate worker pass. Ambiguous fanouts keep their original clocks.
     pub(crate) fn note_connectivity_restored(&mut self) -> Result<usize, AppError> {
         let mut woken_targets = 0;
-        for mut fanout in self.runtime.session().outbound_fanouts()? {
+        for mut fanout in self.runtime.outbound_fanouts()? {
             let woken = fanout.wake_retryable_unavailable_targets();
             if woken == 0 {
                 continue;
             }
             let group_id = fanout.group_id().cloned();
-            self.runtime.session().put_outbound_fanout(&fanout)?;
+            self.runtime.put_outbound_fanout(&fanout)?;
             if let Some(group_id) = group_id {
                 self.pending_convergence_groups.insert(group_id);
             }
@@ -5955,7 +5955,7 @@ impl AppClient {
         let buffered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let progress_updates = buffered.clone();
         let observe = std::sync::Arc::new(
-            move |session: &cgka_session::AccountDeviceSession,
+            move |view: cgka_session::GroupAuthorityView<'_>,
                   published: &marmot_account::PublishedApplicationMessage| {
                 // UPDATE-only finalization cannot create absent rows or clear an
                 // invalidation. Revival requires the live-group check in the final
@@ -5976,7 +5976,7 @@ impl AppClient {
                         // may have no SQL delta but still owes a fresh checkpoint.
                         crate::runtime::publish_conversation_captures_from_session(
                             &conversation_captures,
-                            session,
+                            view,
                             &app,
                             &label,
                             &published.group_id,
@@ -6181,7 +6181,7 @@ impl AppClient {
             .map(|((group, _), _)| group.clone())
             .collect::<HashSet<_>>();
         for group in groups {
-            let fanouts = match self.runtime.session().outbound_fanouts_for_group(&group) {
+            let fanouts = match self.runtime.outbound_fanouts_for_group(&group) {
                 Ok(fanouts) => fanouts,
                 Err(error) => {
                     self.pending_runtime_group_subscription_refresh = true;
@@ -6322,7 +6322,6 @@ impl AppClient {
                 })
                 .and_then(|profile| {
                     self.runtime
-                        .session()
                         .canonical_group_membership(&message.group_id)
                         .map_err(AppError::from)
                         .map(|membership| (profile, membership.member_leaves))
@@ -6727,7 +6726,6 @@ impl AppClient {
                 if !self.has_local_group_deletion_frontier(group_id)?
                     && !self
                         .runtime
-                        .session()
                         .leave_in_progress(group_id)
                         .map_err(cgka_session::SessionError::from)? =>
             {
@@ -6777,7 +6775,6 @@ impl AppClient {
             || self.has_local_group_deletion_frontier(group_id)?
             || self
                 .runtime
-                .session()
                 .leave_in_progress(group_id)
                 .map_err(cgka_session::SessionError::from)?
         {
@@ -6785,7 +6782,6 @@ impl AppClient {
         }
         if self
             .runtime
-            .session()
             .canonical_group_membership(group_id)?
             .local_leaf_active
         {
