@@ -224,7 +224,7 @@ async fn publication_barrier_keeps_pending_mls_after_quorum() {
         .await
         .unwrap();
     let (message, pending) = match &effects.publish[0] {
-        cgka_session::PublishWork::GroupEvolution { msg, pending, .. } => (msg.clone(), *pending),
+        marmot_session::PublishWork::GroupEvolution { msg, pending, .. } => (msg.clone(), *pending),
         other => panic!("expected staged evolution, got {other:?}"),
     };
     let transport_group_id = match &message.envelope {

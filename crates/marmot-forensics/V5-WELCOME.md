@@ -5,7 +5,7 @@ is enabled, `marmot-app` opens `JsonlRecorder::open_v5_with_account_ref` and
 writes `<account_dir>/audit-<engine_id>-v5.jsonl`. The Welcome events below are
 recorded on the live app paths: founding preparation, receipt, peel, engine join,
 app checkpoints and group baselines in `marmot-app`'s `client/audit_v5_probe.rs`,
-and publication start/finish/not-started at the `marmot-account` runtime owner.
+and publication start/finish/not-started at the `marmot-session` runtime owner.
 v5 network delivery uses the dedicated OTLP sender, which hosts
 configure with the UniFFI/C `set_audit_otlp_config_v5` and drive with
 `post_audit_log_tracker_update_v5`.

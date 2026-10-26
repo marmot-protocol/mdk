@@ -1018,28 +1018,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cgka-session"
-version = "0.15.0-dev"
-dependencies = [
- "async-trait",
- "cgka-engine",
- "cgka-traits",
- "hex",
- "marmot-forensics",
- "nostr 0.45.5",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "storage-sqlite",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "transport-nostr-adapter",
- "transport-nostr-peeler",
-]
-
-[[package]]
 name = "cgka-traits"
 version = "0.15.0-dev"
 dependencies = [
@@ -3608,27 +3586,16 @@ version = "0.15.0-dev"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
- "async-trait",
- "cgka-engine",
- "cgka-session",
- "cgka-traits",
  "fs-private",
- "futures",
  "hex",
  "keyring-core",
  "libc",
- "marmot-account",
- "marmot-forensics",
  "nostr 0.45.5",
- "rand 0.8.6",
- "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "storage-sqlite",
  "tempfile",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
  "windows-native-keyring-store",
  "zbus-secret-service-keyring-store",
@@ -3644,7 +3611,6 @@ dependencies = [
  "base64",
  "bytes",
  "cgka-engine",
- "cgka-session",
  "cgka-traits",
  "chacha20poly1305 0.10.1",
  "chrono",
@@ -3661,6 +3627,7 @@ dependencies = [
  "marmot-account",
  "marmot-forensics",
  "marmot-markdown",
+ "marmot-session",
  "media-store",
  "nostr 0.45.5",
  "nostr-directory",
@@ -3741,6 +3708,32 @@ version = "0.15.0-dev"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "marmot-session"
+version = "0.15.0-dev"
+dependencies = [
+ "async-trait",
+ "cgka-engine",
+ "cgka-traits",
+ "futures",
+ "hex",
+ "marmot-forensics",
+ "marmot-session",
+ "nostr 0.45.5",
+ "rand 0.8.6",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "storage-sqlite",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "transport-nostr-adapter",
+ "transport-nostr-peeler",
 ]
 
 [[package]]

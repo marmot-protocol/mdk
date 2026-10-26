@@ -10,12 +10,11 @@
 //! C status and `wn-cli` the CLI code. A call that moves between layers keeps its answers; a change to
 //! any answer fails the crate that owns it.
 
-use cgka_session::SessionError;
 use cgka_traits::TransportAdapterError;
 use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageError;
 use cgka_traits::types::GroupId;
-use marmot_account::AccountError;
+use marmot_session::{AccountError, SessionError};
 
 use crate::{AppError, EXTERNAL_SIGNER_REJECTED, SyncErrorClass};
 

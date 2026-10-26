@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use cgka_session::{PublishWork, SessionEffects};
 use cgka_traits::engine::WelcomeMetadata;
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::{Group, ProtocolProfile};
@@ -22,6 +21,7 @@ use cgka_traits::transport::EncryptedPayload;
 use cgka_traits::types::MemberId;
 use cgka_traits::{GroupEvent, GroupId, MessageId, TransportMessage};
 use marmot_forensics::v5::*;
+use marmot_session::{PublishWork, SessionEffects};
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent, WelcomePeelProvenance};
 
 use crate::AppGroupRecord;

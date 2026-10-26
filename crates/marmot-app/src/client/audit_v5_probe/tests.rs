@@ -1327,7 +1327,7 @@ async fn no_op_welcome_replay_does_not_label_unrelated_checkpoint() {
         assert_eq!(scenario.joins().len(), 1);
         scenario
             .bob
-            .observe_drained_session_events(&marmot_account::AccountDeviceEffects {
+            .observe_drained_session_events(&marmot_session::AccountDeviceEffects {
                 events: vec![event],
                 ..Default::default()
             })

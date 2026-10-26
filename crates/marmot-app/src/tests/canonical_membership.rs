@@ -62,8 +62,8 @@ pub(super) async fn deliver_new(
 
 /// Delay only app projection, retaining every native effect from the owning runtime.
 fn collect_effects(
-    batch: &mut marmot_account::AccountDeviceEffects,
-    mut effects: marmot_account::AccountDeviceEffects,
+    batch: &mut marmot_session::AccountDeviceEffects,
+    mut effects: marmot_session::AccountDeviceEffects,
 ) {
     macro_rules! append {
         ($($field:ident),+ $(,)?) => {
@@ -97,7 +97,7 @@ async fn collect_new_deliveries(
     client: &mut AppClient,
     relay: &ScriptedPushRelayClient,
     cursor: &mut usize,
-    batch: &mut marmot_account::AccountDeviceEffects,
+    batch: &mut marmot_session::AccountDeviceEffects,
 ) {
     let events = relay.published_events.lock().unwrap().clone();
     let account = client
@@ -222,7 +222,7 @@ async fn real_departure_then_disband_projects_after_mls_deletion() {
     tokio::time::sleep(Duration::from_millis(delay + 1)).await;
     alice.retry_group_convergence(&group).await.unwrap();
 
-    let mut batch = marmot_account::AccountDeviceEffects::default();
+    let mut batch = marmot_session::AccountDeviceEffects::default();
     collect_new_deliveries(&mut carol, &relay, &mut carol_cursor, &mut batch).await;
     collect_effects(
         &mut batch,
@@ -466,7 +466,7 @@ async fn late_competing_commit_cannot_restore_terminal_app_copy() {
         "late winning rename",
         "the competing author really confirms its branch"
     );
-    let mut late = marmot_account::AccountDeviceEffects::default();
+    let mut late = marmot_session::AccountDeviceEffects::default();
     collect_new_deliveries(&mut carol, &relay, &mut carol_cursor, &mut late).await;
     collect_effects(
         &mut late,
@@ -937,7 +937,7 @@ async fn native_restoration_restores_projection_unread_without_invitation() {
             .unread_count
     };
     assert_eq!(unread(), 1);
-    let termination = marmot_account::AccountDeviceEffects {
+    let termination = marmot_session::AccountDeviceEffects {
         events: vec![GroupEvent::LocalGroupCopyTerminated {
             group_id: group.clone(),
             voluntary: false,
@@ -949,7 +949,7 @@ async fn native_restoration_restores_projection_unread_without_invitation() {
         .await
         .unwrap();
     assert_eq!(unread(), 0);
-    let restoration = marmot_account::AccountDeviceEffects {
+    let restoration = marmot_session::AccountDeviceEffects {
         events: vec![GroupEvent::LocalGroupCopyRestored { group_id: group }],
         ..Default::default()
     };
@@ -1053,7 +1053,7 @@ async fn termination_then_restoration_preserves_failed_sends_and_archive() {
             },
         )
         .unwrap();
-        let mut effects = marmot_account::AccountDeviceEffects {
+        let mut effects = marmot_session::AccountDeviceEffects {
             events: vec![
                 GroupEvent::LocalGroupCopyTerminated {
                     group_id: group.clone(),
@@ -1066,7 +1066,7 @@ async fn termination_then_restoration_preserves_failed_sends_and_archive() {
             ..Default::default()
         };
         if failed {
-            effects.failures.push(marmot_account::PublishFailure {
+            effects.failures.push(marmot_session::PublishFailure {
                 message_id: MessageId::new(vec![0xef; 32]),
                 reason: "unrelated publication failed".into(),
             });
@@ -1169,7 +1169,7 @@ async fn maintenance_counts_one_recovery_transition() {
         .create_group("maintenance observation", &[])
         .await
         .unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![GroupEvent::PendingCommitRecovered {
             group_id: group,
             recovered_epoch: cgka_traits::EpochId(1),
@@ -1252,7 +1252,7 @@ async fn partial_native_projection_retries_without_republishing() {
              BEGIN SELECT RAISE(FAIL, 'injected restoration failure'); END;",
             )
             .unwrap();
-        let mut effects = marmot_account::AccountDeviceEffects {
+        let mut effects = marmot_session::AccountDeviceEffects {
             events: vec![
                 GroupEvent::LocalGroupCopyTerminated {
                     group_id: group.clone(),
@@ -1299,7 +1299,7 @@ async fn partial_native_projection_retries_without_republishing() {
             .collect::<Vec<_>>();
         effects.events.splice(0..0, message_events);
         if failed_publish {
-            effects.failures.push(marmot_account::PublishFailure {
+            effects.failures.push(marmot_session::PublishFailure {
                 message_id: MessageId::new(vec![0xe4; 32]),
                 reason: "primary failure".into(),
             });
@@ -1478,7 +1478,7 @@ async fn committed_activity_tail_retries_after_storage_failure() {
          BEGIN SELECT RAISE(FAIL, 'injected activity tail failure'); END;",
         )
         .unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: (2..=3)
             .map(|epoch| GroupEvent::GroupStateChanged {
                 group_id: group.clone(),

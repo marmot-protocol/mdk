@@ -9,8 +9,8 @@ publish.workspace = true
 default = []
 product-analytics-export = []
 # Test-only convergence timing/rewind overrides. Never enable in app artifacts.
-# cgka-session forwards this to cgka-engine, which is a dev-dependency here.
-test-policy-overrides = ["cgka-session/test-policy-overrides"]
+# marmot-session forwards this to cgka-engine, which is a dev-dependency here.
+test-policy-overrides = ["marmot-session/test-policy-overrides"]
 # Opt-in relay-telemetry OTLP exporter wire encoding and HTTP push. The
 # privacy-critical mapping and opt-in gate stay in the default build; this
 # feature only adds the OTLP protobuf dependencies and the push transport.
@@ -25,7 +25,7 @@ test-support = []
 async-trait.workspace = true
 base64.workspace = true
 chrono.workspace = true
-cgka-session.workspace = true
+marmot-session.workspace = true
 cgka-traits.workspace = true
 chacha20poly1305.workspace = true
 bytes.workspace = true
@@ -74,7 +74,7 @@ zeroize.workspace = true
 # Production code names no engine item; tests reach into the engine directly.
 cgka-engine.workspace = true
 transport-nostr = { workspace = true, features = ["test-support"] }
-marmot-account = { workspace = true, features = ["test-support"] }
+marmot-session = { workspace = true, features = ["test-support"] }
 criterion.workspace = true
 media-store = { workspace = true, features = ["catalog-conformance", "test-support"] }
 nostr-directory = { workspace = true, features = ["test-support"] }

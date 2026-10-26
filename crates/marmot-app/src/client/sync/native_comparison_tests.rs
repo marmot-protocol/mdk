@@ -7,9 +7,9 @@ use crate::tests::{
     ScriptedEosePump, ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
     remember_test_member_inbox, scripted_eose_pump,
 };
-use cgka_session::PublishWork;
 use cgka_traits::engine::SendIntent;
 use cgka_traits::{TransportAccountActivation, TransportAdapter};
+use marmot_session::PublishWork;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use transport_nostr_adapter::{NostrRelayEvent, ReplayBatchTake};

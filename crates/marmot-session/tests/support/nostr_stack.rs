@@ -11,9 +11,6 @@ use async_trait::async_trait;
 use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
-use cgka_session::{
-    AccountDeviceSession, CreateGroupEffects, IngestEffects, PublishWork, SessionConfig,
-};
 use cgka_traits::app_components::{
     AppComponentData, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, decode_nostr_routing_v1,
     default_group_components, encode_nostr_routing_v1,
@@ -24,6 +21,9 @@ use cgka_traits::{
     TransportEndpoint, TransportEndpointFailure, TransportEndpointFailureKind,
     TransportEndpointReceipt, TransportGroupSubscription, TransportGroupSync, TransportMessage,
     TransportPublishReport, TransportPublishRequest, TransportPublishTarget,
+};
+use marmot_session::{
+    AccountDeviceSession, CreateGroupEffects, IngestEffects, PublishWork, SessionConfig,
 };
 use nostr::prelude::FinalizeEvent;
 use sha2::{Digest, Sha256};

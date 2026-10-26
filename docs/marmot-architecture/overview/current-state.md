@@ -283,10 +283,11 @@ This repository now has the main engine candidate:
 - `crates/fs-private` — restrictive-by-construction helpers for local files, directories, and Unix sockets.
 - `crates/traits` — cross-boundary value types and traits, including the account-aware `TransportAdapter` boundary.
 - `crates/cgka-engine` — OpenMLS-backed engine implementation.
-- `crates/cgka-session` — production-shaped account-device session wrapper over `Engine<SqliteAccountStorage>`.
-- `crates/marmot-account` — account/session orchestration over a session and transport adapter. It activates the transport
-  account, uses static transport routing for early harnesses, publishes fresh KeyPackages through an injected boundary,
-  and confirms or rolls back pending session work from adapter publish reports.
+- `crates/marmot-session` — production-shaped account-device session wrapper over `Engine<SqliteAccountStorage>`, and
+  the account-device runtime over it and a transport adapter. The runtime activates the transport account, uses static
+  transport routing for early harnesses, publishes fresh KeyPackages through an injected boundary, and confirms or rolls
+  back pending session work from adapter publish reports.
+- `crates/marmot-account` — account identity, files and secrets: account homes, setup journals, and signing-key storage.
 - `crates/marmot-app` — first multi-account app runtime over account home, per-account projections, shared
   relay/directory cache, relay-list setup, KeyPackage lookup, runtime subscriptions, and app-facing
   group/message/member methods. Detailed group creation returns the exact chat-list row committed with the local
@@ -354,7 +355,7 @@ explicit recovery flow.
 ## Known gaps
 
 - **Production persistence hardening** — `storage-sqlite` provides encrypted persistence, atomic group snapshots,
-  retained-anchor pruning, and privacy-oriented SQLite defaults. `cgka-session` opens one encrypted database per
+  retained-anchor pruning, and privacy-oriented SQLite defaults. `marmot-session` opens one encrypted database per
   account-device identity. App key-management integration, packaging, and longer-term rekey/vacuum/checkpoint policy
   still need production wiring.
 - **App-core hardening** — `marmot-app` and `wn` now exercise real account setup, key storage, relay-list repair,
@@ -392,7 +393,7 @@ runtime QUIC agent previews are unavailable in this mode.
   `convergence-chaos/v1` is the first convergence-focused generated family with built-in semantic expectations, 20+
   client stress cases, mixed message/commit storms, and conservative generated-failure minimization. The byte-level
   vector plan is still thin beyond the first app-component encoding fixtures.
-- **whitenoise-rs integration map** — the first integration path is likely a shim over `cgka-session` /
+- **whitenoise-rs integration map** — the first integration path is likely a shim over `marmot-session` /
   `marmot-account`, with whitenoise-rs keeping account setup, Nostr directory state, relay-list repair, and shared relay
   plane ownership. The current friction points are tracked in
   [`whitenoise-integration-map.md`](./whitenoise-integration-map.md).

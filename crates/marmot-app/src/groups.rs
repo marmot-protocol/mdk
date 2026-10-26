@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use cgka_session::CanonicalizationPolicy;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_ROLE_FANOUT,
     AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND, AgentTextStreamQuicPolicyV1,
@@ -24,6 +23,7 @@ use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent as Marmo
 use cgka_traits::engine::{GroupEvent, GroupHydrationQuarantineReason};
 use cgka_traits::group::{Group, ProtocolProfile};
 use cgka_traits::{GroupId, MemberId, TransportEndpoint, TransportGroupSubscription};
+use marmot_session::CanonicalizationPolicy;
 use serde::{Deserialize, Serialize};
 
 use crate::media::{EncryptedMediaVersion, media_imeta_tags_preserve_message};
@@ -2367,7 +2367,7 @@ pub(crate) fn add_group(
 /// passage that would have ended a stall run; the seams that already observe
 /// explicitly are the only exception.
 pub(crate) fn fail_if_publish_failed(
-    effects: &marmot_account::AccountDeviceEffects,
+    effects: &marmot_session::AccountDeviceEffects,
 ) -> Result<(), AppError> {
     if effects.failures.is_empty() {
         return Ok(());
@@ -2377,8 +2377,8 @@ pub(crate) fn fail_if_publish_failed(
     let mut any_rolled_back = false;
     for resolution in &effects.pending {
         match resolution {
-            marmot_account::PendingResolution::Confirmed { .. } => any_confirmed = true,
-            marmot_account::PendingResolution::RolledBack { .. } => any_rolled_back = true,
+            marmot_session::PendingResolution::Confirmed { .. } => any_confirmed = true,
+            marmot_session::PendingResolution::RolledBack { .. } => any_rolled_back = true,
         }
     }
 
@@ -2421,7 +2421,7 @@ pub(crate) fn fail_if_publish_failed(
     Err(publish_failure_error(&effects.failures))
 }
 
-pub(crate) fn publish_failure_error(failures: &[marmot_account::PublishFailure]) -> AppError {
+pub(crate) fn publish_failure_error(failures: &[marmot_session::PublishFailure]) -> AppError {
     AppError::Publish(
         failures
             .iter()
@@ -2432,7 +2432,7 @@ pub(crate) fn publish_failure_error(failures: &[marmot_account::PublishFailure])
 }
 
 pub(crate) fn send_summary_from_effects(
-    effects: &marmot_account::AccountDeviceEffects,
+    effects: &marmot_session::AccountDeviceEffects,
 ) -> SendSummary {
     SendSummary {
         published: effects
@@ -2462,7 +2462,7 @@ pub(crate) fn send_summary_from_effects(
 /// per-message answer in `effects.published_app_messages` and reports that,
 /// because one pass can publish unrelated work alongside a retained message.
 pub(crate) fn accept_disposition_from_effects(
-    effects: &marmot_account::AccountDeviceEffects,
+    effects: &marmot_session::AccountDeviceEffects,
 ) -> cgka_traits::SendAcceptDisposition {
     if effects
         .reports
@@ -2752,7 +2752,7 @@ mod fail_if_publish_failed_tests {
         GroupId, MemberId, MessageId, TransportEndpoint, TransportEndpointReceipt,
         TransportPublishReport,
     };
-    use marmot_account::{
+    use marmot_session::{
         AccountDeviceEffects, PendingResolution, PublishFailure, UnresolvedPublish,
         UnresolvedPublishReason, WelcomeDeliveryFailure,
     };

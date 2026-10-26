@@ -9,11 +9,11 @@ impl AccountManager {
         let id = &checkpoint.snapshot.account_id_hex;
         let account = self.resolve(id)?;
         let storage = self.app.account_storage(&account.label)?;
-        let owned = cgka_session::durably_owned_key_packages(
+        let owned = marmot_session::durably_owned_key_packages(
             &storage,
             cgka_traits::group::ProtocolProfile::Current,
         )
-        .map_err(cgka_session::SessionError::from)?;
+        .map_err(marmot_session::SessionError::from)?;
         let local = self.app.local_key_package_records(&account.label, owned)?;
         let mut slots: HashSet<String> = local.iter().map(|p| p.key_package_id.clone()).collect();
         if let Some(lifecycle) = storage.key_package_lifecycle()? {

@@ -38,11 +38,12 @@ and affected host agent guidance aligned.
 `crates/cgka-engine` owns MLS and Marmot group state: create, invite, remove, SelfRemove, app messages, group data,
 publish-before-apply, convergence, and group events.
 
-`crates/cgka-session` owns one account-device session over encrypted SQLite engine state. It turns engine results into
-session effects and keeps engine storage behind a small account-device API.
+`crates/marmot-session` owns one account-device session over encrypted SQLite engine state and the runtime over it.
+The session turns engine results into session effects and keeps engine storage behind a small account-device API. The
+runtime owns session opening, transport activation, routing policy, KeyPackage publication, and publish confirmation or
+rollback.
 
-`crates/marmot-account` owns account home orchestration: account records, signing-key storage, session opening,
-transport activation, routing policy, KeyPackage publication, and publish confirmation or rollback.
+`crates/marmot-account` owns account identity: account records, setup journals, and signing-key storage.
 
 `crates/marmot-app` owns app-core integration: account projections, account-private and shared directory caches,
 relay-list setup and discovery, local development relay support, Nostr SDK relay access, group/message records, and

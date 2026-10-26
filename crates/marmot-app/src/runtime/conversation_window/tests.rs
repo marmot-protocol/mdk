@@ -2324,7 +2324,7 @@ async fn publication_checkpoint_refreshes_epoch_and_dirty_rows_without_reviving_
         .unwrap();
     assert!(matches!(
         cold.runtime.session().group_authority(&f.group),
-        Err(cgka_session::SessionError::Engine(
+        Err(marmot_session::SessionError::Engine(
             cgka_traits::EngineError::GroupNotHydrated(_)
         ))
     ));

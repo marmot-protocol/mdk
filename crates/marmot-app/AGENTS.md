@@ -245,9 +245,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   package and stable replaceable d-tag; expired or policy-invalid packages rotate to a fresh package ref.
 - Incoming welcomes may auto-join MLS state, but app projections must preserve local confirmation state. Pending invites
   should stay visible until accepted, and decline should leave the group before archiving the local projection.
-- Keep protocol engine behavior in `cgka-engine` and session ownership in `cgka-session`.
+- Keep protocol engine behavior in `cgka-engine` and session ownership in `marmot-session`.
 - Name no `cgka_engine` item in production code. `cgka-engine` is only a dev-dependency here, so the library build
-  rejects one; engine types come through `cgka-session`'s re-exports. The crate root re-exports the lower stack's error
+  rejects one; engine types come through `marmot-session`'s re-exports. The crate root re-exports the lower stack's error
   types (`AccountError`, `SessionError`) and identity-proof signer types, so hosts reach them through `marmot_app`
   (mdk#2602).
 - Every recovery cause and caller runs the one comparison job in `src/client/sync/comparison_job.rs`; there is

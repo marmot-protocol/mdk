@@ -4,7 +4,6 @@ use cgka_engine::account_identity_proof::{
 };
 use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_engine::feature_registry::FeatureRegistry;
-use cgka_session::{AccountDeviceSession, PublishWork, SessionConfig};
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, SendIntent};
@@ -18,6 +17,7 @@ use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
+use marmot_session::{AccountDeviceSession, PublishWork, SessionConfig};
 use nostr::prelude::FinalizeEvent;
 use std::io::Write;
 use std::sync::Arc;
@@ -807,7 +807,7 @@ async fn session_advance_convergence_surfaces_auto_selfremove_reproposal() {
     assert!(
         matches!(
             blocked,
-            Err(cgka_session::SessionError::Engine(
+            Err(marmot_session::SessionError::Engine(
                 EngineError::InvalidTransition(_)
             ))
         ),
@@ -1073,9 +1073,9 @@ async fn a_disband_request_carries_no_publish_work() {
 
 #[tokio::test]
 async fn compact_authority_capture_defers_unhydrated_groups_and_uses_session_store() {
-    use cgka_session::SessionError;
     use cgka_traits::storage::GroupStorage;
     use cgka_traits::{GroupLifecycleState, StorageProvider};
+    use marmot_session::SessionError;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("authority.sqlite");
     let key = SqlCipherKey::new("authority session fixture").unwrap();
@@ -1238,10 +1238,10 @@ fn group_account_records(
 /// though both have stored records. A live group gets its stored records.
 #[tokio::test]
 async fn group_scoped_account_records_answer_only_for_live_groups() {
-    use cgka_session::{SessionError, SessionResult};
     use cgka_traits::GroupCapabilities;
     use cgka_traits::group::Group;
     use cgka_traits::storage::{GroupStorage, MaintenanceStorage};
+    use marmot_session::{SessionError, SessionResult};
 
     #[derive(Clone, Copy, Debug)]
     enum Liveness {
@@ -1381,13 +1381,13 @@ async fn group_scoped_account_records_answer_only_for_live_groups() {
 /// it (mdk#2602, rules 1 and 2).
 #[tokio::test]
 async fn account_records_report_a_closed_store_as_the_engine_storage_failure() {
-    use cgka_session::{SessionError, SessionResult};
     use cgka_traits::maintenance::{
         DurableTransportFanout, KeyPackageLifecycleState, MaintenancePhase,
         PeriodicMaintenancePolicy,
     };
     use cgka_traits::storage::StorageError;
     use cgka_traits::{TransportEndpoint, TransportPublishTarget};
+    use marmot_session::{SessionError, SessionResult};
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("closed-records.sqlite");

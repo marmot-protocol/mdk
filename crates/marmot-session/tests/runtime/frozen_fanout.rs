@@ -168,14 +168,14 @@ async fn assert_frozen_fanout_case(
         assert!(effects.failures.is_empty());
         assert!(matches!(
             effects.unresolved_publishes.as_slice(),
-            [marmot_account::UnresolvedPublish {
+            [marmot_session::UnresolvedPublish {
                 reason,
                 ..
             }] if *reason == match error_kind {
                 Some(TransportEndpointFailureKind::RetryableUnavailable) => {
-                    marmot_account::UnresolvedPublishReason::RetryableUnavailable
+                    marmot_session::UnresolvedPublishReason::RetryableUnavailable
                 }
-                _ => marmot_account::UnresolvedPublishReason::AcknowledgementUnknown,
+                _ => marmot_session::UnresolvedPublishReason::AcknowledgementUnknown,
             }
         ));
         assert!(!effects.fanout[0].mls_confirmed);
@@ -311,7 +311,7 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
 
     assert!(matches!(
         effects.failures.as_slice(),
-        [marmot_account::PublishFailure {
+        [marmot_session::PublishFailure {
             message_id: failed_message_id,
             reason,
         }] if failed_message_id == &message_id
@@ -319,7 +319,7 @@ async fn terminal_application_fanout_replays_failure_after_restart_before_delete
     ));
     assert!(matches!(
         effects.failed_app_messages.as_slice(),
-        [marmot_account::FailedApplicationMessage {
+        [marmot_session::FailedApplicationMessage {
             group_id: failed_group_id,
             app_event_id,
             message_id: failed_message_id,
@@ -1068,7 +1068,7 @@ async fn ambiguous_application_publish_is_retained_without_definite_failure() {
     );
     assert_eq!(
         effects.unresolved_app_messages[0].reason,
-        marmot_account::UnresolvedPublishReason::AcknowledgementUnknown
+        marmot_session::UnresolvedPublishReason::AcknowledgementUnknown
     );
     assert_eq!(runtime.session().outbound_fanouts().unwrap().len(), 1);
 }

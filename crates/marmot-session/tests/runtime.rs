@@ -8,7 +8,6 @@ use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
 use cgka_engine::feature_registry::FeatureRegistry;
-use cgka_session::{AccountDeviceSession, PublishWork, SessionConfig, SessionError};
 use cgka_traits::app_components::{
     AppComponentData, GROUP_MESSAGE_RETENTION_COMPONENT_ID, default_group_components,
 };
@@ -35,11 +34,12 @@ use cgka_traits::{
     TransportPublishFailure, TransportPublishReport, TransportPublishRequest,
     TransportPublishTarget,
 };
-use marmot_account::{
-    AccountDeviceRuntime, AccountError, KeyPackagePublication, KeyPackagePublishError,
-    KeyPackagePublishReceipt, KeyPackagePublisher, MaintenanceRandom, MaintenanceTiming,
-    MonotonicClock, NoopKeyPackagePublisher, PendingResolution, PublishedApplicationMessage,
-    StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy, WallClock,
+use marmot_session::{
+    AccountDeviceRuntime, AccountDeviceSession, AccountError, KeyPackagePublication,
+    KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher, MaintenanceRandom,
+    MaintenanceTiming, MonotonicClock, NoopKeyPackagePublisher, PendingResolution, PublishWork,
+    PublishedApplicationMessage, SessionConfig, SessionError, StaticTransportRouting,
+    TransportRoutingError, TransportRoutingPolicy, WallClock,
 };
 use nostr::prelude::FinalizeEvent;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
@@ -359,7 +359,7 @@ async fn welcome_for_key_package(
         .clone()
 }
 
-/// MIP-03 self-remove feature registration, mirroring the cgka-session
+/// MIP-03 self-remove feature registration, mirroring the session
 /// lifecycle test. Sending `SendIntent::Leave` as a non-last-admin produces a
 /// remove **proposal**; when the admin ingests it, the engine auto-commits the
 /// removal and emits a `PublishWork::AutoPublish` carrying a real pending ref.
@@ -3058,7 +3058,7 @@ async fn maintenance_reconciles_restored_copy_from_final_canonical_membership() 
                 group_id: group_id.clone(),
             });
             runtime
-                .publish_session_effects(cgka_session::SessionEffects {
+                .publish_session_effects(marmot_session::SessionEffects {
                     events,
                     publish: Vec::new(),
                     queued: Vec::new(),
@@ -5665,8 +5665,8 @@ async fn auto_publish_confirms_pending_when_commit_was_partially_exposed() {
     assert_eq!(
         phases,
         vec![
-            (marmot_account::AccountIngestPhase::Engine, true),
-            (marmot_account::AccountIngestPhase::EffectPublication, true),
+            (marmot_session::AccountIngestPhase::Engine, true),
+            (marmot_session::AccountIngestPhase::EffectPublication, true),
         ]
     );
     assert_eq!(ingested.effects.pending_convergence, vec![group_id.clone()]);
@@ -5862,7 +5862,7 @@ async fn published_app_messages_carry_exact_source_state_and_adapter_identity() 
         other => panic!("expected Proposal publish work, got {other:?}"),
     };
     let proposal_effects = runtime
-        .publish_session_effects(cgka_session::SessionEffects {
+        .publish_session_effects(marmot_session::SessionEffects {
             events: Vec::new(),
             publish: vec![PublishWork::Proposal {
                 msg: proposal,
@@ -6841,7 +6841,7 @@ async fn later_restoration_reschedules_periodic_maintenance_without_reviving_fai
             let mut removed = live.clone();
             removed.removed = true;
             storage.put_group(&removed).unwrap();
-            let effects = |event| cgka_session::SessionEffects {
+            let effects = |event| marmot_session::SessionEffects {
                 events: vec![event],
                 publish: vec![],
                 queued: vec![],
@@ -7041,7 +7041,7 @@ async fn restore_fault_keeps_effects() {
             removed.removed = true;
             storage.put_group(&removed).unwrap();
             runtime
-                .publish_session_effects(cgka_session::SessionEffects {
+                .publish_session_effects(marmot_session::SessionEffects {
                     events: vec![GroupEvent::LocalGroupCopyTerminated {
                         group_id: group.clone(),
                         voluntary: false,

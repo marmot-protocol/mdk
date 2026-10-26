@@ -3685,7 +3685,7 @@ fn run_legacy_message_promotion_batch(
         client
             .engine_storage
             .promote_legacy_message_rows(limit)
-            .map_err(cgka_session::SessionError::from)
+            .map_err(marmot_session::SessionError::from)
     });
 }
 
@@ -3693,8 +3693,9 @@ fn run_legacy_message_promotion_batch_with(
     schedule: &mut LegacyMessagePromotionSchedule,
     promote: impl FnOnce(
         usize,
-    )
-        -> cgka_session::SessionResult<storage_sqlite::MessageFormatPromotionProgress>,
+    ) -> marmot_session::SessionResult<
+        storage_sqlite::MessageFormatPromotionProgress,
+    >,
 ) {
     if schedule.status != LegacyMessagePromotionStatus::Pending {
         return;
@@ -7155,9 +7156,9 @@ fn convergence_settlement_delay(app: &MarmotApp) -> Duration {
     let quiescence_ms = if cfg!(feature = "test-policy-overrides") {
         app.config
             .dev_settlement_quiescence_ms
-            .unwrap_or(cgka_session::V1_SETTLEMENT_QUIESCENCE_MS)
+            .unwrap_or(marmot_session::V1_SETTLEMENT_QUIESCENCE_MS)
     } else {
-        cgka_session::V1_SETTLEMENT_QUIESCENCE_MS
+        marmot_session::V1_SETTLEMENT_QUIESCENCE_MS
     };
     Duration::from_millis(quiescence_ms.saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS))
 }
@@ -8358,7 +8359,7 @@ mod tests {
         client
             .finish_scheduled_convergence_effects(
                 &group_id,
-                &marmot_account::AccountDeviceEffects::default(),
+                &marmot_session::AccountDeviceEffects::default(),
             )
             .await
             .unwrap();
@@ -8391,7 +8392,7 @@ mod tests {
             received.try_recv().is_err(),
             "a status transition is broadcast once"
         );
-        let effects = marmot_account::AccountDeviceEffects {
+        let effects = marmot_session::AccountDeviceEffects {
             events: vec![cgka_traits::engine::GroupEvent::GroupJoined {
                 group_id: group_id.clone(),
                 via_welcome: cgka_traits::MessageId::new(vec![1; 32]),
@@ -9248,7 +9249,7 @@ mod tests {
         let mut schedule = LegacyMessagePromotionSchedule::new();
 
         run_legacy_message_promotion_batch_with(&mut schedule, |_| {
-            Err(cgka_session::SessionError::from(
+            Err(marmot_session::SessionError::from(
                 cgka_traits::storage::StorageError::Busy("test contention".into()),
             ))
         });
@@ -9264,7 +9265,7 @@ mod tests {
 
         run_legacy_message_promotion_batch_with(&mut schedule, |_| {
             calls += 1;
-            Err(cgka_session::SessionError::from(
+            Err(marmot_session::SessionError::from(
                 cgka_traits::storage::StorageError::Serialization("malformed legacy row".into()),
             ))
         });
