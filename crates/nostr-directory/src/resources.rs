@@ -1,6 +1,5 @@
 //! What the directory asks the app for. `marmot-app` implements
-//! [`DirectoryResources`] over the cache lifecycle it keeps (step 3 of
-//! `docs/marmot-architecture/review/brief-directory.md`).
+//! [`DirectoryResources`] over the cache lifecycle it keeps.
 
 use std::future::Future;
 

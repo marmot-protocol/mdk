@@ -26,5 +26,4 @@ publishes, and below [`marmot-app`](../marmot-app/README.md), which drives it pe
 - No quiet-period recovery timer or independent retry authority.
 - No MLS peeling (`transport-nostr-peeler`) and no relay socket mechanics (`transport-nostr-adapter`, `nostr-sdk`).
 
-`marmot-app` drives it through `transport_nostr::`. See the
-[relay-plane brief](../../docs/marmot-architecture/review/brief-relay-plane.md) for how it moved out of the app.
+`marmot-app` drives it through `transport_nostr::`.

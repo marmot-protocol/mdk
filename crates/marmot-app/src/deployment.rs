@@ -3,7 +3,6 @@
 //! MDK serves any Marmot client, so these are configuration, not protocol.
 //! [`MarmotDeployment::white_noise`] is White Noise's deployment and keeps its
 //! behaviour exactly. [`MarmotDeployment::neutral`] configures none of them.
-//! See `docs/marmot-architecture/review/brief-host-configuration.md`.
 
 pub use nostr_directory::config::{KeyPackageClientPreference, OpenRankingProvider};
 

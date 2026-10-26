@@ -1,6 +1,5 @@
 //! The deployment record a host passes at construction. It mirrors
-//! `marmot_app::MarmotDeployment`; see the host-configuration brief
-//! (`docs/marmot-architecture/review/brief-host-configuration.md`).
+//! `marmot_app::MarmotDeployment`.
 
 use marmot_app::{KeyPackageClientPreference, MarmotDeployment, OpenRankingProvider};
 

@@ -1,8 +1,7 @@
 //! Publication of the account's own profile and follow list.
 //!
-//! These publish the account's own state, so they stay in `marmot-app` when
-//! the directory moves to its own crate (step 3 of
-//! `docs/marmot-architecture/review/brief-directory.md`). They call the
+//! These publish the account's own state, so they stay in `marmot-app` rather
+//! than in `nostr-directory`. They call the
 //! directory to remember what they published.
 
 use cgka_traits::{MemberId, TransportEndpoint};

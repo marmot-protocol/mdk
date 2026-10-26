@@ -1,7 +1,7 @@
 # AGENTS.md - crates/nostr-directory
 
 The directory of other people's public Nostr data (step 3 of the 2026-10 architecture review). Human overview:
-[`README.md`](README.md). Design: [`brief-directory.md`](../../docs/marmot-architecture/review/brief-directory.md).
+[`README.md`](README.md).
 
 ## Boundary
 
