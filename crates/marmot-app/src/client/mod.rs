@@ -2140,7 +2140,7 @@ impl AppClient {
         let creator = self.app.account_home().account(&self.state.label)?;
         let mut founding_selections = Vec::with_capacity(members.len());
         for member in &members {
-            let metadata = cgka_engine::key_package::key_package_metadata(member)
+            let metadata = cgka_session::key_package_metadata(member)
                 .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
             if metadata.credential_identity_hex == creator.account_id_hex {
                 return Err(AppError::GroupCreateIncludesCreator);

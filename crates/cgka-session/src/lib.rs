@@ -7,13 +7,19 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+// Engine items the session's API exposes, re-exported so hosts need not name
+// the engine (mdk#2602).
 pub use cgka_engine::KeyPackageMetadata;
-use cgka_engine::account_identity_proof::AccountIdentityProofSigner;
-use cgka_engine::canonicalization::CanonicalizationPolicy;
+pub use cgka_engine::account_identity_proof::{
+    AccountIdentityProofRequest, AccountIdentityProofSigner,
+};
+pub use cgka_engine::canonicalization::{CanonicalizationPolicy, V1_SETTLEMENT_QUIESCENCE_MS};
 pub use cgka_engine::engine::WelcomeDeliveryIndex;
-use cgka_engine::feature_registry::FeatureRegistry;
-pub use cgka_engine::group_authority::CanonicalGroupMembership;
-pub use cgka_engine::key_package::KeyPackageRequirements;
+pub use cgka_engine::feature_registry::FeatureRegistry;
+pub use cgka_engine::group_authority::{CanonicalGroupMembership, GroupAuthoritySnapshot};
+pub use cgka_engine::key_package::{
+    KeyPackageRequirements, durably_owned_key_packages, key_package_metadata,
+};
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
 use cgka_traits::engine::{

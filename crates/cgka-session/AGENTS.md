@@ -31,6 +31,9 @@ key derivation, relay sync, or UI projection.
 - Keep one audit recorder per account-device: `open` wraps the configured recorder in a `SharedRecorder`, builds the
   engine with a clone, and writes the open-time `recorder_health` row through it. Do not add audit pass-through
   methods; the runtime and the host record, rotate and finish through their own clones (mdk#2602, rule 5).
+- Re-export, under its engine name, each engine item a host names alongside the session: the configuration and signer
+  types, the group-authority types, and the KeyPackage metadata and inventory helpers. Hosts name these through this
+  crate, never `cgka_engine` (mdk#2602).
 - Prefer behavior tests over internal state assertions.
 
 ## Verification

@@ -9,7 +9,7 @@ impl AccountManager {
         let id = &checkpoint.snapshot.account_id_hex;
         let account = self.resolve(id)?;
         let storage = self.app.account_storage(&account.label)?;
-        let owned = cgka_engine::key_package::durably_owned_key_packages(
+        let owned = cgka_session::durably_owned_key_packages(
             &storage,
             cgka_traits::group::ProtocolProfile::Current,
         )

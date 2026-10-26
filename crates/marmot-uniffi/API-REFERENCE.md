@@ -3701,7 +3701,7 @@ fn public_key(&self) -> Result<String, MarmotKitError>
 
 Return the signer account public key as hex or npub.
 
-[Source](src/external_signer.rs#L15)
+[Source](src/external_signer.rs#L13)
 
 ### `ExternalAccountSignerFfi::sign_event`
 
@@ -3713,7 +3713,7 @@ fn sign_event(&self, unsigned_event_json: String) -> Result<String, MarmotKitErr
 
 Sign a serialized unsigned Nostr event and return the signed event JSON.
 
-[Source](src/external_signer.rs#L21)
+[Source](src/external_signer.rs#L19)
 
 ### `ExternalAccountSignerFfi::nip04_encrypt`
 
@@ -3725,7 +3725,7 @@ fn nip04_encrypt(&self, public_key: String, content: String) -> Result<String, M
 
 NIP-04 encrypt/decrypt support for legacy Nostr surfaces.
 
-[Source](src/external_signer.rs#L27)
+[Source](src/external_signer.rs#L25)
 
 ### `ExternalAccountSignerFfi::nip04_decrypt`
 
@@ -3737,7 +3737,7 @@ fn nip04_decrypt( &self, public_key: String, encrypted_content: String, ) -> Res
 
 Host callback for legacy NIP-04 decryption; return an unsupported error if not implemented.
 
-[Source](src/external_signer.rs#L28)
+[Source](src/external_signer.rs#L26)
 
 ### `ExternalAccountSignerFfi::nip44_encrypt`
 
@@ -3749,7 +3749,7 @@ fn nip44_encrypt(&self, public_key: String, content: String) -> Result<String, M
 
 NIP-44 encrypt/decrypt support for gift-wrap and encrypted app data.
 
-[Source](src/external_signer.rs#L35)
+[Source](src/external_signer.rs#L33)
 
 ### `ExternalAccountSignerFfi::nip44_decrypt`
 
@@ -3761,7 +3761,7 @@ fn nip44_decrypt(&self, public_key: String, payload: String) -> Result<String, M
 
 Host callback for NIP-44 payload decryption.
 
-[Source](src/external_signer.rs#L36)
+[Source](src/external_signer.rs#L34)
 
 </details>
 

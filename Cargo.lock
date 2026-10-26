@@ -3767,7 +3767,6 @@ dependencies = [
 name = "marmot-uniffi"
 version = "0.15.0-dev"
 dependencies = [
- "cgka-engine",
  "cgka-traits",
  "futures",
  "hex",

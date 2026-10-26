@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use cgka_engine::canonicalization::CanonicalizationPolicy;
+use cgka_session::CanonicalizationPolicy;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_ROLE_FANOUT,
     AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND, AgentTextStreamQuicPolicyV1,
