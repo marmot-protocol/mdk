@@ -107,25 +107,25 @@ pub enum MarmotKitError {
     /// is unusable (empty batch, oversized, no endpoint).
     #[error("invalid media reference: {details}")]
     InvalidMediaReference { details: String },
-    /// An attachment was encrypted at `reference_epoch`, but the group moved to
-    /// `group_epoch` before it could be sent (mdk#2158). Its media key is bound
+    /// An attachment was encrypted at `source_epoch`, but the group moved to
+    /// `current_epoch` before it could be sent (mdk#2158). Its media key is bound
     /// to the epoch it was encrypted under, so it cannot be sent; upload the
     /// file again. Nothing was published.
     #[error(
-        "media reference was encrypted at epoch {reference_epoch} but the group is at epoch {group_epoch}; upload it again"
+        "media reference was encrypted at epoch {source_epoch} but the group is at epoch {current_epoch}; upload it again"
     )]
     MediaReferenceStaleEpoch {
-        reference_epoch: u64,
-        group_epoch: u64,
+        source_epoch: u64,
+        current_epoch: u64,
     },
     /// The group's epoch is unsettled, so an attachment encrypted at
-    /// `reference_epoch` cannot be sent right now. Nothing was published. Sync
+    /// `source_epoch` cannot be sent right now. Nothing was published. Sync
     /// and send again; if the epoch moved, that send fails with
     /// `MediaReferenceStaleEpoch` and the file must be uploaded again.
     #[error(
-        "the group's epoch is unsettled, so media encrypted at epoch {reference_epoch} cannot be sent yet; sync and send again"
+        "the group's epoch is unsettled, so media encrypted at epoch {source_epoch} cannot be sent yet; sync and send again"
     )]
-    MediaReferenceEpochUnsettled { reference_epoch: u64 },
+    MediaReferenceEpochUnsettled { source_epoch: u64 },
     /// An encrypted-media `imeta` reference failed MDK's shared strict parser
     /// (mdk#1787): `parse_media_imeta_tag` on an inbound tag, or a host-built
     /// reference passed to build/send/upload/download whose fields are
@@ -563,12 +563,12 @@ impl From<&AppError> for MarmotKitError {
                 source_epoch,
                 current_epoch,
             } => Self::MediaReferenceStaleEpoch {
-                reference_epoch: *source_epoch,
-                group_epoch: *current_epoch,
+                source_epoch: *source_epoch,
+                current_epoch: *current_epoch,
             },
             AppError::MediaReferenceEpochUnsettled { source_epoch } => {
                 Self::MediaReferenceEpochUnsettled {
-                    reference_epoch: *source_epoch,
+                    source_epoch: *source_epoch,
                 }
             }
             AppError::MediaAttachmentRejected(rejection) => Self::MediaAttachmentRejected {
@@ -999,8 +999,8 @@ mod tests {
             matches!(
                 stale,
                 MarmotKitError::MediaReferenceStaleEpoch {
-                    reference_epoch: 2,
-                    group_epoch: 3
+                    source_epoch: 2,
+                    current_epoch: 3
                 }
             ),
             "{stale:?}"
@@ -1010,7 +1010,7 @@ mod tests {
         assert!(
             matches!(
                 unsettled,
-                MarmotKitError::MediaReferenceEpochUnsettled { reference_epoch: 4 }
+                MarmotKitError::MediaReferenceEpochUnsettled { source_epoch: 4 }
             ),
             "{unsettled:?}"
         );

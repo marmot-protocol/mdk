@@ -435,10 +435,10 @@ mod tests {
                 details: "d".into(),
             },
             MarmotKitError::MediaReferenceStaleEpoch {
-                reference_epoch: 2,
-                group_epoch: 3,
+                source_epoch: 2,
+                current_epoch: 3,
             },
-            MarmotKitError::MediaReferenceEpochUnsettled { reference_epoch: 2 },
+            MarmotKitError::MediaReferenceEpochUnsettled { source_epoch: 2 },
             MarmotKitError::MediaAttachmentRejected {
                 kind: marmot_uniffi::conversions::MediaAttachmentRejectionKindFfi::MissingField,
                 details: "d".into(),
@@ -606,13 +606,13 @@ mod tests {
         );
         assert_eq!(
             status_from_error(&MarmotKitError::MediaReferenceStaleEpoch {
-                reference_epoch: 2,
-                group_epoch: 3,
+                source_epoch: 2,
+                current_epoch: 3,
             }) as i32,
             108
         );
         assert_eq!(
-            status_from_error(&MarmotKitError::MediaReferenceEpochUnsettled { reference_epoch: 2 })
+            status_from_error(&MarmotKitError::MediaReferenceEpochUnsettled { source_epoch: 2 })
                 as i32,
             109
         );
