@@ -190,6 +190,9 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::DebugRecordedFinals => "debug_recorded_finals",
         AgentControlRequest::SendMedia { .. } => "send_media",
         AgentControlRequest::DownloadMedia { .. } => "download_media",
+        AgentControlRequest::AttachmentGet { .. } => "attachment_get",
+        AgentControlRequest::DownloadAttachment { .. } => "download_attachment",
+        AgentControlRequest::ReleaseAttachment { .. } => "release_attachment",
     }
 }
 

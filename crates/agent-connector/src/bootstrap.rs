@@ -533,6 +533,8 @@ fn response_type_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::StreamFinalized { .. } => "stream_finalized",
         AgentControlResponse::DebugRecordedFinals { .. } => "debug_recorded_finals",
         AgentControlResponse::MediaDownloaded { .. } => "media_downloaded",
+        AgentControlResponse::Attachment { .. } => "attachment",
+        AgentControlResponse::AttachmentReleased => "attachment_released",
     }
 }
 

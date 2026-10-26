@@ -2,6 +2,29 @@
 
 mod diagnostics;
 
+#[cfg(test)]
+mod attachment_wire_tests {
+    use super::*;
+
+    #[test]
+    fn historical_attachment_requests_are_additive_and_slot_scoped() {
+        for operation in ["attachment_get", "download_attachment"] {
+            let value = serde_json::json!({
+                "type": operation,
+                "account_id_hex": "aa".repeat(32),
+                "group_id_hex": "bb".repeat(16),
+                "message_id_hex": "cc".repeat(32),
+                "attachment_index": 3
+            });
+            let request: AgentControlRequest = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+        }
+        let value = serde_json::json!({"type": "release_attachment", "lease": "aa".repeat(16)});
+        let request: AgentControlRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+    }
+}
+
 pub use diagnostics::{
     AgentControlAccountSelection, AgentControlDiagnosticHome, AgentControlDiagnosticKeyPackage,
     AgentControlDiagnosticRelays, AgentControlDiagnosticReplay, AgentControlDiagnosticStatus,
@@ -555,6 +578,25 @@ pub enum AgentControlRequest {
         group_id_hex: String,
         media: AgentControlMediaRef,
     },
+    /// Inspect one current historical source slot without starting acquisition.
+    AttachmentGet {
+        account_id_hex: String,
+        group_id_hex: String,
+        message_id_hex: String,
+        attachment_index: u32,
+    },
+    /// Request native acquisition. Returns status immediately if not retained;
+    /// repeat to obtain a private handoff once ready. Does not reset retries.
+    DownloadAttachment {
+        account_id_hex: String,
+        group_id_hex: String,
+        message_id_hex: String,
+        attachment_index: u32,
+    },
+    /// Release a private plaintext handoff; already released leases are accepted.
+    ReleaseAttachment {
+        lease: String,
+    },
 }
 
 /// A local file to encrypt + upload as an attachment. The connector reads the
@@ -743,6 +785,60 @@ pub enum AgentControlResponse {
         file_name: String,
         size_bytes: u64,
     },
+    /// None means the current source or slot is unavailable, not a successful
+    /// download. Reference identity is not proof that anyone downloaded bytes.
+    Attachment {
+        attachment: Option<AgentControlAttachment>,
+    },
+    AttachmentReleased,
+}
+
+/// Bounded authenticated identity and native acquisition status for one slot.
+/// No locators, keys, peer size hints or opaque native asset handles are exported.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlAttachment {
+    pub source_message_id_hex: String,
+    pub attachment_index: u32,
+    pub source_epoch: u64,
+    pub plaintext_sha256: String,
+    pub ciphertext_sha256: String,
+    pub state: AgentControlAttachmentState,
+    /// Advisory retained-asset availability; each handoff revalidates it.
+    pub locally_available: bool,
+    pub retry_at: Option<u64>,
+    pub failure_hint: Option<String>,
+    /// Present only after a verified, source-revalidated native copy succeeds.
+    pub handoff: Option<AgentControlAttachmentHandoff>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlAttachmentHandoff {
+    pub lease: String,
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlAttachmentState {
+    NotRequested,
+    Queued,
+    Downloading,
+    VerifyingCiphertext,
+    Decrypting,
+    VerifyingPlaintext,
+    Ready,
+    RetryScheduled,
+    Failed,
+    Cancelled,
+    Paused,
+    Removed,
+    PolicyBlocked,
+    PreviouslyAcquiredUnavailable,
+    CompletedUnretained,
+    RetryExhausted,
+    StorageBlocked,
+    CleanedBySetting,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

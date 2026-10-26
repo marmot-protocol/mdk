@@ -382,7 +382,7 @@ async fn connector_profile_publish_rejects_hostile_optional_fields_without_publi
     );
 }
 
-fn test_config(
+pub(crate) fn test_config(
     home: &Path,
     socket: impl Into<std::path::PathBuf>,
     relays: Vec<String>,
