@@ -20,8 +20,7 @@ group snapshots and rollback must be atomic across Marmot records and group-scop
 
 ## Layout
 
-The crate is split by which side owns each table (see the
-[step 4 brief](../../docs/marmot-architecture/review/brief-storage-boundaries.md)):
+The crate is split by which side owns each table:
 
 - `base/` — SQLCipher keying, connection setup and options, opening an account database, the codec, and the
   account/session migration runner with its numbered bodies (`base/migrations/`).

@@ -4,6 +4,11 @@
 
 ### Changed
 
+- `AttachmentTransferSubscription.next()` returns a replacement that changes a
+  row's transfer state as soon as the engine reports it; progress-only
+  replacements still arrive at most four per second. A host that polled
+  `attachmentTransferSnapshot` beside the feed to see `Ready` sooner can drop
+  that poll (#2157).
 - `MarmotKitError` now depends on what an error is, not on which MDK layers
   wrapped it (mdk#2602). Three answers change:
   - A busy, closed or full store that the account session reported itself now

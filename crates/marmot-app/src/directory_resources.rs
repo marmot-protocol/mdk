@@ -1,9 +1,8 @@
 //! The directory's per-account cache lifecycle and account resolution.
 //!
 //! Opening, keying, evicting and closing the per-account directory caches stays
-//! in `marmot-app`, beside its other per-account resources, when the directory
-//! moves to its own crate (step 3 of
-//! `docs/marmot-architecture/review/brief-directory.md`). So do the legacy
+//! in `marmot-app`, beside its other per-account resources, rather than in
+//! `nostr-directory`. So do the legacy
 //! cache import, the future-dated cleanup, and the label-based wrappers that
 //! resolve an account before calling the directory.
 

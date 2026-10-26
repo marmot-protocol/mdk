@@ -1,7 +1,6 @@
 # AGENTS.md - crates/transport-nostr
 
-Agent map for the relay plane crate. Human overview: [`README.md`](README.md). Its extraction from `marmot-app` follows
-the [relay-plane brief](../../docs/marmot-architecture/review/brief-relay-plane.md).
+Agent map for the relay plane crate. Human overview: [`README.md`](README.md).
 
 ## Scope
 
@@ -28,7 +27,7 @@ not depend on `marmot-app` or `storage-sqlite`. The app supplies storage and pol
   `clippy.toml` rejects direct `nostr_sdk` client constructors. See
   `docs/marmot-architecture/overview/dial-safety.md`.
 - Keep logs privacy-safe: aggregate values only, no account ids, group ids, relay URLs, pubkeys or payloads. The
-  tracing target stays `marmot_app::relay_plane` until the brief's later rename.
+  tracing target is still `marmot_app::relay_plane`; rename it only in a change of its own.
 - Transport consumers enter `transport_nostr_adapter::dispatch_sdk_replay` with the SDK's ordered reader/connection
   metadata. Handle payload variants in its private `dispatch_sdk_notification`; do not add a second dispatcher here.
   Keep metadata through worker queueing and fence receiver loss before resuming. Directory Client input stays separate.

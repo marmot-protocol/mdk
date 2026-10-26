@@ -9,6 +9,10 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- `marmot_attachment_transfer_subscription_next` returns a replacement that
+  changes a row's transfer state as soon as the engine reports it; progress-only
+  replacements still arrive at most four per second. A timeout no longer loses
+  a replacement that was waiting out that window (#2157).
 - The status a call returns now depends on what the error is, not on which MDK
   layers wrapped it (mdk#2602). Three answers change:
   - A busy, closed or full store that the account session reported itself now

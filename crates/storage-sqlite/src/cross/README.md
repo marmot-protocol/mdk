@@ -3,8 +3,7 @@
 The protocol side and the app side of `storage-sqlite` share one database file, so some operations must change both
 sides' tables in one transaction. That code lives here, one named function per crossing, and this is the only folder
 `base::boundary_tests` lets name both sides. What still crosses elsewhere is listed in [`allow-list.txt`](allow-list.txt);
-the list only shrinks. The plan is the
-[step 4 storage brief](../../../../docs/marmot-architecture/review/brief-storage-boundaries.md).
+the list only shrinks.
 
 ## What is here
 

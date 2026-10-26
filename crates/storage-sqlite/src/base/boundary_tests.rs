@@ -1,5 +1,4 @@
-//! The boundary between the protocol and app sides of this crate (step 4 of
-//! `docs/marmot-architecture/review/brief-storage-boundaries.md`).
+//! The boundary between the protocol and app sides of this crate.
 //!
 //! Every table has one owning side ([`super::table_owners`]). A production file
 //! runs SQL only against its own side's tables and names only its own side's

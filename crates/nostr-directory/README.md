@@ -30,6 +30,3 @@ service out as `MarmotApp::directory()`.
 
 The crate's API is what its root re-exports, plus the `config` and `error` modules. The `test-support` feature adds
 the hooks `marmot-app`'s directory tests use; production builds never enable it.
-
-See the [directory brief](../../docs/marmot-architecture/review/brief-directory.md) for why the boundary sits where it
-does.
