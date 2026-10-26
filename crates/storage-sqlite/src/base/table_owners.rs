@@ -116,6 +116,7 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
         Side::App,
     ),
     ("encrypted_media_epoch_secrets", Side::App),
+    ("group_push_gossip_state", Side::App),
     ("group_push_token_tombstones", Side::App),
     ("group_push_tokens", Side::App),
     ("local_group_deletion_frontiers", Side::App),

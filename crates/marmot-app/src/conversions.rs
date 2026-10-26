@@ -22,10 +22,11 @@ use cgka_traits::app_components::{
     GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
 };
 use storage_sqlite::{
-    AccountChatNotificationSettings, AccountGroupPushToken, AccountNotificationSettings,
-    AccountPendingPushRegistrationRemoval, AccountPushRegistration, AccountStoredPushRegistration,
-    StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState, StoredAppEvent,
-    StoredAppMessageRecord, StoredAuditLogSettings, StoredNostrRoute, StoredRelayTelemetrySettings,
+    AccountChatNotificationSettings, AccountGroupPushToken, AccountGroupPushTokenTombstone,
+    AccountNotificationSettings, AccountPendingPushRegistrationRemoval, AccountPushRegistration,
+    AccountPushTokenRemovalProof, AccountStoredPushRegistration, StoredAccountGroup,
+    StoredAccountGroupComponent, StoredAccountState, StoredAppEvent, StoredAppMessageRecord,
+    StoredAuditLogSettings, StoredNostrRoute, StoredRelayTelemetrySettings,
 };
 
 pub(crate) fn stored_state_from_account_state(state: &AccountState) -> StoredAccountState {
@@ -503,10 +504,12 @@ pub(crate) fn account_group_push_token_from_app(
     }
 }
 
+/// Read a stored token record back with its stored digest. The digest is kept
+/// only when it equals the one recomputed from the record's fields.
 pub(crate) fn group_push_token_from_account(
     token: AccountGroupPushToken,
-) -> Result<GroupPushTokenRecord, AppError> {
-    Ok(GroupPushTokenRecord {
+) -> Result<notifications::StoredGroupPushToken, AppError> {
+    let record = GroupPushTokenRecord {
         group_id_hex: token.group_id_hex,
         member_id_hex: token.member_id_hex,
         leaf_index: token.leaf_index,
@@ -518,5 +521,59 @@ pub(crate) fn group_push_token_from_account(
         owner_ts: token.owner_ts,
         owner_sig: token.owner_sig,
         updated_at_ms: token.updated_at_ms,
+    };
+    let record_digest = record
+        .record_digest()
+        .ok()
+        .filter(|digest| *digest == token.record_digest);
+    Ok(notifications::StoredGroupPushToken {
+        record,
+        record_digest,
+    })
+}
+
+/// The tombstone an owner-verified removal leaves, keeping the removal's
+/// fingerprint and signature so any member can relay it.
+pub(crate) fn account_push_token_tombstone_from_removal(
+    group_id_hex: &str,
+    removal: &notifications::PushTokenRemovalRecord,
+    created_at_ms: i64,
+) -> Result<AccountGroupPushTokenTombstone, AppError> {
+    Ok(AccountGroupPushTokenTombstone {
+        group_id_hex: group_id_hex.to_owned(),
+        member_id_hex: removal.member_id_hex.clone(),
+        leaf_index: removal.leaf_index,
+        platform: removal.platform.platform_byte(),
+        server_pubkey_hex: removal.server_pubkey_hex.clone(),
+        owner_ts: removal.owner_ts,
+        record_digest: removal.record_digest(group_id_hex)?,
+        removal_proof: Some(AccountPushTokenRemovalProof {
+            token_fingerprint: removal.token_fingerprint.clone(),
+            owner_sig: removal.owner_sig.clone(),
+        }),
+        created_at_ms,
+    })
+}
+
+/// Read a stored tombstone back, rebuilding its owner-signed removal when the
+/// tombstone kept one.
+pub(crate) fn push_token_tombstone_from_account(
+    tombstone: AccountGroupPushTokenTombstone,
+) -> Result<notifications::StoredPushTokenTombstone, AppError> {
+    let platform = PushPlatform::from_platform_byte(tombstone.platform)?;
+    let removal = tombstone
+        .removal_proof
+        .map(|proof| notifications::PushTokenRemovalRecord {
+            member_id_hex: tombstone.member_id_hex,
+            leaf_index: tombstone.leaf_index,
+            platform,
+            token_fingerprint: proof.token_fingerprint,
+            server_pubkey_hex: tombstone.server_pubkey_hex,
+            owner_ts: tombstone.owner_ts,
+            owner_sig: proof.owner_sig,
+        });
+    Ok(notifications::StoredPushTokenTombstone {
+        record_digest: tombstone.record_digest,
+        removal,
     })
 }

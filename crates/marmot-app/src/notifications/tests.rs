@@ -805,6 +805,198 @@ fn surrounding_relay_hint_whitespace_is_deduplicated_before_verification() {
     }
 }
 
+fn push_gossip_test_app(dir: &tempfile::TempDir) -> MarmotApp {
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    MarmotApp::with_relay(dir.path(), "wss://relay.example")
+}
+
+fn push_gossip_message(
+    sender: &Keys,
+    group_id: &cgka_traits::GroupId,
+    kind: u64,
+    plaintext: String,
+) -> ReceivedMessage {
+    ReceivedMessage {
+        authority: None,
+        message_id_hex: "11".repeat(32),
+        source_message_id_hex: "22".repeat(32),
+        sender: sender.public_key().to_hex(),
+        sender_display_name: None,
+        group_id: group_id.clone(),
+        source_epoch: 1,
+        retention: None,
+        plaintext,
+        kind,
+        tags: vec![vec!["v".to_owned(), PUSH_VERSION.to_owned()]],
+        recorded_at: 1,
+        received_at: 1,
+    }
+}
+
+fn removal_payload(removals: &[&PushTokenRemovalRecord]) -> String {
+    serde_json::to_string(&PushTokenRemovalPayload {
+        v: PUSH_VERSION.to_owned(),
+        removals: removals
+            .iter()
+            .map(|removal| PushTokenRemovalEntry::from_record(removal))
+            .collect(),
+    })
+    .unwrap()
+}
+
+/// Any member can relay a stored tombstone in a kind 449 that recipients
+/// verify under the group's owner-proof rules, legacy proof forms included. A
+/// tombstone written before migration 0118 lists as local-only until the same
+/// removal arrives again.
+#[test]
+fn stored_tombstones_relay_as_owner_verified_removals() {
+    let owner = Keys::generate();
+    let owner_id = owner.public_key().to_hex();
+    let group_id = cgka_traits::GroupId::new(vec![0xEF; 16]);
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let server = "cd".repeat(32);
+    let current = signed_removal_record(&owner, &group_id_hex, 1, &server, 100);
+    let mut raw_legacy = signed_removal_record(&owner, &group_id_hex, 2, &server, 100);
+    sign_removal_record_raw_legacy(&mut raw_legacy, &group_id_hex, &owner);
+    let leaves = [1, 2, 3].map(|leaf_index| cgka_traits::engine::GroupMemberLeaf {
+        member: cgka_traits::MemberId::new(owner.public_key().to_bytes().to_vec()),
+        leaf_index,
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = push_gossip_test_app(&dir);
+    app.ingest_push_gossip_message(
+        "alice",
+        &push_gossip_message(
+            &owner,
+            &group_id,
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+            removal_payload(&[&current, &raw_legacy]),
+        ),
+        &leaves,
+        ProtocolProfile::Legacy,
+    )
+    .unwrap();
+    let earlier = signed_removal_record(&owner, &group_id_hex, 3, &server, 100);
+    let mut local_only =
+        crate::conversions::account_push_token_tombstone_from_removal(&group_id_hex, &earlier, 1)
+            .unwrap();
+    local_only.removal_proof = None;
+    app.account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .apply_group_push_token_tombstone(&local_only)
+        .unwrap();
+
+    let stored = app
+        .group_push_token_tombstones("alice", &group_id_hex)
+        .unwrap();
+    assert_eq!(stored.len(), 3);
+    assert_eq!(
+        stored[2].removal, None,
+        "pre-0118 tombstones start local-only"
+    );
+    assert_eq!(stored[2].record_digest, local_only.record_digest);
+
+    // A member relaying the same removal later makes it relayable here too.
+    app.ingest_push_gossip_message(
+        "alice",
+        &push_gossip_message(
+            &owner,
+            &group_id,
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+            removal_payload(&[&earlier]),
+        ),
+        &leaves,
+        ProtocolProfile::Current,
+    )
+    .unwrap();
+    let stored = app
+        .group_push_token_tombstones("alice", &group_id_hex)
+        .unwrap();
+    assert_eq!(stored.len(), 3);
+    for (tombstone, original) in stored.iter().zip([&current, &raw_legacy, &earlier]) {
+        let removal = tombstone.removal.as_ref().expect("tombstone is relayable");
+        assert_eq!(
+            removal, original,
+            "the relayed removal is the owner's, unchanged"
+        );
+        assert_eq!(
+            tombstone.record_digest,
+            removal.record_digest(&group_id_hex).unwrap()
+        );
+    }
+
+    // A recipient parses and verifies the relay exactly as it would the
+    // owner's own kind 449.
+    let relay = removal_payload(
+        &stored
+            .iter()
+            .filter_map(|tombstone| tombstone.removal.as_ref())
+            .collect::<Vec<_>>(),
+    );
+    let verified = |profile| match verify_push_gossip_for_profile(
+        parse_push_gossip(
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+            &group_id_hex,
+            &relay,
+        )
+        .unwrap(),
+        &group_id_hex,
+        std::slice::from_ref(&owner_id),
+        profile,
+    ) {
+        PushGossipAction::Remove(removals) => removals,
+        other => panic!("expected removals, got {other:?}"),
+    };
+    assert_eq!(
+        verified(ProtocolProfile::Legacy),
+        vec![current.clone(), raw_legacy, earlier.clone()]
+    );
+    assert_eq!(verified(ProtocolProfile::Current), vec![current, earlier]);
+}
+
+/// Read-back returns a record's stored digest only while the record's fields
+/// still produce it. The record itself is always returned.
+#[test]
+fn stored_token_digests_are_checked_on_read_back() {
+    let owner = Keys::generate();
+    let group_id_hex = hex::encode([0xEF; 16]);
+    let server = "cd".repeat(32);
+    let dir = tempfile::tempdir().unwrap();
+    let app = push_gossip_test_app(&dir);
+    let storage = app.account_storage("alice").unwrap().app_storage();
+
+    let matching = signed_token_record(&owner, &group_id_hex, 1, &server, 100);
+    let stale = signed_token_record(&owner, &group_id_hex, 2, &server, 100);
+    let mut placeholder = signed_token_record(&owner, &group_id_hex, 3, &server, 100);
+    placeholder.token_fingerprint = "not-a-fingerprint".to_owned();
+    for record in [&matching, &placeholder] {
+        app.upsert_group_push_token("alice", record).unwrap();
+    }
+    let mut stale_row = crate::conversions::account_group_push_token_from_app(&stale);
+    stale_row.record_digest = matching.record_digest().unwrap();
+    storage.upsert_group_push_token(&stale_row).unwrap();
+
+    let stored = app
+        .stored_group_push_tokens("alice", &group_id_hex)
+        .unwrap();
+    let digests = stored
+        .iter()
+        .map(|stored| stored.record_digest.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        digests,
+        vec![Some(matching.record_digest().unwrap()), None, None]
+    );
+    assert_eq!(
+        app.group_push_tokens("alice", &group_id_hex).unwrap(),
+        vec![matching, stale, placeholder]
+    );
+}
+
 #[test]
 fn mixed_entry_permutations_apply_the_same_valid_winner() {
     let owner = Keys::generate();

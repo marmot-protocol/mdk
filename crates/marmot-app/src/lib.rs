@@ -4041,6 +4041,20 @@ impl MarmotApp {
         account_ref: &str,
         group_id_hex: &str,
     ) -> Result<Vec<GroupPushTokenRecord>, AppError> {
+        Ok(self
+            .stored_group_push_tokens(account_ref, group_id_hex)?
+            .into_iter()
+            .map(|stored| stored.record)
+            .collect())
+    }
+
+    /// Every token record stored for `group_id_hex`, each with its checked
+    /// stored digest.
+    pub(crate) fn stored_group_push_tokens(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<Vec<notifications::StoredGroupPushToken>, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
@@ -4048,6 +4062,24 @@ impl MarmotApp {
             .group_push_tokens(group_id_hex)?
             .into_iter()
             .map(group_push_token_from_account)
+            .collect()
+    }
+
+    /// Every tombstone stored for `group_id_hex`. Only those that kept their
+    /// owner-signed removal may be relayed.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn group_push_token_tombstones(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<Vec<notifications::StoredPushTokenTombstone>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .app_storage()
+            .group_push_token_tombstones(group_id_hex)?
+            .into_iter()
+            .map(conversions::push_token_tombstone_from_account)
             .collect()
     }
 
@@ -4100,16 +4132,12 @@ impl MarmotApp {
             }
             notifications::PushGossipAction::Remove(removals) => {
                 for removal in removals {
-                    let digest = removal.record_digest(&group_id_hex)?;
                     storage.apply_group_push_token_tombstone(
-                        &group_id_hex,
-                        &removal.member_id_hex,
-                        removal.leaf_index,
-                        removal.platform.platform_byte(),
-                        &removal.server_pubkey_hex,
-                        removal.owner_ts,
-                        &digest,
-                        notifications::unix_now_ms(),
+                        &conversions::account_push_token_tombstone_from_removal(
+                            &group_id_hex,
+                            &removal,
+                            notifications::unix_now_ms(),
+                        )?,
                     )?;
                 }
             }
@@ -4152,19 +4180,14 @@ impl MarmotApp {
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        let digest = removal.record_digest(group_id_hex)?;
+        let tombstone = conversions::account_push_token_tombstone_from_removal(
+            group_id_hex,
+            removal,
+            notifications::unix_now_ms(),
+        )?;
         self.account_storage(&account.label)?
             .app_storage()
-            .apply_group_push_token_tombstone(
-                group_id_hex,
-                &removal.member_id_hex,
-                removal.leaf_index,
-                removal.platform.platform_byte(),
-                &removal.server_pubkey_hex,
-                removal.owner_ts,
-                &digest,
-                notifications::unix_now_ms(),
-            )?;
+            .apply_group_push_token_tombstone(&tombstone)?;
         Ok(())
     }
 
@@ -4372,7 +4395,7 @@ impl MarmotApp {
         let tokens = storage
             .group_push_tokens(group_id_hex)?
             .into_iter()
-            .map(group_push_token_from_account)
+            .map(|token| group_push_token_from_account(token).map(|stored| stored.record))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(notifications::group_debug_info(
             settings,

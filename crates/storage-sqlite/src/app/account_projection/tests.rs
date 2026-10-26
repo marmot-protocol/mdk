@@ -3487,12 +3487,20 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
     // rejecting relayed records after the group is re-bootstrapped.
     store
         .app_storage()
-        .apply_group_push_token_tombstone("aa", "member-aa", 9, 1, &"cc".repeat(32), 500, "rd", 500)
+        .apply_group_push_token_tombstone(&push_tombstone("aa", "member-aa", 9, 500, "rd"))
         .unwrap();
     store
         .app_storage()
-        .apply_group_push_token_tombstone("bb", "member-bb", 9, 1, &"cc".repeat(32), 500, "rd", 500)
+        .apply_group_push_token_tombstone(&push_tombstone("bb", "member-bb", 9, 500, "rd"))
         .unwrap();
+    for group_id_hex in ["aa", "bb"] {
+        assert!(
+            store
+                .app_storage()
+                .record_group_push_gossip_join(group_id_hex, 500)
+                .unwrap()
+        );
+    }
     insert_read_and_chat_rows(&store, "aa");
     insert_protocol_group_marker(&store, &[0xaa]);
     let historical_message_id = MessageId::new(vec![1]);
@@ -3621,6 +3629,7 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         "chat_list_rows",
         "group_push_tokens",
         "group_push_token_tombstones",
+        "group_push_gossip_state",
         "encrypted_media_epoch_secret_references",
         "pending_push_registration_shares",
         "encrypted_media_epoch_secrets",
@@ -3648,6 +3657,7 @@ fn delete_local_group_data_removes_app_local_rows_without_touching_protocol_stat
         "message_timeline",
         "group_push_tokens",
         "group_push_token_tombstones",
+        "group_push_gossip_state",
         "pending_push_registration_shares",
         "pending_push_registration_removals",
         "encrypted_media_epoch_secrets",
@@ -3855,6 +3865,26 @@ fn record_app_event_retries_concurrent_writer_contention() {
     assert_eq!(writer.app_storage().app_message_count().unwrap(), 1);
 }
 
+fn push_tombstone(
+    group_id_hex: &str,
+    member_id_hex: &str,
+    leaf_index: u32,
+    owner_ts: i64,
+    record_digest: &str,
+) -> AccountGroupPushTokenTombstone {
+    AccountGroupPushTokenTombstone {
+        group_id_hex: group_id_hex.to_owned(),
+        member_id_hex: member_id_hex.to_owned(),
+        leaf_index,
+        platform: 1,
+        server_pubkey_hex: "cc".repeat(32),
+        owner_ts,
+        record_digest: record_digest.to_owned(),
+        removal_proof: None,
+        created_at_ms: owner_ts,
+    }
+}
+
 fn push_token(
     group_id_hex: &str,
     member_id_hex: &str,
@@ -3927,16 +3957,7 @@ fn push_token_apply_retries_concurrent_writer_contention() {
     let blocker = spawn_blocker();
     assert!(
         writer
-            .apply_group_push_token_tombstone(
-                &group_id,
-                &member_id,
-                0,
-                1,
-                &"cc".repeat(32),
-                200,
-                "r1",
-                200,
-            )
+            .apply_group_push_token_tombstone(&push_tombstone(&group_id, &member_id, 0, 200, "r1"))
             .expect("tombstone apply retries after transient contention")
     );
     blocker.join().unwrap();
@@ -3969,7 +3990,7 @@ fn apply_group_push_token_keeps_sibling_leaves_distinct() {
     // A removal targeting leaf 1 must leave leaf 2's record intact.
     assert!(
         store
-            .apply_group_push_token_tombstone(&g, &m, 1, 1, &"cc".repeat(32), 200, "r1", 200)
+            .apply_group_push_token_tombstone(&push_tombstone(&g, &m, 1, 200, "r1"))
             .unwrap()
     );
     let stored = store.group_push_tokens(&g).unwrap();
@@ -4029,7 +4050,7 @@ fn removal_tombstone_blocks_stale_resurrection_until_fresh_record() {
     // Removal at a higher stamp tombstones the key and clears the live row.
     assert!(
         store
-            .apply_group_push_token_tombstone(&g, &m, 0, 1, &"cc".repeat(32), 200, "r2", 200)
+            .apply_group_push_token_tombstone(&push_tombstone(&g, &m, 0, 200, "r2"))
             .unwrap()
     );
     assert!(store.group_push_tokens(&g).unwrap().is_empty());
@@ -4057,7 +4078,7 @@ fn member_cleanup_clears_tokens_and_tombstones() {
     let g = "aa".repeat(32);
     let m = "bb".repeat(32);
     store
-        .apply_group_push_token_tombstone(&g, &m, 0, 1, &"cc".repeat(32), 200, "r2", 200)
+        .apply_group_push_token_tombstone(&push_tombstone(&g, &m, 0, 200, "r2"))
         .unwrap();
     // Departed member: both the (empty) live set and the durable tombstone go.
     store.remove_group_push_tokens_for_member(&g, &m).unwrap();
@@ -4069,6 +4090,164 @@ fn member_cleanup_clears_tokens_and_tombstones() {
             .apply_group_push_token(&push_token(&g, &m, 10, "d1"))
             .unwrap()
     );
+}
+
+/// A tombstone keeps the removal's fingerprint and signature, so it can be
+/// relayed. A newer removal replaces them; an older one changes nothing. A
+/// tombstone written without them lists as unrelayable until the same removal
+/// arrives again with them.
+#[test]
+fn push_tombstones_keep_their_removal_proof_and_list_per_group() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let g = "aa".repeat(32);
+    let m = "bb".repeat(32);
+    let proof = |fingerprint: &str, sig: &str| AccountPushTokenRemovalProof {
+        token_fingerprint: fingerprint.to_owned(),
+        owner_sig: sig.to_owned(),
+    };
+    let relayable = |owner_ts: i64, digest: &str, sig: &str| AccountGroupPushTokenTombstone {
+        removal_proof: Some(proof("fp", sig)),
+        ..push_tombstone(&g, &m, 0, owner_ts, digest)
+    };
+
+    assert!(
+        store
+            .apply_group_push_token_tombstone(&relayable(200, "r2", "sig-200"))
+            .unwrap()
+    );
+    assert!(
+        !store
+            .apply_group_push_token_tombstone(&relayable(100, "r1", "sig-100"))
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_push_token_tombstones(&g).unwrap(),
+        vec![relayable(200, "r2", "sig-200")]
+    );
+    assert!(
+        store
+            .apply_group_push_token_tombstone(&relayable(300, "r3", "sig-300"))
+            .unwrap()
+    );
+    let local_only = push_tombstone(&g, &m, 1, 300, "r4");
+    let other_group = push_tombstone(&"ee".repeat(32), &m, 0, 300, "r5");
+    for tombstone in [&local_only, &other_group] {
+        assert!(store.apply_group_push_token_tombstone(tombstone).unwrap());
+    }
+    assert_eq!(
+        store.group_push_token_tombstones(&g).unwrap(),
+        vec![relayable(300, "r3", "sig-300"), local_only.clone()]
+    );
+
+    // Only the same removal, at an equal stamp, fills in the missing proof.
+    let with_proof = |owner_ts: i64, digest: &str| AccountGroupPushTokenTombstone {
+        removal_proof: Some(proof("fp", "sig-local")),
+        ..push_tombstone(&g, &m, 1, owner_ts, digest)
+    };
+    for other_removal in [with_proof(300, "r0"), with_proof(299, "r4")] {
+        assert!(
+            !store
+                .apply_group_push_token_tombstone(&other_removal)
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        store.group_push_token_tombstones(&g).unwrap()[1],
+        local_only
+    );
+    assert!(
+        !store
+            .apply_group_push_token_tombstone(&with_proof(300, "r4"))
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_push_token_tombstones(&g).unwrap()[1],
+        with_proof(300, "r4")
+    );
+    assert!(
+        !store
+            .apply_group_push_token_tombstone(&AccountGroupPushTokenTombstone {
+                removal_proof: Some(proof("fp", "sig-other")),
+                ..with_proof(300, "r4")
+            })
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_push_token_tombstones(&g).unwrap()[1],
+        with_proof(300, "r4"),
+        "a stored proof is never replaced at an equal stamp"
+    );
+
+    // A strictly newer record clears the tombstone, proof and all.
+    assert!(
+        store
+            .apply_group_push_token(&push_token(&g, &m, 400, "d4"))
+            .unwrap()
+    );
+    assert_eq!(store.group_push_token_tombstones(&g).unwrap().len(), 1);
+}
+
+/// Gossip state covers one membership of a projected group: writes need a
+/// joined group, the first join time stands, the latest announce
+/// wins, and leaving, a local delete or a projection prune clears the row.
+#[test]
+fn push_gossip_state_tracks_the_current_membership() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let save = |groups: Vec<StoredAccountGroup>| {
+        app.save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups,
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    };
+    let state = |group: &str| app.group_push_gossip_state(group).unwrap();
+    assert!(!app.record_group_push_gossip_join("aa", 1).unwrap());
+    assert_eq!(state("aa"), None);
+    save(vec![group("aa", "alpha"), group("bb", "beta")]);
+
+    assert!(app.record_group_push_gossip_join("aa", 10).unwrap());
+    assert!(app.record_group_push_gossip_join("aa", 20).unwrap());
+    assert!(app.record_group_push_gossip_announce("aa", 50).unwrap());
+    assert!(app.record_group_push_gossip_announce("aa", 40).unwrap());
+    let recorded = Some(AccountGroupPushGossipState {
+        group_id_hex: "aa".to_owned(),
+        joined_at_ms: Some(10),
+        last_announced_at_ms: Some(50),
+    });
+    assert_eq!(state("aa"), recorded);
+    // Saving the projection again keeps a still-joined group's row.
+    let mut renamed = group("aa", "renamed");
+    renamed.member_count = Some(3);
+    save(vec![renamed, group("bb", "beta")]);
+    assert_eq!(state("aa"), recorded);
+
+    for membership in [SelfMembership::Left, SelfMembership::Removed] {
+        app.set_group_self_membership("aa", SelfMembership::Member)
+            .unwrap();
+        assert!(app.record_group_push_gossip_join("aa", 60).unwrap());
+        app.set_group_self_membership("aa", membership).unwrap();
+        assert_eq!(state("aa"), None, "{membership:?} ends the membership");
+        assert!(!app.record_group_push_gossip_announce("aa", 70).unwrap());
+        assert_eq!(state("aa"), None, "no write after {membership:?}");
+    }
+    app.set_group_self_membership("aa", SelfMembership::Member)
+        .unwrap();
+    assert!(app.record_group_push_gossip_join("aa", 80).unwrap());
+    assert_eq!(state("aa").unwrap().joined_at_ms, Some(80));
+    assert_eq!(state("aa").unwrap().last_announced_at_ms, None);
+
+    assert!(app.record_group_push_gossip_join("bb", 90).unwrap());
+    store.delete_local_group_data("aa").unwrap();
+    assert_eq!(state("aa"), None);
+    save(Vec::new());
+    assert_eq!(state("bb"), None);
 }
 
 #[test]
@@ -4729,7 +4908,10 @@ fn leaf_cleanup_preserves_sibling_tombstones_until_account_departure() {
     store.apply_group_push_token(&sibling).unwrap();
     assert_eq!(store.group_push_tokens(&g).unwrap().len(), 2);
     store
-        .apply_group_push_token_tombstone(&g, &m, 2, 1, &"dd".repeat(32), 500, "withdrawn", 500)
+        .apply_group_push_token_tombstone(&AccountGroupPushTokenTombstone {
+            server_pubkey_hex: "dd".repeat(32),
+            ..push_tombstone(&g, &m, 2, 500, "withdrawn")
+        })
         .unwrap();
     store
         .remove_group_push_tokens_for_leaves(&g, &[(m.clone(), 0)], &[])
@@ -4780,27 +4962,15 @@ fn canonical_push_leaf_reconciliation_is_atomic_and_account_scoped() {
     let mut old = push_token(&g, &m, 100, "old");
     old.leaf_index = 2;
     old.server_pubkey_hex = "dd".repeat(32);
-    app.apply_group_push_token_tombstone(
-        &g,
-        &m,
-        2,
-        1,
-        &old.server_pubkey_hex,
-        500,
-        "withdrawn",
-        500,
-    )
+    app.apply_group_push_token_tombstone(&AccountGroupPushTokenTombstone {
+        server_pubkey_hex: old.server_pubkey_hex.clone(),
+        ..push_tombstone(&g, &m, 2, 500, "withdrawn")
+    })
     .unwrap();
-    app.apply_group_push_token_tombstone(
-        &g,
-        &peer,
-        2,
-        1,
-        &old.server_pubkey_hex,
-        500,
-        "peer-withdrawn",
-        500,
-    )
+    app.apply_group_push_token_tombstone(&AccountGroupPushTokenTombstone {
+        server_pubkey_hex: old.server_pubkey_hex.clone(),
+        ..push_tombstone(&g, &peer, 2, 500, "peer-withdrawn")
+    })
     .unwrap();
     store
         .lock()
