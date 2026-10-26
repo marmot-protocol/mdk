@@ -47,6 +47,20 @@ pub const NOSTR_GROUP_KEY_LEN: usize = 32;
 /// the 16-byte ChaCha20-Poly1305 authentication tag (`spec/transports/nostr.md`).
 pub const NOSTR_GROUP_CONTENT_MIN_LEN: usize = 12 + 16;
 
+/// Serialized JSON length of a kind-445 event with empty `content`, counting
+/// `created_at` and the optional `expiration` tag at the full width of a `u64`:
+/// the 64-hex `id`, `pubkey` and `h` value, the 128-hex `sig`, and the member
+/// names and punctuation.
+const GROUP_EVENT_JSON_OVERHEAD: usize = 464;
+
+/// Upper bound on the serialized JSON length of the kind-445 event that wraps
+/// an `mls_message_len`-byte MLS message, the size relays measure an event by.
+/// Exact except for the decimal width of `created_at` and `expiration`.
+pub fn group_event_json_len_bound(mls_message_len: usize) -> usize {
+    let sealed = NOSTR_GROUP_CONTENT_MIN_LEN + mls_message_len;
+    GROUP_EVENT_JSON_OVERHEAD + sealed.div_ceil(3) * 4
+}
+
 pub(crate) const GROUP_TAG: &str = "h";
 pub(crate) const EXPIRATION_TAG: &str = "expiration";
 pub(crate) const RECIPIENT_TAG: &str = "p";

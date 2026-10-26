@@ -2100,11 +2100,7 @@ async fn run_app_runtime_account_worker(
             client.has_pending_runtime_group_subscription_refresh(),
             &command_tx,
         );
-        // A member add on any ingest or send path queued a share.
-        client.retry_pending_member_add_push_shares();
-        if client.take_queued_push_registration_share() {
-            scheduled_push_retry.observe_pending(true, &command_tx);
-        }
+        schedule_push_work_after_turn(&mut client, &mut scheduled_push_retry, &command_tx);
         schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
         let ready_command =
             ready_command_index(&pending, &media_http, comparison_recovery.is_some());
@@ -6720,6 +6716,22 @@ fn push_registration_retry_delay(attempt: u32) -> Duration {
         .min(push_registration_retry_max_delay())
 }
 
+/// Arm the push retry for the work a worker turn left: a member add on any
+/// ingest or send path that queued a share or owed a snapshot, or an owed
+/// snapshot that its group's state no longer holds back. What holds one back
+/// (hydration, a queued invite, a disband, a block) changes only through
+/// account work, so checking after every turn notices it without polling.
+fn schedule_push_work_after_turn(
+    client: &mut AppClient,
+    scheduled: &mut ScheduledPushRegistrationRetry,
+    commands: &mpsc::Sender<AccountWorkerCommand>,
+) {
+    client.retry_pending_member_add_push_shares();
+    if client.take_queued_push_registration_share() || client.has_due_push_snapshot() {
+        scheduled.observe_pending(true, commands);
+    }
+}
+
 /// A bounded backoff timer that exists only while durable push outbox rows
 /// remain. This is not a periodic poll: successful drain disarms it completely.
 struct ScheduledPushRegistrationRetry {
@@ -10306,6 +10318,59 @@ mod tests {
 
         scheduled.schedule_after_attempt(false, &commands);
         assert!(!scheduled.is_armed());
+    }
+
+    /// An owed push snapshot held back by its group's state arms no retry, and
+    /// the first turn after the hold clears arms one, with no command or
+    /// member add of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn held_push_snapshot_is_scheduled_once_its_group_lets_it_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app =
+            MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+        let mut client = app.client(&account.label).await.unwrap();
+        let group = client.create_group("held snapshot", &[]).await.unwrap();
+        let group_hex = hex::encode(group.as_slice());
+        let epoch = client.runtime.epoch_state(&group).unwrap().epoch().0;
+        // Owed once the group's epoch passes the current one.
+        assert!(
+            app.record_group_push_snapshot_owed(&account.label, &group_hex, epoch)
+                .unwrap()
+        );
+        let (commands, mut received) = mpsc::channel(2);
+        let mut scheduled = ScheduledPushRegistrationRetry::new();
+        schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
+        assert!(!scheduled.is_armed());
+
+        client
+            .update_group_profile(&group, Some("held snapshot, renamed"), None)
+            .await
+            .unwrap();
+        let _ = client.take_queued_push_registration_share();
+        schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
+        assert!(scheduled.is_armed());
+        let AccountWorkerCommand::RetryPushRegistration { respond } =
+            received.recv().await.unwrap()
+        else {
+            panic!("a due snapshot must enqueue a push retry")
+        };
+        let pending = client
+            .retry_pending_push_registration_shares_best_effort()
+            .await;
+        assert!(!pending);
+        let _ = respond.send(pending);
+        assert_eq!(
+            app.group_push_snapshot_owed(&account.label, &group_hex)
+                .unwrap(),
+            None
+        );
+        schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
+        tokio::task::yield_now().await;
+        assert!(!client.has_due_push_snapshot());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

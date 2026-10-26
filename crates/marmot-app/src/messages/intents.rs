@@ -288,6 +288,9 @@ pub(crate) enum AppMessageIntent {
     PushTokenUpdate {
         content: String,
     },
+    PushTokenList {
+        content: String,
+    },
     PushTokenRemoval {
         content: String,
     },
@@ -725,6 +728,11 @@ pub(crate) fn build_inner_event_with_media_reply(
         }
         AppMessageIntent::PushTokenUpdate { content } => Ok(event(
             MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+            vec![vec!["v".to_owned(), crate::PUSH_VERSION.to_owned()]],
+            content.clone(),
+        )),
+        AppMessageIntent::PushTokenList { content } => Ok(event(
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
             vec![vec!["v".to_owned(), crate::PUSH_VERSION.to_owned()]],
             content.clone(),
         )),

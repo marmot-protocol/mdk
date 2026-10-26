@@ -38,7 +38,7 @@ pub use session::{
     AccountIdentityProofRequest, AccountIdentityProofSigner, CanonicalGroupMembership,
     CanonicalizationPolicy, FeatureRegistry, GroupAuthoritySnapshot, KeyPackageMetadata,
     KeyPackageRequirements, V1_SETTLEMENT_QUIESCENCE_MS, WelcomeDeliveryIndex,
-    durably_owned_key_packages, key_package_metadata,
+    application_message_len, durably_owned_key_packages, key_package_metadata,
 };
 pub use time::{
     MaintenanceRandom, MonotonicClock, OsMaintenanceRandom, SystemMonotonicClock, SystemWallClock,

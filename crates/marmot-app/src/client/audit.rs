@@ -252,6 +252,7 @@ impl AppClient {
             | AppMessageIntent::AgentOperation { .. }
             | AppMessageIntent::GroupSystem { .. }
             | AppMessageIntent::PushTokenUpdate { .. }
+            | AppMessageIntent::PushTokenList { .. }
             | AppMessageIntent::PushTokenRemoval { .. } => return None,
         };
         Some(Self::local_human_action_context(

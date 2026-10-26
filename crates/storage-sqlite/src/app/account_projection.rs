@@ -482,6 +482,10 @@ pub struct AccountGroupPushGossipState {
     pub joined_at_ms: Option<i64>,
     /// When this device last announced in the group. `None` if it never has.
     pub last_announced_at_ms: Option<i64>,
+    /// The device owes the group a push snapshot once its merged epoch passes
+    /// this one: a Commit it published from this epoch adds leaves. `None`
+    /// when nothing is owed.
+    pub snapshot_owed_after_epoch: Option<u64>,
 }
 
 struct RawStoredAccountGroup {
@@ -3065,20 +3069,78 @@ impl SqliteAppStorage {
     ) -> StorageResult<Option<AccountGroupPushGossipState>> {
         self.lock()?
             .query_row_cached(
-                "SELECT group_id_hex, joined_at_ms, last_announced_at_ms
+                "SELECT group_id_hex, joined_at_ms, last_announced_at_ms, snapshot_owed_after_epoch
                  FROM group_push_gossip_state
                  WHERE group_id_hex = ?1",
                 params![group_id_hex],
-                |row| {
-                    Ok(AccountGroupPushGossipState {
-                        group_id_hex: row.get(0)?,
-                        joined_at_ms: row.get(1)?,
-                        last_announced_at_ms: row.get(2)?,
-                    })
-                },
+                group_push_gossip_state_from_row,
             )
             .optional()
             .storage()
+    }
+
+    /// Every group this device owes a push snapshot, in group id order.
+    pub fn owed_group_push_snapshots(&self) -> StorageResult<Vec<AccountGroupPushGossipState>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare_cached(
+                "SELECT group_id_hex, joined_at_ms, last_announced_at_ms, snapshot_owed_after_epoch
+                 FROM group_push_gossip_state
+                 WHERE snapshot_owed_after_epoch IS NOT NULL
+                 ORDER BY group_id_hex",
+            )
+            .storage()?;
+        statement
+            .query_map([], group_push_gossip_state_from_row)
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()
+    }
+
+    /// Record that this device owes `group_id_hex` a push snapshot once its
+    /// merged epoch passes `after_epoch`, the epoch a leaf-adding Commit it is
+    /// about to publish starts from. A later epoch replaces an earlier one,
+    /// since one snapshot after the last add covers both. Returns false,
+    /// recording nothing, unless this device is a member of a projected group.
+    pub fn record_group_push_snapshot_owed(
+        &self,
+        group_id_hex: &str,
+        after_epoch: u64,
+    ) -> StorageResult<bool> {
+        self.upsert_group_push_gossip_state(
+            "INSERT INTO group_push_gossip_state (group_id_hex, snapshot_owed_after_epoch)
+             SELECT group_id_hex, ?2 FROM account_groups
+             WHERE group_id_hex = ?1 AND self_membership = 'member'
+             ON CONFLICT(group_id_hex) DO UPDATE SET
+                snapshot_owed_after_epoch = MAX(
+                    COALESCE(group_push_gossip_state.snapshot_owed_after_epoch, excluded.snapshot_owed_after_epoch),
+                    excluded.snapshot_owed_after_epoch
+                )",
+            group_id_hex,
+            u64_to_i64(after_epoch)?,
+        )
+    }
+
+    /// Replace the owed snapshot epoch of `group_id_hex` with `replacement`
+    /// (`None` settles it) only while it is still `expected`, so settling one
+    /// snapshot cannot drop an owed epoch recorded meanwhile. Returns whether
+    /// it was replaced.
+    pub fn replace_group_push_snapshot_owed(
+        &self,
+        group_id_hex: &str,
+        expected: u64,
+        replacement: Option<u64>,
+    ) -> StorageResult<bool> {
+        let replacement = replacement.map(u64_to_i64).transpose()?;
+        Ok(self
+            .lock()?
+            .execute_cached(
+                "UPDATE group_push_gossip_state SET snapshot_owed_after_epoch = ?3
+                 WHERE group_id_hex = ?1 AND snapshot_owed_after_epoch = ?2",
+                params![group_id_hex, u64_to_i64(expected)?, replacement],
+            )
+            .storage()?
+            > 0)
     }
 
     /// Record when this device's join to `group_id_hex` became final. The
@@ -3127,11 +3189,11 @@ impl SqliteAppStorage {
         &self,
         sql: &str,
         group_id_hex: &str,
-        at_ms: i64,
+        value: i64,
     ) -> StorageResult<bool> {
         Ok(self
             .lock()?
-            .execute_cached(sql, params![group_id_hex, at_ms])
+            .execute_cached(sql, params![group_id_hex, value])
             .storage()?
             > 0)
     }
@@ -4071,6 +4133,24 @@ fn i64_to_u8(value: i64, column: usize) -> rusqlite::Result<u8> {
 fn i64_to_u16(value: i64, column: usize) -> rusqlite::Result<u16> {
     u16::try_from(value).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(err))
+    })
+}
+
+fn group_push_gossip_state_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AccountGroupPushGossipState> {
+    let snapshot_owed_after_epoch: Option<i64> = row.get(3)?;
+    Ok(AccountGroupPushGossipState {
+        group_id_hex: row.get(0)?,
+        joined_at_ms: row.get(1)?,
+        last_announced_at_ms: row.get(2)?,
+        snapshot_owed_after_epoch: snapshot_owed_after_epoch
+            .map(|epoch| {
+                u64::try_from(epoch).map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(3, Type::Integer, Box::new(err))
+                })
+            })
+            .transpose()?,
     })
 }
 

@@ -796,6 +796,69 @@ mod tests {
         assert_eq!(event.tag_values(EXPIRATION_TAG).len(), 1);
     }
 
+    /// The bound is exact for an event whose timestamps are as wide as a `u64`
+    /// allows, and holds for real wraps across base64 padding boundaries.
+    #[tokio::test]
+    async fn group_event_json_len_bound_covers_published_events() {
+        for mls_len in [0, 1, 2, 3, 100, 65_000] {
+            let widest = NostrTransportEvent {
+                id: "a".repeat(64),
+                pubkey: "b".repeat(64),
+                created_at: u64::MAX,
+                kind: KIND_MARMOT_GROUP_MESSAGE,
+                tags: vec![
+                    vec![GROUP_TAG.to_string(), "c".repeat(64)],
+                    vec![EXPIRATION_TAG.to_string(), u64::MAX.to_string()],
+                ],
+                content: BASE64_STANDARD.encode(vec![0; NOSTR_GROUP_CONTENT_MIN_LEN + mls_len]),
+                sig: Some("d".repeat(128)),
+            };
+            assert_eq!(
+                serde_json::to_vec(&widest).unwrap().len(),
+                crate::group_event_json_len_bound(mls_len),
+                "{mls_len}-byte MLS message"
+            );
+        }
+
+        let ctx = GroupContextSnapshot::new(
+            EpochId(9),
+            HashMap::from([(DEFAULT_EXPORTER_LABEL.to_string(), vec![0x7a; 32])]),
+            Some(vec![0x99; 32]),
+        );
+        for (mls_len, metadata) in [
+            (0, GroupMessageMetadata::commit_or_proposal()),
+            (
+                1,
+                GroupMessageMetadata::application(1_700_000_000, Some(60)),
+            ),
+            (2, GroupMessageMetadata::application(1_700_000_000, None)),
+            (
+                65_000,
+                GroupMessageMetadata::application(1_700_000_000, Some(60)),
+            ),
+        ] {
+            let wrapped = NostrMlsPeeler::default()
+                .wrap_group_message_with_metadata(
+                    &EncryptedPayload {
+                        ciphertext: vec![0x42; mls_len],
+                        aad: vec![],
+                    },
+                    &ctx,
+                    &metadata,
+                )
+                .await
+                .expect("wrap succeeds");
+            let event =
+                NostrTransportEvent::from_transport_message(&wrapped).expect("payload parses");
+            assert!(event.sig.is_some());
+            assert!(
+                serde_json::to_vec(&event).unwrap().len()
+                    <= crate::group_event_json_len_bound(mls_len),
+                "{mls_len}-byte MLS message"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn group_peel_accepts_valid_events_before_and_after_expiration() {
         let group_id = vec![0x99; 32];

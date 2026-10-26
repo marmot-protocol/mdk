@@ -13,6 +13,7 @@ pub use cgka_engine::KeyPackageMetadata;
 pub use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
+pub use cgka_engine::application_message_len;
 pub use cgka_engine::canonicalization::{CanonicalizationPolicy, V1_SETTLEMENT_QUIESCENCE_MS};
 pub use cgka_engine::engine::WelcomeDeliveryIndex;
 pub use cgka_engine::feature_registry::FeatureRegistry;

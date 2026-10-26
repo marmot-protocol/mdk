@@ -12,11 +12,11 @@ use std::str::FromStr as _;
 const RELAY: &str = "wss://relay.example";
 
 /// One device of a test account, with its own read position on the shared relay.
-struct Device {
-    label: String,
-    account_id_hex: String,
-    client: AppClient,
-    cursor: usize,
+pub(super) struct Device {
+    pub(super) label: String,
+    pub(super) account_id_hex: String,
+    pub(super) client: AppClient,
+    pub(super) cursor: usize,
 }
 
 impl Device {
@@ -26,7 +26,12 @@ impl Device {
         Self::open(app, label, &account.account_id_hex, 0).await
     }
 
-    async fn open(app: &MarmotApp, label: &str, account_id_hex: &str, cursor: usize) -> Self {
+    pub(super) async fn open(
+        app: &MarmotApp,
+        label: &str,
+        account_id_hex: &str,
+        cursor: usize,
+    ) -> Self {
         let mut client = app.client(label).await.unwrap();
         client.publish_key_package().await.unwrap();
         client.sync().await.unwrap();
@@ -38,12 +43,12 @@ impl Device {
         }
     }
 
-    async fn receive(&mut self, relay: &ScriptedPushRelayClient) {
+    pub(super) async fn receive(&mut self, relay: &ScriptedPushRelayClient) {
         deliver_new(&mut self.client, relay, &mut self.cursor).await;
         self.client.sync().await.unwrap();
     }
 
-    async fn join(&mut self, relay: &ScriptedPushRelayClient, group: &GroupId) {
+    pub(super) async fn join(&mut self, relay: &ScriptedPushRelayClient, group: &GroupId) {
         self.receive(relay).await;
         self.client.accept_group_invite(group).unwrap();
     }
@@ -86,7 +91,7 @@ impl Device {
             .unwrap()
     }
 
-    fn leaf(&self, group: &GroupId) -> (String, u32) {
+    pub(super) fn leaf(&self, group: &GroupId) -> (String, u32) {
         (
             self.account_id_hex.clone(),
             self.client.runtime.own_leaf_index(group).unwrap(),
@@ -94,7 +99,7 @@ impl Device {
     }
 
     /// A second connection to this device's database, for injecting faults.
-    fn raw_connection(&self) -> rusqlite::Connection {
+    pub(super) fn raw_connection(&self) -> rusqlite::Connection {
         let app = &self.client.app;
         let path = app.account_storage_path(&self.label);
         let keys = app.account_home().load_signing_keys(&self.label).unwrap();
@@ -113,7 +118,7 @@ impl Device {
 
     /// `(member, leaf)` of every token record this device holds for `group`,
     /// its own record included.
-    fn token_leaves(&self, group: &GroupId) -> BTreeSet<(String, u32)> {
+    pub(super) fn token_leaves(&self, group: &GroupId) -> BTreeSet<(String, u32)> {
         self.client
             .app
             .group_push_tokens(&self.label, &hex::encode(group.as_slice()))
@@ -158,7 +163,7 @@ fn trigger_tokens(
         .collect()
 }
 
-fn group_message_count(relay: &ScriptedPushRelayClient) -> usize {
+pub(super) fn group_message_count(relay: &ScriptedPushRelayClient) -> usize {
     relay
         .published_events
         .lock()
@@ -170,19 +175,41 @@ fn group_message_count(relay: &ScriptedPushRelayClient) -> usize {
 
 /// Alice and Bob share tokens in a two-member group; Carol and Dave are not
 /// yet members.
-struct Fixture {
-    _dir: tempfile::TempDir,
-    relay: Arc<ScriptedPushRelayClient>,
-    server: nostr::prelude::Keys,
-    group: GroupId,
-    alice: Device,
-    bob: Device,
-    carol: Device,
-    dave: Device,
+pub(super) struct Fixture {
+    pub(super) _dir: tempfile::TempDir,
+    pub(super) relay: Arc<ScriptedPushRelayClient>,
+    pub(super) server: nostr::prelude::Keys,
+    pub(super) group: GroupId,
+    pub(super) alice: Device,
+    pub(super) bob: Device,
+    pub(super) carol: Device,
+    pub(super) dave: Device,
 }
 
 impl Fixture {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
+        Self::with_app(app_at).await
+    }
+
+    /// The fixture whose devices wait `ms` for a group's Commits to settle,
+    /// so a Commit received from a peer holds back this device's own.
+    pub(super) async fn with_settlement_quiescence_ms(ms: u64) -> Self {
+        Self::with_app(|dir, relay| {
+            MarmotApp::with_relay_and_config(
+                dir.path(),
+                RELAY,
+                MarmotAppConfig::white_noise()
+                    .with_dev_settlement_quiescence_ms(ms)
+                    .with_dev_scheduled_convergence_delay_ms(0),
+            )
+            .with_test_relay_client(relay)
+        })
+        .await
+    }
+
+    async fn with_app(
+        app_at: impl FnOnce(&tempfile::TempDir, Arc<ScriptedPushRelayClient>) -> MarmotApp,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -219,7 +246,7 @@ impl Fixture {
         }
     }
 
-    fn group_hex(&self) -> String {
+    pub(super) fn group_hex(&self) -> String {
         hex::encode(self.group.as_slice())
     }
 }
@@ -359,9 +386,11 @@ async fn failed_share_queue_after_own_add_is_retried() {
         .await
         .unwrap();
     assert!(fx.alice.pending_shares().is_empty());
-    assert!(!fx.alice.client.take_queued_push_registration_share());
+    // The add also owes the group a push snapshot, which is pending work.
+    assert!(fx.alice.client.take_queued_push_registration_share());
     fx.alice.client.retry_pending_member_add_push_shares();
     assert!(fx.alice.pending_shares().is_empty());
+    assert!(!fx.alice.client.take_queued_push_registration_share());
 
     connection
         .execute_batch("DROP TRIGGER fail_share_queue")

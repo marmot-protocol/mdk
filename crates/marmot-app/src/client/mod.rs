@@ -806,6 +806,10 @@ pub struct AppClient {
     /// Groups grown by an own command whose push-token share failed to queue;
     /// the account worker retries them.
     pub(super) pending_member_add_push_shares: std::collections::HashSet<GroupId>,
+    /// Groups where a merged Commit by this account added a member, with the
+    /// epoch that Commit started from, whose owed push snapshot failed to
+    /// record; the account worker retries them.
+    pub(super) pending_own_add_push_snapshots: HashMap<GroupId, u64>,
     /// App-visible outputs ingested during a sync whose account-projection
     /// checkpoint failed. A retained client keeps the matching projected state
     /// and outbox acknowledgements, then returns this summary after its next
@@ -2839,6 +2843,26 @@ impl AppClient {
         );
         self.tolerate_pre_send_sync_failure("invite_members", pre_send_sync)?;
 
+        // Record the push snapshot the added leaves are owed before the engine
+        // stages or queues their Commit, from an epoch no later than the one
+        // it starts from. A queued invite merges only when convergence drains
+        // it, possibly after a restart; a staged one is undone below if it
+        // never merges. The engine hydrates the group for the Commit anyway,
+        // and reports any hydration failure there.
+        let _ = self.runtime.ensure_group_hydrated(group_id);
+        let mut push_snapshot = match self.runtime.epoch_state(group_id) {
+            Some(state) => {
+                // A staged commit's state carries the epoch it will reach.
+                let after_epoch = if state.is_resolving_local_publish() {
+                    state.epoch().0.saturating_sub(1)
+                } else {
+                    state.epoch().0
+                };
+                Some(self.record_push_snapshot_owed(group_id, after_epoch)?)
+            }
+            None => None,
+        };
+
         let engine_publish_started_at = Instant::now();
         let commit = self
             .runtime
@@ -2852,8 +2876,17 @@ impl AppClient {
             )
             .await
             .map_err(AppError::from);
+        let adds_leaves = match &commit {
+            Ok(PreparedSessionSend::Commit(prepared)) => !prepared.welcomes().is_empty(),
+            Ok(PreparedSessionSend::Queued(_)) => true,
+            Err(_) => false,
+        };
+        if !adds_leaves && let Some(snapshot) = push_snapshot.take() {
+            self.restore_push_snapshot_owed(snapshot);
+        }
         let prepared = match commit {
             Ok(PreparedSessionSend::Commit(prepared)) => prepared,
+            // The owed snapshot waits for the queued Commit to merge.
             Ok(PreparedSessionSend::Queued(session_effects)) => {
                 let queued = self
                     .runtime
@@ -2881,6 +2914,13 @@ impl AppClient {
                 return Err(error);
             }
         };
+        // A staged commit's state carries the epoch it will reach.
+        let source_epoch = match self.runtime.epoch_state(group_id) {
+            Some(cgka_traits::EpochState::PendingPublish(pending)) => {
+                pending.epoch().0.checked_sub(1)
+            }
+            _ => None,
+        };
         // The invite is staged locally but not canonical yet. Record every
         // Welcome destination atomically before exposing the commit; if that
         // persistence fails, roll back the staged MLS change and return the
@@ -2897,6 +2937,9 @@ impl AppClient {
         let welcome_intents = match welcome_intent_result {
             Ok(welcome_intents) => welcome_intents,
             Err(error) => {
+                if let Some(snapshot) = push_snapshot {
+                    self.restore_push_snapshot_owed(snapshot);
+                }
                 let rollback = self
                     .runtime
                     .rollback_prepared_session_commit(prepared)
@@ -2965,9 +3008,20 @@ impl AppClient {
                 // let this in-memory slot independently publish Welcomes after
                 // a failed caller-visible commit attempt.
                 self.unpublished_welcome_delivery = None;
+                // A commit rolled back leaves the group at its source epoch
+                // with nothing pending, and never owes the snapshot.
+                if let Some(push_snapshot) = push_snapshot
+                    && self.runtime.epoch_state(group_id).is_some_and(|state| {
+                        !state.is_resolving_local_publish() && Some(state.epoch().0) == source_epoch
+                    })
+                {
+                    self.restore_push_snapshot_owed(push_snapshot);
+                }
                 return Err(error);
             }
         };
+        // The account worker sends the owed snapshot.
+        self.push_registration_share_queued |= push_snapshot.is_some();
 
         let local_refresh_started_at = Instant::now();
         let local_refresh = (|| {
@@ -3264,6 +3318,7 @@ impl AppClient {
         self.forget_pending_effect_projections(group_id);
         self.pending_push_leaf_reconciliations.remove(group_id);
         self.pending_member_add_push_shares.remove(group_id);
+        self.pending_own_add_push_snapshots.remove(group_id);
         self.app.presentation_signals.wake();
         // Deletion already committed. A failed transport refresh must not make
         // the caller believe the group still exists; ordinary maintenance retries.
@@ -4256,7 +4311,9 @@ impl AppClient {
                 (Family::MessageAction, "delete")
             }
             AppMessageIntent::Media { .. } => (Family::MessageAction, "media"),
-            AppMessageIntent::PushTokenUpdate { .. } => (Family::Notification, "update"),
+            AppMessageIntent::PushTokenUpdate { .. } | AppMessageIntent::PushTokenList { .. } => {
+                (Family::Notification, "update")
+            }
             AppMessageIntent::PushTokenRemoval { .. } => (Family::Notification, "remove"),
             AppMessageIntent::StreamStart { .. } => (Family::Stream, "start"),
             AppMessageIntent::StreamFinal { .. } => (Family::Stream, "finalize"),
