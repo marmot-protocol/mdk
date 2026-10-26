@@ -36,6 +36,54 @@ runtime-owned subscriptions plus typed events; explicit catch-up remains availab
 The runtime exposes account status, group listing/showing, message listing, and snapshot-plus-live subscription APIs,
 so CLI, TUI, and native surfaces never open the databases directly.
 
+`open_chat_list_selection` is a Rust-only foundation for complete selection in the four native chat views.
+It captures compact frozen IDs independently of the display window, returns an exact count and pages of at most
+200 IDs, and revalidates by removing ineligible targets without adding arrivals. Revalidation changes the revision;
+older page requests fail. Closing, dropping or cancelling the owner is terminal, as are account reset and runtime
+shutdown. Reads run on the blocking pool; cancellation is checked between ID rows and fences late results, but does
+not interrupt a running SQLite step or connection wait. Incomplete base projections fail explicitly. This API has
+no folder/search scopes, bindings or mutation authorization yet.
+
+`open_complete_chat_list_selection` is the complete mode of the same owner for closed folder/type/named-ID/search scopes over
+one native view or active and archived views together. It enumerates native candidates in one owned session
+snapshot. When a rule needs host presentation, `status` has no selected count until the host answers the issued
+bounded operand pages and resolves them. The host freezes localized copy, nickname/profile labels and sparse
+optimistic/mute/invite context under `ChatSelectionHostContext`; it must invalidate that identity whenever those
+required inputs change. No host code runs while native SQL is held. Native captures complete visible search-message
+operands and exact pinned retention inputs; the existing host predicate owns language and content-filter semantics.
+The additive UniFFI `open_chat_selection` surface wraps this same owner; it introduces no second actor or cache.
+Default count/membership skips optional type/lifecycle preparation. Before a confirmation needs those complete-set
+hints, call `prepare_action_hints`; missing optional facts remain absent rather than blocking compact selection.
+Folder preferences use fresh `folder_assignment_page`, inspected-original progress and one revision/host context;
+ordinary display pages never grant preference-write authority. Discard prepared pages after any revision change.
+See [the binding contract](../marmot-uniffi/CHAT-LIST-ROWS.md#complete-selection-ownership) for complete integration rules.
+
+Explicit checkbox re-selection uses `reselect(revision, context, group_ids)` on the same complete-selection owner.
+At most 200 requested IDs must already be selected or have been explicitly unchecked from that native original
+set. Native scope, current owner and presentation checks still apply; new arrivals and action-consumed IDs cannot
+be restored. A changed revision invalidates old pages and answers. Required host leaves use the existing resolving
+phase. Failed capture preserves the previous selection. Once `status.operation_id` is present, freeze re-selection:
+restoring unchecked rows would widen an already prepared operation. Shrink-only `exclude` retains its existing
+uncertainty/admitted-departure guards. Never reopen the full scope to simulate a row toggle or retry a lost mutation.
+Native retained-exclusion text and vector headers are charged against the same conservative transient budget;
+strings move when explicitly unchecked, and successful restoration compacts the retained exclusions.
+
+`refresh_scope` only shrinks the original selected IDs and requires current host context and new answers. Archive
+and delete-local actions recapture each original batch in the actual account worker, compare every required raw
+presentation input and host identity, and request fresh answers before writing when those facts changed. One handle
+binds one operation identity and immutable mutation kind; monotonic attempt identities distinguish its bounded
+batches. Repeating the latest completed attempt returns its retained result, including after refresh, and never
+replays its mutations. Changed presentation retains the same waiting operation. An unresolved worker response or
+uncertain mutation blocks further writes on that handle; refresh does not clear that evidence. Batches contain at
+most 200 original IDs and reuse existing worker mutators and projection events. New arrivals never join the set.
+
+Each capture refuses recoverably above 16 MiB of retained text or 64 MiB of estimated capture state. Comparing an
+old snapshot with a fresh attempt can hold both bounded snapshots temporarily; this is not a process-wide memory
+limit. Typed protocol Group decoding inherits the existing nonpreemptive one-record cost. Required presentation
+uses the existing at-most-64-KiB typed envelope decoder and immediately discards avatar metadata. The native-only
+path skips that decoder. Cancellation fences late results and later mutation admission; it does not roll back an
+already-completed batch or interrupt an in-progress underlying SQLite step or existing mutator.
+
 **Startup.** `MarmotAppRuntime::start()` returns at local readiness: persisted account sessions are hydrated and
 worker-routed local reads are available. Relay activation, group-subscription registration, shared-directory
 synchronization, and initial catch-up continue asynchronously. Hosts should render local chat projections at that

@@ -80,6 +80,7 @@ pub use account_attention::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
     AccountAttentionUnavailable, RuntimeAccountAttentionSubscription,
 };
+mod chat_list_selection;
 mod chat_list_window;
 mod conversation_window;
 mod worker_startup;
@@ -123,6 +124,18 @@ mod onboarding;
 mod presentation;
 mod presented_chat_list;
 mod reactions;
+pub use chat_list_selection::{
+    ChatListSelectionError, ChatListSelectionPage, ChatListSelectionSummary, ChatSelectionAnswer,
+    ChatSelectionAutomaticRule, ChatSelectionBaseScope, ChatSelectionCaptureError,
+    ChatSelectionContext, ChatSelectionDepartureReport, ChatSelectionDepartureStep,
+    ChatSelectionField, ChatSelectionFolder, ChatSelectionFolderPage, ChatSelectionHostContext,
+    ChatSelectionHostOverlays, ChatSelectionLeaf, ChatSelectionLeafKind, ChatSelectionLegacyRule,
+    ChatSelectionMode, ChatSelectionMutation, ChatSelectionMutationReport, ChatSelectionOpen,
+    ChatSelectionOperand, ChatSelectionPredicate, ChatSelectionPresentationError,
+    ChatSelectionQueryError, ChatSelectionScope, ChatSelectionSearchMessage,
+    ChatSelectionSearchPresentation, ChatSelectionSearchPreviewMessage, ChatSelectionSearchScope,
+    ChatSelectionSending, ChatSelectionStatus, RuntimeChatListSelection,
+};
 pub use chat_list_window::{
     CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
     ChatListPageDirection, ChatListView, ChatListWindowError, ChatListWindowHandle,
@@ -5424,19 +5437,14 @@ impl MarmotAppRuntime {
         chat_list_row: Option<ChatListRow>,
         chat_list_trigger: ChatListUpdateTrigger,
     ) {
-        let _ = self
-            .events
-            .send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
-                account_id_hex,
-                account_label,
-                update: AppProjectionUpdate {
-                    group_id_hex,
-                    timeline_messages: Vec::new(),
-                    timeline_changes: Vec::new(),
-                    chat_list_row,
-                    chat_list_trigger,
-                },
-            }));
+        publish_chat_list_projection_update_event(
+            &self.events,
+            account_id_hex,
+            account_label,
+            group_id_hex,
+            chat_list_row,
+            chat_list_trigger,
+        );
     }
 
     pub async fn create_identity(
@@ -9166,3 +9174,25 @@ pub use account_attachment_history::{
     AccountAttachmentCursor, AccountAttachmentEntry, AccountAttachmentPage,
     AccountAttachmentPageRead, AccountAttachmentQuery, AccountAttachmentVersion,
 };
+
+/// Shared event order for ordinary and selection-batch archive operations.
+fn publish_chat_list_projection_update_event(
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: String,
+    account_label: String,
+    group_id_hex: String,
+    chat_list_row: Option<ChatListRow>,
+    chat_list_trigger: ChatListUpdateTrigger,
+) {
+    let _ = events.send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
+        account_id_hex,
+        account_label,
+        update: AppProjectionUpdate {
+            group_id_hex,
+            timeline_messages: Vec::new(),
+            timeline_changes: Vec::new(),
+            chat_list_row,
+            chat_list_trigger,
+        },
+    }));
+}

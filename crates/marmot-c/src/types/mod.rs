@@ -44,3 +44,5 @@ pub mod public_event_preview;
 
 pub mod startup_diagnostics;
 pub use startup_diagnostics::*;
+
+pub mod chat_selection;

@@ -292,7 +292,7 @@ fn ensure_can_remove_members(
     Ok(())
 }
 
-fn ensure_can_promote_admin(
+pub(super) fn ensure_can_promote_admin(
     state: &GroupManagementStateFfi,
     group_id_hex: &str,
     member_ref: &str,
@@ -330,7 +330,7 @@ fn ensure_can_demote_admin(
     Ok(())
 }
 
-fn ensure_can_request_leave(
+pub(super) fn ensure_can_request_leave(
     state: &GroupManagementStateFfi,
     group_id_hex: &str,
 ) -> Result<(), MarmotKitError> {
@@ -364,7 +364,7 @@ fn ensure_can_request_leave(
     Ok(())
 }
 
-fn ensure_can_self_demote_admin(
+pub(super) fn ensure_can_self_demote_admin(
     state: &GroupManagementStateFfi,
     group_id_hex: &str,
 ) -> Result<(), MarmotKitError> {

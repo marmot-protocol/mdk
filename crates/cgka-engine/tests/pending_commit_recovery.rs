@@ -213,6 +213,7 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
         alice.confirm_published(pending).await.unwrap();
         assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(1));
         assert_eq!(alice.members(&group_id).unwrap().len(), 2);
+        alice.check_members_readiness(&group_id).unwrap();
 
         // Stage an invite of carol. This persists the staged commit to MLS
         // storage but does NOT merge it; the projection puts carol in the
@@ -240,6 +241,8 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
             "carol projected pre-confirm"
         );
 
+        alice.check_members_readiness(&group_id).unwrap();
+
         // "Crash": drop the engine without calling confirm_published /
         // publish_failed. The pending commit is now stranded on disk.
         drop(alice);
@@ -257,9 +260,22 @@ async fn reopen_after_crash_during_publish_recovers_stranded_pending_commit() {
 
     let reopened_store_probe = reopened_store.clone();
     let mut alice = build_client(reopened_store, b"alice-pcr");
+    // The exact checker follows the real cheap-seeded owner, not a captured
+    // readiness boolean. PendingPublish recovery still uses projected members.
+    alice.hydrate_stable_groups_from_storage().unwrap();
+    assert!(matches!(
+        alice.check_members_readiness(&group_id),
+        Err(cgka_traits::EngineError::GroupNotHydrated(_))
+    ));
+    assert!(matches!(
+        alice.members(&group_id),
+        Err(cgka_traits::EngineError::GroupNotHydrated(_))
+    ));
     alice
         .hydrate_all_stored_groups()
         .expect("hydrate must recover, not error");
+
+    alice.check_members_readiness(&group_id).unwrap();
 
     // The recovery event was surfaced so the app can resync.
     let events = alice.drain_events();

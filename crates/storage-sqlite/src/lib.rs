@@ -106,11 +106,11 @@ pub use app::timeline::{
     ConversationOpenError, ConversationOpenQuery, ConversationOpenReadState,
     ConversationOpenSnapshot, ConversationOpenTarget, ConversationPresentationPage,
     ConversationWindowQuery, DeletionSource, LOCAL_PUBLISH_FAILED_REASON, MAX_TIMELINE_LIMIT,
-    SecurePruneAppEventsResult, StoredAppEvent, TimelineEditHistoryPage, TimelineEditSummary,
-    TimelineEditVersion, TimelineMessageChange, TimelineMessageQuery, TimelineMessageRecord,
-    TimelineMessageTarget, TimelinePage, TimelinePagination, TimelineProjectionUpdate,
-    TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview, TimelineUpdateTrigger,
-    TimelineUserReaction,
+    SecurePruneAppEventsResult, SelectionMessageInput, StoredAppEvent, TimelineEditHistoryPage,
+    TimelineEditSummary, TimelineEditVersion, TimelineMessageChange, TimelineMessageQuery,
+    TimelineMessageRecord, TimelineMessageTarget, TimelinePage, TimelinePagination,
+    TimelineProjectionUpdate, TimelineReactionSummary, TimelineRemoveReason, TimelineReplyPreview,
+    TimelineUpdateTrigger, TimelineUserReaction,
 };
 pub use app::transport::prepared_group_image_upload::{
     ACTIVE_PREPARED_GROUP_IMAGE_UPLOAD_TTL_SECONDS,
@@ -163,3 +163,13 @@ pub use app::attachment_acquisition::{
 };
 
 pub use base::open_progress::{StorageOpenPhase, StorageOpenProgress};
+
+pub use app::chat_list::{
+    AcceptedSourceFacts, ContextCaptureError, ContextError, ProjectionFacts, RequiredContext,
+    SelectionBaseScope, SelectionContextRequest, SelectionPresentation,
+    SelectionSearchPreviewInput, SelectionSourceContext, SelectionTitleInputs,
+};
+pub use cross::selection_roster::{
+    MAX_SELECTED_MEMBER_KEYS, PeerInputs, ProjectedRosterEvidence, RosterReadError,
+    SelectedMemberKeys, SelectedRosterPresentation,
+};

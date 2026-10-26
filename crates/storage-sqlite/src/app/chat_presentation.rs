@@ -6,6 +6,7 @@
 //! setter, which requeues the row. P2 wires both lifecycle paths before enabling its worker.
 mod maintenance;
 pub(crate) mod row_contract;
+pub(crate) mod selection;
 use crate::base::connection::CachedSql;
 use crate::{ChatListAvatar, SqliteAppStorage, SqliteResultExt, serialize, u64_to_i64};
 use cgka_traits::app_components::GROUP_AVATAR_URL_COMPONENT_ID;
@@ -139,10 +140,14 @@ pub(crate) fn nonnegative(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::R
         .try_into()
         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
 }
-fn decode_envelope(bytes: &[u8]) -> StorageResult<Envelope> {
-    if bytes.len() > MAX_BYTES {
+pub(crate) fn validate_envelope_length(length: usize) -> StorageResult<()> {
+    if length > MAX_BYTES {
         return Err(invalid("oversized chat presentation"));
     }
+    Ok(())
+}
+fn decode_envelope(bytes: &[u8]) -> StorageResult<Envelope> {
+    validate_envelope_length(bytes.len())?;
     let envelope: Envelope =
         serde_json::from_slice(bytes).map_err(|_| invalid("invalid chat presentation encoding"))?;
     if envelope.format != FORMAT {

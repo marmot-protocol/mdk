@@ -40,6 +40,15 @@ _Static_assert(MARMOT_MODERATION_REPORT_ORIGIN_BLOCK_AND_REPORT == 1, "moderatio
 _Static_assert(MARMOT_STATUS_MODERATION_REPORTING_NOT_CONFIGURED == 96, "moderation status ABI value");
 _Static_assert(MARMOT_STATUS_MODERATION_REPORT_RATE_LIMITED == 100, "moderation status ABI value");
 
+_Static_assert(MARMOT_STATUS_CHAT_SELECTION_UNCERTAIN == 108, "selection uncertainty ABI value");
+_Static_assert(MARMOT_STATUS_CHAT_SELECTION_QUERY == 124, "selection query ABI value");
+_Static_assert(MARMOT_CHAT_SELECTION_FIELD_UNREAD == 0, "selection field ABI value");
+_Static_assert(MARMOT_CHAT_SELECTION_FIELD_PARTICIPANTS == 10, "selection participant field ABI value");
+_Static_assert(MARMOT_CHAT_SELECTION_MODE_CONTAINS == 7, "selection mode ABI value");
+_Static_assert(MARMOT_CHAT_SELECTION_SENDING_SUPPRESS_NATIVE == 1, "selection sending ABI value");
+_Static_assert(sizeof(((MarmotChatSelectionAnswerInput *)0)->matches) == sizeof(uint8_t), "selection input boolean ABI");
+_Static_assert(sizeof(((MarmotChatSelectionPredicateInput *)0)->field) == sizeof(uint32_t), "selection input enum ABI");
+
 static int failures = 0;
 
 static void ok(const char *what) {
@@ -122,6 +131,21 @@ int main(int argc, char **argv) {
         return 2;
     }
     const char *home = argv[1];
+
+    /* Required-output preflight must run before input conversion or effect admission. */
+    check(marmot_open_chat_selection(NULL, NULL, NULL, NULL) == MARMOT_STATUS_NULL_POINTER,
+          "selection open output preflight");
+    check(marmot_chat_selection_apply(NULL, 1, 1, 1, NULL, NULL, NULL) == MARMOT_STATUS_NULL_POINTER,
+          "selection mutation output preflight");
+    check(marmot_selection_leave_group(NULL, NULL, NULL, NULL, NULL) == MARMOT_STATUS_NULL_POINTER,
+          "selection departure output preflight");
+    MarmotChatSelectionStatus *selection_status = (MarmotChatSelectionStatus *)(uintptr_t)1;
+    check(marmot_chat_selection_status(NULL, &selection_status) == MARMOT_STATUS_NULL_POINTER,
+          "selection invalid handle refusal");
+    check(selection_status == NULL, "selection refusal clears output sentinel");
+    marmot_chat_selection_operand_list_free(NULL);
+    marmot_chat_selection_departure_report_free(NULL);
+    marmot_chat_selection_free(NULL);
 
     /* ---- file-transfer cancellation and progress (no client) ---------- */
     MarmotMediaFileTransferControl *control = NULL;

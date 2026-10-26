@@ -555,6 +555,9 @@ pub use commands::moderation::*;
 
 pub use commands::AttachmentTransferSubscription;
 
+pub use conversions::chat_selection::*;
+pub use subscriptions::ChatSelection;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -549,3 +549,31 @@ just c-header
 The mirror surface is macro-generated, so header generation runs cbindgen
 with macro expansion (`RUSTC_BOOTSTRAP=1` on the stable toolchain). CI
 diff-gates the checked-in header.
+
+## Complete chat selection
+
+Use the [shared complete-selection contract](../marmot-uniffi/README.md#complete-chat-selection)
+for native candidate ownership, presentation answers, original-only reselect and guarded actions.
+`marmot_open_chat_selection` returns one opaque `MarmotChatSelection`; free it before its
+client, after all calls on the handle have returned. Commands block on that client's runtime.
+`marmot_chat_selection_close` retires the native intent; `marmot_chat_selection_free` also
+retires it and releases the C handle. Returned records remain independently caller-owned.
+
+Borrowed `*Input` records use `uint8_t` booleans (nonzero means true), validated `uint32_t`
+enum tags and pointer/length arrays. Inactive optional records are NULL. Input map entries
+must have unique keys; a present preview entry with NULL value is an explicit replacement
+with no message, distinct from an absent key. Text operands and input text fields are JSON
+string literals, including titles, descriptions, queries, message bodies, system-event labels
+and media fallback text. Decode or encode these once with a JSON string codec to preserve
+embedded NULs. Account, group, member and message identifiers remain ordinary C strings.
+
+Read `has_count` and each `has_all_*` flag before its payload. An unresolved count is not
+zero, and an unknown action hint is not false. `last_mutation` and `last_departure` return
+OK with NULL when no result exists. Free every non-NULL result with its matching root free;
+never free borrowed input fields or embedded records separately.
+
+Display pages and visible membership checks do not authorize mutations. Folder assignment
+uses freshly revalidated pages, follows `next_after` until `done`, and discards all accumulated
+IDs if the returned revision changes. Preserve operation/attempt identity for archive and
+per-target departure. `MARMOT_STATUS_CHAT_SELECTION_UNCERTAIN` means read back the retained
+result; a timeout or abandoned wait must not start a replacement operation.

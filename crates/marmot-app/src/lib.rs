@@ -87,9 +87,11 @@ pub use product_analytics::*;
 mod audit_log;
 pub mod audit_otlp_sender;
 mod chat_presentation;
+mod chat_selection;
 mod client;
 mod config;
 mod deployment;
+pub mod smart_folder;
 pub use deployment::{
     KeyPackageClientPreference, MarmotDeployment, NEUTRAL_KEYCHAIN_SERVICE_NAME,
     OpenRankingProvider,
@@ -177,8 +179,18 @@ pub use runtime::{
 };
 pub use runtime::{
     CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
-    ChatListPageDirection, ChatListView, ChatListWindowError, ChatListWindowHandle,
-    ChatListWindowSnapshot, PresentedChatListUpdate, RuntimeChatListWindowSubscription,
+    ChatListPageDirection, ChatListSelectionError, ChatListSelectionPage, ChatListSelectionSummary,
+    ChatListView, ChatListWindowError, ChatListWindowHandle, ChatListWindowSnapshot,
+    ChatSelectionAnswer, ChatSelectionAutomaticRule, ChatSelectionBaseScope,
+    ChatSelectionCaptureError, ChatSelectionContext, ChatSelectionDepartureReport,
+    ChatSelectionDepartureStep, ChatSelectionField, ChatSelectionFolder, ChatSelectionFolderPage,
+    ChatSelectionHostContext, ChatSelectionHostOverlays, ChatSelectionLeaf, ChatSelectionLeafKind,
+    ChatSelectionLegacyRule, ChatSelectionMode, ChatSelectionMutation, ChatSelectionMutationReport,
+    ChatSelectionOpen, ChatSelectionOperand, ChatSelectionPredicate,
+    ChatSelectionPresentationError, ChatSelectionQueryError, ChatSelectionScope,
+    ChatSelectionSearchMessage, ChatSelectionSearchPresentation, ChatSelectionSearchPreviewMessage,
+    ChatSelectionSearchScope, ChatSelectionSending, ChatSelectionStatus, PresentedChatListUpdate,
+    RuntimeChatListSelection, RuntimeChatListWindowSubscription,
     RuntimePresentedChatListSubscription,
 };
 pub use runtime::{
@@ -5897,24 +5909,14 @@ impl MarmotApp {
         (message.kind != MARMOT_APP_EVENT_KIND_GROUP_SYSTEM).then_some(message.sender.as_str())
     }
 
-    fn hydrate_chat_system_names(&self, rows: &mut [ChatListRow]) -> Result<(), AppError> {
-        use chat_presentation::canonical_identity;
-        let ids = rows
-            .iter()
-            .filter_map(|r| r.last_message.as_ref())
-            .filter_map(|m| m.group_system.as_ref())
-            .filter(|e| e.provenance == GroupSystemEventProvenance::AuthenticatedGroupState)
-            .flat_map(|e| {
-                [
-                    e.actor_account_id_hex.as_deref(),
-                    e.subject_account_id_hex.as_deref(),
-                ]
-            })
-            .flatten()
-            .filter_map(canonical_identity)
-            .collect::<HashSet<_>>();
+    // Pure local cache/shared reads with the same source precedence as prepared
+    // chat rows. No acquisition, refresh, profile request or network operation.
+    fn chat_system_display_names(
+        &self,
+        ids: HashSet<String>,
+    ) -> Result<HashMap<String, String>, AppError> {
         if ids.is_empty() {
-            return Ok(());
+            return Ok(HashMap::new());
         }
         let caches = self.directory_caches()?;
         let shared = self.shared_storage()?;
@@ -5939,6 +5941,29 @@ impl MarmotApp {
             );
             names.insert(id, name);
         }
+        Ok(names)
+    }
+
+    fn hydrate_chat_system_names(&self, rows: &mut [ChatListRow]) -> Result<(), AppError> {
+        use chat_presentation::canonical_identity;
+        let ids = rows
+            .iter()
+            .filter_map(|r| r.last_message.as_ref())
+            .filter_map(|m| m.group_system.as_ref())
+            .filter(|e| e.provenance == GroupSystemEventProvenance::AuthenticatedGroupState)
+            .flat_map(|e| {
+                [
+                    e.actor_account_id_hex.as_deref(),
+                    e.subject_account_id_hex.as_deref(),
+                ]
+            })
+            .flatten()
+            .filter_map(canonical_identity)
+            .collect::<HashSet<_>>();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let names = self.chat_system_display_names(ids)?;
         for event in rows
             .iter_mut()
             .filter_map(|r| r.last_message.as_mut())

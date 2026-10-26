@@ -499,6 +499,131 @@ impl AccountManager {
         Ok(co_members.into_iter().collect())
     }
 
+    /// Private complete-capture worker route. Dropping/timing out the receiver
+    /// makes the synchronous scanner discard its result at the next boundary.
+    pub(crate) async fn capture_selection_context(
+        &self,
+        account_ref: &str,
+        request: crate::chat_selection::capture::CaptureRequest,
+    ) -> Result<crate::client::BoundSelectionCapture, crate::chat_selection::capture::CaptureError>
+    {
+        use crate::chat_selection::capture::CaptureError;
+        let command = self
+            .worker_commands(account_ref)
+            .await
+            .map_err(|_| CaptureError::Closed)?;
+        let (respond, response) = oneshot::channel();
+        // Queue capacity, FIFO waiting and capture share one command budget.
+        // Expiry drops both the pending send and the response receiver.
+        match tokio::time::timeout(super::APP_RUNTIME_WORKER_RESPONSE_WAIT, async {
+            command
+                .send(AccountWorkerCommand::CaptureSelection { request, respond })
+                .await
+                .map_err(|_| CaptureError::Closed)?;
+            response.await.map_err(|_| CaptureError::Closed)?
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(CaptureError::TimedOut),
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Authority, frozen capture proof, action intent and cancellation remain explicit at the account-worker boundary."
+    )]
+    pub(crate) async fn depart_selection_context(
+        &self,
+        account_ref: &str,
+        request: crate::chat_selection::capture::CaptureRequest,
+        proof: Option<std::sync::Arc<crate::chat_selection::presentation::PresentationProof>>,
+        owner: storage_sqlite::SqliteAccountStorage,
+        owner_epoch: Vec<u8>,
+        group_id: String,
+        step: super::ChatSelectionDepartureStep,
+        admitted: bool,
+    ) -> Result<
+        crate::client::SelectionDepartureOutcome,
+        crate::chat_selection::capture::CaptureError,
+    > {
+        use crate::chat_selection::capture::CaptureError;
+        let command = self
+            .worker_commands(account_ref)
+            .await
+            .map_err(|_| CaptureError::Closed)?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::DepartSelection {
+                request,
+                proof,
+                owner,
+                owner_epoch,
+                group_id,
+                step,
+                admitted,
+                respond,
+            })
+            .await
+            .map_err(|_| CaptureError::Closed)?;
+        // The actor retains this receiver after a UI waiter disappears. No
+        // timeout may turn an admitted effect into a replayable failure.
+        let result = response.await.map_err(|_| CaptureError::Closed)?;
+        if matches!(
+            &result,
+            Ok(crate::client::SelectionDepartureOutcome::Effect {
+                summary: Some(_),
+                error: None,
+                ..
+            })
+        ) {
+            self.catch_up_committed(command, "selection_departure")
+                .await;
+            self.schedule_audit_log_tracker_update("selection_departure");
+        }
+        result
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Authority, frozen capture proof, action intent and cancellation remain explicit at the account-worker boundary."
+    )]
+    pub(crate) async fn apply_selection_context(
+        &self,
+        account_ref: &str,
+        request: crate::chat_selection::capture::CaptureRequest,
+        proof: Option<std::sync::Arc<crate::chat_selection::presentation::PresentationProof>>,
+        owner: storage_sqlite::SqliteAccountStorage,
+        owner_epoch: Vec<u8>,
+        mutation: crate::chat_selection::capture::SelectionMutation,
+        attempt_id: u64,
+        operation_id: u64,
+    ) -> Result<crate::client::SelectionApplyOutcome, crate::chat_selection::capture::CaptureError>
+    {
+        use crate::chat_selection::capture::CaptureError;
+        let command = self
+            .worker_commands(account_ref)
+            .await
+            .map_err(|_| CaptureError::Closed)?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::ApplySelection {
+                request,
+                proof,
+                owner,
+                owner_epoch,
+                mutation,
+                attempt_id,
+                operation_id,
+                respond,
+            })
+            .await
+            .map_err(|_| CaptureError::Closed)?;
+        // Keep the receiver alive through the actual bounded batch. The owning
+        // selection actor records the result even if a UI method wait is dropped.
+        response.await.map_err(|_| CaptureError::Closed)?
+    }
+
     pub async fn group_members(
         &self,
         account_ref: &str,
@@ -2294,6 +2419,193 @@ impl AccountManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn selection_capture_waits_past_local_limit_and_remains_bounded() {
+        use super::super::{ManagedAccountWorker, MarmotAppRuntime};
+        use crate::chat_selection::{
+            capture::{CaptureError, CaptureRequest, HostOverlays},
+            presentation::HostContextIdentity,
+            scope::ScopeRequest,
+        };
+        for (delay, expected) in [(11, CaptureError::NotReady), (121, CaptureError::TimedOut)] {
+            let dir = tempfile::tempdir().unwrap();
+            let account = marmot_account::AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let runtime = MarmotAppRuntime::new(crate::MarmotApp::with_relay(
+                dir.path(),
+                "wss://relay.example",
+            ));
+            let manager = runtime.accounts();
+            let (commands, mut received) = mpsc::channel(1);
+            let (shutdown, stopped) = oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let Some(AccountWorkerCommand::CaptureSelection { mut respond, .. }) =
+                    received.recv().await
+                else {
+                    panic!("expected complete selection capture");
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {
+                        assert!(respond.send(Err(CaptureError::NotReady)).is_ok());
+                    }
+                    _ = respond.closed() => {
+                        assert_eq!(expected, CaptureError::TimedOut);
+                    }
+                }
+                let _ = stopped.await;
+            });
+            manager.workers.lock().await.insert(
+                account.account_id_hex.clone(),
+                ManagedAccountWorker {
+                    ready: true,
+                    media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                        super::super::MEDIA_COMMAND_QUEUE_LIMIT,
+                    )),
+                    handle,
+                    commands,
+                    shutdown,
+                },
+            );
+            let request = CaptureRequest {
+                scope: ScopeRequest {
+                    selected_folder: None,
+                    filter_folders: None,
+                    named_chats: None,
+                    direct: false,
+                    groups: false,
+                    search: None,
+                },
+                base: storage_sqlite::SelectionBaseScope::View(crate::ChatListView::Chats),
+                original_ids: None,
+                action_hints: false,
+                excluded_cost: (0, 0),
+                host: HostContextIdentity {
+                    account_id_hex: account.account_id_hex.clone(),
+                    runtime_generation: 1,
+                    selection_generation: 1,
+                    presentation_context_id: 1,
+                },
+                overlays: HostOverlays::default(),
+                revision: 1,
+                capture_now_ms: 1000,
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let started = tokio::time::Instant::now();
+            let result = manager
+                .capture_selection_context(&account.label, request)
+                .await;
+            assert!(matches!(result, Err(error) if error == expected));
+            assert_eq!(
+                started.elapsed(),
+                std::time::Duration::from_secs(if expected == CaptureError::TimedOut {
+                    120
+                } else {
+                    11
+                }),
+            );
+            runtime.shutdown().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn selection_capture_bounds_queue_admission_and_reply_together() {
+        use super::super::{ManagedAccountWorker, MarmotAppRuntime};
+        use crate::chat_selection::{
+            capture::{CaptureError, CaptureRequest, HostOverlays},
+            presentation::HostContextIdentity,
+            scope::ScopeRequest,
+        };
+        for (queue_delay, reply_delay, expected, elapsed) in [
+            (121, 0, CaptureError::TimedOut, 120),
+            (70, 70, CaptureError::TimedOut, 120),
+            (50, 60, CaptureError::NotReady, 110),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let account = marmot_account::AccountHome::open(dir.path())
+                .create_account("alice")
+                .unwrap();
+            let runtime = MarmotAppRuntime::new(crate::MarmotApp::with_relay(
+                dir.path(),
+                "wss://relay.example",
+            ));
+            let manager = runtime.accounts();
+            let (commands, mut received) = mpsc::channel(1);
+            let (filler, _filler_response) = oneshot::channel();
+            commands
+                .try_send(AccountWorkerCommand::RunDueMaintenance { respond: filler })
+                .unwrap();
+            let (shutdown, mut stopped) = oneshot::channel();
+            let handle = tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(queue_delay)) => {}
+                    _ = &mut stopped => return,
+                }
+                assert!(matches!(
+                    received.recv().await,
+                    Some(AccountWorkerCommand::RunDueMaintenance { .. })
+                ));
+                let Some(AccountWorkerCommand::CaptureSelection { mut respond, .. }) =
+                    received.recv().await
+                else {
+                    panic!("expected complete selection capture");
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(reply_delay)) => {
+                        assert!(respond.send(Err(CaptureError::NotReady)).is_ok());
+                    }
+                    _ = respond.closed() => {
+                        assert_eq!(expected, CaptureError::TimedOut);
+                    }
+                }
+                let _ = stopped.await;
+            });
+            manager.workers.lock().await.insert(
+                account.account_id_hex.clone(),
+                ManagedAccountWorker {
+                    ready: true,
+                    media_admission: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                        super::super::MEDIA_COMMAND_QUEUE_LIMIT,
+                    )),
+                    handle,
+                    commands,
+                    shutdown,
+                },
+            );
+            let request = CaptureRequest {
+                scope: ScopeRequest {
+                    selected_folder: None,
+                    filter_folders: None,
+                    named_chats: None,
+                    direct: false,
+                    groups: false,
+                    search: None,
+                },
+                base: storage_sqlite::SelectionBaseScope::View(crate::ChatListView::Chats),
+                original_ids: None,
+                action_hints: false,
+                excluded_cost: (0, 0),
+                host: HostContextIdentity {
+                    account_id_hex: account.account_id_hex.clone(),
+                    runtime_generation: 1,
+                    selection_generation: 1,
+                    presentation_context_id: 1,
+                },
+                overlays: HostOverlays::default(),
+                revision: 1,
+                capture_now_ms: 1000,
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let started = tokio::time::Instant::now();
+            let result = manager
+                .capture_selection_context(&account.label, request)
+                .await;
+            assert!(matches!(result, Err(error) if error == expected));
+            assert_eq!(started.elapsed(), std::time::Duration::from_secs(elapsed),);
+            runtime.shutdown().await;
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn accept_waits_past_local_limit() {

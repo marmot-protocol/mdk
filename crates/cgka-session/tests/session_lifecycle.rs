@@ -189,12 +189,29 @@ async fn session_runs_on_a_host_opened_connection_the_host_can_close() {
         "the session writes through the host's connection"
     );
 
+    // The callback receives this exact host connection, never another cached
+    // account handle. Missing groups are not invented quarantine failures.
+    let other = SqliteAccountStorage::in_memory().unwrap();
+    let missing = GroupId::new(vec![99; 4]);
+    session
+        .with_members_read_snapshot::<_, cgka_traits::StorageError>(|exact, check| {
+            assert!(exact.shares_connection_with(&storage));
+            assert!(!exact.shares_connection_with(&other));
+            check(&missing).unwrap();
+            Ok(())
+        })
+        .unwrap();
+
     storage.closer().close().unwrap();
     assert!(
         session.fresh_key_package().await.is_err(),
         "the session must stop with the host's connection, not reopen storage"
     );
     assert!(storage.is_closed());
+    assert!(matches!(
+        session.with_members_read_snapshot::<_, cgka_traits::StorageError>(|_, _| Ok(())),
+        Err(cgka_traits::StorageError::Closed(_))
+    ));
 }
 
 fn selfremove_registry() -> FeatureRegistry {
@@ -345,6 +362,14 @@ async fn session_reopens_encrypted_sqlite_group_state() {
     assert_eq!(alice.epoch(&created.group_id).unwrap(), EpochId(1));
     assert_eq!(alice.members(&created.group_id).unwrap().len(), 2);
     assert_eq!(alice.own_leaf_index(&created.group_id).unwrap(), 0);
+    alice
+        .with_members_read_snapshot::<_, EngineError>(|exact, check| {
+            use cgka_traits::storage::GroupStorage;
+            check(&created.group_id)?;
+            assert_eq!(exact.get_group(&created.group_id)?.members.len(), 2);
+            Ok(())
+        })
+        .unwrap();
 
     drop(alice);
 

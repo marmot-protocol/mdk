@@ -2699,6 +2699,13 @@ impl<S: StorageProvider> Engine<S> {
         self.quarantined_groups.get(group_id).copied()
     }
 
+    /// Pure source-owned gate for composing a projected-members read under an
+    /// already-held storage connection. No SQL, hydration, epoch or MLS reads.
+    /// This preserves members() readiness; it does not validate record provenance.
+    pub fn check_members_readiness(&self, group_id: &GroupId) -> Result<(), EngineError> {
+        self.ensure_group_live(group_id)
+    }
+
     /// Enforce the documented quarantine contract on a live surface: a
     /// quarantined group is indistinguishable from an unknown one on every
     /// accessor and every send/convergence entry point, so validation-rejected

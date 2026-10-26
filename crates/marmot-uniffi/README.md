@@ -21,7 +21,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [public Nostr event verification](#public-nostr-event-verification),
   [public event previews](#public-event-previews)
 - Screens: [selected chat-list presentation](#selected-chat-list-presentation),
-  [bounded chat screens](#bounded-chat-screens), [prepared conversation windows](#prepared-conversation-windows),
+  [bounded chat screens](#bounded-chat-screens), [complete chat selection](#complete-chat-selection), [prepared conversation windows](#prepared-conversation-windows),
   [live timeline updates](#live-timeline-updates), [durable avatar access](#durable-avatar-access)
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
   [group-system previews](#group-system-previews),
@@ -84,6 +84,7 @@ screen API exists. The method reference marks explicit alternatives individually
 | --- | --- | --- |
 | Runtime construction | `newWithConfiguration` with `MarmotOptions` | `new` with only a deployment; specialized constructors remain compatibility conveniences. Preserve secret store and cursor policy when migrating. |
 | Main Chats/Unread/Archived/Left screens | `openChatListWindow` | `presentedChatList` / `openPresentedChatList` for a full selected list; `chatList` / `subscribeChatList` for raw rows and custom filters. Do not filter a loaded page to implement full-account search. |
+| Select all in the complete offered chat scope | `openChatSelection` | Window rows and ordinary selection pages are display data; use the same native owner for explicit checkbox re-selection and fresh bounded actions. |
 | One chat row | `presentedChatListRow` | `chatListRow` when raw fields are specifically required. Avoid account-wide reads for one row. |
 | Account badges | `subscribeAccountAttention` | `accountUnreadSummary` remains a one-shot lower-level unread query, not a substitute for the prepared attention contract. |
 | Conversation screen | `openConversationWindow` | `timelineMessages` / `subscribeTimelineMessages` for a custom timeline; `messages` / `subscribeMessages` for raw stored messages. |
@@ -780,6 +781,29 @@ an unread, pin, archive or mute update can have the same presentation revision. 
 accounts; cancellation preserves a pending refresh, and shutdown ends the stream. Account-store replacement requires
 opening a new handle. Do not log rows or avatar material, including generated host-language record stringification.
 Existing chat-list APIs remain available.
+
+## Complete chat selection
+
+Use `open_chat_selection` for selection across the complete offered chat scope. Native storage owns the original
+candidate set, count and shrink-only membership; rendered window rows supply no completeness authority. Hosts answer
+issued compact presentation leaves through their existing pure title/search predicates after the SQL snapshot is
+released. Default count/membership needs no optional type/lifecycle preparation. Before a confirmation needs those
+hints, call `prepare_action_hints` and complete its required presentation. Missing optional hints remain absent.
+
+Use native fresh archive/local-delete admission, the guarded departure methods and `last_mutation`/`last_departure`
+readback, preserving operation/attempt identity and uncertain outcomes. Folder preferences remain host-owned and use
+the dedicated fresh folder handoff, not display pages. Read [complete selection ownership](CHAT-LIST-ROWS.md#complete-selection-ownership)
+for scope, snapshot, cancellation, budgeting, retry and localization requirements.
+
+Explicit checkbox re-selection uses `reselect(revision, context, group_ids)` on the same complete-selection owner.
+At most 200 requested IDs must already be selected or have been explicitly unchecked from that native original
+set. Native scope, current owner and presentation checks still apply; new arrivals and action-consumed IDs cannot
+be restored. A changed revision invalidates old pages and answers. Required host leaves use the existing resolving
+phase. Failed capture preserves the previous selection. Once `status.operation_id` is present, freeze re-selection:
+restoring unchecked rows would widen an already prepared operation. Shrink-only `exclude` retains its existing
+uncertainty/admitted-departure guards. Never reopen the full scope to simulate a row toggle or retry a lost mutation.
+Native retained-exclusion text and vector headers are charged against the same conservative transient budget;
+strings move when explicitly unchecked, and successful restoration compacts the retained exclusions.
 
 ## Bounded chat screens
 

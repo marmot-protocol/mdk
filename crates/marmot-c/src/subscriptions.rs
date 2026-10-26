@@ -1380,3 +1380,6 @@ pub unsafe extern "C" fn marmot_block_list_subscription_snapshot(
         }
     })
 }
+
+mod chat_selection;
+pub use chat_selection::*;
