@@ -23,10 +23,11 @@
   registration.
 - `group_push_token_tombstones` lists a group's tombstones. One with an
   `AccountPushTokenRemovalProof` can be relayed as the owner's signed removal;
-  one without, written before migration 0118, stays local-only.
-- `group_push_gossip_state` and `record_group_push_gossip_join`, `_snapshot`
-  and `_announce` keep this device's per-group gossip state for its current
-  membership. Writes need a joined group; the row goes when the device leaves
+  one without, written before migration 0118, stays local-only until the same
+  removal is applied again with its proof.
+- `group_push_gossip_state`, `record_group_push_gossip_join` and
+  `record_group_push_gossip_announce` keep when this device's join became final
+  and when it last announced, for its current membership. Writes need a joined group; the row goes when the device leaves
   or is removed, and with the group.
 
 ## 0.14.0 - 2026-10-23

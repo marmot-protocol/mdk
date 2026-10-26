@@ -6,8 +6,8 @@
 //!   tombstones kept no signature: both columns stay NULL and the tombstone
 //!   stays local-only. The two columns are set together or not at all.
 //! - `group_push_gossip_state` holds this device's per-group gossip state for
-//!   its current membership: when its join became final, the first snapshot
-//!   that arrived, and when it last announced. No rows are seeded: a group
+//!   its current membership: when its join became final and when it last
+//!   announced. No rows are seeded: a group
 //!   joined before this migration has no recorded join and has never
 //!   announced.
 use crate::SqliteResultExt;
@@ -23,7 +23,6 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             group_id_hex TEXT PRIMARY KEY
                 REFERENCES account_groups(group_id_hex) ON DELETE CASCADE,
             joined_at_ms INTEGER,
-            snapshot_received_at_ms INTEGER,
             last_announced_at_ms INTEGER
         );",
     )

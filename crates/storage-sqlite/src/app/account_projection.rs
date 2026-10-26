@@ -480,9 +480,6 @@ pub struct AccountGroupPushGossipState {
     /// When this device's join became final. `None` until recorded, and for a
     /// group joined before migration 0118.
     pub joined_at_ms: Option<i64>,
-    /// When the first snapshot arrived during this membership. `None` while
-    /// none has.
-    pub snapshot_received_at_ms: Option<i64>,
     /// When this device last announced in the group. `None` if it never has.
     pub last_announced_at_ms: Option<i64>,
 }
@@ -3068,7 +3065,7 @@ impl SqliteAppStorage {
     ) -> StorageResult<Option<AccountGroupPushGossipState>> {
         self.lock()?
             .query_row_cached(
-                "SELECT group_id_hex, joined_at_ms, snapshot_received_at_ms, last_announced_at_ms
+                "SELECT group_id_hex, joined_at_ms, last_announced_at_ms
                  FROM group_push_gossip_state
                  WHERE group_id_hex = ?1",
                 params![group_id_hex],
@@ -3076,8 +3073,7 @@ impl SqliteAppStorage {
                     Ok(AccountGroupPushGossipState {
                         group_id_hex: row.get(0)?,
                         joined_at_ms: row.get(1)?,
-                        snapshot_received_at_ms: row.get(2)?,
-                        last_announced_at_ms: row.get(3)?,
+                        last_announced_at_ms: row.get(2)?,
                     })
                 },
             )
@@ -3102,29 +3098,6 @@ impl SqliteAppStorage {
                 joined_at_ms = COALESCE(group_push_gossip_state.joined_at_ms, excluded.joined_at_ms)",
             group_id_hex,
             joined_at_ms,
-        )
-    }
-
-    /// Record that a snapshot arrived in `group_id_hex`. The first arrival
-    /// stands for the rest of the membership, and may precede the join's
-    /// recorded finality. Returns false, recording nothing, unless this device
-    /// is a member of a projected group.
-    pub fn record_group_push_gossip_snapshot(
-        &self,
-        group_id_hex: &str,
-        received_at_ms: i64,
-    ) -> StorageResult<bool> {
-        self.upsert_group_push_gossip_state(
-            "INSERT INTO group_push_gossip_state (group_id_hex, snapshot_received_at_ms)
-             SELECT group_id_hex, ?2 FROM account_groups
-             WHERE group_id_hex = ?1 AND self_membership = 'member'
-             ON CONFLICT(group_id_hex) DO UPDATE SET
-                snapshot_received_at_ms = COALESCE(
-                    group_push_gossip_state.snapshot_received_at_ms,
-                    excluded.snapshot_received_at_ms
-                )",
-            group_id_hex,
-            received_at_ms,
         )
     }
 

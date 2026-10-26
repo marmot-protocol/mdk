@@ -4188,7 +4188,7 @@ fn push_tombstones_keep_their_removal_proof_and_list_per_group() {
 }
 
 /// Gossip state covers one membership of a projected group: writes need a
-/// joined group, the first join and snapshot times stand, the latest announce
+/// joined group, the first join time stands, the latest announce
 /// wins, and leaving, a local delete or a projection prune clears the row.
 #[test]
 fn push_gossip_state_tracks_the_current_membership() {
@@ -4212,17 +4212,13 @@ fn push_gossip_state_tracks_the_current_membership() {
     assert_eq!(state("aa"), None);
     save(vec![group("aa", "alpha"), group("bb", "beta")]);
 
-    // A snapshot may arrive before the join is recorded as final.
-    assert!(app.record_group_push_gossip_snapshot("aa", 5).unwrap());
     assert!(app.record_group_push_gossip_join("aa", 10).unwrap());
     assert!(app.record_group_push_gossip_join("aa", 20).unwrap());
-    assert!(app.record_group_push_gossip_snapshot("aa", 30).unwrap());
     assert!(app.record_group_push_gossip_announce("aa", 50).unwrap());
     assert!(app.record_group_push_gossip_announce("aa", 40).unwrap());
     let recorded = Some(AccountGroupPushGossipState {
         group_id_hex: "aa".to_owned(),
         joined_at_ms: Some(10),
-        snapshot_received_at_ms: Some(5),
         last_announced_at_ms: Some(50),
     });
     assert_eq!(state("aa"), recorded);
@@ -4245,7 +4241,7 @@ fn push_gossip_state_tracks_the_current_membership() {
         .unwrap();
     assert!(app.record_group_push_gossip_join("aa", 80).unwrap());
     assert_eq!(state("aa").unwrap().joined_at_ms, Some(80));
-    assert_eq!(state("aa").unwrap().snapshot_received_at_ms, None);
+    assert_eq!(state("aa").unwrap().last_announced_at_ms, None);
 
     assert!(app.record_group_push_gossip_join("bb", 90).unwrap());
     store.delete_local_group_data("aa").unwrap();
