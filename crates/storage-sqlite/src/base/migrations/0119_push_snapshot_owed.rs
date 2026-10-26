@@ -5,6 +5,9 @@
 //! The device owes the group its token records and relayable tombstones once
 //! its merged epoch passes that value, so a restart between the merge and the
 //! send still sends them. NULL means nothing is owed. No rows are seeded.
+//!
+//! The account worker looks for owed snapshots after every turn, so a partial
+//! index holds only the groups that owe one.
 use crate::SqliteResultExt;
 use cgka_traits::storage::StorageResult;
 use rusqlite::Transaction;
@@ -12,7 +15,10 @@ use rusqlite::Transaction;
 pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
     tx.execute_batch(
         "ALTER TABLE group_push_gossip_state ADD COLUMN snapshot_owed_after_epoch INTEGER
-            CHECK(snapshot_owed_after_epoch >= 0);",
+            CHECK(snapshot_owed_after_epoch >= 0);
+        CREATE INDEX group_push_gossip_state_snapshot_owed
+            ON group_push_gossip_state(group_id_hex)
+            WHERE snapshot_owed_after_epoch IS NOT NULL;",
     )
     .storage()
 }
@@ -51,6 +57,19 @@ mod tests {
                 [],
             )
             .is_err()
+        );
+        // The worker's per-turn lookup reads only the groups that owe one.
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT group_id_hex FROM group_push_gossip_state
+                 WHERE snapshot_owed_after_epoch IS NOT NULL ORDER BY group_id_hex",
+                [],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("group_push_gossip_state_snapshot_owed"),
+            "{plan}"
         );
     }
 }

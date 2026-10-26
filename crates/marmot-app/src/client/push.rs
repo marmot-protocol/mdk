@@ -610,7 +610,7 @@ impl AppClient {
     }
 
     /// Whether a snapshot this device owes can be sent now.
-    fn has_due_push_snapshot(&self) -> bool {
+    pub(crate) fn has_due_push_snapshot(&self) -> bool {
         match self.app.owed_group_push_snapshots(&self.state.label) {
             Ok(owed) => owed.into_iter().any(|(group_id_hex, after_epoch)| {
                 !matches!(

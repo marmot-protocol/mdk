@@ -14,7 +14,8 @@
   tombstones leave NULL, and an empty `group_push_gossip_state` table.
 - Migration 0119 advances account storage to schema 119 (mdk#2611). It adds
   `snapshot_owed_after_epoch` to `group_push_gossip_state`, which existing
-  rows leave NULL. `AccountGroupPushGossipState` gains the matching field.
+  rows leave NULL, and a partial index over the rows that owe one.
+  `AccountGroupPushGossipState` gains the matching field.
 - `apply_group_push_token_tombstone` takes an `AccountGroupPushTokenTombstone`
   instead of eight arguments, and stores its optional removal proof.
 
