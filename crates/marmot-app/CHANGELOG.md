@@ -9,6 +9,14 @@
   X25519/Ed25519 ciphersuite never ran the affected arithmetic on secret data.
   HPKE 0.8 carries `libcrux-kem` 0.0.10, so the local HPKE compatibility patch
   for RUSTSEC-2026-0330 and RUSTSEC-2026-0331 is removed.
+- Attachment transfer subscriptions deliver a frame as soon as a row's transfer
+  state changes, for example to `Ready`, `Failed` or `Cancelled`, instead of up
+  to 250 ms after the previous frame, so a small download opens when the engine
+  finishes it. Progress-only changes are still coalesced to at most four frames
+  per second, and presentation and idle wakes still read at most four times a
+  second. A `next()` call cancelled by its caller, such as a C timeout, no
+  longer loses a frame that was waiting out that window: the next call
+  delivers it (#2157).
 
 ## 0.14.0 - 2026-10-23
 

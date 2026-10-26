@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed
+
+- `AttachmentTransferSubscription.next()` returns a replacement that changes a
+  row's transfer state as soon as the engine reports it; progress-only
+  replacements still arrive at most four per second. A host that polled
+  `attachmentTransferSnapshot` beside the feed to see `Ready` sooner can drop
+  that poll (#2157).
+
 ## 0.14.0 - 2026-10-23
 
 Regenerate Swift/Kotlin bindings with the matching native library. Every

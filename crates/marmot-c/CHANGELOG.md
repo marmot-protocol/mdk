@@ -7,6 +7,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Changed
+
+- `marmot_attachment_transfer_subscription_next` returns a replacement that
+  changes a row's transfer state as soon as the engine reports it; progress-only
+  replacements still arrive at most four per second. A timeout no longer loses
+  a replacement that was waiting out that window (#2157).
+
 ## [0.14.0] - 2026-10-23
 
 Recompile against the matching `marmot.h` and library: every `marmot_client_new*` constructor takes a required
