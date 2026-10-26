@@ -373,7 +373,7 @@ pub struct RuntimeSharedServices {
     // global mutex is never held during storage, engine, or network work.
     local_submission_queue: Arc<StdMutex<local_submission_queue::LocalSubmissionQueue>>,
     attachment_transfer: Arc<tokio::sync::Semaphore>,
-    attachment_updates: watch::Sender<()>,
+    attachment_updates: attachment_controls::AttachmentUpdates,
     attachment_cancellations: watch::Sender<()>,
     attachment_permissions: attachment_permission::Permissions,
     product_analytics: crate::ProductAnalytics,
@@ -488,7 +488,7 @@ impl Default for RuntimeSharedServices {
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             local_submission_wakeups: watch::channel(()).0,
             local_submission_queue: Arc::new(StdMutex::new(Default::default())),
-            attachment_updates: watch::channel(()).0,
+            attachment_updates: Default::default(),
             attachment_cancellations: watch::channel(()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
@@ -584,7 +584,7 @@ impl RuntimeSharedServices {
             #[cfg(test)]
             ordinary_delivery_dropped: Arc::new(Notify::new()),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
-            attachment_updates: watch::channel(()).0,
+            attachment_updates: Default::default(),
             local_submission_wakeups: watch::channel(()).0,
             local_submission_queue: Arc::new(StdMutex::new(Default::default())),
             attachment_cancellations: watch::channel(()).0,

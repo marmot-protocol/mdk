@@ -1908,7 +1908,8 @@ async fn keep_media_skips_automatic_demand_past_the_window() {
 }
 
 /// The maintenance batch at worker start applies "Keep media" to retained
-/// attachments, then waits an hour before sweeping again.
+/// attachments, waking observers with a state change, then waits an hour
+/// before sweeping again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_maintenance_batch_cleans_past_the_keep_media_window() {
     let (_dir, client, store, _reference) = offline_fixture().await;
@@ -1947,6 +1948,10 @@ async fn the_maintenance_batch_cleans_past_the_keep_media_window() {
         storage_sqlite::AttachmentTransferState::CleanedBySetting
     );
     assert!(updates.has_changed().unwrap(), "observers are woken");
+    assert!(
+        *updates.borrow() > 0,
+        "leaving Ready for CleanedBySetting is a state change"
+    );
     assert!(
         admission.keep_media_due.unwrap()
             > std::time::Instant::now() + KEEP_MEDIA_SWEEP_INTERVAL - Duration::from_secs(60)
