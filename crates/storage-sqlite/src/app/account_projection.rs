@@ -2634,6 +2634,60 @@ impl SqliteAppStorage {
         })
     }
 
+    /// Queue the current registration for one joined group again when native
+    /// push is on. A member added by a merged Commit cannot read this device's
+    /// earlier share. The queue holds only unfinished work, so a revision whose
+    /// share already completed is published again.
+    pub fn queue_current_push_registration_share_for_group(
+        &self,
+        group_id_hex: &str,
+        queued_at_ms: i64,
+    ) -> StorageResult<bool> {
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let queued = conn
+                .execute_cached(
+                    "INSERT INTO pending_push_registration_shares (
+                        group_id_hex, token_fingerprint, registration_updated_at_ms,
+                        queued_at_ms, last_attempted_at_ms
+                     )
+                     SELECT account_groups.group_id_hex,
+                            push_registration.token_fingerprint,
+                            push_registration.updated_at_ms, ?2, NULL
+                     FROM account_groups
+                     CROSS JOIN push_registration
+                     JOIN notification_settings
+                       ON notification_settings.account_label = push_registration.account_label
+                     WHERE account_groups.group_id_hex = ?1
+                       AND account_groups.self_membership = 'member'
+                       AND notification_settings.native_push_enabled = 1
+                     ON CONFLICT(group_id_hex) DO UPDATE SET
+                        token_fingerprint = excluded.token_fingerprint,
+                        registration_updated_at_ms = excluded.registration_updated_at_ms,
+                        queued_at_ms = excluded.queued_at_ms,
+                        last_attempted_at_ms = NULL",
+                    params![group_id_hex, queued_at_ms],
+                )
+                .storage()?
+                > 0;
+            if queued {
+                conn.execute_cached("UPDATE push_registration SET last_shared_at_ms = NULL", [])
+                    .storage()?;
+            }
+            Ok(queued)
+        })
+    }
+
+    /// Run migration 0117's one-time push-token share repair again. Test
+    /// support only: the migration ledger runs it once per database.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rerun_push_token_reshare_repair_for_test(&self) -> StorageResult<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().storage()?;
+        crate::base::migrations::rerun_push_token_reshare_repair(&tx)?;
+        tx.commit().storage()
+    }
+
     pub fn has_pending_push_registration_work(&self) -> StorageResult<bool> {
         self.lock()?
             .query_row_cached(

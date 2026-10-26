@@ -5305,6 +5305,34 @@ async fn push_registration_before_join_is_automatically_shared_without_catch_up(
     runtime.shutdown().await;
 }
 
+/// Wait until `account` has joined `group` and holds a token record of `member`.
+async fn wait_for_member_push_token(
+    runtime: &MarmotAppRuntime,
+    account: &str,
+    group: &GroupId,
+    member: &str,
+) {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            match runtime.group_push_debug_info(account, group).await {
+                Ok(view)
+                    if view
+                        .tokens
+                        .iter()
+                        .any(|token| token.member_id_hex == member) =>
+                {
+                    break;
+                }
+                Ok(_) | Err(AppError::AccountWorkerBusy | AppError::UnknownGroup(_)) => {}
+                Err(error) => panic!("push debug info failed: {error}"),
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the member's push token must reach the account");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removed_member_triggers_local_push_token_cleanup() {
     let dir = tempfile::tempdir().unwrap();
@@ -5319,34 +5347,9 @@ async fn removed_member_triggers_local_push_token_cleanup() {
     let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
     let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
     let carol = create_network_ready_identity(&runtime, setup).await;
-    let mut bob_chats = runtime
-        .subscribe_chats(&bob.account.account_id_hex, false)
-        .await
-        .unwrap();
-    let mut carol_chats = runtime
-        .subscribe_chats(&carol.account.account_id_hex, false)
-        .await
-        .unwrap();
-    let group_id = runtime
-        .create_group(
-            &alice.account.account_id_hex,
-            "removal cleanup",
-            &[
-                bob.account.account_id_hex.clone(),
-                carol.account.account_id_hex.clone(),
-            ],
-            None,
-        )
-        .await
-        .unwrap();
-    // Group creation schedules recipient catch-up in the background. Wait for
-    // both recipients to join before registering tokens, otherwise a share can
-    // succeed with no joined groups and leave this cleanup test racing setup.
-    let group_id_hex = hex::encode(group_id.as_slice());
-    wait_for_chat_update(&mut bob_chats, |chat| chat.group_id_hex == group_id_hex).await;
-    wait_for_chat_update(&mut carol_chats, |chat| chat.group_id_hex == group_id_hex).await;
     let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
-
+    // Tokens are registered before anyone joins; no host share or catch-up
+    // follows, so every share below is the workers' own.
     for member in [&bob, &carol] {
         app.set_native_push_enabled(&member.account.account_id_hex, true)
             .unwrap();
@@ -5358,14 +5361,47 @@ async fn removed_member_triggers_local_push_token_cleanup() {
             Some(url.clone()),
         )
         .unwrap();
-        let share = runtime
-            .share_push_registration(&member.account.account_id_hex)
-            .await
-            .unwrap();
-        assert_eq!(share.failed_groups, 0);
-        assert_eq!(share.pending_groups, 0);
     }
-    runtime.catch_up_accounts().await.unwrap();
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "removal cleanup",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    // Bob's token reaches Alice before Carol is added, so only Bob's re-share
+    // after the add can bring it to Carol (mdk#2604).
+    wait_for_member_push_token(
+        &runtime,
+        &alice.account.account_id_hex,
+        &group_id,
+        &bob.account.account_id_hex,
+    )
+    .await;
+    runtime
+        .invite_members(
+            &alice.account.account_id_hex,
+            &group_id,
+            std::slice::from_ref(&carol.account.account_id_hex),
+        )
+        .await
+        .unwrap();
+    wait_for_member_push_token(
+        &runtime,
+        &carol.account.account_id_hex,
+        &group_id,
+        &bob.account.account_id_hex,
+    )
+    .await;
+    wait_for_member_push_token(
+        &runtime,
+        &bob.account.account_id_hex,
+        &group_id,
+        &carol.account.account_id_hex,
+    )
+    .await;
 
     let bob_view_before = runtime
         .group_push_debug_info(&bob.account.account_id_hex, &group_id)

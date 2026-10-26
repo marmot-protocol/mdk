@@ -246,6 +246,8 @@ mod migration_0114_avatar_media_files;
 mod migration_0115_recovery_replay_admission;
 #[path = "migrations/0116_attachment_keep_media.rs"]
 mod migration_0116_attachment_keep_media;
+#[path = "migrations/0117_push_token_reshare_repair.rs"]
+mod migration_0117_push_token_reshare_repair;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -963,7 +965,20 @@ const MIGRATIONS: &[Migration] = &[
         suspend_foreign_keys: &[],
         apply: migration_0116_attachment_keep_media::apply,
     },
+    Migration {
+        version: 117,
+        name: "0117_push_token_reshare_repair",
+        suspend_foreign_keys: &[],
+        apply: migration_0117_push_token_reshare_repair::apply,
+    },
 ];
+
+/// Run migration 0117's push-token share repair on an open database. Test
+/// support only.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn rerun_push_token_reshare_repair(tx: &Transaction<'_>) -> StorageResult<()> {
+    migration_0117_push_token_reshare_repair::apply(tx)
+}
 
 /// Test fixtures use the same default-registry entry point as production with observation disabled.
 #[cfg(test)]

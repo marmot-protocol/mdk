@@ -32,6 +32,14 @@
   notification servers dropped all but the first in their ~5-minute
   content-hash dedup window. Each gift wrap now holds at most 18 real tokens
   plus the padding chunk.
+- Members added to a group now receive the push tokens of the members already
+  there (mdk#2604). Before, a device shared its token only when it first saw
+  a group or its registration changed, so new members never got earlier
+  tokens and sent those members no notification triggers. A device that
+  merges a Commit adding a member now shares its current token with that
+  group again, once per group however many members the batch adds, and a
+  member that was offline shares after catching up. Storage migration 0117
+  repairs existing groups once.
 
 - The OpenMLS RustCrypto provider moves to the elliptic-curve 0.14 crates
   (crypto-bigint 0.7.6) and HPKE 0.8, fixing RUSTSEC-2026-0387. MDK's single

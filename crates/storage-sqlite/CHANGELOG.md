@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Migration 0117 advances account storage to schema 117 on first open; older
+  binaries reject the upgraded database. It queues the current push
+  registration once for every joined group while native push is on, so
+  members who joined before this release receive this device's token
+  (mdk#2604).
+
+### Added
+
+- `queue_current_push_registration_share_for_group` queues the stored
+  registration for one joined group again, including a revision whose share
+  already completed. It does nothing while native push is off or without a
+  registration.
+
 ## 0.14.0 - 2026-10-23
 
 Account storage advances from migration 107 through 116 on first open; downgrade

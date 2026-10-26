@@ -379,6 +379,62 @@ impl AppClient {
         }
     }
 
+    /// A merged Commit added a member, who cannot read this device's earlier
+    /// shares: queue the current registration for the group again. One queue
+    /// row per group absorbs every add in a batch.
+    pub(crate) fn queue_push_registration_share_after_member_added(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        if self
+            .runtime
+            .session()
+            .leave_in_progress(group_id)
+            .map_err(cgka_session::SessionError::from)?
+        {
+            return Ok(());
+        }
+        let queued = self.app.queue_current_push_registration_share_for_group(
+            &self.state.label,
+            &hex::encode(group_id.as_slice()),
+        )?;
+        if queued {
+            self.push_registration_share_queued = true;
+            tracing::debug!(
+                target: "marmot_app::notifications",
+                method = "queue_push_registration_share_after_member_added",
+                queued_groups = 1_u64,
+                "push token share queued for a member add",
+            );
+        }
+        Ok(())
+    }
+
+    /// Queue one share per group that a merged Commit in `events` grew.
+    pub(crate) fn queue_push_registration_shares_for_member_adds(
+        &mut self,
+        events: &[cgka_traits::engine::GroupEvent],
+    ) -> Result<(), AppError> {
+        let mut groups = std::collections::HashSet::new();
+        for event in events {
+            if let cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id,
+                change: cgka_traits::engine::GroupStateChange::MemberAdded { .. },
+                ..
+            } = event
+                && groups.insert(group_id)
+            {
+                self.queue_push_registration_share_after_member_added(group_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a member add queued a share since the last call.
+    pub(crate) fn take_queued_push_registration_share(&mut self) -> bool {
+        std::mem::take(&mut self.push_registration_share_queued)
+    }
+
     pub(crate) fn queue_current_push_registration_removal_for_group(
         &self,
         group_id: &GroupId,

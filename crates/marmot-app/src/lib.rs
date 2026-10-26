@@ -2017,6 +2017,7 @@ impl MarmotApp {
             retained_projection_failures: 0,
             pending_resumed_message_notifications: Default::default(),
             pending_push_leaf_reconciliations: Default::default(),
+            push_registration_share_queued: false,
             pending_failed_sync_summary: SyncSummary::default(),
             pending_native_sync_summary: SyncSummary::default(),
             native_sync_deliveries: 0,
@@ -3926,6 +3927,24 @@ impl MarmotApp {
                 group_id_hex,
                 &registration.token_fingerprint,
                 registration.updated_at_ms,
+                notifications::unix_now_ms(),
+            )?)
+    }
+
+    /// Queue the current registration for one joined group again; see
+    /// `queue_current_push_registration_share_for_group` in storage.
+    pub(crate) fn queue_current_push_registration_share_for_group(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .queue_current_push_registration_share_for_group(
+                group_id_hex,
                 notifications::unix_now_ms(),
             )?)
     }

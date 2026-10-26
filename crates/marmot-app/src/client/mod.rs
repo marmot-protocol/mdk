@@ -793,6 +793,9 @@ pub struct AppClient {
         HashMap<(GroupId, String), sync::PendingMessageNotification>,
     /// Hydrated groups whose canonical push cleanup needs a bounded retry.
     pub(super) pending_push_leaf_reconciliations: std::collections::HashSet<GroupId>,
+    /// Set when an observed member add queued a push-token share, so the
+    /// account worker arms its push retry timer.
+    pub(super) push_registration_share_queued: bool,
     /// App-visible outputs ingested during a sync whose account-projection
     /// checkpoint failed. A retained client keeps the matching projected state
     /// and outbox acknowledgements, then returns this summary after its next
