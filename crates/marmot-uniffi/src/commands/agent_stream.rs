@@ -78,8 +78,9 @@ impl Marmot {
     /// `stream_id_hex = None` to follow the latest stream in the group (the
     /// common case when reacting to an AgentStreamStarted event). The returned
     /// subscription yields incremental `Chunk`s then a terminal `Finished` /
-    /// `Failed`. `server_cert_der` pins a self-signed broker cert (else platform
-    /// trust); `insecure_local` is loopback-only for testing.
+    /// `Failed`. `server_cert_der` pins a self-signed broker cert (else the
+    /// bundled public-CA roots, not the OS trust store); `insecure_local` is
+    /// loopback-only for testing.
     ///
     /// `async` only so the underlying runtime call can spawn the QUIC
     /// subscriber task via `tokio::spawn` (which needs an active runtime); the

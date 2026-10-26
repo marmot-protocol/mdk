@@ -23,12 +23,13 @@ pub use app::account_recovery::{
     RecoveryDemand, RecoveryDemandTicket, RecoveryDemandTransition, RecoveryEligibility,
     RecoveryEndpointCheckpoint, RecoveryLossCause, RecoveryLossImport, RecoveryLossSnapshot,
     RecoveryLossWatermark, RecoveryObligationState, RecoveryObligationStatus, RecoveryPassProgress,
-    RecoveryPredicate, RecoveryRequest, RecoveryRetryState, RecoveryRevisionFence,
-    RecoveryScopeCheckpoint, RecoveryScopeOutcome, RecoveryScopePlan, RecoveryScopeToken,
-    StoredRecoveryScope,
+    RecoveryPredicate, RecoveryReplayPlacement, RecoveryRequest, RecoveryRetryState,
+    RecoveryRevisionFence, RecoveryScopeCheckpoint, RecoveryScopeOutcome, RecoveryScopePlan,
+    RecoveryScopeToken, StoredRecoveryScope,
 };
 pub use app::local_submissions::LocalSubmission;
 pub use app::media_catalog::{SlotPublication, SqliteMediaCatalog, media_storage_error};
+pub use app::storage_compaction::{DatabaseSpace, PageReclaim};
 pub use app::transport::delivery_spill::{
     DeliverySpillDisposition, DeliverySpillLimits, SpilledDelivery, SpilledDeliveryBatch,
     SpilledDeliveryDeferral,
@@ -53,12 +54,12 @@ pub use app::attachment_acquisition::{
     ATTACHMENT_ACQUISITION_BATCH_LIMIT, ATTACHMENT_CHECKPOINT_BYTES, ATTACHMENT_REMOVAL_BATCH,
     ATTACHMENT_STAGING_CHUNK_BYTES, AttachmentAcquisition, AttachmentAcquisitionSource,
     AttachmentAcquisitionState, AttachmentAcquisitionStatus, AttachmentAssetRef,
-    AttachmentCheckpoint, AttachmentDemand, AttachmentMigrationState, AttachmentPartial,
-    AttachmentPartialIdentity, AttachmentPermissionCategory, AttachmentPublication,
-    AttachmentPublishResult, AttachmentRemoval, AttachmentStorageUsage, AttachmentUploadOwner,
-    AttachmentUploadPromotion, AttachmentUploadSource, AttachmentUploadStage,
-    AttachmentWorkerDemand, ChatAttachmentUsage, ChatUsageCursor, LegacyAttachmentBody,
-    LegacyBodyPublication, LegacyBodyReader, MAX_ATTACHMENT_LOCAL_READ_BYTES,
+    AttachmentCheckpoint, AttachmentDemand, AttachmentKeepMedia, AttachmentMigrationState,
+    AttachmentPartial, AttachmentPartialIdentity, AttachmentPermissionCategory,
+    AttachmentPublication, AttachmentPublishResult, AttachmentRemoval, AttachmentStorageUsage,
+    AttachmentUploadOwner, AttachmentUploadPromotion, AttachmentUploadSource,
+    AttachmentUploadStage, AttachmentWorkerDemand, ChatAttachmentUsage, ChatUsageCursor,
+    LegacyAttachmentBody, LegacyBodyPublication, LegacyBodyReader, MAX_ATTACHMENT_LOCAL_READ_BYTES,
     MAX_RETAINED_ATTACHMENT_BYTES, MAX_RETAINED_FILE_ATTACHMENT_BYTES, RetainedAttachmentAsset,
     RetainedAttachmentEntry, RetainedAttachmentRead, RetainedSizeCursor,
 };
@@ -71,8 +72,9 @@ pub use app::attachment_history::{
 pub use app::avatar_cache::{
     AVATAR_IDENTITY_BATCH_LIMIT, AvatarAcquisition, AvatarAcquisitionState,
     AvatarAssetPresentation, AvatarAssetRead, AvatarAssetRef, AvatarAssetStatus, AvatarAssetTarget,
-    AvatarAvailability, AvatarCacheUsage, AvatarIdentityDemand, AvatarImage, AvatarImageFormat,
-    AvatarPublishResult, MAX_AVATAR_BYTES, MAX_AVATAR_CACHE_BYTES, MAX_AVATAR_CACHE_ENTRIES,
+    AvatarAvailability, AvatarCacheUsage, AvatarFileImage, AvatarIdentityDemand, AvatarImage,
+    AvatarImageFormat, AvatarPublication, AvatarPublishResult, AvatarStoredFile, DatabaseAvatar,
+    DatabaseAvatarBody, MAX_AVATAR_BYTES, MAX_AVATAR_CACHE_BYTES, MAX_AVATAR_CACHE_ENTRIES,
     MAX_AVATAR_DIMENSION,
 };
 pub use app::chat_list::{
@@ -81,7 +83,8 @@ pub use app::chat_list::{
     ChatListPage, ChatListPageDirection, ChatListPageError, ChatListPageQuery, ChatListQuery,
     ChatListRow, ChatListSelectionError, ChatListSelectionSnapshot, ChatListView,
     ChatListWindowQuery, ChatListWindowRead, ChatPinError, ChatPinState,
-    ExistingDirectConversation, conversation_kind, select_reusable_direct_conversation,
+    ExistingDirectConversation, RetentionExpiryScan, conversation_kind,
+    select_reusable_direct_conversation,
 };
 pub use app::chat_presentation::{
     CHAT_LIST_DRAFT_PREVIEW_CHARS, CHAT_PRESENTATION_BATCH_LIMIT, ChatListDraftPreview,

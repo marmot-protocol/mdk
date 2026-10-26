@@ -215,6 +215,7 @@ mod tests {
         async fn unsubscribe_account(
             &self,
             _account_id: &MemberId,
+            _replacements: &[NostrSubscription],
         ) -> Result<(), TransportAdapterError> {
             Ok(())
         }

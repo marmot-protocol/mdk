@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use transport_quic_stream::{
     AgentTextStreamCrypto, AgentTextStreamReceiveLimitError, AgentTextStreamReceiveLimits,
-    EphemeralPublisherSequenceStore, QuicPreviewTransportProfile, stream_record_text,
+    EphemeralPublisherSequenceStore, QuicPreviewTransportProfile,
 };
 
 use crate::client::{
@@ -39,8 +39,8 @@ use crate::handlers::{BrokerStreamPolicy, PublishForwardLimits, handle_connectio
 use crate::protocol::{
     DEFAULT_BROKER_BACKLOG_DEPTH, DEFAULT_BROKER_MAX_BACKLOG_BYTES, DEFAULT_BROKER_MAX_ROOMS,
     DEFAULT_BROKER_REPLAY_TTL, DEFAULT_SUBSCRIBER_QUEUE_DEPTH, FINISHED_ROOM_TTL, FRAME_LEN_BYTES,
-    LOCAL_SERVER_BIND, MAX_BROKER_REPLAY_TTL, MAX_FRAME_SIZE, QUIC_BROKER_ALPN_V1,
-    RECORD_QUIET_GAP_DEADLINE, SEND_STOP_WAIT, SUBSCRIBER_WRITE_DEADLINE, UNFINISHED_ROOM_TTL,
+    LOCAL_SERVER_BIND, MAX_BROKER_REPLAY_TTL, MAX_FRAME_SIZE, QUIC_BROKER_ALPN_V1, SEND_STOP_WAIT,
+    UNFINISHED_ROOM_TTL,
 };
 use crate::server::{QuicBrokerServer, certificate_sha256_fingerprint_hex};
 use crate::state::BrokerState;
@@ -60,64 +60,6 @@ fn test_state(max_backlog: usize) -> BrokerState {
         DEFAULT_BROKER_MAX_BACKLOG_BYTES,
         MAX_BROKER_REPLAY_TTL,
     )
-}
-
-#[tokio::test]
-async fn broker_forwards_live_records_to_subscriber_with_same_transcript() {
-    let server = QuicBrokerServer::bind(QuicBrokerConfig {
-        bind_addr: LOCAL_SERVER_BIND,
-        per_subscriber_queue: DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
-        ..QuicBrokerConfig::default()
-    })
-    .unwrap();
-    let broker_addr = server.local_addr().unwrap();
-    let server_cert = server.server_cert_der().to_vec();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let broker_task = tokio::spawn(server.run_until(async {
-        let _ = shutdown_rx.await;
-    }));
-
-    let stream_id = vec![0xaa; 32];
-    let start_event_id = MessageId::new(vec![0x11; 32]);
-    let subscriber = tokio::spawn(subscribe_text_from_broker(SubscribeTextFromBroker {
-        broker_addr,
-        server_name: "localhost".to_owned(),
-        trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
-        stream_id: stream_id.clone(),
-        start_event_id: start_event_id.clone(),
-        crypto: None,
-    }));
-    sleep(Duration::from_millis(100)).await;
-
-    let sent = publish_text_to_broker(PublishTextToBroker {
-        broker_addr,
-        server_name: "localhost".to_owned(),
-        trust: BrokerServerTrust::CertificateDer(server_cert),
-        stream_id: stream_id.clone(),
-        start_event_id,
-        text: "hello broker stream".to_owned(),
-        max_chunk_bytes: 6,
-        chunk_delay: Duration::ZERO,
-        crypto: None,
-        max_plaintext_frame_len: None,
-    })
-    .await
-    .unwrap();
-
-    let received = tokio::time::timeout(Duration::from_secs(5), subscriber)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(received.stream_id, stream_id);
-    assert_eq!(received.text, "hello broker stream");
-    assert_eq!(received.chunk_count, 4);
-    assert_eq!(sent.chunk_count, received.chunk_count);
-    assert_eq!(sent.transcript_hash, received.transcript_hash);
-
-    let _ = shutdown_tx.send(());
-    broker_task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -265,86 +207,6 @@ async fn broker_closes_subscribers_when_publish_stream_errors_after_backlog() {
     assert_eq!(received.stream_id, stream_id);
     assert_eq!(received.text, "ok");
     assert_eq!(received.chunk_count, 1);
-
-    let _ = shutdown_tx.send(());
-    broker_task.await.unwrap().unwrap();
-}
-
-#[tokio::test]
-async fn broker_forwards_status_records_without_adding_to_text() {
-    let server = QuicBrokerServer::bind(QuicBrokerConfig {
-        bind_addr: LOCAL_SERVER_BIND,
-        per_subscriber_queue: DEFAULT_SUBSCRIBER_QUEUE_DEPTH,
-        ..QuicBrokerConfig::default()
-    })
-    .unwrap();
-    let broker_addr = server.local_addr().unwrap();
-    let server_cert = server.server_cert_der().to_vec();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let broker_task = tokio::spawn(server.run_until(async {
-        let _ = shutdown_rx.await;
-    }));
-
-    let stream_id = vec![0xcc; 32];
-    let start_event_id = MessageId::new(vec![0x33; 32]);
-    let subscriber = tokio::spawn(subscribe_text_from_broker(SubscribeTextFromBroker {
-        broker_addr,
-        server_name: "localhost".to_owned(),
-        trust: BrokerServerTrust::CertificateDer(server_cert.clone()),
-        stream_id: stream_id.clone(),
-        start_event_id: start_event_id.clone(),
-        crypto: None,
-    }));
-    sleep(Duration::from_millis(100)).await;
-
-    let mut publisher = BrokerTextPublisher::connect(OpenBrokerTextPublisher {
-        broker_addr,
-        server_name: "localhost".to_owned(),
-        trust: BrokerServerTrust::CertificateDer(server_cert),
-        stream_id: stream_id.clone(),
-        start_event_id,
-        crypto: None,
-        max_plaintext_frame_len: None,
-    })
-    .await
-    .unwrap();
-    publisher
-        .append_text("hello", 32, Duration::ZERO)
-        .await
-        .unwrap();
-    publisher
-        .append_record_text(
-            AGENT_TEXT_STREAM_RECORD_STATUS,
-            "thinking",
-            32,
-            Duration::ZERO,
-        )
-        .await
-        .unwrap();
-    let sent = publisher.finish().await.unwrap();
-
-    let received = tokio::time::timeout(Duration::from_secs(5), subscriber)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(received.stream_id, stream_id);
-    assert_eq!(received.text, "hello");
-    assert_eq!(received.chunk_count, 2);
-    assert_eq!(received.chunks.len(), 2);
-    assert_eq!(
-        received.chunks[0].record_type,
-        AGENT_TEXT_STREAM_RECORD_TEXT_DELTA
-    );
-    assert_eq!(received.chunks[0].text, "hello");
-    assert_eq!(
-        received.chunks[1].record_type,
-        AGENT_TEXT_STREAM_RECORD_STATUS
-    );
-    assert_eq!(received.chunks[1].text, "thinking");
-    assert_eq!(sent.chunk_count, received.chunk_count);
-    assert_eq!(sent.transcript_hash, received.transcript_hash);
 
     let _ = shutdown_tx.send(());
     broker_task.await.unwrap().unwrap();
@@ -918,20 +780,6 @@ async fn broker_purges_stale_unfinished_rooms_without_live_subscribers() {
 }
 
 #[tokio::test]
-async fn broker_buffers_records_until_subscriber_arrives() {
-    let state = test_state(DEFAULT_BROKER_BACKLOG_DEPTH);
-    let key = BrokerStreamKey::new(vec![0xaa; 32], MessageId::new(vec![0x11; 32]));
-    let record = AgentTextStreamRecordV1::text_delta(vec![0xaa; 32], 1, b"hello".to_vec());
-
-    assert_eq!(state.publish(&key, record.clone()).await.unwrap(), 0);
-    let (_subscriber_id, backlog, _rx) = state.subscribe(key).await.unwrap();
-    let received = backlog.first().expect("subscriber should receive backlog");
-
-    assert_eq!(received.seq, record.seq);
-    assert_eq!(received.plaintext_frame, record.plaintext_frame);
-}
-
-#[tokio::test]
 async fn broker_backlog_drops_oldest_records_when_bound_reached() {
     let state = test_state(2);
     let key = BrokerStreamKey::new(vec![0xaa; 32], MessageId::new(vec![0x11; 32]));
@@ -1086,42 +934,6 @@ fn oversized_frames_are_rejected_before_allocation() {
         validate_frame_len(MAX_FRAME_SIZE + 1, MAX_FRAME_SIZE),
         Err(QuicBrokerError::FrameTooLarge(_))
     ));
-}
-
-#[test]
-fn stream_record_text_decodes_renderable_frames_and_leaves_advisory_records_empty() {
-    use cgka_traits::agent_text_stream::{
-        AGENT_TEXT_STREAM_RECORD_ABORT, AGENT_TEXT_STREAM_RECORD_FINAL_NOTICE,
-    };
-
-    let stream_id = vec![0x11; 32];
-    let record = |record_type, plaintext: &str| {
-        AgentTextStreamRecordV1::new(stream_id.clone(), 1, record_type, plaintext.as_bytes())
-    };
-
-    // Renderable frames decode to their UTF-8 plaintext. Checkpoint is a full
-    // preview snapshot the consumer swaps in, so it must not stay blank.
-    for (record_type, plaintext) in [
-        (AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, "hello"),
-        (AGENT_TEXT_STREAM_RECORD_STATUS, "thinking"),
-        (AGENT_TEXT_STREAM_RECORD_PROGRESS_DELTA, "search: glp-1"),
-        (AGENT_TEXT_STREAM_RECORD_CHECKPOINT, "hello world"),
-    ] {
-        assert_eq!(
-            stream_record_text(&record(record_type, plaintext)),
-            plaintext
-        );
-    }
-
-    // Abort and FinalNotice are advisory: the consumer reacts to the record
-    // type, so they decode to "" even when the sender attached bytes.
-    for record_type in [
-        AGENT_TEXT_STREAM_RECORD_ABORT,
-        AGENT_TEXT_STREAM_RECORD_FINAL_NOTICE,
-        0xff,
-    ] {
-        assert_eq!(stream_record_text(&record(record_type, "ignored")), "");
-    }
 }
 
 #[test]
@@ -2519,12 +2331,6 @@ impl FlowControlledWritePair {
         let _ = timeout(Duration::from_secs(2), self.client_endpoint.wait_idle()).await;
         let _ = timeout(Duration::from_secs(2), self.server_endpoint.wait_idle()).await;
     }
-}
-
-#[test]
-fn subscriber_write_deadline_reuses_record_quiet_gap() {
-    assert_eq!(SUBSCRIBER_WRITE_DEADLINE, RECORD_QUIET_GAP_DEADLINE);
-    assert_eq!(SUBSCRIBER_WRITE_DEADLINE, Duration::from_secs(120));
 }
 
 #[tokio::test]

@@ -162,12 +162,15 @@ pub enum MarmotStatus {
     /// or the volume or database is full. A send refuses an attachment it
     /// cannot stage before uploading anything; retry once space is free.
     StorageFull = 106,
+    /// The current kind-3 contact list has at least 2,048 follows, more than
+    /// MDK reads from one list; a follow or unfollow published nothing.
+    FollowListTooLarge = 107,
     /// An attachment was encrypted at an epoch the group has left, so it cannot
     /// be sent; upload the file again (mdk#2158).
-    MediaReferenceStaleEpoch = 107,
+    MediaReferenceStaleEpoch = 108,
     /// The group's epoch is unsettled, so an attachment cannot be sent yet;
     /// sync and send again (mdk#2158).
-    MediaReferenceEpochUnsettled = 108,
+    MediaReferenceEpochUnsettled = 109,
 }
 
 thread_local! {
@@ -282,6 +285,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::MediaDownloadFailed { .. } => MarmotStatus::MediaDownloadFailed,
         MarmotKitError::InvalidKeyPackageEvent { .. } => MarmotStatus::InvalidKeyPackageEvent,
         MarmotKitError::FollowListUnavailable => MarmotStatus::FollowListUnavailable,
+        MarmotKitError::FollowListTooLarge => MarmotStatus::FollowListTooLarge,
         MarmotKitError::RuntimeBusy => MarmotStatus::RuntimeBusy,
         MarmotKitError::AccountSessionBusy => MarmotStatus::AccountSessionBusy,
         MarmotKitError::AccountSetupRecoveryRequired => MarmotStatus::AccountSetupRecoveryRequired,
@@ -468,6 +472,7 @@ mod tests {
                 details: "d".into(),
             },
             MarmotKitError::FollowListUnavailable,
+            MarmotKitError::FollowListTooLarge,
             MarmotKitError::TransportClosed,
             MarmotKitError::RuntimeBusy,
             MarmotKitError::AccountSessionBusy,
@@ -565,7 +570,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            99,
+            100,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -596,16 +601,20 @@ mod tests {
             106
         );
         assert_eq!(
+            status_from_error(&MarmotKitError::FollowListTooLarge) as i32,
+            107
+        );
+        assert_eq!(
             status_from_error(&MarmotKitError::MediaReferenceStaleEpoch {
                 reference_epoch: 2,
                 group_epoch: 3,
             }) as i32,
-            107
+            108
         );
         assert_eq!(
             status_from_error(&MarmotKitError::MediaReferenceEpochUnsettled { reference_epoch: 2 })
                 as i32,
-            108
+            109
         );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,

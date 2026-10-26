@@ -43,23 +43,6 @@ mod tests {
     }
 
     #[test]
-    fn account_device_signer_binding_roundtrips() {
-        let store = SqliteAccountStorage::in_memory().unwrap();
-        let binding = AccountDeviceSignerBinding {
-            marmot_identity: member_id(1),
-            mls_signature_public_key: vec![1, 2, 3],
-        };
-
-        store.put_account_device_signer(&binding).unwrap();
-
-        assert_eq!(
-            store.account_device_signer(&member_id(1)).unwrap(),
-            Some(binding)
-        );
-        assert_eq!(store.account_device_signer(&member_id(9)).unwrap(), None);
-    }
-
-    #[test]
     fn account_device_signer_binding_survives_encrypted_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
@@ -79,5 +62,6 @@ mod tests {
             reopened.account_device_signer(&member_id(1)).unwrap(),
             Some(binding)
         );
+        assert_eq!(reopened.account_device_signer(&member_id(9)).unwrap(), None);
     }
 }

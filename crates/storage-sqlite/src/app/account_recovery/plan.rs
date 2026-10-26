@@ -62,6 +62,8 @@ pub struct StoredRecoveryScope {
     pub token: RecoveryScopeToken,
     pub checkpoints: Vec<RecoveryEndpointCheckpoint>,
     pub retained_known_event: bool,
+    /// A current native complete-range admission proof, never history coverage.
+    pub replay_admitted: bool,
     pub attempt_serial: u64,
     pub obligation_revision: u64,
     pub route_revision: u64,
@@ -89,11 +91,25 @@ pub struct RecoveryScopeCheckpoint {
     /// The owner may set this only after validation and durable retention of the
     /// exact known event in the frozen plan. It is not an SDK receipt.
     pub retained_known_event: bool,
+    /// Owner-validated native complete-range admission/placement for this goal.
+    /// This does not establish exhaustive history or acknowledge input loss.
+    pub replay_admitted: bool,
 }
 
 /// Quiet comparisons in a row that each uncertified scope of an obligation
 /// needs, for its unchanged goal, before the obligation parks.
 pub const RECOVERY_PARK_AFTER_QUIET_PASSES: u64 = 3;
+
+/// Account-wide placement fence copied alongside scoped native source facts.
+/// Scoped proofs may be retained while unrelated input still blocks final
+/// completion; neither case establishes history coverage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryReplayPlacement {
+    /// Current account input still blocks aggregate native completion.
+    Pending,
+    /// All copied account input reached its native placement boundary.
+    Placed,
+}
 
 /// Unserved comparisons in a row, for an unchanged goal and its required
 /// relays, after which a scope counts toward parking like a quiet one. A
@@ -135,6 +151,8 @@ pub(super) struct ScopePayloadV1 {
     pub(super) admitted_endpoints: Vec<String>,
     checkpoints: Vec<RecoveryEndpointCheckpoint>,
     retained_known_event: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    replay_admitted: bool,
     attempt_serial: u64,
     pub(super) obligation_revision: u64,
     pub(super) loss_revision: u64,
@@ -250,6 +268,7 @@ pub(super) fn payload_is_qualified(
                     .is_ok()
                 && checkpoint.outcome != RecoveryScopeOutcome::LossInvalidated
         }),
+        3_i64 => payload.replay_admitted && !payload.admitted_endpoints.is_empty(),
         _ => false,
     }
 }
@@ -268,6 +287,7 @@ pub(super) fn invalidate_retained_scope(format: i64, bytes: &[u8]) -> StorageRes
     let mut payload = decode_scope(format, bytes)?;
     payload.checkpoints.clear();
     payload.retained_known_event = false;
+    payload.replay_admitted = false;
     encode_scope(&payload)
 }
 
@@ -349,6 +369,49 @@ fn scopes_qualify_where(
         } else {
             all_qualified
         })
+}
+
+fn native_observation_matches(
+    conn: &Connection,
+    fence: &RecoveryRevisionFence,
+    ticket: RecoveryDemandTicket,
+    tokens: &[RecoveryScopeToken],
+) -> StorageResult<bool> {
+    if !fence.obligations.contains(&(ticket.id, ticket.revision)) {
+        return Ok(false);
+    }
+    let mut selected = fence.clone();
+    selected.obligations.retain(|(id, _)| *id == ticket.id);
+    let native: bool = conn
+        .query_row_cached(
+            "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations
+         WHERE id=?1 AND revision=?2 AND cause=7 AND predicate=3 AND state=0)",
+            params![ticket.id.as_slice(), sqlite_integer(ticket.revision)?],
+            |row| row.get(0),
+        )
+        .storage()?;
+    if !native || !selected_fence_matches(&revision_fence(conn)?, &selected) {
+        return Ok(false);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for token in tokens {
+        if token.obligation_id != ticket.id || !seen.insert(token.scope_id) {
+            return Err(invalid_scope());
+        }
+        let current: Option<i64> = conn
+            .query_row_cached(
+                "SELECT scope_revision FROM account_recovery_scopes
+             WHERE obligation_id=?1 AND scope_id=?2 AND snapshot_state=1",
+                params![ticket.id.as_slice(), sqlite_integer(token.scope_id)?],
+                |row| row.get(0),
+            )
+            .optional()
+            .storage()?;
+        if current.map(i64_to_u64).transpose()? != Some(token.revision) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// One route an obligation could not certify, with the relays it requires.
@@ -566,6 +629,7 @@ impl SqliteAppStorage {
                 plan,
                 checkpoints: payload.checkpoints,
                 retained_known_event: payload.retained_known_event,
+                replay_admitted: payload.replay_admitted,
                 attempt_serial: payload.attempt_serial,
                 obligation_revision: payload.obligation_revision,
                 route_revision: payload.route_revision,
@@ -581,10 +645,13 @@ impl SqliteAppStorage {
     /// Freeze all scopes for one selected obligation before external effects.
     /// Existing ready scopes cannot disappear from the plan. A fresh attempt
     /// invalidates session-bound EOSE; compatible qualified coverage is retained.
-    /// Install the entire resolved goal. Requests/migration seed scope zero;
-    /// every existing scope, including unresolved placeholders, must appear.
+    /// Install the entire resolved goal. Non-native requests/migration seed
+    /// scope zero; native goals start with only their owner's issued sources.
+    /// Every existing scope, including unresolved placeholders, must appear.
     /// Retention invalidates tokens and proof only for overlapping scopes;
     /// unaffected qualified progress may survive a new account inventory revision.
+    /// A native replay goal alone may use attempt zero to prepare passive
+    /// observations without reserving network work or spending retry cost.
     pub fn install_recovery_scope_plan(
         &self,
         expected: &RecoveryRevisionFence,
@@ -592,11 +659,31 @@ impl SqliteAppStorage {
         obligation_id: [u8; 16],
         plans: &[RecoveryScopePlan],
     ) -> StorageResult<Option<Vec<RecoveryScopeToken>>> {
-        self.install_recovery_scope_plan_inner(expected, attempt_serial, obligation_id, plans, true)
+        if attempt_serial == 0 {
+            let native: bool = self
+                .lock()?
+                .query_row_cached(
+                    "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations
+                 WHERE id=?1 AND cause=7 AND predicate=3 AND state=0)",
+                    [obligation_id.as_slice()],
+                    |row| row.get(0),
+                )
+                .storage()?;
+            if !native {
+                return Err(invalid_scope());
+            }
+        }
+        self.install_recovery_scope_plan_inner(
+            expected,
+            attempt_serial,
+            obligation_id,
+            plans,
+            attempt_serial != 0,
+        )
     }
 
-    // Only comparison-debt preparation may store a goal without reserving I/O.
-    // Its zero attempt can never certify completion or authorize an executor.
+    // Comparison debt and native passive observations may prepare an unreserved
+    // goal. Attempt zero never authorizes an executor or certifies history.
     pub(super) fn install_recovery_scope_plan_inner(
         &self,
         expected: &RecoveryRevisionFence,
@@ -643,6 +730,13 @@ impl SqliteAppStorage {
             {
                 return Ok(None);
             }
+            // A native successor's revision is above every token from its
+            // previous source generation, including rows already pruned.
+            let scope_revision_floor: i64 = conn.query_row_cached(
+                "SELECT CASE WHEN cause=7 AND predicate=3 THEN revision ELSE 0 END
+                 FROM account_recovery_obligations WHERE id=?1",
+                [obligation_id.as_slice()], |row| row.get(0),
+            ).storage()?;
             let existing = conn.prepare_cached(
                 "SELECT scope_id, scope_revision, scope_format, scope_payload, snapshot_state
                  FROM account_recovery_scopes WHERE obligation_id = ?1 ORDER BY scope_id",
@@ -668,13 +762,13 @@ impl SqliteAppStorage {
             let mut tokens = Vec::with_capacity(plans.len());
             for plan in plans {
                 let prior = existing.iter().find(|(id, ..)| Some(*id) == i64::try_from(plan.scope_id).ok());
-                let scope_revision = prior.map_or(Ok(1), |(_, revision, ..)| {
-                    revision.checked_add(1).ok_or_else(invalid_scope)
-                })?;
+                let scope_revision = prior.map_or(0, |(_, revision, ..)| *revision)
+                    .max(scope_revision_floor).checked_add(1).ok_or_else(invalid_scope)?;
                 let mut payload = ScopePayloadV1 {
                     required_endpoints: plan.required_endpoints.clone(),
                     admitted_endpoints: plan.admitted_endpoints.clone(),
                     checkpoints: Vec::new(), retained_known_event: false, attempt_serial,
+                    replay_admitted: false,
                     obligation_revision: *revision,
                     loss_revision: expected.loss_revision, route_revision: expected.route_revision,
                     inventory_revision: expected.inventory_revision,
@@ -717,6 +811,9 @@ impl SqliteAppStorage {
                         && previous.loss_revision == expected.loss_revision
                         && previous.required_endpoints == plan.required_endpoints
                     {
+                        payload.replay_admitted = previous.replay_admitted
+                            && previous.route_revision == expected.route_revision
+                            && previous.admitted_endpoints == plan.admitted_endpoints;
                         payload.checkpoints = previous.checkpoints.into_iter().filter(|checkpoint| {
                             checkpoint.outcome == RecoveryScopeOutcome::Covered
                                 && checkpoint.exhaustive && checkpoint.admission_complete
@@ -750,6 +847,159 @@ impl SqliteAppStorage {
                 tokens.push(RecoveryScopeToken { obligation_id, scope_id: plan.scope_id, revision: i64_to_u64(scope_revision)? });
             }
             Ok(Some(tokens))
+        })
+    }
+
+    /// Retire only the native scopes the owner proved no longer required by
+    /// authoritative group/route lifecycle state. Loss and history scopes are
+    /// never touched. Bumping above every old token prevents a recreated source
+    /// from accepting a delayed observation after retirement.
+    pub fn retire_native_replay_scopes(
+        &self,
+        fence: &RecoveryRevisionFence,
+        ticket: RecoveryDemandTicket,
+        tokens: &[RecoveryScopeToken],
+    ) -> StorageResult<bool> {
+        if tokens.is_empty() {
+            return Ok(true);
+        }
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !native_observation_matches(&conn, fence, ticket, tokens)? {
+                return Ok(false);
+            }
+            let high_water: i64 = conn.query_row_cached(
+                "SELECT MAX(scope_revision) FROM account_recovery_scopes WHERE obligation_id=?1",
+                [ticket.id.as_slice()], |row| row.get(0),
+            ).storage()?;
+            for token in tokens {
+                conn.execute_cached(
+                    "DELETE FROM account_recovery_scopes WHERE obligation_id=?1 AND scope_id=?2",
+                    params![ticket.id.as_slice(), sqlite_integer(token.scope_id)?],
+                ).storage()?;
+            }
+            conn.execute_cached(
+                "UPDATE account_recovery_obligations SET revision=MAX(revision,?2)+1,
+                 state=CASE WHEN EXISTS(SELECT 1 FROM account_recovery_scopes WHERE obligation_id=?1)
+                     THEN 0 ELSE 2 END,eligibility=0,parked_at_ms=NULL
+                 WHERE id=?1 AND cause=7 AND predicate=3",
+                params![ticket.id.as_slice(), high_water],
+            ).storage()?;
+            Ok(true)
+        })
+    }
+
+    /// A wanted native range has no serving source in an installed route set.
+    /// Park it visibly without reserving a no-I/O attempt or manufacturing loss,
+    /// admission or history coverage. Temporary account absence is not evidence
+    /// for this owner-supplied observation.
+    pub fn park_unserved_native_replay(
+        &self,
+        fence: &RecoveryRevisionFence,
+        ticket: RecoveryDemandTicket,
+        tokens: &[RecoveryScopeToken],
+    ) -> StorageResult<bool> {
+        if tokens.is_empty() {
+            return Ok(false);
+        }
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            if !native_observation_matches(&conn, fence, ticket, tokens)? {
+                return Ok(false);
+            }
+            conn.execute_cached(
+                "UPDATE account_recovery_obligations SET eligibility=4,
+                 parked_at_ms=COALESCE(parked_at_ms,?3)
+                 WHERE id=?1 AND revision=?2 AND state=0 AND cause=7 AND predicate=3",
+                params![
+                    ticket.id.as_slice(),
+                    sqlite_integer(ticket.revision)?,
+                    crate::base::codec::unix_now_ms().max(0)
+                ],
+            )
+            .storage()?;
+            Ok(true)
+        })
+    }
+
+    /// Persist already observed native replay admission without reserving I/O.
+    /// Only the native fact is recorded: endpoint history/maintenance facts,
+    /// retained-event facts, loss watermarks and retry pacing are untouched.
+    /// Every token and frozen source/route revision must still match. Returns
+    /// whether every scope of this exact native goal is now admitted and the
+    /// owner's copied account-wide placement fence permits final completion.
+    pub fn checkpoint_replay_admission(
+        &self,
+        fence: &RecoveryRevisionFence,
+        ticket: RecoveryDemandTicket,
+        placement: RecoveryReplayPlacement,
+        checkpoints: &[RecoveryScopeCheckpoint],
+    ) -> StorageResult<bool> {
+        if !fence.obligations.contains(&(ticket.id, ticket.revision)) {
+            return Ok(false);
+        }
+        let mut selected = fence.clone();
+        selected.obligations.retain(|(id, _)| *id == ticket.id);
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let native: bool = conn.query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations
+                 WHERE id=?1 AND revision=?2 AND cause=7 AND predicate=3 AND state=0)",
+                params![ticket.id.as_slice(), sqlite_integer(ticket.revision)?],
+                |row| row.get(0),
+            ).storage()?;
+            if !native || !selected_fence_matches(&revision_fence(&conn)?, &selected)
+                || !no_unimported_loss(&conn)?
+            {
+                return Ok(false);
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            let mut updates = Vec::with_capacity(checkpoints.len());
+            for checkpoint in checkpoints {
+                let token = &checkpoint.token;
+                if token.obligation_id != ticket.id || !seen.insert(token.scope_id) {
+                    return Err(invalid_scope());
+                }
+                let record = conn.query_row_cached(
+                    "SELECT scope_revision,scope_format,scope_payload FROM account_recovery_scopes
+                     WHERE obligation_id=?1 AND scope_id=?2 AND snapshot_state=1",
+                    params![ticket.id.as_slice(), sqlite_integer(token.scope_id)?],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?)),
+                ).optional().storage()?;
+                let Some((revision, format, bytes)) = record else { return Ok(false); };
+                if i64_to_u64(revision)? != token.revision {
+                    return Ok(false);
+                }
+                let mut payload = decode_scope(format, &bytes)?;
+                if payload.obligation_revision != ticket.revision
+                    || payload.route_revision != fence.route_revision
+                    || payload.loss_revision != fence.loss_revision
+                    || payload.inventory_revision != fence.inventory_revision
+                {
+                    return Ok(false);
+                }
+                validate_checkpoints(&payload, &checkpoint.endpoints)?;
+                payload.replay_admitted |= checkpoint.replay_admitted;
+                updates.push((token.scope_id, encode_scope(&payload)?));
+            }
+            // Reject a stale observation as a whole, before any writes.
+            for (scope_id, payload) in updates {
+                conn.execute_cached(
+                    "UPDATE account_recovery_scopes SET scope_payload=?3
+                     WHERE obligation_id=?1 AND scope_id=?2",
+                    params![ticket.id.as_slice(), sqlite_integer(scope_id)?, payload],
+                ).storage()?;
+            }
+            let qualified = placement == RecoveryReplayPlacement::Placed
+                && scopes_qualify(&conn, fence, None, ticket.id, RecoveryPredicate::ReplayAdmission as i64)?;
+            if qualified {
+                conn.execute_cached(
+                    "UPDATE account_recovery_obligations SET state=1,parked_at_ms=NULL
+                     WHERE id=?1 AND revision=?2 AND cause=7 AND predicate=3 AND state=0",
+                    params![ticket.id.as_slice(), sqlite_integer(ticket.revision)?],
+                ).storage()?;
+            }
+            Ok(qualified)
         })
     }
 
@@ -889,6 +1139,7 @@ impl SqliteAppStorage {
                     }
                 }
                 payload.retained_known_event |= checkpoint.retained_known_event;
+                payload.replay_admitted |= checkpoint.replay_admitted;
                 updates.push((token.scope_id, encode_scope(&payload)?));
             }
             // A stale token rejects the entire observation. Validate every
@@ -1016,6 +1267,7 @@ mod tests {
             token: token.clone(),
             endpoints,
             retained_known_event: false,
+            replay_admitted: false,
         }
     }
 
@@ -1749,15 +2001,18 @@ mod tests {
             };
             store
                 .app_storage()
-                .record_transport_reconciliation_item(&TransportReconciliationRoute::Inbox, &item)
+                .record_reconciliation_items(std::iter::once((
+                    &TransportReconciliationRoute::Inbox,
+                    &item,
+                )))
                 .unwrap();
             let (_, steps) = measure(&store, || {
                 store
                     .app_storage()
-                    .record_transport_reconciliation_item(
+                    .record_reconciliation_items(std::iter::once((
                         &TransportReconciliationRoute::Inbox,
                         &item,
-                    )
+                    )))
                     .unwrap()
             });
             if let Some(old) = previous {
@@ -1992,13 +2247,13 @@ mod tests {
                         .unwrap();
                     store
                         .app_storage()
-                        .record_transport_reconciliation_item(
+                        .record_reconciliation_items(std::iter::once((
                             &route,
                             &TransportReconciliationItem {
                                 event_id: [9; 32],
                                 created_at: now + 1,
                             },
-                        )
+                        )))
                         .unwrap();
                     assert!(
                         store
@@ -2173,13 +2428,13 @@ mod tests {
             assert!(
                 store
                     .app_storage()
-                    .record_transport_reconciliation_item(
+                    .record_reconciliation_items(std::iter::once((
                         &TransportReconciliationRoute::Inbox,
                         &TransportReconciliationItem {
                             event_id: [9; 32],
                             created_at: now + 1
                         }
-                    )
+                    )))
                     .is_err()
             );
             assert_eq!(
@@ -2205,13 +2460,13 @@ mod tests {
                 .unwrap();
             store
                 .app_storage()
-                .record_transport_reconciliation_item(
+                .record_reconciliation_items(std::iter::once((
                     &TransportReconciliationRoute::Inbox,
                     &TransportReconciliationItem {
                         event_id: [9; 32],
                         created_at: now + 1,
                     },
-                )
+                )))
                 .unwrap();
             assert!(
                 !store
@@ -2334,7 +2589,8 @@ mod tests {
                         &[RecoveryScopeCheckpoint {
                             token: tokens[0].clone(),
                             endpoints: vec![covered("a"), missing],
-                            retained_known_event: false
+                            retained_known_event: false,
+                            replay_admitted: false,
                         }],
                         RecoveryEligibility::WaitingCapability
                     )
@@ -2353,7 +2609,8 @@ mod tests {
                         &[RecoveryScopeCheckpoint {
                             token: tokens[0].clone(),
                             endpoints: vec![unretained],
-                            retained_known_event: false
+                            retained_known_event: false,
+                            replay_admitted: false,
                         }],
                         RecoveryEligibility::Retry
                     )
@@ -2369,7 +2626,8 @@ mod tests {
                         &[RecoveryScopeCheckpoint {
                             token: tokens[0].clone(),
                             endpoints: vec![covered("b")],
-                            retained_known_event: false
+                            retained_known_event: false,
+                            replay_admitted: false,
                         }],
                         RecoveryEligibility::Retry
                     )
@@ -2404,12 +2662,14 @@ mod tests {
                         RecoveryScopeCheckpoint {
                             token: tokens[0].clone(),
                             endpoints: vec![covered("a"), covered("b")],
-                            retained_known_event: false
+                            retained_known_event: false,
+                            replay_admitted: false,
                         },
                         RecoveryScopeCheckpoint {
                             token: stale,
                             endpoints: vec![covered("a"), covered("b")],
-                            retained_known_event: false
+                            retained_known_event: false,
+                            replay_admitted: false,
                         },
                     ],
                     RecoveryEligibility::Retry

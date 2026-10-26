@@ -84,6 +84,7 @@ async fn update_relay_list(
         ));
     }
     let status = app
+        .directory()
         .fetch_current_account_relay_list_status_for_account_id(
             &account.account_id_hex,
             source_relays.clone(),

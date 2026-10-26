@@ -82,20 +82,19 @@ mod retention;
 mod sync;
 #[cfg(test)]
 mod upload_cleanup_tests;
-pub(crate) mod upload_holds;
 
 use epoch_stall::EpochStallDetector;
 use push::notification_trigger_for_intent;
 #[cfg(test)]
 pub(crate) use sync::ScriptedComparisons;
 #[cfg(test)]
-pub(crate) use sync::TestComparisonActivityWitness;
-#[cfg(test)]
 pub(crate) use sync::epoch_stall_now_ms;
 pub(crate) use sync::{
-    ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob, ConvergenceScheduleState,
-    EpochBackfillRunOutcome, PendingRecoverySelection, SyncMode,
+    CommittedSyncProgress, ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob,
+    ConvergenceScheduleState, EpochBackfillRunOutcome, PendingRecoverySelection, SyncMode,
 };
+#[cfg(test)]
+pub(crate) use sync::{MAX_COMPARISON_ADMISSION_PER_TURN, TestComparisonActivityWitness};
 
 #[cfg(test)]
 const CREATE_GROUP_LOOKUP_CONCURRENCY: usize = 8;
@@ -415,10 +414,6 @@ pub(crate) struct EncryptedMediaUploadFinish {
     /// File-backed uploads only: a cancellation observed before message
     /// admission prevents publication. Admission itself is not interruptible.
     control: Option<Arc<crate::MediaFileTransferControl>>,
-    /// Holds the group's due periodic self-update while the upload is in
-    /// flight: until the send is admitted, through the admission grace when the
-    /// upload is sent separately, or until this finish drops (mdk#2158).
-    epoch_hold: upload_holds::UploadEpochHold,
 }
 
 /// Preserve the primary upload/admission failure when orphan cleanup also fails.
@@ -635,6 +630,13 @@ fn prepared_group_image_status(
     }
 }
 
+/// Optional inventory writes are separate from per-frame durability and ACKs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InventoryWrite {
+    Immediate,
+    NativeTurn,
+}
+
 /// Outcome of one [`AppClient::refresh_group_routes`] pass, separating the
 /// in-memory routing-table delta from durable-state mutation: only the latter
 /// obligates a state save, only the former obligates a relay-subscription
@@ -660,6 +662,44 @@ pub(crate) enum CursorSeal {
 #[cfg(test)]
 pub(crate) type CursorSealProbe = Box<dyn FnMut(CursorSeal) + Send>;
 
+type EpochGapWindowKey = ([u8; 32], String);
+type EpochGapWindows = Arc<std::sync::Mutex<EpochGapWindowCache>>;
+
+#[derive(Default)]
+pub(super) struct EpochGapWindowCache {
+    entries: HashMap<EpochGapWindowKey, EpochGapWindow>,
+    tick: u64,
+}
+
+#[derive(Clone, Copy)]
+struct EpochGapBound {
+    until: u64,
+    /// Skip a held suffix only after its older prefix finishes.
+    resume_since: u64,
+}
+
+impl EpochGapBound {
+    fn new(until: u64) -> Self {
+        Self {
+            until,
+            resume_since: until.saturating_add(1),
+        }
+    }
+}
+
+/// Evictable acquisition hints, never coverage, replay or retry authority.
+#[derive(Clone)]
+pub(super) struct EpochGapWindow {
+    /// Loss, route and retained-inventory revisions for held-span reuse.
+    generation: (u64, u64, u64),
+    goal: storage_sqlite::RecoveryDemandTicket,
+    origin_since: u64,
+    until: u64,
+    since: u64,
+    bounds: Vec<EpochGapBound>,
+    last_used: u64,
+}
+
 pub struct AppClient {
     #[cfg(test)]
     pub(crate) test_recovery_selection_witness:
@@ -680,6 +720,7 @@ pub struct AppClient {
     #[cfg(test)]
     pub(crate) test_comparison_saved_cursor: Option<[u8; 32]>,
     pub(crate) recovery_owner: recovery::AccountRecoveryOwner,
+    pub(super) epoch_gap_windows: EpochGapWindows,
     /// The process credits recovery jobs share. A managed worker installs
     /// its runtime's pool; a directly owned client uses the process pool.
     pub(crate) recovery_credits:
@@ -699,10 +740,6 @@ pub struct AppClient {
     pub(crate) relay_plane: MarmotRelayPlane,
     pub(crate) transport_signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     pub(crate) blossom_http_transport: BlossomHttpTransport,
-    /// Attachment uploads in flight; each holds its group's due periodic
-    /// self-update. Shared by every client of this account on this app, so a
-    /// client rebuilt on reconnect still sees uploads its predecessor started.
-    pub(crate) upload_epoch_holds: upload_holds::UploadEpochHolds,
     pub(crate) state: AccountState,
     /// O(1) membership index over `state.seen_events`, kept in lockstep by
     /// `remember_seen_event` (which removes pruned ring entries from it).
@@ -762,6 +799,9 @@ pub struct AppClient {
     /// successful checkpoint. A reopened client recovers the same outputs from
     /// the durable engine outbox instead.
     pub(crate) pending_failed_sync_summary: crate::SyncSummary,
+    /// Native checkpoints already committed; retained across drain cancellation.
+    pub(super) pending_native_sync_summary: crate::SyncSummary,
+    pub(super) native_sync_deliveries: u64,
     /// Whether the last settled job certified the retained window of every
     /// explicit-history scope it compared. Explicit history reaches below
     /// that window, so this never completes it; it names why it stays open.
@@ -1324,7 +1364,7 @@ impl AppClient {
             "sweep",
             crate::ProductUnit::Attempt,
         );
-        let held = self.self_update_holds()?;
+        let held = self.epoch_gap_held_groups()?;
         let effects = self.runtime.run_due_maintenance_holding(&held).await;
         let mut activity = self.runtime.take_maintenance_activity();
         activity.absorb(previous);
@@ -1697,9 +1737,11 @@ impl AppClient {
         &self,
         member_refs: &[&str],
     ) -> Result<crate::MemberKeyPackagePrewarmSummary, AppError> {
-        self.app
+        Ok(self
+            .app
+            .directory()
             .prewarm_group_member_key_packages(member_refs)
-            .await
+            .await?)
     }
 
     /// Validate and encrypt a founding image, then durably stage its exact
@@ -1804,7 +1846,7 @@ impl AppClient {
                 server: self
                     .app
                     .deployment()
-                    .group_image_endpoint_or_fallback(server.as_deref()),
+                    .group_image_endpoint_for(server.as_deref())?,
                 allow_loopback_http,
                 transport: self.blossom_http_transport.clone(),
             },
@@ -2031,8 +2073,9 @@ impl AppClient {
                 .to_app_component_data()
                 .map_err(|err| AppError::InvalidAgentTextStreamPolicy(err.to_string()))?,
         );
-        let encrypted_media = self.encrypted_media_component_for_new_group()?;
-        app_components.push(encrypted_media);
+        if let Some(encrypted_media) = self.encrypted_media_component_for_new_group()? {
+            app_components.push(encrypted_media);
+        }
         if disappearing_message_secs != 0 {
             app_components.push(
                 AppGroupMessageRetentionComponent::new(disappearing_message_secs)
@@ -2055,13 +2098,14 @@ impl AppClient {
         let key_package_started_at = Instant::now();
         let key_packages = self
             .app
+            .directory()
             .resolve_compatible_member_key_packages(
                 member_refs
                     .iter()
                     .map(|member_ref| (*member_ref).to_owned())
                     .collect(),
                 &requirements,
-                crate::directory::MemberResolutionPurpose::Commit,
+                nostr_directory::MemberResolutionPurpose::Commit,
             )
             .await;
         let key_package_elapsed = key_package_started_at.elapsed();
@@ -2127,7 +2171,7 @@ impl AppClient {
                                 let upload = upload_group_image(
                                     &image.plaintext,
                                     &image.media_type,
-                                    &self.app.deployment().group_image_endpoint_or_fallback(None),
+                                    &self.app.deployment().group_image_endpoint_for(None)?,
                                     &self.blossom_http_transport,
                                 )
                                 .await?;
@@ -2731,13 +2775,14 @@ impl AppClient {
             .map_err(cgka_session::SessionError::from)?;
         let key_packages = self
             .app
+            .directory()
             .resolve_compatible_member_key_packages(
                 member_refs
                     .iter()
                     .map(|member| (*member).to_owned())
                     .collect(),
                 &requirements,
-                crate::directory::MemberResolutionPurpose::Commit,
+                nostr_directory::MemberResolutionPurpose::Commit,
             )
             .await
             .map(|resolved| resolved.key_packages);
@@ -2785,7 +2830,7 @@ impl AppClient {
             pre_send_sync_started_at.elapsed(),
             pre_send_sync.is_ok(),
         );
-        pre_send_sync?;
+        self.tolerate_pre_send_sync_failure("invite_members", pre_send_sync)?;
 
         let engine_publish_started_at = Instant::now();
         let commit = self
@@ -3003,7 +3048,7 @@ impl AppClient {
             .map(|member| hex::encode(member.as_slice()))
             .collect::<Vec<_>>();
 
-        self.sync_runtime_groups().await?;
+        self.sync_runtime_groups_for_send("remove_members").await?;
         let wake_snapshot = self.snapshot_group_push_tokens_for_members(group_id, &target_hexes);
         let effects = self
             .runtime
@@ -3078,7 +3123,8 @@ impl AppClient {
             ],
             None,
         );
-        self.sync_runtime_groups().await?;
+        self.sync_runtime_groups_for_send("enable_group_disbanding")
+            .await?;
         let effects = self
             .runtime
             .send_with_audit_context(
@@ -3136,7 +3182,7 @@ impl AppClient {
             ],
             None,
         );
-        self.sync_runtime_groups().await?;
+        self.sync_runtime_groups_for_send("disband_group").await?;
         let effects = self
             .runtime
             .send_with_audit_context(
@@ -3399,7 +3445,7 @@ impl AppClient {
             .drain_push_registration_removal_before_departure(group_id)
             .await?;
         let effects = match async {
-            self.sync_runtime_groups().await?;
+            self.sync_runtime_groups_for_send("leave_group").await?;
             let effects = self
                 .runtime
                 .send_with_audit_context(
@@ -3826,7 +3872,8 @@ impl AppClient {
         self.ensure_group_change_admitted(group_id)?;
         let component = AppGroupAdminPolicyComponent::new(admins).to_app_component_data()?;
 
-        self.sync_runtime_groups().await?;
+        self.sync_runtime_groups_for_send("update_admin_policy")
+            .await?;
         let wake_snapshot = self.snapshot_group_push_tokens_for_members(group_id, wake_targets);
         let effects = self
             .runtime
@@ -3874,7 +3921,8 @@ impl AppClient {
         validate_app_component(component_id, &data)?;
         self.ensure_group(group_id)?;
         self.ensure_group_change_admitted(group_id)?;
-        self.sync_runtime_groups().await?;
+        self.sync_runtime_groups_for_send("update_app_component")
+            .await?;
         // `required_capabilities` is read out of the MLS GroupContext, not
         // from local config, so any admin in the group can mark an
         // application component required — including a peer on another
@@ -3956,7 +4004,8 @@ impl AppClient {
             None,
         );
 
-        self.sync_runtime_groups().await?;
+        self.sync_runtime_groups_for_send("update_message_retention")
+            .await?;
         let effects = self
             .runtime
             .send_with_audit_context(
@@ -4028,7 +4077,8 @@ impl AppClient {
             Some(endpoint_count),
         );
 
-        self.sync_runtime_groups().await?;
+        self.sync_runtime_groups_for_send("replace_encrypted_media_blob_endpoints")
+            .await?;
         let effects = self
             .runtime
             .send_with_audit_context(
@@ -4073,7 +4123,8 @@ impl AppClient {
             None,
         );
 
-        self.sync_runtime_groups().await?;
+        self.sync_runtime_groups_for_send("update_group_avatar_url")
+            .await?;
         let effects = self
             .runtime
             .send_with_audit_context(
@@ -4271,7 +4322,8 @@ impl AppClient {
         };
         let (event, payload) = crate::local_submissions::retained_event(submission)?;
         if !request.attachments.is_empty() {
-            self.sync_runtime_groups().await?;
+            self.sync_runtime_groups_for_send("publish_local_submission")
+                .await?;
             self.validate_draft_media_references(&group, &request.attachments)?;
         }
         self.send_app_event_with_context(
@@ -4534,7 +4586,10 @@ impl AppClient {
             self.publish_conversation_captures(group_id);
         }
 
-        let send_result = match self.sync_runtime_groups().await {
+        let send_result = match self
+            .sync_runtime_groups_for_send("send_app_event_with_local_projection")
+            .await
+        {
             Ok(()) => {
                 let send_intent = SendIntent::AppMessage {
                     group_id: group_id.clone(),
@@ -4867,7 +4922,8 @@ impl AppClient {
         self.ensure_group_application_messages_allowed(group_id)?;
         crate::messages::validate_reaction_content(emoji)?;
         if !attachments.is_empty() {
-            self.sync_runtime_groups().await?;
+            self.sync_runtime_groups_for_send("react_to_message_with_local_projection")
+                .await?;
             self.validate_draft_media_references(group_id, &attachments)?;
         }
         let sender = self
@@ -5093,7 +5149,8 @@ impl AppClient {
                 ),
             }
         } else {
-            self.sync_runtime_groups().await?;
+            self.sync_runtime_groups_for_send("send_message_draft_with_local_projection")
+                .await?;
             self.validate_draft_media_references(group, &attachments)?;
             (
                 AppMessageIntent::Media {
@@ -5173,7 +5230,8 @@ impl AppClient {
         message_tags: Vec<Vec<String>>,
     ) -> Result<SendSummary, AppError> {
         self.ensure_group_application_messages_allowed(group_id)?;
-        self.sync_runtime_groups().await?;
+        self.sync_runtime_groups_for_send("send_tagged_media")
+            .await?;
         self.validate_draft_media_references(group_id, &attachments)?;
         let (_event, summary) = self
             .send_app_event(
@@ -5199,7 +5257,8 @@ impl AppClient {
         reference: &MediaAttachmentReference,
     ) -> Result<Vec<String>, AppError> {
         self.ensure_group_application_messages_allowed(group_id)?;
-        self.sync_runtime_groups().await?;
+        self.sync_runtime_groups_for_send("build_media_imeta_tag")
+            .await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
         reference.build_imeta_tag(
             policy.version,
@@ -5250,7 +5309,8 @@ impl AppClient {
         request: crate::media::file_transfer::MediaUploadPayload,
     ) -> Result<(EncryptedMediaUploadHttp, EncryptedMediaUploadFinish), AppError> {
         self.ensure_group_application_messages_allowed(group_id)?;
-        self.sync_runtime_groups().await?;
+        self.sync_runtime_groups_for_send("prepare_encrypted_media_upload_payload")
+            .await?;
         let policy = self.encrypted_media_policy_for_group(group_id)?;
         // `upload_encrypted_media` always performs Blossom upload semantics and
         // emits a `blossom-v1` locator, so every default upload candidate MUST be
@@ -5294,11 +5354,6 @@ impl AppClient {
             endpoints
         };
         let (source_epoch, media_secret) = self.encrypted_media_secret(group_id)?;
-        // The media key is now bound to `source_epoch`: hold this device's own
-        // periodic rotation for the group until the upload is sent or dropped.
-        let epoch_hold = self
-            .upload_epoch_holds
-            .hold(group_id.clone(), std::time::Instant::now());
         let account = self.app.account_home().account(&self.state.label)?;
         let signer = self.app.account_signer_for_summary(&account)?;
         crate::messages::validate_message_tags(request.tags())?;
@@ -5335,7 +5390,6 @@ impl AppClient {
                 caption,
                 message_tags,
                 control,
-                epoch_hold,
             },
         ))
     }
@@ -5364,12 +5418,8 @@ impl AppClient {
             return Err(error);
         }
         if !finish.should_send {
-            // Upload only: token admission, or the host, sends the references
-            // in a separate command, and admission then protects the bound
-            // uploads; unsent ones expire. Keep the group held through the
-            // grace so that send still finds the epoch the upload was
-            // encrypted under.
-            finish.epoch_hold.linger(std::time::Instant::now());
+            // Upload only: the host sends the references later, and admission
+            // then protects the bound uploads; unsent ones expire.
             return Ok((result, Some(uploads)));
         }
         let attachments = result
@@ -5565,14 +5615,15 @@ impl AppClient {
             vec![GROUP_BLOSSOM_IMAGE_COMPONENT_ID],
             None,
         );
-        self.sync_runtime_groups().await?;
+        self.sync_runtime_groups_for_send("update_group_image")
+            .await?;
         let input = if plaintext.is_empty() {
             AppGroupImageInput::default()
         } else {
             let upload = upload_group_image(
                 &plaintext,
                 media_type,
-                &self.app.deployment().group_image_endpoint_or_fallback(None),
+                &self.app.deployment().group_image_endpoint_for(None)?,
                 &self.blossom_http_transport,
             )
             .await?;
@@ -5618,7 +5669,8 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<GroupImageDownloadHttp, AppError> {
         self.ensure_group(group_id)?;
-        self.sync_runtime_groups().await?;
+        self.sync_runtime_groups_for_send("prepare_group_image_download")
+            .await?;
         let input = self.image_for_group(group_id);
         if !input.is_present() {
             return Err(AppError::InvalidEncryptedMedia(
@@ -5630,7 +5682,7 @@ impl AppClient {
             image_key_hex: input.image_key_hex,
             image_nonce_hex: input.image_nonce_hex,
             media_type: input.media_type.unwrap_or_default(),
-            server: self.app.deployment().group_image_endpoint_or_fallback(None),
+            server: self.app.deployment().group_image_endpoint_for(None)?,
             transport: self.blossom_http_transport.clone(),
         })
     }
@@ -5846,6 +5898,9 @@ impl AppClient {
     ) -> Result<SendSummary, AppError> {
         self.ensure_group(group_id)?;
 
+        // Unlike a send, a convergence retry needs live subscriptions, and its
+        // pass re-syncs routes before checkpointing. Refuse it up front rather
+        // than publish and then fail that checkpoint.
         self.sync_runtime_groups().await?;
         let effects = self.runtime.advance_convergence(group_id).await?;
         self.observe_convergence_retry_effects(group_id, &effects)
@@ -5923,7 +5978,8 @@ impl AppClient {
             None,
         );
 
-        self.sync_runtime_groups().await?;
+        self.sync_runtime_groups_for_send("update_group_profile")
+            .await?;
         let effects = self
             .runtime
             .send_with_audit_context(
@@ -6139,28 +6195,6 @@ impl AppClient {
             .account_storage(&self.state.label)?
             .app_storage()
             .epoch_gap_recovery_open_since(group_id.as_slice(), epoch.0)?)
-    }
-
-    /// Groups whose due self-update waits, and why: epoch-gap recovery first,
-    /// then an attachment upload in flight or within its admission grace
-    /// (mdk#2158).
-    fn self_update_holds(
-        &self,
-    ) -> Result<Vec<(GroupId, marmot_account::SelfUpdateHold)>, AppError> {
-        let mut held: Vec<_> = self
-            .epoch_gap_held_groups()?
-            .into_iter()
-            .map(|group| (group, marmot_account::SelfUpdateHold::EpochGap))
-            .collect();
-        for group in self
-            .upload_epoch_holds
-            .held_groups(std::time::Instant::now())
-        {
-            if !held.iter().any(|(held_group, _)| held_group == &group) {
-                held.push((group, marmot_account::SelfUpdateHold::Upload));
-            }
-        }
-        Ok(held)
     }
 
     /// Groups whose due self-updates wait for epoch-gap recovery. Automatic
@@ -6657,12 +6691,18 @@ impl AppClient {
             )?)
     }
 
-    fn encrypted_media_component_for_new_group(&self) -> Result<AppComponentData, AppError> {
-        let endpoints = self
-            .app
-            .deployment()
-            .new_group_media_endpoints_or_fallback();
-        match self.runtime.new_protocol_profile() {
+    /// The encrypted-media component for a new group, or `None` when the
+    /// deployment sets no media servers: the group is then text-only for
+    /// life, since `replace_encrypted_media_blob_endpoints` can't add the
+    /// component later.
+    fn encrypted_media_component_for_new_group(
+        &self,
+    ) -> Result<Option<AppComponentData>, AppError> {
+        let endpoints = self.app.deployment().new_group_media_endpoints.clone();
+        if endpoints.is_empty() {
+            return Ok(None);
+        }
+        let component = match self.runtime.new_protocol_profile() {
             ProtocolProfile::Legacy => {
                 let policy = EncryptedMediaPolicyV1::blossom_default(endpoints, true)
                     .map_err(AppError::InvalidEncryptedMedia)?;
@@ -6673,7 +6713,8 @@ impl AppClient {
                     .map_err(AppError::InvalidEncryptedMedia)?;
                 AppGroupEncryptedMediaComponent::new_v2(policy)?.to_app_component_data()
             }
-        }
+        }?;
+        Ok(Some(component))
     }
 
     /// Reconcile every group's current and still-live prior transport
@@ -6701,10 +6742,11 @@ impl AppClient {
             // prune while convergence still has unresolved inputs: the
             // retained anchor is not settled yet, so conservatively keep every
             // prior address until the next stable reconciliation.
-            if !self
-                .runtime
-                .has_pending_convergence_inputs(&group_id)
-                .unwrap_or(true)
+            if !group.prior_nostr_routes.is_empty()
+                && !self
+                    .runtime
+                    .has_pending_convergence_inputs(&group_id)
+                    .unwrap_or(true)
                 && let Ok(group_record) = self.runtime.group_record(&group_id)
                 && group.prune_prior_nostr_routes(group_record.epoch.0)
             {
@@ -6972,10 +7014,10 @@ impl AppClient {
     /// re-creating the group, re-committing the invite, or re-consuming
     /// KeyPackages.
     fn reconcile_pending_welcome_delivery_index(&self) -> Result<(), AppError> {
-        let outstanding = self.runtime.outstanding_welcome_deliveries()?;
-        let tracked_ids = self
-            .runtime
-            .tracked_outbound_welcome_ids()?
+        let index = self.runtime.welcome_delivery_index()?;
+        let outstanding = index.outstanding;
+        let tracked_ids = index
+            .tracked_ids
             .into_iter()
             .map(|id| hex::encode(id.as_slice()))
             .collect::<HashSet<_>>();

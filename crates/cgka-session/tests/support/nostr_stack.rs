@@ -91,6 +91,7 @@ impl NostrRelayClient for FakeRelayClient {
     async fn unsubscribe_account(
         &self,
         account_id: &MemberId,
+        _replacements: &[transport_nostr_adapter::NostrSubscription],
     ) -> Result<(), TransportAdapterError> {
         self.active_accounts.lock().unwrap().remove(account_id);
         Ok(())

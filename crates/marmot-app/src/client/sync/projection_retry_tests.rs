@@ -690,7 +690,7 @@ async fn cancelling_public_waits_keeps_repaired_notifications() {
             }
         } else {
             assert!(
-                tokio::time::timeout(Duration::from_millis(20), client.sync_sdk_relay())
+                tokio::time::timeout(Duration::from_millis(20), client.sync_sdk_relay(None))
                     .await
                     .is_err()
             );
@@ -702,7 +702,7 @@ async fn cancelling_public_waits_keeps_repaired_notifications() {
         let summary = if next_event {
             client.next_event().await.unwrap()
         } else {
-            client.sync_sdk_relay().await.unwrap()
+            client.sync_sdk_relay(None).await.unwrap()
         };
         assert_eq!(summary.projection_updates.iter().flat_map(|update| &update.timeline_changes).filter(|change| matches!(change, crate::TimelineMessageChange::Upsert { message, .. } if message.kind == 1210)).count(), 1);
         assert!(

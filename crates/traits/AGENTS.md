@@ -50,7 +50,6 @@ what lives here is in [`README.md`](README.md#what-lives-in-here).
 | `tests/snapshots.rs` | JSON/debug shape checks for cross-boundary types. |
 | `tests/error_display.rs` | Asserts `EngineError`/`PeelerError` `Display` output leaks no group/member ids or pubkeys. |
 | `tests/host_safety_public.rs` | Public host-safety classifier surface (`reject_non_public_ip` and friends). |
-| `tests/async_send.rs` | Native-only `Send` bounds on async trait futures. |
 | `benches/stored_message_codec.rs` | `StoredMessagePayload` codec benchmark. |
 
 ## Verification

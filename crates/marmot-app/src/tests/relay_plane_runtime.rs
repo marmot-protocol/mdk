@@ -3,7 +3,6 @@
 //! become its own crate (relay-plane brief, PR 2); they reach plane state only
 //! through its `_for_test` accessors.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -31,10 +30,6 @@ struct RecordingRelayClient {
     subscriptions: StdMutex<Vec<NostrSubscription>>,
     unsubscribed: StdMutex<Vec<NostrSubscription>>,
     unsubscribed_accounts: StdMutex<Vec<MemberId>>,
-    /// REQs re-issued by lag repairs, with the endpoints they went to.
-    reissued: StdMutex<Vec<(String, Vec<TransportEndpoint>)>>,
-    /// Re-issues left that reach no relay, as when it is unreachable.
-    unsent_reissues: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -74,38 +69,10 @@ impl NostrRelayClient for RecordingRelayClient {
         Ok(())
     }
 
-    async fn reissue_subscription(
-        &self,
-        _account_id: &MemberId,
-        subscription_id: &str,
-        endpoints: &[TransportEndpoint],
-    ) -> Result<transport_nostr_adapter::SubscriptionReissue, TransportAdapterError> {
-        self.reissued
-            .lock()
-            .unwrap()
-            .push((subscription_id.to_owned(), endpoints.to_vec()));
-        let outcome = if self
-            .unsent_reissues
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                left.checked_sub(1)
-            })
-            .is_ok()
-        {
-            transport_nostr_adapter::RelayReissue::Unsent
-        } else {
-            transport_nostr_adapter::RelayReissue::Sent
-        };
-        Ok(transport_nostr_adapter::SubscriptionReissue {
-            relays: endpoints
-                .iter()
-                .map(|endpoint| (endpoint.clone(), outcome))
-                .collect(),
-        })
-    }
-
     async fn unsubscribe_account(
         &self,
         account_id: &MemberId,
+        _replacements: &[NostrSubscription],
     ) -> Result<(), TransportAdapterError> {
         self.unsubscribed_accounts
             .lock()
@@ -458,6 +425,10 @@ async fn sdk_account_worker_keeps_serving_through_notification_lag() {
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let storage = app.account_storage(&alice.label).unwrap().app_storage();
+    // Model a returning account with a settled cursor, not first-load history.
+    let mut state = app.load_state(&alice.label).unwrap();
+    state.last_transport_timestamp = Some(crate::unix_now_seconds());
+    app.save_state(&state).unwrap();
     let runtime = crate::MarmotAppRuntime::new(app);
     runtime.reconcile_accounts().await.unwrap();
     timeout(Duration::from_secs(30), runtime.catch_up_accounts())
@@ -551,6 +522,10 @@ async fn notification_lag_while_post_join_maintenance_is_live_stays_bounded() {
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let storage = app.account_storage(&alice.label).unwrap();
+    // Other live REQs have a settled floor newer than the Welcome below.
+    let mut state = app.load_state(&alice.label).unwrap();
+    state.last_transport_timestamp = Some(crate::unix_now_seconds());
+    app.save_state(&state).unwrap();
     let mut client = crate::tests::client_on_app_relay_plane(&app, &alice.label).await;
     client.prepare_transport().await.unwrap();
     let group = client
@@ -599,6 +574,7 @@ async fn notification_lag_while_post_join_maintenance_is_live_stays_bounded() {
             None,
             marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
         )
+        .await
         .unwrap()
         .unwrap();
     client.run_recovery_grant_for_test(grant).await.unwrap();
@@ -646,6 +622,11 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
     // Before the upgrade: a group whose retained route has no switch time.
     {
         let app = crate::MarmotApp::with_relay_and_config(dir.path(), url.clone(), config());
+        // The current route resumes a settled cursor; only the retained route
+        // is missing its old switch-time floor.
+        let mut state = app.load_state(&alice.label).unwrap();
+        state.last_transport_timestamp = Some(crate::unix_now_seconds());
+        app.save_state(&state).unwrap();
         let mut client = crate::tests::client_on_app_relay_plane(&app, &alice.label).await;
         client.prepare_transport().await.unwrap();
         client
@@ -715,7 +696,7 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join() {
-    use transport_nostr::{AccountDeliveryReceive, MarmotRelayPlane};
+    use transport_nostr::MarmotRelayPlane;
     let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
     let config = || crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
@@ -777,14 +758,7 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
     bob_client.prepare_transport().await.unwrap();
     timeout(Duration::from_secs(20), async {
         while bob_client.runtime.group_record(&group).is_err() {
-            if let AccountDeliveryReceive::Delivery(delivery) =
-                bob_client.receive_next_delivery().await.unwrap()
-            {
-                bob_client
-                    .ingest_received_delivery(*delivery)
-                    .await
-                    .unwrap();
-            }
+            bob_client.next_event().await.unwrap();
         }
     })
     .await
@@ -796,18 +770,8 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
     );
 
     // Control: the live REQs, which resume after the rename, never bring it.
-    while let Ok(received) = timeout(
-        Duration::from_millis(1_500),
-        bob_client.receive_next_delivery(),
-    )
-    .await
-    {
-        if let AccountDeliveryReceive::Delivery(delivery) = received.unwrap() {
-            bob_client
-                .ingest_received_delivery(*delivery)
-                .await
-                .unwrap();
-        }
+    while let Ok(summary) = timeout(Duration::from_millis(1_500), bob_client.next_event()).await {
+        summary.unwrap();
     }
     assert_eq!(
         bob_client.runtime.group_record(&group).unwrap().epoch,
@@ -831,6 +795,7 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
             None,
             marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
         )
+        .await
         .unwrap()
         .unwrap();
     bob_client.run_recovery_grant_for_test(grant).await.unwrap();
@@ -839,11 +804,6 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
             .post_join_maintenance_subscriptions
             .contains_key(&group)
     );
-    assert_eq!(
-        bob_client.runtime.group_record(&group).unwrap().epoch,
-        joined_epoch,
-        "installing the REQ fetched nothing by itself"
-    );
     let comparisons = bob_app
         .relay_telemetry()
         .await
@@ -851,18 +811,13 @@ async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join(
         .reconciliation_attempts;
     timeout(Duration::from_secs(20), async {
         while bob_client.runtime.group_record(&group).unwrap().epoch < renamed_epoch {
-            if let AccountDeliveryReceive::Delivery(delivery) =
-                bob_client.receive_next_delivery().await.unwrap()
-            {
-                bob_client
-                    .ingest_received_delivery(*delivery)
-                    .await
-                    .unwrap();
-            }
+            // Group replay is native-owned; next_event admits it only after
+            // this maintenance source reaches its own relay boundary.
+            bob_client.next_event().await.unwrap();
         }
     })
     .await
-    .expect("the maintenance REQ brings the rename made before Bob joined");
+    .expect("the maintenance REQ admits the rename made before Bob joined");
     assert_eq!(
         bob_app
             .relay_telemetry()

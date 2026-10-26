@@ -1,16 +1,59 @@
 //! Account-private block policy and NIP-51 synchronization.
 use crate::{AppError, MarmotApp};
 use cgka_traits::{TransportEndpoint, TransportEndpointFailureKind};
+use futures::{StreamExt, stream};
 use nostr::prelude::{EventBuilder, FinalizeEventAsync, Kind, PublicKey, Tag, Timestamp};
+use nostr_directory::BlockListSink;
+use nostr_directory::error::{DirectoryError, blocking_directory_task};
 use std::sync::Arc;
 use storage_sqlite::{PendingBlockPublication, StoredBlockList};
 use transport_nostr::DirectoryEventQuery;
 use transport_nostr_peeler::{NostrTransportEvent, SdkSigner};
 
+use nostr_directory::MUTE_LIST_KIND;
 pub use storage_sqlite::{BlockListSnapshot, BlockedUser};
-pub(crate) const MUTE_LIST_KIND: u64 = 10000;
 
 impl MarmotApp {
+    /// Fetch and reconcile every local account's block list; the directory
+    /// sync worker runs this through [`BlockListSink`].
+    pub(crate) async fn reconcile_block_lists(&self) {
+        let app = self.clone();
+        // Install live subscriptions first. Reconcile accounts concurrently with a
+        // fixed bound so one slow account does not serialize every other account's
+        // startup/reconnect, and report failures without exposing identities.
+        let app_for_accounts = app.clone();
+        let accounts = match blocking_directory_task(move || {
+            Ok(app_for_accounts
+                .account_home()
+                .accounts()
+                .map_err(AppError::from)?)
+        })
+        .await
+        {
+            Ok(accounts) => accounts,
+            Err(_) => {
+                tracing::warn!(target: "marmot_app::user_blocks", method = "reconcile_block_lists", "block list account enumeration failed");
+                return;
+            }
+        };
+        let failures = stream::iter(accounts.into_iter().map(|account| {
+            let app = app.clone();
+            async move {
+                let lock = app.block_update_lock(&account.label).await;
+                let _guard = lock.lock().await;
+                app.fetch_block_list(&account.label).await.is_err()
+            }
+        }))
+        .buffer_unordered(4)
+        .fold(0usize, |count, failed| async move {
+            count + usize::from(failed)
+        })
+        .await;
+        if failures != 0 {
+            tracing::warn!(target: "marmot_app::user_blocks", method = "reconcile_block_lists", failed_account_count = failures, "block list reconciliation incomplete");
+        }
+    }
+
     pub(crate) async fn block_update_lock(&self, label: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.block_list_locks
             .lock()
@@ -22,11 +65,12 @@ impl MarmotApp {
 
     pub(crate) fn block_list_endpoints(&self, account_id: &str) -> Vec<TransportEndpoint> {
         let relays = self
+            .directory()
             .account_relay_list_status_for_account_id(account_id)
             .map(|s| s.nip65.relays)
             .unwrap_or_default();
         if relays.is_empty() {
-            self.directory_source_relays(&[])
+            self.directory().directory_source_relays(&[])
         } else {
             relays.into_iter().map(TransportEndpoint).collect()
         }
@@ -325,6 +369,23 @@ fn block_entries(list: &StoredBlockList, own: &str) -> Vec<(String, bool)> {
             (key != own).then_some((key, private))
         })
         .collect()
+}
+
+/// The directory sync worker hands live mute-list events and reconcile passes
+/// back to the app, which owns block lists.
+impl BlockListSink for MarmotApp {
+    fn adopt_block_list_event(
+        &self,
+        event: NostrTransportEvent,
+    ) -> impl std::future::Future<Output = Result<(), DirectoryError>> + Send + 'static {
+        let app = self.clone();
+        async move { Ok(app.ingest_block_list_event(event).await?) }
+    }
+
+    fn reconcile_block_lists(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let app = self.clone();
+        async move { MarmotApp::reconcile_block_lists(&app).await }
+    }
 }
 
 #[cfg(test)]

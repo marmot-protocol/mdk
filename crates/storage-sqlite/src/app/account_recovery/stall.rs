@@ -22,6 +22,27 @@ impl SqliteAppStorage {
     ) -> StorageResult<bool> {
         self.connection.with_transaction(|| {
             let storage = self;
+            if let Some(native) = storage
+                .pending_recovery_demands()?
+                .into_iter()
+                .find(|demand| demand.cause == RecoveryCause::SubscriptionReplay)
+            {
+                let tokens = storage
+                    .recovery_scope_snapshots(native.ticket.id)?
+                    .into_iter()
+                    .filter(|scope| scope.plan.group_id.as_deref() == Some(group.as_slice()))
+                    .map(|scope| scope.token)
+                    .collect::<Vec<_>>();
+                if !storage.retire_native_replay_scopes(
+                    &storage.recovery_revision_fence()?,
+                    native.ticket,
+                    &tokens,
+                )? {
+                    return Err(StorageError::Backend(
+                        "terminal replay retirement changed".into(),
+                    ));
+                }
+            }
             storage.lock()?.execute_cached(
                 "DELETE FROM account_recovery_obligations WHERE group_id=?1 AND cause IN (1,2,4)",
                 [group.as_slice()],
@@ -166,12 +187,40 @@ mod tests {
         )
         .unwrap();
         app.mark_account_delivery_recovery("alice", 55, 1).unwrap();
+        let native = app
+            .request_recovery(
+                RecoveryRequest::SubscriptionReplay { snapshot: &[9; 32] },
+                1,
+            )
+            .unwrap();
+        let native_goal = RecoveryScopePlan {
+            scope_id: 41,
+            route_kind: 1,
+            route_role: 0,
+            group_id: Some(group.as_slice().to_vec()),
+            transport_group_id: Some([4; 32]),
+            since_seconds: None,
+            until_seconds: 100,
+            known_event_id: None,
+            inventory_floor: None,
+            required_endpoints: vec!["issued".into()],
+            admitted_endpoints: vec!["issued".into()],
+        };
+        app.install_recovery_scope_plan(
+            &app.recovery_revision_fence().unwrap(),
+            0,
+            native.id,
+            &[native_goal],
+        )
+        .unwrap()
+        .unwrap();
         let before = app.recovery_revision_fence().unwrap();
         let retry = app.recovery_retry_state().unwrap();
         store.lock().unwrap().execute_batch("CREATE TRIGGER fail_terminal_retire BEFORE DELETE ON app_epoch_stall_evidence BEGIN SELECT RAISE(ABORT, 'injected terminal retire failure'); END;").unwrap();
         assert!(app.retire_terminal_group_recovery(&group).is_err());
         assert_eq!(app.recovery_revision_fence().unwrap(), before);
         assert_eq!(app.epoch_stall_evidence().unwrap().len(), 1);
+        assert_eq!(app.recovery_scope_snapshots(native.id).unwrap().len(), 1);
         store
             .lock()
             .unwrap()
@@ -179,6 +228,14 @@ mod tests {
             .unwrap();
         app.retire_terminal_group_recovery(&group).unwrap();
         assert!(app.epoch_stall_evidence().unwrap().is_empty());
+        assert!(app.recovery_scope_snapshots(native.id).unwrap().is_empty());
+        assert_eq!(
+            app.recovery_obligation_status(native.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            RecoveryObligationState::Retired
+        );
         assert!(
             app.pending_recovery_demands()
                 .unwrap()
@@ -249,6 +306,7 @@ mod tests {
                     &[RecoveryScopeCheckpoint {
                         token,
                         retained_known_event: false,
+                        replay_admitted: false,
                         endpoints: vec![RecoveryEndpointCheckpoint {
                             endpoint: "relay".into(),
                             outcome: RecoveryScopeOutcome::Covered,

@@ -18,8 +18,7 @@ mod time;
 pub use error::{AccountError, AccountHomeError, AccountHomeResult, AccountResult};
 pub use home::{
     AccountHome, AccountSetupKind, AccountSetupPhase, AccountSetupState, AccountSummary,
-    DEFAULT_KEYCHAIN_SERVICE_NAME, EXTERNAL_SQLCIPHER_SECRET_FILE, ExternalSecretMode,
-    NostrAccountImport,
+    EXTERNAL_SQLCIPHER_SECRET_FILE, ExternalSecretMode, NostrAccountImport,
 };
 pub use key_package::{
     KeyPackagePublication, KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
@@ -31,8 +30,8 @@ pub use runtime::{
     CompletedWelcomePublishTask, FailedApplicationMessage, MaintenanceActivity,
     MaintenanceAttemptDuration, MaintenanceTiming, PendingResolution, PreparedSessionCommit,
     PreparedSessionSend, PreparedWelcomePublishTask, PublishFailure, PublishedApplicationMessage,
-    SelfUpdateHold, UndeliveredCommit, UnresolvedApplicationMessage, UnresolvedPublish,
-    UnresolvedPublishReason, WelcomeDeliveryFailure,
+    UndeliveredCommit, UnresolvedApplicationMessage, UnresolvedPublish, UnresolvedPublishReason,
+    WelcomeDeliveryFailure,
 };
 pub use secret_store::{AccountSecretStore, KeychainSecretStore, LocalFileSecretStore};
 pub use time::{

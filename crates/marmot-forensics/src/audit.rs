@@ -1379,6 +1379,8 @@ pub enum AuditEventKind {
         spill_already_seen: u64,
         queue_dropped: u64,
     },
+    /// Historical wire-reissue repair format; retained for decoding only.
+    ///
     /// One pass of the relay plane's lag-lost end-of-stored-events repair,
     /// which re-issues the REQs a notification lag may have cost their EOSE.
     /// Account-scoped. The repair runs off the worker and only queues its
@@ -1410,6 +1412,7 @@ pub enum AuditEventKind {
         follow_up_scheduled: bool,
         dropped_before: u64,
     },
+
     /// Relays ended live subscriptions of this account with `CLOSED`. The Nostr
     /// adapter queues each refusal as it arrives; the account worker records
     /// what it holds at its next publication seam, so recording never delays

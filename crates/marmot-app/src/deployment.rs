@@ -3,7 +3,8 @@
 //! MDK serves any Marmot client, so these are configuration, not protocol.
 //! [`MarmotDeployment::white_noise`] is White Noise's deployment and keeps its
 //! behaviour exactly. [`MarmotDeployment::neutral`] configures none of them.
-//! See `docs/marmot-architecture/review/brief-host-configuration.md`.
+
+pub use nostr_directory::config::{KeyPackageClientPreference, OpenRankingProvider};
 
 /// The services and identifiers one deployment's users rely on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,26 +40,6 @@ pub struct MarmotDeployment {
     /// Platform keychain service name for account secrets. Changing it for an
     /// existing install strands the secrets stored under the old name.
     pub keychain_service: String,
-}
-
-/// An Open Ranking pubkey-search endpoint and the relays that hydrate its
-/// results into signed kind-0 profiles.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OpenRankingProvider {
-    pub search_endpoint: String,
-    pub profile_relays: Vec<String>,
-}
-
-/// KeyPackage ranking by self-asserted `client` tag. Labels authenticate
-/// nothing: they only order candidates that already passed admission.
-/// Temporary until device-aware delivery replaces single-package selection
-/// (mdk#1696).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct KeyPackageClientPreference {
-    /// Client names ranked first, case-insensitively.
-    pub preferred: Vec<String>,
-    /// Client names ranked last, case-insensitively.
-    pub last: Vec<String>,
 }
 
 /// Neutral keychain service name for hosts that never chose one.
@@ -173,63 +154,42 @@ impl MarmotDeployment {
             .collect()
     }
 
-    /// Servers a new group's encrypted-media component lists. An empty list
-    /// still falls back to White Noise's servers, as before this was
-    /// configuration, until the neutral default lands (host-configuration
-    /// brief, PR 3).
-    pub(crate) fn new_group_media_endpoints_or_fallback(&self) -> Vec<String> {
-        if self.new_group_media_endpoints.is_empty() {
-            owned(white_noise::MEDIA_SERVERS)
-        } else {
-            self.new_group_media_endpoints.clone()
-        }
-    }
-
-    /// The group-image server for `requested`, else this deployment's. Unset
-    /// still falls back to White Noise's, as before this was configuration,
-    /// until the neutral default lands (host-configuration brief, PR 3).
-    pub(crate) fn group_image_endpoint_or_fallback(&self, requested: Option<&str>) -> String {
+    /// The group-image server for `requested`, else this deployment's. With
+    /// neither, group images can't be uploaded or fetched: group state
+    /// records no server, so there is nowhere to look.
+    pub(crate) fn group_image_endpoint_for(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<String, crate::AppError> {
         requested
             .or(self.group_image_endpoint.as_deref())
-            .unwrap_or(white_noise::MEDIA_SERVERS[0])
-            .to_owned()
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                crate::AppError::BlobStore("this deployment sets no group-image server".into())
+            })
     }
 
     /// The profile-image upload server for `requested`, else this
-    /// deployment's. Unset still falls back to White Noise's, as before this
-    /// was configuration, until the neutral default lands (host-configuration
-    /// brief, PR 3).
-    pub(crate) fn profile_image_endpoint_or_fallback(&self, requested: Option<&str>) -> String {
+    /// deployment's. With neither there is no upload; peers' avatars still
+    /// load from the URL in their own profile.
+    pub(crate) fn profile_image_endpoint_for(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<String, crate::AppError> {
         requested
             .or(self.profile_image_endpoint.as_deref())
-            .unwrap_or(white_noise::PROFILE_IMAGE_SERVER)
-            .to_owned()
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                crate::AppError::BlobStore("this deployment sets no profile-image server".into())
+            })
     }
 }
 
 impl Default for MarmotDeployment {
-    /// White Noise's deployment for now. The host-configuration brief's PR 3
-    /// makes the default [`MarmotDeployment::neutral`].
+    /// [`MarmotDeployment::neutral`]: a host names its services, White
+    /// Noise's included ([`MarmotDeployment::white_noise`]).
     fn default() -> Self {
-        Self::white_noise()
-    }
-}
-
-impl KeyPackageClientPreference {
-    /// 2 for a preferred client, 0 for one ranked last, 1 for any other or no
-    /// tag.
-    pub(crate) fn rank(&self, client: Option<&str>) -> u8 {
-        let Some(client) = client.map(str::trim) else {
-            return 1;
-        };
-        let matches = |names: &[String]| names.iter().any(|name| name.eq_ignore_ascii_case(client));
-        if matches(&self.preferred) {
-            2
-        } else if matches(&self.last) {
-            0
-        } else {
-            1
-        }
+        Self::neutral()
     }
 }
 
@@ -314,17 +274,6 @@ mod tests {
         assert_eq!(deployment.clone().normalize(), deployment);
     }
 
-    /// Until the bindings read the keychain name from the deployment
-    /// (host-configuration brief, PR 2), the preset must name the same
-    /// service `marmot-account` opens by default.
-    #[test]
-    fn white_noise_keychain_matches_the_account_default() {
-        assert_eq!(
-            MarmotDeployment::white_noise().keychain_service,
-            marmot_account::DEFAULT_KEYCHAIN_SERVICE_NAME
-        );
-    }
-
     #[test]
     fn neutral_configures_no_service() {
         let deployment = MarmotDeployment::neutral();
@@ -376,33 +325,35 @@ mod tests {
     #[test]
     fn key_package_preference_ranks_by_client_tag() {
         let white_noise = MarmotDeployment::white_noise().key_package_client_preference;
-        assert_eq!(white_noise.rank(Some("WhiteNoise")), 2);
-        assert_eq!(white_noise.rank(Some(" amethyst ")), 0);
-        assert_eq!(white_noise.rank(Some("other")), 1);
-        assert_eq!(white_noise.rank(None), 1);
+        assert_eq!(white_noise.rank_for_test(Some("WhiteNoise")), 2);
+        assert_eq!(white_noise.rank_for_test(Some(" amethyst ")), 0);
+        assert_eq!(white_noise.rank_for_test(Some("other")), 1);
+        assert_eq!(white_noise.rank_for_test(None), 1);
         let neutral = KeyPackageClientPreference::default();
-        assert_eq!(neutral.rank(Some("whitenoise")), 1);
-        assert_eq!(neutral.rank(Some("amethyst")), 1);
+        assert_eq!(neutral.rank_for_test(Some("whitenoise")), 1);
+        assert_eq!(neutral.rank_for_test(Some("amethyst")), 1);
     }
 
     #[test]
-    fn fallbacks_keep_white_noise_servers_until_the_neutral_default() {
+    fn unset_image_servers_are_refused_not_borrowed() {
         let neutral = MarmotDeployment::neutral();
+        assert!(neutral.group_image_endpoint_for(None).is_err());
+        assert!(neutral.profile_image_endpoint_for(None).is_err());
         assert_eq!(
-            neutral.new_group_media_endpoints_or_fallback(),
-            MarmotDeployment::white_noise().new_group_media_endpoints
+            neutral
+                .group_image_endpoint_for(Some("https://other.example"))
+                .unwrap(),
+            "https://other.example",
+            "an explicit server still wins"
         );
+        let white_noise = MarmotDeployment::white_noise();
         assert_eq!(
-            neutral.group_image_endpoint_or_fallback(None),
+            white_noise.group_image_endpoint_for(None).unwrap(),
             "https://blossom.divine.video"
         );
         assert_eq!(
-            neutral.profile_image_endpoint_or_fallback(None),
+            white_noise.profile_image_endpoint_for(None).unwrap(),
             "https://blossom.primal.net"
-        );
-        assert_eq!(
-            neutral.group_image_endpoint_or_fallback(Some("https://other.example")),
-            "https://other.example"
         );
     }
 }

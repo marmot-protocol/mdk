@@ -259,6 +259,7 @@ pub(crate) fn park_recovery_for_test(storage: &storage_sqlite::SqliteAccountStor
 /// One reserved attempt for exactly `id`, checkpointed with synthetic finite
 /// endpoint evidence: qualified coverage when `covered`, otherwise nothing,
 /// which parks it. Returns whether the obligation is now satisfied.
+/// The synthetic goal stays fixed across attempts of the same revision.
 #[cfg(test)]
 pub(crate) fn settle_recovery_for_test(
     storage: &storage_sqlite::SqliteAccountStorage,
@@ -292,7 +293,7 @@ pub(crate) fn settle_recovery_for_test(
                 group_id: None,
                 transport_group_id: None,
                 since_seconds: Some(1),
-                until_seconds: now / 1000,
+                until_seconds: 1,
                 known_event_id: None,
                 inventory_floor: Some(1),
                 required_endpoints: vec![endpoint.clone()],
@@ -322,6 +323,7 @@ pub(crate) fn settle_recovery_for_test(
                     first_boundary: false,
                 }],
                 retained_known_event: false,
+                replay_admitted: false,
             }],
             if covered {
                 RecoveryEligibility::Retry

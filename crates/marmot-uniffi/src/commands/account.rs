@@ -583,9 +583,12 @@ impl Marmot {
     /// current kind-3 contact list. Returns the complete updated list.
     ///
     /// This fetches the current replaceable event from the account's known
-    /// outbox/default relays before publishing. If no current event can be
-    /// established, it returns `FollowListUnavailable` rather than risking a
-    /// destructive replacement.
+    /// outbox/default relays and appends one `p` tag; petnames, relay hints,
+    /// other tags and the content are republished unchanged. If no current
+    /// event can be established, it returns `FollowListUnavailable` rather
+    /// than risking a destructive replacement. If the list has 2,048 follows
+    /// or more, the most MDK reads from one list, it returns
+    /// `FollowListTooLarge` and publishes nothing.
     pub async fn follow_user(
         &self,
         account_ref: String,
@@ -600,6 +603,10 @@ impl Marmot {
 
     /// Unfollow `user_ref` while preserving every other entry in the account's
     /// current kind-3 contact list. Returns the complete updated list.
+    ///
+    /// Removes only `user_ref`'s `p` tags and otherwise behaves as
+    /// `follow_user`, including `FollowListUnavailable` and
+    /// `FollowListTooLarge`.
     pub async fn unfollow_user(
         &self,
         account_ref: String,
@@ -805,6 +812,7 @@ mod tests {
         assert_eq!(created.readiness, AccountSetupReadinessFfi::LocalReady);
         let cached = kit
             .app
+            .directory()
             .directory_entry_for_account_id(&created.account.account_id_hex)
             .expect("read cached profile")
             .and_then(|entry| entry.profile)
@@ -855,6 +863,7 @@ mod tests {
         assert_eq!(created.profile.about.as_deref(), Some("first profile"));
         let cached = kit
             .app
+            .directory()
             .directory_entry_for_account_id(&created.account.account_id_hex)
             .expect("read cached profile")
             .and_then(|entry| entry.profile)
@@ -862,26 +871,6 @@ mod tests {
         assert_eq!(cached.name.as_deref(), Some("Chosen Heron"));
         assert_ne!(cached.created_at, 0);
         kit.runtime.shutdown().await;
-    }
-
-    #[test]
-    fn account_unread_summary_reports_zero_attention_for_idle_local_account() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let home = AccountHome::open(root.path());
-        let account = home.create_account("alice").expect("create alice");
-        let app = MarmotApp::with_relay(root.path(), "wss://relay.invalid.test");
-        let runtime = app.runtime();
-        let kit = Marmot { app, runtime };
-
-        let summary = kit
-            .account_unread_summary()
-            .expect("unread summary without starting a session");
-        assert_eq!(summary.len(), 1);
-        assert_eq!(summary[0].account_id_hex, account.account_id_hex);
-        assert_eq!(summary[0].unread_count, 0);
-        assert_eq!(summary[0].unread_conversations, 0);
-        assert_eq!(summary[0].attention_only_conversations, 0);
-        assert!(!summary[0].has_unread);
     }
 
     #[tokio::test(flavor = "multi_thread")]

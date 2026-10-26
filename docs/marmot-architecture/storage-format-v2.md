@@ -1,7 +1,7 @@
 ---
 title: "Storage Format v2"
 created: 2026-08-13
-updated: 2026-10-15
+updated: 2026-10-22
 tags: [marmot, storage, sqlite, migration, encoding]
 status: current
 ---
@@ -373,55 +373,172 @@ The benchmark executes those batches continuously only to measure their total
 database work and worst observed transaction duration. Page reclamation is not
 required for correctness and remains a separately scheduled maintenance choice.
 
-## SQLCipher key presentation and KDF work factor (decision record, mdk#1439)
+## SQLCipher key presentation and KDF work factor (decision record, mdk#1791)
 
-Every `storage-sqlite` database is keyed with 256-bit key material derived by
-HKDF over the account secret and a stable per-database salt
-(`crates/marmot-app/src/sqlcipher.rs`). The derived bytes are hex-encoded and
-presented to SQLCipher as a *passphrase*. With `cipher_compatibility = 4`
-pinned and no `cipher_kdf_iterations` override anywhere in the workspace,
-SQLCipher then runs PBKDF2-HMAC-SHA512 with 256,000 iterations on every keyed
-open. That KDF exists to resist dictionary attacks on human passphrases; the
-HKDF-derived input is already uniform high-entropy key material, so the
-stretching adds no effective security on this path — its cost is pure latency
-(~50–500 ms per derivation depending on device class).
+Decision (2026-10-22): accept raw-key presentation for app-owned databases.
+This supersedes the 2026-08-14 decision in mdk#1439 to retain passphrase
+presentation. The HKDF derivation in `crates/marmot-app/src/sqlcipher.rs`
+continues to produce the same 32 bytes from the account secret and stable
+per-database `.salt` sidecar. External-signer accounts use their device-local
+database secret from `SecretStore` and follow the same migration.
 
-**Decision (2026-08-14): keep passphrase presentation and the compat-4 KDF
-work factor unchanged.** Do not adopt raw `x'…'` key presentation or a reduced
-`cipher_kdf_iterations` as part of the mdk#1439 performance work. The measured
-win ships without touching on-disk cipher parameters: the in-process v2-open
-verdict cache makes each existing-database open pay the KDF once instead of
-twice, and the remaining open-count reduction is tracked by mdk#1436.
+`SqlCipherKey::raw([u8; 32])` presents those bytes as `x'<64 hex digits>'`.
+`SqlCipherKey::new` remains the passphrase constructor and rejects raw-key
+syntax; user passphrases must not bypass stretching through that constructor.
+Key buffers and their rendered forms remain zeroizing and debug-redacted.
+The old app format used the 64-character HKDF hex string as a passphrase,
+which made SQLCipher apply PBKDF2-HMAC-SHA512 with 256,000 iterations on open.
+Raw presentation removes that passphrase-stretching step for the app's
+high-entropy key, rather than lowering the work factor for passphrases.
 
-Rationale for rejecting the key-presentation change in this context:
+### One-time rewrite and crash recovery
 
-1. **It is a storage-format change, not a tuning change.** Raw-key presentation
-   or a reduced iteration count changes the on-disk cipher parameters of every
-   existing database. That requires a numbered, crash-safe `PRAGMA rekey`
-   migration with the same marker/sidecar discipline as the salt migration,
-   plus a rollback plan — and a reduced iteration count additionally becomes a
-   de-facto open parameter that must be pinned before keying on *every* open
-   path (account storage, hardened cache opens, probe/rekey opens, and external
-   tooling).
-2. **It requires explicit security sign-off.** Raw presentation is sound only
-   because every presented key is HKDF-derived 256-bit uniform material; that
-   invariant must be enforced by construction (a typed raw-key variant of
-   `SqlCipherKey` that no user-supplied passphrase can ever reach) before
-   adoption. A lowered `cipher_kdf_iterations` would instead weaken brute-force
-   resistance for any future low-entropy passphrase that reaches the same
-   pragma path.
-3. **The trade is nil in both directions today, so measure first.** With the
-   verdict cache, per-open KDF count is observable in the fleet via
-   `app_sqlcipher_migration_probe_runs`/`app_sqlcipher_migration_probe_skips`
-   and the `app_account_open`/`app_account_session_open` duration buckets
-   (`telemetry.md`). If those numbers still show open-latency pain after
-   mdk#1436 lands, the accept path below can be evaluated on evidence rather
-   than stacked silently into a performance fix.
+Existing passphrase-keyed session and encrypted cache databases require a
+one-time `PRAGMA rekey` page rewrite. This is a key-format migration, separate
+from numbered SQL schema migrations. Allow for rewrite I/O and temporary disk
+usage; steady-state open timings do not characterize migration cost.
 
-Accept path, if revisited: a versioned rekey migration guarded by a durable
-marker (mirroring the salt migration's crash windows), no change to hardening
-semantics (`cipher_compatibility` pin, `cipher_memory_security`,
-`secure_delete`, `synchronous=FULL`), a downgrade story (rekey back to
-passphrase presentation), typed raw-key construction in `storage-sqlite`, and
-updated forensic/tooling docs (raw-keyed databases need raw-key open syntax in
-the `sqlcipher` CLI).
+Before rekey, durably write `<db>.raw-key-migrating` with exactly
+`raw-key-v1\n`. Recovery probes raw first, then the salted HKDF hex passphrase,
+then the legacy passphrase derivation. Old passphrase forms are migration-only
+read paths, not new-write formats.
+Unknown marker versions fail closed. Errors retain the salts and markers needed
+for recovery; cleanup follows verification through a fresh raw-key connection.
+
+- A crash after marker publication but before rekey leaves a passphrase-keyed
+  database. Recovery opens it with the matching old key and retries rekey.
+- A crash after rekey but before marker cleanup leaves a raw-keyed database.
+  Recovery's raw probe succeeds; it completes sidecar/marker cleanup without
+  deriving a different key or repeating the rewrite.
+
+An existing `.salt-migrating` migration targets raw presentation directly;
+its pending salt must remain available until recovery finishes. Never discard
+either migration marker to force an open. The `.salt` sidecar is an HKDF input,
+distinct from SQLCipher's database-header salt. Retain it and the original
+account or external-signer database secret. No derived page key is persisted.
+
+Hardening is unchanged: pin `cipher_compatibility = 4`, retain
+`cipher_memory_security`, `secure_delete` and `synchronous=FULL`, and do not
+lower KDF iterations or introduce a compatibility fallback.
+
+### Offline forensic and CLI opens
+
+Exit every process using the account before inspecting or rekeying its files.
+Use a SQLCipher CLI compatible with the pinned cipher format. For a migrated
+database, the key statement is:
+
+```sql
+PRAGMA cipher_compatibility = 4;
+PRAGMA cipher_memory_security = ON;
+PRAGMA key = "x'<64 HKDF hex>'";
+SELECT count(*) FROM sqlite_master;
+PRAGMA secure_delete = ON;
+PRAGMA synchronous = FULL;
+```
+
+Replace `<64 HKDF hex>` with exactly the hex encoding of the 32 derived bytes,
+without angle brackets. A bare `PRAGMA key = '<64 HKDF hex>';` instead opens
+the old passphrase format and cannot open the migrated database. Do not append
+the HKDF sidecar salt to the raw key or substitute the header salt for it.
+Preserve the normal hardening settings in any writable tooling connection.
+Treat derived hex as a secret: do not place it in command arguments, shell/SQL
+history, logs, telemetry, or shared forensic artifacts.
+
+### Offline downgrade
+
+Raw-keyed databases cannot be opened by app versions that only supply the
+HKDF hex passphrase. Before downgrading, exit every process using the account, preserve
+a consistent backup and all salt/secret material, and finish any interrupted
+migration with the current binary. For each encrypted account database,
+including the cache and external-signer databases, open with the raw syntax
+above, verify a real schema read, then rekey to the original salted HKDF hex
+*passphrase*:
+
+```sql
+PRAGMA secure_delete = ON;
+PRAGMA synchronous = FULL;
+PRAGMA rekey = '<64 HKDF hex>';
+```
+
+Close the connection and reopen a fresh connection in this order:
+
+```sql
+PRAGMA cipher_compatibility = 4;
+PRAGMA cipher_memory_security = ON;
+PRAGMA key = '<64 HKDF hex>';
+SELECT count(*) FROM sqlite_master;
+PRAGMA secure_delete = ON;
+PRAGMA synchronous = FULL;
+PRAGMA cipher_integrity_check;
+PRAGMA integrity_check;
+```
+
+Verify the schema read and integrity checks before using the older binary. Keep the
+`.salt` sidecar and original secret unchanged. This reverses key presentation
+only; it does not reverse schema migrations or their downgrade refusal.
+A fresh process running the current app migrates it to raw presentation again.
+
+### Validation evidence
+
+Local regressions reserve the database writer to force rekey failure, then
+verify that the retained salt and markers allow recovery. A separate regression
+exits a child process without SQLite cleanup after rekey commits, leaving raw-key
+WAL frames over the old-key main file; reopening preserves both committed rows
+and passes `integrity_check`. Neither test simulates a power failure.
+
+On 2026-10-22, a disposable Rust harness on an AMD Ryzen AI MAX+ 395 ran
+the dev-profile app and storage APIs against a newly created, current-schema
+account database. It derived the same session HKDF bytes for both presentations,
+downgraded the database offline, measured 21 opens, migrated it through
+`MarmotApp::account_unread_summary`, and measured 21 raw-key opens. The separate
+probe measurement used `open_hardened_sqlcipher` and its schema read. Cipher
+memory security stayed enabled throughout; timings include connection close.
+
+| Desktop operation (median) | Hex passphrase | Raw key | Ratio |
+| --- | ---: | ---: | ---: |
+| `SqliteAccountStorage::open_encrypted` | 81.865 ms | 21.077 ms | 3.88x |
+| Hardened key + schema probe | 80.510 ms | 21.355 ms | 3.77x |
+
+The app query's one-time migration took 129.973 ms and preserved a stored marker
+row. Its telemetry reported one recovery probe and no cached-probe skips. This
+fixture has no retained message history; these observations establish neither
+an order-of-magnitude app-open improvement nor large-database rewrite cost.
+
+The same day, a standalone C harness ran on a physical Pixel 8 Pro, Android 17
+build `CP3A.261005.005/2026101601`. It used the pinned SQLCipher 4.17.0
+amalgamation at rusqlite revision `5ae7fdf83085c595fd54f977b3a56ccacabaf16b`,
+SQLite 3.53.3 and static OpenSSL 3.6.2. NDK r28c clang 19.0.1 targeted arm64
+API 26 with `-O2 -DNDEBUG -fPIC` and the bundled Android SQLCipher defines;
+OpenSSL used its Android configuration, `-O3` and assembly.
+
+The passphrase and raw fixtures had identical schemas and three rows in separate
+8,192-byte files. After three warmups, 21 paired opens alternated presentation
+order. Each connection pinned compatibility 4 and enabled cipher memory security
+before keying and reading the schema. Full runtime settings retained WAL,
+`synchronous=FULL`, `secure_delete=ON`, memory temp store and untrusted schema.
+
+| Pixel 8 Pro operation (median) | Hex passphrase | Raw key |
+| --- | ---: | ---: |
+| Open + cipher settings + key + schema read | 75.873 ms | 0.352 ms |
+| Above + runtime pragmas | 75.878 ms | 0.356 ms |
+| Above + close | 76.135 ms | 0.570 ms |
+| Recovery probe + actual open (two connections) | 152.283 ms | 1.203 ms |
+
+Both rekey directions preserved all three rows and passed `integrity_check` on
+a fresh connection; wrong keys and the previous presentation returned
+`SQLITE_NOTADB`. Rekey, checkpoint and close took 12.717 ms for upgrade and
+84.530 ms for downgrade on this tiny fixture. Filesystem caches were warm;
+there was no CPU pinning or thermal normalization. These are standalone
+SQLCipher measurements, not Rust app-bucket, cold-storage or interrupted-rekey
+device evidence.
+
+### Outstanding release evidence
+
+Acceptance for implementation is not security release sign-off or a measured
+app-performance claim. Physical Android and iOS app evidence is still required:
+capture `app_account_open` and `app_account_session_open` durations for first
+migration and subsequent opens, together with
+`app_sqlcipher_migration_probe_runs` / `app_sqlcipher_migration_probe_skips`
+counters, and verify reopen and interrupted-migration behavior on both platforms.
+Record device/build provenance and separate rewrite cost from steady-state open
+cost. No iOS measurements or completed security release sign-off are asserted here.

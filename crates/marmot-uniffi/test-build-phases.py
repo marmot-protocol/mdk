@@ -379,6 +379,42 @@ class BuildPhases(unittest.TestCase):
                         BUILD_TEST_ANCESTRY_FAILURE=ancestry_failure), capture_output=True, text=True)
                 self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
 
+    def test_nightly_identity_requires_a_dev_source_on_master(self):
+        # The same identity script, as nightly-releases.yml calls it.
+        self.shim(self.bin / "git")
+        workflow = (TOOLS.parents[1] / ".github/workflows/bindings.yaml").read_text()
+        block = workflow.split("      - name: Resolve release identity\n", 1)[1]
+        block = block.split("        run: |\n", 1)[1].split("\n  apple-build:", 1)[0]
+        script = textwrap.dedent(block)
+        version = "0.14.0-nightly.20261020"
+        cases = [
+            ("0.14.0-dev", version, "refs/heads/master", "false", "0", True),
+            ("0.14.0-dev", version + ".1", "refs/heads/master", "false", "0", True),
+            ("0.14.0-dev", version, "refs/heads/experiment", "true", "0", True),
+            ("0.14.0-dev", version, "refs/heads/experiment", "false", "0", False),
+            ("0.14.0-dev", version, "refs/heads/master", "false", "1", False),
+            ("0.14.0", version, "refs/heads/master", "false", "0", False),
+            ("0.15.0-dev", version, "refs/heads/master", "false", "0", False),
+            ("0.14.0-dev", "0.14.0-nightly.2026102", "refs/heads/master", "false", "0", False),
+        ]
+        for workspace, nightly, ref, build_only, ancestry_failure, success in cases:
+            with self.subTest(workspace=workspace, nightly=nightly, ref=ref, build_only=build_only,
+                              ancestry_failure=ancestry_failure):
+                (self.root / "Cargo.toml").write_text(f'version = "{workspace}"\n')
+                outputs = self.root / "outputs"
+                outputs.unlink(missing_ok=True)
+                result = subprocess.run(["bash", "-c", script], cwd=self.root,
+                    env=self.env | dict(GITHUB_EVENT_NAME="schedule", GITHUB_REF=ref,
+                        BUILD_ONLY=build_only, REQUESTED_SHA="a" * 40, BUILDER_SHA="b" * 40,
+                        NIGHTLY_VERSION=nightly, GITHUB_OUTPUT=str(outputs),
+                        BUILD_TEST_ANCESTRY_FAILURE=ancestry_failure), capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
+                if success:
+                    values = dict(line.split("=", 1) for line in outputs.read_text().splitlines())
+                    self.assertEqual(values["release_tag"], f"marmotkit-v{nightly}")
+                    self.assertEqual(values["binary_name"], f"MarmotKitFFI-{nightly}.xcframework.zip")
+                    self.assertEqual((values["is_nightly"], values["is_snapshot"]), ("true", "false"))
+
 
 if __name__ == "__main__":
     unittest.main()

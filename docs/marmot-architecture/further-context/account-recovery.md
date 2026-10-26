@@ -1,6 +1,6 @@
 ---
 title: Account history recovery
-updated: 2026-10-01
+updated: 2026-10-21
 status: Design (v2), being implemented. Replaces the 22 recovery design, ledger and qualification notes.
 ---
 
@@ -62,7 +62,7 @@ The simulator comes first; Jeff validates on a phone.
      group's route replaced while the group was hidden, makes the charge unknown, and every
      later charge on that context with it. A lag keeps the account route open and forces
      no reconnect. The SDK client has already marked the lost events seen, so only
-     comparison and exact-ID acquisition recover them.
+     owner-granted original-window capture, comparison and exact-ID acquisition recover them.
    - Loss with no known bound has an unbounded goal. That covers SDK notification lag while
      an unfloored REQ is in scope, an undecodable spill row, count-only rows written before
      step 2, and an epoch gap whose commit time is unknown. So does a goal that reaches below the retained-inventory floor. None of these can be certified by
@@ -95,9 +95,9 @@ The simulator comes first; Jeff validates on a phone.
 2. **The queue keeps what it drops.** Overflowed deliveries are stored durably (bytes), within
    a cap.
 3. **Required relays are the relays we operate.** `MarmotDeployment::recovery_operated_relays`
-   (on `MarmotAppConfig::deployment`) names them; White Noise's deployment, today's default, is
-   `wss://relay.eu.whitenoise.chat` and `wss://relay.us.whitenoise.chat`, and NIP-77 is a hard
-   requirement for them. A route that
+   (on `MarmotAppConfig::deployment`) names them; White Noise's deployment
+   (`MarmotDeployment::white_noise()`) operates `wss://relay.eu.whitenoise.chat` and
+   `wss://relay.us.whitenoise.chat`, and NIP-77 is a hard requirement for them. A route that
    lists any operated relay requires exactly those. A route that lists none requires all of
    its relays, so its history can still certify. Every other relay is best effort: it is
    still compared and its events are admitted, but its failure, truncation or missing NIP-77
@@ -118,6 +118,67 @@ The simulator comes first; Jeff validates on a phone.
 
 ## Design
 
+### 0. Native replay belongs to the account owner
+
+`SubscriptionReplay` records the original live inbox and group query windows. It is not a loss charge.
+Unresolved floors survive cancellation, source replacement and reopen; an unfloored query stays unfloored.
+Completed scopes can be pruned when sources change, so they do not force permanent full-history fetches.
+
+The adapter exposes borrowed source facts under its admission guard and a coalescing change watch. The owner
+copies those facts and drops the guard before durable recovery writes. It combines a session nonce with the
+process-monotonic wire generation to identify the current goal. It freezes source capabilities into the existing
+comparison job and uses that job's recovery credit and cancellation.
+Native capture and comparison run concurrently under that grant's cutoff. A quiet native REQ cannot consume
+the whole pass before comparison starts; both remain owned until cancellation and IO cleanup finish.
+Neither the adapter nor the relay plane selects retries or runs a quiet-period repair timer.
+
+All native group input, including local publication fanout and post-EOSE live tails, uses the owner's ordered admission path rather than
+the ordinary queue and its spill tail.
+Before activation, durable group spill rows enter the native range as local supplements, including copies
+the current relay no longer holds. Every in-deadline peer must finish or settle its finite lease before payload
+release; one peer's EOSE cannot release newer ciphertext ahead of another peer's older history. Replacement
+REQs establish their own boundaries, including equivalent or narrower repacks. An empty expired peer becomes
+dormant without certifying history or inventing loss. After every transport tag's pages finish, a bounded `ReplayBatch` leases
+the group's sorted frames. Ordinary ingest borrows each frame until ACK; cancellation returns its
+unacknowledged suffix. Native and comparison input share one four-ingest turn and select the oldest known
+frame of each group across both sources. An unfinished native range fences comparison only for that group;
+independent groups, commands and inbox input still take turns. Each turn also examines at most four native
+frames, including receipt skips. Source replacement or restart revokes an unstarted loan before more ciphertext
+arrives; its suffix rejoins the complete range. Same-account repacks preserve held live bodies. A frame whose
+ingest already committed is acknowledged even if its loan was revoked in the meantime. Retained rows are removed
+only after durable admission and successful spill settlement. Backend errors remain visible to explicit callers;
+automatic worker retries use the existing 1–60-second backoff and return the failed loan to the fair ready queue.
+
+Native ingests resume the same owner-controlled `Receive` recovery follow-up as ordinary deliveries, including
+undecryptable input with no visible summary. Receipt skips and cursor-save-only progress do not request this
+follow-up. The receive intent is retained before ACK can suspend; it changes neither capture authority nor credit.
+
+`ReplayAdmission` needs a complete original range placed from at least one issued current-epoch peer for
+every scope, with no pending ciphertext or nondurable spill handoff. Empty silence is not notification loss.
+The limited `replay_admitted` fact cannot certify retained history, retain a missing known event, satisfy a
+maintenance boundary, or acknowledge real queue/notification loss. Those predicates are unchanged.
+Scoped source placement is independent of unrelated pending groups, but same-group waiting peers withhold
+that group's proof. Final native completion separately requires account-wide placement, including spill handoffs;
+persisting a scoped proof does not release that global fence. Local publication cannot supply a relay boundary.
+
+Passive admission spends no network retry credit. Cursor seal consults the owner's cached completion or
+explicit retirement while holding the source guard through router placement locking; a changed generation
+defers the seal until the owner synchronizes. No source or endpoint identifier enters audit output.
+A range already queued to the owner spends no further acquisition attempts while its bytes drain.
+That pending observation is not cursor permission: retry eligibility and qualified completion remain separate.
+
+Terminal group removal or disband retires only that group's native scopes under revision checks. A wanted
+range with no serving source, including a sole terminally refused REQ or a narrower replacement, parks as
+`NeedsDeepRepair` with its original floor. It spends no retry credit and creates no loss evidence. The existing
+incremental-history notice exposes it; dismissal records retirement, not completion. A genuinely changed source
+generation can rearm the debt without narrowing its original range.
+
+After native ACKs drain the current sources, the owner can save the admitted cursor through the existing live
+promotion path. A failed save retains its target for the next admission turn. Replayed durable receipts restore
+their validated transport timestamps without emitting duplicate plaintext. Ordinary drain checkpoints still
+settle live-promoted floors; native promotion does not add a drain audit row for each message. Future-dated
+cursors and explicit full-history policy keep the plane's unfloored query instead of substituting a recent tail.
+
 ### 1. Overflow becomes a durable tail, not a loss
 
 Today, when the 1,024-slot account queue is full, the router holds the whole
@@ -125,7 +186,7 @@ Today, when the 1,024-slot account queue is full, the router holds the whole
 current design follows from that choice: loss of unknown scope, broad replay, a completion
 nobody can certify, and the wait behind the queued backlog.
 
-New behavior, with each tier falling back to the next:
+Native group input uses section 0. Inbox and legacy delivery use these tiers, each falling back to the next:
 
 ```
 router ─► account queue (1,024, memory) ─► worker ingest
@@ -157,7 +218,7 @@ NIP-77 comparison covers what remains.
   the fence is on the subscription cursor.
 - While spilled rows remain, the worker alternates them with live deliveries, and yields
   between them, so neither a busy live queue nor a large spill starves the other. Order is
-  not guaranteed; the engine already handles reordered input (deferral and retained input).
+  not guaranteed on this inbox/legacy path. Native group replay never uses this alternation.
 - A row is removed only once its event is in the seen index. A row whose ingest left no
   durable trace is retried with a doubling delay, from one minute up to an hour. After 8
   attempts it is removed and recorded as queue loss in the same transaction, so recovery
@@ -191,19 +252,28 @@ Every cause runs the same job:
    Request-local NIP-77 comparison plus bounded exact-ID fetch, reusing #2031/#2037. The
    task returns an owned batch plus a per-relay outcome: complete, truncated, failed or
    unsupported. On an epoch-gap group route, each relay that failed without answering its
-   comparison is then asked for the route's newest events in the same window (a REQ `limit`
-   of 256, and at most 4 MiB per relay, inside the pass deadline). A commit first accepted
-   long after it was wrapped keeps its wrap-time `created_at`, so it sits below every live
-   `since` and a relay that cannot compare would otherwise never return it (mdk#2256). The
-   fetch keeps the oldest-first boundary: it does not run while a compared relay still owes
-   older history or the pass could not order what it was missing, only a page the relay
-   ended itself is kept (a cut page holds only the newer events), and the route's
-   comparison and window events are admitted together, oldest first. That window fetch is
-   investigation, not coverage: its events never certify a route, move its replay cursor or
-   withhold its certificate.
+   comparison is searched backwards through the same window in 256-event raw pages. Each
+   relay gets at most 16,384 raw events and 4 MiB of validated event JSON per pass, with at
+   most three seconds within the shared pass deadline. Raw SDK counts and oldest timestamps survive
+   filtering. Full pages overlap their oldest second; a short page probes the older prefix
+   before admission. An empty probe returns the buffered short page without fetching it
+   twice. Only a completed oldest page is admitted; cuts and saturated seconds release no
+   newer suffix. Bounded advisory hints resume held spans on later passes. The fetch never
+   runs ahead of older comparison backlog, and comparison/window candidates stay ordered
+   oldest first. Window events never certify a route, move its replay cursor or withhold
+   its certificate. Original comparison stability and SQL fences remain unchanged.
+   Inventory revisions invalidate held-span hints, so released input is not skipped on reuse.
+   Hints follow every pending epoch-gap ticket, including capacity-waiting tickets
+   omitted from another grant's selection.
+   Traversing already-held input is not recovery progress: it cannot reset backoff or the
+   durable unserved-pass count. Reconstruction or hint eviction may repeat traversal but
+   cannot renew that budget. A sufficiently deep prefix may exhaust it and park for explicit
+   repair. This paging change does not activate an independent known-event retry tier.
 3. **Admit** (worker, bounded turns). A few events per turn go straight into the normal
    ingest path, never through the live queue. The worker yields between turns, so commands
-   and live input interleave. A turn admits at most four events.
+   and live input interleave. A turn admits at most four events. Each successful turn publishes
+   its committed message and projection updates; consumers do not wait for the whole batch.
+   Published prefixes leave the pending summary, not the pass's accounting or coverage evidence.
 4. **Settle** (worker, short turn). Checkpoint, then complete, retry or park according to
    the tier rules, using the existing revision checks. Old attempts still cannot clear newer
    demand.
@@ -350,8 +420,8 @@ relay, and three notification lags during the replay.
 
 A live ingest's own save now promotes the cursor to what the account ingested, when:
 
-- every account subscription reported end-of-stored-events (relays replay newest-first, so
-  promoting mid-replay would put the rest of the replay below the new floor);
+- the owner's limited native-input goal is completed or explicitly retired for the guarded source generation;
+  all original ranges must be placed before admission, including backward pages and newly added group REQs;
 - no loss or spill hand-off is pending, as for any other checkpoint;
 - the cursor advances (not a frozen wake pass) and restarts rebuild from it;
 - the account has a settled floor (below). An account that has never persisted a cursor
@@ -551,41 +621,21 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   there cannot certify. The inbox's two-day NIP-59 widening sets that floor at least two
   days back on every route; per-route floors would need per-scope storage. Relays that
   ignore `since` are not detected.
-- End-of-stored-events lost in a notification lag (#2070). A lag cannot tell a lost EOSE
-  from one still coming, so it marks none complete. Once the receiver has gone 30 seconds
-  without another lag, each REQ issued before the lag that the adapter still sees awaiting
-  EOSE on a relay is repaired there. The SDK records each REQ's EOSE in its relay read
-  loop, before it sends the notification, so a lag cannot drop it
-  (`Relay::subscription_received_eose`). When it has one, the lag lost only the
-  notification: the adapter records that EOSE with no network traffic. Every repair reads
-  that record for every such relay, including one an earlier repair re-issued the REQ to,
-  so a re-issued replay whose fresh EOSE a later lag lost still completes. Otherwise the REQ's CLOSE and the REQ again, unchanged and under its own id, are
-  queued in one all-or-nothing batch (`Relay::batch_msg`) to a connected relay. The CLOSE
-  goes first, so no relay sees a repeated live id, which a relay could refuse instead of
-  replacing the subscription, and the SDK's registry keeps the REQ it restores on
-  reconnect. The relay replays from the same `since` and answers with a fresh EOSE, so
-  activation reuse returns, live cursor promotion resumes, quiet drains end early again,
-  and post-join maintenance observes its boundary. The loss floor does not move. A batch stranded by a disconnect
-  goes out once: the SDK's reconnect skips a REQ already queued. Only the network re-issue
-  is limited: a relay gets the REQ again at most once, so a replay that keeps lagging
-  cannot loop. A relay that got
-  nothing, because it was not connected or had no room for both frames, still has the old
-  REQ live; its claim is released and the repair runs again after the settle window for
-  the same lag, until its EOSE is recorded or the REQ goes out. One known behaviour: an
-  EOSE for the old REQ still in flight on the same connection sets the SDK's flag for the
-  re-issued one. That is harmless here, because the filters are identical, so it answers
-  for the same stored events. What remains: a replay still running 30 seconds after the
-  last lag restarts once; a group route removed before its EOSE keeps the activation's
-  frozen coverage incomplete; and a relay that stays unreachable is retried once per
-  settle window.
+- Lost end-of-stored-events (#2070, #2375, #2381). Ordered receiver gaps fence the source;
+  they never infer completion from an out-of-band SDK EOSE flag or re-issue its live REQ.
+  The account owner preserves original query windows and grants bounded private capture
+  under its existing retry policy and process credit. Captures and delivery draining
+  survive notification-worker cancellation; owner cancellation retains credit through IO
+  cleanup. Empty expiry creates no loss. Actual discarded ciphertext and real notification
+  gaps retain separate loss evidence. See design section 0 for the limited native predicate.
 - Live cursor promotion (design section 6). A delivery the raised floor sends to the spill
   is volatile until its spill write commits; a stop in that window loses it until the
   startup comparison. Routing is by content, so the router cannot tell an unfloored
   maintenance or prior-route replay from a floored REQ: such a replay's events above the
   settled floor go to the spill too, which costs spill writes (seen events are discarded
-  before they use capacity) but loses nothing. EOSE covers the activation's snapshot, not a
-  group added since, so a new group's replay may still be arriving when a promotion seals;
-  what falls below the floor is spilled, not lost. A drain checkpoint spills only what
+  before they use capacity) but loses nothing. Source generations include newly issued
+  group REQs; native admission fences their original ranges, not just the activation snapshot.
+  A drain checkpoint spills only what
   arrives while it saves; an older delivery that arrives after it is queued below its floor,
   exposed to a stop as it always was.
 - Explicit repair compares the retained window only. A goal with no lower bound, or one
@@ -600,6 +650,7 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
 - Recovery audit. The owner records its decisions in audit v5 only: need changes, attempt
   start and finish, per-obligation reassessment, and transport-cursor advances
   ([audit-logging.md](../audit-logging.md#account-recovery-owner-rows-v5-only)). The rows sit at
-  the comparison job's execution bracket and the owner's storage transitions. Each lag-lost EOSE repair pass (#2076) records its counts as `subscription_eose_repaired`.
+  the comparison job's execution bracket and the owner's storage transitions. Native replay uses the same owner
+  rows with cause `subscription_replay`; `subscription_eose_repaired` remains historical decoding only.
 - NSE behavior needs device validation. The spill makes short extension runs safer, because
   nothing is lost if one ends mid-drain.

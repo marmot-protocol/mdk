@@ -1150,6 +1150,7 @@ pub(crate) fn insert_chat_projection(value: &mut Value, chat_list_row: Option<Ch
 pub(crate) fn display_name_for_sender(app: &MarmotApp, sender: &str) -> Option<String> {
     let account_id = parse_public_key(sender).ok()?;
     let profile = app
+        .directory()
         .directory_entry_for_account_id(&account_id)
         .ok()
         .flatten()

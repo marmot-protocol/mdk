@@ -140,7 +140,6 @@ c_enum! {
         DeferredClockSkew,
         /// Expired messages are still unread; pruning waits.
         DeferredUnread,
-        DeferredScanExhausted,
         Failed,
     }
 }

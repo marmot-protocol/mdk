@@ -22,6 +22,9 @@ systems to Marmot through `wn-agent`.
 
 Installer scripts live in `scripts/install-*-marmot.sh`; the five terminal
 harness installers are thin wrappers over `scripts/install-terminal-harness-marmot.sh`.
+`scripts/install-wn-agent.sh` runs that shared installer in its connector-only
+mode (`MARMOT_TERMINAL_HARNESS=none`): `wn-agent` and its service for a custom
+client, no harness. `custom-client.md` is the guide for those clients.
 
 The shared boundary is the `marmot.agent-control.v2` NDJSON protocol over a
 local Unix socket. `wn-agent` owns Marmot account state, MLS state, Nostr
@@ -137,7 +140,8 @@ connector-specific
 `org.marmot.wn-agent.hermes`, `org.marmot.wn-agent.openclaw`,
 `org.marmot.wn-agent.claude`, `org.marmot.wn-agent.codex`,
 `org.marmot.wn-agent.harnesses`, `org.marmot.wn-agent.pi`, and
-`org.marmot.wn-agent.goose`). Harness services are also connector-specific
+`org.marmot.wn-agent.goose`; the connector-only install uses
+`wn-agent-standalone.service` / `org.marmot.wn-agent.standalone`). Harness services are also connector-specific
 (`wn-claude`, `wn-codex`, `wn-opencode`, `wn-pi`, and `wn-goose`). If you add a new
 production installer, choose names that can coexist with the existing
 integrations on the same login.
@@ -177,7 +181,12 @@ just pi-installer-test
 cargo test -p wn-goose
 just goose-dev-e2e-connector
 just goose-installer-test
+
+just wn-agent-installer-test
 ```
+
+Changing `scripts/install-terminal-harness-marmot.sh` changes every terminal
+harness installer and `install-wn-agent.sh`: run all six installer tests.
 
 When editing install examples in any integration README, `integrations/README.md`,
 or `release.md`, also run the doc gates. They count `install_verified` calls per

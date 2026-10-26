@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-10-09
+updated: 2026-10-22
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -149,6 +149,10 @@ The production retention and retry limits remain unchanged.
 
 Same-database first opens now serialize SQLCipher key selection, schema migration
 and handle publication; salts cannot be overwritten by competing initializers.
+App-derived SQLCipher keys now use raw-key presentation, with a durable-marker
+rekey migration for old passphrase-keyed databases, including external-signer
+accounts. See [key presentation and offline downgrade](../storage-format-v2.md#sqlcipher-key-presentation-and-kdf-work-factor-decision-record-mdk1791).
+Android/iOS app-level open-latency evidence and security release sign-off remain outstanding.
 Android publishes key material with a per-destination file lock and atomic rename,
 preserving API 26 support without hard links; iOS and macOS retain hard-link publication.
 Generated identities remain unavailable to background attention and managed workers
@@ -163,6 +167,9 @@ setup/onboarding changes can retry it. Aggregate reconciliation still reports pa
 
 MDK now exposes opt-in durable onboarding for imported identities, with per-step
 validation, repair proposals, explicit approval, and Swift/Kotlin/C bindings.
+Repair approval requires a completed freshness query from every onboarding
+source, including relays in the signed relay declaration and public indexers.
+An unavailable source blocks replacement even when another returns a record.
 It requires single-device acknowledgment before KeyPackage publication and offers
 advisory detection of packages that may belong to another installation.
 Account onboarding gates normal worker commands until required checks and

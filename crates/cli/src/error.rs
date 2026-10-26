@@ -4,7 +4,9 @@ use std::net::SocketAddr;
 
 use cgka_traits::error::EngineError;
 use marmot_account::AccountHomeError;
-use marmot_app::{AccountRelayListStatus, AppError, MissingKeyPackageReason, MissingRelayListKind};
+use marmot_app::{
+    AccountRelayListStatus, AppError, DirectoryError, MissingKeyPackageReason, MissingRelayListKind,
+};
 use serde_json::{Value, json};
 
 use crate::relay_lists_json;
@@ -191,6 +193,14 @@ pub(crate) enum WnError {
     },
     #[error("user search did not complete: {0}")]
     UserSearch(String),
+}
+
+/// Directory failures render as the `AppError` they convert to, so `--json`
+/// codes stay the same whichever layer reported them.
+impl From<DirectoryError> for WnError {
+    fn from(error: DirectoryError) -> Self {
+        Self::App(error.into())
+    }
 }
 
 pub(crate) fn wn_error_json(err: &WnError) -> Value {
@@ -772,6 +782,12 @@ fn app_error_json(err: &AppError) -> Value {
             "code": "missing_relay_lists",
             "message": err.to_string(),
             "missing": missing.iter().map(|k| k.token()).collect::<Vec<_>>(),
+        }),
+        // Terminal for this list: it holds more follows than MDK reads from
+        // one kind-3 event, so an edit could drop some. Nothing was published.
+        AppError::FollowListTooLarge => json!({
+            "code": "follow_list_too_large",
+            "message": err.to_string(),
         }),
         AppError::RelayDirectory(reason) => json!({
             "code": "relay_directory_failed",

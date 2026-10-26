@@ -10,11 +10,18 @@ import subprocess
 import tempfile
 import textwrap
 import tomllib
+import datetime as dt
+import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import nightly_release  # noqa: E402
+from check_install_example_sha256 import documented_release_version  # noqa: E402
 
 
 def workflow_step(filename: str, name: str) -> str:
@@ -107,12 +114,15 @@ class MergeGatePolicyTests(unittest.TestCase):
         passed = {"changes": {"result": "success"}, "rust-test": {"result": "success"}}
         skipped = {**passed, "rust-test": {"result": "skipped"}}
         failed = {**passed, "rust-test": {"result": "failure"}}
+        cancelled = {**passed, "rust-test": {"result": "cancelled"}}
         for event, mode, needs, expected in [
             ("pull_request", "precheck", skipped, True),
             ("pull_request", "precheck", failed, False),
+            ("pull_request", "precheck", cancelled, False),
             ("pull_request", "full", skipped, False),
             ("merge_group", "full", passed, True),
             ("merge_group", "full", skipped, False),
+            ("merge_group", "full", cancelled, False),
             ("merge_group", "precheck", skipped, False),
             ("merge_group", "", skipped, False),
             ("push", "warm", skipped, True),
@@ -143,7 +153,535 @@ class MergeGatePolicyTests(unittest.TestCase):
         jobs = set(re.findall(r"(?m)^  ([a-z0-9-]+):$", workflow.split("\njobs:\n", 1)[1]))
         required = workflow.split("\n  required-ci:\n", 1)[1].split("\n    needs:\n", 1)[1]
         needs = set(re.findall(r"(?m)^      - ([a-z0-9-]+)$", required.split("\n    runs-on:", 1)[0]))
-        self.assertEqual(needs, jobs - {"required-ci"})
+        # The fail-fast watcher waits for Required CI to appear, so it cannot be a need.
+        self.assertEqual(needs, jobs - {"required-ci", "merge-group-fail-fast"})
+
+    def test_only_the_merge_group_watcher_can_cancel_and_it_cannot_fail_the_run(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        watcher = workflow.split("\n  merge-group-fail-fast:\n", 1)[1].split("\n  required-ci:\n", 1)[0]
+        self.assertIn("    if: github.event_name == 'merge_group'\n", watcher)
+        self.assertIn("    continue-on-error: true\n    permissions:\n      actions: write\n      contents: read\n\n",
+                      watcher)
+        # The branch lookup must name this run's own group and commit.
+        self.assertIn("          HEAD_REF: ${{ github.ref }}\n          HEAD_SHA: ${{ github.sha }}\n", watcher)
+        # Build and test jobs run third-party code; none of them may cancel or dispatch runs.
+        self.assertEqual(len(re.findall(r"(?m)^ +actions: write$", workflow)), 1)
+        # A job-level continue-on-error reads as success in `needs` but as a failed job to the watcher.
+        self.assertEqual(len(re.findall(r"(?m)^ +continue-on-error:", workflow)), 1)
+        timeout = int(re.search(r"(?m)^    timeout-minutes: (\d+)$", watcher).group(1))
+        watch = int(re.search(r"deadline=\$\(\(SECONDS \+ (\d+) \* 60\)\)", watcher).group(1))
+        self.assertLess(watch, timeout)
+        # Required CI must still run, and fail, once the watcher cancels the run.
+        self.assertIn("\n  required-ci:\n    name: Required CI\n", workflow)
+        required = workflow.split("\n  required-ci:\n", 1)[1].split("\n    needs:\n", 1)[0]
+        self.assertRegex(required, r"(?m)^    if: always\(\)$")
+
+    def test_merge_group_watcher_cancels_a_failed_or_dropped_group(self):
+        script = workflow_step("ci.yml", "Cancel the run when a job fails")
+        # gh applies the trailing --jq filter itself; the fake runs it with jq.
+        # Request n to an endpoint reads its response n, and later requests
+        # repeat its last response.
+        fakes = textwrap.dedent("""\
+            gh() {
+              if [[ "$1" == api ]]; then
+                echo "gh ${*:1:$#-1}" >> "$STATE/calls"
+                local kind=jobs
+                [[ "$*" != *matching-refs* ]] || kind=refs
+                local count=$(( $(cat "$STATE/$kind") + 1 ))
+                echo "$count" > "$STATE/$kind"
+                local last=$(ls "$STATE/$kind".*.json | wc -l)
+                local response="$STATE/$kind.$(( count < last ? count : last )).json"
+                [[ "$(cat "$response")" != error ]] || return 1
+                jq -r "${@: -1}" "$response"
+              else
+                echo "gh $*" >> "$STATE/calls"
+                local cancels=$(( $(cat "$STATE/cancels") + 1 ))
+                echo "$cancels" > "$STATE/cancels"
+                (( cancels > REFUSED_CANCELS ))
+              fi
+            }
+            sleep() { echo "sleep $1" >> "$STATE/calls"; SECONDS=$((SECONDS + $1)); }
+        """)
+
+        def job(name, status, conclusion=None):
+            return {"name": name, "status": status, "conclusion": conclusion}
+
+        group = "refs/heads/gh-readonly-queue/master/pr-7-" + "b" * 40
+        commit = "c" * 40
+
+        def branch(sha, ref=group):
+            return [{"ref": ref, "object": {"type": "commit", "sha": sha}}]
+
+        live, gone, reused = branch(commit), [], branch("d" * 40)
+        running = [job("Classify CI changes", "completed", "success"),
+                   job("Rust tests (1/7)", "in_progress"), job("Rust WASM check", "completed", "skipped")]
+        failed = running + [job("Relay runtime tests (2/2)", "completed", "failure")]
+        finished = [job("Rust tests (1/7)", "completed", "success"), job("Required CI", "queued")]
+        poll = "gh api --paginate repos/o/r/actions/runs/42/jobs?per_page=100 --jq"
+        look = f"gh api repos/o/r/git/matching-refs/{group.removeprefix('refs/')} --jq"
+        wait, cancel = "sleep 60", "gh run cancel 42"
+        for name, jobs, refs, refused, expected, env in [
+            ("failure cancels at once", [failed], [live], 0, [poll, cancel], {}),
+            ("timeout or cancellation counts as a failure",
+             [running + [job("Windows filesystem contracts", "completed", "cancelled")]], [live], 0,
+             [poll, cancel], {}),
+            ("success, skips and running jobs on a live branch keep watching", [running, finished], [live], 0,
+             [poll, look, wait, poll], {}),
+            ("Required CI means nothing is left to stop",
+             [finished + [job("Rust tests (2/7)", "completed", "failure")]], [gone], 0, [poll], {}),
+            ("failed request is retried", ["error", failed], [live], 0, [poll, wait, poll, cancel], {}),
+            ("refused cancel is retried", [failed], [live], 1, [poll, cancel, wait, poll, cancel], {}),
+            ("watching stops at the deadline", [running], [live], 0, [poll, look, wait] * 150, {}),
+            # The queue deleted the group's branch, or gave its name to a later group on the same base.
+            ("a branch gone for two lookups cancels", [running], [gone], 0,
+             [poll, look, wait, poll, look, cancel], {}),
+            ("a branch reused by another group cancels", [running], [reused], 0,
+             [poll, look, wait, poll, look, cancel], {}),
+            ("another branch sharing the prefix is not this group", [running],
+             [branch(commit, group + "-other")], 0, [poll, look, wait, poll, look, cancel], {}),
+            ("refused cancel of a dropped group is retried", [running], [gone], 1,
+             [poll, look, wait, poll, look, cancel, wait, poll, look, cancel], {}),
+            # A passed group's branch is deleted after Required CI appears, which wins.
+            ("a passed group's deleted branch never cancels", [running, finished], [gone], 0,
+             [poll, look, wait, poll], {}),
+            ("one missing lookup is not enough", [running, running, running, finished], [gone, live, gone], 0,
+             [poll, look, wait, poll, look, wait, poll, look, wait, poll], {}),
+            ("a failed lookup proves nothing", [running, running, running, finished], [gone, "error", gone], 0,
+             [poll, look, wait, poll, look, wait, poll, look, wait, poll], {}),
+            ("a failed jobs request skips the lookup", [running, "error", finished], [gone], 0,
+             [poll, look, wait, poll, wait, poll], {}),
+            ("no group branch, no lookups", [running, finished], [gone], 0, [poll, wait, poll],
+             {"HEAD_REF": ""}),
+            ("a tag is not a group branch", [running, finished], [gone], 0, [poll, wait, poll],
+             {"HEAD_REF": "refs/tags/v1"}),
+            ("a malformed commit disables lookups", [running, finished], [gone], 0, [poll, wait, poll],
+             {"HEAD_SHA": "HEAD"}),
+        ]:
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                state = Path(tmp)
+                (state / "calls").write_text("")
+                for counter in ("jobs", "refs", "cancels"):
+                    (state / counter).write_text("0")
+                for kind, responses in (("jobs", [{"jobs": r} if r != "error" else r for r in jobs]),
+                                        ("refs", refs)):
+                    for index, response in enumerate(responses, 1):
+                        body = response if response == "error" else json.dumps(response)
+                        (state / f"{kind}.{index}.json").write_text(body)
+                # GitHub runs `run:` steps with `bash -e`.
+                result = subprocess.run(["bash", "-e", "-c", fakes + script], capture_output=True, text=True,
+                                        timeout=60, env={**os.environ, "STATE": tmp, "GH_REPO": "o/r",
+                                                         "RUN_ID": "42", "HEAD_REF": group, "HEAD_SHA": commit,
+                                                         "REFUSED_CANCELS": str(refused), **env})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((state / "calls").read_text().splitlines(), expected)
+
+def semver_key(version: str):
+    """Semver 2.0 precedence key for X.Y.Z[-pre] (no build metadata)."""
+    core, _, pre = version.partition("-")
+    numbers = tuple(int(part) for part in core.split("."))
+    if not pre:
+        return numbers, (1,)
+    fields = tuple((0, int(f), "") if f.isdigit() else (1, 0, f) for f in pre.split("."))
+    return numbers, (0, fields)
+
+
+class NightlyReleasePolicyTests(unittest.TestCase):
+    DAY = dt.date(2026, 10, 20)
+
+    def test_nightly_base_comes_only_from_a_dev_workspace_version(self):
+        self.assertEqual(nightly_release.nightly_base_version("0.14.0-dev"), "0.14.0")
+        for version in ("0.14.0", "0.14.0-rc.1", "0.14.0-dev.1", "v0.14.0-dev"):
+            with self.subTest(version=version):
+                self.assertIsNone(nightly_release.nightly_base_version(version))
+
+    def test_names_are_dated_and_take_a_counter_when_any_track_used_the_day(self):
+        choose = nightly_release.choose_nightly_version
+        self.assertEqual(choose("0.14.0", self.DAY, []), "0.14.0-nightly.20261020")
+        self.assertEqual(nightly_release.nightly_tags("0.14.0-nightly.20261020"), {
+            "marmotkit": "marmotkit-v0.14.0-nightly.20261020",
+            "marmotc": "marmotc-v0.14.0-nightly.20261020",
+            "wn-agent": "wn-agent-v0.14.0-nightly.20261020",
+        })
+        taken = ["marmotc-v0.14.0-nightly.20261020"]
+        self.assertEqual(choose("0.14.0", self.DAY, taken), "0.14.0-nightly.20261020.1")
+        taken += ["wn-agent-v0.14.0-nightly.20261020.1"]
+        self.assertEqual(choose("0.14.0", self.DAY, taken), "0.14.0-nightly.20261020.2")
+
+    def test_nightly_versions_sort_between_releases_by_date_and_counter(self):
+        ordered = ["0.13.0", "0.14.0-nightly.20261019", "0.14.0-nightly.20261020",
+                   "0.14.0-nightly.20261020.1", "0.14.0-nightly.20261020.2",
+                   "0.14.0-nightly.20261021", "0.14.0", "0.15.0-nightly.20261102"]
+        self.assertEqual(sorted(reversed(ordered), key=semver_key), ordered)
+
+    def test_source_is_the_newest_green_commit_and_never_older_than_the_last_nightly(self):
+        shas = ["d", "c", "b", "a"]
+        select = nightly_release.select_source
+        self.assertEqual(select(shas, None, lambda sha: sha in {"c", "a"}), "c")
+        # Unchanged master: the previous nightly's source is the answer, so the run skips.
+        self.assertEqual(select(shas, "b", lambda sha: False), "b")
+        # A green commit older than the previous nightly is never chosen.
+        self.assertEqual(select(shas, "c", lambda sha: sha == "a"), "c")
+        self.assertIsNone(select(shas, None, lambda sha: False))
+
+    def test_retention_deletes_only_expired_unprotected_nightly_tags(self):
+        tags = [
+            "marmotkit-v0.14.0-nightly.20260919", "marmotc-v0.14.0-nightly.20260919.1",
+            "wn-agent-v0.13.0-nightly.20260901", "marmotkit-v0.14.0-nightly.20260920",
+            "marmotkit-v0.14.0-nightly.20261019", "marmotkit-v0.14.0-nightly.20260801",
+            # Formal, snapshot, other pre-releases and malformed names are never touched.
+            "v0.13.0", "marmotkit-v0.13.0", "marmotc-v0.12.0", "wn-agent-v0.13.0",
+            "marmotkit-v0.14.0-rc.1", "marmotkit-snapshot-" + "a" * 40,
+            "v0.14.0-nightly.20200101", "marmotkit-v0.14.0-nightly.20261399",
+            "marmotkit-v0.14.0-nightly.2020010", "marmotkit-v0.14.0-nightly.20200101-x",
+        ]
+        expired = nightly_release.expired_nightly_tags(
+            tags, self.DAY, protected=["marmotkit-v0.14.0-nightly.20260801"]
+        )
+        self.assertEqual(expired, [
+            "marmotc-v0.14.0-nightly.20260919.1",
+            "marmotkit-v0.14.0-nightly.20260919",
+            "wn-agent-v0.13.0-nightly.20260901",
+        ])
+
+    def test_latest_json_names_each_track_asset_with_its_url_and_checksum(self):
+        version = "0.14.0-nightly.20261020"
+        releases = {
+            prefix: {"assets": [{"name": f"{prefix}.zip", "size": 3, "digest": "sha256:" + "b" * 64}]}
+            for prefix in nightly_release.TRACK_PREFIXES
+        }
+        document = nightly_release.latest_document(version, "a" * 40, releases, "o/r", "https://run")
+        self.assertEqual((document["version"], document["source_sha"], document["date"]),
+                         (version, "a" * 40, "2026-10-20"))
+        self.assertEqual(document["tracks"]["marmotc"], {
+            "tag": "marmotc-v" + version,
+            "release_url": "https://github.com/o/r/releases/tag/marmotc-v" + version,
+            "assets": [{"name": "marmotc.zip", "sha256": "b" * 64, "size": 3,
+                        "url": f"https://github.com/o/r/releases/download/marmotc-v{version}/marmotc.zip"}],
+        })
+        releases["wn-agent"]["assets"][0]["digest"] = None
+        with self.assertRaises(nightly_release.NightlyError):
+            nightly_release.latest_document(version, "a" * 40, releases, "o/r", "https://run")
+
+    def test_only_release_and_snapshot_runs_hold_the_lane(self):
+        busy = nightly_release.busy_release_runs({
+            "bindings.yaml": [{"id": 1, "status": "in_progress", "event": "workflow_dispatch"},
+                              {"id": 2, "status": "completed", "event": "push"}],
+            "c-bindings.yml": [{"id": 3, "status": "queued", "event": "push"}],
+            "wn-agent-binaries.yml": [
+                {"id": 4, "status": "in_progress", "event": "push", "head_branch": "master"},
+                {"id": 5, "status": "waiting", "event": "push", "head_branch": "wn-agent-v0.14.0"},
+                {"id": 6, "status": "in_progress", "event": "pull_request", "head_branch": "wn-agent-v-ish"},
+            ],
+        })
+        self.assertEqual([run["id"] for run in busy], [1, 3, 5])
+
+    def test_required_ci_is_read_from_the_merge_queue_run_for_the_master_commit(self):
+        # Shape of run 39288024598: the merge-queue run that produced master commit 3cafb038
+        # reports that same commit as head_sha, on its gh-readonly-queue branch.
+        master = "3cafb03883832fb27f4fee178e9568be53acb1b8"
+        gh = nightly_release.GitHub("o/r", "token")
+        runs = {"workflow_runs": [{"id": 39288024598, "head_sha": master, "conclusion": "success",
+                                   "event": "merge_group",
+                                   "head_branch": "gh-readonly-queue/master/pr-2469-3188510989374e7b588717fc3d077c257f6a55ce"}]}
+        jobs = [{"name": "Rust tests", "conclusion": "success"}, {"name": "Required CI", "conclusion": "success"}]
+        with unittest.mock.patch.object(gh, "get", return_value=runs) as get, \
+                unittest.mock.patch.object(gh, "paginate", return_value=jobs):
+            self.assertTrue(gh.required_ci_passed(master))
+        self.assertIn(f"event=merge_group&head_sha={master}&status=success", get.call_args.args[0])
+        for wrong_jobs in ([{"name": "Required CI", "conclusion": "failure"}], [{"name": "Rust tests", "conclusion": "success"}]):
+            with self.subTest(jobs=wrong_jobs), unittest.mock.patch.object(gh, "get", return_value=runs), \
+                    unittest.mock.patch.object(gh, "paginate", return_value=wrong_jobs):
+                self.assertFalse(gh.required_ci_passed(master))
+
+    def test_nightly_jobs_require_their_dependencies_and_own_concurrency(self):
+        workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
+        self.assertIn("    if: success() && !inputs.build_only && !inputs.dry_run\n", workflow)
+        self.assertEqual(workflow.count("    if: success() && needs.lane.outputs.lane_free == 'true'\n"), 3)
+        bindings = (ROOT / ".github/workflows/bindings.yaml").read_text()
+        # A nightly must not share a same-SHA snapshot's group, which waits for the nightly.
+        self.assertIn("  group: marmotkit-bindings-${{ inputs.nightly_version || inputs.source_sha || github.ref }}-",
+                      bindings)
+
+    def test_a_failed_scheduled_nightly_reports_to_one_open_issue(self):
+        workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
+        jobs = re.findall(r"^  ([a-z][a-z-]*):\n", workflow.split("\njobs:\n", 1)[1], re.MULTILINE)
+        report = workflow.split("\n  report:\n", 1)[1].split("\n    steps:\n", 1)[0]
+        # Skipped nights exit 0, so only real failures in any other job report. A job timeout
+        # leaves that job cancelled rather than failed; a cancelled run reports nothing.
+        self.assertIn(f"    needs: [{', '.join(job for job in jobs if job != 'report')}]\n", report)
+        self.assertIn("    if: github.event_name == 'schedule' && !cancelled() && "
+                      "(failure() || contains(needs.*.result, 'cancelled'))\n", report)
+        self.assertIn("    permissions:\n      issues: write\n", report)
+        self.assertEqual(workflow.count("issues: write"), 1)
+
+        script = workflow_step("nightly-releases.yml", "Open or update the nightly failure issue")
+        fake_gh = textwrap.dedent("""\
+            gh() {
+              if [[ "$1 $2" == "issue list" ]]; then
+                while [[ "$1" != --jq ]]; do shift; done
+                jq -r "$2" <<<"$ISSUES"
+                return
+              fi
+              printf '%s\\n' "$*" >>"$LOG"
+            }
+        """)
+        needs = json.dumps({"plan": {"result": "success"}, "marmotc": {"result": "failure"},
+                            "wn-agent": {"result": "cancelled"}, "publish": {"result": "skipped"},
+                            "retention": {"result": "failure"}})
+        body = ("--body The scheduled nightly failed for abc123 "
+                "(failed jobs: marmotc, wn-agent (cancelled), retention). Run: https://run")
+        for issues, expected in [
+            ([{"number": 9, "title": "Nightly release failed twice"}],
+             f"issue create --repo o/r --title Nightly release failed {body}"),
+            ([{"number": 9, "title": "Nightly release failed twice"}, {"number": 12, "title": "Nightly release failed"}],
+             f"issue comment 12 --repo o/r {body}"),
+        ]:
+            with self.subTest(issues=issues), tempfile.TemporaryDirectory() as tmp:
+                log = Path(tmp) / "gh.log"
+                subprocess.run(
+                    ["bash", "-c", fake_gh + script], check=True, timeout=10,
+                    env={**os.environ, "ISSUES": json.dumps(issues), "LOG": str(log), "NEEDS": needs,
+                         "REPO": "o/r", "RUN_URL": "https://run", "SOURCE_SHA": "abc123"},
+                )
+                self.assertEqual(log.read_text(), expected + "\n")
+
+    def test_tag_pushed_release_workflows_ignore_nightly_tags(self):
+        for workflow, prefix in [("bindings.yaml", "marmotkit"), ("c-bindings.yml", "marmotc"),
+                                 ("wn-agent-binaries.yml", "wn-agent")]:
+            with self.subTest(workflow=workflow):
+                text = (ROOT / ".github/workflows" / workflow).read_text()
+                self.assertIn(f'      - "!{prefix}-v*-nightly.*"\n', text)
+                self.assertIn("  workflow_call:\n", text)
+                self.assertIn("      nightly_version:\n", text)
+                # Tag pushes and dispatches have no nightly_version input at all (null), so
+                # conditions must test truthiness rather than compare with ''.
+                self.assertIsNone(re.search(r"inputs\.nightly_version\s*[!=]=", text))
+                self.assertIn("inputs.nightly_version }}", text)
+
+    def test_nightlies_are_scheduled_pre_releases_that_never_become_latest(self):
+        workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
+        self.assertIn('    - cron: "17 0 * * *"\n', workflow)
+        self.assertIn("  group: nightly-releases\n", workflow)
+        self.assertNotIn("git push", workflow)
+        script = (ROOT / "scripts/nightly_release.py").read_text()
+        self.assertEqual(script.count('"make_latest": "false"'), 2)
+        self.assertNotIn('"make_latest": "true"', script)
+        self.assertEqual(nightly_release.RETENTION_DAYS, 30)
+        bindings = (ROOT / ".github/workflows/bindings.yaml").read_text()
+        self.assertIn(
+            '          if [[ "$IS_NIGHTLY" == "true" ]]; then\n'
+            '            title="v$version - MarmotKit"\n'
+            '            release_flags=(--prerelease --latest=false --target "$SOURCE_SHA")\n',
+            bindings,
+        )
+
+    def test_install_guidance_never_resolves_to_a_nightly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            notes = Path(tmp) / "docs/release"
+            notes.mkdir(parents=True)
+            for name in ("0.13.0.md", "0.14.0-nightly.20261020.md", "wn-homebrew.md"):
+                (notes / name).write_text("notes\n")
+            self.assertEqual(documented_release_version(Path(tmp), "0.14.0-dev"), "0.13.0")
+        quickstart = (ROOT / "integrations/README.md").read_text()
+        installer_pattern = re.search(r"grep -Eq '(\^https://github\[\.\]com/marmot-protocol/mdk/[^']+)'",
+                                      quickstart).group(1)
+        resolver = re.search(r'match = re\.fullmatch\(r"([^"]+)", tag\)', quickstart).group(1)
+        nightly = "wn-agent-v0.14.0-nightly.20261020"
+        url = f"https://github.com/marmot-protocol/mdk/releases/download/{nightly}/install-hermes-marmot.sh"
+        self.assertIsNone(re.search(installer_pattern, url))
+        self.assertIsNotNone(re.search(installer_pattern, url.replace(nightly, "wn-agent-v0.13.0")))
+        self.assertIsNone(re.fullmatch(resolver, nightly))
+        self.assertIsNotNone(re.fullmatch(resolver, "wn-agent-v0.13.0"))
+
+    def test_binary_bundles_take_the_nightly_version_and_source_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "src"
+            root.mkdir()
+            (root / "Cargo.toml").write_text('[workspace.package]\nversion = "0.14.0-dev"\n')
+            (root / "Cargo.lock").write_text("# lock\n")
+            git = ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@example.com",
+                   "-c", "commit.gpgsign=false"]
+            subprocess.run([*git, "init", "-q"], check=True)
+            subprocess.run([*git, "add", "."], check=True)
+            subprocess.run([*git, "commit", "-qm", "source"], check=True)
+            source_sha = subprocess.run([*git, "rev-parse", "HEAD"], check=True,
+                                        capture_output=True, text=True).stdout.strip()
+            binary = root / "target/x86_64-unknown-linux-gnu/release/wn-agent"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\n")
+            env = {**os.environ, "RUNNER_TEMP": tmp, "GITHUB_SHA": "f" * 40, "GITHUB_REF_TYPE": "branch",
+                   "RELEASE_SOURCE_SHA": source_sha, "NIGHTLY_VERSION": "0.14.0-nightly.20261020"}
+            command = ["bash", str(ROOT / "scripts/package-binary-bundle.sh"), "wn-agent", "linux-x86_64",
+                       "x86_64-unknown-linux-gnu"]
+            subprocess.run(command, cwd=root, env=env, check=True, capture_output=True)
+            asset = root / "dist/wn-agent-linux-x86_64/wn-agent-linux-x86_64-0.14.0-nightly.20261020.tar.gz"
+            manifest = json.loads(subprocess.run(
+                ["tar", "-xzOf", str(asset), "wn-agent-linux-x86_64/manifest.json"],
+                check=True, capture_output=True).stdout)
+            self.assertEqual(
+                (manifest["artifact_version"], manifest["release_tag"], manifest["source_sha"]),
+                ("0.14.0-nightly.20261020", "wn-agent-v0.14.0-nightly.20261020", source_sha))
+            for overrides in ({"NIGHTLY_VERSION": "0.15.0-nightly.20261020"},
+                              {"NIGHTLY_VERSION": "0.14.0-nightly.2026102"},
+                              {"RELEASE_SOURCE_SHA": "e" * 40}):
+                with self.subTest(overrides=overrides):
+                    result = subprocess.run(command, cwd=root, env={**env, **overrides}, capture_output=True)
+                    self.assertNotEqual(result.returncode, 0)
+
+
+class FakeNightlyGitHub:
+    """In-memory stand-in for the GitHub calls that publish_nightly makes."""
+
+    SHA = "a" * 40
+
+    def __init__(self, version: str, *, verified: bool = True):
+        self.repository = "o/r"
+        self.verified = verified
+        self.fail_patch: set[str] = set()
+        self.tags: dict[str, str] = {}
+        self.meta_head: str | None = None
+        self.meta: dict | None = None
+        self.commits: dict[str, dict] = {}
+        self.blobs: dict[str, str] = {}
+        self.releases = {}
+        for index, (prefix, title) in enumerate(nightly_release.TRACKS):
+            tag = f"{prefix}-v{version}"
+            self.releases[tag] = {
+                "id": index, "tag_name": tag, "name": f"v{version} - {title}", "draft": True,
+                "prerelease": True, "target_commitish": self.SHA, "immutable": False,
+                "assets": [{"name": f"{prefix}.zip", "size": 1, "digest": "sha256:" + "c" * 64}],
+            }
+
+    def repo(self, suffix):
+        return f"repos/o/r/{suffix}"
+
+    def release_for_tag(self, tag):
+        release = self.releases.get(tag)
+        return dict(release) if release else None
+
+    def tag_commit(self, tag):
+        return self.tags.get(tag)
+
+    def read_latest(self):
+        return self.meta
+
+    def get(self, path, *, allow_404=False):
+        suffix = path.removeprefix("repos/o/r/")
+        if suffix.startswith("releases/"):
+            release = next(r for r in self.releases.values() if r["id"] == int(suffix.split("/")[1]))
+            return dict(release)
+        if suffix == f"git/ref/heads/{nightly_release.META_BRANCH}":
+            return {"object": {"sha": self.meta_head}} if self.meta_head else None
+        raise AssertionError(path)
+
+    def request(self, method, path, body=None, **_):
+        suffix = path.removeprefix("repos/o/r/")
+        if method == "PATCH" and suffix.startswith("releases/"):
+            release = next(r for r in self.releases.values() if r["id"] == int(suffix.split("/")[1]))
+            if release["tag_name"] in self.fail_patch:
+                self.fail_patch.discard(release["tag_name"])
+                raise nightly_release.NightlyError(f"PATCH {path} failed with HTTP 502")
+            assert body == {"draft": False, "prerelease": True, "make_latest": "false"}
+            release.update(draft=False, immutable=True)
+            self.tags[release["tag_name"]] = release["target_commitish"]
+            return None, ""
+        if suffix == "git/blobs":
+            sha = f"blob{len(self.blobs)}"
+            self.blobs[sha] = body["content"]
+            return {"sha": sha}, ""
+        if suffix == "git/trees":
+            assert [entry["path"] for entry in body["tree"]] == [nightly_release.META_FILE]
+            return {"sha": "tree-" + body["tree"][0]["sha"]}, ""
+        if suffix == "git/commits":
+            assert "author" not in body and "committer" not in body
+            sha = f"commit{len(self.commits)}"
+            self.commits[sha] = body
+            return {"sha": sha, "verification": {"verified": self.verified, "reason": "valid"}}, ""
+        if (method, suffix) in (("PATCH", f"git/refs/heads/{nightly_release.META_BRANCH}"), ("POST", "git/refs")):
+            assert body.get("force") in (None, False)
+            self.meta_head = body["sha"]
+            tree = self.commits[body["sha"]]["tree"]
+            self.meta = json.loads(self.blobs[tree.removeprefix("tree-")])
+            return None, ""
+        raise AssertionError((method, path))
+
+
+class NightlyPublishTests(unittest.TestCase):
+    VERSION = "0.14.0-nightly.20261020"
+
+    def publish(self, gh):
+        with unittest.mock.patch.object(nightly_release.time, "sleep"):
+            return nightly_release.publish_nightly(gh, self.VERSION, FakeNightlyGitHub.SHA, "https://run")
+
+    def test_publishes_all_three_tracks_then_latest_json_on_an_orphan_branch(self):
+        gh = FakeNightlyGitHub(self.VERSION)
+        self.publish(gh)
+        self.assertTrue(all(not r["draft"] and r["immutable"] for r in gh.releases.values()))
+        self.assertEqual(gh.meta["version"], self.VERSION)
+        self.assertEqual(sorted(gh.meta["tracks"]), ["marmotc", "marmotkit", "wn-agent"])
+        self.assertEqual(gh.commits[gh.meta_head]["parents"], [])
+
+    def test_a_missing_or_wrong_track_publishes_nothing(self):
+        for breakage in ("missing", "target", "title"):
+            with self.subTest(breakage=breakage):
+                gh = FakeNightlyGitHub(self.VERSION)
+                tag = "wn-agent-v" + self.VERSION
+                if breakage == "missing":
+                    del gh.releases[tag]
+                elif breakage == "target":
+                    gh.releases[tag]["target_commitish"] = "b" * 40
+                else:
+                    gh.releases[tag]["name"] = "v0.14.0 - wn-agent"
+                with self.assertRaises(nightly_release.NightlyError):
+                    self.publish(gh)
+                self.assertTrue(all(r["draft"] for r in gh.releases.values() if r["tag_name"] != tag))
+                self.assertIsNone(gh.meta)
+
+    def test_a_failed_publication_resumes_on_rerun_without_moving_latest_early(self):
+        gh = FakeNightlyGitHub(self.VERSION)
+        gh.meta = {"version": "0.14.0-nightly.20261019"}
+        gh.fail_patch.add("marmotc-v" + self.VERSION)
+        with self.assertRaisesRegex(nightly_release.NightlyError, "Published so far: marmotkit-v"):
+            self.publish(gh)
+        self.assertEqual(gh.meta, {"version": "0.14.0-nightly.20261019"})
+        self.publish(gh)
+        self.assertTrue(all(not r["draft"] for r in gh.releases.values()))
+        self.assertEqual(gh.meta["version"], self.VERSION)
+        # A further re-run finds everything done and writes nothing.
+        commits = len(gh.commits)
+        self.assertIsNone(self.publish(gh))
+        self.assertEqual(len(gh.commits), commits)
+
+    def test_an_unverified_metadata_commit_never_moves_the_branch(self):
+        gh = FakeNightlyGitHub(self.VERSION, verified=False)
+        with self.assertRaisesRegex(nightly_release.NightlyError, "not verified"):
+            self.publish(gh)
+        self.assertIsNone(gh.meta_head)
+        gh.verified = True
+        self.publish(gh)
+        self.assertEqual(gh.meta["source_sha"], FakeNightlyGitHub.SHA)
+
+    def test_releases_and_snapshots_wait_only_for_a_nightly_past_its_lane_wait(self):
+        lane = nightly_release.LANE_JOB
+        step = nightly_release.LANE_STEP
+        building = nightly_release.nightly_is_building
+        self.assertFalse(building([{"name": "Plan nightly", "conclusion": "success"}]))
+        self.assertFalse(building([{"name": lane, "conclusion": None,
+                                    "steps": [{"name": step, "status": "in_progress", "conclusion": None}]}]))
+        self.assertTrue(building([{"name": lane, "conclusion": None,
+                                   "steps": [{"name": step, "status": "completed", "conclusion": "success"}]}]))
+        self.assertTrue(building([{"name": lane, "conclusion": "success"}]))
+        workflow = (ROOT / ".github/workflows/nightly-releases.yml").read_text()
+        self.assertIn(f"    name: {lane}\n", workflow)
+        self.assertIn(f"      - name: {step}\n", workflow)
+
+    def test_binding_jobs_never_inherit_a_skipped_ancestor(self):
+        # A skipped job skips every job below it that uses the implicit success(), so the
+        # lane job that nightly and build-only runs do not need must still run.
+        bindings = (ROOT / ".github/workflows/bindings.yaml").read_text()
+        lane = bindings.split("\n  release-lane:\n", 1)[1].split("\n    steps:\n", 1)[0]
+        self.assertNotIn("\n    if:", lane)
+        self.assertIn("\n    needs: release-lane\n", bindings.split("\n  metadata:\n", 1)[1].split("\n    steps:", 1)[0])
 
 
 if __name__ == "__main__":

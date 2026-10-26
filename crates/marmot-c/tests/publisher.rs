@@ -56,6 +56,7 @@ fn publisher_preflights_outputs() {
                 0,
                 u32::MAX,
                 ptr::null(),
+                marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
                 &mut client
             ),
             MarmotStatus::InvalidArgument
@@ -100,6 +101,7 @@ fn publisher_finishes_and_cancels() {
             1,
             MarmotRelayPolicy::AllowLoopback as u32,
             ptr::null(),
+            marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
             &mut client,
         ));
         check(marmot_client_start(client));

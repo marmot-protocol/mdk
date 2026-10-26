@@ -13,7 +13,10 @@ fun main() {
             MediaAttachmentOutcomeFfi.Rejected(7u, MediaAttachmentRejectionFfi(MediaAttachmentRejectionKindFfi.UNSUPPORTED_FORMAT, "unsupported")))
         check(FfiConverterTypeAttachmentEntryFfi.lift(FfiConverterTypeAttachmentEntryFfi.lower(entry)) == entry)
     }
-    val options = MarmotOptions(attachmentAcquisitionMode = AttachmentAcquisitionModeFfi.HOST_MANAGED)
+    val options = MarmotOptions(
+        attachmentAcquisitionMode = AttachmentAcquisitionModeFfi.HOST_MANAGED,
+        deployment = marmotDeploymentNeutral(),
+    )
     check(FfiConverterTypeMarmotOptions.lift(FfiConverterTypeMarmotOptions.lower(options)) == options)
     val permission = AttachmentAutomaticPermissionFfi(false, true, false, true)
     check(FfiConverterTypeAttachmentAutomaticPermissionFfi.lift(FfiConverterTypeAttachmentAutomaticPermissionFfi.lower(permission)) == permission)

@@ -145,8 +145,11 @@ int main(int argc, char **argv) {
 
     /* ---- argument validation + NULL-free discipline (no client) ------- */
     MarmotClient *client = NULL;
-    MarmotStatus st = marmot_client_new(NULL, NULL, 0, &client);
-    check(st == MARMOT_STATUS_NULL_POINTER, "NULL root_path rejected");
+    MarmotDeployment *deployment = NULL;
+    check(marmot_deployment_white_noise(&deployment) == MARMOT_STATUS_OK, "White Noise deployment");
+    /* A live deployment, so the NULL root is what gets rejected. */
+    MarmotStatus st = marmot_client_new(NULL, NULL, 0, deployment, &client);
+    check(st == MARMOT_STATUS_NULL_POINTER && client == NULL, "NULL root_path rejected");
 
     marmot_client_free(NULL);
     marmot_string_free(NULL);
@@ -192,7 +195,10 @@ int main(int argc, char **argv) {
 
     /* ---- construct + lifecycle ---------------------------------------- */
     const char *relays[] = {"wss://relay.example.org"};
-    st = marmot_client_new(home, relays, 1, &client);
+    st = marmot_client_new(home, relays, 1, NULL, &client);
+    check(st == MARMOT_STATUS_NULL_POINTER && client == NULL, "NULL deployment rejected before opening");
+    st = marmot_client_new(home, relays, 1, deployment, &client);
+    marmot_deployment_free(deployment);
     if (st == MARMOT_STATUS_KEYSTORE_UNAVAILABLE) {
         /* No platform keychain (headless): a documented limitation. */
         print_last_error("client_new");

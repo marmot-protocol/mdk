@@ -1,7 +1,7 @@
 ---
 title: "MDK Architecture Review (2026-10)"
 created: 2026-10-15
-updated: 2026-10-17
+updated: 2026-10-26
 tags: [marmot, architecture, review]
 status: in-progress
 ---
@@ -58,14 +58,15 @@ work should target groups within one account, not parallelism across accounts.
 
 ## Plan
 
-Progress on the review, the structural plan and the fixes it produced is tracked in
-[#2360](https://github.com/marmot-protocol/mdk/issues/2360).
+The review's progress, the order of the extraction steps and the fixes the review produced are tracked in
+[#2360](https://github.com/marmot-protocol/mdk/issues/2360). Each step's plan and PR checklist is its own tracking issue,
+linked from there.
 
 | Pass | Output | Status |
 | --- | --- | --- |
 | 0. System map | [`00-system-map.md`](00-system-map.md) plus the `map-*.md` pages it links | Done (#2325) |
-| 1. System reviews | One page per system, A to H below | B [`b-runtime-concurrency.md`](b-runtime-concurrency.md) and E [`e-transport.md`](e-transport.md) done (#2325). The other systems are covered by extraction briefs as their steps come up. |
-| 2. Synthesis | Ranked findings and an evolve/refactor/rebuild posture per system | Structural part drafted: [`core-structure.md`](core-structure.md). Extraction briefs: [relay plane](brief-relay-plane.md), [storage boundaries](brief-storage-boundaries.md), [host configuration](brief-host-configuration.md) |
+| 1. System reviews | One page per system, A to H below | B [`b-runtime-concurrency.md`](b-runtime-concurrency.md) and E [`e-transport.md`](e-transport.md) done (#2325). The other systems are covered by each extraction step's plan as the step comes up. |
+| 2. Synthesis | Ranked findings and an evolve/refactor/rebuild posture per system | Structural part drafted: [`core-structure.md`](core-structure.md). Each extraction step's plan is a tracking issue linked from #2360 |
 
 Pass 1 systems:
 

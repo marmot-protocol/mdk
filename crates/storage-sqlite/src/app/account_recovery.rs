@@ -10,6 +10,8 @@ mod loss;
 mod notice;
 mod observe;
 mod plan;
+#[cfg(test)]
+mod replay_tests;
 mod stall;
 pub use loss::{RecoveryLossCause, RecoveryLossSnapshot, RecoveryLossWatermark};
 pub use notice::ParkedRecoveryObligation;
@@ -18,8 +20,8 @@ pub use observe::{
 };
 pub use plan::{
     RECOVERY_PARK_AFTER_QUIET_PASSES, RecoveryEligibility, RecoveryEndpointCheckpoint,
-    RecoveryPassProgress, RecoveryScopeCheckpoint, RecoveryScopeOutcome, RecoveryScopePlan,
-    RecoveryScopeToken, StoredRecoveryScope,
+    RecoveryPassProgress, RecoveryReplayPlacement, RecoveryScopeCheckpoint, RecoveryScopeOutcome,
+    RecoveryScopePlan, RecoveryScopeToken, StoredRecoveryScope,
 };
 pub use stall::QualifiedRecoveryStallSample;
 
@@ -659,7 +661,12 @@ impl SqliteAppStorage {
             if attempt_serial == 0
                 || prior.attempt_serial != attempt_serial
                 || prior.ordinal <= 1
-                || !selected_fence_matches(&revision_fence(&conn)?, expected)
+                || expected.obligations.is_empty()
+                || !comparison::completed_work_fence_matches(
+                    &conn,
+                    &revision_fence(&conn)?,
+                    expected,
+                )?
                 || !plan::no_unimported_loss(&conn)?
             {
                 return Ok(false);

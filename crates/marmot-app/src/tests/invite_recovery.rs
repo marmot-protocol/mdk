@@ -80,8 +80,15 @@ async fn invite_recovery_supports_prewarm_and_multi_member_lookup() {
         .iter()
         .map(|account| account.account_id_hex.as_str())
         .collect::<Vec<_>>();
-    app.prewarm_group_member_key_packages(&refs).await.unwrap();
-    let packages = app.resolve_member_key_packages(&refs).await.unwrap();
+    app.directory()
+        .prewarm_group_member_key_packages(&refs)
+        .await
+        .unwrap();
+    let packages = app
+        .directory()
+        .resolve_member_key_packages(&refs)
+        .await
+        .unwrap();
     assert_eq!(packages.len(), 2);
     let requests = fetcher.requests.lock().unwrap();
     assert!(requests.iter().any(|request| {
@@ -115,7 +122,8 @@ async fn invite_recovery_keeps_advertised_success_free_of_supplementary_reads() 
         .get_mut(OUTBOX)
         .unwrap()
         .push(published);
-    app.resolve_member_key_packages(&[&accounts[0].account_id_hex])
+    app.directory()
+        .resolve_member_key_packages(&[&accounts[0].account_id_hex])
         .await
         .unwrap();
     {
@@ -133,7 +141,8 @@ async fn invite_recovery_keeps_advertised_success_free_of_supplementary_reads() 
     // The direct diagnostic normal path also avoids supplementary package and
     // deletion reads once the advertised package succeeds.
     fetcher.requests.lock().unwrap().clear();
-    app.fetch_latest_key_package_for_account_id(&accounts[0].account_id_hex, vec![])
+    app.directory()
+        .fetch_latest_key_package_for_account_id(&accounts[0].account_id_hex, vec![])
         .await
         .unwrap();
     let requests = fetcher.requests.lock().unwrap();
@@ -177,14 +186,16 @@ async fn invite_recovery_honors_signed_event_and_coordinate_deletions() {
             .unwrap()
             .push(deletion);
         assert!(matches!(
-            app.resolve_member_key_packages(&[&account.account_id_hex])
+            app.directory()
+                .resolve_member_key_packages(&[&account.account_id_hex])
                 .await,
-            Err(AppError::MissingKeyPackage { .. })
+            Err(DirectoryError::MissingKeyPackage { .. })
         ));
         assert!(matches!(
-            app.fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
+            app.directory()
+                .fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
                 .await,
-            Err(AppError::MissingKeyPackage { .. })
+            Err(DirectoryError::MissingKeyPackage { .. })
         ));
     }
 }
@@ -212,7 +223,8 @@ async fn invite_recovery_keeps_a_newer_package_after_coordinate_deletion() {
         .get_mut(OUTBOX)
         .unwrap()
         .push(deletion);
-    app.resolve_member_key_packages(&[&account.account_id_hex])
+    app.directory()
+        .resolve_member_key_packages(&[&account.account_id_hex])
         .await
         .unwrap();
 }
@@ -254,9 +266,10 @@ async fn invite_recovery_does_not_revive_a_newer_malformed_or_deleted_slot() {
                 .push(deletion);
         }
         assert!(matches!(
-            app.resolve_member_key_packages(&[&account.account_id_hex])
+            app.directory()
+                .resolve_member_key_packages(&[&account.account_id_hex])
                 .await,
-            Err(AppError::InvalidKeyPackageEvent(_))
+            Err(DirectoryError::InvalidKeyPackageEvent(_))
         ));
     }
 }
@@ -267,12 +280,14 @@ async fn invite_recovery_unknown_coverage_is_retryable_and_can_recover_after_rou
     *fetcher.incomplete_endpoint.lock().unwrap() = Some(OUTBOX.into());
     *fetcher.incomplete_query_kind.lock().unwrap() = Some(5);
     assert!(matches!(
-        app.resolve_member_key_packages(&[&accounts[0].account_id_hex])
+        app.directory()
+            .resolve_member_key_packages(&[&accounts[0].account_id_hex])
             .await,
-        Err(AppError::DirectoryLookupIncomplete(_))
+        Err(DirectoryError::DirectoryLookupIncomplete(_))
     ));
     *fetcher.incomplete_endpoint.lock().unwrap() = None;
-    app.resolve_member_key_packages(&[&accounts[0].account_id_hex])
+    app.directory()
+        .resolve_member_key_packages(&[&accounts[0].account_id_hex])
         .await
         .unwrap();
 }
@@ -287,6 +302,7 @@ async fn invite_recovery_direct_lookup_uses_explicit_bootstrap_discovery() {
         .unwrap()
         .insert("wss://explicit.example".into(), events);
     let fetched = app
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &npub_for_account_id_lossy(&accounts[0].account_id_hex),
             vec![TransportEndpoint("wss://explicit.example".into())],
@@ -319,7 +335,8 @@ async fn invite_recovery_ignores_many_unrelated_deletions() {
         .get_mut(OUTBOX)
         .unwrap()
         .extend(deletions);
-    app.resolve_member_key_packages(&[&account.account_id_hex])
+    app.directory()
+        .resolve_member_key_packages(&[&account.account_id_hex])
         .await
         .unwrap();
     assert!(
@@ -363,7 +380,8 @@ async fn invite_recovery_ignores_wrong_author_and_unsigned_deletions() {
         .get_mut(OUTBOX)
         .unwrap()
         .extend([wrong_author, unsigned]);
-    app.resolve_member_key_packages(&[&account.account_id_hex])
+    app.directory()
+        .resolve_member_key_packages(&[&account.account_id_hex])
         .await
         .unwrap();
 }
@@ -390,9 +408,10 @@ async fn invite_recovery_does_not_resurrect_an_older_slot_after_revoking_its_win
         endpoints.get_mut(DISCOVERY).unwrap().push(winner);
     }
     assert!(matches!(
-        app.resolve_member_key_packages(&[&account.account_id_hex])
+        app.directory()
+            .resolve_member_key_packages(&[&account.account_id_hex])
             .await,
-        Err(AppError::MissingKeyPackage { .. })
+        Err(DirectoryError::MissingKeyPackage { .. })
     ));
 }
 
@@ -406,6 +425,7 @@ async fn invite_recovery_mixed_batch_preserves_first_failed_recipient() {
         });
     }
     let result = app
+        .directory()
         .resolve_member_key_packages(&[
             &accounts[0].account_id_hex,
             &accounts[2].account_id_hex,
@@ -413,7 +433,7 @@ async fn invite_recovery_mixed_batch_preserves_first_failed_recipient() {
         ])
         .await;
     assert!(
-        matches!(result, Err(AppError::MissingKeyPackage { account, reason: crate::MissingKeyPackageReason::NotFound }) if account == accounts[2].account_id_hex)
+        matches!(result, Err(DirectoryError::MissingKeyPackage { account, reason: crate::MissingKeyPackageReason::NotFound }) if account == accounts[2].account_id_hex)
     );
 }
 
@@ -432,11 +452,13 @@ async fn invite_recovery_direct_lookup_and_membership_share_bounded_waits() {
         let target = accounts[0].account_id_hex.clone();
         let task = tokio::spawn(async move {
             if direct {
-                app.fetch_latest_key_package_for_account_id(&target, vec![])
+                app.directory()
+                    .fetch_latest_key_package_for_account_id(&target, vec![])
                     .await
                     .map(|_| ())
             } else {
-                app.resolve_member_key_packages(&[&target])
+                app.directory()
+                    .resolve_member_key_packages(&[&target])
                     .await
                     .map(|_| ())
             }
@@ -445,7 +467,7 @@ async fn invite_recovery_direct_lookup_and_membership_share_bounded_waits() {
         tokio::time::advance(Duration::from_secs(51)).await;
         assert!(matches!(
             task.await.unwrap(),
-            Err(AppError::DirectoryLookupIncomplete(_))
+            Err(DirectoryError::DirectoryLookupIncomplete(_))
         ));
         release.notify_one();
         tokio::time::resume();
@@ -465,7 +487,8 @@ async fn resolution_deadline_names_the_member_whose_lookup_did_not_finish() {
         accounts[0].account_id_hex.clone(),
     ];
     let task = tokio::spawn(async move {
-        app.resolve_member_key_packages(&[&members[0], &members[1]])
+        app.directory()
+            .resolve_member_key_packages(&[&members[0], &members[1]])
             .await
             .map(|_| ())
     });
@@ -473,7 +496,7 @@ async fn resolution_deadline_names_the_member_whose_lookup_did_not_finish() {
     tokio::time::advance(Duration::from_secs(51)).await;
     let error = task.await.unwrap().unwrap_err();
     assert!(
-        matches!(&error, AppError::DirectoryLookupIncomplete(id) if *id == accounts[0].account_id_hex),
+        matches!(&error, DirectoryError::DirectoryLookupIncomplete(id) if *id == accounts[0].account_id_hex),
         "the finished member must not be blamed: {error:?}"
     );
     assert!(!error.to_string().contains(&accounts[0].account_id_hex));
@@ -488,20 +511,29 @@ async fn invite_recovery_cancellation_does_not_admit_an_unverified_package() {
     let (entered, release) = fetcher.hold_fetches_for_kind(5);
     let copy = app.clone();
     let target = id.clone();
-    let task = tokio::spawn(async move { copy.resolve_member_key_packages(&[&target]).await });
+    let task = tokio::spawn(async move {
+        copy.directory()
+            .resolve_member_key_packages(&[&target])
+            .await
+    });
     entered.notified().await;
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     assert!(
-        app.directory_entry_for_account_id(&id)
+        app.directory()
+            .directory_entry_for_account_id(&id)
             .unwrap()
             .and_then(|entry| entry.key_package)
             .is_none()
     );
     release.notify_one();
-    app.resolve_member_key_packages(&[&id]).await.unwrap();
+    app.directory()
+        .resolve_member_key_packages(&[&id])
+        .await
+        .unwrap();
     assert!(
-        app.directory_entry_for_account_id(&id)
+        app.directory()
+            .directory_entry_for_account_id(&id)
             .unwrap()
             .unwrap()
             .key_package
@@ -513,12 +545,13 @@ async fn invite_recovery_cancellation_does_not_admit_an_unverified_package() {
 async fn invite_recovery_limits_safe_canonical_supplementary_endpoints() {
     let (_directory, mut app, accounts, fetcher) = discovery_fixture(1).await;
     let id = &accounts[0].account_id_hex;
-    app.fetch_account_relay_list_status_for_account_id(
-        id,
-        vec![TransportEndpoint(DISCOVERY.into())],
-    )
-    .await
-    .unwrap();
+    app.directory()
+        .fetch_account_relay_list_status_for_account_id(
+            id,
+            vec![TransportEndpoint(DISCOVERY.into())],
+        )
+        .await
+        .unwrap();
     app.config.directory_relay_urls = vec![
         format!("{OUTBOX}/"),
         "ws://127.0.0.1:9876".into(),
@@ -530,7 +563,8 @@ async fn invite_recovery_limits_safe_canonical_supplementary_endpoints() {
         .directory_relay_urls
         .extend((0..20).map(|i| format!("wss://extra-{i}.example")));
     fetcher.requests.lock().unwrap().clear();
-    app.fetch_latest_key_package_for_account_id(id, vec![])
+    app.directory()
+        .fetch_latest_key_package_for_account_id(id, vec![])
         .await
         .unwrap();
     let requests = fetcher.requests.lock().unwrap();
@@ -574,6 +608,7 @@ async fn invite_recovery_preserves_only_unrevoked_future_record_cache_fallback()
         let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
         let account = &accounts[0];
         let cached = app
+            .directory()
             .fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
             .await
             .unwrap();
@@ -613,10 +648,14 @@ async fn invite_recovery_preserves_only_unrevoked_future_record_cache_fallback()
                 .extend([future, revoked, deletion]);
         }
         let result = app
+            .directory()
             .fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
             .await;
         if revoke_cached {
-            assert!(matches!(result, Err(AppError::MissingKeyPackage { .. })));
+            assert!(matches!(
+                result,
+                Err(DirectoryError::MissingKeyPackage { .. })
+            ));
         } else {
             assert_eq!(
                 result.unwrap().key_package_event_id,
@@ -750,9 +789,10 @@ async fn invite_recovery_preserves_known_malformed_error_on_incomplete_primary_e
     *fetcher.incomplete_endpoint.lock().unwrap() = Some(OUTBOX.into());
     *fetcher.incomplete_query_kind.lock().unwrap() = Some(KIND_MARMOT_KEY_PACKAGE);
     assert!(matches!(
-        app.resolve_member_key_packages(&[&account.account_id_hex])
+        app.directory()
+            .resolve_member_key_packages(&[&account.account_id_hex])
             .await,
-        Err(AppError::InvalidKeyPackageEvent(_))
+        Err(DirectoryError::InvalidKeyPackageEvent(_))
     ));
 }
 
@@ -762,9 +802,10 @@ async fn invite_recovery_incomplete_supplement_cannot_authorize_a_usable_copy() 
     *fetcher.incomplete_endpoint.lock().unwrap() = Some(DISCOVERY.into());
     *fetcher.incomplete_query_kind.lock().unwrap() = Some(KIND_MARMOT_KEY_PACKAGE);
     assert!(matches!(
-        app.resolve_member_key_packages(&[&accounts[0].account_id_hex])
+        app.directory()
+            .resolve_member_key_packages(&[&accounts[0].account_id_hex])
             .await,
-        Err(AppError::DirectoryLookupIncomplete(_))
+        Err(DirectoryError::DirectoryLookupIncomplete(_))
     ));
 }
 
@@ -784,9 +825,10 @@ async fn invite_recovery_verified_deletion_rejects_despite_other_incomplete_rout
     *fetcher.incomplete_endpoint.lock().unwrap() = Some(DISCOVERY.into());
     *fetcher.incomplete_query_kind.lock().unwrap() = Some(5);
     assert!(matches!(
-        app.resolve_member_key_packages(&[&account.account_id_hex])
+        app.directory()
+            .resolve_member_key_packages(&[&account.account_id_hex])
             .await,
-        Err(AppError::MissingKeyPackage { .. })
+        Err(DirectoryError::MissingKeyPackage { .. })
     ));
 }
 
@@ -810,6 +852,7 @@ async fn invite_recovery_revoked_preferred_slot_allows_an_independent_survivor()
         routes.get_mut(OUTBOX).unwrap().push(deletion);
     }
     let recovered = app
+        .directory()
         .fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
         .await
         .unwrap();
@@ -821,6 +864,7 @@ async fn invite_recovery_future_only_cache_requires_its_own_completed_deletion_p
     let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
     let account = &accounts[0];
     let cached = app
+        .directory()
         .fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
         .await
         .unwrap();
@@ -838,13 +882,15 @@ async fn invite_recovery_future_only_cache_requires_its_own_completed_deletion_p
     *fetcher.incomplete_endpoint.lock().unwrap() = Some(DISCOVERY.into());
     *fetcher.incomplete_query_kind.lock().unwrap() = Some(5);
     assert!(matches!(
-        app.fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
+        app.directory()
+            .fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
             .await,
-        Err(AppError::DirectoryLookupIncomplete(_))
+        Err(DirectoryError::DirectoryLookupIncomplete(_))
     ));
     *fetcher.incomplete_endpoint.lock().unwrap() = None;
     assert_eq!(
-        app.fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
+        app.directory()
+            .fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
             .await
             .unwrap()
             .key_package_event_id,
@@ -865,9 +911,10 @@ async fn invite_recovery_future_only_cache_requires_its_own_completed_deletion_p
         .unwrap()
         .push(deletion);
     assert!(matches!(
-        app.fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
+        app.directory()
+            .fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
             .await,
-        Err(AppError::MissingKeyPackage { .. })
+        Err(DirectoryError::MissingKeyPackage { .. })
     ));
 }
 
@@ -875,12 +922,13 @@ async fn invite_recovery_future_only_cache_requires_its_own_completed_deletion_p
 async fn invite_recovery_incomplete_negative_without_new_routes_is_unknown() {
     let (_directory, mut app, accounts, fetcher) = discovery_fixture(1).await;
     let id = &accounts[0].account_id_hex;
-    app.fetch_account_relay_list_status_for_account_id(
-        id,
-        vec![TransportEndpoint(DISCOVERY.into())],
-    )
-    .await
-    .unwrap();
+    app.directory()
+        .fetch_account_relay_list_status_for_account_id(
+            id,
+            vec![TransportEndpoint(DISCOVERY.into())],
+        )
+        .await
+        .unwrap();
     app.config.directory_relay_urls = vec![OUTBOX.into()];
     for events in fetcher.events_by_endpoint.lock().unwrap().values_mut() {
         events.retain(|e| e.kind != KIND_MARMOT_KEY_PACKAGE);
@@ -888,9 +936,10 @@ async fn invite_recovery_incomplete_negative_without_new_routes_is_unknown() {
     *fetcher.incomplete_endpoint.lock().unwrap() = Some(OUTBOX.into());
     *fetcher.incomplete_query_kind.lock().unwrap() = Some(KIND_MARMOT_KEY_PACKAGE);
     assert!(matches!(
-        app.fetch_latest_key_package_for_account_id(id, vec![])
+        app.directory()
+            .fetch_latest_key_package_for_account_id(id, vec![])
             .await,
-        Err(AppError::DirectoryLookupIncomplete(_))
+        Err(DirectoryError::DirectoryLookupIncomplete(_))
     ));
 }
 
@@ -940,9 +989,10 @@ async fn invite_recovery_candidate_budget_does_not_accept_an_unchecked_survivor(
     app.config.directory_relay_urls =
         vec![DISCOVERY.into(), "wss://second-discovery.example".into()];
     assert!(matches!(
-        app.resolve_member_key_packages(&[&account.account_id_hex])
+        app.directory()
+            .resolve_member_key_packages(&[&account.account_id_hex])
             .await,
-        Err(AppError::DirectoryLookupIncomplete(_))
+        Err(DirectoryError::DirectoryLookupIncomplete(_))
     ));
 }
 
@@ -988,17 +1038,18 @@ async fn invite_recovery_preserves_incompatible_errors_for_empty_and_failed_supp
         *fetcher.failing_endpoint.lock().unwrap() = supplement_error.then(|| DISCOVERY.into());
         *fetcher.failing_endpoint_kind.lock().unwrap() = Some(KIND_MARMOT_KEY_PACKAGE);
         let result = app
+            .directory()
             .resolve_compatible_member_key_packages(
                 vec![account.account_id_hex.clone()],
                 &requirements,
-                crate::directory::MemberResolutionPurpose::CommitFresh,
+                nostr_directory::MemberResolutionPurpose::CommitFresh,
             )
             .await;
         assert!(matches!(
             result,
-            Err(AppError::Session(cgka_session::SessionError::Engine(
+            Err(DirectoryError::KeyPackageRequirements(
                 cgka_traits::EngineError::MissingRequiredCapabilities { .. }
-            )))
+            ))
         ));
     }
     {
@@ -1012,9 +1063,10 @@ async fn invite_recovery_preserves_incompatible_errors_for_empty_and_failed_supp
             .content = "not base64".into();
     }
     assert!(matches!(
-        app.resolve_member_key_packages(&[&account.account_id_hex])
+        app.directory()
+            .resolve_member_key_packages(&[&account.account_id_hex])
             .await,
-        Err(AppError::InvalidKeyPackageEvent(_))
+        Err(DirectoryError::InvalidKeyPackageEvent(_))
     ));
 }
 
@@ -1024,6 +1076,7 @@ async fn invite_recovery_diagnostic_cache_event_ids_are_canonical_or_ineligible(
         let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
         let account = &accounts[0];
         let mut cached = app
+            .directory()
             .fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
             .await
             .unwrap();
@@ -1047,12 +1100,18 @@ async fn invite_recovery_diagnostic_cache_event_ids_are_canonical_or_ineligible(
         } else {
             canonical_id.to_ascii_uppercase()
         };
-        app.remember_directory_key_package(&cached).unwrap();
+        app.directory()
+            .remember_directory_key_package(&cached)
+            .unwrap();
         let result = app
+            .directory()
             .fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
             .await;
         if empty {
-            assert!(matches!(result, Err(AppError::MissingKeyPackage { .. })));
+            assert!(matches!(
+                result,
+                Err(DirectoryError::MissingKeyPackage { .. })
+            ));
         } else {
             assert_eq!(result.unwrap().key_package_event_id, canonical_id);
         }
@@ -1106,12 +1165,14 @@ async fn assert_recovery_keeps_checked_candidate_across_clock_boundary(membershi
         tokio::spawn(async move {
             if membership {
                 let packages = app
+                    .directory()
                     .resolve_member_key_packages(&[&account_id])
                     .await
                     .unwrap();
                 hex::encode(packages[0].source.as_ref().unwrap().event_id.as_slice())
             } else {
-                app.fetch_latest_key_package_for_account_id(&account_id, vec![])
+                app.directory()
+                    .fetch_latest_key_package_for_account_id(&account_id, vec![])
                     .await
                     .unwrap()
                     .key_package_event_id
@@ -1134,7 +1195,7 @@ async fn assert_recovery_keeps_checked_candidate_across_clock_boundary(membershi
         crate::key_package_records::preferred_fresh_key_package_from_records(
             &account.account_id_hex,
             &records,
-            app.directory_freshness(),
+            app.directory().directory_freshness_for_test(),
             None,
             &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
@@ -1319,7 +1380,7 @@ async fn assert_recovery_does_not_switch_after_mls_expiry(membership: bool) {
         crate::key_package_records::preferred_fresh_key_package_from_records(
             &account.account_id_hex,
             &records,
-            app.directory_freshness(),
+            app.directory().directory_freshness_for_test(),
             None,
             &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
@@ -1336,11 +1397,13 @@ async fn assert_recovery_does_not_switch_after_mls_expiry(membership: bool) {
         let account_id = account.account_id_hex.clone();
         tokio::spawn(async move {
             if membership {
-                app.resolve_member_key_packages(&[&account_id])
+                app.directory()
+                    .resolve_member_key_packages(&[&account_id])
                     .await
                     .map(|_| ())
             } else {
-                app.fetch_latest_key_package_for_account_id(&account_id, vec![])
+                app.directory()
+                    .fetch_latest_key_package_for_account_id(&account_id, vec![])
                     .await
                     .map(|_| ())
             }
@@ -1360,7 +1423,7 @@ async fn assert_recovery_does_not_switch_after_mls_expiry(membership: bool) {
         crate::key_package_records::preferred_fresh_key_package_from_records(
             &account.account_id_hex,
             &records,
-            app.directory_freshness(),
+            app.directory().directory_freshness_for_test(),
             None,
             &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )

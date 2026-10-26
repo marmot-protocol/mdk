@@ -231,7 +231,7 @@ fn open(root: &Path, relay_url: &str) -> Arc<Marmot> {
         MarmotOptions {
             relay_policy: Some(RelayPolicyFfi::AllowLoopback),
             secret_store: Some(Arc::new(MemorySecretStore::default())),
-            ..Default::default()
+            ..MarmotOptions::for_deployment(marmot_uniffi::marmot_deployment_white_noise())
         },
     )
     .expect("open marmot")

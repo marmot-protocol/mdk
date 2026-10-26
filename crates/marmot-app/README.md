@@ -89,7 +89,7 @@ database and releases file locks; `shutdown` alone does not. See
 reaches live subscriptions only after the write behind it has committed, so an update a host received that way is
 still stored after `shutdown_and_close`.
 
-For where the code lives (`src/runtime/`, `src/client/`, `src/directory/`, `src/media/`, and so on) see
+For where the code lives (`src/runtime/`, `src/client/`, `src/media/`, and so on; the user directory is the [`nostr-directory`](../nostr-directory) crate) see
 [`AGENTS.md`](AGENTS.md).
 
 ## SOCKS5 routing
@@ -159,6 +159,12 @@ requires acknowledgements from its operational relays.
 - Import flows can check whether those lists already exist before writing local account state. The same status API can
   fetch relay-list events from supplied bootstrap relays and store discovered user relay/KeyPackage data for
   deterministic CLI/TUI development.
+- A KeyPackage publish or rotation never replaces lists the identity already published. When the cached lists are
+  incomplete (an identity imported offline, or a kind `10002` with read relays only), it first reads the published
+  lists from the app's relays and the outboxes they advertise, and adopts what it finds. It publishes the app's relays
+  only for a list that read proved absent. A read that could not finish fails with `DirectoryLookupIncomplete`, and a
+  published list with no usable relay fails with `MissingRelayLists`; neither publishes anything. An open generated
+  setup still owns its lists.
 
 **Publication.** KeyPackage publication keeps a stable replaceable `d` tag per account and tracks the decoded
 KeyPackage ref separately. Normal publish reuses only a cached current-profile last-resort package; explicit rotate, a
@@ -195,7 +201,8 @@ event, pre-cache direct follows, and cache profile metadata for those likely con
 directory subscriptions for local accounts and known users so profile, follow-list, relay-list, and KeyPackage updates
 keep warming the cache.
 
-**Profile sanitization.** Incoming kind `0` strings are sanitized in `directory/records.rs` before they are cached:
+**Profile sanitization.** Incoming kind `0` strings are sanitized in `nostr-directory`'s `src/records.rs` before they
+are cached:
 
 - `about` keeps normalized line breaks: adjacent CRLF and a lone CR become LF, U+2028 and U+2029 become LF, and interior
   blank lines stay. Every other known string (`name`, `display_name` / `displayName`, `picture`, `banner`, `nip05`,
@@ -301,12 +308,12 @@ event journal.
 ## Encrypted media endpoints
 
 Encrypted media and encrypted group images are uploaded as opaque `application/octet-stream` blobs. A compatible Blossom
-server must accept arbitrary binary data rather than only recognizable image, audio, or video payloads. New groups use
-the deployment's `MarmotDeployment::new_group_media_endpoints` (White Noise's ordered ciphertext-compatible list by
-default) unless the host build supplies `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS`. Encrypted media uploads try those
-endpoints in order; encrypted group images use the deployment's `group_image_endpoint` (White Noise's primary
-endpoint by default). Until the neutral default lands, an empty `new_group_media_endpoints` or an unset
-`group_image_endpoint` still resolves to White Noise's servers, so clearing the list still signs them into new groups.
+server must accept arbitrary binary data rather than only recognizable image, audio, or video payloads. New groups sign
+the deployment's `MarmotDeployment::new_group_media_endpoints` into their encrypted-media component, and uploads try
+those endpoints in order. Encrypted group images use the deployment's `group_image_endpoint`.
+`MarmotDeployment::white_noise()` sets White Noise's ordered ciphertext-compatible list and primary endpoint. The
+neutral default sets neither: new groups then carry no encrypted-media component and stay text-only, and setting or
+fetching a group image is refused. Nothing falls back to White Noise's servers.
 
 The endpoint list is embedded in the signed `marmot.group.encrypted-media.v1` component. Changing application defaults
 does not rewrite existing group state. An active group admin can migrate an existing group with
@@ -386,6 +393,9 @@ bounded investigation can leave unresolved debt parked for new evidence or expli
 ## History may be incomplete notices
 
 Recovery parks an obligation after its fixed budget of fruitless attempts instead of retrying forever.
+Native replay whose original range has no serving source parks immediately, without spending that budget or
+inventing delivery loss. It uses the existing incremental-history notice; a new source generation can rearm
+the preserved range. Removing or disbanding a group retires its obsolete native scopes, not unrelated history debt.
 `MarmotAppRuntime::history_notices(account_ref)` lists each parked occurrence as a `HistoryNotice`: an opaque
 `notice_id`, a `HistoryNoticeCause` (delivery loss, notification loss, a group's epoch gap, incremental or explicit
 history), the group for a group-scoped occurrence, and when it parked. Show it as "history may be incomplete". A group's

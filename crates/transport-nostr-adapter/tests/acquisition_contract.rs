@@ -58,7 +58,11 @@ impl NostrRelayClient for FakeRelay {
     async fn unsubscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
         Ok(())
     }
-    async fn unsubscribe_account(&self, _: &MemberId) -> Result<(), TransportAdapterError> {
+    async fn unsubscribe_account(
+        &self,
+        _: &MemberId,
+        _: &[NostrSubscription],
+    ) -> Result<(), TransportAdapterError> {
         Ok(())
     }
     async fn publish_event(
@@ -194,7 +198,11 @@ async fn legacy_client_reports_unsupported_without_network_work() {
         async fn unsubscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
             Ok(())
         }
-        async fn unsubscribe_account(&self, _: &MemberId) -> Result<(), TransportAdapterError> {
+        async fn unsubscribe_account(
+            &self,
+            _: &MemberId,
+            _: &[NostrSubscription],
+        ) -> Result<(), TransportAdapterError> {
             Ok(())
         }
         async fn publish_event(

@@ -1085,3 +1085,363 @@ fn unfinished_imports_and_legacy_uploads_are_left_alone() {
     assert_eq!(fixture.count("retained_attachment_files"), 1);
     assert_eq!(fixture.count("outgoing_attachment_uploads"), 1);
 }
+
+// "Keep media" (mdk#2314 step 10).
+
+const DAY: u64 = 24 * 60 * 60;
+
+impl Fixture {
+    fn status(&self, group: &str, message: &str) -> AttachmentTransferState {
+        self.store
+            .app_storage()
+            .attachment_transfer_status(group, message, message, 0, NOW, true)
+            .unwrap()
+            .unwrap()
+            .state
+    }
+
+    fn reason(&self, group: &str, message: &str) -> Option<i64> {
+        self.store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT reason FROM attachment_removal_suppression
+                 WHERE group_id_hex=?1 AND message_id_hex=?2",
+                [group, message],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    /// Records a message with one attachment, received at `received`, and
+    /// no acquisition.
+    fn recorded(&self, message: &str, plaintext: &[u8], received: u64) -> AttachmentHistoryEntry {
+        let (mut event, mut entry) = Self::entry(message, plaintext);
+        event.received_at = received;
+        entry.received_at = received;
+        self.store.app_storage().record_app_event(&event).unwrap();
+        entry
+    }
+}
+
+/// Forever is the default and removes nothing; the setting round-trips.
+#[test]
+fn keep_media_defaults_to_forever_and_round_trips() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    assert_eq!(
+        app.attachment_keep_media().unwrap(),
+        AttachmentKeepMedia::Forever
+    );
+    let content = sized(8_000, 20);
+    let job = fixture.claimed_in(GROUP, &"a".repeat(64), &content, 0);
+    assert!(matches!(
+        fixture.publish(&job, &content),
+        PublishOutcome::Published(_)
+    ));
+    assert_eq!(
+        app.clean_attachments_past_keep_window(1_000 * DAY).unwrap(),
+        AttachmentRemoval::default()
+    );
+    for keep in [
+        AttachmentKeepMedia::OneYear,
+        AttachmentKeepMedia::SixMonths,
+        AttachmentKeepMedia::ThirtyDays,
+        AttachmentKeepMedia::Forever,
+    ] {
+        app.set_attachment_keep_media(keep).unwrap();
+        assert_eq!(app.attachment_keep_media().unwrap(), keep);
+    }
+    assert_eq!(
+        app.clean_attachments_past_keep_window(1_000 * DAY).unwrap(),
+        AttachmentRemoval::default(),
+        "back to Forever removes nothing"
+    );
+    assert_eq!(fixture.read(&job).unwrap(), content);
+}
+
+/// The sweep removes retained attachments of both layouts received before
+/// the window, records them as cleaned by the setting, reports the files it
+/// released, and leaves newer ones; the boundary itself is kept.
+#[test]
+fn the_sweep_cleans_both_layouts_past_the_window() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let now = 400 * DAY;
+    let cutoff = now - 30 * DAY;
+    let old = sized(20_000, 21);
+    let old_job = fixture.claimed_in(GROUP, &"b".repeat(64), &old, cutoff - 1);
+    let PublishOutcome::Published(old_id) = fixture.publish(&old_job, &old) else {
+        panic!("published");
+    };
+    let legacy_body = sized(9_000, 22);
+    let legacy_job = fixture.claimed_in(GROUP, &"c".repeat(64), &legacy_body, 0);
+    fixture.legacy(&legacy_job, &legacy_body);
+    let edge = sized(7_000, 23);
+    let edge_job = fixture.claimed_in(GROUP, &"d".repeat(64), &edge, cutoff);
+    assert!(matches!(
+        fixture.publish(&edge_job, &edge),
+        PublishOutcome::Published(_)
+    ));
+
+    app.set_attachment_keep_media(AttachmentKeepMedia::ThirtyDays)
+        .unwrap();
+    let removal = app.clean_attachments_past_keep_window(now).unwrap();
+    assert_eq!(removal.removed, 2);
+    assert!(!removal.more);
+    assert_eq!(removal.released_files, vec![old_id]);
+    assert!(fixture.read(&old_job).is_none());
+    assert!(fixture.read(&legacy_job).is_none());
+    assert_eq!(fixture.read(&edge_job).unwrap(), edge, "at the boundary");
+    assert_eq!(app.attachment_storage_usage(now).unwrap().legacy_bytes, 0);
+    for message in ["b".repeat(64), "c".repeat(64)] {
+        assert_eq!(fixture.reason(GROUP, &message), Some(1));
+        assert_eq!(
+            fixture.status(GROUP, &message),
+            AttachmentTransferState::CleanedBySetting
+        );
+    }
+    assert_eq!(
+        app.clean_attachments_past_keep_window(now).unwrap(),
+        AttachmentRemoval::default()
+    );
+}
+
+/// The sweep works in bounded batches and says when more remain.
+#[test]
+fn the_sweep_is_bounded() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    for i in 0..=ATTACHMENT_REMOVAL_BATCH {
+        let content = sized(100, i as u8);
+        let job = fixture.claimed_in(GROUP, &format!("{i:064x}"), &content, 0);
+        fixture.legacy(&job, &content);
+    }
+    app.set_attachment_keep_media(AttachmentKeepMedia::OneYear)
+        .unwrap();
+    let first = app.clean_attachments_past_keep_window(400 * DAY).unwrap();
+    assert_eq!(
+        (first.removed, first.more),
+        (ATTACHMENT_REMOVAL_BATCH, true)
+    );
+    let rest = app.clean_attachments_past_keep_window(400 * DAY).unwrap();
+    assert_eq!((rest.removed, rest.more), (1, false));
+}
+
+/// Downloading a cleaned attachment again restarts its clock: the next
+/// sweep keeps it for the whole window from that request, then cleans it.
+#[test]
+fn download_again_restarts_the_clock() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let content = sized(12_000, 24);
+    let message = "e".repeat(64);
+    let job = fixture.claimed_in(GROUP, &message, &content, 0);
+    assert!(matches!(
+        fixture.publish(&job, &content),
+        PublishOutcome::Published(_)
+    ));
+    app.set_attachment_keep_media(AttachmentKeepMedia::ThirtyDays)
+        .unwrap();
+    let cleaned_at = 100 * DAY;
+    assert_eq!(
+        app.clean_attachments_past_keep_window(cleaned_at)
+            .unwrap()
+            .removed,
+        1
+    );
+
+    let (_, entry) = Fixture::entry(&message, &content);
+    let AttachmentDemand::Requested(reference) = app
+        .request_attachment_download_again(GROUP, &entry, digest(&content), cleaned_at)
+        .unwrap()
+    else {
+        panic!("download again is allowed");
+    };
+    assert_eq!(fixture.reason(GROUP, &message), None);
+    let again = app
+        .claim_attachment_acquisition(&reference, cleaned_at, cleaned_at + LEASE)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        fixture.publish(&again, &content),
+        PublishOutcome::Published(_)
+    ));
+    assert_eq!(
+        app.clean_attachments_past_keep_window(cleaned_at + DAY)
+            .unwrap()
+            .removed,
+        0,
+        "kept for the window from the request"
+    );
+    assert_eq!(
+        app.clean_attachments_past_keep_window(cleaned_at + 30 * DAY + 1)
+            .unwrap()
+            .removed,
+        1
+    );
+}
+
+/// An explicit first download of an old attachment is kept for the window
+/// from the request, like download-again.
+#[test]
+fn an_explicit_download_of_an_old_attachment_is_kept() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    app.set_attachment_keep_media(AttachmentKeepMedia::ThirtyDays)
+        .unwrap();
+    let content = sized(6_000, 25);
+    let entry = fixture.recorded(&"f".repeat(64), &content, 0);
+    let now = 100 * DAY;
+    let AttachmentDemand::Requested(reference) = app
+        .request_explicit_attachment(GROUP, &entry, digest(&content), now)
+        .unwrap()
+    else {
+        panic!("explicit requests pass the window");
+    };
+    let job = app
+        .claim_attachment_acquisition(&reference, now, now + LEASE)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        fixture.publish(&job, &content),
+        PublishOutcome::Published(_)
+    ));
+    assert_eq!(
+        app.clean_attachments_past_keep_window(now + DAY)
+            .unwrap()
+            .removed,
+        0
+    );
+}
+
+/// Automatic demand does not fetch an attachment already past the window: it
+/// is recorded as cleaned instead. Newer attachments, and slots that already
+/// have an acquisition, are requested as before.
+#[test]
+fn automatic_demand_skips_attachments_past_the_window() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let now = 100 * DAY;
+    let old = sized(3_000, 26);
+    let old_entry = fixture.recorded(&"1".repeat(64), &old, 0);
+    let recent = sized(3_000, 27);
+    let recent_entry = fixture.recorded(&"2".repeat(64), &recent, now);
+
+    // Forever: everything is requested.
+    assert!(matches!(
+        app.request_automatic_acquisition(GROUP, &old_entry, digest(&old), now)
+            .unwrap(),
+        AttachmentDemand::Requested(_)
+    ));
+    app.set_attachment_keep_media(AttachmentKeepMedia::ThirtyDays)
+        .unwrap();
+    assert!(
+        matches!(
+            app.request_automatic_acquisition(GROUP, &old_entry, digest(&old), now)
+                .unwrap(),
+            AttachmentDemand::Requested(_)
+        ),
+        "an existing acquisition is left to the sweep, which cleans it"
+    );
+
+    let older = sized(3_000, 28);
+    let older_entry = fixture.recorded(&"3".repeat(64), &older, 0);
+    assert_eq!(
+        app.request_automatic_acquisition(GROUP, &older_entry, digest(&older), now)
+            .unwrap(),
+        AttachmentDemand::Suppressed
+    );
+    assert_eq!(
+        fixture.status(GROUP, &"3".repeat(64)),
+        AttachmentTransferState::CleanedBySetting
+    );
+    assert!(matches!(
+        app.request_automatic_acquisition(GROUP, &recent_entry, digest(&recent), now)
+            .unwrap(),
+        AttachmentDemand::Requested(_)
+    ));
+}
+
+/// Removing a slot the setting cleaned records it as removed by you; the
+/// setting never relabels a slot the user removed.
+#[test]
+fn explicit_remove_relabels_a_cleaned_slot() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    app.set_attachment_keep_media(AttachmentKeepMedia::ThirtyDays)
+        .unwrap();
+    let content = sized(2_000, 29);
+    let message = "4".repeat(64);
+    let entry = fixture.recorded(&message, &content, 0);
+    assert_eq!(
+        app.request_automatic_acquisition(GROUP, &entry, digest(&content), 100 * DAY)
+            .unwrap(),
+        AttachmentDemand::Suppressed
+    );
+    assert_eq!(fixture.reason(GROUP, &message), Some(1));
+    assert!(app.remove_local_attachment(GROUP, &message, 0).unwrap());
+    assert_eq!(fixture.reason(GROUP, &message), Some(0));
+    assert_eq!(
+        fixture.status(GROUP, &message),
+        AttachmentTransferState::Removed
+    );
+    assert_eq!(
+        app.request_automatic_acquisition(GROUP, &entry, digest(&content), 100 * DAY)
+            .unwrap(),
+        AttachmentDemand::Suppressed
+    );
+    assert_eq!(
+        fixture.reason(GROUP, &message),
+        Some(0),
+        "still removed by you"
+    );
+}
+
+/// An automatic download queued before the window reached it (the setting
+/// changed, or it aged while offline) is cleaned by the sweep before it
+/// fetches; an explicitly requested one is kept.
+#[test]
+fn the_sweep_cleans_queued_automatic_downloads_but_not_explicit_ones() {
+    let fixture = Fixture::new();
+    let app = fixture.store.app_storage();
+    let now = 100 * DAY;
+    let automatic = sized(3_000, 30);
+    let automatic_entry = fixture.recorded(&"5".repeat(64), &automatic, 0);
+    let AttachmentDemand::Requested(queued) = app
+        .request_automatic_acquisition(GROUP, &automatic_entry, digest(&automatic), 0)
+        .unwrap()
+    else {
+        panic!("requested under Forever");
+    };
+    let explicit = sized(3_000, 31);
+    let explicit_entry = fixture.recorded(&"6".repeat(64), &explicit, 0);
+    let AttachmentDemand::Requested(requested) = app
+        .request_explicit_attachment(GROUP, &explicit_entry, digest(&explicit), now)
+        .unwrap()
+    else {
+        panic!("explicit request");
+    };
+
+    app.set_attachment_keep_media(AttachmentKeepMedia::ThirtyDays)
+        .unwrap();
+    let removal = app.clean_attachments_past_keep_window(now).unwrap();
+    assert_eq!((removal.removed, removal.released_files.len()), (1, 0));
+    assert!(
+        app.claim_attachment_acquisition(&queued, now, now + LEASE)
+            .unwrap()
+            .is_none(),
+        "the queued automatic job is gone"
+    );
+    assert_eq!(
+        fixture.status(GROUP, &"5".repeat(64)),
+        AttachmentTransferState::CleanedBySetting
+    );
+    assert!(
+        app.claim_attachment_acquisition(&requested, now, now + LEASE)
+            .unwrap()
+            .is_some(),
+        "the explicit request still downloads"
+    );
+}

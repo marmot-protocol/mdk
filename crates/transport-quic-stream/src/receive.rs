@@ -185,6 +185,8 @@ pub fn stream_record_text(record: &AgentTextStreamRecordV1) -> String {
 
 #[derive(Clone, Debug)]
 pub enum ServerTrust {
+    /// Default public-CA trust: the bundled Mozilla roots, not the OS trust
+    /// store (see [`crate::platform_trust_verifier`]).
     Platform,
     CertificateDer(Vec<u8>),
     InsecureLocal,

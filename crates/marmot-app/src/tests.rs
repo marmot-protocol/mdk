@@ -1,9 +1,11 @@
 #[cfg(feature = "test-policy-overrides")]
 mod canonical_membership;
 mod draft_lifecycle;
+mod follow_list_edits;
 mod group_lookup;
 pub(crate) mod invite_recovery;
 mod key_package_inventory;
+mod key_package_relay_lists;
 mod key_package_selection;
 mod message_journeys;
 mod publication_progress;
@@ -12,6 +14,7 @@ mod relay_plane_runtime;
 mod replaceable_delivery;
 mod report_backfill;
 mod suspension_close;
+mod unreachable_group_relays;
 mod user_blocks;
 
 use super::*;
@@ -31,6 +34,7 @@ use cgka_traits::app_event::{
 use cgka_traits::storage::{DisbandCandidate, DisbandCandidateStorage};
 use cgka_traits::{GroupStorage as _, Timestamp};
 use marmot_account::AccountHomeError;
+use nostr_directory::error::DirectoryError;
 use nostr_sdk::prelude::{
     EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp as NostrTimestamp,
 };
@@ -47,16 +51,14 @@ use crate::client::epoch_stall::{BackfillDecision, EPOCH_STALL_BACKFILL_THRESHOL
 use crate::conversions::{
     app_group_from_stored_group, stored_components_from_app_group, stored_group_from_app_group,
 };
-use crate::directory::records::{
-    FetchedFollowList, profile_content_json, public_directory_user_record,
-};
-use crate::ids::npub_for_account_id_lossy;
 use crate::key_package_records::{
     relay_list_queries, relay_list_status_from_records, require_key_package_tag,
     require_multi_value_key_package_tag_matches,
 };
 use crate::messages::STREAM_ROUTE_QUIC;
 use crate::messages::{AppMessageIntent, build_inner_event};
+use nostr_directory::npub_for_account_id_lossy;
+use nostr_directory::{FetchedFollowList, profile_content_json, public_directory_user_record};
 
 fn one_pixel_png() -> Vec<u8> {
     use image::ImageEncoder;
@@ -524,6 +526,7 @@ pub(crate) struct ScriptedPushRelayClient {
     group_subscribe_attempts: std::sync::atomic::AtomicUsize,
     fail_blocked_subscribe: std::sync::atomic::AtomicBool,
     fail_next_subscribe: std::sync::atomic::AtomicBool,
+    refuse_group_subscribes: std::sync::atomic::AtomicBool,
     block_next_unsubscribe: std::sync::atomic::AtomicBool,
     block_next_publish: std::sync::atomic::AtomicBool,
     block_publish_count: std::sync::atomic::AtomicUsize,
@@ -544,7 +547,6 @@ pub(crate) struct ScriptedPushRelayClient {
     subscribe_release: tokio::sync::Notify,
     unsubscribe_started: tokio::sync::Notify,
     unsubscribe_release: tokio::sync::Notify,
-    reissued_subscriptions: std::sync::Mutex<Vec<(String, Vec<TransportEndpoint>)>>,
 }
 
 #[derive(Default)]
@@ -856,6 +858,13 @@ impl ScriptedPushRelayClient {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Refuse every group-route `subscribe` until cleared, as the SDK relay
+    /// client does for a relay it currently considers unreachable (mdk#2562).
+    pub(crate) fn refuse_group_subscribes(&self, refuse: bool) {
+        self.refuse_group_subscribes
+            .store(refuse, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub(crate) fn subscription_count(&self) -> usize {
         self.subscriptions.lock().unwrap().len()
     }
@@ -863,11 +872,6 @@ impl ScriptedPushRelayClient {
     /// Every subscription this relay has accepted so far.
     pub(crate) fn accepted_subscriptions(&self) -> Vec<NostrSubscription> {
         self.subscriptions.lock().unwrap().clone()
-    }
-
-    /// Every REQ a lag repair has re-issued so far, with its endpoints.
-    pub(crate) fn reissued_subscriptions(&self) -> Vec<(String, Vec<TransportEndpoint>)> {
-        self.reissued_subscriptions.lock().unwrap().clone()
     }
 
     pub(crate) fn unfloored_account_subscription_count(&self) -> usize {
@@ -888,7 +892,7 @@ impl ScriptedPushRelayClient {
         self.subscribe_started.notified().await;
     }
 
-    fn release_subscribe(&self) {
+    pub(crate) fn release_subscribe(&self) {
         self.subscribe_release.notify_waiters();
     }
 
@@ -1059,6 +1063,24 @@ impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
             })
             .collect())
     }
+
+    // The scripted relay holds every event published through it, so a read
+    // finishes unless a query's limit cut it short.
+    async fn fetch_directory_events_with_completion(
+        &self,
+        request: transport_nostr::DirectoryFetchRequest,
+    ) -> Result<transport_nostr::DirectoryFetchOutcome, String> {
+        let queries = request.queries.clone();
+        let records = self.fetch_directory_events(request).await?;
+        let complete = queries.iter().all(|query| {
+            records
+                .iter()
+                .filter(|record| query.matches(&record.event))
+                .count()
+                < query.limit
+        });
+        Ok(transport_nostr::DirectoryFetchOutcome { records, complete })
+    }
 }
 
 #[async_trait]
@@ -1094,11 +1116,57 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                 }
             }
         }
-        self.acquisition_result
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or(transport_nostr_adapter::NostrAcquisitionError::Unsupported)
+        let scripted = self.acquisition_result.lock().unwrap();
+        let scripted = scripted
+            .as_ref()
+            .ok_or(transport_nostr_adapter::NostrAcquisitionError::Unsupported)?;
+        if let transport_nostr_adapter::NostrAcquisitionScope::GroupWindow {
+            transport_group_id,
+            since,
+            until,
+            newest,
+        } = request.scope
+        {
+            let group = hex::encode(transport_group_id);
+            let mut endpoints = Vec::with_capacity(request.endpoints.len());
+            for page in &scripted.endpoints {
+                if !request.endpoints.iter().any(|endpoint| {
+                    transport_nostr::same_relay(endpoint.as_str(), page.endpoint.as_str())
+                }) {
+                    continue;
+                }
+                let mut selected = page
+                    .events
+                    .iter()
+                    .filter(|event| event.created_at >= since && event.created_at <= until)
+                    .filter(|event| {
+                        event.kind == u64::from(nostr_sdk::prelude::Kind::MlsGroupMessage.as_u16())
+                            && event.tags.iter().any(|tag| {
+                                matches!(tag.as_slice(), [name, value, ..] if name == "h" && value == &group)
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                selected.sort_by(|a, b| (b.created_at, &b.id).cmp(&(a.created_at, &a.id)));
+                selected.truncate(newest.unwrap_or(usize::MAX));
+                let mut stats = page.stats;
+                stats.raw_received_items = selected.len();
+                stats.oldest_raw_created_at = selected.iter().map(|event| event.created_at).min();
+                stats.received_items = selected.len();
+                stats.serialized_event_bytes = selected
+                    .iter()
+                    .map(|event| serde_json::to_vec(event).unwrap().len())
+                    .sum();
+                endpoints.push(transport_nostr_adapter::NostrAcquisitionEndpoint {
+                    endpoint: page.endpoint.clone(),
+                    session_generation: page.session_generation,
+                    events: selected.into_iter().cloned().collect(),
+                    end: page.end,
+                    stats,
+                });
+            }
+            return Ok(transport_nostr_adapter::NostrAcquisitionResult { endpoints });
+        }
+        Ok(scripted.clone())
     }
     fn supports_scoped_subscriptions(&self) -> bool {
         true
@@ -1146,6 +1214,15 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         {
             return Err(cgka_traits::TransportAdapterError::Subscription(
                 "injected subscribe failure".to_owned(),
+            ));
+        }
+        if subscription.is_group_route()
+            && self
+                .refuse_group_subscribes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "subscribe registered on 0 of 1 relays".to_owned(),
             ));
         }
         let block_for_account = {
@@ -1212,32 +1289,9 @@ impl NostrRelayClient for ScriptedPushRelayClient {
     async fn unsubscribe_account(
         &self,
         _account_id: &cgka_traits::MemberId,
+        _replacements: &[NostrSubscription],
     ) -> Result<(), cgka_traits::TransportAdapterError> {
         Ok(())
-    }
-
-    async fn reissue_subscription(
-        &self,
-        _account_id: &cgka_traits::MemberId,
-        subscription_id: &str,
-        endpoints: &[TransportEndpoint],
-    ) -> Result<transport_nostr_adapter::SubscriptionReissue, cgka_traits::TransportAdapterError>
-    {
-        self.reissued_subscriptions
-            .lock()
-            .unwrap()
-            .push((subscription_id.to_owned(), endpoints.to_vec()));
-        Ok(transport_nostr_adapter::SubscriptionReissue {
-            relays: endpoints
-                .iter()
-                .map(|endpoint| {
-                    (
-                        endpoint.clone(),
-                        transport_nostr_adapter::RelayReissue::Sent,
-                    )
-                })
-                .collect(),
-        })
     }
 
     async fn publish_event(
@@ -1608,6 +1662,23 @@ pub(crate) async fn inject_epoch_gap_probe(app: &MarmotApp, event: NostrTranspor
     );
 }
 
+// Queue/pin contracts start at the router. Relay producers separately prove
+// their complete-range fence before handing group input to the native lane.
+async fn route_group_probe(client: &AppClient, event: NostrTransportEvent) {
+    let delivery = client
+        .adapter
+        .recovered_deliveries(NostrRelayEvent {
+            endpoint: TransportEndpoint("wss://relay.example".to_owned()),
+            subscription_id: None,
+            event,
+        })
+        .await
+        .unwrap()
+        .pop()
+        .expect("the active group route receives the probe");
+    client.relay_plane.route_account_delivery_for_test(delivery);
+}
+
 /// Script the recovery job's comparisons: every pass over the group route
 /// `nostr_group_id_hex` fetches one fresh probe from its relay, and every
 /// other route answers with nothing missing.
@@ -1902,6 +1973,7 @@ fn failed_epoch_backfill_attempt_retains_one_correlated_retry() {
                 None,
                 marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             )
+            .await
             .unwrap()
             .expect("the armed gap is granted");
         client.released_backfill_reload_pending = true;
@@ -2107,6 +2179,7 @@ fn recovery_warning_requires_qualified_local_observations_and_survives_local_com
                 Some(&mut permit),
                 marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
             )
+            .await
             .unwrap()
             .unwrap();
         // The job fails while it takes ownership of its network result.
@@ -2131,6 +2204,7 @@ fn recovery_warning_requires_qualified_local_observations_and_survives_local_com
                 Some(&mut permit),
                 marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
             )
+            .await
             .unwrap()
             .unwrap();
         assert!(qualify_group_recovery_for_test(&storage, &grant, &group_id));
@@ -2325,6 +2399,7 @@ fn qualify_group_recovery_for_test(
         .map(|scope| RecoveryScopeCheckpoint {
             token: scope.token.clone(),
             retained_known_event: false,
+            replay_admitted: false,
             endpoints: scope
                 .goal
                 .required_endpoints
@@ -2762,6 +2837,7 @@ fn a_failed_epoch_backfill_execution_paces_the_next_automatic_seam() {
                 Some(&mut permit),
                 marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
             )
+            .await
             .unwrap()
             .expect("the armed gap is granted");
         client.released_backfill_reload_pending = true;
@@ -3117,6 +3193,7 @@ fn local_epoch_progress_does_not_clear_history_or_suppress_independent_gaps() {
                 None,
                 marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             )
+            .await
             .unwrap()
             .unwrap();
         // The app refuses group changes while this gap is armed (mdk#2258),
@@ -3366,6 +3443,7 @@ fn in_flight_epoch_backfill_arm_preserves_both_demands_on_failure() {
                 None,
                 marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             )
+            .await
             .unwrap()
             .unwrap();
         let epoch = client.group_mls_state(&group_b).unwrap().epoch;
@@ -3381,6 +3459,7 @@ fn in_flight_epoch_backfill_arm_preserves_both_demands_on_failure() {
                     None,
                     marmot_forensics::EpochBackfillExecutionSeam::Receive
                 )
+                .await
                 .unwrap()
                 .is_none()
         );
@@ -3408,6 +3487,7 @@ fn in_flight_epoch_backfill_arm_preserves_both_demands_on_failure() {
                     None,
                     marmot_forensics::EpochBackfillExecutionSeam::Receive
                 )
+                .await
                 .unwrap()
                 .is_none()
         );
@@ -3417,6 +3497,7 @@ fn in_flight_epoch_backfill_arm_preserves_both_demands_on_failure() {
                 None,
                 marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             )
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(retry.reservation.attempt_serial, 2);
@@ -3450,6 +3531,7 @@ fn repeated_epoch_backfill_deferral_does_not_multiply_identical_evidence() {
                 None,
                 marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             )
+            .await
             .unwrap()
             .unwrap();
         let retry = storage.recovery_retry_state().unwrap();
@@ -3467,6 +3549,7 @@ fn repeated_epoch_backfill_deferral_does_not_multiply_identical_evidence() {
                         None,
                         marmot_forensics::EpochBackfillExecutionSeam::Receive
                     )
+                    .await
                     .unwrap()
                     .is_none()
             );
@@ -3480,6 +3563,7 @@ fn repeated_epoch_backfill_deferral_does_not_multiply_identical_evidence() {
                     None,
                     marmot_forensics::EpochBackfillExecutionSeam::Maintenance
                 )
+                .await
                 .unwrap()
                 .is_none()
         );
@@ -3537,6 +3621,7 @@ fn owner_deferral_deduplicates_identical_observations_but_keeps_epoch_changes() 
                         None,
                         marmot_forensics::EpochBackfillExecutionSeam::Receive,
                     )
+                    .await
                     .unwrap(),
             );
         }
@@ -3556,6 +3641,7 @@ fn owner_deferral_deduplicates_identical_observations_but_keeps_epoch_changes() 
                         None,
                         marmot_forensics::EpochBackfillExecutionSeam::Receive
                     )
+                    .await
                     .unwrap()
                     .is_none()
             );
@@ -3600,6 +3686,7 @@ fn unresolved_epoch_backfill_scope_does_not_starve_another_group() {
                 None,
                 marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
             )
+            .await
             .unwrap()
             .unwrap();
         assert!(grant.plan().unwrap().iter().any(|obligation| {
@@ -3622,51 +3709,56 @@ fn unresolved_epoch_backfill_scope_does_not_starve_another_group() {
         assert_eq!(
             storage
                 .app_storage()
-                .recovery_retry_state()
+                .pending_epoch_backfill_intents()
                 .unwrap()
-                .attempt_serial,
-            1
+                .into_iter()
+                .map(|intent| intent.group_id_hex)
+                .collect::<Vec<_>>(),
+            vec![hex::encode(phantom.as_slice())],
+            "qualified real-group coverage cannot erase the unsupported group's debt"
+        );
+        let unresolved = storage
+            .app_storage()
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.group_id.as_deref() == Some(phantom.as_slice()))
+            .unwrap();
+        assert_eq!(
+            unresolved.eligibility,
+            storage_sqlite::RecoveryEligibility::WaitingCapability
+        );
+        client
+            .recovery_owner
+            .test_advance_clock(Duration::from_secs(300));
+        // A native replay goal may run after its source lease expires. That
+        // independent work must neither retry nor retire the unsupported scope.
+        client
+            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
+            .await
+            .unwrap();
+        let still_unresolved = storage
+            .app_storage()
+            .pending_recovery_demands()
+            .unwrap()
+            .into_iter()
+            .find(|d| d.group_id.as_deref() == Some(phantom.as_slice()))
+            .unwrap();
+        assert!(still_unresolved.ticket == unresolved.ticket);
+        assert_eq!(
+            still_unresolved.eligibility,
+            storage_sqlite::RecoveryEligibility::WaitingCapability,
+            "a timer cannot investigate a group with no acquisition route repeatedly"
         );
         assert_eq!(
             storage
                 .app_storage()
                 .pending_epoch_backfill_intents()
                 .unwrap()
-                .len(),
-            1,
-            "qualified real-group coverage cannot erase the unsupported group's debt"
-        );
-        assert_eq!(
-            storage
-                .app_storage()
-                .pending_recovery_demands()
-                .unwrap()
                 .into_iter()
-                .find(|d| d.group_id.as_deref() == Some(phantom.as_slice()))
-                .unwrap()
-                .eligibility,
-            storage_sqlite::RecoveryEligibility::WaitingCapability
-        );
-        client
-            .recovery_owner
-            .test_advance_clock(Duration::from_secs(300));
-        assert!(matches!(
-            client
-                .run_pending_epoch_backfill(
-                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance
-                )
-                .await
-                .unwrap(),
-            crate::EpochBackfillRunOutcome::Deferred
-        ));
-        assert_eq!(
-            storage
-                .app_storage()
-                .recovery_retry_state()
-                .unwrap()
-                .attempt_serial,
-            1,
-            "a timer cannot investigate a group with no acquisition route repeatedly"
+                .map(|intent| intent.group_id_hex)
+                .collect::<Vec<_>>(),
+            vec![hex::encode(phantom.as_slice())],
         );
         let rows = recorded_audit_rows(&app);
         assert_eq!(
@@ -3699,8 +3791,7 @@ where
 /// [`run_composed_app_runtime_test`] on a current-thread runtime, for a test
 /// that pauses the clock (Tokio allows `time::pause` only there) or builds an
 /// interleaving that needs one thread. Say why with a `//` comment on the line
-/// above the call; `async_suites_choose_their_tokio_flavor` rejects a call
-/// without one.
+/// above the call.
 pub(crate) fn run_composed_app_runtime_test_on_one_thread<F, Fut>(thread_name: &str, body: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -6919,6 +7010,7 @@ async fn generated_identity_publishes_supplied_initial_profile_as_first_kind0() 
         "a zero stamp would lose to any stale relay copy"
     );
     let cached = app
+        .directory()
         .directory_entry_for_account_id(&local.account.account_id_hex)
         .unwrap()
         .and_then(|entry| entry.profile)
@@ -7999,11 +8091,12 @@ fn configured_directory_relays_stay_separate_from_operational_relays() {
         "directory configuration must not widen operational publication fanout"
     );
     assert_eq!(
-        app.directory_source_relays(&[]),
+        app.directory().directory_source_relays(&[]),
         vec![TransportEndpoint(discovery.into())]
     );
     assert_eq!(
-        app.directory_source_relays(std::slice::from_ref(&explicit)),
+        app.directory()
+            .directory_source_relays(std::slice::from_ref(&explicit)),
         vec![explicit],
         "per-operation discovery relays must retain precedence"
     );
@@ -8390,7 +8483,8 @@ pub(crate) fn remember_test_member_inbox(app: &MarmotApp, account_id_hex: &str, 
     relay_lists.inbox.created_at = 1;
     relay_lists.inbox.relays = vec![relay.to_owned()];
     relay_lists.refresh();
-    app.remember_directory_relay_lists(account_id_hex, &relay_lists)
+    app.directory()
+        .remember_directory_relay_lists(account_id_hex, &relay_lists)
         .unwrap();
 }
 
@@ -8457,27 +8551,28 @@ async fn member_key_package_falls_back_to_current_directory_for_local_account() 
         },
     )
     .unwrap();
-    app.save_directory_entry(&UserDirectoryRecord {
-        account_id_hex: account.account_id_hex.clone(),
-        npub: npub_for_account_id_lossy(&account.account_id_hex),
-        local_account: Some(UserDirectoryLocalAccount {
-            label: account.label.clone(),
-            local_signing: true,
-        }),
-        profile: None,
-        follows: Vec::new(),
-        follow_source_relays: Vec::new(),
-        relay_lists: AccountRelayListStatus::empty(),
-        key_package: Some(DirectoryKeyPackage {
-            key_package_id: "current-directory".into(),
-            key_package_ref_hex: metadata.key_package_ref_hex.clone(),
-            key_package_event_id: String::new(),
-            key_package_hex: hex::encode(current.bytes()),
-            created_at: 2,
-            source_relays: Vec::new(),
-        }),
-    })
-    .unwrap();
+    app.directory()
+        .save_directory_entry_for_test(&UserDirectoryRecord {
+            account_id_hex: account.account_id_hex.clone(),
+            npub: npub_for_account_id_lossy(&account.account_id_hex),
+            local_account: Some(UserDirectoryLocalAccount {
+                label: account.label.clone(),
+                local_signing: true,
+            }),
+            profile: None,
+            follows: Vec::new(),
+            follow_source_relays: Vec::new(),
+            relay_lists: AccountRelayListStatus::empty(),
+            key_package: Some(DirectoryKeyPackage {
+                key_package_id: "current-directory".into(),
+                key_package_ref_hex: metadata.key_package_ref_hex.clone(),
+                key_package_event_id: String::new(),
+                key_package_hex: hex::encode(current.bytes()),
+                created_at: 2,
+                source_relays: Vec::new(),
+            }),
+        })
+        .unwrap();
 
     let selected = app.member_key_package(&account.label).await.unwrap();
     let selected_metadata = cgka_engine::key_package::key_package_metadata(&selected).unwrap();
@@ -8499,6 +8594,7 @@ async fn member_key_package_set_canonicalizes_and_deduplicates_in_input_order() 
 
     let bob_npub = npub_for_account_id_lossy(&bob.account_id_hex);
     let resolved = app
+        .directory()
         .resolve_member_key_packages(&[
             bob.label.as_str(),
             bob_npub.as_str(),
@@ -8654,6 +8750,7 @@ async fn member_inbox_is_resolved_on_discovered_outbox() {
     ]);
 
     let resolution = app
+        .directory()
         .resolve_member_key_packages(&[account_id.as_str()])
         .await;
     assert!(
@@ -8673,7 +8770,8 @@ async fn member_inbox_is_resolved_on_discovered_outbox() {
             })
     }));
     assert!(
-        app.directory_entry_for_account_id(&account_id)
+        app.directory()
+            .directory_entry_for_account_id(&account_id)
             .unwrap()
             .is_some_and(|entry| entry
                 .relay_lists
@@ -8712,6 +8810,7 @@ async fn account_outbox_route_cap_keeps_usable_first_hop_metadata() {
     ];
 
     let status = app
+        .directory()
         .resolve_account_relay_list_status_for_account_id(
             &account_id,
             vec![TransportEndpoint("wss://directory.example".into())],
@@ -8722,6 +8821,7 @@ async fn account_outbox_route_cap_keeps_usable_first_hop_metadata() {
     assert_eq!(status.nip65.relays, outboxes);
     assert_eq!(status.inbox.relays, vec![inbox]);
     let cached = app
+        .directory()
         .directory_entry_for_account_id(&account_id)
         .unwrap()
         .expect("observed relay metadata must remain durable");
@@ -8739,13 +8839,16 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
     let account_id = accounts[0].account_id_hex.clone();
     let outbox = "wss://cached-outbox.example";
     let mut entry = app
+        .directory()
         .directory_entry_for_account_id(&account_id)
         .unwrap()
-        .unwrap_or_else(|| app.empty_directory_record(&account_id));
+        .unwrap_or_else(|| app.directory().empty_directory_record_for_test(&account_id));
     entry.relay_lists.nip65.created_at = 1;
     entry.relay_lists.nip65.relays = vec![outbox.into()];
     entry.relay_lists.refresh();
-    app.save_directory_entry(&entry).unwrap();
+    app.directory()
+        .save_directory_entry_for_test(&entry)
+        .unwrap();
     fetcher.events_by_endpoint.lock().unwrap().extend([
         ("wss://directory.example".to_owned(), Vec::new()),
         (outbox.to_owned(), Vec::new()),
@@ -8753,12 +8856,13 @@ async fn incomplete_discovery_is_not_cleared_by_an_empty_cached_outbox() {
     *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://directory.example".into());
 
     let error = app
+        .directory()
         .resolve_member_key_packages(&[account_id.as_str()])
         .await
         .expect_err("an empty outbox cannot prove absence after discovery failed");
 
     assert!(
-        matches!(error, AppError::DirectoryLookupIncomplete(ref id) if *id == account_id),
+        matches!(error, DirectoryError::DirectoryLookupIncomplete(ref id) if *id == account_id),
         "unknown discovery must remain retryable instead of becoming a missing-route verdict: {error:?}"
     );
     assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -8783,12 +8887,13 @@ async fn member_inbox_of_only_retired_relays_is_reported_distinctly() {
     *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://shared.example".into());
 
     let error = app
+        .directory()
         .resolve_member_key_packages(&[account_id.as_str()])
         .await
         .expect_err("a member with no usable inbox cannot be invited");
 
     assert!(
-        matches!(error, AppError::DirectoryLookupIncomplete(ref id) if *id == account_id),
+        matches!(error, DirectoryError::DirectoryLookupIncomplete(ref id) if *id == account_id),
         "{error:?}"
     );
 }
@@ -8805,18 +8910,20 @@ async fn cached_retired_inbox_with_failed_refresh_remains_retryable() {
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
     let error = app
+        .directory()
         .resolve_member_key_packages(&[account_id.as_str()])
         .await
         .expect_err("a failed refresh cannot use a retired-only cached inbox");
     assert!(
-        matches!(error, AppError::DirectoryLookupIncomplete(ref id) if *id == account_id),
+        matches!(error, DirectoryError::DirectoryLookupIncomplete(ref id) if *id == account_id),
         "{error:?}"
     );
 
     fetcher
         .fail_all
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    app.resolve_member_key_packages(&[account_id.as_str()])
+    app.directory()
+        .resolve_member_key_packages(&[account_id.as_str()])
         .await
         .expect("a completed refresh finds the newer usable inbox without republication");
 }
@@ -8835,10 +8942,20 @@ async fn directory_relay_persistence_preserves_newer_signed_empty_lists() {
     empty.nip65.created_at = 20;
     empty.inbox.created_at = 20;
     empty.refresh();
-    app.remember_directory_relay_lists(id, &older).unwrap();
-    app.remember_directory_relay_lists(id, &empty).unwrap();
-    app.remember_directory_relay_lists(id, &older).unwrap();
-    let persisted = app.directory_entry_for_account_id(id).unwrap().unwrap();
+    app.directory()
+        .remember_directory_relay_lists(id, &older)
+        .unwrap();
+    app.directory()
+        .remember_directory_relay_lists(id, &empty)
+        .unwrap();
+    app.directory()
+        .remember_directory_relay_lists(id, &older)
+        .unwrap();
+    let persisted = app
+        .directory()
+        .directory_entry_for_account_id(id)
+        .unwrap()
+        .unwrap();
     assert_eq!(persisted.relay_lists.nip65.created_at, 20);
     assert_eq!(persisted.relay_lists.inbox.created_at, 20);
     assert!(persisted.relay_lists.nip65.relays.is_empty());
@@ -8864,14 +8981,21 @@ async fn account_outbox_route_cap_without_inbox_remains_unknown() {
         String::new(),
     )];
     let error = app
+        .directory()
         .resolve_account_relay_list_status_for_account_id(
             id,
             vec![TransportEndpoint("wss://directory.example".into())],
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, AppError::DirectoryLookupIncomplete(ref account) if account == id));
-    let cached = app.directory_entry_for_account_id(id).unwrap().unwrap();
+    assert!(
+        matches!(error, DirectoryError::DirectoryLookupIncomplete(ref account) if account == id)
+    );
+    let cached = app
+        .directory()
+        .directory_entry_for_account_id(id)
+        .unwrap()
+        .unwrap();
     assert_eq!(cached.relay_lists.nip65.relays.len(), 17);
     assert!(cached.relay_lists.inbox.relays.is_empty());
     assert_eq!(fetcher.requests.lock().unwrap().len(), 1);
@@ -8888,14 +9012,21 @@ async fn account_signed_empty_inbox_with_incomplete_outbox_remains_unknown() {
     }
     *fetcher.incomplete_endpoint.lock().unwrap() = Some("wss://shared.example".into());
     let error = app
+        .directory()
         .resolve_account_relay_list_status_for_account_id(
             id,
             vec![TransportEndpoint("wss://directory.example".into())],
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, AppError::DirectoryLookupIncomplete(ref account) if account == id));
-    let cached = app.directory_entry_for_account_id(id).unwrap().unwrap();
+    assert!(
+        matches!(error, DirectoryError::DirectoryLookupIncomplete(ref account) if account == id)
+    );
+    let cached = app
+        .directory()
+        .directory_entry_for_account_id(id)
+        .unwrap()
+        .unwrap();
     assert!(cached.relay_lists.inbox.created_at > 0);
     assert!(cached.relay_lists.inbox.relays.is_empty());
     assert_eq!(fetcher.requests.lock().unwrap().len(), 2);
@@ -8904,6 +9035,7 @@ async fn account_signed_empty_inbox_with_incomplete_outbox_remains_unknown() {
     // outbox also completes; retaining it in the cache must not mask retries.
     *fetcher.incomplete_endpoint.lock().unwrap() = None;
     let error = app
+        .directory()
         .resolve_account_relay_list_status_for_account_id(
             id,
             vec![TransportEndpoint("wss://directory.example".into())],
@@ -8911,7 +9043,7 @@ async fn account_signed_empty_inbox_with_incomplete_outbox_remains_unknown() {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, AppError::MissingRelayLists(ref kinds) if kinds == &[MissingRelayListKind::Inbox])
+        matches!(error, DirectoryError::MissingRelayLists(ref kinds) if kinds == &[MissingRelayListKind::Inbox])
     );
 }
 
@@ -8938,6 +9070,7 @@ async fn account_read_only_nip65_returns_typed_missing_write_routes() {
         ),
     ];
     let error = app
+        .directory()
         .resolve_account_relay_list_status_for_account_id(
             id,
             vec![TransportEndpoint("wss://directory.example".into())],
@@ -8945,9 +9078,13 @@ async fn account_read_only_nip65_returns_typed_missing_write_routes() {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, AppError::MissingRelayLists(ref kinds) if kinds == &[MissingRelayListKind::Nip65])
+        matches!(error, DirectoryError::MissingRelayLists(ref kinds) if kinds == &[MissingRelayListKind::Nip65])
     );
-    let cached = app.directory_entry_for_account_id(id).unwrap().unwrap();
+    let cached = app
+        .directory()
+        .directory_entry_for_account_id(id)
+        .unwrap()
+        .unwrap();
     assert!(cached.relay_lists.nip65.relays.is_empty());
     assert_eq!(
         cached.relay_lists.nip65.read_relays,
@@ -8965,6 +9102,7 @@ async fn future_dated_inbox_is_unknown_for_account_and_member_resolution() {
         }
     }
     let account_error = app
+        .directory()
         .resolve_account_relay_list_status_for_account_id(
             id,
             vec![TransportEndpoint("wss://directory.example".into())],
@@ -8972,14 +9110,15 @@ async fn future_dated_inbox_is_unknown_for_account_and_member_resolution() {
         .await
         .unwrap_err();
     assert!(
-        matches!(account_error, AppError::DirectoryLookupIncomplete(ref account) if account == id)
+        matches!(account_error, DirectoryError::DirectoryLookupIncomplete(ref account) if account == id)
     );
     let member_error = app
+        .directory()
         .resolve_member_key_packages(&[id.as_str()])
         .await
         .unwrap_err();
     assert!(
-        matches!(member_error, AppError::DirectoryLookupIncomplete(ref account) if account == id)
+        matches!(member_error, DirectoryError::DirectoryLookupIncomplete(ref account) if account == id)
     );
 }
 
@@ -9072,16 +9211,18 @@ async fn missing_inbox_is_discovered_when_nip65_is_cached() {
         .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST);
 
     let prewarm_error = app
+        .directory()
         .prewarm_group_member_key_packages(&[account_id.as_str()])
         .await
         .expect_err("KeyPackage-only prewarm must not report invite readiness");
     assert!(matches!(
         prewarm_error,
-        AppError::MissingMemberInboxRoute(ref recipient) if recipient == &account_id
+        DirectoryError::MissingMemberInboxRoute(ref recipient) if recipient == &account_id
     ));
     fetcher.requests.lock().unwrap().clear();
 
     let error = app
+        .directory()
         .resolve_member_key_packages(&[account_id.as_str()])
         .await
         .expect_err("commit-purpose resolution must require a safe inbox route");
@@ -9089,7 +9230,7 @@ async fn missing_inbox_is_discovered_when_nip65_is_cached() {
     assert!(
         matches!(
             &error,
-            AppError::MissingMemberInboxRoute(recipient) if recipient == &account_id
+            DirectoryError::MissingMemberInboxRoute(recipient) if recipient == &account_id
         ),
         "the typed error must identify the unready canonical recipient"
     );
@@ -9132,12 +9273,13 @@ async fn unsafe_cached_inbox_is_refreshed_before_member_resolution_succeeds() {
     fetcher.events.lock().unwrap().push(unsafe_event);
 
     let error = app
+        .directory()
         .prewarm_group_member_key_packages(&[account_id.as_str()])
         .await
         .expect_err("a loopback inbox route must not satisfy invite readiness");
     assert!(matches!(
         error,
-        AppError::MissingMemberInboxRoute(ref recipient) if recipient == &account_id
+        DirectoryError::MissingMemberInboxRoute(ref recipient) if recipient == &account_id
     ));
 
     fetcher
@@ -9155,7 +9297,8 @@ async fn unsafe_cached_inbox_is_refreshed_before_member_resolution_succeeds() {
     fetcher.events.lock().unwrap().push(safe_event);
     fetcher.requests.lock().unwrap().clear();
 
-    app.resolve_member_key_packages(&[account_id.as_str()])
+    app.directory()
+        .resolve_member_key_packages(&[account_id.as_str()])
         .await
         .expect("a safe replacement inbox route should make the member ready");
     assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -9163,60 +9306,6 @@ async fn unsafe_cached_inbox_is_refreshed_before_member_resolution_succeeds() {
             .queries
             .iter()
             .any(|query| query.kind == KIND_MARMOT_INBOX_RELAY_LIST)
-    }));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-/// Existing-group invitations reject unrouteable members before MLS mutation.
-async fn invite_with_key_package_but_no_inbox_route_fails_before_commit() {
-    let (directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
-    let account_id = accounts[0].account_id_hex.clone();
-    fetcher
-        .events
-        .lock()
-        .unwrap()
-        .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST);
-
-    let inviter = AccountHome::open(directory.path())
-        .create_account("single-route-readiness-inviter")
-        .unwrap();
-    let mut client = app.client(&inviter.label).await.unwrap();
-    let group_id = client
-        .create_group("single route readiness", &[])
-        .await
-        .unwrap();
-
-    let error = client
-        .invite_members(&group_id, &[account_id.as_str()])
-        .await
-        .expect_err("a KeyPackage alone must not allow an Add commit");
-    assert!(matches!(
-        error,
-        AppError::MissingMemberInboxRoute(ref recipient) if recipient == &account_id
-    ));
-    assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 1);
-
-    fetcher
-        .events
-        .lock()
-        .unwrap()
-        .push(NostrTransportEvent::new_unsigned(
-            account_id.clone(),
-            KIND_MARMOT_INBOX_RELAY_LIST,
-            vec![vec!["relay".into(), "wss://shared.example".into()]],
-            String::new(),
-        ));
-    fetcher.requests.lock().unwrap().clear();
-    client
-        .invite_members(&group_id, &[account_id.as_str()])
-        .await
-        .expect("the explicit retry should refetch the unconsumed KeyPackage");
-    assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 2);
-    assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
-        request
-            .queries
-            .iter()
-            .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
     }));
 }
 
@@ -9348,7 +9437,10 @@ async fn thirty_incremental_invites_with_large_directory_cache_converge_without_
     let (directory, app, accounts, _fetcher) = member_resolution_fixture(30, false).await;
     for _ in 0..256 {
         let account_id = Keys::generate().public_key().to_hex();
-        app.save_directory_entry(&app.empty_directory_record(&account_id))
+        app.directory()
+            .save_directory_entry_for_test(
+                &app.directory().empty_directory_record_for_test(&account_id),
+            )
             .unwrap();
     }
 
@@ -9388,11 +9480,13 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
     let recipient = &accounts[0];
     let members = [recipient.account_id_hex.as_str()];
     let old = app
+        .directory()
         .resolve_member_key_packages(&members)
         .await
         .unwrap()
         .remove(0);
     let old_directory = app
+        .directory()
         .directory_entry_for_account_id(&recipient.account_id_hex)
         .unwrap()
         .unwrap()
@@ -9427,13 +9521,15 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
         ));
     }
     let prewarm = app
+        .directory()
         .prewarm_group_member_key_packages(&members)
         .await
         .unwrap();
     assert_eq!(prewarm.reused_members, 0);
     assert_eq!(prewarm.network_resolved_members, 1);
     assert_eq!(
-        app.directory_entry_for_account_id(&recipient.account_id_hex)
+        app.directory()
+            .directory_entry_for_account_id(&recipient.account_id_hex)
             .unwrap()
             .unwrap()
             .key_package
@@ -9457,7 +9553,10 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
     }
     fetcher.requests.lock().unwrap().clear();
     assert_eq!(
-        app.resolve_member_key_packages(&members).await.unwrap(),
+        app.directory()
+            .resolve_member_key_packages(&members)
+            .await
+            .unwrap(),
         vec![latest]
     );
     let requests = fetcher.requests.lock().unwrap();
@@ -9474,8 +9573,12 @@ async fn member_key_package_resolution_fails_closed_after_cached_prewarm() {
     for relay_failure in [false, true] {
         let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
         let members = [accounts[0].account_id_hex.as_str()];
-        app.resolve_member_key_packages(&members).await.unwrap();
-        app.prewarm_group_member_key_packages(&members)
+        app.directory()
+            .resolve_member_key_packages(&members)
+            .await
+            .unwrap();
+        app.directory()
+            .prewarm_group_member_key_packages(&members)
             .await
             .unwrap();
         if relay_failure {
@@ -9488,17 +9591,22 @@ async fn member_key_package_resolution_fails_closed_after_cached_prewarm() {
                 .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
         }
         assert!(
-            app.resolve_member_key_packages(&members).await.is_err(),
+            app.directory()
+                .resolve_member_key_packages(&members)
+                .await
+                .is_err(),
             "neither a relay error nor a relay miss may authorize using the cached package"
         );
         assert!(
-            app.prewarm_group_member_key_packages(&members)
+            app.directory()
+                .prewarm_group_member_key_packages(&members)
                 .await
                 .is_err(),
             "prewarm must also refresh instead of returning cached readiness"
         );
         assert!(
-            app.directory_entry_for_account_id(members[0])
+            app.directory()
+                .directory_entry_for_account_id(members[0])
                 .unwrap()
                 .unwrap()
                 .key_package
@@ -9529,16 +9637,18 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             .session()
             .invite_key_package_requirements(&group)
             .unwrap();
-        app.resolve_compatible_member_key_packages(
-            members.clone(),
-            &requirements,
-            crate::directory::MemberResolutionPurpose::CommitFresh,
-        )
-        .await
-        .unwrap();
+        app.directory()
+            .resolve_compatible_member_key_packages(
+                members.clone(),
+                &requirements,
+                nostr_directory::MemberResolutionPurpose::CommitFresh,
+            )
+            .await
+            .unwrap();
         for member in &members {
             assert!(
-                app.directory_entry_for_account_id(member)
+                app.directory()
+                    .directory_entry_for_account_id(member)
                     .unwrap()
                     .unwrap()
                     .key_package
@@ -9555,16 +9665,17 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
         }
         fetcher.requests.lock().unwrap().clear();
         let error = app
+            .directory()
             .resolve_compatible_member_key_packages(
                 members.clone(),
                 &requirements,
-                crate::directory::MemberResolutionPurpose::CommitFresh,
+                nostr_directory::MemberResolutionPurpose::CommitFresh,
             )
             .await
             .err()
             .expect("future-only discovery must fail closed");
         assert!(
-            matches!(error, AppError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
+            matches!(error, DirectoryError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
         );
         assert!(
             fetcher.requests.lock().unwrap().iter().any(|request| {
@@ -9576,16 +9687,21 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
             "single-author fallback must also reject cached material"
         );
         let refs = members.iter().map(String::as_str).collect::<Vec<_>>();
-        let ordinary = app.resolve_member_key_packages(&refs).await.unwrap_err();
+        let ordinary = app
+            .directory()
+            .resolve_member_key_packages(&refs)
+            .await
+            .unwrap_err();
         assert!(
-            matches!(ordinary, AppError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
+            matches!(ordinary, DirectoryError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
         );
         let prewarm = app
+            .directory()
             .prewarm_group_member_key_packages(&refs)
             .await
             .unwrap_err();
         assert!(
-            matches!(prewarm, AppError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
+            matches!(prewarm, DirectoryError::MissingKeyPackage { account: id, reason: crate::MissingKeyPackageReason::NotFound } if id == members[0])
         );
     }
 }
@@ -9599,6 +9715,7 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
         .collect::<Vec<_>>();
 
     let summary = app
+        .directory()
         .prewarm_group_member_key_packages(&members)
         .await
         .unwrap();
@@ -9639,7 +9756,8 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
 
     for account in &accounts {
         assert!(
-            app.directory_entry_for_account_id(&account.account_id_hex)
+            app.directory()
+                .directory_entry_for_account_id(&account.account_id_hex)
                 .unwrap()
                 .and_then(|entry| entry.key_package)
                 .is_none(),
@@ -9647,7 +9765,11 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
         );
     }
 
-    let resolved = app.resolve_member_key_packages(&members).await.unwrap();
+    let resolved = app
+        .directory()
+        .resolve_member_key_packages(&members)
+        .await
+        .unwrap();
     assert_eq!(resolved.len(), 8);
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
@@ -9661,7 +9783,10 @@ async fn member_key_package_prewarm_does_not_renew_routes_after_incomplete_disco
     for incomplete in ["wss://directory.example", "wss://shared.example"] {
         let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
         let members = [accounts[0].account_id_hex.as_str()];
-        app.resolve_member_key_packages(&members).await.unwrap();
+        app.directory()
+            .resolve_member_key_packages(&members)
+            .await
+            .unwrap();
         // Keep a usable durable inbox, but make its relay refresh incomplete.
         // A successful KeyPackage fetch does not establish route freshness.
         fetcher
@@ -9670,12 +9795,16 @@ async fn member_key_package_prewarm_does_not_renew_routes_after_incomplete_disco
             .unwrap()
             .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST);
         *fetcher.incomplete_endpoint.lock().unwrap() = Some(incomplete.to_owned());
-        app.prewarm_group_member_key_packages(&members)
+        app.directory()
+            .prewarm_group_member_key_packages(&members)
             .await
             .unwrap();
         fetcher.requests.lock().unwrap().clear();
         *fetcher.incomplete_endpoint.lock().unwrap() = None;
-        app.resolve_member_key_packages(&members).await.unwrap();
+        app.directory()
+            .resolve_member_key_packages(&members)
+            .await
+            .unwrap();
         assert!(
             fetcher.requests.lock().unwrap().iter().any(|request| {
                 request
@@ -9704,7 +9833,8 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
         .iter()
         .map(|account| account.account_id_hex.as_str())
         .collect::<Vec<_>>();
-    app.prewarm_group_member_key_packages(&members)
+    app.directory()
+        .prewarm_group_member_key_packages(&members)
         .await
         .unwrap();
     let requests = fetcher.requests.lock().unwrap().clone();
@@ -9716,7 +9846,8 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     assert_eq!(requests[0].queries.len(), 2);
     assert_eq!(requests[1].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
     assert_eq!(
-        app.resolve_member_key_packages(&members)
+        app.directory()
+            .resolve_member_key_packages(&members)
             .await
             .unwrap()
             .len(),
@@ -9741,6 +9872,7 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_rejecte
         .collect::<Vec<_>>();
 
     let summary = app
+        .directory()
         .prewarm_group_member_key_packages(&members)
         .await
         .unwrap();
@@ -9774,6 +9906,7 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_incompl
         .collect::<Vec<_>>();
 
     let summary = app
+        .directory()
         .prewarm_group_member_key_packages(&members)
         .await
         .expect("CLOSED-shaped incomplete batches must retry per author");
@@ -9812,16 +9945,18 @@ async fn relay_list_fallback_failure_preserves_valid_siblings_and_input_order() 
     ];
 
     let error = app
+        .directory()
         .prewarm_group_member_key_packages(&members)
         .await
         .expect_err("the first member is missing and the third relay-list fallback fails");
     assert!(
-        matches!(error, AppError::MissingKeyPackage { account: account_id, reason: crate::MissingKeyPackageReason::NotFound } if account_id == accounts[0].account_id_hex),
+        matches!(error, DirectoryError::MissingKeyPackage { account: account_id, reason: crate::MissingKeyPackageReason::NotFound } if account_id == accounts[0].account_id_hex),
         "the first canonical member error must win over a later relay-list failure"
     );
     let requests_after_partial = fetcher.requests.lock().unwrap().len();
 
     let summary = app
+        .directory()
         .prewarm_group_member_key_packages(&[accounts[1].account_id_hex.as_str()])
         .await
         .expect("the valid sibling should remain reusable after the partial failure");
@@ -9848,12 +9983,13 @@ async fn member_key_package_set_reports_missing_packages_in_input_order() {
     ];
 
     let error = app
+        .directory()
         .prewarm_group_member_key_packages(&members)
         .await
         .expect_err("both packages are absent");
 
     assert!(
-        matches!(error, AppError::MissingKeyPackage { account: account_id, reason: crate::MissingKeyPackageReason::NotFound } if account_id == accounts[1].account_id_hex),
+        matches!(error, DirectoryError::MissingKeyPackage { account: account_id, reason: crate::MissingKeyPackageReason::NotFound } if account_id == accounts[1].account_id_hex),
         "the first canonical input error must win regardless of batch completion order"
     );
 }
@@ -9875,13 +10011,15 @@ async fn malformed_batch_member_does_not_discard_valid_member_prewarm() {
     }
 
     let error = app
+        .directory()
         .prewarm_group_member_key_packages(&[malformed_account.as_str(), valid_account.as_str()])
         .await
         .expect_err("the malformed member must fail");
-    assert!(matches!(error, AppError::InvalidKeyPackageEvent(_)));
+    assert!(matches!(error, DirectoryError::InvalidKeyPackageEvent(_)));
     let requests_after_partial = fetcher.requests.lock().unwrap().len();
 
     let summary = app
+        .directory()
         .prewarm_group_member_key_packages(&[valid_account.as_str()])
         .await
         .expect("the valid member from the partial batch remains safely reusable");
@@ -9913,6 +10051,7 @@ async fn member_key_package_resolution_ignores_older_malformed_publication() {
     }
 
     let summary = app
+        .directory()
         .prewarm_group_member_key_packages(&[account_id.as_str()])
         .await
         .expect("the newest valid KeyPackage must win over an older malformed publication");
@@ -9940,11 +10079,12 @@ async fn member_key_package_resolution_rejects_superseded_slot_after_malformed_r
     }
 
     let error = app
+        .directory()
         .prewarm_group_member_key_packages(&[account_id.as_str()])
         .await
         .expect_err("a malformed replacement must suppress the superseded KeyPackage in its slot");
 
-    assert!(matches!(error, AppError::InvalidKeyPackageEvent(_)));
+    assert!(matches!(error, DirectoryError::InvalidKeyPackageEvent(_)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9956,6 +10096,7 @@ async fn cancelled_member_prewarm_does_not_admit_or_reserve_results() {
     let task_member = member.clone();
     let task = tokio::spawn(async move {
         task_app
+            .directory()
             .prewarm_group_member_key_packages(&[task_member.as_str()])
             .await
     });
@@ -9971,7 +10112,8 @@ async fn cancelled_member_prewarm_does_not_admit_or_reserve_results() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     assert!(
-        app.directory_entry_for_account_id(&member)
+        app.directory()
+            .directory_entry_for_account_id(&member)
             .unwrap()
             .and_then(|entry| entry.key_package)
             .is_none(),
@@ -9980,6 +10122,7 @@ async fn cancelled_member_prewarm_does_not_admit_or_reserve_results() {
     *fetcher.stalled_endpoint.lock().unwrap() = None;
     let requests_before_retry = fetcher.requests.lock().unwrap().len();
     let summary = app
+        .directory()
         .prewarm_group_member_key_packages(&[member.as_str()])
         .await
         .unwrap();
@@ -9997,12 +10140,13 @@ async fn member_key_package_resolution_scaling_report() {
             .iter()
             .map(|account| account.account_id_hex.as_str())
             .collect::<Vec<_>>();
-        app.prewarm_group_member_key_packages(&members)
+        app.directory()
+            .prewarm_group_member_key_packages(&members)
             .await
             .unwrap();
         fetcher.requests.lock().unwrap().clear();
         let started = Instant::now();
-        let outcome = app.resolve_member_key_packages(&members).await;
+        let outcome = app.directory().resolve_member_key_packages(&members).await;
         report.push(format!(
             "{count},warm_cache,{},{},{}",
             fetcher.requests.lock().unwrap().len(),
@@ -10016,7 +10160,10 @@ async fn member_key_package_resolution_scaling_report() {
             .map(|account| account.account_id_hex.as_str())
             .collect::<Vec<_>>();
         let started = Instant::now();
-        let outcome = app.prewarm_group_member_key_packages(&members).await;
+        let outcome = app
+            .directory()
+            .prewarm_group_member_key_packages(&members)
+            .await;
         report.push(format!(
             "{count},shared_relays,{},{},{}",
             fetcher.requests.lock().unwrap().len(),
@@ -10030,7 +10177,10 @@ async fn member_key_package_resolution_scaling_report() {
             .map(|account| account.account_id_hex.as_str())
             .collect::<Vec<_>>();
         let started = Instant::now();
-        let outcome = app.prewarm_group_member_key_packages(&members).await;
+        let outcome = app
+            .directory()
+            .prewarm_group_member_key_packages(&members)
+            .await;
         report.push(format!(
             "{count},split_relays,{},{},{}",
             fetcher.requests.lock().unwrap().len(),
@@ -10052,7 +10202,10 @@ async fn member_key_package_resolution_scaling_report() {
             .map(|account| account.account_id_hex.as_str())
             .collect::<Vec<_>>();
         let started = Instant::now();
-        let outcome = app.prewarm_group_member_key_packages(&members).await;
+        let outcome = app
+            .directory()
+            .prewarm_group_member_key_packages(&members)
+            .await;
         report.push(format!(
             "{count},one_stalled_relay,{},{},{}",
             fetcher.requests.lock().unwrap().len(),
@@ -10072,7 +10225,10 @@ async fn member_key_package_resolution_scaling_report() {
             .map(|account| account.account_id_hex.as_str())
             .collect::<Vec<_>>();
         let started = Instant::now();
-        let outcome = app.prewarm_group_member_key_packages(&members).await;
+        let outcome = app
+            .directory()
+            .prewarm_group_member_key_packages(&members)
+            .await;
         report.push(format!(
             "{count},missing_package,{},{},{}",
             fetcher.requests.lock().unwrap().len(),
@@ -10199,22 +10355,25 @@ fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
         }
     };
 
-    app.ingest_directory_relay_event(record(
-        1,
-        vec![vec!["r".into(), "wss://stale-write.example".into()]],
-    ))
-    .unwrap();
-    app.ingest_directory_relay_event(record(
-        2,
-        vec![vec![
-            "r".into(),
-            "wss://read-only.example".into(),
-            "read".into(),
-        ]],
-    ))
-    .unwrap();
+    app.directory()
+        .ingest_directory_relay_event(record(
+            1,
+            vec![vec!["r".into(), "wss://stale-write.example".into()]],
+        ))
+        .unwrap();
+    app.directory()
+        .ingest_directory_relay_event(record(
+            2,
+            vec![vec![
+                "r".into(),
+                "wss://read-only.example".into(),
+                "read".into(),
+            ]],
+        ))
+        .unwrap();
 
     let cached = app
+        .directory()
         .directory_entry_for_account_id(&account_id)
         .unwrap()
         .expect("cached relay list");
@@ -10253,14 +10412,18 @@ fn stale_live_relay_list_events_do_not_replace_newer_cached_lists() {
             }
         };
 
-        app.ingest_directory_relay_event(record(20, "wss://new.example"))
+        app.directory()
+            .ingest_directory_relay_event(record(20, "wss://new.example"))
             .unwrap();
-        app.ingest_directory_relay_event(record(10, "wss://old.example"))
+        app.directory()
+            .ingest_directory_relay_event(record(10, "wss://old.example"))
             .unwrap();
-        app.ingest_directory_relay_event(record(20, "wss://equal.example"))
+        app.directory()
+            .ingest_directory_relay_event(record(20, "wss://equal.example"))
             .unwrap();
 
         let cached = app
+            .directory()
             .directory_entry_for_account_id(&account_id)
             .unwrap()
             .expect("cached relay list");
@@ -10289,13 +10452,15 @@ fn zero_timestamp_relay_list_event_populates_legacy_empty_state() {
     );
     event.created_at = 0;
 
-    app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
-        endpoints: vec![TransportEndpoint("wss://source.example".into())],
-        event,
-    })
-    .unwrap();
+    app.directory()
+        .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
+            endpoints: vec![TransportEndpoint("wss://source.example".into())],
+            event,
+        })
+        .unwrap();
 
     let cached = app
+        .directory()
         .directory_entry_for_account_id(&account_id)
         .unwrap()
         .expect("zero-timestamp relay list is cached");
@@ -10586,6 +10751,7 @@ fn directory_search_bounds_frontier_from_cached_follow_lists() {
     }
 
     let results = app
+        .directory()
         .search_user_directory(UserDirectorySearch {
             searcher_account_id_hex: account.account_id_hex,
             query: "needle".into(),
@@ -10620,8 +10786,8 @@ fn directory_search_uses_graph_cache_without_promoting_known_user() {
         })
         .unwrap();
     cache
-        .put_search_graph_record(
-            &directory::DirectorySearchGraphRecord {
+        .put_search_graph_record_for_test(
+            &nostr_directory::DirectorySearchGraphRecord {
                 account_id_hex: graph_user.clone(),
                 npub: npub_for_account_id_lossy(&graph_user),
                 profile: Some(UserProfileMetadata {
@@ -10645,6 +10811,7 @@ fn directory_search_uses_graph_cache_without_promoting_known_user() {
         .unwrap();
 
     let results = app
+        .directory()
         .search_user_directory(UserDirectorySearch {
             searcher_account_id_hex: account.account_id_hex.clone(),
             query: "graph-needle".into(),
@@ -10657,7 +10824,8 @@ fn directory_search_uses_graph_cache_without_promoting_known_user() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].account_id_hex, graph_user);
     assert!(
-        app.directory_entry_for_account_id(&graph_user)
+        app.directory()
+            .directory_entry_for_account_id(&graph_user)
             .unwrap()
             .is_none()
     );
@@ -10723,17 +10891,20 @@ fn duplicate_directory_entry_save_skips_cache_writes() {
     entry.profile.as_mut().unwrap().source_relays = vec!["wss://profiles.example".into()];
 
     cache.reset_put_count_for_test();
-    app.save_directory_entry_with_reason(&entry, "message")
+    app.directory()
+        .save_directory_entry_with_reason_for_test(&entry, "message")
         .unwrap();
     assert_eq!(cache.put_count_for_test(), 1);
 
     cache.reset_put_count_for_test();
-    app.save_directory_entry_with_reason(&entry, "message")
+    app.directory()
+        .save_directory_entry_with_reason_for_test(&entry, "message")
         .unwrap();
     assert_eq!(cache.put_count_for_test(), 0);
 
     entry.profile.as_mut().unwrap().display_name = Some("cached peer".into());
-    app.save_directory_entry_with_reason(&entry, "message")
+    app.directory()
+        .save_directory_entry_with_reason_for_test(&entry, "message")
         .unwrap();
     assert_eq!(cache.put_count_for_test(), 1);
 }
@@ -10751,12 +10922,13 @@ fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
     let account_id = format!("{:064x}", 206);
 
     // Local edit cached at t=1_700_000_000 (own-account entry).
-    app.save_directory_entry(&test_directory_record(
-        &account_id,
-        "edited-local",
-        1_700_000_000,
-    ))
-    .unwrap();
+    app.directory()
+        .save_directory_entry_for_test(&test_directory_record(
+            &account_id,
+            "edited-local",
+            1_700_000_000,
+        ))
+        .unwrap();
 
     // Stale relay copy arrives with the SAME second-resolution timestamp.
     let stale_same_second = UserProfileMetadata {
@@ -10764,11 +10936,13 @@ fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
         created_at: 1_700_000_000,
         ..UserProfileMetadata::default()
     };
-    app.remember_directory_profile_if_newer(&account_id, &stale_same_second)
+    app.directory()
+        .remember_directory_profile_if_newer_for_test(&account_id, &stale_same_second)
         .unwrap();
 
     // The local edit must survive the equal-timestamp refresh.
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&account_id)
         .unwrap()
         .unwrap();
@@ -10783,9 +10957,11 @@ fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
         created_at: 1_700_000_001,
         ..UserProfileMetadata::default()
     };
-    app.remember_directory_profile_if_newer(&account_id, &newer)
+    app.directory()
+        .remember_directory_profile_if_newer_for_test(&account_id, &newer)
         .unwrap();
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&account_id)
         .unwrap()
         .unwrap();
@@ -10811,16 +10987,17 @@ fn same_second_multiline_bio_does_not_replace_cached_single_line_bio() {
         (peer.as_str(), false),
         (alice.account_id_hex.as_str(), true),
     ] {
-        app.remember_directory_profile(
-            account_id,
-            &UserProfileMetadata {
-                name: Some("bob".to_owned()),
-                about: Some("onetwo".to_owned()),
-                created_at,
-                ..UserProfileMetadata::default()
-            },
-        )
-        .unwrap();
+        app.directory()
+            .remember_directory_profile(
+                account_id,
+                &UserProfileMetadata {
+                    name: Some("bob".to_owned()),
+                    about: Some("onetwo".to_owned()),
+                    created_at,
+                    ..UserProfileMetadata::default()
+                },
+            )
+            .unwrap();
         let ingest = |created_at: u64| {
             let mut event = NostrTransportEvent::new_unsigned(
                 account_id.to_owned(),
@@ -10829,12 +11006,14 @@ fn same_second_multiline_bio_does_not_replace_cached_single_line_bio() {
                 serde_json::json!({ "name": "bob", "about": "one\ntwo" }).to_string(),
             );
             event.created_at = created_at;
-            app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
-                endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
-                event,
-            })
-            .unwrap();
-            app.directory_entry_for_account_id(account_id)
+            app.directory()
+                .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
+                    endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
+                    event,
+                })
+                .unwrap();
+            app.directory()
+                .directory_entry_for_account_id(account_id)
                 .unwrap()
                 .unwrap()
         };
@@ -10865,7 +11044,8 @@ fn roster_labels_keep_profiles() {
     let alice = home.create_account("alice").unwrap();
     let bob = home.create_account("bob").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    app.save_directory_entry(&test_directory_record(&alice.account_id_hex, "Alice", 1))
+    app.directory()
+        .save_directory_entry_for_test(&test_directory_record(&alice.account_id_hex, "Alice", 1))
         .unwrap();
     let names = app.profiles_by_id().unwrap();
     assert_eq!(names.len(), 2);
@@ -10894,6 +11074,7 @@ fn directory_entry_prefers_newer_shared_record_over_stale_cache() {
         .unwrap();
 
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&contact)
         .unwrap()
         .unwrap();
@@ -10955,6 +11136,7 @@ fn directory_entry_reconciles_nostr_components_independently() {
         .unwrap();
 
     let reconciled = app
+        .directory()
         .directory_entry_for_account_id(&contact)
         .unwrap()
         .expect("reconciled directory entry");
@@ -10987,13 +11169,15 @@ fn directory_entry_reconciles_nostr_components_independently() {
         String::new(),
     );
     stale_event.created_at = 15;
-    app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
-        event: stale_event,
-        endpoints: vec![TransportEndpoint("wss://source.example".into())],
-    })
-    .unwrap();
+    app.directory()
+        .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
+            event: stale_event,
+            endpoints: vec![TransportEndpoint("wss://source.example".into())],
+        })
+        .unwrap();
 
     let after_stale_replay = app
+        .directory()
         .directory_entry_for_account_id(&contact)
         .unwrap()
         .expect("directory entry after stale replay");
@@ -11012,7 +11196,8 @@ fn repeated_display_name_lookup_reuses_directory_cache_handle() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let contact = format!("{:064x}", 44);
 
-    app.save_directory_entry(&test_directory_record(&contact, "Cached Contact", 1))
+    app.directory()
+        .save_directory_entry_for_test(&test_directory_record(&contact, "Cached Contact", 1))
         .unwrap();
     drop(app);
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
@@ -11076,12 +11261,20 @@ fn batch_names_preserve_selection() {
         (alice.account_id_hex.clone(), "alice".to_owned()),
     ]);
     assert_eq!(
-        app.display_names_for_account_ids(&requested).unwrap(),
+        app.directory()
+            .display_names_for_account_ids(&requested)
+            .unwrap(),
         expected
     );
-    assert!(app.display_names_for_account_ids(&[]).unwrap().is_empty());
     assert!(
-        app.display_names_for_account_ids(&["invalid".into()])
+        app.directory()
+            .display_names_for_account_ids(&[])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        app.directory()
+            .display_names_for_account_ids(&["invalid".into()])
             .is_err()
     );
 
@@ -11092,7 +11285,9 @@ fn batch_names_preserve_selection() {
         )
         .unwrap();
     assert_eq!(
-        app.display_names_for_account_ids(&requested).unwrap()[&ids[1]],
+        app.directory()
+            .display_names_for_account_ids(&requested)
+            .unwrap()[&ids[1]],
         "updated"
     );
 }
@@ -11106,12 +11301,14 @@ fn batch_display_name_lookup_opens_one_directory_cache_per_local_account() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let contact = format!("{:064x}", 45);
 
-    app.save_directory_entry(&test_directory_record(&contact, "Batch Contact", 1))
+    app.directory()
+        .save_directory_entry_for_test(&test_directory_record(&contact, "Batch Contact", 1))
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
     for _ in 0..5 {
         let names = app
+            .directory()
             .display_names_for_account_ids(&[contact.clone(), bob.account_id_hex.clone()])
             .unwrap();
         assert_eq!(names.get(&contact), Some(&"Batch Contact".to_owned()));
@@ -11168,7 +11365,8 @@ fn cached_identity_page_is_order_stable_and_distinguishes_local_from_remote() {
     let unknown = format!("{:064x}", 47);
     let malformed = "not-a-public-key".to_owned();
 
-    app.save_directory_entry(&test_directory_record(&remote, "Remote Peer", 1))
+    app.directory()
+        .save_directory_entry_for_test(&test_directory_record(&remote, "Remote Peer", 1))
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
@@ -11181,6 +11379,7 @@ fn cached_identity_page_is_order_stable_and_distinguishes_local_from_remote() {
         bob.account_id_hex.clone(),
     ];
     let page = app
+        .directory()
         .cached_identity_projections_for_account_ids(&requested)
         .unwrap();
 
@@ -11236,8 +11435,9 @@ fn cached_identity_page_rejects_oversized_input() {
     let oversized = vec!["00".repeat(32); MAX_CACHED_IDENTITY_PAGE_SIZE + 1];
 
     assert!(matches!(
-        app.cached_identity_projections_for_account_ids(&oversized),
-        Err(AppError::InvalidCachedIdentityPage(_))
+        app.directory()
+            .cached_identity_projections_for_account_ids(&oversized),
+        Err(DirectoryError::InvalidCachedIdentityPage(_))
     ));
 }
 
@@ -11248,7 +11448,8 @@ fn cached_identity_page_acquires_directory_handles_once_for_100_ids() {
     home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let remote = format!("{:064x}", 48);
-    app.save_directory_entry(&test_directory_record(&remote, "Bulk Peer", 1))
+    app.directory()
+        .save_directory_entry_for_test(&test_directory_record(&remote, "Bulk Peer", 1))
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
@@ -11258,6 +11459,7 @@ fn cached_identity_page_acquires_directory_handles_once_for_100_ids() {
 
     let before = app.directory_handle_acquire_count_for_test();
     let page = app
+        .directory()
         .cached_identity_projections_for_account_ids(&requested)
         .unwrap();
     let after_page = app.directory_handle_acquire_count_for_test();
@@ -11267,7 +11469,7 @@ fn cached_identity_page_acquires_directory_handles_once_for_100_ids() {
     assert_eq!(after_page, before + 1);
 
     for account_id in &requested {
-        let _ = app.directory_entry_for_account_id(account_id);
+        let _ = app.directory().directory_entry_for_account_id(account_id);
     }
     assert_eq!(
         app.directory_handle_acquire_count_for_test(),
@@ -11300,7 +11502,8 @@ fn warm_directory_storage_opens_shared_and_local_directory_handles() {
         Some("alice".to_owned())
     );
     assert_eq!(
-        app.display_names_for_account_ids(&[bob.account_id_hex.clone(), public_key])
+        app.directory()
+            .display_names_for_account_ids(&[bob.account_id_hex.clone(), public_key])
             .unwrap()
             .get(&bob.account_id_hex),
         Some(&"bob".to_owned())
@@ -11440,6 +11643,7 @@ fn legacy_plaintext_directory_cache_migrates_once_into_resident_cache() {
 
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&contact)
         .unwrap()
         .unwrap();
@@ -11460,6 +11664,7 @@ fn legacy_plaintext_directory_cache_migrates_once_into_resident_cache() {
     assert!(open_count_after_migration >= 1);
 
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&contact)
         .unwrap()
         .unwrap();
@@ -11496,7 +11701,10 @@ fn legacy_plaintext_directory_cache_migrates_to_shared_storage_without_account_c
         .public_directory_user(&contact)
         .unwrap()
         .unwrap();
-    let hydrated = app.hydrate_public_directory_record(shared_entry).unwrap();
+    let hydrated = app
+        .directory()
+        .hydrate_public_directory_record(shared_entry)
+        .unwrap();
     assert_eq!(
         hydrated.profile.and_then(|profile| profile.name),
         Some("Shared Legacy Contact".to_owned())
@@ -11554,7 +11762,7 @@ fn directory_entries_and_save_keep_newer_shared_record() {
         .put_public_directory_user(&public_directory_user_record(&fresh).unwrap())
         .unwrap();
 
-    let listed = app.directory_entries().unwrap();
+    let listed = app.directory().directory_entries().unwrap();
     let listed_entry = listed
         .iter()
         .find(|entry| entry.account_id_hex == contact)
@@ -11567,9 +11775,11 @@ fn directory_entries_and_save_keep_newer_shared_record() {
         Some("new-shared")
     );
 
-    app.save_directory_entry_with_reason(&stale, "stale-cache")
+    app.directory()
+        .save_directory_entry_with_reason_for_test(&stale, "stale-cache")
         .unwrap();
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&contact)
         .unwrap()
         .unwrap();
@@ -11588,28 +11798,17 @@ fn received_message_sender_is_admitted_to_directory_cache() {
     let sender = format!("{:064x}", 42);
 
     assert!(
-        app.directory_entry_for_account_id(&sender)
+        app.directory()
+            .directory_entry_for_account_id(&sender)
             .unwrap()
             .is_none()
     );
-    app.remember_directory_message_sender(&ReceivedMessage {
-        authority: None,
-        message_id_hex: "message-id".to_owned(),
-        source_message_id_hex: "source-message-id".to_owned(),
-        sender: sender.clone(),
-        sender_display_name: None,
-        group_id: GroupId::new(vec![0x01]),
-        source_epoch: 0,
-        retention: None,
-        plaintext: "hello".to_owned(),
-        kind: MARMOT_APP_EVENT_KIND_CHAT,
-        tags: Vec::new(),
-        recorded_at: 0,
-        received_at: 0,
-    })
-    .unwrap();
+    app.directory()
+        .remember_directory_message_sender(&sender)
+        .unwrap();
 
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&sender)
         .unwrap()
         .unwrap();
@@ -11626,10 +11825,11 @@ fn directory_sync_plan_watches_local_accounts_and_known_users() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let contact = format!("{:064x}", 42);
 
-    app.remember_directory_user_with_reason(&contact, "message")
+    app.directory()
+        .remember_directory_user_with_reason_for_test(&contact, "message")
         .unwrap();
 
-    let plan = app.directory_sync_plan().unwrap();
+    let plan = app.directory().directory_sync_plan_for_test().unwrap();
     let watched = plan
         .batches
         .iter()
@@ -11656,10 +11856,11 @@ fn directory_sync_plan_does_not_subscribe_kind3_for_non_local_known_user() {
     // A non-local known user (e.g. a message sender) is admitted to the
     // directory but must never have its kind-3 contact list subscribed: doing
     // so feeds the unbounded transitive social-graph crawl (mdk#687).
-    app.remember_directory_user_with_reason(&sender, "message")
+    app.directory()
+        .remember_directory_user_with_reason_for_test(&sender, "message")
         .unwrap();
 
-    let plan = app.directory_sync_plan().unwrap();
+    let plan = app.directory().directory_sync_plan_for_test().unwrap();
 
     let local_kinds = plan
         .batches
@@ -11712,7 +11913,7 @@ fn contact_list_event(author_hex: &str, follows: &[String]) -> NostrTransportEve
 
 #[test]
 fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follows() {
-    use crate::directory::records::MAX_FOLLOW_LIST_ENTRIES;
+    use nostr_directory::MAX_FOLLOW_LIST_ENTRIES;
 
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -11721,7 +11922,8 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
 
     // A remote, non-local user whose contact list arrives over a relay.
     let author = format!("{:064x}", 42);
-    app.remember_directory_user_with_reason(&author, "message")
+    app.directory()
+        .remember_directory_user_with_reason_for_test(&author, "message")
         .unwrap();
 
     // Build a contact list far larger than the per-list cap.
@@ -11734,10 +11936,13 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
         event: contact_list_event(&author, &follows),
     };
 
-    app.ingest_directory_relay_event(record).unwrap();
+    app.directory()
+        .ingest_directory_relay_event(record)
+        .unwrap();
 
     // None of the followed pubkeys may be promoted into known directory entries.
     let known_ids = app
+        .directory()
         .directory_entries()
         .unwrap()
         .into_iter()
@@ -11752,6 +11957,7 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
 
     // The author's cached follow edges are bounded by the per-list cap.
     let author_entry = app
+        .directory()
         .directory_entry_for_account_id(&author)
         .unwrap()
         .unwrap();
@@ -11759,7 +11965,7 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
 
     // The directory sync plan still watches only the author and local account,
     // never the discovered follows — so no transitive crawl is scheduled.
-    let plan = app.directory_sync_plan().unwrap();
+    let plan = app.directory().directory_sync_plan_for_test().unwrap();
     let watched = plan
         .batches
         .iter()
@@ -11778,7 +11984,7 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
     // per-account search graph, even though the follows are not promoted.
     let cache = app.directory_cache_for_account(&account).unwrap();
     let search_record = cache
-        .search_record(&author, crate::unix_now_seconds() as i64)
+        .search_record_for_test(&author, crate::unix_now_seconds() as i64)
         .unwrap()
         .unwrap();
     assert_eq!(search_record.follows.len(), MAX_FOLLOW_LIST_ENTRIES);
@@ -11808,11 +12014,12 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
         .to_string(),
     );
     event.created_at = 1_700_000_867;
-    app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
-        endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
-        event,
-    })
-    .unwrap();
+    app.directory()
+        .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
+            endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
+            event,
+        })
+        .unwrap();
 
     let assert_bounded_extra = |profile: &UserProfileMetadata| {
         assert_eq!(profile.name.as_deref(), Some("alice"));
@@ -11837,6 +12044,7 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
     };
 
     let cached = app
+        .directory()
         .directory_entry_for_account_id(&author)
         .unwrap()
         .expect("ingested profile is cached");
@@ -11868,6 +12076,7 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
     drop(app);
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let reopened = app
+        .directory()
         .directory_entries()
         .unwrap()
         .into_iter()
@@ -11910,11 +12119,12 @@ fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
         .to_string(),
     );
     event.created_at = 1_700_000_868;
-    app.ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
-        endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
-        event,
-    })
-    .unwrap();
+    app.directory()
+        .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
+            endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
+            event,
+        })
+        .unwrap();
 
     let assert_normalized = |profile: &UserProfileMetadata, source_relays: Option<&[String]>| {
         let single = "firstsecond[2Jthird";
@@ -11938,6 +12148,7 @@ fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
     };
 
     let cached = app
+        .directory()
         .directory_entry_for_account_id(&author)
         .unwrap()
         .expect("ingested profile is cached")
@@ -11964,6 +12175,7 @@ fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
     drop(app);
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let reopened = app
+        .directory()
         .directory_entries()
         .unwrap()
         .into_iter()
@@ -11986,28 +12198,32 @@ fn local_account_directory_refresh_still_promotes_follows() {
     // A user-initiated refresh of a local account's own follow list (distinct
     // from passive relay ingest) intentionally records its follows so they are
     // searchable and watched.
-    app.remember_directory_user_with_reason(&account.account_id_hex, "local")
+    app.directory()
+        .remember_directory_user_with_reason_for_test(&account.account_id_hex, "local")
         .unwrap();
     let follow_list = FetchedFollowList {
         follows: vec![follow.clone()],
         source_relays: vec!["wss://relay.example".to_owned()],
     };
-    app.remember_directory_follow_list_for_test(&account.account_id_hex, &follow_list)
+    app.directory()
+        .remember_directory_follow_list_for_test(&account.account_id_hex, &follow_list)
         .unwrap();
 
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&account.account_id_hex)
         .unwrap()
         .unwrap();
     assert_eq!(entry.follows, vec![follow.clone()]);
     assert!(
-        app.directory_entry_for_account_id(&follow)
+        app.directory()
+            .directory_entry_for_account_id(&follow)
             .unwrap()
             .is_some(),
         "an explicit follow-list refresh promotes follows into directory entries"
     );
 
-    let plan = app.directory_sync_plan().unwrap();
+    let plan = app.directory().directory_sync_plan_for_test().unwrap();
     let local_batch = plan
         .batches
         .iter()
@@ -12031,7 +12247,7 @@ fn empty_follow_fetch_preserves_cached_edges() {
         key_package: None,
     };
 
-    let selected = directory::cached_or_unknown_follow_list(
+    let selected = nostr_directory::cached_or_unknown_follow_list(
         Some(cached),
         &[TransportEndpoint("wss://queried.example".to_owned())],
     );
@@ -12478,7 +12694,7 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
                 &format!("retained-history-{index}"),
             );
             client.remember_seen_event(event.id.clone());
-            inject_epoch_gap_probe(&app, event).await;
+            route_group_probe(&client, event).await;
         }
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -12757,8 +12973,11 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
         let relay = Arc::new(ScriptedPushRelayClient::default());
         let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
-        app.relay_plane =
-            MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay, true);
+        app.relay_plane = MarmotRelayPlane::new_with_loopback(
+            Some(Duration::from_secs(120)),
+            relay.clone(),
+            true,
+        );
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client.create_group("overflow spill", &[]).await.unwrap();
         let nostr_group_id_hex = app
@@ -12788,10 +13007,10 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
         for index in 0..transport_nostr::ACCOUNT_DELIVERY_BUFFER + NEW {
             let event = probe(index);
             expected.push(event.id.clone());
-            inject_epoch_gap_probe(&app, event).await;
+            route_group_probe(&client, event).await;
         }
         for event in known {
-            inject_epoch_gap_probe(&app, event).await;
+            route_group_probe(&client, event).await;
         }
         let health = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -12842,16 +13061,11 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
             .len();
         drop(client);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        for _ in 0..spilled_before_reopen {
-            let received =
-                tokio::time::timeout(Duration::from_secs(5), client.receive_next_delivery())
-                    .await
-                    .expect("spilled rows are admitted after reopen")
-                    .unwrap();
-            let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
-                panic!("a spill never creates a loss generation");
-            };
-            client.ingest_received_delivery(*delivery).await.unwrap();
+        report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+        for _ in 0..=spilled_before_reopen {
+            if !client.admit_native_turn().await.unwrap() {
+                break;
+            }
         }
         assert!(
             storage
@@ -12941,8 +13155,8 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         // fills its queue. Their in-memory max is above the older event that
         // will be omitted, but they must not promote the durable drain floor.
         for index in 0..3_u64 {
-            inject_epoch_gap_probe(
-                &app,
+            route_group_probe(
+                &client,
                 epoch_gap_probe(
                     &nostr_group_id_hex,
                     cursor_before + 4_000 - index,
@@ -12971,8 +13185,8 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
             if index == transport_nostr::ACCOUNT_DELIVERY_BUFFER {
                 omitted_timestamp = created_at;
             }
-            inject_epoch_gap_probe(
-                &app,
+            route_group_probe(
+                &client,
                 epoch_gap_probe(
                     &nostr_group_id_hex,
                     created_at,
@@ -13055,6 +13269,7 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         // needed to prove cursor safety across this handoff and reopen.
         let grant = client
             .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Receive)
+            .await
             .unwrap();
         drop(grant);
         assert!(
@@ -13074,12 +13289,80 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
     });
 }
 
+#[test]
+fn replay_fences_cursor_on_save() {
+    run_composed_app_runtime_test("unfinished-replay-checkpoint", || async {
+        let mut fixture = LiveCursorFixture::open().await;
+        fixture._eose.0.abort();
+        let _ = (&mut fixture._eose.0).await;
+        fixture
+            .client
+            .runtime
+            .activate_transport(None)
+            .await
+            .unwrap();
+        assert!(
+            !fixture
+                .client
+                .adapter
+                .account_subscription_eose()
+                .await
+                .complete()
+        );
+
+        let id = fixture
+            .relay
+            .accepted_subscriptions()
+            .iter()
+            .rev()
+            .find(|subscription| {
+                matches!(
+                    subscription,
+                    NostrSubscription::Group { .. } | NostrSubscription::GroupBatch { .. }
+                )
+            })
+            .expect("the fresh activation issued the group's REQ")
+            .subscription_id();
+        fixture
+            .app
+            .relay_plane
+            .handle_relay_event_for_test(NostrRelayEvent {
+                endpoint: TransportEndpoint("wss://relay.example".into()),
+                subscription_id: Some(id),
+                event: fixture.probe(fixture.cursor_before + 1_000, "held ciphertext"),
+            })
+            .await
+            .unwrap();
+
+        // An independent inbox delivery may have advanced the in-memory
+        // candidate while group ciphertext is still held outside the router.
+        fixture.client.state.last_transport_timestamp = Some(fixture.cursor_before + 4_000);
+        let sealed = fixture.client.seal_transport_cursor();
+        fixture
+            .client
+            .save_state_with_pending_local_group_deletion_frontier_clears()
+            .unwrap();
+        fixture.client.settle_transport_cursor(
+            sealed,
+            marmot_forensics::TransportCursorTrigger::DrainCheckpoint,
+        );
+        assert_eq!(fixture.persisted(), Some(fixture.cursor_before));
+
+        let reopened = fixture.reopen().await;
+        assert_eq!(
+            reopened.client.checkpointed_transport_timestamp,
+            Some(reopened.cursor_before)
+        );
+    });
+}
+
 /// One account that opened with `cursor_before` persisted (unless opened
 /// without a cursor), owns a group, and has every subscription past
 /// end-of-stored-events, so live ingests may promote its transport cursor.
 pub(crate) struct LiveCursorFixture {
     pub(crate) app: MarmotApp,
     pub(crate) client: crate::AppClient,
+    relay: Arc<ScriptedPushRelayClient>,
     account_id: MemberId,
     nostr_group_id_hex: String,
     pub(crate) cursor_before: u64,
@@ -13133,7 +13416,7 @@ impl LiveCursorFixture {
             seeded.last_transport_timestamp = Some(cursor_before);
             app.save_state(&seeded).unwrap();
         }
-        let eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+        let eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         let group_id = client.create_group("live cursor", &[]).await.unwrap();
         let nostr_group_id_hex = app
@@ -13149,9 +13432,11 @@ impl LiveCursorFixture {
         })
         .await
         .expect("every subscription finishes replaying stored history");
+        client.synchronize_native_replay().await.unwrap();
         Self {
             app,
             client,
+            relay,
             account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
             nostr_group_id_hex,
             cursor_before,
@@ -13214,6 +13499,7 @@ impl LiveCursorFixture {
         let Self {
             app,
             client,
+            relay,
             account_id,
             nostr_group_id_hex,
             cursor_before,
@@ -13225,6 +13511,7 @@ impl LiveCursorFixture {
         Self {
             app,
             client,
+            relay,
             account_id,
             nostr_group_id_hex,
             cursor_before,
@@ -13263,7 +13550,7 @@ impl LiveCursorFixture {
     /// longer asks relays for it.
     pub(crate) async fn reopen_and_admit_spilled(self, event_id: &str) -> Self {
         let mut fixture = self.reopen().await;
-        assert_eq!(fixture.ingest_next_live_delivery().await, event_id);
+        fixture.client.sync().await.unwrap();
         assert!(
             fixture
                 .client
@@ -13287,6 +13574,7 @@ impl LiveCursorFixture {
 
     pub(crate) async fn wait_for_queue_depth(&self, depth: usize) {
         tokio::time::timeout(Duration::from_secs(5), async {
+            // Queue visibility precedes the router's replay-placement acknowledgement.
             while self
                 .app
                 .relay_plane
@@ -13294,12 +13582,18 @@ impl LiveCursorFixture {
                 .await
                 .account_delivery_queue_depth
                 < depth
+                || !self
+                    .client
+                    .adapter
+                    .account_subscription_eose()
+                    .await
+                    .complete()
             {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("the router queues every injected probe");
+        .expect("the router queues and acknowledges every injected probe");
     }
 
     pub(crate) async fn ingest_next_live_delivery(&mut self) -> String {
@@ -13328,7 +13622,10 @@ impl LiveCursorFixture {
     ) -> (NostrTransportEvent, cgka_traits::TransportDelivery) {
         let late = self.probe(late_at, "late");
         let delivery = self.delivery(late.clone()).await;
-        inject_epoch_gap_probe(&self.app, self.probe(created_at, "promoting")).await;
+        let promoting = self.delivery(self.probe(created_at, "promoting")).await;
+        self.app
+            .relay_plane
+            .route_account_delivery_for_test(promoting);
         self.wait_for_queue_depth(1).await;
         (late, delivery)
     }
@@ -13362,8 +13659,8 @@ fn live_ingest_keeps_the_cursor_until_every_subscription_replayed_stored_history
             .nostr_routing
             .nostr_group_id_hex;
         assert!(!client.adapter.account_subscription_eose().await.complete());
-        inject_epoch_gap_probe(
-            &app,
+        route_group_probe(
+            &client,
             epoch_gap_probe(&nostr_group_id_hex, cursor_before + 4_000, "replaying"),
         )
         .await;
@@ -13393,7 +13690,11 @@ fn live_ingest_promotes_the_cursor_as_far_as_a_restart_still_fetches_the_queue()
             (cursor_before + 4_000, "newer"),
             (cursor_before + 1_000, "older"),
         ] {
-            inject_epoch_gap_probe(&fixture.app, fixture.probe(created_at, marker)).await;
+            let delivery = fixture.delivery(fixture.probe(created_at, marker)).await;
+            fixture
+                .app
+                .relay_plane
+                .route_account_delivery_for_test(delivery);
         }
         fixture.wait_for_queue_depth(2).await;
 
@@ -13527,7 +13828,13 @@ fn deliveries_older_than_the_promoted_floor_go_through_the_spill_and_are_all_adm
     run_composed_app_runtime_test("live-cursor-older-burst", || async {
         let mut fixture = LiveCursorFixture::open().await;
         let cursor_before = fixture.cursor_before;
-        inject_epoch_gap_probe(&fixture.app, fixture.probe(cursor_before + 4_000, "newest")).await;
+        let newest = fixture
+            .delivery(fixture.probe(cursor_before + 4_000, "newest"))
+            .await;
+        fixture
+            .app
+            .relay_plane
+            .route_account_delivery_for_test(newest);
         fixture.wait_for_queue_depth(1).await;
         fixture.ingest_next_live_delivery().await;
         assert_eq!(fixture.persisted(), Some(cursor_before + 4_000));
@@ -13539,7 +13846,11 @@ fn deliveries_older_than_the_promoted_floor_go_through_the_spill_and_are_all_adm
         for index in 0..OLDER {
             let event = fixture.probe(cursor_before + 2_000 + index, &format!("older-{index}"));
             older.push(event.id.clone());
-            inject_epoch_gap_probe(&fixture.app, event).await;
+            let delivery = fixture.delivery(event).await;
+            fixture
+                .app
+                .relay_plane
+                .route_account_delivery_for_test(delivery);
         }
         tokio::time::timeout(Duration::from_secs(5), async {
             while fixture
@@ -13603,8 +13914,8 @@ fn live_ingest_keeps_the_cursor_behind_a_queue_omission_after_replay() {
                 .set_account_delivery_recovery_marker_for_test(&fixture.account_id, marker)
         );
         for index in 0..=transport_nostr::ACCOUNT_DELIVERY_BUFFER {
-            inject_epoch_gap_probe(
-                &fixture.app,
+            route_group_probe(
+                &fixture.client,
                 fixture.probe(
                     cursor_before + 4_000 - index as u64,
                     &format!("burst-{index}"),
@@ -13787,14 +14098,6 @@ async fn own_relay_echo_requires_known_event_id_not_just_pubkey() {
     assert!(!receipts.contains(&hex::encode(same_pubkey_new_event.message.id.as_slice())));
     let peer_delivery = relay_delivery("peer", "44".repeat(32));
     assert!(!receipts.contains(&hex::encode(peer_delivery.message.id.as_slice())));
-}
-
-#[test]
-fn account_worker_is_spawned_as_abortable_async_task() {
-    let source = include_str!("runtime/account_worker.rs");
-
-    assert!(source.contains("tokio::spawn(run_app_runtime_account_worker"));
-    assert!(source.contains("managed account worker shutdown timed out; aborting"));
 }
 
 #[test]
@@ -17365,17 +17668,8 @@ async fn a_deferred_open_never_subscribes_a_departed_groups_route() {
         .remove_members(&removed_group, &[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    let received = tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
-        .await
-        .expect("the removal commit must fan out to bob's group route")
-        .unwrap();
-    let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
-        panic!("the test did not overflow its account delivery queue");
-    };
-    bob_client
-        .ingest_received_delivery(*delivery)
-        .await
-        .unwrap();
+    report_scripted_eose(&plane, &relay, every_subscription).await;
+    while bob_client.admit_native_turn().await.unwrap() {}
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !bob_client
         .runtime
@@ -17437,6 +17731,7 @@ async fn a_committed_leave_stops_routing_the_group_across_a_reopen() {
         .with_test_relay_client(relay.clone());
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
     let plane = MarmotRelayPlane::new(None, relay.clone());
+    let _eose = scripted_eose_pump(plane.clone(), relay.clone(), every_subscription);
 
     let mut alice = app
         .client_with_relay_plane("alice", &plane, None)
@@ -17626,20 +17921,11 @@ async fn an_admin_removal_clears_the_removed_devices_group_routes() {
         .remove_members(&removed_group, &[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    // The runtime's dominant receive path. The removal commit lands in the
-    // same epoch bob still holds, so the engine buffers it for distributed
-    // convergence instead of applying it inline.
-    let received = tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
-        .await
-        .expect("the removal commit must fan out to bob's group route")
-        .unwrap();
-    let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
-        panic!("the test did not overflow its account delivery queue");
-    };
-    bob_client
-        .ingest_received_delivery(*delivery)
-        .await
-        .unwrap();
+    // The native group lane waits for the current REQ's stored-history
+    // boundary before admitting the real locally published removal commit.
+    // It lands in bob's current epoch and buffers for convergence.
+    report_scripted_eose(&plane, &relay, every_subscription).await;
+    while bob_client.admit_native_turn().await.unwrap() {}
     // The scheduled-convergence path the account worker drives. This is the
     // field case: the removal was adopted through convergence, not inline.
     // Adoption cannot freeze until the settlement quiescence window closes, so
@@ -17703,42 +17989,6 @@ async fn an_admin_removal_clears_the_removed_devices_group_routes() {
 /// disband tombstones. The removed group is still in `state.groups`, so the
 /// rebuild seeded its subscriptions back and handed them straight to the adapter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn key_package_publication_never_issues_a_full_history_subscription() {
-    // An unfloored activation replays every held event on every route and
-    // leaves a notification lag's loss unbounded. Publishing or rotating a
-    // KeyPackage reuses the live activation, or rebuilds it from the cursor.
-    let dir = tempfile::tempdir().unwrap();
-    AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .with_test_relay_client(relay.clone());
-    let _pump = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
-    let mut client = client_on_app_relay_plane(&app, "alice").await;
-    client.create_group("floored", &[]).await.unwrap();
-    client.prepare_transport().await.unwrap();
-    let before = relay.accepted_subscriptions().len();
-    client.publish_key_package().await.unwrap();
-    client.rotate_key_package().await.unwrap();
-    let unfloored = relay.accepted_subscriptions()[before..]
-        .iter()
-        .filter(|subscription| {
-            matches!(
-                subscription,
-                NostrSubscription::AccountInbox { since: None, .. }
-                    | NostrSubscription::Group { since: None, .. }
-                    | NostrSubscription::GroupBatch { since: None, .. }
-            )
-        })
-        .count();
-    assert_eq!(
-        unfloored, 0,
-        "a KeyPackage publication replayed full history"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_routing_rebuild_after_a_removal_does_not_resubscribe_the_removed_group() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -17778,17 +18028,8 @@ async fn a_routing_rebuild_after_a_removal_does_not_resubscribe_the_removed_grou
         .remove_members(&removed_group, &[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    let received = tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
-        .await
-        .expect("the removal commit must fan out to bob's group route")
-        .unwrap();
-    let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
-        panic!("the test did not overflow its account delivery queue");
-    };
-    bob_client
-        .ingest_received_delivery(*delivery)
-        .await
-        .unwrap();
+    report_scripted_eose(&plane, &relay, every_subscription).await;
+    while bob_client.admit_native_turn().await.unwrap() {}
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !bob_client
         .runtime
@@ -17883,17 +18124,8 @@ async fn a_removed_device_fails_a_composer_send_before_projecting_a_row() {
         .remove_members(&group_id, &[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    let received = tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
-        .await
-        .expect("the removal commit must fan out to bob's group route")
-        .unwrap();
-    let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
-        panic!("the test did not overflow its account delivery queue");
-    };
-    bob_client
-        .ingest_received_delivery(*delivery)
-        .await
-        .unwrap();
+    report_scripted_eose(&plane, &relay, every_subscription).await;
+    while bob_client.admit_native_turn().await.unwrap() {}
     // The removal lands in the epoch bob still holds, so convergence adopts it
     // rather than the inline commit-apply path.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -17953,12 +18185,14 @@ async fn local_delete_compensation_preserves_primary_error_and_attempts_route_re
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
     let group_id = client.create_group("compensation", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
     let routes_before = client.routing.snapshot().group_routes;
 
     relay.block_next_unsubscribe();
+    let deleted_group = group_id.clone();
     let delete = tokio::spawn(async move {
-        let result = client.delete_group_local(&group_id).await;
-        (result, client.routing.snapshot().group_routes)
+        let result = client.delete_group_local(&deleted_group).await;
+        (result, client)
     });
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -17967,21 +18201,41 @@ async fn local_delete_compensation_preserves_primary_error_and_attempts_route_re
     .await
     .unwrap();
     app.close_storage().unwrap();
-    relay.fail_next_subscribe();
     relay.release_unsubscribe();
 
-    let (result, routes_after) = delete.await.unwrap();
+    let (result, client) = delete.await.unwrap();
     let error = format!("{:?}", result.unwrap_err());
     assert!(
         error.contains("Closed"),
         "the original storage-delete failure must win over compensation failures: {error}"
     );
-    assert_eq!(routes_after, routes_before);
+    assert_eq!(client.routing.snapshot().group_routes, routes_before);
+    // Restoring native transport first reads durable replay state, so closed
+    // storage prevents a new REQ. Keep the route and its refresh intent instead.
+    assert!(client.has_pending_runtime_group_subscription_refresh());
+    drop(client);
+
+    let reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    assert!(reopened.group("alice", &group_id_hex).unwrap().is_some());
+    assert_eq!(
+        reopened
+            .account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .local_group_deletion_frontier(&group_id_hex)
+            .unwrap(),
+        None,
+    );
+    let before_restore = relay.accepted_subscriptions().len();
+    let mut restored = reopened.client("alice").await.unwrap();
+    restored.prepare_transport().await.unwrap();
+    assert_eq!(restored.routing.snapshot().group_routes, routes_before);
     assert!(
-        !relay
-            .fail_next_subscribe
-            .load(std::sync::atomic::Ordering::SeqCst),
-        "runtime route restoration must still be attempted after storage compensation fails"
+        relay.accepted_subscriptions()[before_restore..]
+            .iter()
+            .any(|subscription| subscription.carries_group(&group_id)),
+        "reopening must restore a real subscription for the undeleted group"
     );
 }
 
@@ -20078,28 +20332,26 @@ async fn an_escalation_recorded_during_a_received_delivery_rides_that_seam() {
 /// A delivery whose ingest fails must stay retryable on the same reused
 /// client.
 ///
-/// `receive_next_delivery` must not mark the id seen before
-/// `ingest_received_delivery` commits it: a pre-ingest mark would poison the
-/// seen-events index on failure, so the reused client would silently skip the
-/// event when the relay redelivers it.
+/// Native admission must not mark the id seen or acknowledge its loan before
+/// ingest commits it. The retained frame retries without another relay copy.
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failed_ingest_leaves_the_delivery_retryable_on_the_reused_client() {
-    assert_failed_delivery_cursor_pin(FailedDeliveryRecovery::Redelivery).await;
+async fn native_failed_ingest_cursor() {
+    assert_failed_cursor_pin(FailedDeliveryRecovery::Redelivery).await;
 }
 
 /// Projection repair must release its taken delivery without relay redelivery.
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn quiet_projection_retry_releases_the_failed_delivery_cursor_pin() {
-    assert_failed_delivery_cursor_pin(FailedDeliveryRecovery::QuietProjectionRetry).await;
+async fn native_quiet_cursor_retry() {
+    assert_failed_cursor_pin(FailedDeliveryRecovery::QuietProjectionRetry).await;
 }
 
 /// A failure before engine admission still needs a real ingest before release.
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pre_engine_ingest_failure_keeps_the_delivery_cursor_pin() {
-    assert_failed_delivery_cursor_pin(FailedDeliveryRecovery::BeforeEngine).await;
+async fn native_pre_ingest_cursor() {
+    assert_failed_cursor_pin(FailedDeliveryRecovery::BeforeEngine).await;
 }
 
 #[cfg(feature = "test-policy-overrides")]
@@ -20110,7 +20362,7 @@ enum FailedDeliveryRecovery {
 }
 
 #[cfg(feature = "test-policy-overrides")]
-async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
+async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -20137,18 +20389,6 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
         .create_group("retryable failed ingest", &[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    let inject = |event: NostrTransportEvent| {
-        let plane = plane.clone();
-        async move {
-            plane
-                .handle_relay_event_for_test(NostrRelayEvent {
-                    endpoint: TransportEndpoint("wss://relay.example".to_owned()),
-                    subscription_id: None,
-                    event,
-                })
-                .await
-        }
-    };
     assert!(
         bob_client
             .sync()
@@ -20158,6 +20398,8 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
             .contains(&group_id),
         "bob must join before the failing application message",
     );
+    report_scripted_eose(&plane, &relay, every_subscription).await;
+    while bob_client.admit_native_turn().await.unwrap() {}
     bob_client.take_pending_projection_updates();
     bob_client.take_pending_applied_sync_summary();
 
@@ -20175,26 +20417,21 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
         .find(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
         .cloned()
         .expect("published group message backing the send");
-    let delivery = tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
-        .await
-        .expect("locally fanned-out application message")
-        .unwrap();
-    let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = delivery else {
-        panic!("the test did not overflow its account delivery queue");
-    };
-    let delivery = *delivery;
-    let event_id = hex::encode(delivery.message.id.as_slice());
+    let message = relay_event.to_transport_message().unwrap();
+    let event_id = hex::encode(message.id.as_slice());
     assert_eq!(event_id, relay_event.id);
-    let later_cursor = delivery.message.timestamp.0 + 10_000;
+    let later_cursor = message.timestamp.0 + 10_000;
     let probe_cursor = |client: &AppClient| {
-        let sealed = client.adapter.seal_transport_cursor(Some(later_cursor));
+        let sealed = client
+            .adapter
+            .seal_transport_cursor(Some(later_cursor), |_| true);
         client
             .adapter
             .unseal_transport_cursor(client.state.last_transport_timestamp);
         sealed
     };
     if matches!(recovery, FailedDeliveryRecovery::BeforeEngine) {
-        bob_client.fail_ingest_of = Some(delivery.message.id.clone());
+        bob_client.fail_ingest_of = Some(message.id);
     } else {
         bob_client
             .app
@@ -20202,7 +20439,7 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
             .dev_fail_ingest_after_application_event_ack = true;
     }
     bob_client
-        .ingest_received_delivery(delivery)
+        .admit_native_turn()
         .await
         .expect_err("the injected ingest failure must surface");
     assert!(
@@ -20210,7 +20447,7 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
         "a failed ingest must not mark the delivery seen",
     );
     assert!(
-        probe_cursor(&bob_client).is_some_and(|cursor| cursor < later_cursor),
+        probe_cursor(&bob_client).is_none_or(|cursor| cursor < later_cursor),
         "a taken delivery must cap the cursor while its ingest remains failed",
     );
 
@@ -20226,6 +20463,8 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
             .await
             .expect("quiet retry must complete the retained projection");
         assert!(!bob_client.has_pending_effect_projections());
+        report_scripted_eose(&plane, &relay, every_subscription).await;
+        assert!(bob_client.admit_native_turn().await.unwrap());
         assert_eq!(
             probe_cursor(&bob_client),
             Some(later_cursor),
@@ -20245,28 +20484,17 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
                     .unwrap(),
             );
             assert!(
-                probe_cursor(&bob_client).is_some_and(|cursor| cursor < later_cursor),
+                probe_cursor(&bob_client).is_none_or(|cursor| cursor < later_cursor),
                 "projection retry must not release an unaccepted delivery",
             );
         }
+        report_scripted_eose(&plane, &relay, every_subscription).await;
         assert!(
-            inject(relay_event).await.expect("route the redelivery") >= 1,
-            "the group route must accept the redelivery",
-        );
-        let redelivery =
-            tokio::time::timeout(Duration::from_secs(5), bob_client.receive_next_delivery())
+            bob_client
+                .admit_native_turn()
                 .await
-                .expect("redelivered application message")
-                .unwrap();
-        let transport_nostr::AccountDeliveryReceive::Delivery(redelivery) = redelivery else {
-            panic!("the test did not overflow its account delivery queue");
-        };
-        let redelivery = *redelivery;
-        assert_eq!(hex::encode(redelivery.message.id.as_slice()), event_id);
-        let summary = bob_client
-            .ingest_received_delivery(redelivery)
-            .await
-            .expect("the retry must ingest the redelivered event");
+                .expect("the retry must ingest the retained native frame")
+        );
         assert!(
             bob_client.seen_events_index.contains(&event_id),
             "a successful ingest must mark the delivery seen",
@@ -20276,7 +20504,7 @@ async fn assert_failed_delivery_cursor_pin(recovery: FailedDeliveryRecovery) {
             Some(later_cursor),
             "successful redelivery must release the original cursor pin",
         );
-        summary
+        bob_client.take_pending_applied_sync_summary()
     };
     // A post-ack failure already projected the message without returning its
     // summary; a pre-engine failure projected nothing. Either recovery path
@@ -20732,49 +20960,90 @@ fn a_transport_deferred_delivery_is_still_marked_seen() {
 }
 
 /// The same rule at the catch-up drain seam: a refused delivery must leave both
-/// the seen index and the transport cursor untouched there too, so the relay
-/// re-serves it on the next drain instead of the app skipping it.
+/// the seen index and the durable transport cursor untouched there too, so a
+/// restarted client's new history REQ can re-serve the exact same object.
 #[test]
 fn a_refused_delivery_stays_fetchable_through_the_catch_up_drain() {
     run_composed_app_runtime_test("refused-ingest-drain-seam", || async {
+        use cgka_traits::storage::MessageStorage;
+
         let dir = tempfile::tempdir().unwrap();
         let filled_through = crate::unix_now_seconds() - 1_000;
-        let (app, mut client, route) =
-            group_at_the_undecryptable_retention_cap(&dir, filled_through).await;
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
+            &dir,
+            &relay,
+            MarmotAppConfig::white_noise(),
+            filled_through,
+        )
+        .await;
+        {
+            let _eose =
+                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+            client
+                .sync()
+                .await
+                .expect("the retained prefix must checkpoint");
+        }
+        assert_eq!(
+            app.load_state("alice").unwrap().last_transport_timestamp,
+            Some(filled_through),
+        );
 
         let refused = epoch_gap_probe(
             &route.nostr_group_id_hex,
             filled_through + 500,
             "refused-in-the-drain",
         );
-        let refused_id = refused.id.clone();
-        inject_epoch_gap_probe(&app, refused.clone()).await;
-        client.sync().await.expect("the drain must complete");
+        let message_id = refused.to_transport_message().unwrap().id;
+        for expected_refusals in 1..=2 {
+            // Filling the real backlog may outlast the original source lease.
+            // Each drain starts with a fresh lifecycle-owned history REQ.
+            let before_reopen = relay.accepted_subscriptions().len();
+            drop(client);
+            client = client_on_app_relay_plane(&app, "alice").await;
+            client.prepare_transport().await.unwrap();
+            let subscription_id = relay.accepted_subscriptions()[before_reopen..]
+                .iter()
+                .rev()
+                .find(|subscription| subscription.carries_group(&route.group_id))
+                .expect("the open client issued a group history REQ")
+                .subscription_id();
+            assert_eq!(
+                app.relay_plane
+                    .handle_relay_event_for_test(NostrRelayEvent {
+                        endpoint: TransportEndpoint("wss://relay.example".to_owned()),
+                        subscription_id: Some(subscription_id),
+                        event: refused.clone(),
+                    })
+                    .await
+                    .unwrap(),
+                1,
+            );
+            let _eose =
+                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+            client
+                .sync()
+                .await
+                .expect("the history drain must complete");
 
-        assert_eq!(
-            recorded_ingest_outcomes(&app, &refused_id),
-            vec!["resource_refused".to_owned()],
-            "the backlog must be full, so the drain's object is refused",
-        );
-        assert!(
-            !client.seen_events_index.contains(&refused_id),
-            "the drain must not mark a refused object seen",
-        );
-        assert_eq!(
-            client.state.last_transport_timestamp,
-            Some(filled_through),
-            "nor carry the relay `since` floor past it",
-        );
-
-        // The relay re-serves it on the next drain, and the drain ingests it
-        // again rather than counting it as an already-seen skip.
-        inject_epoch_gap_probe(&app, refused).await;
-        client.sync().await.expect("the second drain must complete");
-        assert_eq!(
-            recorded_ingest_outcomes(&app, &refused_id),
-            vec!["resource_refused".to_owned(), "resource_refused".to_owned()],
-            "the re-served object must reach the engine again",
-        );
+            assert_eq!(
+                recorded_ingest_outcomes(&app, &refused.id),
+                vec!["resource_refused".to_owned(); expected_refusals],
+                "each REQ's exact re-served object must reach engine admission",
+            );
+            assert!(!client.seen_events_index.contains(&refused.id));
+            let persisted = app.load_state("alice").unwrap();
+            assert!(!persisted.seen_events.contains(&refused.id));
+            assert_eq!(client.state.last_transport_timestamp, Some(filled_through));
+            assert_eq!(persisted.last_transport_timestamp, Some(filled_through));
+            assert!(matches!(
+                app.account_storage("alice")
+                    .unwrap()
+                    .get_message(&message_id),
+                Err(cgka_traits::storage::StorageError::NotFound)
+            ));
+        }
     });
 }
 
@@ -20847,7 +21116,7 @@ fn close_storage_releases_every_database_and_the_root_lease() {
     assert!(
         matches!(
             directory_cache.entries(),
-            Err(AppError::Storage(err)) if err.is_closed()
+            Err(DirectoryError::Storage(err)) if err.is_closed()
         ),
         "the directory cache connection must be closed, not just uncached",
     );
@@ -21211,7 +21480,7 @@ fn assert_suspension_storage_closed(
     assert!(shared.is_closed());
     assert!(matches!(
         directory.entries(),
-        Err(AppError::Storage(error)) if error.is_closed()
+        Err(DirectoryError::Storage(error)) if error.is_closed()
     ));
     for database in [session_path, shared_path] {
         for suffix in ["-wal", "-shm"] {
@@ -22639,7 +22908,7 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
             "unsaved receipts",
             "direct ingest",
             "sdk drain",
-            "receive",
+            "native receive",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -22677,7 +22946,7 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                 assert!(client.seen_events_index.contains(&probe.id));
             }
             storage.release_message_for_replay(&record).unwrap();
-            if matches!(handling, "direct ingest" | "sdk drain" | "receive") {
+            if matches!(handling, "direct ingest" | "sdk drain" | "native receive") {
                 // Readmit immediately, with no effect observation, explicit
                 // reconcile or unrelated checkpoint to clean up the cache.
                 if handling == "direct ingest" {
@@ -22687,21 +22956,16 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                         .unwrap();
                 } else {
                     inject_epoch_gap_probe(&app, probe.clone()).await;
+                    report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+                    let _eose = scripted_eose_pump(
+                        app.relay_plane.clone(),
+                        relay.clone(),
+                        every_subscription,
+                    );
                     if handling == "sdk drain" {
                         client.sync().await.unwrap();
                     } else {
-                        let received = tokio::time::timeout(
-                            Duration::from_secs(5),
-                            client.receive_next_delivery(),
-                        )
-                        .await
-                        .unwrap()
-                        .unwrap();
-                        let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received
-                        else {
-                            panic!("unexpected overflow")
-                        };
-                        client.ingest_received_delivery(*delivery).await.unwrap();
+                        assert!(client.admit_native_turn().await.unwrap());
                     }
                 }
                 assert_eq!(
@@ -22768,6 +23032,8 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                     .any(|item| hex::encode(item.event_id) == probe.id)
             );
             inject_epoch_gap_probe(&app, probe.clone()).await;
+            let _eose =
+                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
             client.sync().await.unwrap();
             assert_eq!(
                 recorded_ingest_outcomes(&app, &probe.id).len(),
@@ -23288,6 +23554,7 @@ fn presentation_worker_refreshes_without_screen_subscribers_and_recovers_notific
         let storage = app.account_storage("alice").unwrap();
         // No UI or presentation subscriber is attached for initial hydration or this update.
         let mut entry = app
+            .directory()
             .directory_entry_for_account_id(&bob.account_id_hex)
             .unwrap()
             .unwrap();
@@ -23296,7 +23563,9 @@ fn presentation_worker_refreshes_without_screen_subscribers_and_recovers_notific
             created_at: unix_now_seconds() + 1,
             ..Default::default()
         });
-        app.save_directory_entry(&entry).unwrap();
+        app.directory()
+            .save_directory_entry_for_test(&entry)
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let storage_sqlite::ChatPresentationRead::Ready(value) =
@@ -23481,180 +23750,6 @@ fn assert_group_catching_up<T: std::fmt::Debug>(
         Err(AppError::GroupCatchingUp(held)) => assert_eq!(held, group_hex, "{operation}"),
         other => panic!("{operation} must refuse while the group is behind, got {other:?}"),
     }
-}
-
-/// Opens alice's client on an app that accepts loopback blob servers and
-/// creates a group for an upload hold test.
-async fn upload_hold_fixture(
-    name: &str,
-) -> (
-    tempfile::TempDir,
-    MarmotApp,
-    AppClient,
-    GroupId,
-    cgka_traits::EpochId,
-) {
-    let dir = tempfile::tempdir().unwrap();
-    AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let app = MarmotApp::with_relay_and_config(
-        dir.path(),
-        "wss://relay.example",
-        crate::MarmotAppConfig::white_noise().with_allow_loopback_blob_endpoints(true),
-    )
-    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-    let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group(name, &[]).await.unwrap();
-    let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
-    (dir, app, client, group_id, epoch)
-}
-
-/// Prepares an upload to `group_id` up to its HTTP step, which binds its media
-/// key to the group's epoch and starts its hold.
-async fn prepare_held_upload(
-    client: &mut AppClient,
-    group_id: &GroupId,
-) -> crate::client::EncryptedMediaUploadFinish {
-    let (_http, finish) = client
-        .prepare_encrypted_media_upload(
-            group_id,
-            crate::MediaUploadRequest {
-                attachments: vec![crate::MediaUploadAttachmentRequest {
-                    file_name: "photo.bin".into(),
-                    media_type: "application/octet-stream".into(),
-                    plaintext: vec![7; 64],
-                    dim: None,
-                    thumbhash: None,
-                }],
-                caption: None,
-                send: false,
-                blossom_server: Some("http://127.0.0.1:9".into()),
-                message_tags: Vec::new(),
-            },
-        )
-        .await
-        .unwrap();
-    finish
-}
-
-/// Makes a periodic self-update of `group_id` due now and runs a maintenance
-/// sweep, returning the failure code the obligation records: `upload_hold`
-/// when an upload holds it, none when it ran.
-async fn run_due_periodic_rotation(client: &mut AppClient, group_id: &GroupId) -> Option<String> {
-    let obligation_id = client
-        .runtime
-        .schedule_manual_self_update(group_id)
-        .unwrap();
-    let mut obligation = client
-        .runtime
-        .session()
-        .maintenance_obligation(&obligation_id)
-        .unwrap()
-        .unwrap();
-    obligation.trigger = cgka_traits::MaintenanceTrigger::Periodic;
-    obligation.phase = cgka_traits::MaintenancePhase::Retry;
-    client
-        .runtime
-        .session()
-        .put_maintenance_obligation(&obligation)
-        .unwrap();
-    client.run_due_maintenance().await.unwrap();
-    client
-        .runtime
-        .session()
-        .maintenance_obligation(&obligation_id)
-        .unwrap()
-        .and_then(|obligation| obligation.last_failure_code)
-}
-
-/// mdk#2158: while an attachment upload is in flight, this device holds its
-/// own due periodic self-update for the group, so a rotation cannot leave the
-/// finished upload unsendable. The rotation stays owed and runs once the upload
-/// ends.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_in_flight_upload_holds_the_groups_self_update_until_it_ends() {
-    let (_dir, _app, mut client, group_id, epoch) = upload_hold_fixture("uploading").await;
-    let upload = prepare_held_upload(&mut client, &group_id).await;
-    assert_eq!(
-        run_due_periodic_rotation(&mut client, &group_id)
-            .await
-            .as_deref(),
-        Some("upload_hold")
-    );
-    assert_eq!(client.runtime.group_record(&group_id).unwrap().epoch, epoch);
-
-    // The upload ends (here: abandoned before its HTTP ran); the rotation runs.
-    drop(upload);
-    client.run_due_maintenance().await.unwrap();
-    assert_eq!(
-        client.runtime.group_record(&group_id).unwrap().epoch.0,
-        epoch.0 + 1
-    );
-}
-
-/// mdk#2158: an upload sent in a separate command, by token admission or by
-/// the host, keeps its group's periodic self-update held through the
-/// admission grace, so that send still finds the epoch the upload used.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_upload_sent_separately_holds_its_group_through_admission() {
-    let (_dir, _app, mut client, group_id, epoch) = upload_hold_fixture("admitting").await;
-    let finish = prepare_held_upload(&mut client, &group_id).await;
-    // The HTTP upload completed; the send follows in another command.
-    let (reference, _) = crate::media::tests::attachment_worker_fixture(b"generated bytes");
-    let result = crate::MediaUploadResult {
-        attachments: vec![crate::media::MediaUploadAttachmentResult {
-            reference,
-            encrypted_size_bytes: 31,
-        }],
-        sent: None,
-    };
-    let uploads = crate::media::outgoing::OutgoingUploads::new(client.app.clone(), "alice".into());
-    client
-        .finish_encrypted_media_upload(finish, result, uploads)
-        .await
-        .unwrap();
-    assert_eq!(
-        run_due_periodic_rotation(&mut client, &group_id)
-            .await
-            .as_deref(),
-        Some("upload_hold")
-    );
-    assert_eq!(client.runtime.group_record(&group_id).unwrap().epoch, epoch);
-    assert!(
-        client
-            .upload_epoch_holds
-            .held_groups(
-                std::time::Instant::now() + crate::client::upload_holds::UPLOAD_ADMISSION_GRACE
-            )
-            .is_empty(),
-        "the hold ends with the grace"
-    );
-}
-
-/// mdk#2158: an upload outlives the client that started it when the account
-/// worker rebuilds its client, as it does on reconnect, so the rebuilt client
-/// still holds the group's periodic self-update until the upload ends.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_upload_holds_its_group_across_a_client_rebuild() {
-    let (_dir, app, mut client, group_id, epoch) = upload_hold_fixture("reconnecting").await;
-    let upload = prepare_held_upload(&mut client, &group_id).await;
-    drop(client);
-    let mut client = app.client("alice").await.unwrap();
-    assert_eq!(
-        run_due_periodic_rotation(&mut client, &group_id)
-            .await
-            .as_deref(),
-        Some("upload_hold")
-    );
-    assert_eq!(client.runtime.group_record(&group_id).unwrap().epoch, epoch);
-
-    drop(upload);
-    client.run_due_maintenance().await.unwrap();
-    assert_eq!(
-        client.runtime.group_record(&group_id).unwrap().epoch.0,
-        epoch.0 + 1
-    );
 }
 
 /// mdk#2258: a device with unresolved epoch-gap recovery knows the group moved
@@ -24208,11 +24303,7 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
         }
         delivery.message.timestamp = cgka_traits::Timestamp(cutoff.0 + 3600);
         delivery.received_at = cgka_traits::Timestamp(cutoff.0 + 3600);
-        let effects = bob_client
-            .runtime
-            .ingest_delivery(delivery.clone())
-            .await
-            .unwrap();
+        let effects = bob_client.runtime.ingest_delivery(&delivery).await.unwrap();
         assert!(matches!(
             effects.outcome,
             cgka_traits::IngestOutcome::Ignored { .. }
@@ -24228,11 +24319,7 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
             .client_with_relay_plane("bob", &plane, None)
             .await
             .unwrap();
-        let effects = reopened
-            .runtime
-            .ingest_delivery(delivery.clone())
-            .await
-            .unwrap();
+        let effects = reopened.runtime.ingest_delivery(&delivery).await.unwrap();
         assert!(matches!(
             effects.outcome,
             cgka_traits::IngestOutcome::Ignored { .. }
@@ -24312,7 +24399,7 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
         old_delivery.message = old_group_event;
         let ignored = reopened
             .runtime
-            .ingest_delivery(old_delivery)
+            .ingest_delivery(&old_delivery)
             .await
             .unwrap();
         assert!(!matches!(
@@ -24321,7 +24408,7 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
         ));
         assert!(ignored.effects.events.is_empty());
         assert!(app.messages("bob").unwrap().is_empty());
-        let old = reopened.runtime.ingest_delivery(delivery).await.unwrap();
+        let old = reopened.runtime.ingest_delivery(&delivery).await.unwrap();
         assert!(matches!(
             old.outcome,
             cgka_traits::IngestOutcome::Ignored { .. }
@@ -24473,9 +24560,11 @@ fn legacy_directory_label() {
         .create_account("alice")
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    app.remember_directory_user_with_reason(&account.account_id_hex, "test")
+    app.directory()
+        .remember_directory_user_with_reason_for_test(&account.account_id_hex, "test")
         .unwrap();
     let entry = app
+        .directory()
         .directory_entry_for_account_id(&account.account_id_hex)
         .unwrap()
         .unwrap();

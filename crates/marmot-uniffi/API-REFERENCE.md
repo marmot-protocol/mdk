@@ -2,11 +2,12 @@
 
 This reference inventories the UniFFI exports and is maintained alongside source changes.
 Start with the [integration guide](README.md#integration-guide-and-api-reference)
-for API selection, lifecycle, localization and ownership. For the 0.13.0 changes, read
-[0.12.0 → 0.13.0](../../docs/integration/0.13.0.md).
+for API selection, lifecycle, localization and ownership. For the 0.14.0 changes, read
+[0.13.0 → 0.14.0](../../docs/integration/0.14.0.md).
 
-This inventories runtime/object methods, free functions and host callback methods. `AttachmentHistoryCursor` is an opaque object with no exported
-methods. Generated disposal/concurrency helpers are platform scaffolding, not additional
+This inventories runtime/object methods, free functions and host callback methods. `AttachmentHistoryCursor`,
+`AccountAttachmentCursor`, `ChatStorageCursor`, `RetainedAttachmentsCursor` and `ChatListDraftVersionFfi` are opaque
+objects with no exported methods. Generated disposal/concurrency helpers are platform scaffolding, not additional
 MDK commands. C has a separate [complete symbol index](../marmot-c/API-REFERENCE.md), including
 its lifetime helpers and compatibility-only entry points.
 
@@ -418,9 +419,9 @@ Return whether `account_ref` currently follows `user_ref`, using the same local 
 pub async fn follow_user( &self, account_ref: String, user_ref: String, ) -> Result<Vec<String>, MarmotKitError>
 ```
 
-Follow `user_ref` while preserving every other entry in the account's current kind-3 contact list. Returns the complete updated list.
+Follow `user_ref` while preserving every other entry in the account's current kind-3 contact list. Returns the complete updated list. Appends one `p` tag and republishes petnames, relay hints, other tags and the content unchanged. Returns `FollowListUnavailable` when no current list is found, and `FollowListTooLarge`, publishing nothing, when the list has 2,048 follows or more (the most MDK reads from one list).
 
-[Source](src/commands/account.rs#L589)
+[Source](src/commands/account.rs#L592)
 
 ### `Marmot::unfollow_user`
 
@@ -430,9 +431,9 @@ Follow `user_ref` while preserving every other entry in the account's current ki
 pub async fn unfollow_user( &self, account_ref: String, user_ref: String, ) -> Result<Vec<String>, MarmotKitError>
 ```
 
-Unfollow `user_ref` while preserving every other entry in the account's current kind-3 contact list. Returns the complete updated list.
+Unfollow `user_ref` while preserving every other entry in the account's current kind-3 contact list. Returns the complete updated list. Removes only `user_ref`'s `p` tags; errors as `follow_user`.
 
-[Source](src/commands/account.rs#L603)
+[Source](src/commands/account.rs#L610)
 
 ### `Marmot::reveal_nsec`
 
@@ -444,7 +445,7 @@ pub fn reveal_nsec(&self, account_ref: String) -> Result<String, MarmotKitError>
 
 Export the active account's raw private key in canonical `nsec1...` bech32 form for an in-app key-backup display (mdk#543).
 
-[Source](src/commands/account.rs#L627)
+[Source](src/commands/account.rs#L634)
 
 ### `Marmot::export_encrypted_secret_key`
 
@@ -456,7 +457,7 @@ pub fn export_encrypted_secret_key( &self, account_ref: String, passphrase: Stri
 
 Export the active account's private key as a password-encrypted NIP-49 `ncryptsec1...` bech32 backup string (mdk#544).
 
-[Source](src/commands/account.rs#L644)
+[Source](src/commands/account.rs#L651)
 
 ### `Marmot::publish_user_profile`
 
@@ -468,7 +469,7 @@ pub async fn publish_user_profile( &self, account_ref: String, profile: UserProf
 
 Publish Nostr kind:0 metadata with explicit caller-supplied relay overrides. Most app clients should use `publish_user_profile_using_account_relays` so relay selection remains owned by MDK. This override remains for diagnostics, tests, and specialized clients. Public indexers receive a best-effort copy of the same event.
 
-[Source](src/commands/account.rs#L666)
+[Source](src/commands/account.rs#L673)
 
 ### `Marmot::publish_user_profile_using_account_relays`
 
@@ -480,7 +481,7 @@ pub async fn publish_user_profile_using_account_relays( &self, account_ref: Stri
 
 Publish Nostr kind:0 metadata using one coherent snapshot of the selected account's MDK-owned relay configuration. Public indexers receive a best-effort copy of the same event.
 
-[Source](src/commands/account.rs#L695)
+[Source](src/commands/account.rs#L702)
 
 ### `Marmot::upload_profile_image`
 
@@ -492,7 +493,7 @@ pub async fn upload_profile_image( &self, account_ref: String, data: Vec<u8>, me
 
 Upload a public raster profile image to Blossom with the account's signer. The returned HTTPS URL can be published as kind:0 `picture`.
 
-[Source](src/commands/account.rs#L713)
+[Source](src/commands/account.rs#L720)
 
 ### `Marmot::download_profile_image`
 
@@ -504,7 +505,7 @@ pub async fn download_profile_image( &self, url: String, max_bytes: u64, ) -> Re
 
 Fetch one untrusted kind:0 profile `picture` URL with MDK dial-safe HTTPS policy, address pinning, and bounded streaming.
 
-[Source](src/commands/account.rs#L728)
+[Source](src/commands/account.rs#L735)
 
 </details>
 
@@ -531,9 +532,9 @@ Anchor a live agent text stream start in the encrypted group history. Host apps 
 pub async fn watch_agent_text_stream( &self, account_ref: String, group_id_hex: String, stream_id_hex: Option<String>, server_cert_der: Option<Vec<u8>>, insecure_local: bool, ) -> Result<Arc<AgentStreamSubscription>, MarmotKitError>
 ```
 
-Watch a live agent text stream over the brokered QUIC channel. Pass `stream_id_hex = None` to follow the latest stream in the group (the common case when reacting to an AgentStreamStarted event). The returned subscription yields incremental `Chunk`s then a terminal `Finished` / `Failed`. `server_cert_der` pins a self-signed broker cert (else platform trust); `insecure_local` is loopback-only for testing.
+Watch a live agent text stream over the brokered QUIC channel. Pass `stream_id_hex = None` to follow the latest stream in the group (the common case when reacting to an AgentStreamStarted event). The returned subscription yields incremental `Chunk`s then a terminal `Finished` / `Failed`. `server_cert_der` pins a self-signed broker cert (else the bundled public-CA roots, not the OS trust store); `insecure_local` is loopback-only for testing.
 
-[Source](src/commands/agent_stream.rs#L88)
+[Source](src/commands/agent_stream.rs#L89)
 
 </details>
 
@@ -601,9 +602,9 @@ Delete a handoff copy once the OS surface is done with it (the installer or shar
 pub async fn next(&self) -> Result<Option<AttachmentTransferSnapshotFfi>, MarmotKitError>
 ```
 
-Initial snapshot, then coalesced replacements. None means closed. Errors terminate this observation; close/drop never cancels acquisition.
+Initial snapshot, then replacements: a transfer state change at once, progress-only changes at most four per second. None means closed. Errors terminate this observation; close/drop never cancels acquisition.
 
-[Source](src/commands/attachment_controls.rs#L14)
+[Source](src/commands/attachment_controls.rs#L15)
 
 ### `AttachmentTransferSubscription::cancel`
 
@@ -615,7 +616,7 @@ pub fn cancel(&self)
 
 Stop observation and wake receivers; does not cancel acquisition.
 
-[Source](src/commands/attachment_controls.rs#L23)
+[Source](src/commands/attachment_controls.rs#L24)
 
 ### `Marmot::attachment_download_policy`
 
@@ -627,7 +628,7 @@ pub async fn attachment_download_policy( &self, account_ref: String, ) -> Result
 
 Read the durable per-account automatic acquisition, quota, disk-reserve and transfer-cap policy.
 
-[Source](src/commands/attachment_controls.rs#L67)
+[Source](src/commands/attachment_controls.rs#L68)
 
 ### `Marmot::set_attachment_download_policy`
 
@@ -639,7 +640,7 @@ pub async fn set_attachment_download_policy( &self, account_ref: String, policy:
 
 Validate and persist acquisition policy; disabling automatic work preserves explicit work and retained files.
 
-[Source](src/commands/attachment_controls.rs#L77)
+[Source](src/commands/attachment_controls.rs#L78)
 
 ### `Marmot::request_explicit_attachment`
 
@@ -649,7 +650,7 @@ pub async fn request_explicit_attachment( &self, account_ref: String, group_id_h
 
 Join a current source or promote automatic demand to explicit priority without resetting retry budgets or scheduled backoff. Use this for ordinary interactive demand; reserve `control_attachment(Retry)` and `download_attachment_again` for deliberate recovery. A returned opaque reference does not promise readiness: inspect transfer state and prefer local assets first. Active attempts retain their original size limit and deadline; promotion changes subsequent admission, not the existing transport budget. Cancelled, removed, exhausted and failed sources are not rearmed.
 
-[Source](src/commands/attachment_controls.rs#L104)
+[Source](src/commands/attachment_controls.rs#L105)
 
 ### `Marmot::control_attachment`
 
@@ -661,7 +662,7 @@ pub async fn control_attachment( &self, account_ref: String, reference: String, 
 
 Cancel durably, retry explicitly, or remove local bytes. Returns false for obsolete references or ineligible operations; cancellation preserves ready bytes.
 
-[Source](src/commands/attachment_controls.rs#L89)
+[Source](src/commands/attachment_controls.rs#L90)
 
 ### `Marmot::download_attachment_again`
 
@@ -673,7 +674,7 @@ pub async fn download_attachment_again( &self, account_ref: String, group_id_hex
 
 Queue explicit acquisition for a current original source slot, clearing removal/cancellation; no reference means unavailable or obsolete.
 
-[Source](src/commands/attachment_controls.rs#L118)
+[Source](src/commands/attachment_controls.rs#L119)
 
 ### `Marmot::attachment_transfer_snapshot`
 
@@ -685,7 +686,7 @@ pub async fn attachment_transfer_snapshot( &self, account_ref: String, group_id_
 
 Read bounded transfer state for up to 64 source slots in one group without requesting a transfer.
 
-[Source](src/commands/attachment_controls.rs#L131)
+[Source](src/commands/attachment_controls.rs#L132)
 
 ### `Marmot::subscribe_attachment_transfers`
 
@@ -695,9 +696,9 @@ Read bounded transfer state for up to 64 source slots in one group without reque
 pub async fn subscribe_attachment_transfers( &self, account_ref: String, group_id_hex: String, targets: Vec<AttachmentLocalTargetFfi>, ) -> Result<Arc<AttachmentTransferSubscription>, MarmotKitError>
 ```
 
-Observe initial transfer state and coalesced complete replacements for bounded source slots; observation does not request a transfer.
+Observe initial transfer state and complete replacements for bounded source slots: a row that appears, disappears or changes transfer state arrives as soon as the engine reports it, while progress-only replacements stay coalesced to at most four per second. Observation does not request a transfer.
 
-[Source](src/commands/attachment_controls.rs#L153)
+[Source](src/commands/attachment_controls.rs#L154)
 
 </details>
 
@@ -741,7 +742,7 @@ Cheap local refresh signal, including for a fully loaded or empty library. Compa
 pub async fn attachment_storage_usage( &self, account_ref: String, ) -> Result<AttachmentStorageUsageFfi, MarmotKitError>
 ```
 
-Account-wide attachment storage for a Manage storage screen: `media_bytes` (media-store files, a file shared by several attachments counted once), `legacy_bytes` (bodies still in the account database; they move to the media store in the background), `attachment_count`, the database's `database_bytes` and `database_free_bytes`, and `migration` with `migration_bytes`: where moving legacy bodies into the media store stands (`Running` with the bytes left, `Paused` with the free space it still needs, `NotNeeded` or `Complete`). Reads no bodies and starts no worker. See [Manage storage](ATTACHMENT-ACCESS.md#manage-storage).
+Account-wide attachment storage for a Manage storage screen: `media_bytes` (media-store files, a file shared by several attachments counted once), `legacy_bytes` (bodies still in the account database; they move to the media store in the background), `attachment_count`, the database's `database_bytes` and `database_free_bytes`, and `migration` with `migration_bytes`: where moving legacy bodies into the media store stands (`Running` with the bytes left, `Paused` with the free space it still needs, `NotNeeded`, `Complete`, or `Compacting` while the database returns its free pages to the filesystem, with the other figures from just before), and `cache_bytes`: the avatar and group-image cache, which `clear_avatar_cache` empties and which is fetched again on demand. Reads no bodies and starts no worker. See [Manage storage](ATTACHMENT-ACCESS.md#manage-storage).
 
 [Source](src/commands/attachment_storage.rs#L15)
 
@@ -792,6 +793,30 @@ pub async fn remove_attachments_older_than( &self, account_ref: String, received
 Removes retained attachments of messages received before `received_before` (Unix seconds, the message's received time), across the account or within one chat (`group_id_hex`), with the same semantics and immediate reclaim as `remove_chat_attachments`. Returns how many it removed.
 
 [Source](src/commands/attachment_storage.rs#L87)
+
+### `Marmot::attachment_keep_media`
+
+**Current.**
+
+```rust
+pub async fn attachment_keep_media( &self, account_ref: String, ) -> Result<AttachmentKeepMediaFfi, MarmotKitError>
+```
+
+Reads the account's "Keep media" setting for a settings screen: `Forever` (the default) unless the user chose `OneYear`, `SixMonths` or `ThirtyDays`. The setting is per account on this device and is not synced to the account's other devices. Local read; needs no started runtime.
+
+[Source](src/commands/attachment_storage.rs#L102)
+
+### `Marmot::set_attachment_keep_media`
+
+**Current.**
+
+```rust
+pub async fn set_attachment_keep_media( &self, account_ref: String, keep: AttachmentKeepMediaFfi, ) -> Result<u64, MarmotKitError>
+```
+
+Stores the account's "Keep media" setting, then removes every retained attachment already past the new window before returning, and returns how many it removed so the host can confirm what was freed. Age is the message's received time, or the user's last explicit download of that attachment when later. Removed attachments read `CleanedBySetting` in transfer snapshots, distinct from `Removed` (removed by you); `download_attachment_again` works for both. Media-store space is freed before this returns. While the runtime runs, the account worker applies the window at start and hourly as attachments age, and automatic downloads of attachments past it are skipped, or dropped if already queued but unfinished (they count toward the returned number and read `CleanedBySetting` too). `Forever` removes nothing. Ask the user to confirm before shortening the window: Blossom servers may no longer hold old media, so a removed attachment may not download again.
+
+[Source](src/commands/attachment_storage.rs#L121)
 
 </details>
 
@@ -1276,7 +1301,7 @@ pub fn cached_identity_projections( &self, account_id_hexes: Vec<String>, ) -> R
 
 Bounded local cached-identity page for many account IDs.
 
-[Source](src/commands/directory.rs#L98)
+[Source](src/commands/directory.rs#L101)
 
 ### `Marmot::user_profile_website`
 
@@ -1288,7 +1313,7 @@ pub fn user_profile_website( &self, account_id_hex: String, ) -> Result<Option<S
 
 Cached Nostr kind:0 `website` metadata for an account id, when it is a string. The generic profile record intentionally exposes the fields the host can publish; this read-only accessor preserves arbitrary kind:0 metadata while still making the standard website field available to profile presentation surfaces.
 
-[Source](src/commands/directory.rs#L120)
+[Source](src/commands/directory.rs#L124)
 
 ### `Marmot::refresh_profile`
 
@@ -1300,7 +1325,7 @@ pub async fn refresh_profile( &self, account_id_hex: String, relays: Vec<String>
 
 Fetch and cache an account's own Nostr kind:0 profile from `relays`. After this resolves, `user_profile` / `display_name` return the freshly-fetched metadata (name, picture, etc.) for that account.
 
-[Source](src/commands/directory.rs#L137)
+[Source](src/commands/directory.rs#L144)
 
 ### `Marmot::user_relay_lists`
 
@@ -1312,7 +1337,7 @@ pub fn user_relay_lists( &self, account_id_hex: String, ) -> Result<conversions:
 
 Cached NIP-65 and inbox relay lists for any account id — no network. An account with nothing cached yet returns an empty status with both kinds in `missing` rather than erroring; call `refresh_user_relay_lists` to fetch.
 
-[Source](src/commands/directory.rs#L152)
+[Source](src/commands/directory.rs#L160)
 
 ### `Marmot::refresh_user_relay_lists`
 
@@ -1324,7 +1349,7 @@ pub async fn refresh_user_relay_lists( &self, account_id_hex: String, relays: Ve
 
 Fetch an account's published NIP-65 and inbox relay lists from `relays`, updating the cache. An account with nothing published reports both kinds in `missing` rather than erroring.
 
-[Source](src/commands/directory.rs#L165)
+[Source](src/commands/directory.rs#L174)
 
 ### `Marmot::search_cached_users`
 
@@ -1336,7 +1361,7 @@ pub fn search_cached_users( &self, account_id_hex: String, query: String, limit:
 
 Search public identities cached through any connected account, without network or group-membership work. Follow flags refer only to the selected searcher. Call off the UI thread; zero limit returns no rows.
 
-[Source](src/commands/directory.rs#L180)
+[Source](src/commands/directory.rs#L190)
 
 ### `Marmot::search_users`
 
@@ -1348,7 +1373,7 @@ pub async fn search_users( &self, account_id_hex: String, query: String, radius_
 
 Stream cached public identities across accounts, then independent provider and graph results. The radius window bounds known social distances; cached/provider identities without a known distance remain discoverable. Those identities can recur when paging radii: deduplicate by account id across pages as well as within each subscription.
 
-[Source](src/commands/directory.rs#L206)
+[Source](src/commands/directory.rs#L217)
 
 </details>
 
@@ -2758,6 +2783,11 @@ pub fn snapshot(&self) -> OnboardingSnapshotFfi
 
 Read the initial/current snapshot for this handle; follow its feature contract for one-shot versus repeatable reads.
 
+Each finding preserves typed context, check purpose/outcome, declared capability,
+allowed finding actions, and optional original observation revision. Keep rows
+with the same endpoint separate. See the [evidence limits](README.md#interactive-account-onboarding);
+`InspectionCompleted` directory-query success is not event-publication evidence.
+
 [Source](src/commands/onboarding.rs#L19)
 
 ### `OnboardingSubscription::next`
@@ -3746,69 +3776,69 @@ Host callback for NIP-44 payload decryption.
 pub fn new_with_configuration( root_path: String, relay_urls: Vec<String>, options: MarmotOptions, ) -> Result<Arc<Self>, MarmotKitError>
 ```
 
-Open with any combination of runtime options. Existing constructors are compatibility wrappers around this entry point.
+Open with any combination of runtime options, including the required deployment. The other constructors are wrappers around this entry point and take the deployment as their last argument.
 
-[Source](src/lib.rs#L273)
+[Source](src/lib.rs#L283)
 
 ### `Marmot::new_with_options`
 
 **Compatibility.** Prefer new_with_configuration when combining settings.
 
 ```rust
-pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_policy: RelayPolicyFfi, secret_store: Option<Arc<dyn SecretStore>>, ) -> Result<Arc<Self>, MarmotKitError>
+pub fn new_with_options( root_path: String, relay_urls: Vec<String>, relay_policy: RelayPolicyFfi, secret_store: Option<Arc<dyn SecretStore>>, deployment: MarmotDeploymentFfi, ) -> Result<Arc<Self>, MarmotKitError>
 ```
 
 Open with an explicit relay policy and optional host-owned key storage. Existing constructors retain their public-only relay policy.
 
-[Source](src/lib.rs#L289)
+[Source](src/lib.rs#L299)
 
 ### `Marmot::new`
 
 **Current.**
 
 ```rust
-pub fn new(root_path: String, relay_urls: Vec<String>) -> Result<Arc<Self>, MarmotKitError>
+pub fn new( root_path: String, relay_urls: Vec<String>, deployment: MarmotDeploymentFfi, ) -> Result<Arc<Self>, MarmotKitError>
 ```
 
-Open the Marmot app at `root_path`, configured with the given default relay URLs. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) via the default keychain-backed account home — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
+Open the Marmot app at `root_path`, configured with the given default relay URLs and `deployment`. Account secrets (Nostr private keys) are stored in the platform keyring (Keychain on Apple platforms, Android's native keyring on Android) under the deployment's `keychain_service` — not in a plaintext file. Fallible because initializing the platform secret store can fail or another process may own the same root (`MarmotKitError::RuntimeBusy`). Root ownership is nonblocking and remains held until the final `Marmot`/runtime handle is dropped, even after `Marmot::shutdown`. Call `Marmot::start` before subscribing to events.
 
-[Source](src/lib.rs#L317)
+[Source](src/lib.rs#L328)
 
 ### `Marmot::new_with_secret_store`
 
 **Compatibility.** Prefer new_with_configuration when combining settings.
 
 ```rust
-pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret_store: Arc<dyn SecretStore>, ) -> Result<Arc<Self>, MarmotKitError>
+pub fn new_with_secret_store( root_path: String, relay_urls: Vec<String>, secret_store: Arc<dyn SecretStore>, deployment: MarmotDeploymentFfi, ) -> Result<Arc<Self>, MarmotKitError>
 ```
 
 Open the Marmot app with host-supplied account-secret storage instead of the platform keychain. Identical to `Marmot::new` except that every read, write, and removal of an account signing key goes through `secret_store`.
 
-[Source](src/lib.rs#L335)
+[Source](src/lib.rs#L354)
 
 ### `Marmot::new_with_cursor_persistence`
 
 **Compatibility.** Prefer new_with_configuration when combining settings.
 
 ```rust
-pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, cursor_persistence: CursorPersistenceFfi, ) -> Result<Arc<Self>, MarmotKitError>
+pub fn new_with_cursor_persistence( root_path: String, relay_urls: Vec<String>, cursor_persistence: CursorPersistenceFfi, deployment: MarmotDeploymentFfi, ) -> Result<Arc<Self>, MarmotKitError>
 ```
 
 Construct with explicit advancing/frozen relay cursor behavior; new_with_configuration composes this with other options.
 
-[Source](src/lib.rs#L365)
+[Source](src/lib.rs#L385)
 
 ### `Marmot::new_with_client_name`
 
 **Compatibility.** Prefer new_with_configuration when combining settings.
 
 ```rust
-pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_name: Option<String>, cursor_persistence: CursorPersistenceFfi, secret_store: Option<Arc<dyn SecretStore>>, ) -> Result<Arc<Self>, MarmotKitError>
+pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_name: Option<String>, cursor_persistence: CursorPersistenceFfi, secret_store: Option<Arc<dyn SecretStore>>, deployment: MarmotDeploymentFfi, ) -> Result<Arc<Self>, MarmotKitError>
 ```
 
 Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels are omitted. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L384)
+[Source](src/lib.rs#L405)
 
 ### `Marmot::start`
 
@@ -3820,7 +3850,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L421)
+[Source](src/lib.rs#L443)
 
 ### `Marmot::shutdown`
 
@@ -3832,7 +3862,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L433)
+[Source](src/lib.rs#L455)
 
 ### `Marmot::shutdown_and_close`
 
@@ -3844,7 +3874,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L469)
+[Source](src/lib.rs#L491)
 
 ### `Marmot::storage_is_closed`
 
@@ -3856,7 +3886,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L477)
+[Source](src/lib.rs#L499)
 
 ### `Marmot::is_stopping`
 
@@ -3868,7 +3898,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L484)
+[Source](src/lib.rs#L506)
 
 </details>
 
@@ -4448,7 +4478,7 @@ pub async fn begin_attachment_permission_update( &self, account_ref: String, ) -
 
 Revoke automatic permission for this account before asynchronous network/preference evaluation. Returns a single-use runtime/account generation. Requires HostManaged construction; do not persist the token or mint a new one from a stale callback. See the [host-managed contract](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104).
 
-[Source](src/commands/attachment_controls.rs#L31)
+[Source](src/commands/attachment_controls.rs#L32)
 
 ### `Marmot::request_automatic_attachment`
 
@@ -4458,7 +4488,7 @@ pub async fn request_automatic_attachment( &self, account_ref: String, group_id_
 
 Submit idempotent automatic demand for an authoritative original source slot. Returns current status plus whether work was newly queued; preserves suppression, history, deadlines and retry budgets. Use from foreground and restored workers; never substitute explicit download-again or legacy downloadMedia after a local miss. See [Android migration](ATTACHMENT-ACCESS.md#android-migration).
 
-[Source](src/commands/attachment_controls.rs#L53)
+[Source](src/commands/attachment_controls.rs#L54)
 
 ### `Marmot::set_attachment_automatic_permission`
 
@@ -4468,7 +4498,7 @@ pub async fn set_attachment_automatic_permission( &self, account_ref: String, ge
 
 Apply media-category permission using the generation captured before evaluating host policy. False means stale, foreign or already consumed; it is not permission to retry with a fresh token. Approval is runtime-only and cannot override the durable automatic policy. See the [permission lifecycle](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104).
 
-[Source](src/commands/attachment_controls.rs#L41)
+[Source](src/commands/attachment_controls.rs#L42)
 
 </details>
 
@@ -4715,9 +4745,9 @@ pub fn marmot_deployment_neutral() -> MarmotDeploymentFfi
 
 **Current free function.** Generated Swift/Kotlin name: `marmotDeploymentNeutral`. **C:** `marmot_deployment_neutral`.
 
-A deployment with no services: recovery requires every relay on a route, onboarding searches only the host's discovery relays, there is no Open Ranking tier or KeyPackage client preference, moderation reporting refuses a destination, and the keychain service is `org.marmot-protocol.mdk`. Start here and fill in the services your deployment operates. Until the neutral default lands, an empty media list or unset image server still falls back to White Noise's servers.
+A deployment with no services: recovery requires every relay on a route, onboarding searches only the host's discovery relays, there is no Open Ranking tier or KeyPackage client preference, moderation reporting refuses a destination, and the keychain service is `org.marmot-protocol.mdk`. With no media servers new groups stay text-only, and with no group-image server group images are refused. Start here and fill in the services your deployment operates.
 
-[Source](src/deployment.rs#L110)
+[Source](src/deployment.rs#L109)
 
 ### `marmot_deployment_white_noise`
 
@@ -4727,9 +4757,9 @@ pub fn marmot_deployment_white_noise() -> MarmotDeploymentFfi
 
 **Current free function.** Generated Swift/Kotlin name: `marmotDeploymentWhiteNoise`. **C:** `marmot_deployment_white_noise`.
 
-White Noise's deployment as this build compiled it: its recovery relays, discovery indexers, media and image servers, Vertex Open Ranking, KeyPackage client preference, moderation label namespace and keychain service, with a build-time `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` list over the new-group media servers. A `MarmotOptions` without a deployment uses these values until the neutral default lands; White Noise apps should pass this record explicitly before then. Keep `keychain_service` unchanged for an existing install, or its account secrets are stranded.
+White Noise's deployment: its recovery relays, discovery indexers, media and image servers, Vertex Open Ranking, KeyPackage client preference, moderation label namespace and keychain service `com.marmot.whitenoise`. White Noise apps pass it to every constructor. Keep `keychain_service` unchanged for an existing install, or its account secrets are stranded.
 
-[Source](src/deployment.rs#L101)
+[Source](src/deployment.rs#L100)
 
 </details>
 

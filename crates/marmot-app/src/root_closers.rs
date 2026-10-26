@@ -22,6 +22,12 @@ pub(crate) trait RootCloser: Send {
     /// last handle is being dropped on another thread.
     fn close(&self) -> Result<(), AppError>;
 
+    /// Start closing without waiting: refuse new work, which also stops a
+    /// long operation that polls for it (a database compaction), so nothing
+    /// blocked behind it holds up the rest of the teardown. [`Self::close`]
+    /// still follows.
+    fn begin_close(&self) {}
+
     /// Whether the resource is gone, closed or dropped with its last handle,
     /// so there is nothing left to close.
     fn is_released(&self) -> bool;
@@ -30,6 +36,10 @@ pub(crate) trait RootCloser: Send {
 impl RootCloser for storage_sqlite::DatabaseCloser {
     fn close(&self) -> Result<(), AppError> {
         Ok(storage_sqlite::DatabaseCloser::close(self)?)
+    }
+
+    fn begin_close(&self) {
+        storage_sqlite::DatabaseCloser::begin_close(self);
     }
 
     fn is_released(&self) -> bool {
@@ -64,6 +74,19 @@ impl RootClosers {
         // once every handle is gone so the list stays bounded.
         closers.retain(|closer| !closer.is_released());
         closers.push(Box::new(closer));
+    }
+
+    /// [`RootCloser::begin_close`] on every registered resource, without
+    /// waiting on any of them.
+    pub(crate) fn begin_close_all(&self) {
+        for closer in self
+            .closers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
+            closer.begin_close();
+        }
     }
 
     /// Close every registered resource that is still alive and empty the

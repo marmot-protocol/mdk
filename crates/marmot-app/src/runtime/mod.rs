@@ -33,7 +33,7 @@ use crate::app_telemetry::{
     AppPerformanceOperation, AppPerformanceTelemetry, SyncErrorClass, SyncFailureClassification,
     SyncFailureStage, bounded_advisory_step,
 };
-use crate::directory::DirectorySyncHandle;
+use crate::directory_resources::directory_account;
 use crate::ids::{account_id_hex_from_ref, normalize_group_id_hex_app};
 use crate::messages::AppMessageIntent;
 use crate::notifications;
@@ -61,6 +61,7 @@ use crate::{
     TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
     unix_now_seconds,
 };
+use nostr_directory::DirectorySyncHandle;
 
 const MEDIA_COMMAND_QUEUE_LIMIT: usize = 8;
 
@@ -104,8 +105,8 @@ pub use attachment_access::{
     MAX_ATTACHMENT_LOCAL_READ_BYTES, RetainedAttachmentAsset,
 };
 pub use attachment_storage::{
-    AttachmentMigrationState, AttachmentStorageUsage, ChatAttachmentUsage, ChatUsageCursor,
-    RetainedAttachmentSummary, RetainedSizeCursor,
+    AttachmentKeepMedia, AttachmentMigrationState, AttachmentStorageUsage, ChatAttachmentUsage,
+    ChatUsageCursor, RetainedAttachmentSummary, RetainedSizeCursor,
 };
 mod avatar;
 pub use attachment_history::{
@@ -191,7 +192,6 @@ pub struct MarmotAppRuntime {
     shared: RuntimeSharedServices,
     accounts: AccountManager,
     follow_list_updates: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    directory_sync: Arc<Mutex<Option<DirectorySyncHandle>>>,
     initial_directory_sync: Arc<Mutex<Option<JoinHandle<()>>>>,
     #[cfg(test)]
     shutdown_test_hook: Arc<StdMutex<Option<ShutdownTestHook>>>,
@@ -1559,7 +1559,6 @@ impl MarmotAppRuntime {
             shared,
             accounts,
             follow_list_updates: Arc::new(Mutex::new(HashMap::new())),
-            directory_sync: Arc::new(Mutex::new(None)),
             initial_directory_sync: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             shutdown_test_hook: Arc::new(StdMutex::new(None)),
@@ -1597,18 +1596,22 @@ impl MarmotAppRuntime {
         &self,
         account_id_hexes: &[String],
     ) -> Result<HashMap<String, String>, AppError> {
-        self.accounts
+        Ok(self
+            .accounts
             .app
-            .display_names_for_account_ids(account_id_hexes)
+            .directory()
+            .display_names_for_account_ids(account_id_hexes)?)
     }
 
     pub fn cached_identity_projections_for_account_ids(
         &self,
         account_id_hexes: &[String],
     ) -> Result<Vec<crate::CachedIdentityProjection>, AppError> {
-        self.accounts
+        Ok(self
+            .accounts
             .app
-            .cached_identity_projections_for_account_ids(account_id_hexes)
+            .directory()
+            .cached_identity_projections_for_account_ids(account_id_hexes)?)
     }
 
     pub fn accounts(&self) -> AccountManager {
@@ -1786,19 +1789,7 @@ impl MarmotAppRuntime {
     }
 
     async fn ensure_directory_sync_worker(&self) -> DirectorySyncHandle {
-        let mut directory_sync = self.directory_sync.lock().await;
-        if let Some(handle) = directory_sync.as_ref() {
-            return handle.clone();
-        }
-        let handle = DirectorySyncHandle::spawn(
-            self.accounts.app.clone(),
-            self.shared.relay_plane().clone(),
-        );
-        self.accounts
-            .app
-            .set_directory_sync_handle(Some(handle.clone()));
-        *directory_sync = Some(handle.clone());
-        handle
+        self.accounts.app.directory().sync_worker()
     }
 
     pub async fn reconcile_accounts(&self) -> Result<(), AppError> {
@@ -2154,14 +2145,20 @@ impl MarmotAppRuntime {
         let include_groups = params.radius_end >= 1;
         self.accounts
             .app
+            .directory()
             .search_users_with_seeds(params, async move {
                 if include_groups {
-                    runtime.group_co_members(&searcher).await
+                    // The worker's error travels through the directory unchanged.
+                    runtime
+                        .group_co_members(&searcher)
+                        .await
+                        .map_err(nostr_directory::error::DirectoryError::from)
                 } else {
                     Ok(Vec::new())
                 }
             })
             .await
+            .map_err(AppError::from)
     }
 
     /// Accounts the searcher currently shares a group with.
@@ -4441,10 +4438,12 @@ impl MarmotAppRuntime {
         account_id_hex: &str,
         source_relays: Vec<TransportEndpoint>,
     ) -> Result<Option<UserProfileMetadata>, AppError> {
-        self.accounts
+        Ok(self
+            .accounts
             .app
+            .directory()
             .fetch_current_user_profile_for_account_id(account_id_hex, source_relays)
-            .await
+            .await?)
     }
 
     pub async fn publish_user_profile(
@@ -4505,6 +4504,7 @@ impl MarmotAppRuntime {
         let relay_lists = self
             .accounts
             .app
+            .directory()
             .account_relay_list_status_for_account_id(&account.account_id_hex)?;
         let endpoints = self
             .accounts
@@ -4567,6 +4567,7 @@ impl MarmotAppRuntime {
             .await?;
         self.accounts
             .app
+            .directory()
             .remember_directory_profile(&account.account_id_hex, &profile)?;
         Ok(profile)
     }
@@ -4585,7 +4586,7 @@ impl MarmotAppRuntime {
             .accounts
             .app
             .deployment()
-            .profile_image_endpoint_or_fallback(blossom_server);
+            .profile_image_endpoint_for(blossom_server)?;
         crate::media::upload_profile_image_with_policy(
             &data,
             media_type,
@@ -4604,11 +4605,13 @@ impl MarmotAppRuntime {
         let cached = self
             .accounts
             .app
+            .directory()
             .directory_entry_for_account_id(account_id_hex)?
             .and_then(|entry| entry.profile);
         match self
             .accounts
             .app
+            .directory()
             .fetch_current_user_profile_for_account_id(account_id_hex, source_relays.to_vec())
             .await
         {
@@ -4661,6 +4664,7 @@ impl MarmotAppRuntime {
         let mut follows = self
             .accounts
             .app
+            .directory()
             .directory_entry_for_account_id(&account.account_id_hex)?
             .map(|entry| entry.follows)
             .unwrap_or_default();
@@ -4679,9 +4683,11 @@ impl MarmotAppRuntime {
         references: &[String],
     ) -> Result<Vec<crate::PublicEventPreviewRead>, AppError> {
         let account = self.accounts.resolve(account_ref)?;
-        self.accounts
+        Ok(self
+            .accounts
             .app
-            .cached_public_event_previews(&account, references)
+            .directory()
+            .cached_public_event_previews(&directory_account(&account), references)?)
     }
 
     /// Fetch one referenced public event from relays when it is missing or
@@ -4695,10 +4701,12 @@ impl MarmotAppRuntime {
         reference: &str,
     ) -> Result<crate::PublicEventPreviewRead, AppError> {
         let account = self.accounts.resolve(account_ref)?;
-        self.accounts
+        Ok(self
+            .accounts
             .app
-            .resolve_public_event_preview(&account, reference)
-            .await
+            .directory()
+            .resolve_public_event_preview(&directory_account(&account), reference)
+            .await?)
     }
 
     /// Fast, network-free membership check against [`Self::account_follows`].
@@ -4788,6 +4796,7 @@ impl MarmotAppRuntime {
         let status = self
             .accounts
             .app
+            .directory()
             .account_relay_list_status_for_account_id(&account.account_id_hex)?;
         let mut source_relays = status
             .nip65
@@ -4795,43 +4804,49 @@ impl MarmotAppRuntime {
             .into_iter()
             .map(TransportEndpoint)
             .collect::<Vec<_>>();
-        for endpoint in self.accounts.app.directory_source_relays(&[]) {
+        for endpoint in self.accounts.app.directory().directory_source_relays(&[]) {
             if !source_relays.contains(&endpoint) {
                 source_relays.push(endpoint);
             }
         }
-        let mut follows = self
-            .accounts
+        let fallback = self.accounts.app.directory().directory_source_relays(&[]);
+        self.accounts
             .app
-            .fetch_current_follow_list_for_account_id(&account.account_id_hex, source_relays)
-            .await?
-            .ok_or(AppError::FollowListUnavailable)?;
-
-        let changed = if following {
-            if follows.iter().any(|follow| follow == user_account_id_hex) {
-                false
-            } else {
-                follows.push(user_account_id_hex.to_owned());
-                true
-            }
-        } else {
-            let previous_len = follows.len();
-            follows.retain(|follow| follow != user_account_id_hex);
-            follows.len() != previous_len
-        };
-        follows.sort();
-        follows.dedup();
-
-        if changed {
-            let fallback = self.accounts.app.directory_source_relays(&[]);
-            self.publish_account_follow_list_unlocked(
-                &account,
-                &follows,
+            .update_account_follow_list(
+                &account.label,
+                user_account_id_hex,
+                following,
+                source_relays,
                 AccountRelayListBootstrap::new(fallback.clone(), fallback),
             )
-            .await?;
-        }
-        Ok(follows)
+            .await
+    }
+
+    /// Follow or unfollow one account through
+    /// [`MarmotApp::update_account_follow_list`], fetching the current list
+    /// from `source_relays` and publishing through `bootstrap`, serialized
+    /// with this account's other follow-list updates.
+    pub async fn update_account_follow_list(
+        &self,
+        account_ref: &str,
+        user_account_id_hex: &str,
+        following: bool,
+        source_relays: Vec<TransportEndpoint>,
+        bootstrap: AccountRelayListBootstrap,
+    ) -> Result<Vec<String>, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        let update_lock = self.follow_list_update_lock(&account.account_id_hex).await;
+        let _update_guard = update_lock.lock().await;
+        self.accounts
+            .app
+            .update_account_follow_list(
+                &account.label,
+                user_account_id_hex,
+                following,
+                source_relays,
+                bootstrap,
+            )
+            .await
     }
 
     async fn follow_list_update_lock(&self, account_id_hex: &str) -> Arc<Mutex<()>> {
@@ -4849,8 +4864,10 @@ impl MarmotAppRuntime {
     ) -> Result<UserDirectoryRefresh, AppError> {
         self.accounts
             .app
+            .directory()
             .refresh_user_directory_for_account_id(account_id_hex, bootstrap_relays)
             .await
+            .map_err(AppError::from)
     }
 
     pub async fn publish_account_relay_list_kind(
@@ -5715,6 +5732,7 @@ impl MarmotAppRuntime {
             let cached = self
                 .accounts
                 .app
+                .directory()
                 .directory_entry_for_account_id(&account.account_id_hex)?
                 .and_then(|entry| entry.profile);
             let (profile, store) = generated_setup_profile(
@@ -5727,6 +5745,7 @@ impl MarmotAppRuntime {
             if store {
                 self.accounts
                     .app
+                    .directory()
                     .remember_directory_profile(&account.account_id_hex, &profile)?;
             }
             Ok::<_, AppError>(profile)
@@ -6043,7 +6062,7 @@ impl MarmotAppRuntime {
         #[cfg(test)]
         self.stall_shutdown_phase_for_test(ShutdownTestPhase::DirectorySync)
             .await;
-        if let Some(directory_sync) = self.directory_sync.lock().await.take() {
+        if let Some(directory_sync) = self.accounts.app.directory().take_sync_worker() {
             directory_sync.shutdown().await;
         }
         #[cfg(test)]
@@ -6052,7 +6071,6 @@ impl MarmotAppRuntime {
         if let Some(initial_directory_sync) = self.initial_directory_sync.lock().await.take() {
             let _ = initial_directory_sync.await;
         }
-        self.accounts.app.set_directory_sync_handle(None);
         let accounts = async {
             #[cfg(test)]
             self.stall_shutdown_phase_for_test(ShutdownTestPhase::AccountWorkers)
@@ -7826,7 +7844,7 @@ impl AccountManager {
                 &self.shared.app_performance_telemetry(),
                 ACCOUNT_SETUP_ADVISORY_WAIT,
                 "import_directory_refresh",
-                self.app.refresh_user_directory_for_account_id(
+                self.app.directory().refresh_user_directory_for_account_id(
                     &account.account_id_hex,
                     directory_bootstrap_relays.clone(),
                 ),
@@ -8038,7 +8056,7 @@ impl AccountManager {
             &self.shared.app_performance_telemetry(),
             ACCOUNT_SETUP_ADVISORY_WAIT,
             "login_directory_refresh",
-            self.app.refresh_user_directory_for_account_id(
+            self.app.directory().refresh_user_directory_for_account_id(
                 &account.account_id_hex,
                 directory_bootstrap_relays,
             ),
@@ -8093,6 +8111,7 @@ impl AccountManager {
     ) -> Option<AccountRelayListStatus> {
         let status = match self
             .app
+            .directory()
             .resolve_account_relay_list_status_for_account_id(account_id_hex, discovery_relays)
             .await
         {
@@ -8120,6 +8139,7 @@ impl AccountManager {
         }
         if let Err(err) = self
             .app
+            .directory()
             .refresh_profile_for_account_id(account_id_hex, profile_relays)
             .await
         {
@@ -8141,6 +8161,7 @@ impl AccountManager {
     ) -> Result<(AccountRelayListStatus, Option<UserProfileMetadata>), AppError> {
         let mut profile = if let Some(cached) = self
             .app
+            .directory()
             .directory_entry_for_account_id(&account.account_id_hex)?
             .and_then(|entry| entry.profile)
         {
@@ -8183,6 +8204,7 @@ impl AccountManager {
             let status = self.app.account_relay_list_status(&account.label)?;
             if let Some(cached) = self
                 .app
+                .directory()
                 .directory_entry_for_account_id(&account.account_id_hex)?
                 .and_then(|entry| entry.profile)
             {
@@ -8318,10 +8340,12 @@ impl AccountManager {
                         &self.shared.app_performance_telemetry(),
                         ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
                         "import_relay_list_status",
-                        self.app.resolve_account_relay_list_status_for_account_id(
-                            &account.account_id_hex,
-                            directory_discovery_relays_for_setup(request),
-                        ),
+                        self.app
+                            .directory()
+                            .resolve_account_relay_list_status_for_account_id(
+                                &account.account_id_hex,
+                                directory_discovery_relays_for_setup(request),
+                            ),
                     )
                     .await
                     {
@@ -8335,7 +8359,7 @@ impl AccountManager {
                             );
                             return self
                                 .complete_cached_relay_list_status(&account.label)
-                                .or(Err(error));
+                                .or(Err(AppError::from(error)));
                         }
                         None => {
                             return self
@@ -8388,12 +8412,14 @@ impl AccountManager {
             if bootstrap_relays.is_empty() {
                 return Err(AppError::MissingDefaultRelays);
             }
-            self.app
+            Ok(self
+                .app
+                .directory()
                 .resolve_account_relay_list_status_for_account_id(
                     &account.account_id_hex,
                     bootstrap_relays,
                 )
-                .await
+                .await?)
         }
     }
 

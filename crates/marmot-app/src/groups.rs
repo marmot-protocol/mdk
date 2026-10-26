@@ -1788,8 +1788,10 @@ impl AppGroupEncryptedMediaComponent {
 
     pub(crate) fn endpoint_policy(&self) -> Result<AppEncryptedMediaPolicy, AppError> {
         if !self.required {
+            // A group created with no media servers is text-only for life:
+            // nothing can add the component later.
             return Err(AppError::InvalidEncryptedMedia(
-                "group does not require encrypted media".into(),
+                "group has no encrypted-media servers, so it carries no media".into(),
             ));
         }
         match self.component_id {

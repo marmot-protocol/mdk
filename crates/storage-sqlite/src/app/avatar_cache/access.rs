@@ -211,7 +211,7 @@ pub(crate) fn target_presentation(
     };
     conn.prepare_cached(
         "SELECT m.store_epoch, r.presentation_row_epoch, a.token,
-                coalesce(a.content_revision, 0), coalesce(length(a.bytes), 0),
+                coalesce(a.content_revision, 0), coalesce(length(a.bytes), a.byte_len, 0),
                 a.refresh_at, q.state
          FROM chat_list_rows r CROSS JOIN chat_presentation_meta m
          LEFT JOIN avatar_assets a ON a.owner_key =

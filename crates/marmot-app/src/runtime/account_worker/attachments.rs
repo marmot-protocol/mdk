@@ -15,8 +15,16 @@ const DEMAND_BATCH: usize = 32;
 // Background HTTP has a two-minute whole-transfer deadline. Leave publication margin.
 const LEASE_SECONDS: u64 = 3 * 60;
 const EXPLICIT_LEASE_SECONDS: u64 = 20 * 60;
+/// Compaction attempts that may roll back under one worker ownership.
+const MAX_COMPACTION_ROLLBACKS: u32 = 3;
 /// Rows, then file names, per media sweep batch.
 const MEDIA_SWEEP_BATCH: usize = 256;
+/// How often the "Keep media" sweep runs after worker start. Its windows are
+/// measured in days, so a sweep every tick would only rescan.
+const KEEP_MEDIA_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// How long one "Keep media" pass removes before leaving the rest to the
+/// next tick.
+const KEEP_MEDIA_SWEEP_BUDGET: Duration = Duration::from_millis(250);
 
 type PermitWait = std::pin::Pin<
     Box<
@@ -40,6 +48,28 @@ pub(super) struct Admission {
     upload_cursor: Arc<std::sync::Mutex<Option<storage_sqlite::AttachmentUploadOwner>>>,
     /// The legacy body migration batch running on the blocking pool, if any.
     legacy_migration: Option<tokio::task::JoinHandle<()>>,
+    /// The one-time database compaction ran under this worker; it is not
+    /// attempted again until the next worker ownership.
+    compaction_attempted: bool,
+    /// The maintenance task found the one-time compaction due. Only then
+    /// does the worker wait on the blocking pool for it; a tick with nothing
+    /// due costs the worker nothing.
+    compaction_due: Arc<std::sync::atomic::AtomicBool>,
+    /// Compactions that rolled back under this worker. After
+    /// [`MAX_COMPACTION_ROLLBACKS`] it is not attempted again until the next
+    /// worker ownership, so a failure that repeats cannot rebuild the
+    /// in-memory copy every tick.
+    compaction_rollbacks: u32,
+    /// This worker settled the WAL truncate an earlier process may have left
+    /// owed (recorded nowhere): set only once a maintenance pass tried it,
+    /// so a pass that failed before that leaves it for the next one.
+    startup_wal_settled: Arc<std::sync::atomic::AtomicBool>,
+    /// When the "Keep media" sweep (mdk#2314 step 10) next runs: `None` at
+    /// worker start, then hourly.
+    keep_media_due: Option<std::time::Instant>,
+    /// A sweep stopped at its time budget with attachments still past the
+    /// window, or failed: the next tick runs it again.
+    keep_media_more: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Starts a media sweep on the blocking pool unless one is still running:
@@ -112,10 +142,13 @@ fn spawn_upload_promotion(
 }
 
 /// Starts one batch of moving legacy database bodies into the media store
-/// (mdk#2314 step 6) on the blocking pool, unless one is still running. The
-/// account worker calls this once per maintenance tick, after readiness. A
-/// batch that pauses for free space, resumes, finishes, or drops a corrupt
-/// body wakes attachment observers.
+/// (mdk#2314 step 6) on the blocking pool, unless one is still running, and
+/// then returns freed database pages to the filesystem once the database is
+/// incremental. The account worker calls this once per maintenance tick,
+/// after readiness. A batch that pauses for free space, resumes, finishes,
+/// or drops a corrupt body wakes attachment observers. At worker start and
+/// then hourly, the batch first applies the "Keep media" setting (mdk#2314
+/// step 10) for up to [`KEEP_MEDIA_SWEEP_BUDGET`].
 pub(super) fn spawn_legacy_migration(
     client: &AppClient,
     shared: &RuntimeSharedServices,
@@ -132,6 +165,18 @@ pub(super) fn spawn_legacy_migration(
     let app = client.app.clone();
     let label = client.state.label.clone();
     let updates = shared.attachment_updates.clone();
+    let startup_wal_settled = admission.startup_wal_settled.clone();
+    let compaction_due = admission.compaction_due.clone();
+    let check_compaction = !admission.compaction_attempted;
+    let now = std::time::Instant::now();
+    let sweep_keep_media = admission
+        .keep_media_more
+        .swap(false, std::sync::atomic::Ordering::AcqRel)
+        || admission.keep_media_due.is_none_or(|due| now >= due);
+    if sweep_keep_media {
+        admission.keep_media_due = Some(now + KEEP_MEDIA_SWEEP_INTERVAL);
+    }
+    let keep_media_more = admission.keep_media_more.clone();
     admission.legacy_migration = Some(tokio::task::spawn_blocking(move || {
         let started = (|| {
             let storage = app.account_storage(&label)?;
@@ -145,26 +190,152 @@ pub(super) fn spawn_legacy_migration(
             Ok::<_, AppError>((storage, media, reserve))
         })();
         let Ok((storage, media, reserve)) = started else {
+            if sweep_keep_media {
+                keep_media_more.store(true, std::sync::atomic::Ordering::Release);
+            }
             tracing::warn!(target: "marmot_app::storage_maintenance",
                 method = "migrate_legacy_attachments",
                 "legacy attachment migration batch deferred");
             return;
         };
         let account_dir = app.account_dir(&label);
+        let free = || crate::media::attachment_resume::available_space(&account_dir);
+        let progress = app.legacy_media_migration(&label);
+        let app_storage = storage.app_storage();
+        // "Keep media" first, so bodies past the window are not moved only
+        // to be removed.
+        if sweep_keep_media {
+            let deadline = std::time::Instant::now() + KEEP_MEDIA_SWEEP_BUDGET;
+            match super::super::attachment_storage::clean_past_keep_window(
+                &app_storage,
+                &media,
+                Some(deadline),
+            ) {
+                Ok((removed, more)) => {
+                    if more {
+                        keep_media_more.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    if removed > 0 {
+                        tracing::info!(target: "marmot_app::storage_maintenance",
+                            method = "keep_media_sweep", removed, more,
+                            "attachments past the keep media window removed");
+                        updates.send_modify(|_| {});
+                    }
+                }
+                Err(_) => {
+                    keep_media_more.store(true, std::sync::atomic::Ordering::Release);
+                    tracing::warn!(target: "marmot_app::storage_maintenance",
+                        method = "keep_media_sweep",
+                        "keep media sweep deferred");
+                }
+            }
+        }
         let changed = crate::media::legacy_migration::run_batch(
-            &storage.app_storage(),
+            &app_storage,
             &media,
             reserve,
-            &|| crate::media::attachment_resume::available_space(&account_dir),
-            &app.legacy_media_migration(&label),
+            &free,
+            &progress,
         );
         if changed {
             updates.send_modify(|_| {});
         }
+        // Then images still held in the database move into cache files
+        // (mdk#2314 step 9), so compaction can return their pages.
+        if crate::media::avatar_files::run_batch(&app_storage, &media, reserve, &free) {
+            app.presentation_signals.wake();
+            let _ = app.presentation_signals.avatars.send(label.clone());
+        }
+        let startup = !startup_wal_settled.load(std::sync::atomic::Ordering::Acquire);
+        if crate::media::storage_compaction::reclaim(&app_storage, startup) && startup {
+            startup_wal_settled.store(true, std::sync::atomic::Ordering::Release);
+        }
+        if check_compaction
+            && crate::media::storage_compaction::compaction_check(
+                &app_storage,
+                reserve,
+                &free,
+                &progress,
+            )
+            .is_some()
+        {
+            compaction_due.store(true, std::sync::atomic::Ordering::Release);
+        }
     }));
 }
 
+/// The one-time database compaction (mdk#2314 step 6), once the maintenance
+/// task found it due and this worker has not attempted it, awaited on the
+/// blocking pool. The worker makes no storage calls while it waits, so the
+/// `VACUUM` holding the account connection never parks an async thread.
+/// Skipped while a migration batch still runs; the next tick checks again.
+/// When nothing is due the worker does not wait at all.
+pub(super) async fn compact_if_due(
+    client: &AppClient,
+    shared: &RuntimeSharedServices,
+    admission: &mut Admission,
+) {
+    if client.app.config.cursor_persistence == crate::CursorPersistence::Frozen
+        || admission.compaction_attempted
+        || !admission
+            .compaction_due
+            .load(std::sync::atomic::Ordering::Acquire)
+        || admission
+            .legacy_migration
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    {
+        return;
+    }
+    admission
+        .compaction_due
+        .store(false, std::sync::atomic::Ordering::Release);
+    let app = client.app.clone();
+    let label = client.state.label.clone();
+    let updates = shared.attachment_updates.clone();
+    let attempted = tokio::task::spawn_blocking(move || {
+        let storage = app.account_storage(&label).ok()?;
+        let reserve = storage
+            .app_storage()
+            .attachment_download_policy(&super::super::attachment_controls::default_policy(
+                &app.config,
+            ))
+            .ok()?
+            .disk_reserve;
+        let account_dir = app.account_dir(&label);
+        Some(crate::media::storage_compaction::compact_if_due(
+            &storage.app_storage(),
+            reserve,
+            &|| crate::media::attachment_resume::available_space(&account_dir),
+            &app.legacy_media_migration(&label),
+            &|| updates.send_modify(|_| {}),
+        ))
+    })
+    .await;
+    if let Ok(Some(attempt)) = attempted {
+        admission.record_compaction(attempt);
+    }
+}
+
 impl Admission {
+    /// Counts a compaction attempt: one that ran is not repeated under this
+    /// worker, and rollbacks stop being retried after
+    /// [`MAX_COMPACTION_ROLLBACKS`].
+    pub(super) fn record_compaction(
+        &mut self,
+        attempt: crate::media::storage_compaction::CompactionAttempt,
+    ) {
+        use crate::media::storage_compaction::CompactionAttempt;
+        match attempt {
+            CompactionAttempt::Done => self.compaction_attempted = true,
+            CompactionAttempt::RolledBack => {
+                self.compaction_rollbacks += 1;
+                self.compaction_attempted = self.compaction_rollbacks >= MAX_COMPACTION_ROLLBACKS;
+            }
+            CompactionAttempt::NotDue => {}
+        }
+    }
+
     pub(super) fn is_waiting(&self) -> bool {
         self.waiting.is_some()
     }
@@ -206,7 +377,7 @@ fn admit_demands(storage: &SqliteAppStorage, now: u64, loopback: bool) -> Result
             // One parser result supplies both the download reference and digest.
             // Claim reparses the exact source-fenced slot, never client metadata.
             let digest = crate::media::media_hash_from_reference(&reference)?;
-            storage.request_attachment_acquisition(
+            storage.request_automatic_acquisition(
                 &demand.group_id_hex,
                 &demand.entry,
                 digest,

@@ -4,36 +4,6 @@
 
 ### Breaking changes
 
-- `AttachmentStorageUsageFfi` adds `migration` (`AttachmentMigrationStateFfi`:
-  `NotNeeded`, `Running`, `Paused`, `Complete`) and `migration_bytes`: where
-  the background move of legacy database bodies into the media store stands
-  (mdk#2314 step 6). Regenerate bindings; update code that constructs or
-  exhaustively destructures the record.
-
-- `MarmotKitError` adds `InvalidPublicEventReferences`: a cached public event preview read named more than 16 references. Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
-- `MarmotKitError` adds `DirectoryLookupIncomplete { account }` (mdk#2302): a recipient's or
-  account's relay-list or KeyPackage lookup ran out of time or relay coverage, so nothing is
-  known to be missing. Offer retry. These failures previously arrived as `Runtime`. Update
-  exhaustive Swift `switch` / Kotlin `when` handling.
-- `MarmotKitError::MissingKeyPackage` adds `reason: MissingKeyPackageReasonFfi`. `ObsoleteOnly`
-  means the recipient has published only obsolete KeyPackages and must update their app;
-  these recipients previously surfaced as `InvalidKeyPackageEvent` (mdk#1975). `NotFound`
-  keeps the previous meaning. Regenerate bindings and update Swift associated-value patterns.
-- `MarmotKitError` adds `GroupCatchingUp`: a group change was refused because the group may have moved past this device and recovery has not caught it up yet (mdk#2258). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
-- `AttachmentTransferStateFfi` adds `StorageBlocked`: free disk cannot cover
-  the publication reserve for the body, checkpoints are kept, and the job
-  readmits once space frees or on explicit Retry. Update exhaustive
-  Swift/Kotlin handling and regenerate bindings with the matching native
-  library; render a storage prompt rather than a retry timer. See
-  [the attachment access contract](ATTACHMENT-ACCESS.md).
-- `MarmotKitError` adds `StorageFull { details }` (mdk#2314): the device has no room for the
-  operation. `upload_media`, `upload_media_files` and their token-aware twins return it when an
-  attachment cannot be stored locally beyond the disk reserve, before anything is uploaded;
-  such sends previously went out without a local copy. A full disk or database elsewhere also
-  maps here instead of `Runtime`. Ask the user to free space. Regenerate bindings and update
-  exhaustive Swift `switch` / Kotlin `when` handling.
-- `MarmotKitError` adds `InvalidEditTarget`, returned by `edit_message` (see Fixed). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
-- `MarmotKitError` adds `GroupCommitUndelivered`: a group change was refused because the group's last change has not reached every group relay yet (mdk#2255). Regenerate bindings and update exhaustive Swift `switch` / Kotlin `when` handling.
 - `MarmotKitError` adds `MediaReferenceStaleEpoch { reference_epoch, group_epoch }`
   and `MediaReferenceEpochUnsettled { reference_epoch }`. They replace the
   generic `InvalidMediaReference` for these two cases: the first means the
@@ -42,36 +12,249 @@
   exhaustive Swift/Kotlin handling and regenerate bindings with the matching
   native library (#2158).
 
+### Changed
+
+- `AttachmentTransferSubscription.next()` returns a replacement that changes a
+  row's transfer state as soon as the engine reports it; progress-only
+  replacements still arrive at most four per second. A host that polled
+  `attachmentTransferSnapshot` beside the feed to see `Ready` sooner can drop
+  that poll (#2157).
+
+## 0.14.0 - 2026-10-23
+
+Regenerate Swift/Kotlin bindings with the matching native library. Every
+constructor now takes a deployment; White Noise apps pass
+`marmotDeploymentWhiteNoise()`. Account storage upgrades on first open, and
+downgrade is unsupported. See the
+[release notes](../../docs/release/0.14.0.md) and the
+[client upgrade guide](../../docs/integration/0.14.0.md).
+
+### Breaking changes
+
+- `OnboardingFindingFfi` adds `context`, `purpose`, `outcome`,
+  `declared_capability`, `actions`, and `observed_revision` (mdk#2565).
+  Update host record construction and use the typed provenance to distinguish
+  discovery failures from declared-route checks. `OnboardingIssueFfi` adds
+  `InspectionCompleted`; update exhaustive Swift `switch` / Kotlin `when`
+  handling. A successful directory query does not establish write support.
+
+- Every `Marmot` constructor requires a `MarmotDeploymentFfi`.
+  `MarmotOptions.deployment` has no default, and `new`, `new_with_options`,
+  `new_with_secret_store`, `new_with_cursor_persistence` and
+  `new_with_client_name` take it as their last argument. It holds the
+  deployment's recovery relays, discovery indexers, media and image servers,
+  Open Ranking (`OpenRankingProviderFfi`), KeyPackage client preference,
+  moderation label namespace and keychain service. Its fields have no binding
+  defaults: start from `marmot_deployment_white_noise()` or
+  `marmot_deployment_neutral()` and change what differs. White Noise apps pass
+  the White Noise preset at every construction, including background and
+  notification-extension runtimes, which keeps their behaviour and keychain
+  unchanged. See [deployment](README.md#deployment).
+
+- Without a `SecretStore`, the platform keychain opens under the deployment's
+  `keychain_service`. 0.13.0 always used `com.marmot.whitenoise`; the neutral
+  preset uses `org.marmot-protocol.mdk`. An app that relied on the 0.13.0
+  default must keep `com.marmot.whitenoise`, or its existing account secrets
+  are not found.
+
+- Unset deployment values fall back to nothing. With the neutral preset, new
+  groups are text-only, setting or fetching a group image fails with
+  `Runtime`, `upload_profile_image` needs an explicit server, a moderation
+  report destination is refused, account setup and onboarding search no public
+  indexers, directory search has no Open Ranking tier and no KeyPackage client
+  is preferred. The build-time `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` override
+  is gone; set `new_group_media_endpoints` instead.
+
+- `MarmotKitError` adds `GroupCatchingUp { group_id_hex }` (mdk#2258) and
+  `GroupCommitUndelivered { group_id_hex }` (mdk#2255). A group change (invite,
+  remove, admin, profile, image, avatar URL, retention, media servers, app
+  components, disbanding) is refused while the group may have moved past this
+  device, or once its last change has been owed to a group relay for two
+  minutes. Messages and leaving are not affected. See the acknowledgements
+  under Added. Update exhaustive Swift `switch` / Kotlin `when` handling.
+
+- `MarmotKitError` adds `DirectoryLookupIncomplete { account }` (mdk#2302): a
+  recipient's or account's relay-list or KeyPackage lookup ran out of time or
+  relay coverage, so nothing is known to be missing. Offer retry. These
+  failures previously arrived as `Runtime`. The error message omits the
+  account; read it from the field.
+
+- `MarmotKitError::MissingKeyPackage` adds `reason: MissingKeyPackageReasonFfi`
+  (mdk#1975). `ObsoleteOnly` means the recipient has published only obsolete
+  KeyPackages and must update their app; these recipients previously surfaced
+  as `InvalidKeyPackageEvent`. `NotFound` keeps the previous meaning. The
+  message now ends with `[not_found]` or `[obsolete_only]`. Update Swift
+  associated-value patterns.
+
+- `MarmotKitError` adds `StorageFull { details }` (mdk#2314): the device has no
+  room for the operation. `upload_media`, `upload_media_files` and their
+  token-aware twins return it before anything is uploaded when an attachment
+  cannot be stored locally beyond the disk reserve; such sends previously went
+  out without a local copy. `open_attachment_handoff` returns it when the disk
+  cannot hold the copy. A full disk or database elsewhere also maps here
+  instead of `Runtime`. Ask the user to free space.
+
+- `MarmotKitError` adds `InvalidEditTarget` (`edit_message`) and
+  `FollowListTooLarge` (`follow_user`, `unfollow_user`), both described under
+  Fixed, and `InvalidPublicEventReferences { max_references }`:
+  `cached_public_event_previews` was given more than 16 references. Update
+  exhaustive Swift `switch` / Kotlin `when` handling.
+
+- `AttachmentTransferStateFfi` adds `StorageBlocked` and `CleanedBySetting`.
+  `StorageBlocked`: free disk cannot cover the publication reserve for the
+  body; checkpoints are kept, and the job readmits once space frees or on
+  explicit Retry. Render a storage prompt rather than a retry timer.
+  `CleanedBySetting`: the account's "Keep media" setting removed the body;
+  download again is allowed, as for `Removed`. Update exhaustive Swift
+  `switch` / Kotlin `when` handling. See
+  [the attachment access contract](ATTACHMENT-ACCESS.md).
+
+- `RetentionSweepStatusFfi::DeferredScanExhausted` is removed with the sweep's
+  page scan (mdk#2425, see Fixed). Remove exhaustive Swift `switch` / Kotlin
+  `when` arms for it.
+
 ### Added
 
-- Manage storage (mdk#2314 step 5): `attachment_storage_usage`,
-  `attachment_storage_by_chat`, `largest_retained_attachments` (paged largest
-  first with opaque `ChatStorageCursor` / `RetainedAttachmentsCursor` handles),
-  `remove_chat_attachments` and `remove_attachments_older_than`. Removal is
-  `control_attachment` Remove, and released media-store files are deleted
-  before the call returns. See [Manage storage](ATTACHMENT-ACCESS.md#manage-storage).
+- Manage storage (mdk#2314): `attachment_storage_usage` returns
+  `AttachmentStorageUsageFfi`: media-store bytes, legacy database bytes, the
+  retained attachment count, the database's size and free pages, `cache_bytes`
+  for the avatar and group-image cache, and `migration` /
+  `migration_bytes` (`AttachmentMigrationStateFfi`: `NotNeeded`, `Running`,
+  `Paused`, `Complete`, `Compacting`) for the background move of legacy bodies.
+  `attachment_storage_by_chat` and `largest_retained_attachments` page largest
+  first, 1 to 256 per page, with opaque `ChatStorageCursor` /
+  `RetainedAttachmentsCursor` handles. `remove_chat_attachments` and
+  `remove_attachments_older_than` remove in bulk, as `control_attachment`
+  Remove does, and return the count. Show `cache_bytes` next to a "Clear cache"
+  action (`clear_avatar_cache`). See
+  [Manage storage](ATTACHMENT-ACCESS.md#manage-storage).
 
-- `MarmotOptions.deployment` takes a `MarmotDeploymentFfi` (with `OpenRankingProviderFfi`) for the deployment's recovery relays, discovery indexers, media and image servers, Open Ranking, KeyPackage client preference, moderation label namespace and keychain service; `marmot_deployment_white_noise()` and `marmot_deployment_neutral()` build one. Without a `SecretStore`, the platform keychain now opens under the deployment's `keychain_service`. An omitted deployment is White Noise's, unchanged, until the neutral default lands, when every constructor will require one (host-configuration brief, PR 2).
+- `attachment_keep_media` and `set_attachment_keep_media` with
+  `AttachmentKeepMediaFfi` (`Forever`, `OneYear`, `SixMonths`, `ThirtyDays`):
+  the opt-in, per-device "Keep media" setting. `Forever` is the default and
+  removes nothing. Setting a window removes what is already past it and
+  returns the count; the account worker then applies it at start and hourly.
+  See [Manage storage](ATTACHMENT-ACCESS.md#manage-storage).
+
 - `open_attachment_handoff` and `release_attachment_handoff`, with record
-  `AttachmentHandoffFfi` (mdk#2314 step 4): a private plaintext copy of a
-  retained attachment, lent under a lease to an OS surface that needs a real
-  file (package installer, share sheet, "open with", Quick Look). Release it
-  when the surface is done, and cancel a copy only through its control, not by
-  cancelling the awaiting coroutine. See [handoff leases](ATTACHMENT-ACCESS.md#handoff-leases).
+  `AttachmentHandoffFfi`: a private plaintext copy of a retained attachment,
+  lent under a lease to an OS surface that needs a real file (package
+  installer, share sheet, "open with", Quick Look). Release it when the
+  surface is done, and cancel a copy only through its control, not by
+  cancelling the awaiting coroutine. See
+  [handoff leases](ATTACHMENT-ACCESS.md#handoff-leases).
 
-- `Marmot::cached_public_event_previews` and `Marmot::resolve_public_event_preview` cache verified public Nostr events referenced from message content (mdk#1547). Cached reads are network-free and survive restarts; resolve fetches missing or stale previews. See [public event previews](README.md#public-event-previews).
+- `cached_public_event_previews` and `resolve_public_event_preview` cache
+  verified public Nostr events referenced from message content (mdk#1547).
+  Cached reads take at most 16 references, are network-free and survive
+  restarts; resolve fetches one missing or stale preview. The cache adds a
+  directory-cache migration that older builds refuse. See
+  [public event previews](README.md#public-event-previews).
 
-- Account-wide attachment candidate pages, group/sender/date queries and opaque account/query-bound cursor/version handles. Filtered empty pages can continue; source changes require restart. Existing group history and acquisition primitives are unchanged.
+- `account_attachment_history_page` and `account_attachment_history_version`
+  browse local attachments across one account, filtered by group, sender and
+  date (`AccountAttachmentQueryFfi`), at most 100 candidates per page, with
+  opaque `AccountAttachmentCursor` / `AccountAttachmentVersion` handles and
+  `AccountAttachmentVersion::change_since`. A filtered empty page can still
+  continue. Reads start no acquisition. See
+  [account attachment history](ACCOUNT-ATTACHMENT-HISTORY.md).
 
-- `Marmot::send_prepared_media_with_client_token` exposes captured ordinary-media admission with transactional conditional draft consumption. Use the original token and revision for live retries, recover ownership by token after interruption, and pair regenerated Swift/Kotlin bindings with the matching library. See [local sends](LOCAL-SENDS.md).
+- `send_prepared_media_with_client_token` admits an uploaded ordinary-media
+  snapshot and consumes its captured draft only if that draft is unchanged.
+  Keep the original token and revision for live retries, and recover
+  ownership by token after interruption. See
+  [captured media drafts](LOCAL-SENDS.md#captured-ordinary-media-drafts).
 
-- `Marmot::acknowledge_group_catching_up`: after `GroupCatchingUp`, call it once the user accepts that the change may split the group, then retry. See [the epoch-gap notes](README.md#history-may-be-incomplete-notices).
+- `acknowledge_group_catching_up`: after `GroupCatchingUp`, call it once the
+  user accepts that the change may split the group, then retry.
+  `group_commit_delivery` returns the relays still owed the group's last
+  change (`GroupCommitDeliveryFfi`), and `acknowledge_group_commit_undelivered`
+  lets one change through after `GroupCommitUndelivered` once the user accepts
+  the risk. Each acknowledgement admits one attempt and is not persisted. See
+  [the epoch-gap and delivery notes](README.md#history-may-be-incomplete-notices).
 
-- `Marmot::group_commit_delivery` returns the relays still owed the group's last change (`GroupCommitDeliveryFfi`), and `Marmot::acknowledge_group_commit_undelivered` lets one change through after `GroupCommitUndelivered` once the user accepts the risk. See [the delivery notes](README.md#history-may-be-incomplete-notices).
+### Changed
+
+- MarmotKit runs MDK on its own process-wide multi-thread Tokio runtime (half
+  the CPUs, 2 to 4 `marmotkit-rt` workers) instead of UniFFI's single
+  `async_compat` thread and the thread that polls each call. Awaiting from the
+  main actor or `Dispatchers.Main` no longer runs MDK work there. Cancelling a
+  Kotlin coroutine aborts its task; `shutdown_and_close` and
+  `release_attachment_handoff` still complete. Subscription receives stay on
+  the calling thread, so a cancelled wait never consumes an update. Host
+  callbacks can run on runtime threads concurrently and must not wait for the
+  main thread. Constructors return `Runtime` if the runtime cannot start. See
+  [threading model](README.md#threading-model).
+
+- Downloaded and sent attachment bodies are encrypted files in the account's
+  `media/` directory instead of database rows (mdk#2314). Bodies and avatars
+  stored by earlier releases move there in the background, and the account
+  database is compacted once when enough of it is free; account reads and
+  writes wait while it compacts, typically about a second. Exclude the
+  account directory, including `media/` and `handoff/`, from iCloud and
+  Android backups. `AttachmentDownloadPolicyFfi.retained_bytes` no longer
+  limits downloads: free disk above `disk_reserve` is the only gate, and a
+  download needs the reserve plus twice its body. Download checkpoints saved
+  by earlier releases are discarded, so interrupted downloads start over.
+
+- With 256 uploads already awaiting publication, `upload_media`,
+  `upload_media_files` and their token-aware twins fail with
+  `InvalidMediaReference` and publish nothing. Before, the send went out
+  without a local copy.
+
+- `control_attachment` Remove deletes the released media-store file before it
+  returns, and fails before removing anything when the media store cannot
+  open.
+
+- `approve_onboarding_repair` and `approve_onboarding_repair_in_epoch` need a
+  completed freshness query from every source, including relays in the
+  account's own relay declaration. If one does not answer, the step is a
+  retryable failure, even when another source returned a record.
 
 ### Fixed
 
-- `edit_message` returns `InvalidEditTarget`, publishing nothing, unless the target is an available chat message this account sent. Before, an edit of another account's message, a reaction or a deleted message was published to the group and reported as sent, then ignored by every recipient. The check uses this device's view when the edit is requested; recipients stay authoritative.
+- `follow_user` and `unfollow_user` change only the followed account's `p` tag
+  in the current kind-3 contact list; petnames, relay hints, other tags and
+  the content stay as published (mdk#2268). Before, every edit dropped them. A
+  list with 2,048 follows or more, the most MDK reads from one list, returns
+  `FollowListTooLarge` and publishes nothing, where it used to be republished
+  cut to 2,048 follows.
+
+- `edit_message` returns `InvalidEditTarget`, publishing nothing, unless the
+  target is an available chat message this account sent. Before, an edit of
+  another account's message, a reaction or a deleted message was published to
+  the group and reported as sent, then ignored by every recipient. The check
+  uses this device's view when the edit is requested; recipients stay
+  authoritative.
+
+- `open_agent_publisher` and `watch_agent_text_stream` verify QUIC brokers
+  against bundled Mozilla roots instead of the OS trust store when no
+  certificate is pinned. This fixes an Android process abort on the first
+  handshake. Pin a broker behind a private CA with `server_cert_der`.
+
+- `shutdown_and_close` closes every account engine's database connection
+  before releasing the root lease, so `storage_is_closed()` no longer reports
+  true while an engine still holds the database (iOS `0xdead10cc`).
+
+- A generated identity's setup no longer advertises the app's configured
+  relays before the relay lists the user chose, and its KeyPackages go to the
+  chosen relays.
+
+- The retention sweep no longer prunes a message the unread projection still
+  counts unread (mdk#2425).
+
+- An explicit download the device lacks room to publish parks as
+  `StorageBlocked` instead of retrying forever, and receiving an attachment no
+  longer holds several copies of it in native memory (mdk#2239, mdk#2241).
+
+- Runtime fixes need no new calls: ordered offline catch-up (#2513), epoch-gap
+  fallback history (#2298, #2500), a quarantined group no longer stalling every
+  conversation's receives (#2327, #2328), notification-extension wakes arming
+  stall detection (#2343), bounded reconciliation progress (#2490, #2503) and
+  less redundant inbound work (#2547, #2548). See `marmot-app`'s 0.14.0 fixes.
+  Dependency updates fix RUSTSEC-2026-0338 to -0342 (`quinn-proto`),
+  RUSTSEC-2026-0346 to -0349 (`rustls`), RUSTSEC-2026-0365 (`negentropy`) and
+  RUSTSEC-2026-0381 and -0382 (`webpki-roots`, `rustls-webpki`).
 
 ## 0.13.0 - 2026-10-12
 

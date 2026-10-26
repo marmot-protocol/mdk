@@ -98,8 +98,15 @@ static void report(const char *what) {
 
 int main(void) {
     MarmotClient *client = NULL;
+    MarmotDeployment *deployment = NULL;
     const char *relays[] = {"wss://relay.example.org"};
-    if (marmot_client_new("/path/to/home", relays, 1, &client) != MARMOT_STATUS_OK) {
+    if (marmot_deployment_white_noise(&deployment) != MARMOT_STATUS_OK) {
+        report("deployment_white_noise");
+        return 1;
+    }
+    MarmotStatus status = marmot_client_new("/path/to/home", relays, 1, deployment, &client);
+    marmot_deployment_free(deployment); /* the client keeps its own copy */
+    if (status != MARMOT_STATUS_OK) {
         report("client_new");
         return 1;
     }
@@ -147,6 +154,13 @@ context retain nonblocking cleanup to avoid deadlock and are not a process-teard
 
 ## Onboarding relay repair
 
+`MarmotOnboardingFinding` includes typed context, check purpose and outcome,
+declared capability, an owned `actions`/`actions_len` array, and optional
+`has_observed_revision`/`observed_revision`. Free all nested findings and actions
+through `marmot_onboarding_snapshot_free`; do not free the arrays separately.
+See the shared [diagnostic evidence limits](../marmot-uniffi/README.md#interactive-account-onboarding)
+before interpreting query success as relay capability or publication evidence.
+
 For a general or inbox onboarding relay failure, call
 `marmot_propose_onboarding_relay_repair` and inspect the optional
 `proposal->relay_repair` in the returned snapshot. Its ordered before/after
@@ -179,12 +193,13 @@ the same defaults as the Swift/Kotlin `MarmotOptions` (see the
 [shared contract](../marmot-uniffi/README.md#runtime-options-and-client-label)). Use the matching header and library
 for that struct's layout. `marmot_client_new_with_client_name` is the older label-only constructor.
 
-`marmot_client_new_with_deployment` takes the same options plus a `MarmotDeployment`: the deployment's recovery
-relays, discovery indexers, media and image servers, Open Ranking, KeyPackage client preference, moderation label
-namespace and keychain service. Create one with `marmot_deployment_white_noise` or `marmot_deployment_neutral`,
-adjust it with the `marmot_deployment_set_*` functions, construct, then free it with `marmot_deployment_free`; the
-client keeps its own copy. A NULL deployment, like every other constructor, uses White Noise's until the default
-turns neutral. The [shared contract](../marmot-uniffi/README.md#deployment) covers the keychain caveat.
+Every `marmot_client_new*` constructor takes a required `MarmotDeployment` just before `out_client`: the
+deployment's recovery relays, discovery indexers, media and image servers, Open Ranking, KeyPackage client
+preference, moderation label namespace and keychain service. Create one with `marmot_deployment_white_noise` or
+`marmot_deployment_neutral`, adjust it with the `marmot_deployment_set_*` functions, construct, then free it with
+`marmot_deployment_free`; the client keeps its own copy. A NULL deployment returns `MARMOT_STATUS_NULL_POINTER`
+before anything opens. White Noise hosts pass `marmot_deployment_white_noise()`. The
+[shared contract](../marmot-uniffi/README.md#deployment) covers what neutral means and the keychain caveat.
 
 For private integration fixtures, `marmot_client_new_with_options` accepts
 an explicit loopback relay policy and an optional host secret-store vtable.
@@ -207,16 +222,19 @@ lease. Both calls block, and the open holds the calling thread for the whole cop
 run them off the UI thread. See the
 [shared contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#handoff-leases).
 
-
 ## Attachment storage
 
 `marmot_attachment_storage_usage`, `marmot_attachment_storage_by_chat` and
 `marmot_largest_retained_attachments` read a Manage storage screen's usage and
 largest-first pages; `marmot_remove_chat_attachments` and
 `marmot_remove_attachments_older_than` remove in bulk, each removal being an
-ordinary Remove. Page cursors are borrowed from their page: keep the page alive
+ordinary Remove. `marmot_attachment_keep_media` and
+`marmot_set_attachment_keep_media` read and set the account's "Keep media"
+window as `MarmotAttachmentKeepMedia` discriminants; attachments it removes read
+`CleanedBySetting`. Page cursors are borrowed from their page: keep the page alive
 while passing its `next_cursor`, then free the page. Calls block. See the
 [shared contract](../marmot-uniffi/ATTACHMENT-ACCESS.md#manage-storage).
+
 ## File-backed media upload
 
 `marmot_upload_media_files` and its token-aware twin take borrowed
@@ -231,6 +249,10 @@ cannot hold returns `MARMOT_STATUS_STORAGE_FULL` before any upload.
 File-backed calls have no fixed worker-response timeout; per-endpoint network
 deadlines still apply. Cancellation observed before message admission starts
 prevents publication; admission is not interruptible once started.
+
+## Account attachment history
+
+`marmot_account_attachment_history_page` blocks off the UI thread and borrows its query arrays and cursor. Deep-free the result with `marmot_account_attachment_page_read_free`; its cursor and version are borrowed fields and must not be freed separately. Clone a version baseline with `marmot_account_attachment_version_clone` when it must outlive a page. Query flags use `uint8_t`, and arrays are capped at 100 before decoding. See the [shared contract](../marmot-uniffi/ACCOUNT-ATTACHMENT-HISTORY.md).
 
 ## Local sends
 
@@ -512,6 +534,12 @@ evidence only. Changing `strip` changes Cargo's release-profile fingerprint, so
 alternating these scripts with an unpinned `cargo build --release` can rebuild
 release dependencies.
 
+On OpenBSD `c-bindings.sh` builds SQLCipher with `OMIT_MEMLOCK` and routes its
+`malloc`/`calloc` to `malloc_conceal`/`calloc_conceal`, so a host can run under
+`pledge(2)`, which forbids `mlock`. Concealed pages stay out of core dumps and
+are wiped on free, but are not pinned in RAM: swap protection follows the
+host's swap encryption. Flags already in `LIBSQLITE3_FLAGS` are kept.
+
 ## Regenerating the header
 
 ```sh
@@ -521,7 +549,3 @@ just c-header
 The mirror surface is macro-generated, so header generation runs cbindgen
 with macro expansion (`RUSTC_BOOTSTRAP=1` on the stable toolchain). CI
 diff-gates the checked-in header.
-
-## Account attachment history
-
-`marmot_account_attachment_history_page` blocks off the UI thread and borrows its query arrays and cursor. Deep-free the result with `marmot_account_attachment_page_read_free`; its cursor and version are borrowed fields and must not be freed separately. Clone a version baseline with `marmot_account_attachment_version_clone` when it must outlive a page. Query flags use `uint8_t`, and arrays are capped at 100 before decoding. See the [shared contract](../marmot-uniffi/ACCOUNT-ATTACHMENT-HISTORY.md).

@@ -99,6 +99,24 @@ impl CandidateRelay {
                 }
                 (account_id.clone(), endpoints.clone(), filter)
             }
+            NostrSubscription::GroupBatch {
+                account_id,
+                endpoints,
+                routes,
+                since,
+                ..
+            } => {
+                let mut filter = Filter::new().kind(Kind::MlsGroupMessage).custom_tags(
+                    SingleLetterTag::from_char('h').unwrap(),
+                    routes
+                        .iter()
+                        .map(|route| hex::encode(&route.transport_group_id)),
+                );
+                if let Some(since) = since {
+                    filter = filter.since(Timestamp::from_secs(since.0));
+                }
+                (account_id.clone(), endpoints.clone(), filter)
+            }
             NostrSubscription::GroupMaintenance {
                 account_id,
                 endpoints,
@@ -210,6 +228,7 @@ impl NostrRelayClient for CandidateRelay {
     async fn unsubscribe_account(
         &self,
         account_id: &MemberId,
+        _replacements: &[NostrSubscription],
     ) -> Result<(), TransportAdapterError> {
         let saved = self
             .subscriptions

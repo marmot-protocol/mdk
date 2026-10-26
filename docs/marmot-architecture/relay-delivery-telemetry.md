@@ -221,10 +221,21 @@ The implementation keeps at most 16,384 exact ids per inbox or group route and a
 when it compacts an authored-time bucket. It also applies a rolling 30-day lower bound and the same item limit to the
 relay filter, so storage, set exchange, and startup memory remain bounded. Events below the persisted floor are outside
 the automatic late-publication repair contract. A first start after the inventory migration begins empty and therefore
-discovers the relay-held difference inside that bounded window; it fetches at most 128 deterministic ids per route pass,
-then durable ingestion removes that subset from the next dry-run comparison. The account attempts at most four routes
-per startup pass, using a durable rotating cursor and a two-second per-route deadline, so a slow or unsupported route
-cannot permanently hide later routes. Retiring a group transport route deletes its inventory and route state.
+discovers the relay-held difference inside that bounded window. Each route pass selects at most 512 remote-only IDs
+and returns at most 256 events within its byte allowance. Only durable ingestion removes an event from the next
+comparison. Retiring a group transport route deletes its inventory and cursor state.
+
+MarmotApp runs up to four route comparisons concurrently in one account-owned job, collects results in frozen
+inventory order, and admits them serially. Automatic network work keeps its ten-second cutoff; explicit full-history
+repair has fifty seconds for network work inside its sixty-second total budget. The SDK receives the caller's cutoff,
+with time reserved for partial-result handoff and epoch-gap windows.
+
+The durable rotation cursor claims only the starting batch before I/O, even when an explicit inventory contains more
+than four routes. A comparison plan retains every pending executable goal, not just that batch. Unselected or skipped
+routes and locally unretained or unattempted events stay retryable in the same comparison revision. An answered route
+with unknown remote coverage is serviced without certifying history, so uncertainty alone does not force retries.
+A goal whose observed retained floor is newer than its upper bound cannot be searched. It is left out of the
+operational plan without certifying or erasing its coverage debt.
 
 A signed, in-payload **per-sender monotonic counter** is an optional further hint: a client that holds sender A's #5 and
 #7 but not #6 knows to delay settling and re-fetch. It is protocol evidence (inside the MLS payload, signed), so it is

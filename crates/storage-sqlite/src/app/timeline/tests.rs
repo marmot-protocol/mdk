@@ -67,6 +67,73 @@ fn modifier_lookup_bounds() {
     assert_eq!(LOOKUPS.load(Ordering::Relaxed), 6);
 }
 
+#[test]
+fn modifier_lookups_reuse_their_compiled_statements() {
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // A kind bound as a parameter is compared with the partial index
+    // `content_report_labels`, so every rebind recompiled the statement.
+    static TARGETED: AtomicUsize = AtomicUsize::new(0);
+    static DELETED_REACTIONS: AtomicUsize = AtomicUsize::new(0);
+    static POLL_VOTES: AtomicUsize = AtomicUsize::new(0);
+    static REPREPARES: AtomicUsize = AtomicUsize::new(0);
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    store.lock().unwrap().trace_v2(
+        TraceEventCodes::SQLITE_TRACE_PROFILE,
+        Some(|event| {
+            if let TraceEvent::Profile(stmt, _) = event
+                && stmt.sql().contains("FROM message_modifier_edges AS edges")
+            {
+                let sql = stmt.sql();
+                let counter = if sql.contains("voter_rank") {
+                    &POLL_VOTES
+                } else if sql.contains("edges.target_message_id_hex IN") {
+                    &DELETED_REACTIONS
+                } else {
+                    &TARGETED
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+                REPREPARES.fetch_add(
+                    stmt.get_status(rusqlite::StatementStatus::RePrepare) as usize,
+                    Ordering::Relaxed,
+                );
+            }
+        }),
+    );
+    let app = store.app_storage();
+    for index in 0..3u64 {
+        let at = 100 * (index + 1);
+        let id = |offset: u64| format!("{:064x}", 16 * index + offset);
+        app.record_app_event(&chat(&id(1), "alice", at, "hello"))
+            .unwrap();
+        app.record_app_event(&reaction(&id(2), "bob", &id(1), at + 1, "+"))
+            .unwrap();
+        app.record_app_event(&delete(&id(3), "bob", &id(2), at + 2))
+            .unwrap();
+        app.record_app_event(&poll(&id(4), "alice", at + 3))
+            .unwrap();
+        app.record_app_event(&poll_response(
+            &id(5),
+            "bob",
+            &id(4),
+            at + 4,
+            "0",
+            "received",
+        ))
+        .unwrap();
+    }
+    store
+        .lock()
+        .unwrap()
+        .trace_v2(TraceEventCodes::empty(), None);
+
+    assert!(TARGETED.load(Ordering::Relaxed) > 3);
+    assert!(DELETED_REACTIONS.load(Ordering::Relaxed) > 3);
+    assert!(POLL_VOTES.load(Ordering::Relaxed) > 3);
+    assert_eq!(REPREPARES.load(Ordering::Relaxed), 0);
+}
+
 fn no_mentions(_plaintext: &str, _tags: &[Vec<String>]) -> bool {
     false
 }
@@ -2015,7 +2082,7 @@ fn group_timeline_pagination_rejects_missing_canonical_cursor() {
 }
 
 #[test]
-fn wall_clock_timeline_query_preserves_retention_scan_order() {
+fn wall_clock_timeline_query_orders_by_sender_time() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
     let mut system_seven = group_system("system-7", "member_added", 100);
     system_seven.source_epoch = Some(7);

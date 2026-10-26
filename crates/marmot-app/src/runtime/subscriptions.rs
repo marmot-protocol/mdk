@@ -928,7 +928,8 @@ pub enum RuntimeAgentStreamUpdate {
 pub struct AgentStreamWatchOptions {
     /// Watch a specific stream id; `None` watches the latest stream in the group.
     pub stream_id_hex: Option<String>,
-    /// DER cert for a self-signed broker; `None` uses platform trust.
+    /// DER cert for a self-signed broker; `None` uses the bundled public-CA
+    /// roots, not the OS trust store.
     pub server_cert_der: Option<Vec<u8>>,
     /// Loopback-only insecure trust, for local testing.
     pub insecure_local: bool,
@@ -1952,6 +1953,7 @@ fn messages_recovery_updates(
         .map(|record| record.sender.clone())
         .collect::<Vec<_>>();
     let display_names = app
+        .directory()
         .display_names_for_account_ids(&senders)
         .unwrap_or_default();
     let updates = records

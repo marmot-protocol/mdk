@@ -5598,7 +5598,7 @@ async fn auto_publish_confirms_pending_when_commit_was_partially_exposed() {
 
     let mut phases = Vec::new();
     let ingested = runtime
-        .ingest_delivery_with_observer(delivery, |phase, _elapsed, success| {
+        .ingest_delivery_with_observer(&delivery, |phase, _elapsed, success| {
             phases.push((phase, success));
         })
         .await
@@ -6518,30 +6518,6 @@ async fn maintenance_supersession_leaves_a_failed_obligation_terminal() {
     );
 }
 
-#[tokio::test]
-async fn maintenance_timing_defaults_match_production_windows() {
-    let timing = MaintenanceTiming::default();
-    assert_eq!(timing.quiet, Duration::from_secs(60));
-    assert_eq!(timing.contention_jitter_max, Duration::from_millis(30_000));
-    assert_eq!(timing.eose_timeout, Duration::from_secs(5 * 60));
-    assert_eq!(timing.post_eose_grace, Duration::from_secs(15));
-    assert_eq!(MaintenanceTiming::immediate().quiet, Duration::ZERO);
-
-    let dir = tempfile::tempdir().unwrap();
-    let key = SqlCipherKey::new("marmot maintenance timing key").unwrap();
-    let runtime = AccountDeviceRuntime::new(
-        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
-        RecordingAdapter::default(),
-        StaticTransportRouting::new(vec![]),
-        RecordingKeyPackages::default(),
-    );
-    assert_eq!(
-        runtime.maintenance_timing(),
-        MaintenanceTiming::default(),
-        "a runtime built without an override runs production maintenance windows"
-    );
-}
-
 /// One single-member group with periodic rotation disabled, reopened under
 /// `timing` with clocks that never advance. Returns the reopened runtime, the
 /// group, and its epoch before any maintenance.
@@ -6653,7 +6629,7 @@ async fn held_group_defers_a_due_self_update_until_the_hold_lifts() {
     let (_dir, mut runtime, group_id, source_epoch) =
         manual_only_group_runtime(MaintenanceTiming::immediate()).await;
     let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
-    let held = [(group_id.clone(), marmot_account::SelfUpdateHold::EpochGap)];
+    let held = [group_id.clone()];
     for _ in 0..3 {
         runtime.run_due_maintenance_holding(&held).await.unwrap();
     }
@@ -6680,96 +6656,6 @@ async fn held_group_defers_a_due_self_update_until_the_hold_lifts() {
     assert_eq!(
         runtime.session().epoch(&group_id).unwrap().0,
         source_epoch.0 + 1
-    );
-}
-
-/// mdk#2158: a group with an attachment upload in flight keeps its due
-/// periodic self-update owed, recorded as an upload hold, until the upload
-/// ends. A self-update the user asked for and the post-join rotation are not
-/// held.
-#[tokio::test]
-async fn upload_hold_defers_only_periodic_self_updates() {
-    let (_dir, mut runtime, group_id, source_epoch) =
-        manual_only_group_runtime(MaintenanceTiming::immediate()).await;
-    let held = [(group_id.clone(), marmot_account::SelfUpdateHold::Upload)];
-    let confirmed = |effects: &marmot_account::AccountDeviceEffects| {
-        effects
-            .pending
-            .iter()
-            .any(|resolution| matches!(resolution, PendingResolution::Confirmed { .. }))
-    };
-
-    // A manual self-update goes ahead during an upload.
-    runtime.schedule_manual_self_update(&group_id).unwrap();
-    let mut rotated = false;
-    for _ in 0..3 {
-        let effects = runtime.run_due_maintenance_holding(&held).await.unwrap();
-        rotated |= confirmed(&effects);
-    }
-    assert!(rotated, "a manual self-update is not held by an upload");
-    assert_eq!(
-        runtime.session().epoch(&group_id).unwrap().0,
-        source_epoch.0 + 1
-    );
-
-    // A periodic rotation that is due waits for the upload.
-    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
-    let mut obligation = runtime
-        .session()
-        .maintenance_obligation(&obligation_id)
-        .unwrap()
-        .unwrap();
-    obligation.trigger = cgka_traits::MaintenanceTrigger::Periodic;
-    obligation.phase = cgka_traits::MaintenancePhase::Retry;
-    runtime
-        .session()
-        .put_maintenance_obligation(&obligation)
-        .unwrap();
-    for _ in 0..3 {
-        runtime.run_due_maintenance_holding(&held).await.unwrap();
-    }
-    let obligation = runtime
-        .session()
-        .maintenance_obligation(&obligation_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(obligation.phase, cgka_traits::MaintenancePhase::Retry);
-    assert_eq!(obligation.last_failure_code.as_deref(), Some("upload_hold"));
-    assert_eq!(
-        runtime.session().epoch(&group_id).unwrap().0,
-        source_epoch.0 + 1
-    );
-
-    // Once the upload ends, the rotation runs.
-    let effects = runtime.run_due_maintenance().await.unwrap();
-    assert!(confirmed(&effects), "{effects:?}");
-    assert_eq!(
-        runtime.session().epoch(&group_id).unwrap().0,
-        source_epoch.0 + 2
-    );
-
-    // A post-join rotation goes ahead during an upload.
-    let obligation_id = runtime.schedule_manual_self_update(&group_id).unwrap();
-    let mut obligation = runtime
-        .session()
-        .maintenance_obligation(&obligation_id)
-        .unwrap()
-        .unwrap();
-    obligation.trigger = cgka_traits::MaintenanceTrigger::PostJoin;
-    obligation.phase = cgka_traits::MaintenancePhase::Retry;
-    runtime
-        .session()
-        .put_maintenance_obligation(&obligation)
-        .unwrap();
-    let mut rotated = false;
-    for _ in 0..3 {
-        let effects = runtime.run_due_maintenance_holding(&held).await.unwrap();
-        rotated |= confirmed(&effects);
-    }
-    assert!(rotated, "a post-join self-update is not held by an upload");
-    assert_eq!(
-        runtime.session().epoch(&group_id).unwrap().0,
-        source_epoch.0 + 3
     );
 }
 

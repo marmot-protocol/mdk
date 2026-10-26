@@ -83,7 +83,10 @@ impl Marmot {
         &self,
         account_id_hex: String,
     ) -> Result<Option<UserProfileMetadataFfi>, MarmotKitError> {
-        let entry = self.app.directory_entry_for_account_id(&account_id_hex)?;
+        let entry = self
+            .app
+            .directory()
+            .directory_entry_for_account_id(&account_id_hex)?;
         Ok(entry.and_then(|record| record.profile).map(Into::into))
     }
 
@@ -106,6 +109,7 @@ impl Marmot {
         }
         Ok(self
             .app
+            .directory()
             .cached_identity_projections_for_account_ids(&account_id_hexes)?
             .into_iter()
             .map(Into::into)
@@ -121,7 +125,10 @@ impl Marmot {
         &self,
         account_id_hex: String,
     ) -> Result<Option<String>, MarmotKitError> {
-        let entry = self.app.directory_entry_for_account_id(&account_id_hex)?;
+        let entry = self
+            .app
+            .directory()
+            .directory_entry_for_account_id(&account_id_hex)?;
         Ok(entry.and_then(|record| record.profile).and_then(|profile| {
             profile
                 .extra
@@ -140,6 +147,7 @@ impl Marmot {
         relays: Vec<String>,
     ) -> Result<(), MarmotKitError> {
         self.app
+            .directory()
             .refresh_profile_for_account_id(&account_id_hex, endpoints(&relays))
             .await?;
         Ok(())
@@ -155,6 +163,7 @@ impl Marmot {
     ) -> Result<conversions::AccountRelayListsFfi, MarmotKitError> {
         Ok(self
             .app
+            .directory()
             .account_relay_list_status_for_account_id(&account_id_hex)?
             .into())
     }
@@ -169,6 +178,7 @@ impl Marmot {
     ) -> Result<conversions::AccountRelayListsFfi, MarmotKitError> {
         Ok(self
             .app
+            .directory()
             .fetch_account_relay_list_status_for_account_id(&account_id_hex, endpoints(&relays))
             .await?
             .into())
@@ -185,6 +195,7 @@ impl Marmot {
     ) -> Result<Vec<conversions::UserDirectorySearchResultFfi>, MarmotKitError> {
         Ok(self
             .app
+            .directory()
             .search_cached_users(&account_id_hex, &query, limit as usize)?
             .into_iter()
             .map(Into::into)

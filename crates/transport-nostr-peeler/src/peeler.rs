@@ -19,8 +19,8 @@ use cgka_traits::types::{GroupId, MemberId};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use nostr::prelude::{
-    EventBuilder, FinalizeEvent, FinalizeUnsignedEvent, Keys, Kind, PublicKey, RelayUrl, Tag,
-    Timestamp as NostrTimestamp, UnsignedEvent,
+    Event, EventBuilder, FinalizeEvent, FinalizeUnsignedEvent, Keys, Kind, PublicKey, RelayUrl,
+    Tag, Timestamp as NostrTimestamp, UnsignedEvent,
 };
 use rand::RngCore;
 use std::sync::Arc;
@@ -204,7 +204,14 @@ impl NostrMlsPeeler {
             )));
         }
         ensure_welcome_routing_matches(&event, msg)?;
-        let gift_wrap = event.to_verified_nostr_event().map_err(to_peeler_error)?;
+        ensure_event_identity_matches(&event, msg)?;
+        if event.sig.is_none() {
+            return Err(PeelerError::InvalidSignature);
+        }
+        // NIP-59 verifies the outer event and seal. Decode the original payload
+        // directly instead of rebuilding and verifying the DTO a second time.
+        let gift_wrap =
+            Event::from_json(&msg.payload).map_err(|_| PeelerError::InvalidSignature)?;
         let unwrapped =
             nostr::nips::nip59::extract_rumor_async(&SdkSigner(signer.clone()), &gift_wrap)
                 .await
@@ -286,8 +293,10 @@ impl TransportPeeler for NostrMlsPeeler {
                 event.kind
             )));
         }
-        event.to_verified_nostr_event().map_err(to_peeler_error)?;
         ensure_group_routing_matches(&event, msg)?;
+        // The ingest boundary verifies signatures. Bind arbitrary message
+        // payloads to their admitted identity without another SDK round trip.
+        ensure_event_identity_matches(&event, msg)?;
 
         // spec/transports/nostr.md: content = base64(nonce || ciphertext).
         // Reject content that is not valid base64 or that decodes to fewer than
@@ -490,6 +499,20 @@ fn transport_group_id(msg: &TransportMessage) -> Option<GroupId> {
     }
 }
 
+fn ensure_event_identity_matches(
+    event: &NostrTransportEvent,
+    msg: &TransportMessage,
+) -> Result<(), PeelerError> {
+    let event_id = event.computed_id();
+    if !event.id.eq_ignore_ascii_case(&event_id)
+        || decode_hex_exact("event id", &event_id, 32).map_err(to_peeler_error)?
+            != msg.id.as_slice()
+    {
+        return Err(PeelerError::InvalidSignature);
+    }
+    Ok(())
+}
+
 fn ensure_group_routing_matches(
     event: &NostrTransportEvent,
     msg: &TransportMessage,
@@ -604,7 +627,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_peel_rejects_unsigned_kind_445() {
+    async fn group_peel_rejects_payload_hash_mismatch() {
         let secret = vec![0x7a; NOSTR_GROUP_KEY_LEN];
         let group_id = vec![0x99; 32];
         let ctx = GroupContextSnapshot::new(
@@ -624,17 +647,18 @@ mod tests {
             .await
             .expect("wrap succeeds");
         let mut event = NostrTransportEvent::from_transport_message(&wrapped).unwrap();
-        event.sig = None;
-        let unsigned_msg = event.to_transport_message().unwrap();
+        event.content.push('A');
+        let mut tampered = wrapped;
+        tampered.payload = serde_json::to_vec(&event).unwrap();
 
         assert!(matches!(
-            peeler.peel_group_message(&unsigned_msg, &ctx).await,
+            peeler.peel_group_message(&tampered, &ctx).await,
             Err(PeelerError::InvalidSignature)
         ));
     }
 
     #[tokio::test]
-    async fn group_peel_rejects_tampered_signature_before_decryption() {
+    async fn group_peel_rejects_payload_identity_mismatch_before_decryption() {
         let group_id = vec![0x99; 32];
         let wrap_ctx = GroupContextSnapshot::new(
             EpochId(9),
@@ -673,19 +697,13 @@ mod tests {
             )
             .await
             .expect("second wrap succeeds");
-        let mut tampered_event =
-            NostrTransportEvent::from_transport_message(&wrapped).expect("payload parses");
-        tampered_event.sig = NostrTransportEvent::from_transport_message(&unrelated)
-            .expect("unrelated payload parses")
-            .sig;
-        let tampered = tampered_event
-            .to_transport_message()
-            .expect("id and outer route still map");
+        let mut tampered = wrapped;
+        tampered.payload = unrelated.payload;
 
         let err = peeler
             .peel_group_message(&tampered, &wrong_secret_ctx)
             .await
-            .expect_err("tampered signature must fail before decryption");
+            .expect_err("different event identity must fail before decryption");
 
         assert!(matches!(err, PeelerError::InvalidSignature));
     }

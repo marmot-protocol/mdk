@@ -11,7 +11,7 @@ use zeroize::Zeroizing;
 
 use crate::error::{AccountHomeError, AccountHomeResult};
 use crate::io::{
-    read_json, validate_account_label, write_json, write_private_bytes, write_private_json,
+    read_json, read_private_json, validate_account_label, write_private_bytes, write_private_json,
 };
 use crate::secret_store::{
     AccountSecretStore, KeychainSecretStore, LocalFileSecretStore,
@@ -28,7 +28,6 @@ const ACCOUNT_KEY_SECURITY_FILE: &str = "key-security.json";
 pub(crate) const ACCOUNT_SECRET_FILE: &str = "secret.json";
 pub const EXTERNAL_SQLCIPHER_SECRET_FILE: &str = ".external-sqlcipher-secret";
 pub(crate) const LOCAL_FILE_SECRET_BACKEND: &str = "local-dev-file";
-pub const DEFAULT_KEYCHAIN_SERVICE_NAME: &str = "com.marmot.whitenoise";
 const TRACE_TARGET: &str = "marmot_account::home";
 /// Subdirectory of the home root that holds account directories that have been
 /// atomically renamed out of the live `accounts/` namespace by
@@ -218,10 +217,6 @@ impl AccountHome {
     ) -> AccountHomeResult<Self> {
         let secret_store = Arc::new(KeychainSecretStore::new(service_name)?);
         Ok(Self::open_with_secret_store(root, secret_store))
-    }
-
-    pub fn open_with_default_keychain(root: impl AsRef<Path>) -> AccountHomeResult<Self> {
-        Self::open_with_keychain(root, DEFAULT_KEYCHAIN_SERVICE_NAME)
     }
 
     pub fn open_with_secret_store(
@@ -909,7 +904,7 @@ impl AccountHome {
         if validate_account_label(account_ref).is_ok() {
             let path = self.account_record_path(account_ref);
             if path.exists() {
-                return read_json(path);
+                return read_private_json(path);
             }
         }
 
@@ -919,7 +914,7 @@ impl AccountHome {
         if !path.exists() {
             return Err(AccountHomeError::UnknownAccount(account_ref.to_owned()));
         }
-        read_json(path)
+        read_private_json(path)
     }
 
     pub fn accounts(&self) -> AccountHomeResult<Vec<AccountSummary>> {
@@ -1035,7 +1030,7 @@ impl AccountHome {
                 path.exists()
             };
             if exists {
-                match read_json(path) {
+                match read_private_json(path) {
                     Ok(account) => accounts.push(account),
                     Err(error) if strict => return Err(error),
                     Err(_) => skipped_unreadable_records += 1,
@@ -1304,7 +1299,7 @@ impl AccountHome {
         let path = self
             .account_dir(&account.label)
             .join(ACCOUNT_KEY_SECURITY_FILE);
-        match read_json::<StoredKeySecurity>(&path) {
+        match read_private_json::<StoredKeySecurity>(&path) {
             Ok(stored) => Ok(stored.key_security_byte),
             Err(AccountHomeError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
                 Ok(0x02)
@@ -1320,7 +1315,7 @@ impl AccountHome {
         let path = self
             .account_dir(&account.label)
             .join(ACCOUNT_KEY_SECURITY_FILE);
-        write_json(
+        write_private_json(
             &path,
             &StoredKeySecurity {
                 key_security_byte: 0x00,
@@ -1458,7 +1453,7 @@ impl AccountHome {
 
     fn write_account_record(&self, account: &AccountSummary) -> AccountHomeResult<()> {
         validate_account_label(&account.label)?;
-        write_json(self.account_record_path(&account.label), account)
+        write_private_json(self.account_record_path(&account.label), account)
     }
 
     fn accounts_dir(&self) -> PathBuf {

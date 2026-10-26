@@ -120,6 +120,7 @@ fn open_client(root: &tempfile::TempDir) -> *mut MarmotClient {
             relays.as_ptr(),
             1,
             &raw const store,
+            marmot_c::deployment::OwnedDeployment::white_noise().as_ptr(),
             &raw mut client,
         )
     };

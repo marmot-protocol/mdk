@@ -25,6 +25,10 @@ pub struct AttachmentStorageUsage {
     /// The account database file, and the part of it that is free pages.
     pub database_bytes: u64,
     pub database_free_bytes: u64,
+    /// The avatar and group-image cache: images still in the database plus
+    /// each cache file once, however many owners share it. Unlike retained
+    /// media it can be cleared and fetched again.
+    pub cache_bytes: u64,
     /// Moving legacy bodies into the media store. From the database this is
     /// `NotNeeded` or `Running`; the app runtime adds what its batches saw.
     pub migration: AttachmentMigrationState,
@@ -114,7 +118,7 @@ pub struct AttachmentRemoval {
 pub const ATTACHMENT_REMOVAL_BATCH: usize = 64;
 
 /// SQL for "`q` is a retained attachment at `now` (parameter `now_param`)".
-fn retained(now_param: &str) -> String {
+pub(super) fn retained(now_param: &str) -> String {
     format!(
         "q.state=3 AND {RETAINED_BODY} AND {SOURCE_MATCH}
          AND (q.expires_at IS NULL OR q.expires_at>{now_param})"
@@ -130,15 +134,27 @@ fn page_limit(limit: usize) -> StorageResult<i64> {
     Ok(limit as i64)
 }
 
+/// Why a slot is suppressed (`attachment_removal_suppression.reason`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RemovalReason {
+    /// The user removed it: explicit `Remove` or a Manage storage bulk removal.
+    ByYou = 0,
+    /// The "Keep media" setting cleaned it (mdk#2314 step 10).
+    BySetting = 1,
+}
+
 /// Removes one slot as explicit `Remove` does: records suppression and
 /// deletes its acquisition, whose body rows and media reference cascade.
 /// `None` when the slot is unknown. Otherwise the media files whose last
 /// reference (and so whose key) went with it, for an immediate unlink.
+/// Removing a slot the setting already cleaned records it as removed by
+/// you; the setting never relabels a slot the user removed.
 pub(super) fn remove_slot(
     conn: &Connection,
     group: &str,
     message: &str,
     index: u32,
+    reason: RemovalReason,
 ) -> StorageResult<Option<Vec<FileId>>> {
     let exists: bool = conn
         .query_row(
@@ -169,8 +185,10 @@ pub(super) fn remove_slot(
             .storage()?
     };
     conn.execute(
-        "INSERT INTO attachment_removal_suppression VALUES(?1,?2,?3) ON CONFLICT DO NOTHING",
-        params![group, message, index],
+        "INSERT INTO attachment_removal_suppression(group_id_hex,message_id_hex,attachment_index,reason)
+         VALUES(?1,?2,?3,?4)
+         ON CONFLICT DO UPDATE SET reason=min(reason,excluded.reason)",
+        params![group, message, index, reason as i64],
     )
     .storage()?;
     conn.execute(
@@ -225,27 +243,17 @@ impl SqliteAppStorage {
                 |r| r.get(0),
             )
             .storage()?;
-        // Table-valued pragmas: SQLCipher answers the `PRAGMA page_size`
-        // statement with its own cipher setting.
-        let (page_count, page_size, free_pages): (i64, i64, i64) = conn
-            .query_row(
-                "SELECT (SELECT page_count FROM pragma_page_count()),
-                        CAST((SELECT page_size FROM pragma_page_size()) AS INTEGER),
-                        (SELECT freelist_count FROM pragma_freelist_count())",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .storage()?;
+        let cache_bytes = crate::app::avatar_cache::usage(&conn)?.byte_count;
+        let space = crate::app::storage_compaction::database_space_in(&conn)?;
         let remaining = super::legacy_migration::legacy_attachment_bytes_in(&conn)?;
-        let database_bytes = page_count.saturating_mul(page_size);
-        let database_free_bytes = free_pages.saturating_mul(page_size);
         let unsigned = |value: i64| u64::try_from(value).unwrap_or(0);
         Ok(AttachmentStorageUsage {
             media_bytes: unsigned(media_bytes),
             legacy_bytes: unsigned(legacy_bytes),
             attachment_count: unsigned(attachment_count),
-            database_bytes: unsigned(database_bytes),
-            database_free_bytes: unsigned(database_free_bytes),
+            database_bytes: space.file_bytes(),
+            database_free_bytes: space.free_bytes(),
+            cache_bytes,
             migration: if remaining == 0 {
                 AttachmentMigrationState::NotNeeded
             } else {
@@ -380,6 +388,33 @@ impl SqliteAppStorage {
         // A bound past SQLite's integer range is later than every stored
         // received time, so it filters nothing.
         let before = received_before.and_then(|before| i64::try_from(before).ok());
+        self.remove_batch(
+            now,
+            &format!(
+                "{} AND (?2 IS NULL OR q.group_id_hex=?2)
+             AND (?3 IS NULL OR EXISTS(SELECT 1 FROM attachment_history h
+                 WHERE h.group_id_hex=q.group_id_hex
+                   AND h.message_id_hex=q.message_id_hex
+                   AND h.attachment_index=q.attachment_index
+                   AND h.received_at<?3))",
+                retained("?1")
+            ),
+            params![group, before],
+            RemovalReason::ByYou,
+        )
+    }
+
+    /// One bounded removal transaction over the acquisitions matching
+    /// `selection` (SQL on `q`, `now` is `?1`, `selection_params` start at
+    /// `?2`).
+    pub(super) fn remove_batch(
+        &self,
+        now: u64,
+        selection: &str,
+        selection_params: &[&dyn rusqlite::ToSql],
+        reason: RemovalReason,
+    ) -> StorageResult<AttachmentRemoval> {
+        let limit_param = selection_params.len() + 2;
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             let slots = {
@@ -387,32 +422,23 @@ impl SqliteAppStorage {
                     .prepare(&format!(
                         "SELECT q.group_id_hex,q.message_id_hex,q.attachment_index
                          FROM attachment_acquisition q
-                         WHERE {} AND (?2 IS NULL OR q.group_id_hex=?2)
-                           AND (?3 IS NULL OR EXISTS(SELECT 1 FROM attachment_history h
-                               WHERE h.group_id_hex=q.group_id_hex
-                                 AND h.message_id_hex=q.message_id_hex
-                                 AND h.attachment_index=q.attachment_index
-                                 AND h.received_at<?3))
+                         WHERE {selection}
                          ORDER BY q.group_id_hex,q.message_id_hex,q.attachment_index
-                         LIMIT ?4",
-                        retained("?1")
+                         LIMIT ?{limit_param}"
                     ))
                     .storage()?;
-                stmt.query_map(
-                    params![
-                        u64_to_i64(now)?,
-                        group,
-                        before,
-                        (ATTACHMENT_REMOVAL_BATCH + 1) as i64
-                    ],
-                    |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, u32>(2)?,
-                        ))
-                    },
-                )
+                let now = u64_to_i64(now)?;
+                let limit = (ATTACHMENT_REMOVAL_BATCH + 1) as i64;
+                let mut bound: Vec<&dyn rusqlite::ToSql> = vec![&now];
+                bound.extend_from_slice(selection_params);
+                bound.push(&limit);
+                stmt.query_map(bound.as_slice(), |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, u32>(2)?,
+                    ))
+                })
                 .storage()?
                 .collect::<Result<Vec<_>, _>>()
                 .storage()?
@@ -423,7 +449,7 @@ impl SqliteAppStorage {
                 ..Default::default()
             };
             for (group, message, index) in slots.into_iter().take(ATTACHMENT_REMOVAL_BATCH) {
-                if let Some(released) = remove_slot(&conn, &group, &message, index)? {
+                if let Some(released) = remove_slot(&conn, &group, &message, index, reason)? {
                     removal.removed += 1;
                     removal.released_files.extend(released);
                 }

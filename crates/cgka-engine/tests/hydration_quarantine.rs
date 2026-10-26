@@ -48,7 +48,7 @@ fn pad32(name: &[u8]) -> Vec<u8> {
         hasher.update(name);
         hasher.update(counter.to_be_bytes());
         material.copy_from_slice(&hasher.finalize());
-        if let Ok(sk) = SigningKey::from_bytes(&material) {
+        if let Ok(sk) = SigningKey::from_slice(&material) {
             return sk.verifying_key().to_bytes().to_vec();
         }
         counter += 1;
@@ -956,6 +956,9 @@ async fn welcome_delivery_accessors_hide_quarantined_groups() {
         engine.tracked_outbound_welcome_ids().unwrap().is_empty(),
         "quarantined groups must not contribute tracked Welcome ids"
     );
+    let index = engine.welcome_delivery_index().unwrap();
+    assert!(index.outstanding.is_empty());
+    assert!(index.tracked_ids.is_empty());
 }
 
 async fn create_confirmed_group_flaky(engine: &mut Engine<FlakyGroupRecordStorage>) -> GroupId {

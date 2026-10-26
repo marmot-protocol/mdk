@@ -318,13 +318,13 @@ mod tests {
         for route_id in [[0x01; 32], [0x02; 32], [0x03; 32], [0x04; 32]] {
             store
                 .app_storage()
-                .record_transport_reconciliation_item(
+                .record_reconciliation_items(std::iter::once((
                     &TransportReconciliationRoute::Group(route_id),
                     &TransportReconciliationItem {
                         event_id: route_id,
                         created_at: now,
                     },
-                )
+                )))
                 .unwrap();
         }
 
@@ -371,13 +371,13 @@ mod tests {
             .as_secs();
         store
             .app_storage()
-            .record_transport_reconciliation_item(
+            .record_reconciliation_items(std::iter::once((
                 &TransportReconciliationRoute::Group([0xAA; 32]),
                 &TransportReconciliationItem {
                     event_id: [0xBB; 32],
                     created_at: now,
                 },
-            )
+            )))
             .unwrap();
 
         let result: Result<(), StorageError> = store.with_transaction(|storage| {
@@ -404,13 +404,13 @@ mod tests {
             .as_secs();
         store
             .app_storage()
-            .record_transport_reconciliation_item(
+            .record_reconciliation_items(std::iter::once((
                 &TransportReconciliationRoute::Group([0xCC; 32]),
                 &TransportReconciliationItem {
                     event_id: [0xDD; 32],
                     created_at: now,
                 },
-            )
+            )))
             .unwrap();
         store.delete_group(&group.id).unwrap();
         assert!(store.list_transport_group_routes().unwrap().is_empty());

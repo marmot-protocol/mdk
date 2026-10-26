@@ -29,6 +29,10 @@ loopback / private / link-local / CGNAT / metadata endpoint is an SSRF vector, a
 - **Trust comes from configuration, not from a resolved IP.** No-certificate-verification trust (`InsecureLocal` /
   skip-verification) is reachable only via an explicit dev/config flag **and** a *literal* loopback candidate host
   parsed before resolution — never because a name happened to resolve to loopback.
+- **Default verification uses the bundled roots.** Relay WebSockets, HTTP, and QUIC brokers verify against the same
+  bundled Mozilla root set (`webpki-roots`), never the OS trust store, so verification behaves the same on every
+  platform and needs no host-side initialization (the OS verifier panics on Android without JNI setup). A
+  configured certificate pin replaces those roots; it never adds to them.
 - **Loopback is opt-in, never inferred.** A local/loopback endpoint is reachable only when an explicit dev/test flag is
   set (`MarmotAppConfig::allow_loopback_relay_endpoints` / `allow_loopback_blob_endpoints`, `WN_ALLOW_LOOPBACK_RELAYS` /
   `WN_ALLOW_LOOPBACK_BLOB_ENDPOINTS`, `wn --insecure-local`, `wn-agent --insecure-local-broker`). The flag opens

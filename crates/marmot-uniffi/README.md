@@ -82,7 +82,7 @@ screen API exists. The method reference marks explicit alternatives individually
 
 | Use case | Recommended starting point | Existing alternative and when to use it |
 | --- | --- | --- |
-| Runtime construction | `newWithConfiguration` with `MarmotOptions` | `new` for defaults; specialized constructors remain compatibility conveniences. Preserve secret store and cursor policy when migrating. |
+| Runtime construction | `newWithConfiguration` with `MarmotOptions` | `new` with only a deployment; specialized constructors remain compatibility conveniences. Preserve secret store and cursor policy when migrating. |
 | Main Chats/Unread/Archived/Left screens | `openChatListWindow` | `presentedChatList` / `openPresentedChatList` for a full selected list; `chatList` / `subscribeChatList` for raw rows and custom filters. Do not filter a loaded page to implement full-account search. |
 | One chat row | `presentedChatListRow` | `chatListRow` when raw fields are specifically required. Avoid account-wide reads for one row. |
 | Account badges | `subscribeAccountAttention` | `accountUnreadSummary` remains a one-shot lower-level unread query, not a substitute for the prepared attention contract. |
@@ -241,19 +241,20 @@ The reference's names, signatures and source-line links are checked against sour
 ## Runtime options and client label
 
 `MarmotOptions` combines `relayPolicy`, `cursorPersistence`, `clientName`, `secretStore` and
-`attachmentAcquisitionMode` in `Marmot.newWithConfiguration`. Each field is optional in generated
-Swift/Kotlin: omitted policies mean public-only endpoints and an advancing cursor;
+`attachmentAcquisitionMode` with the required [`deployment`](#deployment) in `Marmot.newWithConfiguration`.
+Every other field is optional in generated Swift/Kotlin: omitted policies mean public-only endpoints and an advancing cursor;
 an omitted label stays untagged, omitted storage uses the platform keychain, and an omitted
 acquisition mode keeps native automatic acquisition (see
 [host-managed acquisition](ATTACHMENT-ACCESS.md#host-managed-automatic-acquisition-0104)).
-Existing constructors keep their signatures and delegate to this same configuration
-path. Use the options constructor when combining a label with a custom relay policy.
+Existing constructors take the deployment as their last argument and delegate to this
+same configuration path. Use the options constructor when combining a label with a
+custom relay policy.
 C hosts use `marmot_client_new_with_configuration` and a `MarmotClientOptions`
 struct; zero initialization selects the same defaults. Use the matching header
 and library for that struct's layout.
 
 ```swift
-let options = MarmotOptions(clientName: "whitenoise")
+let options = MarmotOptions(clientName: "whitenoise", deployment: marmotDeploymentWhiteNoise())
 let marmot = try Marmot.newWithConfiguration(
     rootPath: rootPath, relayUrls: relayUrls, options: options
 )
@@ -268,7 +269,8 @@ let marmot = try Marmot.newWithClientName(
     relayUrls: relayUrls,
     clientName: "whitenoise",
     cursorPersistence: .advance,
-    secretStore: nil
+    secretStore: nil,
+    deployment: marmotDeploymentWhiteNoise()
 )
 ```
 
@@ -288,21 +290,25 @@ and `MDK_KOTLIN_CLASSPATH=<JNA:Android:annotations:coroutines jars>
 
 ### Deployment
 
-`MarmotOptions.deployment` takes a `MarmotDeploymentFfi`: the services a deployment's users rely on. These are the
+Every constructor requires a `MarmotDeploymentFfi`: `MarmotOptions.deployment` has no default, and the other
+constructors take it as their last argument. It holds the services a deployment's users rely on: the
 recovery-operated relays, discovery indexers, new-group media servers, group- and profile-image servers, Open
 Ranking, the KeyPackage client preference, the moderation label namespace, and the keychain service used when no
 `secretStore` is given. Start from `marmotDeploymentWhiteNoise()` or `marmotDeploymentNeutral()` and change what
-differs. An omitted deployment is White Noise's for now. When the default turns neutral, every constructor will
-require one, so White Noise apps should pass `marmotDeploymentWhiteNoise()` now, in every entry point, including
-background and notification-extension runtimes. Never change `keychainService` for an existing install: secrets
-stored under the old name are stranded. Until the neutral default lands, an empty `newGroupMediaEndpoints` or an
-unset group-image or profile-image server still falls back to White Noise's servers, so even
-`marmotDeploymentNeutral()` signs those media servers into new groups and fetches group images from White Noise's.
-C hosts use `marmot_client_new_with_deployment`.
+differs. White Noise apps pass `marmotDeploymentWhiteNoise()` in every entry point, including background and
+notification-extension runtimes. Never change `keychainService` for an existing install: secrets stored under the old
+name are stranded.
+
+Nothing an unset value configures falls back to White Noise's services. With no `newGroupMediaEndpoints`, new groups
+carry no encrypted-media component and stay text-only. With no group-image server, setting or fetching an encrypted
+group image fails; with no profile-image server, `uploadProfileImage` needs an explicit server. No recovery relays
+means every route's history needs all its relays to certify, no discovery indexers means onboarding searches the
+discovery relays the host passes plus the account's declared relays, no Open Ranking turns that directory-search tier off, no KeyPackage client
+preference leaves candidates unranked by client tag, and no moderation label namespace leaves reporting unconfigured. The neutral keychain service
+is `org.marmot-protocol.mdk`.
 
 ```swift
-var options = MarmotOptions(clientName: "whitenoise")
-options.deployment = marmotDeploymentWhiteNoise()
+let options = MarmotOptions(clientName: "whitenoise", deployment: marmotDeploymentWhiteNoise())
 let marmot = try Marmot.newWithConfiguration(
     rootPath: rootPath, relayUrls: relayUrls, options: options
 )
@@ -325,6 +331,11 @@ lease while the `Marmot` object or one of its runtime handles is still alive.
 Await `shutdownAndClose()` before suspension or root handoff; it terminally closes
 storage and releases the lease without waiting for every host reference to disappear.
 Reconstruct the runtime and its handles for the next foreground session.
+
+Exclude each account directory under `rootPath`, including its `media/` and `handoff/`
+folders, from iCloud and Android auto-backup. Attachment files are encrypted with
+device-bound keys, so a restored copy cannot be read, and `handoff/` holds plaintext
+copies lent to OS surfaces.
 
 ## Threading model
 
@@ -374,12 +385,10 @@ These are route URLs only. Host apps still supply audit and telemetry bearer tok
 runtime. Set any of these environment variables before invoking a build script to override the default for staging
 or local testing.
 
-Public profile-image uploads default to `https://blossom.primal.net`, White
-Noise's deployment value. Rust hosts can override it with
-`MarmotDeployment::profile_image_endpoint` (`MarmotAppConfig::with_deployment`);
-an unset value still falls back to primal until the neutral default lands. FFI
-callers can continue to pass an explicit Blossom server to `uploadProfileImage`.
-Peers' avatars always load from the URL in their own profile.
+Public profile-image uploads use the deployment's `profileImageEndpoint`
+(`https://blossom.primal.net` in White Noise's), or an explicit Blossom server
+passed to `uploadProfileImage`. With neither, the upload fails. Peers' avatars
+always load from the URL in their own profile.
 
 ## Interactive account onboarding
 
@@ -437,6 +446,21 @@ Imported identities can use the durable preflight API instead of `login`:
    commands reject unfinished onboarding; the workflow alone can publish its
    initial KeyPackage. `account_setup_readiness` stays `Initializing` until the
    interactive workflow is complete.
+
+Findings carry typed `context`, `purpose`, `outcome`, `declared_capability`,
+`actions`, and `observed_revision` alongside `issue` and `endpoint`. Render
+each finding separately, even when endpoints match. Use its actions as the
+authoritative subset applicable to that finding; an empty list offers no
+finding-specific action. The step's `actions` remain the full set, including
+single-device consent and KeyPackage setup actions outside relay diagnostics.
+`InspectionCompleted` with `DirectoryQuery` success records only a successful
+directory inspection, not relay write support or event publication. Timeouts,
+incomplete discovery, and unreachable queries leave the outcome unknown.
+Retained findings keep their original observed revision and step `checked_at`;
+interpret revisions only within the snapshot's account and recovery epoch.
+Observations outside relay diagnostics may have unknown context/purpose/outcome
+and no finding actions. Legacy checkpoints also have no observed revision;
+rechecking supplies a fresh revision without upgrading retained evidence.
 
 ### Explicit recovery and checkpoint compatibility
 
@@ -1049,7 +1073,8 @@ source revalidation, host buffer ownership and integration guidance. For an OS s
 that needs a real file (package installer, share sheet, "open with", Quick Look), use
 `openAttachmentHandoff` and release its lease when done; see
 [handoff leases](ATTACHMENT-ACCESS.md#handoff-leases). A Manage storage screen reads
-usage and largest-first listings and removes attachments in bulk; see
+usage and largest-first listings, removes attachments in bulk and sets the opt-in
+"Keep media" window; see
 [Manage storage](ATTACHMENT-ACCESS.md#manage-storage). Acquisition
 defaults on with bounded per-account policy. Native progress snapshots/subscriptions
 and durable cancellation, retry, remove and download-again controls use the same source slots.
@@ -1240,10 +1265,14 @@ explicitly selected, including for changes to the UniFFI crate.
 Matching `master` pushes always build the complete matrix and open an issue
 when it fails; later pushes do not cancel running or queued candidate builds.
 Pull requests restore the trusted release
-cache read-only; only runs using the workflow from `master` may update it. A
-weekly scheduled exact-head run on `master` provides drift detection and
-refreshes those trusted cache seeds; it intentionally executes the complete
-packaging matrix.
+cache read-only; only runs using the workflow from `master` may update it.
+The workflow has no schedule of its own. The
+[nightly release](../../release.md#nightly-builds) builds and validates the
+same Android and Apple packages from `master`, but only on nights it does not
+skip: it skips when master has no new green commit or is not on an
+`X.Y.Z-dev` version, and when releases or snapshots keep the macOS runners busy
+for three hours. It does not run `test-native-archive.py` or refresh this
+workflow's cache seeds; matching `master` pushes do both.
 
 Baseline-versus-candidate measurements are intentionally manual. Run the
 `MarmotKit Release Profile Measurements` workflow from `master` with the full

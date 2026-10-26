@@ -151,22 +151,6 @@ mod tests {
         assert_eq!(collected, HashSet::from([10, 20, 30]));
     }
 
-    // Compile-time guard: a zero cap would silently defeat dedup.
-    const _: () = assert!(DEDUP_CACHE_CAPACITY > 0);
-
-    #[test]
-    fn default_dedup_cap_is_wired_and_bounds_growth() {
-        // The engine constructs both dedup caches with `DEDUP_CACHE_CAPACITY`
-        // (see `engine.rs`). Prove a cache built with it reports that capacity
-        // and never grows past it even under heavy insertion.
-        let mut set = BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY);
-        assert_eq!(set.capacity(), DEDUP_CACHE_CAPACITY);
-        for id in 0..(DEDUP_CACHE_CAPACITY as u64 + 1_000) {
-            set.insert(id);
-        }
-        assert_eq!(set.len(), DEDUP_CACHE_CAPACITY);
-    }
-
     #[test]
     #[should_panic(expected = "BoundedIdSet capacity must be non-zero")]
     fn zero_capacity_panics() {

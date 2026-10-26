@@ -26,6 +26,8 @@ use crate::tls::client_endpoint;
 
 #[derive(Clone, Debug)]
 pub enum BrokerServerTrust {
+    /// Default public-CA trust: the bundled Mozilla roots, not the OS trust
+    /// store (see [`transport_quic_stream::platform_trust_verifier`]).
     Platform,
     CertificateDer(Vec<u8>),
     InsecureLocal,

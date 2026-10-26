@@ -24,6 +24,10 @@ pub struct AttachmentStorageUsageFfi {
     /// With `Running`, the legacy bytes still to move; with `Paused`, how
     /// many more bytes must be free before the move resumes. Otherwise 0.
     pub migration_bytes: u64,
+    /// The avatar and group-image cache, each stored image once. Unlike
+    /// attachments it can be cleared (`clear_avatar_cache`) and is fetched
+    /// again on demand.
+    pub cache_bytes: u64,
 }
 impl From<app::AttachmentStorageUsage> for AttachmentStorageUsageFfi {
     fn from(v: app::AttachmentStorageUsage) -> Self {
@@ -36,6 +40,9 @@ impl From<app::AttachmentStorageUsage> for AttachmentStorageUsageFfi {
                 (AttachmentMigrationStateFfi::Paused, needed_bytes)
             }
             app::AttachmentMigrationState::Complete => (AttachmentMigrationStateFfi::Complete, 0),
+            app::AttachmentMigrationState::Compacting => {
+                (AttachmentMigrationStateFfi::Compacting, 0)
+            }
         };
         Self {
             media_bytes: v.media_bytes,
@@ -45,6 +52,7 @@ impl From<app::AttachmentStorageUsage> for AttachmentStorageUsageFfi {
             database_free_bytes: v.database_free_bytes,
             migration,
             migration_bytes,
+            cache_bytes: v.cache_bytes,
         }
     }
 }
@@ -64,6 +72,47 @@ pub enum AttachmentMigrationStateFfi {
     Paused,
     /// This runtime moved the last legacy body.
     Complete,
+    /// The account database is being compacted to return its free pages to
+    /// the filesystem; the other figures are from just before it started.
+    /// Account reads and writes wait until it finishes.
+    Compacting,
+}
+
+/// How long retained attachments are kept on this device, per account
+/// ("Keep media"). Attachments of messages older than the window are
+/// removed automatically and show as `CleanedBySetting`; download again
+/// stays allowed and keeps that attachment for the whole window from the
+/// request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum AttachmentKeepMediaFfi {
+    /// Nothing is removed automatically. The default.
+    Forever,
+    /// 365 days.
+    OneYear,
+    /// 183 days.
+    SixMonths,
+    /// 30 days.
+    ThirtyDays,
+}
+impl From<app::AttachmentKeepMedia> for AttachmentKeepMediaFfi {
+    fn from(v: app::AttachmentKeepMedia) -> Self {
+        match v {
+            app::AttachmentKeepMedia::Forever => Self::Forever,
+            app::AttachmentKeepMedia::OneYear => Self::OneYear,
+            app::AttachmentKeepMedia::SixMonths => Self::SixMonths,
+            app::AttachmentKeepMedia::ThirtyDays => Self::ThirtyDays,
+        }
+    }
+}
+impl From<AttachmentKeepMediaFfi> for app::AttachmentKeepMedia {
+    fn from(v: AttachmentKeepMediaFfi) -> Self {
+        match v {
+            AttachmentKeepMediaFfi::Forever => Self::Forever,
+            AttachmentKeepMediaFfi::OneYear => Self::OneYear,
+            AttachmentKeepMediaFfi::SixMonths => Self::SixMonths,
+            AttachmentKeepMediaFfi::ThirtyDays => Self::ThirtyDays,
+        }
+    }
 }
 
 /// Where the next page of chats starts.
@@ -238,6 +287,11 @@ mod tests {
             (
                 app::AttachmentMigrationState::Complete,
                 AttachmentMigrationStateFfi::Complete,
+                0,
+            ),
+            (
+                app::AttachmentMigrationState::Compacting,
+                AttachmentMigrationStateFfi::Compacting,
                 0,
             ),
         ];

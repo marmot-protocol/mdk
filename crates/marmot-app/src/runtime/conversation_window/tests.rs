@@ -756,13 +756,19 @@ async fn retained_anchor_recovers_after_expiry_and_profile_only_updates_refresh_
         recovered.anchors[anchor_index(recovered.anchor).unwrap()].message_id_hex(),
         id(6)
     );
-    let mut record = f.app.empty_directory_record(&"bb".repeat(32));
+    let mut record = f
+        .app
+        .directory()
+        .empty_directory_record_for_test(&"bb".repeat(32));
     record.profile = Some(crate::UserProfileMetadata {
         display_name: Some("Updated sender".into()),
         created_at: 42,
         ..Default::default()
     });
-    f.app.save_directory_entry(&record).unwrap();
+    f.app
+        .directory()
+        .save_directory_entry_for_test(&record)
+        .unwrap();
     let refreshed = next(&mut sub).await;
     assert_eq!(
         refreshed.presentation.identities[&"bb".repeat(32)].display_name,
@@ -1850,13 +1856,16 @@ async fn live_window_waits_for_queue_capacity_without_a_display_retry_delay() {
 async fn avatar_identity_sidecar_tracks_local_bytes_without_new_timeline_activity() {
     let f = Fixture::new(2).await;
     let member = "bb".repeat(32);
-    let mut record = f.app.empty_directory_record(&member);
+    let mut record = f.app.directory().empty_directory_record_for_test(&member);
     record.profile = Some(crate::UserProfileMetadata {
         picture: Some("https://example.com/avatar.png".into()),
         created_at: 42,
         ..Default::default()
     });
-    f.app.save_directory_entry(&record).unwrap();
+    f.app
+        .directory()
+        .save_directory_entry_for_test(&record)
+        .unwrap();
     let mut sub = f.open(ConversationOpenTarget::Latest, 2).await;
     let asset = sub.snapshot.presentation.identities[&member]
         .avatar_asset

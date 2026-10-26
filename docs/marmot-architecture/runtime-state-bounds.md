@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-10-17
+updated: 2026-10-20
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -41,6 +41,16 @@ Tracking issue: marmot-protocol/mdk#381.
 The retry delay starts at one second, doubles after each actual failure, and caps at 60 seconds.
 Suppressed calls do not advance the count or deadline. Expiry permits an attempt on the next
 existing trigger; no timer retains an account or holds the transaction through a cooldown.
+
+### `marmot-app` epoch-gap paging (`src/client/sync/comparison_job.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Advisory group/peer resume hints | At most 1,024 entries per client; at most 2,048 two-word boundaries per hint (32 KiB of boundary values), plus route/peer identity and ownership metadata | LRU eviction, stale ownership and client drop discard hints. Losing a hint causes a rescan, never a reset of the durable park budget. No event bodies or scan-credit ledger persist in the cache. |
+
+Each peer's scan receives at most 16,384 raw events and 4 MiB of validated event JSON per pass, in 256-event
+pages and at most three seconds within the shared pass deadline. Held-only traversal is not recovery progress;
+the existing durable unserved-pass count and backoff survive client reconstruction unchanged.
 
 ### `marmot-app` runtime performance observations (`src/app_telemetry/runtime.rs`)
 
@@ -150,7 +160,7 @@ re-delivery and expiry continue through the existing ingress deduplication and r
 | --- | --- | --- |
 | Durable jobs | One per requested retained message slot; source descriptor at most 16 KiB; due/expiry scans at most 64 rows | Raw-source deletion cascades. Canonical source replacement/invalidation reconciles transactionally; matching timeline repair preserves work. Expired leases are reclaimable with a new attempt token; stale completion cannot publish. Eligible demand resumes policy-parked work; explicit-retry failures remain blocked. Worker policy changes must re-admit affected sources. No in-memory history-sized queue. |
 | Retained attachment bytes | At most 512 MiB per object; caller-supplied account payload-byte budget checked atomically at publication; local reads at most 1 MiB; received-body publication copies the caller's plaintext buffer into 64 KiB chunk rows (a body of at most one chunk stays one row), so no SQLite value holds more than one chunk; promoting an in-memory staged send still pre-sizes one array row | No LRU eviction. Budget refusal commits no bytes. Source deletion/expiry, explicit removal and store-generation reset release objects. Separate copies per message slot give independent erasure. Worker admission reserves filesystem/WAL overhead and prunes up to 64 expired jobs per turn. |
-| Removal suppression | One tombstone per explicitly removed source slot, owned by the raw app event rather than a rebuildable timeline row | Survives reopen, repair and source revalidation; cleared only by explicit download-again, raw-source deletion or store-generation reset. |
+| Removal suppression | One tombstone per removed source slot, owned by the raw app event rather than a rebuildable timeline row, with its reason: removed by you, or cleaned by the opt-in "Keep media" setting | Survives reopen, repair and source revalidation; cleared only by explicit download-again, raw-source deletion or store-generation reset. The setting's sweep removes at most 64 slots per transaction, runs at most 250 ms per worker maintenance pass, and never relabels a slot the user removed. |
 
 These are attachment-storage bounds, not convergence-input or engine-recovery policy.
 C8-C2 schedules complete-body transfers only with explicit Rust opt-in; acquisition

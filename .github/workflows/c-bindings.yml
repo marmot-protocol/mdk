@@ -4,12 +4,29 @@ on:
   push:
     tags:
       - marmotc-v*
+      # Nightly tags are created by nightly-releases.yml, which calls this workflow itself.
+      - "!marmotc-v*-nightly.*"
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Full 40-character source SHA on master
+        required: true
+        type: string
+      build_only:
+        description: Build and smoke-test the bundle without staging a release
+        required: false
+        default: false
+        type: boolean
+      nightly_version:
+        description: Nightly version X.Y.Z-nightly.YYYYMMDD[.N]; stages a draft for nightly-releases.yml to publish
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: marmot-c-bindings-${{ github.ref }}
+  group: marmot-c-bindings-${{ inputs.nightly_version || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -22,27 +39,61 @@ jobs:
     name: Build Linux C bindings
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      release_tag: ${{ steps.identity.outputs.release_tag }}
+      release_version: ${{ steps.identity.outputs.release_version }}
+      source_sha: ${{ steps.identity.outputs.source_sha }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+          # Empty for tag pushes, which build the tagged commit.
+          ref: ${{ inputs.source_sha }}
 
       - name: Validate release tag
+        id: identity
         shell: bash
+        env:
+          NIGHTLY_VERSION: ${{ inputs.nightly_version }}
+          REQUESTED_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          if [[ ! "$GITHUB_REF_NAME" =~ ^marmotc-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "error: C binding releases must use a version tag like marmotc-v0.1.0" >&2
-            exit 1
-          fi
-          tag_version="${GITHUB_REF_NAME#marmotc-v}"
           workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-          if [[ "$tag_version" != "$workspace_version" ]]; then
-            echo "error: tag version $tag_version does not match workspace version $workspace_version" >&2
-            exit 1
+          source_sha="$(git rev-parse 'HEAD^{commit}')"
+          if [[ -n "$NIGHTLY_VERSION" ]]; then
+            if [[ ! "$NIGHTLY_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-nightly\.[0-9]{8}(\.[1-9][0-9]{0,2})?$ ]]; then
+              echo "error: nightly version must look like 0.14.0-nightly.20261020" >&2
+              exit 1
+            fi
+            if [[ "${BASH_REMATCH[1]}-dev" != "$workspace_version" ]]; then
+              echo "error: nightly $NIGHTLY_VERSION does not match source workspace version $workspace_version" >&2
+              exit 1
+            fi
+            if [[ "$source_sha" != "$REQUESTED_SHA" ]]; then
+              echo "error: nightly source must be the requested SHA $REQUESTED_SHA, got $source_sha" >&2
+              exit 1
+            fi
+            tag="marmotc-v$NIGHTLY_VERSION"
+            tag_version="$NIGHTLY_VERSION"
+          else
+            if [[ ! "$GITHUB_REF_NAME" =~ ^marmotc-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "error: C binding releases must use a version tag like marmotc-v0.1.0" >&2
+              exit 1
+            fi
+            tag="$GITHUB_REF_NAME"
+            tag_version="${GITHUB_REF_NAME#marmotc-v}"
+            if [[ "$tag_version" != "$workspace_version" ]]; then
+              echo "error: tag version $tag_version does not match workspace version $workspace_version" >&2
+              exit 1
+            fi
           fi
+          {
+            echo "release_tag=$tag"
+            echo "release_version=$tag_version"
+            echo "source_sha=$source_sha"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
         shell: bash
@@ -68,10 +119,14 @@ jobs:
 
       - name: Package bundle
         shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.identity.outputs.release_tag }}
+          RELEASE_VERSION: ${{ steps.identity.outputs.release_version }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
         run: |
           set -euo pipefail
-          tag="$GITHUB_REF_NAME"
-          version="${tag#marmotc-v}"
+          tag="$RELEASE_TAG"
+          version="$RELEASE_VERSION"
           workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           lock_sha="$(sha256sum Cargo.lock | awk '{print $1}')"
 
@@ -87,9 +142,10 @@ jobs:
           {
             "artifact": "marmot-c",
             "version": "$version",
+            "release_tag": "$tag",
             "workspace_version": "$workspace_version",
             "cargo_lock_sha256": "$lock_sha",
-            "commit": "$GITHUB_SHA",
+            "commit": "$SOURCE_SHA",
             "target": "x86_64-unknown-linux-gnu"
           }
           EOF
@@ -107,6 +163,7 @@ jobs:
 
   release:
     name: Create GitHub release
+    if: ${{ !inputs.build_only }}
     runs-on: ubuntu-latest
     needs:
       - linux-bindings
@@ -126,6 +183,7 @@ jobs:
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name marmot-c-linux --dir dist
 
       - name: Create or update release
+        if: ${{ !inputs.nightly_version }}
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -157,3 +215,52 @@ jobs:
               --title "v$version - Marmot C" \
               --notes-file "$notes"
           fi
+
+      - name: Check out workflow scripts
+        if: ${{ !!inputs.nightly_version }}
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: builder
+
+      - name: Stage nightly draft
+        if: ${{ !!inputs.nightly_version }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.linux-bindings.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.linux-bindings.outputs.release_version }}
+          SOURCE_SHA: ${{ needs.linux-bindings.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          version="$RELEASE_VERSION"
+          asset="dist/marmot-c-linux-x86_64-$version.zip"
+          (cd dist && sha256sum -c "marmot-c-linux-x86_64-$version.zip.sha256")
+          unzip -p "$asset" "marmot-c-$version/manifest.json" | python3 -c '
+          import json, os, sys
+          manifest = json.load(sys.stdin)
+          expected = {"version": os.environ["RELEASE_VERSION"], "release_tag": os.environ["RELEASE_TAG"],
+                      "commit": os.environ["SOURCE_SHA"]}
+          wrong = {key: manifest.get(key) for key, value in expected.items() if manifest.get(key) != value}
+          if wrong:
+              sys.exit(f"error: Marmot C manifest does not match the nightly: {wrong}")
+          '
+          nightly_notes="$RUNNER_TEMP/nightly-notes.md"
+          cat > "$nightly_notes" <<EOF
+          Nightly build for testing only. Pin a formal \`marmotc-v<version>\` release for anything you ship.
+          Nightlies are deleted after 30 days, and going back to an older nightly is not supported.
+
+          Marmot C bindings generated from exact MDK commit \`$SOURCE_SHA\`.
+
+          Assets:
+          - \`marmot-c-linux-x86_64-$version.zip\`: \`libmarmot_c.so\` + \`libmarmot_c.a\`, \`marmot.h\`, pkg-config file, README.
+
+          Verify downloads with the accompanying \`.sha256\` files.
+          EOF
+          python3 builder/scripts/nightly_release.py stage-draft \
+            --tag "$RELEASE_TAG" \
+            --title "v$version - Marmot C" \
+            --target "$SOURCE_SHA" \
+            --notes-file "$nightly_notes" \
+            "$asset" "$asset.sha256"

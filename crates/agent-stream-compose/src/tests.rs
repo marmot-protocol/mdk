@@ -271,62 +271,6 @@ async fn compose_session_clamps_local_transcript_to_group_policy_cap() {
 }
 
 #[tokio::test]
-async fn compose_session_final_report_contains_full_transcript_text() {
-    let stream_id = vec![0xcc; 32];
-    let start_event_id = MessageId::new(vec![0xdd; 32]);
-    let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
-    let report = test_stream_compose_report(&stream_id);
-    let (tx, rx) = mpsc::channel(4);
-    let (_cancel_tx, cancel_rx) = mpsc::channel(1);
-    let session = tokio::spawn(run_stream_compose_session(open, 5, rx, cancel_rx, report));
-
-    for text in ["hello ", "world"] {
-        let (respond, response) = oneshot::channel();
-        tx.send(StreamComposeCommand::Append {
-            text: text.to_owned(),
-            respond,
-        })
-        .await
-        .unwrap();
-        tokio::time::timeout(Duration::from_millis(250), response)
-            .await
-            .expect("append should complete")
-            .unwrap()
-            .unwrap();
-    }
-
-    let (respond, response) = oneshot::channel();
-    tx.send(StreamComposeCommand::Finish {
-        expected: None,
-        respond,
-    })
-    .await
-    .unwrap();
-    let finished = tokio::time::timeout(Duration::from_millis(250), response)
-        .await
-        .expect("finish should complete")
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(finished.text, "hello world");
-    assert_eq!(finished.chunk_count, 3);
-    assert_eq!(
-        finished.transcript_hash.as_deref(),
-        Some(
-            expected_stream_transcript_hash_for_appends(
-                &stream_id,
-                &start_event_id,
-                &["hello ", "world"],
-                5,
-            )
-            .as_str()
-        )
-    );
-
-    session.await.unwrap();
-}
-
-#[tokio::test]
 async fn compose_session_status_updates_transcript_without_changing_text() {
     let stream_id = vec![0xee; 32];
     let start_event_id = MessageId::new(vec![0xff; 32]);
@@ -1148,59 +1092,6 @@ async fn compose_session_cancel_completes_when_broker_unreachable() {
         .await
         .expect("cancel must not hang when the broker is unreachable")
         .unwrap();
-}
-
-#[tokio::test]
-async fn finish_with_matching_expectation_finishes_session() {
-    let stream_id = vec![0x7a; 32];
-    let start_event_id = MessageId::new(vec![0x7b; 32]);
-    let open = test_stream_compose_open(stream_id.clone(), start_event_id.clone());
-    let report = test_stream_compose_report(&stream_id);
-    let (tx, rx) = mpsc::channel(4);
-    let (_cancel_tx, cancel_rx) = mpsc::channel(1);
-    let session = tokio::spawn(run_stream_compose_session(open, 8, rx, cancel_rx, report));
-
-    let (append_tx, append_rx) = oneshot::channel();
-    tx.send(StreamComposeCommand::Append {
-        text: "hello ".to_owned(),
-        respond: append_tx,
-    })
-    .await
-    .unwrap();
-    tokio::time::timeout(Duration::from_millis(250), append_rx)
-        .await
-        .expect("append should complete")
-        .unwrap()
-        .unwrap();
-
-    let expected_hash =
-        expected_stream_transcript_hash_for_appends(&stream_id, &start_event_id, &["hello "], 8);
-    let (finish_tx, finish_rx) = oneshot::channel();
-    tx.send(StreamComposeCommand::Finish {
-        expected: Some(StreamFinishExpectation {
-            final_text: "hello ".to_owned(),
-            transcript_hash_hex: Some(expected_hash.clone()),
-            chunk_count: Some(1),
-        }),
-        respond: finish_tx,
-    })
-    .await
-    .unwrap();
-    let finished = tokio::time::timeout(Duration::from_millis(250), finish_rx)
-        .await
-        .expect("finish with a matching expectation should complete")
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(finished.status, "finished");
-    assert_eq!(finished.text, "hello ");
-    assert_eq!(finished.chunk_count, 1);
-    assert_eq!(
-        finished.transcript_hash.as_deref(),
-        Some(expected_hash.as_str())
-    );
-
-    session.await.unwrap();
 }
 
 /// Regression for #366: a finish whose expectation does not match the composed

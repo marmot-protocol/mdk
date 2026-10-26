@@ -20,6 +20,10 @@ pub enum RecoveryRequest<'a> {
         event_id: &'a [u8; 32],
     },
     IncrementalHistory,
+    /// The current account owner's opaque live-subscription generation.
+    SubscriptionReplay {
+        snapshot: &'a [u8; 32],
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +32,7 @@ pub enum RecoveryPredicate {
     AllEndpoints = 0,
     RetainedKnownEvent = 1,
     MaintenanceBoundary = 2,
+    ReplayAdmission = 3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +45,7 @@ pub enum RecoveryCause {
     KnownEvent = 4,
     IncrementalHistory = 5,
     NotificationLoss = 6,
+    SubscriptionReplay = 7,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -69,13 +75,14 @@ pub(super) fn invalid_demand() -> StorageError {
 
 pub(super) fn recovery_cause(value: i64) -> StorageResult<RecoveryCause> {
     Ok(match value {
-        0 => RecoveryCause::QueueLoss,
-        1 => RecoveryCause::EpochGap,
-        2 => RecoveryCause::Maintenance,
-        3 => RecoveryCause::ExplicitHistory,
-        4 => RecoveryCause::KnownEvent,
-        5 => RecoveryCause::IncrementalHistory,
-        6 => RecoveryCause::NotificationLoss,
+        0_i64 => RecoveryCause::QueueLoss,
+        1_i64 => RecoveryCause::EpochGap,
+        2_i64 => RecoveryCause::Maintenance,
+        3_i64 => RecoveryCause::ExplicitHistory,
+        4_i64 => RecoveryCause::KnownEvent,
+        5_i64 => RecoveryCause::IncrementalHistory,
+        6_i64 => RecoveryCause::NotificationLoss,
+        7_i64 => RecoveryCause::SubscriptionReplay,
         _ => return Err(invalid_demand()),
     })
 }
@@ -137,16 +144,23 @@ impl SqliteAppStorage {
                 )
             }
             RecoveryRequest::IncrementalHistory => ("incremental".into(), 5, 0, None, None, false),
+            RecoveryRequest::SubscriptionReplay { snapshot } => (
+                format!("replay:{}", hex::encode(snapshot)),
+                7,
+                3,
+                None,
+                None,
+                false,
+            ),
         };
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            // Explicit history shares one obligation under the latest caller's
-            // key, so its prior row is the one explicit row, whatever its key.
-            let before = if cause == 3 {
+            // Explicit history and native replay each reuse one account row.
+            let before = if cause == 3 || cause == 7 {
                 conn.query_row_cached(
                     "SELECT id, revision, state, eligibility FROM account_recovery_obligations
-                     WHERE cause = 3 LIMIT 1",
-                    [],
+                     WHERE cause = ?1 LIMIT 1",
+                    [cause],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
@@ -168,6 +182,55 @@ impl SqliteAppStorage {
                     params![key,sqlite_integer(now_ms)?],
                 ).storage()?;
             }
+            if cause == 7 {
+                // Only unresolved pending windows cross source generations.
+                // An admitted native range is no longer debt; this fact never
+                // retires loss or certifies history. A completed/retired goal
+                // has no windows to carry forward.
+                // The same snapshot is a no-op even for parked/closed work.
+                // Carry the token high-water through deleted scope rows so a
+                // recreated source ID cannot reuse an earlier generation's
+                // scope token, even when paired with the successor ticket.
+                let scope_revision: i64 = conn.query_row_cached(
+                    "SELECT COALESCE(MAX(s.scope_revision),0)
+                     FROM account_recovery_scopes AS s
+                     JOIN account_recovery_obligations AS o ON o.id=s.obligation_id
+                     WHERE o.cause=7 AND o.demand_key!=?1",
+                    [&key], |row| row.get(0),
+                ).storage()?;
+                let previous = conn.prepare_cached(
+                    "SELECT s.obligation_id,s.scope_id,s.scope_format,s.scope_payload
+                     FROM account_recovery_scopes AS s
+                     JOIN account_recovery_obligations AS o ON o.id=s.obligation_id
+                     WHERE o.cause=7 AND o.predicate=3 AND o.state=0
+                       AND o.demand_key!=?1 AND s.snapshot_state=1",
+                ).storage()?.query_map([&key], |row| Ok((
+                    row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?, row.get::<_, Vec<u8>>(3)?,
+                ))).storage()?.collect::<Result<Vec<_>, _>>().storage()?;
+                for (id, scope, format, bytes) in previous {
+                    let payload = super::plan::decode_scope(format, &bytes)?;
+                    if super::plan::payload_is_qualified(&payload, RecoveryPredicate::ReplayAdmission as i64, false) {
+                        conn.execute_cached(
+                            "DELETE FROM account_recovery_scopes WHERE obligation_id=?1 AND scope_id=?2",
+                            params![id, scope],
+                        ).storage()?;
+                    }
+                }
+                conn.execute_cached(
+                    "DELETE FROM account_recovery_scopes WHERE obligation_id IN (
+                     SELECT id FROM account_recovery_obligations
+                     WHERE cause=7 AND demand_key!=?1 AND state IN (1,2))",
+                    [&key],
+                ).storage()?;
+                conn.execute_cached(
+                    "UPDATE account_recovery_obligations SET demand_key=?1,
+                     revision=MAX(revision,?3)+1,state=0,eligibility=0,updated_at_ms=?2,
+                     incomplete_reason=NULL,parked_at_ms=NULL
+                     WHERE cause=7 AND demand_key!=?1",
+                    params![key,sqlite_integer(now_ms)?,scope_revision],
+                ).storage()?;
+            }
             // A new request for a known event or incremental history is new
             // demand even when that key was satisfied or retired before.
             conn.execute_cached(
@@ -181,9 +244,12 @@ impl SqliteAppStorage {
                 params![key,cause,predicate,group,sqlite_integer(now_ms)?,caller],
             ).storage()?;
             let after = super::observe::demand_row(&conn, &key)?.ok_or_else(invalid_demand)?;
+            // Native scopes are issued-source identities supplied by the
+            // owner, not scope zero. Do not invent an unresolved source row.
             conn.execute_cached(
                 "INSERT OR IGNORE INTO account_recovery_scopes(obligation_id,scope_id,group_id,known_event_id)
-                 VALUES (?1,0,?2,?3)", params![after.0,group,event],
+                 SELECT ?1,0,?2,?3 WHERE ?4!=7",
+                params![after.0,group,event,cause],
             ).storage()?;
             Ok((
                 super::observe::ticket(&after)?,
@@ -366,9 +432,10 @@ impl SqliteAppStorage {
                         },
                         cause: recovery_cause(cause)?,
                         predicate: match predicate {
-                            0 => RecoveryPredicate::AllEndpoints,
-                            1 => RecoveryPredicate::RetainedKnownEvent,
-                            2 => RecoveryPredicate::MaintenanceBoundary,
+                            0_i64 => RecoveryPredicate::AllEndpoints,
+                            1_i64 => RecoveryPredicate::RetainedKnownEvent,
+                            2_i64 => RecoveryPredicate::MaintenanceBoundary,
+                            3_i64 => RecoveryPredicate::ReplayAdmission,
                             _ => return Err(invalid_demand()),
                         },
                         eligibility: match eligibility {

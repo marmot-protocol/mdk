@@ -6,6 +6,9 @@ use crate::SqliteAppStorage;
 
 use serde::{Deserialize, Serialize};
 
+const LEGACY_PLAN_FORMAT: i64 = 1;
+const CURRENT_PLAN_FORMAT: i64 = 2;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryComparisonPlan {
@@ -16,8 +19,8 @@ pub struct RecoveryComparisonPlan {
     #[serde(skip_serializing)]
     pub live_since_seconds: Option<u64>,
     pub routes: Vec<RecoveryScopePlan>,
-    /// Only transiently failed selected routes survive settlement. Empty after
-    /// a serviced unknown/partial pass; unattempted routes remain coverage debt.
+    /// Pending goals to retry, including transient failures and unselected or
+    /// unstarted routes. Capability blocking remains separate from this set.
     pub retry_routes: Vec<u64>,
 }
 
@@ -58,7 +61,7 @@ fn read(conn: &Connection) -> StorageResult<RecoveryComparison> {
             r.get::<_, i64>(3)?,r.get::<_, i64>(4)?,r.get::<_, i64>(5)?,
             r.get::<_, Option<Vec<u8>>>(6)?,r.get::<_, Option<i64>>(7)?)),
     ).storage()?;
-    if format != 1 {
+    if !matches!(format, LEGACY_PLAN_FORMAT | CURRENT_PLAN_FORMAT) {
         return Err(invalid());
     }
     let plan: Option<RecoveryComparisonPlan> = bytes
@@ -67,6 +70,13 @@ fn read(conn: &Connection) -> StorageResult<RecoveryComparison> {
     if let Some(plan) = &plan {
         validate_plan(plan)?;
     }
+    // Format 1 froze only selected routes. Its retry subset cannot represent
+    // every pending goal, so validate it but require the owner to reconstruct.
+    let plan = if format == CURRENT_PLAN_FORMAT {
+        plan
+    } else {
+        None
+    };
     Ok(RecoveryComparison {
         revision: i64_to_u64(revision)?,
         settled_revision: i64_to_u64(settled)?,
@@ -91,10 +101,11 @@ fn validate_plan(plan: &RecoveryComparisonPlan) -> StorageResult<()> {
                 || r.admitted_endpoints.windows(2).any(|e| e[0] >= e[1])
         })
         || plan.retry_routes.windows(2).any(|r| r[0] >= r[1])
-        || plan
-            .retry_routes
-            .iter()
-            .any(|id| !plan.routes.iter().any(|r| r.scope_id == *id))
+        || plan.retry_routes.iter().any(|id| {
+            plan.routes
+                .binary_search_by_key(id, |route| route.scope_id)
+                .is_err()
+        })
     {
         return Err(invalid());
     }
@@ -130,6 +141,48 @@ pub(super) fn selection_matches(
         && (explicit || slot.blocked_route_revision.is_none_or(|r| r != route)))
 }
 
+// A passive native admission can finish while its mixed grant's comparison is
+// still running. Only that exact terminal native selection may disappear from
+// the pending fence; no other completed, retired, replaced or missing demand
+// can validate the comparison's old grant. Reservation remains pending-only.
+pub(super) fn completed_work_fence_matches(
+    conn: &Connection,
+    current: &RecoveryRevisionFence,
+    expected: &RecoveryRevisionFence,
+) -> StorageResult<bool> {
+    if current.loss_revision != expected.loss_revision
+        || current.route_revision != expected.route_revision
+        || current.inventory_revision != expected.inventory_revision
+        || expected
+            .obligations
+            .windows(2)
+            .any(|pair| pair[0].0 >= pair[1].0)
+    {
+        return Ok(false);
+    }
+    for (id, revision) in &expected.obligations {
+        if current
+            .obligations
+            .binary_search_by_key(id, |(candidate, _)| *candidate)
+            .is_ok_and(|index| current.obligations[index].1 == *revision)
+        {
+            continue;
+        }
+        let terminal_native: bool = conn
+            .query_row_cached(
+                "SELECT EXISTS(SELECT 1 FROM account_recovery_obligations
+             WHERE id=?1 AND revision=?2 AND cause=7 AND predicate=3 AND state IN (1,2))",
+                params![id.as_slice(), sqlite_integer(*revision)?],
+                |row| row.get(0),
+            )
+            .storage()?;
+        if !terminal_native {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 impl SqliteAppStorage {
     pub fn recovery_comparison(&self) -> StorageResult<RecoveryComparison> {
         {
@@ -155,7 +208,8 @@ impl SqliteAppStorage {
                 let duplicate: bool = conn.query_row_cached(
                     "SELECT request_key IS ?1 FROM account_recovery_comparison WHERE singleton=1", [key.as_slice()], |r| r.get(0),
                 ).storage()?;
-                if duplicate { return Ok(read(&conn)?.revision); }
+                let slot = read(&conn)?;
+                if duplicate { return Ok(slot.revision); }
             }
             let ticket = storage.request_recovery(RecoveryRequest::IncrementalHistory, now_ms)?;
             let stored = storage.recovery_scope_snapshots(ticket.id)?;
@@ -198,7 +252,8 @@ impl SqliteAppStorage {
             }
             let conn = storage.lock()?;
             conn.execute_cached("UPDATE account_recovery_comparison SET revision=revision+1,
-                request_key=?1,requested_at_ms=?2,requested_until_seconds=MAX(requested_until_seconds,?3)
+                request_key=?1,requested_at_ms=?2,requested_until_seconds=MAX(requested_until_seconds,?3),
+                plan_payload=NULL
                 WHERE singleton=1", params![key.as_slice(),sqlite_integer(now_ms)?,sqlite_integer(now_ms/1000)?]).storage()?;
             Ok(read(&conn)?.revision)
         })
@@ -261,14 +316,15 @@ impl SqliteAppStorage {
                 }
             }
             let mut frozen = plan.clone();
-            // A cancelled executor has not serviced any selected route yet.
+            // A cancelled executor has not serviced any pending route yet.
             frozen.retry_routes = frozen.routes.iter().map(|r| r.scope_id).collect();
             conn.execute_cached(
                 "UPDATE account_recovery_comparison SET attempt_serial=?1,
-                frozen_revision=?2,plan_format=1,plan_payload=?3 WHERE singleton=1",
+                frozen_revision=?2,plan_format=?3,plan_payload=?4 WHERE singleton=1",
                 params![
                     sqlite_integer(attempt)?,
                     sqlite_integer(revision)?,
+                    CURRENT_PLAN_FORMAT,
                     serde_json::to_vec(&frozen).map_err(|_| invalid())?
                 ],
             )
@@ -298,7 +354,7 @@ impl SqliteAppStorage {
                 || retry.attempt_serial != attempt
                 || retry.ordinal <= 1
                 || slot.plan.as_ref().is_none_or(|p| p.fence != *expected)
-                || !work_fence_matches(&revision_fence(&conn)?, expected, true)
+                || !completed_work_fence_matches(&conn, &revision_fence(&conn)?, expected)?
                 || !plan::no_unimported_loss(&conn)?
             {
                 return Ok(false);
@@ -334,7 +390,7 @@ impl SqliteAppStorage {
             let Some(mut frozen) = slot.plan else { return Ok(false); };
             if slot.settled_revision >= revision || attempt == 0 || slot.attempt_serial != attempt || slot.frozen_revision != revision
                 || retry_state(&conn)?.attempt_serial != attempt
-                || !work_fence_matches(&revision_fence(&conn)?, &frozen.fence, true)
+                || !completed_work_fence_matches(&conn, &revision_fence(&conn)?, &frozen.fence)?
                 || !plan::no_unimported_loss(&conn)? { return Ok(false); }
             if outcomes.len() != frozen.routes.len() || outcomes.windows(2).any(|x| x[0].0 >= x[1].0)
                 || outcomes.iter().zip(&frozen.routes).any(|((id,_),r)| *id != r.scope_id)
@@ -348,9 +404,9 @@ impl SqliteAppStorage {
                 else if outcomes.iter().any(|(_,o)| *o == RecoveryComparisonOutcome::ServicedPartial) { 1 } else { 0 };
             conn.execute_cached("UPDATE account_recovery_comparison SET
                 settled_revision=CASE WHEN ?1 THEN MAX(settled_revision,?2) ELSE settled_revision END,
-                blocked_route_revision=?3,blocked_capability_key=?4,plan_payload=?5,last_outcome=?6 WHERE singleton=1",
+                blocked_route_revision=?3,blocked_capability_key=?4,plan_format=?5,plan_payload=?6,last_outcome=?7 WHERE singleton=1",
                 params![complete,sqlite_integer(revision)?,unsupported_key.map(|_| sqlite_integer(frozen.fence.route_revision)).transpose()?,
-                    unsupported_key,serde_json::to_vec(&frozen).map_err(|_| invalid())?,outcome]).storage()?;
+                    unsupported_key,CURRENT_PLAN_FORMAT,serde_json::to_vec(&frozen).map_err(|_| invalid())?,outcome]).storage()?;
             Ok(true)
         })
     }
@@ -443,14 +499,13 @@ mod tests {
 
     fn stored_comparison_plan(s: &SqliteAccountStorage) -> serde_json::Value {
         let conn = s.lock().unwrap();
-        let (format, payload): (i64, Vec<u8>) = conn
+        let payload: Vec<u8> = conn
             .query_row_cached(
-                "SELECT plan_format,plan_payload FROM account_recovery_comparison WHERE singleton=1",
+                "SELECT plan_payload FROM account_recovery_comparison WHERE singleton=1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(format, 1);
         serde_json::from_slice(&payload).unwrap()
     }
 
@@ -458,27 +513,119 @@ mod tests {
         s.lock()
             .unwrap()
             .execute_cached(
-                "UPDATE account_recovery_comparison SET plan_payload=?1 WHERE singleton=1",
-                [serde_json::to_vec(payload).unwrap()],
+                "UPDATE account_recovery_comparison SET plan_format=?1,plan_payload=?2 WHERE singleton=1",
+                params![LEGACY_PLAN_FORMAT, serde_json::to_vec(payload).unwrap()],
             )
             .unwrap();
     }
 
+    fn stored_scope_records(s: &SqliteAccountStorage) -> Vec<(i64, Vec<u8>, Option<Vec<u8>>)> {
+        s.lock()
+            .unwrap()
+            .prepare_cached(
+                "SELECT scope_revision,scope_payload,progress_after FROM account_recovery_scopes
+                 ORDER BY obligation_id,scope_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
     #[test]
-    fn legacy_comparison_plans_rewrite_without_retired_live_floor() {
-        for live_floor in [serde_json::Value::Null, serde_json::json!(90)] {
+    fn legacy_plan_rebuild_preserves() {
+        for (live_floor, blocked) in [
+            (serde_json::Value::Null, false),
+            (serde_json::json!(90), true),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("comparison.sqlite");
             let key = crate::SqlCipherKey::new("legacy comparison plan").unwrap();
             let s = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-            s.app_storage()
-                .join_recovery_comparison(&[1; 16], 100_000, &[scope()])
+            let app = s.app_storage();
+            s.lock()
+                .unwrap()
+                .execute_batch("INSERT INTO cgka_groups(id,epoch,record) VALUES(x'07',0,x'00')")
                 .unwrap();
-            let (revision, attempt, fence) = reserve(&s.app_storage(), 100_000, vec![scope()]);
-            let cost = s.app_storage().recovery_retry_state().unwrap();
-            let debt = s.app_storage().pending_recovery_demands().unwrap()[0]
-                .ticket
-                .id;
+            app.join_recovery_comparison(&[1; 16], 100_000, &[scope()])
+                .unwrap();
+            let (settled_revision, first_attempt, _) = reserve(&app, 100_000, vec![scope()]);
+            assert!(
+                app.settle_recovery_comparison(
+                    settled_revision,
+                    first_attempt,
+                    &[(0, RecoveryComparisonOutcome::ServicedUnknown)],
+                    None,
+                )
+                .unwrap()
+            );
+            let mut first = scope();
+            first.until_seconds = 101;
+            let second = RecoveryScopePlan {
+                scope_id: 1,
+                route_kind: 1,
+                group_id: Some(vec![7]),
+                transport_group_id: Some([7; 32]),
+                ..first.clone()
+            };
+            let goals = vec![first.clone(), second];
+            app.join_recovery_comparison(&[2; 16], 101_000, &goals)
+                .unwrap();
+            // This is the old writer's selected-only plan: goal 1 never ran.
+            let (revision, attempt, fence) = reserve(&app, 115_000, vec![first]);
+            let debt_fence = app.recovery_revision_fence().unwrap();
+            let debt = app.pending_recovery_demands().unwrap()[0].ticket;
+            let tokens = app
+                .install_recovery_scope_plan(&debt_fence, attempt, debt.id, &goals)
+                .unwrap()
+                .unwrap();
+            assert!(
+                !app.checkpoint_recovery_obligation(
+                    &debt_fence,
+                    attempt,
+                    debt.id,
+                    &[RecoveryScopeCheckpoint {
+                        token: tokens[0].clone(),
+                        endpoints: vec![RecoveryEndpointCheckpoint {
+                            endpoint: goals[0].admitted_endpoints[0].clone(),
+                            outcome: RecoveryScopeOutcome::Covered,
+                            exhaustive: true,
+                            admission_complete: true,
+                            first_boundary: true,
+                        }],
+                        retained_known_event: false,
+                        replay_admitted: false,
+                    }],
+                    RecoveryEligibility::Retry,
+                )
+                .unwrap()
+            );
+            s.lock()
+                .unwrap()
+                .execute_cached(
+                    "UPDATE account_recovery_scopes SET progress_after=?1 WHERE scope_id=1",
+                    [[17_u8; 32].as_slice()],
+                )
+                .unwrap();
+            assert!(
+                app.settle_recovery_comparison(
+                    revision,
+                    attempt,
+                    &[(
+                        0,
+                        if blocked {
+                            RecoveryComparisonOutcome::Unsupported
+                        } else {
+                            RecoveryComparisonOutcome::TransientFailure
+                        }
+                    )],
+                    blocked.then_some(b"unsupported-v1".as_slice()),
+                )
+                .unwrap()
+            );
+            let cost = app.recovery_retry_state().unwrap();
+            let scopes = stored_scope_records(&s);
             let fresh = stored_comparison_plan(&s);
             assert!(
                 fresh.get("live_since_seconds").is_none(),
@@ -490,28 +637,34 @@ mod tests {
             let mut legacy = fresh.clone();
             legacy["live_since_seconds"] = live_floor.clone();
             replace_comparison_plan(&s, &legacy);
-            let decoded = s.app_storage().recovery_comparison().unwrap().plan.unwrap();
-            assert_eq!(decoded.live_since_seconds, live_floor.as_u64());
-            assert_eq!(decoded.fence, fence);
-            assert_eq!(decoded.retry_routes, vec![0]);
+            assert!(app.recovery_comparison().unwrap().plan.is_none());
             s.close().unwrap();
 
             let s = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-            let reopened = s.app_storage().recovery_comparison().unwrap();
+            let app = s.app_storage();
+            let reopened = app.recovery_comparison().unwrap();
             assert!(reopened.pending());
             assert_eq!(reopened.revision, revision);
+            assert_eq!(reopened.settled_revision, settled_revision);
+            assert_eq!(reopened.requested_until_seconds, 101);
             assert_eq!(reopened.attempt_serial, attempt);
+            assert_eq!(reopened.frozen_revision, revision);
             assert_eq!(
-                reopened.plan.unwrap().live_since_seconds,
-                live_floor.as_u64()
+                reopened.blocked_route_revision,
+                blocked.then_some(fence.route_revision)
             );
-            assert_eq!(s.app_storage().recovery_retry_state().unwrap(), cost);
+            assert!(reopened.plan.is_none(), "a legacy subset is not reusable");
             assert_eq!(
-                s.app_storage().pending_recovery_demands().unwrap()[0]
-                    .ticket
-                    .id,
-                debt
+                stored_comparison_plan(&s),
+                legacy,
+                "reading does not rewrite the record"
             );
+            assert_eq!(stored_scope_records(&s), scopes);
+            assert_eq!(app.recovery_revision_fence().unwrap(), debt_fence);
+            assert_eq!(app.recovery_retry_state().unwrap(), cost);
+            let reopened_debt = app.pending_recovery_demands().unwrap()[0].ticket;
+            assert_eq!(reopened_debt.id, debt.id);
+            assert_eq!(reopened_debt.revision, debt.revision);
 
             // Tolerating the retired field must not relax its legacy type or
             // the strict format-1 decoder's treatment of other unknown keys.
@@ -537,46 +690,148 @@ mod tests {
                 s.app_storage().recovery_comparison(),
                 Err(StorageError::Serialization(_))
             ));
+            let mut invalid_routes = legacy.clone();
+            invalid_routes["retry_routes"] = serde_json::json!([999]);
+            replace_comparison_plan(&s, &invalid_routes);
+            assert!(matches!(
+                app.recovery_comparison(),
+                Err(StorageError::Serialization(_))
+            ));
+            s.lock()
+                .unwrap()
+                .execute_cached(
+                    "UPDATE account_recovery_comparison SET plan_payload=?1 WHERE singleton=1",
+                    [b"{".as_slice()],
+                )
+                .unwrap();
+            assert!(matches!(
+                app.recovery_comparison(),
+                Err(StorageError::Serialization(_))
+            ));
+            assert!(
+                app.join_recovery_comparison(&[3; 16], 120_000, &goals)
+                    .is_err()
+            );
+            assert_eq!(app.recovery_revision_fence().unwrap(), debt_fence);
+            assert_eq!(stored_scope_records(&s), scopes);
             replace_comparison_plan(&s, &legacy);
 
             assert!(
-                s.app_storage()
-                    .settle_recovery_comparison(
-                        revision,
-                        attempt,
-                        &[(0, RecoveryComparisonOutcome::ServicedPartial)],
-                        None,
-                    )
-                    .unwrap()
+                !app.settle_recovery_comparison(
+                    revision,
+                    attempt,
+                    &[(0, RecoveryComparisonOutcome::ServicedUnknown)],
+                    None,
+                )
+                .unwrap()
             );
-            let rewritten = stored_comparison_plan(&s);
-            assert!(rewritten.get("live_since_seconds").is_none());
-            assert_eq!(rewritten["fence"], fresh["fence"]);
-            assert_eq!(rewritten["routes"], fresh["routes"]);
-            assert_eq!(rewritten["retry_routes"], serde_json::json!([]));
-            assert_eq!(s.app_storage().recovery_retry_state().unwrap(), cost);
-            assert_eq!(s.app_storage().pending_recovery_demands().unwrap().len(), 1);
+            assert!(
+                !app.checkpoint_recovery_comparison_progress(
+                    revision, attempt, &fence, 120_000, 15_000
+                )
+                .unwrap()
+            );
             assert_eq!(
-                s.app_storage().pending_recovery_demands().unwrap()[0]
-                    .ticket
-                    .id,
-                debt
+                app.join_recovery_comparison(&[2; 16], 999_000, &[scope()])
+                    .unwrap(),
+                revision,
+            );
+            assert_eq!(stored_comparison_plan(&s), legacy);
+            if blocked {
+                assert!(
+                    app.reserve_recovery_work(&fence, Some(revision), 130_000, 15_000, false)
+                        .unwrap()
+                        .is_none()
+                );
+                app.observe_recovery_comparison_capability(b"unsupported-v1")
+                    .unwrap();
+                assert!(
+                    app.reserve_recovery_work(&fence, Some(revision), 130_000, 15_000, false)
+                        .unwrap()
+                        .is_none()
+                );
+                app.observe_recovery_comparison_capability(b"supported-v2")
+                    .unwrap();
+            }
+            assert_eq!(app.recovery_retry_state().unwrap(), cost);
+            let reconstructed: Vec<_> = app
+                .recovery_scope_snapshots(debt.id)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.plan)
+                .collect();
+            assert_eq!(
+                reconstructed.len(),
+                2,
+                "the never-selected goal remains durable debt"
+            );
+            let (_, next_attempt, _) = reserve(&app, 130_000, reconstructed);
+            assert!(
+                !app.settle_recovery_comparison(
+                    revision,
+                    attempt,
+                    &[(0, RecoveryComparisonOutcome::ServicedUnknown)],
+                    None,
+                )
+                .unwrap()
+            );
+            assert!(
+                app.settle_recovery_comparison(
+                    revision,
+                    next_attempt,
+                    &[
+                        (0, RecoveryComparisonOutcome::ServicedUnknown),
+                        (1, RecoveryComparisonOutcome::TransientFailure),
+                    ],
+                    None,
+                )
+                .unwrap()
+            );
+            let next_cost = app.recovery_retry_state().unwrap();
+            assert_eq!(
+                stored_scope_records(&s),
+                scopes,
+                "operational installation and settlement grant no coverage"
             );
             s.close().unwrap();
 
             let s = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-            let s_app = s.app_storage();
-            let settled = s_app.recovery_comparison().unwrap();
-            assert!(!settled.pending());
-            assert_eq!(settled.settled_revision, revision);
-            assert_eq!(settled.plan.unwrap().fence, fence);
-            assert_eq!(s_app.recovery_retry_state().unwrap(), cost);
-            assert_eq!(s_app.pending_recovery_demands().unwrap()[0].ticket.id, debt);
+            let app = s.app_storage();
+            let retry = app.recovery_comparison().unwrap();
+            assert!(retry.pending());
+            assert_eq!(retry.settled_revision, settled_revision);
+            assert_eq!(retry.attempt_serial, next_attempt);
+            let plan = retry.plan.unwrap();
+            assert_eq!(plan.fence, fence);
+            assert_eq!(plan.routes.len(), 2);
+            assert_eq!(plan.retry_routes, vec![1]);
+            assert_eq!(app.recovery_retry_state().unwrap(), next_cost);
+            let reopened_debt = app.pending_recovery_demands().unwrap()[0].ticket;
+            assert_eq!(reopened_debt.id, debt.id);
+            assert_eq!(reopened_debt.revision, debt.revision);
+            assert_eq!(stored_scope_records(&s), scopes);
             assert!(
                 stored_comparison_plan(&s)
                     .get("live_since_seconds")
                     .is_none()
             );
+            assert!(
+                app.settle_recovery_comparison(
+                    revision,
+                    next_attempt,
+                    &[
+                        (0, RecoveryComparisonOutcome::ServicedUnknown),
+                        (1, RecoveryComparisonOutcome::ServicedPartial),
+                    ],
+                    None,
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                app.recovery_comparison().unwrap().settled_revision,
+                revision
+            );
+            assert_eq!(app.recovery_retry_state().unwrap(), next_cost);
             s.close().unwrap();
         }
     }
@@ -659,30 +914,38 @@ mod tests {
     }
 
     #[test]
-    fn settlement_preserves_successor_and_rejects_loss_or_inventory_changes() {
+    fn join_key_fences_plans() {
         let s = storage().app_storage();
         s.join_recovery_comparison(&[1; 16], 100_000, &[scope()])
             .unwrap();
-        let (revision, attempt, _) = reserve(&s, 100_000, vec![scope()]);
+        let (revision, attempt, fence) = reserve(&s, 100_000, vec![scope()]);
         let cost = s.recovery_retry_state().unwrap();
         let mut successor = scope();
         successor.until_seconds = 101;
-        s.join_recovery_comparison(&[2; 16], 101_000, &[successor])
-            .unwrap();
-        assert!(
-            s.settle_recovery_comparison(
-                revision,
-                attempt,
-                &[(0, RecoveryComparisonOutcome::ServicedUnknown)],
-                None
-            )
-            .unwrap()
+        assert_eq!(
+            s.join_recovery_comparison(&[1; 16], 101_000, std::slice::from_ref(&successor))
+                .unwrap(),
+            revision,
         );
-        assert!(s.recovery_comparison().unwrap().pending());
-        assert_eq!(s.recovery_retry_state().unwrap(), cost);
-        let (revision, attempt, fence) = reserve(&s, 115_000, vec![scope()]);
-        s.ensure_account_projection("alice").unwrap();
-        s.mark_account_delivery_recovery("alice", 42, 100).unwrap();
+        let duplicate = s.recovery_comparison().unwrap();
+        assert_eq!(duplicate.requested_until_seconds, 100);
+        assert_eq!(duplicate.attempt_serial, attempt);
+        assert_eq!(duplicate.frozen_revision, revision);
+        let retained = duplicate.plan.unwrap();
+        assert_eq!(retained.fence, fence);
+        assert_eq!(retained.routes[0].until_seconds, 100);
+        assert_eq!(retained.retry_routes, vec![0]);
+        let next_revision = s
+            .join_recovery_comparison(&[2; 16], 101_000, &[successor])
+            .unwrap();
+        assert_eq!(next_revision, revision + 1);
+        let joined = s.recovery_comparison().unwrap();
+        assert!(joined.pending());
+        assert_eq!(joined.settled_revision, 0);
+        assert_eq!(joined.requested_until_seconds, 101);
+        assert_eq!(joined.attempt_serial, attempt);
+        assert_eq!(joined.frozen_revision, revision);
+        assert!(joined.plan.is_none());
         assert!(
             !s.settle_recovery_comparison(
                 revision,
@@ -690,11 +953,56 @@ mod tests {
                 &[(0, RecoveryComparisonOutcome::ServicedUnknown)],
                 None
             )
+            .unwrap(),
+            "a missing plan fences settlement from the superseded executor"
+        );
+        assert!(
+            !s.checkpoint_recovery_comparison_progress(revision, attempt, &fence, 102_000, 15_000)
+                .unwrap()
+        );
+        assert!(s.recovery_comparison().unwrap().pending());
+        assert_eq!(s.recovery_retry_state().unwrap(), cost);
+        let (next_revision, next_attempt, next_fence) = reserve(&s, 115_000, vec![scope()]);
+        assert!(
+            !s.settle_recovery_comparison(
+                next_revision,
+                attempt,
+                &[(0, RecoveryComparisonOutcome::ServicedUnknown)],
+                None,
+            )
+            .unwrap(),
+            "an old attempt cannot settle the reconstructed current plan"
+        );
+        assert!(
+            !s.checkpoint_recovery_comparison_progress(
+                next_revision,
+                attempt,
+                &next_fence,
+                116_000,
+                15_000
+            )
+            .unwrap()
+        );
+        s.ensure_account_projection("alice").unwrap();
+        s.mark_account_delivery_recovery("alice", 42, 100).unwrap();
+        assert!(
+            !s.settle_recovery_comparison(
+                next_revision,
+                next_attempt,
+                &[(0, RecoveryComparisonOutcome::ServicedUnknown)],
+                None
+            )
             .unwrap()
         );
         assert!(
-            !s.checkpoint_recovery_comparison_progress(revision, attempt, &fence, 116_000, 15_000)
-                .unwrap()
+            !s.checkpoint_recovery_comparison_progress(
+                next_revision,
+                next_attempt,
+                &next_fence,
+                116_000,
+                15_000
+            )
+            .unwrap()
         );
         assert!(s.account_delivery_recovery("alice").unwrap().is_some());
         assert!(s.recovery_comparison().unwrap().pending());
@@ -721,7 +1029,17 @@ mod tests {
             .unwrap();
         let (revision, attempt, _) = reserve(&s_app, 100_000, vec![scope()]);
         let cost = s_app.recovery_retry_state().unwrap();
+        let fence = s_app.recovery_revision_fence().unwrap();
+        let frozen = stored_comparison_plan(&s);
         s.lock().unwrap().execute_batch("CREATE TRIGGER reject_comparison BEFORE UPDATE ON account_recovery_comparison BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
+        assert!(
+            s_app
+                .join_recovery_comparison(&[2; 16], 101_000, &[scope()])
+                .is_err()
+        );
+        assert_eq!(s_app.recovery_revision_fence().unwrap(), fence);
+        assert_eq!(stored_comparison_plan(&s), frozen);
+        assert_eq!(s_app.recovery_comparison().unwrap().revision, revision);
         assert!(
             s_app
                 .settle_recovery_comparison(
@@ -742,15 +1060,31 @@ mod tests {
         let path = dir.path().join("comparison.sqlite");
         let key = crate::SqlCipherKey::new("comparison reopen").unwrap();
         let cost;
+        let frozen_revision;
         {
             let s = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
             let s_app = s.app_storage();
             s_app
                 .join_recovery_comparison(&[1; 16], 100_000, &[scope()])
                 .unwrap();
-            reserve(&s_app, 100_000, vec![scope()]);
+            frozen_revision = reserve(&s_app, 100_000, vec![scope()]).0;
             cost = s_app.recovery_retry_state().unwrap();
             s.close().unwrap(); // Future dropped after freeze: no settlement.
+        }
+        {
+            let s = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+            let s_app = s.app_storage();
+            assert_eq!(
+                s_app
+                    .join_recovery_comparison(&[1; 16], 101_000, &[scope()])
+                    .unwrap(),
+                frozen_revision,
+            );
+            let slot = s_app.recovery_comparison().unwrap();
+            assert!(slot.pending());
+            assert_eq!(slot.plan.unwrap().retry_routes, vec![0]);
+            assert_eq!(s_app.recovery_retry_state().unwrap(), cost);
+            s.close().unwrap();
         }
         for boot in 2..5 {
             let s = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
@@ -760,7 +1094,12 @@ mod tests {
                 .unwrap();
             let slot = s_app.recovery_comparison().unwrap();
             assert!(slot.pending());
-            assert_eq!(slot.plan.unwrap().retry_routes, vec![0]);
+            assert!(
+                slot.plan.is_none(),
+                "a new startup cannot inherit a cancelled subset"
+            );
+            assert_eq!(slot.attempt_serial, cost.attempt_serial);
+            assert_eq!(slot.frozen_revision, frozen_revision);
             let mut fence = s_app.recovery_revision_fence().unwrap();
             fence.obligations.clear();
             assert!(
@@ -793,6 +1132,9 @@ mod tests {
         let revision = s
             .join_recovery_comparison(&[2; 16], 101_000, &[scope()])
             .unwrap();
+        let joined = s.recovery_comparison().unwrap();
+        assert!(joined.plan.is_none());
+        assert_eq!(joined.blocked_route_revision, Some(fence.route_revision));
         assert!(
             s.reserve_recovery_work(&fence, Some(revision), 900_000, 30_000, false)
                 .unwrap()

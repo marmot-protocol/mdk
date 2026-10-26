@@ -9,6 +9,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use cgka_engine::account_identity_proof::AccountIdentityProofSigner;
 use cgka_engine::canonicalization::CanonicalizationPolicy;
+pub use cgka_engine::engine::WelcomeDeliveryIndex;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{Engine, EngineBuilder};
 use cgka_traits::app_components::{AppComponentId, AppComponentSet, default_group_components};
@@ -749,6 +750,11 @@ impl AccountDeviceSession {
         Ok(self.engine.tracked_outbound_welcome_ids()?)
     }
 
+    /// Outstanding Welcome obligations and tracked IDs from one engine scan.
+    pub fn welcome_delivery_index(&self) -> SessionResult<WelcomeDeliveryIndex> {
+        Ok(self.engine.welcome_delivery_index()?)
+    }
+
     /// Complete one retained outbound Welcome delivery obligation after the
     /// transport reports the required acknowledgements.
     pub fn mark_sent_welcome_delivered(&self, id: &MessageId) -> SessionResult<()> {
@@ -1087,19 +1093,21 @@ impl AccountDeviceSession {
         })
     }
 
+    /// Ingest without taking ownership of the delivery or copying its wire payload.
+    /// The transport owner may release the frame after successful acknowledgement.
     pub async fn ingest_delivery(
         &mut self,
-        delivery: TransportDelivery,
+        delivery: &TransportDelivery,
     ) -> SessionResult<IngestEffects> {
         tracing::debug!(
             target: TRACE_TARGET,
             method = "ingest_delivery",
             "ingesting transport delivery"
         );
-        let transport_context = audit_transport_context(delivery.source);
+        let transport_context = audit_transport_context(delivery.source.clone());
         let outcome = self
             .engine
-            .ingest_with_audit_context(delivery.message, Some(transport_context))
+            .ingest_with_audit_context(&delivery.message, Some(transport_context))
             .await?;
         let left_object_unpersisted = self.engine.last_ingest_left_object_unpersisted();
         tracing::debug!(
