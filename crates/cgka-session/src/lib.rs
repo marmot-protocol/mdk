@@ -27,7 +27,7 @@ use cgka_traits::maintenance::{
     WallClock,
 };
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::StorageError;
+use cgka_traits::storage::{MaintenanceStorage, StorageError};
 use cgka_traits::transport::TransportMessage;
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use cgka_traits::{
@@ -257,6 +257,10 @@ impl SessionConfig {
 
 pub struct AccountDeviceSession {
     engine: Engine<SqliteAccountStorage>,
+    /// A clone of the engine's connection. The account records live here,
+    /// not behind engine forwards; a group-scoped one asks
+    /// [`Engine::check_group_live`] first, so only the engine decides
+    /// whether a group is live (mdk#2602).
     storage: SqliteAccountStorage,
     /// The audit log's one recorder. The engine holds a clone from build, and
     /// the runtime and the app take their own from [`Self::audit_recorder`].
@@ -414,10 +418,10 @@ impl AccountDeviceSession {
             ),
             SessionStorage::Open { storage, opened_in } => (storage, opened_in),
         };
-        // Keep a clone of the same closeable connection for storage-only
-        // maintenance that must not widen the generic engine API. The engine
-        // and this handle share one underlying connection and terminal close
-        // state.
+        // Keep a clone of the same closeable connection for the account
+        // records and storage-only maintenance the layers above need, so the
+        // generic engine API does not widen for them. The engine and this
+        // handle share one underlying connection and terminal close state.
         let maintenance_storage = storage.clone();
         let storage_open = opened_at.elapsed() + host_storage_open;
         let build_started = std::time::Instant::now();
@@ -593,11 +597,11 @@ impl AccountDeviceSession {
     }
 
     pub fn key_package_lifecycle(&self) -> SessionResult<Option<KeyPackageLifecycleState>> {
-        Ok(self.engine.key_package_lifecycle()?)
+        Ok(self.storage.key_package_lifecycle()?)
     }
 
     pub fn put_key_package_lifecycle(&self, state: &KeyPackageLifecycleState) -> SessionResult<()> {
-        Ok(self.engine.put_key_package_lifecycle(state)?)
+        Ok(self.storage.put_key_package_lifecycle(state)?)
     }
 
     pub fn stage_key_package_replacement(
@@ -627,39 +631,42 @@ impl AccountDeviceSession {
         &self,
         group_id: &GroupId,
     ) -> SessionResult<Option<GroupMaintenanceState>> {
-        Ok(self.engine.group_maintenance(group_id)?)
+        self.engine.check_group_live(group_id)?;
+        Ok(self.storage.group_maintenance(group_id)?)
     }
 
     pub fn put_group_maintenance(&self, state: &GroupMaintenanceState) -> SessionResult<()> {
-        Ok(self.engine.put_group_maintenance(state)?)
+        self.engine.check_group_live(&state.group_id)?;
+        Ok(self.storage.put_group_maintenance(state)?)
     }
 
     pub fn put_maintenance_obligation(&self, record: &MaintenanceObligation) -> SessionResult<()> {
-        Ok(self.engine.put_maintenance_obligation(record)?)
+        Ok(self.storage.put_maintenance_obligation(record)?)
     }
 
     pub fn maintenance_obligation(
         &self,
         id: &MessageId,
     ) -> SessionResult<Option<MaintenanceObligation>> {
-        Ok(self.engine.maintenance_obligation(id)?)
+        Ok(self.storage.maintenance_obligation(id)?)
     }
 
     pub fn maintenance_obligations(&self) -> SessionResult<Vec<MaintenanceObligation>> {
-        Ok(self.engine.list_maintenance_obligations()?)
+        Ok(self.storage.list_maintenance_obligations()?)
     }
 
     pub fn maintenance_obligations_for_group(
         &self,
         group_id: &GroupId,
     ) -> SessionResult<Vec<MaintenanceObligation>> {
+        self.engine.check_group_live(group_id)?;
         Ok(self
-            .engine
+            .storage
             .list_maintenance_obligations_for_group(group_id)?)
     }
 
     pub fn delete_maintenance_obligation(&self, id: &MessageId) -> SessionResult<()> {
-        Ok(self.engine.delete_maintenance_obligation(id)?)
+        Ok(self.storage.delete_maintenance_obligation(id)?)
     }
 
     /// Durable disposition of one stored message, for state-derived repair of
@@ -672,18 +679,19 @@ impl AccountDeviceSession {
     }
 
     pub fn group_evolutions(&self) -> SessionResult<Vec<DurableGroupEvolution>> {
-        Ok(self.engine.list_group_evolutions()?)
+        Ok(self.storage.list_group_evolutions()?)
     }
 
     pub fn group_evolutions_for_group(
         &self,
         group_id: &GroupId,
     ) -> SessionResult<Vec<DurableGroupEvolution>> {
-        Ok(self.engine.list_group_evolutions_for_group(group_id)?)
+        self.engine.check_group_live(group_id)?;
+        Ok(self.storage.list_group_evolutions_for_group(group_id)?)
     }
 
     pub fn put_group_evolution(&self, record: &DurableGroupEvolution) -> SessionResult<()> {
-        Ok(self.engine.put_group_evolution(record)?)
+        Ok(self.storage.put_group_evolution(record)?)
     }
 
     pub fn own_leaf_hash(&self, group_id: &GroupId) -> SessionResult<Vec<u8>> {
@@ -700,33 +708,33 @@ impl AccountDeviceSession {
     }
 
     pub fn put_transport_fanout(&self, record: &DurableTransportFanout) -> SessionResult<()> {
-        Ok(self.engine.put_transport_fanout(record)?)
+        Ok(self.storage.put_transport_fanout(record)?)
     }
 
     pub fn transport_fanout(
         &self,
         id: &MessageId,
     ) -> SessionResult<Option<DurableTransportFanout>> {
-        Ok(self.engine.transport_fanout(id)?)
+        Ok(self.storage.transport_fanout(id)?)
     }
 
     pub fn transport_fanouts(&self) -> SessionResult<Vec<DurableTransportFanout>> {
-        Ok(self.engine.list_transport_fanouts()?)
+        Ok(self.storage.list_transport_fanouts()?)
     }
 
     pub fn delete_transport_fanout(&self, id: &MessageId) -> SessionResult<()> {
-        Ok(self.engine.delete_transport_fanout(id)?)
+        Ok(self.storage.delete_transport_fanout(id)?)
     }
 
     pub fn periodic_maintenance_policy(&self) -> SessionResult<PeriodicMaintenancePolicy> {
-        Ok(self.engine.periodic_maintenance_policy()?)
+        Ok(self.storage.periodic_maintenance_policy()?)
     }
 
     pub fn put_periodic_maintenance_policy(
         &self,
         policy: PeriodicMaintenancePolicy,
     ) -> SessionResult<()> {
-        Ok(self.engine.put_periodic_maintenance_policy(policy)?)
+        Ok(self.storage.put_periodic_maintenance_policy(policy)?)
     }
 
     /// Abandon a group locally without sending a leave or disband.

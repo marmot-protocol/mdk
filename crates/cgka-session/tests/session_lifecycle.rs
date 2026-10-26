@@ -1147,3 +1147,400 @@ async fn compact_authority_capture_defers_unhydrated_groups_and_uses_session_sto
     assert!(reopened.ensure_group_hydrated(&group).unwrap());
     assert_eq!(reopened.group_authority(&group).unwrap(), before);
 }
+
+async fn create_confirmed_group(session: &mut AccountDeviceSession, name: &str) -> GroupId {
+    let created = session
+        .create_group(CreateGroupRequest {
+            name: name.into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let PublishWork::GroupCreated { pending, .. } = created.effects.publish[0] else {
+        panic!("legacy founding commit");
+    };
+    session.confirm_published(pending).await.unwrap();
+    created.group_id
+}
+
+fn record_id(kind: &str, group_id: &GroupId) -> MessageId {
+    let mut id = kind.as_bytes().to_vec();
+    id.extend_from_slice(group_id.as_slice());
+    MessageId::new(id)
+}
+
+/// One stored record of each group-scoped kind for `group_id`. The evolution
+/// is confirmed, so hydration does not try to restore it.
+fn group_account_records(
+    group_id: &GroupId,
+) -> (
+    cgka_traits::maintenance::GroupMaintenanceState,
+    cgka_traits::maintenance::MaintenanceObligation,
+    cgka_traits::maintenance::DurableGroupEvolution,
+) {
+    use cgka_traits::maintenance::{
+        DurableGroupEvolution, GroupEvolutionPhase, GroupEvolutionSemantic, GroupMaintenanceState,
+        MaintenanceObligation, MaintenancePhase, MaintenanceTrigger,
+    };
+    let state = GroupMaintenanceState {
+        group_id: group_id.clone(),
+        enrolled_at: Some(Timestamp(10)),
+        periodic_enrolled: true,
+        last_own_leaf_rotation_at: Some(Timestamp(10)),
+        next_periodic_rotation_at: Some(Timestamp(1_000)),
+        leaf_refresh_due_at: None,
+    };
+    let obligation = MaintenanceObligation {
+        id: record_id("obligation", group_id),
+        group_id: group_id.clone(),
+        trigger: MaintenanceTrigger::Periodic,
+        phase: MaintenancePhase::Quiet,
+        created_at: Timestamp(10),
+        operational_target_at: None,
+        overdue: false,
+        eose_deadline_at: None,
+        grace_until: None,
+        quiet_since: Some(Timestamp(10)),
+        own_leaf_baseline_hash: None,
+        sampled_jitter_ms: 0,
+        not_before: None,
+        attempt_count: 0,
+        semantic_rearm_count: 0,
+        last_failure_code: None,
+    };
+    let evolution = DurableGroupEvolution {
+        id: record_id("evolution", group_id),
+        group_id: group_id.clone(),
+        source_epoch: EpochId(0),
+        target_epoch: EpochId(1),
+        phase: GroupEvolutionPhase::Confirmed,
+        semantic: GroupEvolutionSemantic::SelfUpdate {
+            trigger: MaintenanceTrigger::Periodic,
+            obligation_id: Some(obligation.id.clone()),
+        },
+        own_leaf_before_hash: None,
+        removal_members: vec![],
+        signed_message_id: None,
+        pending_ref: None,
+    };
+    (state, obligation, evolution)
+}
+
+/// Rule 4 of mdk#2602: only the engine decides whether a group is live. The
+/// group-scoped account records live on the session's storage handle, but
+/// each of their accessors, the write included, asks the engine first. A
+/// quarantined group fails with `UnknownGroup` and a seeded-but-unhydrated one
+/// with the retryable `GroupNotHydrated`, before storage is touched, even
+/// though both have stored records. A live group gets its stored records.
+#[tokio::test]
+async fn group_scoped_account_records_answer_only_for_live_groups() {
+    use cgka_session::{SessionError, SessionResult};
+    use cgka_traits::GroupCapabilities;
+    use cgka_traits::group::Group;
+    use cgka_traits::storage::{GroupStorage, MaintenanceStorage};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Liveness {
+        Live,
+        Unhydrated,
+        Quarantined,
+    }
+
+    fn expect<T: std::fmt::Debug + PartialEq>(
+        accessor: &str,
+        group_id: &GroupId,
+        liveness: Liveness,
+        result: SessionResult<T>,
+        stored: T,
+    ) {
+        match (liveness, result) {
+            (Liveness::Live, Ok(value)) => assert_eq!(value, stored, "{accessor} on a live group"),
+            (
+                Liveness::Unhydrated,
+                Err(SessionError::Engine(EngineError::GroupNotHydrated(id))),
+            )
+            | (Liveness::Quarantined, Err(SessionError::Engine(EngineError::UnknownGroup(id)))) => {
+                assert_eq!(&id, group_id, "{accessor} names the gated group");
+            }
+            (liveness, result) => panic!("{accessor} on a {liveness:?} group gave {result:?}"),
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account-records.sqlite");
+    let key = SqlCipherKey::new("account records liveness key").unwrap();
+    let mut session = AccountDeviceSession::open(config(&path, &key, b"alice")).unwrap();
+    let live = create_confirmed_group(&mut session, "live").await;
+    let unhydrated = create_confirmed_group(&mut session, "unhydrated").await;
+    drop(session);
+
+    // A Marmot group record with no OpenMLS state quarantines on hydration.
+    let quarantined = GroupId::new(b"account-records-without-openmls-state".to_vec());
+    let groups = [
+        (live.clone(), Liveness::Live),
+        (unhydrated.clone(), Liveness::Unhydrated),
+        (quarantined.clone(), Liveness::Quarantined),
+    ];
+    {
+        let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        storage
+            .put_group(&Group {
+                id: quarantined.clone(),
+                name: "quarantined".into(),
+                description: String::new(),
+                members: Vec::new(),
+                epoch: EpochId(3),
+                required_capabilities: GroupCapabilities::default(),
+                protocol_profile: ProtocolProfile::Legacy,
+                removed: false,
+                unrecoverable: false,
+                disbanded: None,
+                join_epoch: EpochId(0),
+                local_copy_install_epoch: EpochId(0),
+                local_copy_welcome_created_at: None,
+            })
+            .unwrap();
+        for (group_id, _) in &groups {
+            let (state, obligation, evolution) = group_account_records(group_id);
+            storage.put_group_maintenance(&state).unwrap();
+            storage.put_maintenance_obligation(&obligation).unwrap();
+            storage.put_group_evolution(&evolution).unwrap();
+        }
+    }
+
+    let mut session =
+        AccountDeviceSession::open(config(&path, &key, b"alice").defer_group_hydration()).unwrap();
+    session.ensure_group_hydrated(&live).unwrap();
+    session.ensure_group_hydrated(&quarantined).unwrap();
+    assert_eq!(session.unhydrated_group_ids(), vec![unhydrated.clone()]);
+    assert_eq!(
+        session
+            .quarantined_groups()
+            .into_iter()
+            .map(|(group_id, _)| group_id)
+            .collect::<Vec<_>>(),
+        vec![quarantined.clone()]
+    );
+    assert!(session.live_group_ids().unwrap().contains(&live));
+
+    let observer = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    for (group_id, liveness) in &groups {
+        let (state, obligation, evolution) = group_account_records(group_id);
+        expect(
+            "group_maintenance",
+            group_id,
+            *liveness,
+            session.group_maintenance(group_id),
+            Some(state.clone()),
+        );
+        expect(
+            "maintenance_obligations_for_group",
+            group_id,
+            *liveness,
+            session.maintenance_obligations_for_group(group_id),
+            vec![obligation],
+        );
+        expect(
+            "group_evolutions_for_group",
+            group_id,
+            *liveness,
+            session.group_evolutions_for_group(group_id),
+            vec![evolution],
+        );
+
+        let rescheduled = cgka_traits::maintenance::GroupMaintenanceState {
+            next_periodic_rotation_at: Some(Timestamp(2_000)),
+            ..state.clone()
+        };
+        expect(
+            "put_group_maintenance",
+            group_id,
+            *liveness,
+            session.put_group_maintenance(&rescheduled),
+            (),
+        );
+        // A gated write must not reach storage.
+        let written = match liveness {
+            Liveness::Live => rescheduled,
+            Liveness::Unhydrated | Liveness::Quarantined => state,
+        };
+        assert_eq!(
+            observer.group_maintenance(group_id).unwrap(),
+            Some(written),
+            "put_group_maintenance on a {liveness:?} group"
+        );
+    }
+}
+
+/// Every account-record accessor, against a store the host closed, fails
+/// with the engine's storage failure of kind `Closed`, whichever layer met
+/// it (mdk#2602, rules 1 and 2).
+#[tokio::test]
+async fn account_records_report_a_closed_store_as_the_engine_storage_failure() {
+    use cgka_session::{SessionError, SessionResult};
+    use cgka_traits::maintenance::{
+        DurableTransportFanout, KeyPackageLifecycleState, MaintenancePhase,
+        PeriodicMaintenancePolicy,
+    };
+    use cgka_traits::storage::StorageError;
+    use cgka_traits::{TransportEndpoint, TransportPublishTarget};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("closed-records.sqlite");
+    let key = SqlCipherKey::new("closed account records key").unwrap();
+    let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+    let keys = deterministic_nostr_keys(b"alice");
+    let config = SessionConfig::with_storage(
+        storage.clone(),
+        std::time::Duration::ZERO,
+        keys.public_key().to_bytes().to_vec(),
+        Box::new(MockPeeler),
+    )
+    .legacy_compatibility_profile()
+    .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
+    .feature_registry(FeatureRegistry::new());
+    let mut session = AccountDeviceSession::open(config).unwrap();
+    // A live group, so the group-scoped accessors pass the liveness check
+    // and reach storage.
+    let group_id = create_confirmed_group(&mut session, "closed").await;
+    let (state, obligation, evolution) = group_account_records(&group_id);
+    let lifecycle = KeyPackageLifecycleState {
+        stable_slot_id: "closed-slot".into(),
+        phase: MaintenancePhase::Complete,
+        current_key_package: None,
+        current_key_package_ref: None,
+        current_not_before: None,
+        current_not_after: None,
+        authored_event_id: None,
+        authored_event_created_at: None,
+        authored_signed_event: None,
+        publication_targets: Vec::new(),
+        refresh_at: None,
+        upgrade_rotation_recorded: false,
+        generation_revision: 0,
+        last_consumed_key_package_ref: None,
+        last_consumed_at: None,
+        retained_private_material: Vec::new(),
+        pending_replacement: None,
+    };
+    let fanout_id = record_id("fanout", &group_id);
+    let fanout = DurableTransportFanout {
+        id: fanout_id.clone(),
+        group_id: Some(group_id.clone()),
+        evolution_id: None,
+        exact_message: TransportMessage {
+            id: fanout_id.clone(),
+            payload: vec![1],
+            timestamp: Timestamp(10),
+            causal_deps: vec![],
+            source: TransportSource("session-test".into()),
+            envelope: TransportEnvelope::GroupMessage {
+                transport_group_id: vec![],
+            },
+        },
+        target: TransportPublishTarget::Group {
+            group_id: group_id.clone(),
+            transport_group_id: vec![],
+            endpoints: vec![TransportEndpoint("wss://relay.example".into())],
+        },
+        targets: Vec::new(),
+        required_acks: 1,
+        evolution_confirmed: false,
+        possible_exposure: false,
+        created_at: Timestamp(10),
+        bounded_until: None,
+    };
+
+    storage.closer().close().unwrap();
+
+    let rows: Vec<(&str, SessionResult<()>)> = vec![
+        (
+            "key_package_lifecycle",
+            session.key_package_lifecycle().map(drop),
+        ),
+        (
+            "put_key_package_lifecycle",
+            session.put_key_package_lifecycle(&lifecycle),
+        ),
+        (
+            "group_maintenance",
+            session.group_maintenance(&group_id).map(drop),
+        ),
+        (
+            "put_group_maintenance",
+            session.put_group_maintenance(&state),
+        ),
+        (
+            "put_maintenance_obligation",
+            session.put_maintenance_obligation(&obligation),
+        ),
+        (
+            "maintenance_obligation",
+            session.maintenance_obligation(&obligation.id).map(drop),
+        ),
+        (
+            "maintenance_obligations",
+            session.maintenance_obligations().map(drop),
+        ),
+        (
+            "maintenance_obligations_for_group",
+            session
+                .maintenance_obligations_for_group(&group_id)
+                .map(drop),
+        ),
+        (
+            "delete_maintenance_obligation",
+            session.delete_maintenance_obligation(&obligation.id),
+        ),
+        ("group_evolutions", session.group_evolutions().map(drop)),
+        (
+            "group_evolutions_for_group",
+            session.group_evolutions_for_group(&group_id).map(drop),
+        ),
+        (
+            "put_group_evolution",
+            session.put_group_evolution(&evolution),
+        ),
+        (
+            "put_transport_fanout",
+            session.put_transport_fanout(&fanout),
+        ),
+        (
+            "transport_fanout",
+            session.transport_fanout(&fanout_id).map(drop),
+        ),
+        ("transport_fanouts", session.transport_fanouts().map(drop)),
+        (
+            "delete_transport_fanout",
+            session.delete_transport_fanout(&fanout_id),
+        ),
+        (
+            "periodic_maintenance_policy",
+            session.periodic_maintenance_policy().map(drop),
+        ),
+        (
+            "put_periodic_maintenance_policy",
+            session.put_periodic_maintenance_policy(PeriodicMaintenancePolicy::Disabled),
+        ),
+    ];
+    assert_eq!(rows.len(), 18, "one row per account-record accessor");
+    let mismatched: Vec<_> = rows
+        .iter()
+        .filter(|(_, result)| {
+            !matches!(
+                result,
+                Err(SessionError::Engine(EngineError::Storage(
+                    StorageError::Closed(_)
+                )))
+            )
+        })
+        .collect();
+    assert!(
+        mismatched.is_empty(),
+        "accessors that did not report the engine's closed-storage failure: {mismatched:?}"
+    );
+}

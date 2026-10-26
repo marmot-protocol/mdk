@@ -1,20 +1,22 @@
-//! Public persistence helpers for account-device maintenance orchestration.
+//! Maintenance operations that need OpenMLS state.
 //!
-//! Scheduling and transport policy live above the engine; these methods keep
-//! their records in the same encrypted database as MLS state.
+//! Scheduling and transport policy live above the engine, and so do the
+//! account records it runs on: the session reads and writes them on its own
+//! storage handle (mdk#2602). What stays here touches OpenMLS state too:
+//! KeyPackage staging and promotion write OpenMLS material and the lifecycle
+//! record in one transaction, and the own-leaf hash reads the MLS group.
 
 use crate::engine::Engine;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::error::EngineError;
 use cgka_traits::maintenance::{
-    DurableGroupEvolution, DurableTransportFanout, GroupMaintenanceState, KeyPackageLifecycleState,
-    MaintenanceObligation, MaintenancePhase, PendingKeyPackageReplacement,
-    PeriodicMaintenancePolicy, RetainedKeyPackagePrivateMaterial, TransportFanoutTarget,
+    KeyPackageLifecycleState, MaintenancePhase, PendingKeyPackageReplacement,
+    RetainedKeyPackagePrivateMaterial, TransportFanoutTarget,
 };
 use cgka_traits::storage::StorageProvider;
 use cgka_traits::transport::Timestamp;
-use cgka_traits::types::{GroupId, MessageId};
+use cgka_traits::types::GroupId;
 use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
 use openmls_traits::OpenMlsProvider as _;
 use sha2::{Digest, Sha256};
@@ -27,19 +29,6 @@ impl<S: StorageProvider> Engine<S> {
         self.storage
             .maintenance_storage()
             .ok_or_else(|| EngineError::Backend("maintenance storage is unavailable".into()))
-    }
-
-    pub fn key_package_lifecycle(&self) -> Result<Option<KeyPackageLifecycleState>, EngineError> {
-        Ok(self.maintenance_storage()?.key_package_lifecycle()?)
-    }
-
-    pub fn put_key_package_lifecycle(
-        &self,
-        state: &KeyPackageLifecycleState,
-    ) -> Result<(), EngineError> {
-        Ok(self
-            .maintenance_storage()?
-            .put_key_package_lifecycle(state)?)
     }
 
     /// Atomically generate a private KeyPackage bundle and persist the
@@ -137,73 +126,6 @@ impl<S: StorageProvider> Engine<S> {
         })
     }
 
-    pub fn group_maintenance(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Option<GroupMaintenanceState>, EngineError> {
-        self.ensure_group_live(group_id)?;
-        Ok(self.maintenance_storage()?.group_maintenance(group_id)?)
-    }
-
-    pub fn put_group_maintenance(&self, state: &GroupMaintenanceState) -> Result<(), EngineError> {
-        self.ensure_group_live(&state.group_id)?;
-        Ok(self.maintenance_storage()?.put_group_maintenance(state)?)
-    }
-
-    pub fn put_maintenance_obligation(
-        &self,
-        record: &MaintenanceObligation,
-    ) -> Result<(), EngineError> {
-        Ok(self
-            .maintenance_storage()?
-            .put_maintenance_obligation(record)?)
-    }
-
-    pub fn maintenance_obligation(
-        &self,
-        id: &MessageId,
-    ) -> Result<Option<MaintenanceObligation>, EngineError> {
-        Ok(self.maintenance_storage()?.maintenance_obligation(id)?)
-    }
-
-    pub fn list_maintenance_obligations(&self) -> Result<Vec<MaintenanceObligation>, EngineError> {
-        Ok(self.maintenance_storage()?.list_maintenance_obligations()?)
-    }
-
-    pub fn list_maintenance_obligations_for_group(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Vec<MaintenanceObligation>, EngineError> {
-        self.ensure_group_live(group_id)?;
-        Ok(self
-            .maintenance_storage()?
-            .list_maintenance_obligations_for_group(group_id)?)
-    }
-
-    pub fn delete_maintenance_obligation(&self, id: &MessageId) -> Result<(), EngineError> {
-        Ok(self
-            .maintenance_storage()?
-            .delete_maintenance_obligation(id)?)
-    }
-
-    pub fn list_group_evolutions(&self) -> Result<Vec<DurableGroupEvolution>, EngineError> {
-        Ok(self.maintenance_storage()?.list_group_evolutions()?)
-    }
-
-    pub fn list_group_evolutions_for_group(
-        &self,
-        group_id: &GroupId,
-    ) -> Result<Vec<DurableGroupEvolution>, EngineError> {
-        self.ensure_group_live(group_id)?;
-        Ok(self
-            .maintenance_storage()?
-            .list_group_evolutions_for_group(group_id)?)
-    }
-
-    pub fn put_group_evolution(&self, record: &DurableGroupEvolution) -> Result<(), EngineError> {
-        Ok(self.maintenance_storage()?.put_group_evolution(record)?)
-    }
-
     pub fn own_leaf_hash(&self, group_id: &GroupId) -> Result<Vec<u8>, EngineError> {
         self.ensure_group_live(group_id)?;
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
@@ -217,37 +139,5 @@ impl<S: StorageProvider> Engine<S> {
             .tls_serialize_detached()
             .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
         Ok(Sha256::digest(leaf).to_vec())
-    }
-
-    pub fn put_transport_fanout(&self, record: &DurableTransportFanout) -> Result<(), EngineError> {
-        Ok(self.maintenance_storage()?.put_transport_fanout(record)?)
-    }
-
-    pub fn transport_fanout(
-        &self,
-        id: &MessageId,
-    ) -> Result<Option<DurableTransportFanout>, EngineError> {
-        Ok(self.maintenance_storage()?.transport_fanout(id)?)
-    }
-
-    pub fn list_transport_fanouts(&self) -> Result<Vec<DurableTransportFanout>, EngineError> {
-        Ok(self.maintenance_storage()?.list_transport_fanouts()?)
-    }
-
-    pub fn delete_transport_fanout(&self, id: &MessageId) -> Result<(), EngineError> {
-        Ok(self.maintenance_storage()?.delete_transport_fanout(id)?)
-    }
-
-    pub fn periodic_maintenance_policy(&self) -> Result<PeriodicMaintenancePolicy, EngineError> {
-        Ok(self.maintenance_storage()?.periodic_maintenance_policy()?)
-    }
-
-    pub fn put_periodic_maintenance_policy(
-        &self,
-        policy: PeriodicMaintenancePolicy,
-    ) -> Result<(), EngineError> {
-        Ok(self
-            .maintenance_storage()?
-            .put_periodic_maintenance_policy(policy)?)
     }
 }

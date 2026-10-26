@@ -1890,7 +1890,7 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
         .as_mut()
         .unwrap()
         .generation_revision = 0;
-    engine.put_key_package_lifecycle(&state).unwrap();
+    handle.put_key_package_lifecycle(&state).unwrap();
     let old_state = state.clone();
     let old_bundles = handle.stored_key_package_bundles().unwrap();
     lifecycle_fault.arm(1);
