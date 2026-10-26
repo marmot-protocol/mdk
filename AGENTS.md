@@ -19,8 +19,8 @@ before adding behavior or bindings.
 | Task | Start here |
 | --- | --- |
 | Engine behavior | `crates/cgka-engine/AGENTS.md` (`src/`, `tests/` have their own) |
-| Account-device session lifecycle | `crates/cgka-session/AGENTS.md` (`tests/` has its own) |
-| Account orchestration / app-core shell | `crates/marmot-account/AGENTS.md` |
+| Account-device runtime and session lifecycle | `crates/marmot-session/AGENTS.md` (`tests/` has its own) |
+| Account homes, signing keys, secret storage | `crates/marmot-account/AGENTS.md` |
 | App runtime bridge | `crates/marmot-app/AGENTS.md` |
 | App message Markdown display parsing | `crates/marmot-markdown/AGENTS.md` |
 | Storage traits and shared types | `crates/traits/AGENTS.md` |

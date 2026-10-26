@@ -95,14 +95,14 @@ and reasoned about on its own:
  apps (MarmotKit / C)    wn CLI · wnd · TUI    wn-agent ──► agent runtimes
             └────────────────┬─────┴──────────────┘
                      marmot-app        multi-account runtime, projections
-                     marmot-account    account homes, keys, transport orchestration
-                     cgka-session      one encrypted account-device lifecycle
+                     marmot-session    account-device runtime over one encrypted session
                      cgka-engine       OpenMLS group state machine + commit convergence
                      storage-sqlite    SQLCipher persistence (one DB per account-device)
 
  transport-nostr                     the relay plane: shared relay sessions, delivery, directory fetches
  transport-nostr-peeler / -adapter   Nostr events ⇄ engine messages, relay I/O
  transport-quic-stream / -broker     transient live previews for agent replies
+ marmot-account                      account homes, signing keys, secret storage
 ```
 
 - The engine is generic over a storage trait and knows nothing about Nostr; transport code lives in the peeler and
@@ -135,7 +135,6 @@ still land on the same epoch and group state. The engine — not relay order or 
 | --- | --- | --- |
 | Engine | [`cgka-engine`](crates/cgka-engine/README.md) | OpenMLS-backed group state machine and commit convergence |
 | | [`traits`](crates/traits/README.md) (`cgka-traits`) | Shared traits and cross-boundary types |
-| | [`cgka-session`](crates/cgka-session/README.md) | Encrypted account-device session over the engine |
 | Storage | [`storage-sqlite`](crates/storage-sqlite/README.md) | SQLCipher persistence for engine, session, and simulator |
 | | [`fs-private`](crates/fs-private/README.md) | Owner-only file, directory, and socket creation |
 | | [`media-store`](crates/media-store/README.md) | Encrypted per-file media store: file format and file lifecycle |
@@ -144,7 +143,8 @@ still land on the same epoch and group state. The engine — not relay order or 
 | | [`transport-nostr`](crates/transport-nostr/README.md) | The relay plane: per-account relay sessions, delivery and directory fetches |
 | | [`transport-quic-stream`](crates/transport-quic-stream/README.md) | QUIC transport for live agent text previews |
 | | [`transport-quic-broker`](crates/transport-quic-broker/README.md) | Memory-only preview broker (`marmot-quic-broker`); [deployment](docs/quic-broker-deployment.md) |
-| App | [`marmot-account`](crates/marmot-account/README.md) | Account homes, key storage, transport orchestration |
+| App | [`marmot-session`](crates/marmot-session/README.md) | Account-device runtime over an encrypted engine session: publish, routing, KeyPackages |
+| | [`marmot-account`](crates/marmot-account/README.md) | Account homes, signing keys, secret storage |
 | | [`marmot-app`](crates/marmot-app/README.md) | Multi-account app runtime used by every front end |
 | | [`nostr-directory`](crates/nostr-directory/README.md) | Directory of other people's public Nostr data: lookups, search, KeyPackage resolution |
 | | [`marmot-markdown`](crates/marmot-markdown/README.md) | CommonMark + Nostr display parser for messages |

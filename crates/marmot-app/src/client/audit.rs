@@ -298,7 +298,7 @@ impl AppClient {
         &self,
         group_id: &GroupId,
         context: &AuditEventContext,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) {
         self.record_human_action(
             group_id,
@@ -824,7 +824,7 @@ pub(super) fn refusal_category(
     }
 }
 
-fn audit_message_ids_from_effects(effects: &marmot_account::AccountDeviceEffects) -> Vec<String> {
+fn audit_message_ids_from_effects(effects: &marmot_session::AccountDeviceEffects) -> Vec<String> {
     effects
         .reports
         .iter()

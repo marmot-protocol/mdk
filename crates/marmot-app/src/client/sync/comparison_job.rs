@@ -5613,7 +5613,7 @@ mod tests {
                     &app,
                 );
             connection.execute_batch("CREATE TRIGGER fail_repaired_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected activity'); END;").unwrap();
-            let effects = marmot_account::AccountDeviceEffects {
+            let effects = marmot_session::AccountDeviceEffects {
                 events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
                     group_id: fixture.group_id.clone(),
                     epoch: cgka_traits::EpochId(1),

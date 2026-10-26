@@ -747,7 +747,7 @@ impl StagedSyncError {
 /// Durable membership and push state are independently reconciled on reopen.
 #[derive(Clone)]
 pub(crate) struct PendingAppliedEffects {
-    effects: marmot_account::AccountDeviceEffects,
+    effects: marmot_session::AccountDeviceEffects,
     received_at: u64,
     source_message_id_hex: String,
     source_delivery_id: Option<cgka_traits::MessageId>,
@@ -966,7 +966,7 @@ impl AppClient {
     /// account worker can arm their group timers.
     pub(crate) fn remember_pending_convergence_groups(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) {
         self.pending_convergence_groups
             .extend(effects.pending_convergence.iter().cloned());
@@ -995,7 +995,7 @@ impl AppClient {
     /// later evidence contradicts.
     pub(crate) fn observe_recovery_evidence(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) {
         if self.app.cursor_persistence() != CursorPersistence::Advance {
             return;
@@ -1111,7 +1111,7 @@ impl AppClient {
     /// automatically after temporary transport loss.
     pub(crate) async fn observe_recovery_evidence_then_fail_if_publish_failed(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         // Foreground send preflight can settle unrelated retained commits.
         // Their membership decisions are already canonical even if the
@@ -1132,7 +1132,7 @@ impl AppClient {
     /// and reuse route refresh and subscriber buffering from the full observer.
     pub(crate) async fn observe_native_membership_effects(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         let queued = self.pending_applied_effects.len();
         self.retain_effect_projection(effects, "", unix_now_seconds(), false);
@@ -1160,7 +1160,7 @@ impl AppClient {
     /// failures retain a retry edge without changing the command's publish result.
     async fn observe_native_membership_effects_best_effort(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) {
         if let Err(error) = self.observe_native_membership_effects(effects).await {
             self.pending_runtime_group_subscription_refresh = true;
@@ -1177,7 +1177,7 @@ impl AppClient {
     /// withdrawal events. Project the full batch before returning that failure.
     async fn observe_failed_publish_effects_best_effort(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) {
         let result = self
             .observe_send_applied_effects(effects)
@@ -2100,7 +2100,7 @@ impl AppClient {
     /// so the projection is exercisable against a given batch of effects.
     pub(crate) async fn observe_drained_session_events(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
         self.retain_effect_projection(effects, "", unix_now_seconds(), true);
         let mut summary = self.take_pending_applied_sync_summary();
@@ -2124,7 +2124,7 @@ impl AppClient {
     /// publication bookkeeping. Keep its successful prefix available on failure.
     fn project_drained_effects(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
         source_received_at: u64,
         summary: &mut SyncSummary,
         progress: &mut EffectProjectionProgress,
@@ -2358,7 +2358,7 @@ impl AppClient {
     /// `pending_applied_sync_summary`. The caller persists state afterwards.
     pub(crate) async fn observe_send_applied_effects(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         self.retain_applied_effects(effects);
         self.flush_send_applied_effects().await
@@ -2377,14 +2377,14 @@ impl AppClient {
     /// Retain drained native events until every app storage projection succeeds.
     pub(crate) fn retain_applied_effects(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) {
         self.retain_effect_projection(effects, "", unix_now_seconds(), false);
     }
 
     fn retain_effect_projection(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
         source_message_id_hex: &str,
         received_at: u64,
         drained: bool,
@@ -2398,7 +2398,7 @@ impl AppClient {
 
     fn enqueue_effect_projection(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
         source_message_id_hex: &str,
         received_at: u64,
         drained: bool,
@@ -2433,7 +2433,7 @@ impl AppClient {
         received_at: u64,
         cursor: usize,
     ) {
-        let effects = marmot_account::AccountDeviceEffects {
+        let effects = marmot_session::AccountDeviceEffects {
             events: events.to_vec(),
             ..Default::default()
         };
@@ -3920,8 +3920,8 @@ impl AppClient {
             .ingest_delivery_with_observer(delivery, |phase, duration, success| {
                 if let Some(telemetry) = &telemetry {
                     let operation = match phase {
-                        marmot_account::AccountIngestPhase::Engine => RuntimeOp::IngestEngine,
-                        marmot_account::AccountIngestPhase::EffectPublication => {
+                        marmot_session::AccountIngestPhase::Engine => RuntimeOp::IngestEngine,
+                        marmot_session::AccountIngestPhase::EffectPublication => {
                             RuntimeOp::IngestEffectPublish
                         }
                     };
@@ -5955,8 +5955,8 @@ impl AppClient {
         let buffered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let progress_updates = buffered.clone();
         let observe = std::sync::Arc::new(
-            move |view: cgka_session::GroupAuthorityView<'_>,
-                  published: &marmot_account::PublishedApplicationMessage| {
+            move |view: marmot_session::GroupAuthorityView<'_>,
+                  published: &marmot_session::PublishedApplicationMessage| {
                 // UPDATE-only finalization cannot create absent rows or clear an
                 // invalidation. Revival requires the live-group check in the final
                 // effects handler and intentionally waits for that handler.
@@ -6046,7 +6046,7 @@ impl AppClient {
     pub(crate) async fn finish_scheduled_convergence_effects(
         &mut self,
         group_id: &cgka_traits::GroupId,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
         let result = self
             .observe_scheduled_convergence_effects(group_id, effects)
@@ -6064,7 +6064,7 @@ impl AppClient {
     pub(crate) async fn observe_scheduled_convergence_effects(
         &mut self,
         group_id: &cgka_traits::GroupId,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         for published in &effects.published_app_messages {
             self.pending_resumed_message_notifications
@@ -6208,7 +6208,7 @@ impl AppClient {
     /// classified against this same authority, independent of batch order.
     fn local_group_deletion_frontiers_at_batch_start(
         &self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<HashMap<String, u64>, AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
         let mut frontiers = HashMap::new();
@@ -6727,7 +6727,7 @@ impl AppClient {
                     && !self
                         .runtime
                         .leave_in_progress(group_id)
-                        .map_err(cgka_session::SessionError::from)? =>
+                        .map_err(marmot_session::SessionError::from)? =>
             {
                 routes_dirty |= self.restore_canonical_self_membership(group_id)?;
             }
@@ -6777,7 +6777,7 @@ impl AppClient {
             || self
                 .runtime
                 .leave_in_progress(group_id)
-                .map_err(cgka_session::SessionError::from)?
+                .map_err(marmot_session::SessionError::from)?
         {
             return Ok(false);
         }
@@ -6889,7 +6889,7 @@ impl AppClient {
     #[cfg(test)]
     async fn observe_account_device_effects(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
         summary: &mut SyncSummary,
         source_message_id_hex: &str,
         source_received_at: u64,
@@ -6915,7 +6915,7 @@ impl AppClient {
 
     fn observe_account_device_effects_inner(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
         summary: &mut SyncSummary,
         source_message_id_hex: &str,
         source_received_at: u64,
@@ -7761,7 +7761,7 @@ mod runtime_group_subscription_refresh_tests {
         connection.execute_batch(&format!("CREATE TRIGGER fail_kept_removal BEFORE UPDATE OF self_membership ON account_groups
             WHEN NEW.group_id_hex = '{kept_hex}' AND NEW.self_membership = 'removed'
             BEGIN SELECT RAISE(FAIL, 'injected kept removal failure'); END;")).unwrap();
-        let mixed = marmot_account::AccountDeviceEffects {
+        let mixed = marmot_session::AccountDeviceEffects {
             events: [forgotten.clone(), kept.clone()]
                 .into_iter()
                 .map(|group_id| GroupEvent::LocalGroupCopyTerminated {
@@ -7778,14 +7778,14 @@ mod runtime_group_subscription_refresh_tests {
                 .await
                 .is_err()
         );
-        let forgotten_only = marmot_account::AccountDeviceEffects {
+        let forgotten_only = marmot_session::AccountDeviceEffects {
             events: vec![GroupEvent::LocalGroupCopyRestored {
                 group_id: forgotten.clone(),
             }],
             ..Default::default()
         };
         client.retain_effect_projection(&forgotten_only, "forgotten-source", 112, true);
-        let welcome = marmot_account::AccountDeviceEffects {
+        let welcome = marmot_session::AccountDeviceEffects {
             events: vec![GroupEvent::GroupJoined {
                 group_id: kept.clone(),
                 via_welcome: cgka_traits::MessageId::new(vec![0x75; 32]),
@@ -7943,9 +7943,9 @@ mod runtime_group_subscription_refresh_tests {
                         origin_commit_id: Some(cgka_traits::MessageId::new(vec![0x76; 32])),
                     }
                 };
-                let effects = marmot_account::AccountDeviceEffects {
+                let effects = marmot_session::AccountDeviceEffects {
                     events: vec![event.clone()],
-                    published_app_messages: vec![marmot_account::PublishedApplicationMessage {
+                    published_app_messages: vec![marmot_session::PublishedApplicationMessage {
                         group_id: group.clone(),
                         app_event_id: "published-before-tail".into(),
                         message_id: cgka_traits::MessageId::new(vec![0x77; 32]),
@@ -8059,7 +8059,7 @@ mod runtime_group_subscription_refresh_tests {
         connection.execute_batch(&format!("CREATE TRIGGER fail_second_termination BEFORE UPDATE OF self_membership ON account_groups
             WHEN NEW.group_id_hex = '{blocked_hex}' AND NEW.self_membership = 'removed'
             BEGIN SELECT RAISE(FAIL, 'injected second termination failure'); END;")).unwrap();
-        let effects = marmot_account::AccountDeviceEffects {
+        let effects = marmot_session::AccountDeviceEffects {
             events: vec![
                 GroupEvent::LocalGroupCopyTerminated {
                     group_id: group.clone(),
@@ -8076,7 +8076,7 @@ mod runtime_group_subscription_refresh_tests {
             .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
             .await
             .unwrap();
-        let rejoin = marmot_account::AccountDeviceEffects {
+        let rejoin = marmot_session::AccountDeviceEffects {
             events: vec![GroupEvent::GroupJoined {
                 group_id: group.clone(),
                 via_welcome: cgka_traits::MessageId::new(vec![0x77; 32]),
@@ -8244,7 +8244,7 @@ mod runtime_group_subscription_refresh_tests {
             let group_hex = hex::encode(group.as_slice());
             // Explicit projection fixture: force the post-canonical observer's
             // rebuild, independently of the requested command's publication.
-            let mut effects = marmot_account::AccountDeviceEffects {
+            let mut effects = marmot_session::AccountDeviceEffects {
                 events: vec![GroupEvent::LocalGroupCopyTerminated {
                     group_id: group.clone(),
                     voluntary: true,
@@ -8264,7 +8264,7 @@ mod runtime_group_subscription_refresh_tests {
                     },
                     origin_commit_id: Some(cgka_traits::MessageId::new(vec![0x73; 32])),
                 });
-                effects.failures.push(marmot_account::PublishFailure {
+                effects.failures.push(marmot_session::PublishFailure {
                     message_id: cgka_traits::MessageId::new(vec![0x74; 32]),
                     reason: "primary publication failure".into(),
                 });
@@ -8385,7 +8385,7 @@ mod runtime_group_subscription_refresh_tests {
             .await
             .unwrap();
 
-        let effects = marmot_account::AccountDeviceEffects {
+        let effects = marmot_session::AccountDeviceEffects {
             events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
                 group_id: created.group_id,
                 epoch: cgka_traits::EpochId(2),
@@ -8747,7 +8747,7 @@ mod tests {
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
         let group_id = client.create_group("batch projection", &[]).await.unwrap();
-        let mut effects = marmot_account::AccountDeviceEffects::default();
+        let mut effects = marmot_session::AccountDeviceEffects::default();
         let mut sources = HashMap::new();
         for index in 0..3 {
             let payload = crate::messages::encode_inner_event(

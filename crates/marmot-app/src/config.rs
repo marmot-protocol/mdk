@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use marmot_account::MaintenanceTiming;
+use marmot_session::MaintenanceTiming;
 
 use crate::deployment::{MarmotDeployment, OpenRankingProvider};
 use serde::{Deserialize, Serialize};

@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use cgka_session::{CanonicalizationPolicy, FeatureRegistry, SessionConfig, key_package_metadata};
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_QUIC_FANOUT_CAPABILITY, AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE,
     AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
@@ -47,10 +46,11 @@ use cgka_traits::{
     GroupId, MemberId, MessageId, TransportEndpoint, TransportGroupSubscription,
     TransportPublishTarget,
 };
-use marmot_account::{
-    AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSetupKind, AccountSummary,
-    KeyPackagePublication, KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
-    TransportRoutingError, TransportRoutingPolicy,
+use marmot_account::{AccountHome, AccountHomeError, AccountSetupKind, AccountSummary};
+use marmot_session::{
+    AccountDeviceRuntime, CanonicalizationPolicy, FeatureRegistry, KeyPackagePublication,
+    KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher, SessionConfig,
+    TransportRoutingError, TransportRoutingPolicy, key_package_metadata,
 };
 use nostr_sdk::prelude::{
     EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag, Timestamp as NostrTimestamp,
@@ -142,14 +142,16 @@ pub use startup_diagnostics::{
 #[cfg(feature = "test-policy-overrides")]
 mod test_support;
 
-pub use cgka_session::{AccountIdentityProofRequest, AccountIdentityProofSigner, SessionError};
 pub use cgka_traits::engine::{
     SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
 };
 use external_signer::{AccountSigner, RegisteredExternalSigner};
 pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
 pub(crate) use groups::AppGroupImageInput;
-pub use marmot_account::{AccountError, MaintenanceTiming};
+pub use marmot_session::{
+    AccountError, AccountIdentityProofRequest, AccountIdentityProofSigner, MaintenanceTiming,
+    SessionError,
+};
 pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLease};
 use runtime::account_worker::{AccountStartupProgress, AccountStartupStage};
 pub(crate) use runtime::blocking_app_task;
@@ -2183,7 +2185,7 @@ impl MarmotApp {
                 if client.runtime.key_package_generation_upgrade_due()? {
                     client.runtime.publish_fresh_key_package().await?;
                 }
-                Ok::<_, marmot_account::AccountError>(())
+                Ok::<_, marmot_session::AccountError>(())
             }
             .await;
             if let Err(error) = result {
@@ -5384,11 +5386,11 @@ impl MarmotApp {
     > {
         let storage = self.account_storage(label)?;
         cgka_traits::StorageProvider::with_read_snapshot(&storage, |storage| {
-            let owned = cgka_session::durably_owned_key_packages(
+            let owned = marmot_session::durably_owned_key_packages(
                 storage,
                 cgka_traits::group::ProtocolProfile::Current,
             )
-            .map_err(cgka_session::SessionError::from)?;
+            .map_err(marmot_session::SessionError::from)?;
             #[cfg(test)]
             self.run_inventory_snapshot_between_reads_for_test();
             let lifecycle = storage.key_package_lifecycle()?;
@@ -7392,7 +7394,7 @@ impl MarmotApp {
             &self.account_storage(label)?,
             cgka_traits::group::ProtocolProfile::Current,
         )
-        .map_err(|error| AppError::from(cgka_session::SessionError::from(error)))
+        .map_err(|error| AppError::from(marmot_session::SessionError::from(error)))
     }
 
     #[cfg(test)]
@@ -7705,7 +7707,7 @@ impl MarmotApp {
 
     fn key_package_metadata_matches_current_support(
         &self,
-        metadata: &cgka_session::KeyPackageMetadata,
+        metadata: &marmot_session::KeyPackageMetadata,
     ) -> bool {
         metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
             && self

@@ -169,7 +169,7 @@ impl Lister<'_> {
     fn max_inner_len(&self) -> usize {
         let fits = |inner_len| {
             transport_nostr_peeler::group_event_json_len_bound(
-                cgka_session::application_message_len(self.group_id_len, inner_len),
+                marmot_session::application_message_len(self.group_id_len, inner_len),
             ) <= PUSH_GOSSIP_EVENT_MAX_BYTES
         };
         // Both lengths grow with the inner length, and base64 makes the
@@ -190,7 +190,7 @@ fn escaped_len(text: &str) -> Result<usize, AppError> {
 
 #[cfg(test)]
 pub(crate) fn published_len_bound(group_id_len: usize, inner_len: usize) -> usize {
-    transport_nostr_peeler::group_event_json_len_bound(cgka_session::application_message_len(
+    transport_nostr_peeler::group_event_json_len_bound(marmot_session::application_message_len(
         group_id_len,
         inner_len,
     ))

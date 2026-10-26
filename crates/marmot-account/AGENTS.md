@@ -1,24 +1,21 @@
 # AGENTS.md - crates/marmot-account
 
-Agent-facing map for the Marmot account orchestration crate.
+Agent-facing map for the Marmot account identity crate.
 
 ## Scope
 
-Owns the account/session orchestration layer: account home layout, local account records and signing-key storage,
-`AccountDeviceSession` activation over a pluggable `TransportAdapter`, transport routing policy, KeyPackage publication,
-and publish confirmation/rollback. For the human overview see [`README.md`](README.md).
+Owns account identity, files and secrets: account home layout, local account records, setup journals, signing-key
+storage and NIP-49 export. For the human overview see [`README.md`](README.md).
 
-It must not own MLS internals, transport event parsing, SQLCipher key derivation, UI projection, notifications, real
-relay auth, or transport-specific relay discovery.
+It must not own MLS state, sessions, transport, publish work, or anything else that needs a protocol crate; the
+account-device runtime is `marmot-session`'s. It must not own UI projection, notifications, or relay-list discovery.
 
 ## Layout
 
 `src/lib.rs` is a thin facade: crate docs, `mod` declarations, and `pub use` re-exports. Every public item keeps its
 `marmot_account::Item` path. Source is split into focused modules:
 
-- `error.rs` — `AccountError`/`AccountHomeError` enums and the `AccountResult`/`AccountHomeResult` aliases.
-  `AccountError::as_engine_error` finds the engine error whether the runtime met it directly or through the session;
-  ask it instead of matching `Engine(..)` or `Session(..)`.
+- `error.rs` — the `AccountHomeError` enum and the `AccountHomeResult` alias.
 - `home.rs` — `AccountHome` and `AccountSummary`; owns the account-record layout and signing-key lifecycle.
 - `nip49_export.rs` — NIP-49 `ncryptsec` export policy (fixed scrypt cost, non-empty passphrase, key-security byte);
   crypto is delegated to the upstream `nostr` crate. Do not hand-roll NIP-49 here.
@@ -26,60 +23,19 @@ relay auth, or transport-specific relay discovery.
 - `keyring.rs` — platform keyring entry construction, iOS service versioning and secret writes, store init (per-OS
   `#[cfg]` cascade), and keyring-error mapping.
 - `io.rs` — JSON read/write helpers, atomic private- and secret-file writes, and account-label validation.
-- `key_package.rs` — `KeyPackagePublisher` trait, `KeyPackagePublication`, and `NoopKeyPackagePublisher`.
-- `routing.rs` — `TransportRoutingPolicy` trait, `TransportRoutingError`, and `StaticTransportRouting`.
-- `runtime.rs` — `AccountDeviceRuntime` plus its effect aggregates (`AccountDeviceEffects`, `AccountIngestEffects`,
-  `PublishFailure`, `PendingResolution`), durable maintenance, and KeyPackage generator upgrades.
-- `time.rs` — injectable wall clock, monotonic clock, and maintenance randomness (`SystemWallClock`,
-  `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
-  for in-process windows and timeouts.
 
-Tests: `tests/home.rs` (account home), `tests/runtime.rs` plus `tests/runtime/` (frozen fanout, KeyPackage generator
-upgrade).
+Tests: `tests/home.rs` (account home).
 
 ## Rules
 
-- Keep the crate transport-generic. Nostr-specific publication belongs behind an injected boundary or in a
-  transport-specific crate.
-- Treat `StaticTransportRouting` as a test/simple harness implementation. A production Nostr routing policy should
-  derive account inbox routes, KeyPackage publication routes, and group routes from Nostr/account state and the
-  `marmot.transport.nostr.routing.v1` app component.
-- Treat `KeyPackagePublisher` as provisional. The likely production direction is to move KeyPackage publication into the
-  transport adapter family rather than keeping it as a separate app-core-owned publisher.
-- Keep `AccountDeviceSession` as the owner of engine state.
-- Keep `AccountDeviceRuntime` the only production way to the session (mdk#2602). Hosts open it with
-  `AccountDeviceRuntime::open`, which opens the session before it builds the host's transport. A session method a host
-  needs becomes a runtime forward with the session's exact signature: same return type, error type and generics.
-  Code a host hands the session to gets `group_authority_view()`, not the session. `session()`, `session_mut()` and
-  `new` exist only under the `test-support` feature, which this crate's tests and `marmot-app` enable as a
-  dev-dependency; never enable it in a normal dependency.
+- Depend on no protocol crate: no `cgka-*` crate, no `marmot-forensics`, no storage crate (mdk#2602). The bindings,
+  the CLI and the agent connector use this crate for identity alone.
 - Keep CLI account-selection ergonomics and relay-list repair out of this crate; those belong in `wn` and `marmot-app`.
 - Replace account-home files only through the `io.rs` writers, and never change a published file in place while a reader
   can still open it. Owner-only files that hold no key material (setup journal and context, onboarding checkpoints) use
   `write_private_json`/`write_private_bytes`. Only `write_secret_json` zeroes the inode it replaces, so read those files
   with `read_secret_json`, which rejects a read of an unlinked inode. Readiness polls read the setup journal while
   background setup rewrites it.
-- Confirm pending work only after the adapter reports enough acknowledgements.
-- Never let a durable maintenance record depend on an engine event alone. Engine events are in-memory, and this layer
-  consumes them *after* awaiting the batch's relay publishes, so the loss window is network-wide. `GroupStateInvalidated`
-  retires a `DurableGroupEvolution`, and `run_due_maintenance` re-derives that same retirement from the commit's stored
-  disposition (`ConvergenceDeferred`/`EpochInvalidated`) so a lost announcement cannot strand it. Both paths go through
-  `mark_evolution_superseded`; keep it the sole writer of `SupersededByConvergence`, and keep the derivation forward-only
-  — nothing here un-marks a supersession on re-adoption. A supersession never revives a `Failed` obligation: that phase
-  is a terminal verdict (`local_member_removed` is the live one), and re-arming it would send a `SelfUpdate` into a group
-  the device has left, once per tick, uncounted by `MaintenanceRunSummary.failures`. `Complete` is deliberately not
-  guarded — a withdrawn commit un-completing the obligation it satisfied is the PCS re-arm this layer owes. A pending
-  leave or disband is not a terminal verdict: `run_due_maintenance` leaves the group's obligation untouched while
-  either is in progress, since both can resolve with the device still a member.
-- The same two reconcilers also hand a withdrawn own commit's intent back to the engine
-  (`reissue_superseded_own_commit` on the event path, `reissue_superseded_own_commits_from_state` in
-  `run_due_maintenance`) and return the engine's `SupersededIntentReport`s in `AccountDeviceEffects::superseded_intents`.
-  Every seam that produces effects must carry them through (`extend`/`absorb`); `marmot-app` turns each report into one
-  `MarmotAppEvent::GroupChangeSuperseded`, so a report dropped here is a saved change the user is never told was lost
-  (mdk#1734).
-- Roll back pending work when publication fails before any external exposure is possible. Once publication intent is
-  durable and a relay may have accepted work, retain the journaled state and retry the exact or replaceable publication
-  instead.
 - Do not log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key material.
 
 ## Verification

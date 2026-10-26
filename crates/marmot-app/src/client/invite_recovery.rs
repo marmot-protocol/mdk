@@ -75,7 +75,7 @@ impl AppClient {
                     let metadata = self
                         .runtime
                         .key_package_metadata(package)
-                        .map_err(cgka_session::SessionError::from)?;
+                        .map_err(marmot_session::SessionError::from)?;
                     missing |= !group.members.iter().any(|member| {
                         hex::encode(member.id.as_slice()) == metadata.credential_identity_hex
                     });
@@ -136,7 +136,7 @@ impl AppClient {
             .list_welcomes()?
             .into_iter()
             .find(|candidate| &candidate.message_id == welcome_id && candidate.rejoin.is_some())
-            .ok_or(AppError::Session(cgka_session::SessionError::Engine(
+            .ok_or(AppError::Session(marmot_session::SessionError::Engine(
                 cgka_traits::EngineError::InvalidWelcome,
             )))?;
         self.runtime.decline_group_rejoin(welcome_id)?;
@@ -146,7 +146,7 @@ impl AppClient {
 
     pub(crate) fn observe_recovery_health(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         for event in &effects.events {
             let group = match event {
@@ -256,7 +256,7 @@ impl AppClient {
                 let metadata = self
                     .runtime
                     .key_package_metadata(package)
-                    .map_err(cgka_session::SessionError::from)?;
+                    .map_err(marmot_session::SessionError::from)?;
                 if !group.as_ref().is_some_and(|group| {
                     group.members.iter().any(|member| {
                         hex::encode(member.id.as_slice()) == metadata.credential_identity_hex
@@ -275,7 +275,7 @@ impl AppClient {
                     {
                         Ok(requirements) => requirements,
                         Err(error @ cgka_traits::EngineError::Storage(_)) => {
-                            return Err(cgka_session::SessionError::from(error).into());
+                            return Err(marmot_session::SessionError::from(error).into());
                         }
                         Err(_) => break,
                     };

@@ -948,7 +948,7 @@ fn engine_error_json(err: &EngineError) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use marmot_account::AccountError;
+    use marmot_app::AccountError;
 
     use super::*;
 

@@ -38,7 +38,6 @@ EXECUTABLE_MARKDOWN_PREFIXES = (
 
 C_WORKSPACE_CRATES = {
     "cgka-engine",
-    "cgka-session",
     "fs-private",
     "media-store",
     "marmot-account",
@@ -46,6 +45,7 @@ C_WORKSPACE_CRATES = {
     "marmot-c",
     "marmot-forensics",
     "marmot-markdown",
+    "marmot-session",
     "nostr-directory",
     "marmot-uniffi",
     "storage-sqlite",
@@ -60,7 +60,6 @@ C_WORKSPACE_CRATES = {
 CONFORMANCE_WORKSPACE_CRATES = {
     "cgka-conformance-simulator",
     "cgka-engine",
-    "cgka-session",
     "convergence-campaign-runner",
     "fs-private",
     "media-store",
@@ -68,6 +67,7 @@ CONFORMANCE_WORKSPACE_CRATES = {
     "marmot-app",
     "marmot-forensics",
     "marmot-markdown",
+    "marmot-session",
     "nostr-directory",
     "storage-sqlite",
     "traits",
@@ -80,11 +80,11 @@ CONFORMANCE_WORKSPACE_CRATES = {
 
 IOS_WORKSPACE_CRATES = {
     "cgka-engine",
-    "cgka-session",
     "fs-private",
     "media-store",
     "marmot-account",
     "marmot-forensics",
+    "marmot-session",
     "storage-sqlite",
     "traits",
 }

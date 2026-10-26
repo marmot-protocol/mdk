@@ -4752,7 +4752,7 @@ mod unresolved_commit_state_tests {
     ///
     /// - `marmot_app::AppClient::reconcile_branch_selection_withdrawals`, which
     ///   tombstones the app rows a parked commit synthesized, and
-    /// - `marmot_account::AccountDeviceRuntime::reconcile_superseded_maintenance_from_state`,
+    /// - `marmot_session::AccountDeviceRuntime::reconcile_superseded_maintenance_from_state`,
     ///   which retires the `DurableGroupEvolution` behind it and re-arms the
     ///   self-update obligation it owed.
     ///

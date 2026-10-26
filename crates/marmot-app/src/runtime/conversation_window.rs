@@ -12,8 +12,8 @@ use crate::conversation_presentation::{
 use crate::drafts::MessageDraftInvalidation;
 use crate::{AppClient, AppError, MarmotApp, MarmotAppEvent, SelectedMessageDraft};
 use crate::{AppPerformanceTelemetry, RuntimePerformanceOperation as RuntimeOp};
-use cgka_session::GroupAuthoritySnapshot;
 use cgka_traits::{GroupId, StorageError};
+use marmot_session::GroupAuthoritySnapshot;
 use std::{
     sync::{Arc, Mutex, Weak},
     time::Duration,
@@ -62,8 +62,8 @@ impl From<StorageError> for ConversationWindowError {
         AppError::from(error).into()
     }
 }
-impl From<cgka_session::SessionError> for ConversationWindowError {
-    fn from(error: cgka_session::SessionError) -> Self {
+impl From<marmot_session::SessionError> for ConversationWindowError {
+    fn from(error: marmot_session::SessionError) -> Self {
         AppError::from(error).into()
     }
 }
@@ -264,7 +264,7 @@ impl AppClient {
 /// closed windows across a network wait; each upgrade lasts one checkpoint.
 pub(crate) fn publish_conversation_captures_from_session(
     observers: &[Weak<SendCapture>],
-    view: cgka_session::GroupAuthorityView<'_>,
+    view: marmot_session::GroupAuthorityView<'_>,
     app: &MarmotApp,
     label: &str,
     group: &GroupId,
@@ -347,7 +347,7 @@ pub(super) fn capture_conversation(
 /// keyed read projection may be repaired locally outside that snapshot; cold
 /// engine authority never triggers hydration or uses cached permissions.
 fn capture_conversation_from_session(
-    view: cgka_session::GroupAuthorityView<'_>,
+    view: marmot_session::GroupAuthorityView<'_>,
     app: &MarmotApp,
     label: &str,
     group: &GroupId,

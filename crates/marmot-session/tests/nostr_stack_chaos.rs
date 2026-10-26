@@ -3,12 +3,11 @@ mod support;
 use std::path::Path;
 
 use cgka_engine::canonicalization::CanonicalizationPolicy;
-use cgka_session::IngestEffects;
-use cgka_session::PublishWork;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 use cgka_traits::engine::{CreateGroupRequest, GroupEvent, KeyPackage, SendIntent};
 use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, StaleReason};
 use cgka_traits::{EpochId, GroupId, MemberId, MessageId, TransportEndpoint, TransportMessage};
+use marmot_session::{IngestEffects, PublishWork};
 use serde::Serialize;
 use support::nostr_stack::{CreatedGroup, NostrStackHarness, StackClient};
 use transport_nostr_peeler::NostrTransportEvent;

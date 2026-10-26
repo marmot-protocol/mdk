@@ -7,7 +7,7 @@
 - The crate root re-exports `AccountError`, `SessionError`,
   `AccountIdentityProofRequest` and `AccountIdentityProofSigner`, so hosts
   reach the lower stack's error and signer types through `marmot_app`
-  (mdk#2602). The old paths still work.
+  (mdk#2602).
 - A device whose invite adds members now sends the group a push snapshot
   once the Commit merges (mdk#2611): kind 448 lists of every token record it
   holds, other members' included, and kind 449 lists of every tombstone that
@@ -20,6 +20,12 @@
 
 ### Changed
 
+- `cgka-session` is now `marmot-session`, which also takes the account-device
+  runtime from `marmot-account` (mdk#2602). `cgka_session::*` and the
+  runtime's `marmot_account::*` paths, such as `AccountDeviceRuntime`,
+  `AccountError` and `MaintenanceTiming`, move to `marmot_session::`;
+  `marmot-account` keeps account homes and secret storage. Types keep their
+  names, and the `marmot_app` re-exports are unchanged.
 - What an error reports depends on what it is, not on which lower-stack
   layers wrapped it (mdk#2602). Three answers change:
   - A storage failure that the account session reported itself is now the

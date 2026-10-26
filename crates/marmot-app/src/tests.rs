@@ -26,7 +26,6 @@ use super::*;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use cgka_session::AccountDeviceSession;
 use cgka_traits::app_event::{
     AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
     AGENT_OPERATION_TYPE_TAG, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
@@ -40,6 +39,7 @@ use cgka_traits::app_event::{
 use cgka_traits::storage::{DisbandCandidate, DisbandCandidateStorage};
 use cgka_traits::{GroupStorage as _, Timestamp};
 use marmot_account::AccountHomeError;
+use marmot_session::AccountDeviceSession;
 use nostr_directory::error::DirectoryError;
 use nostr_sdk::prelude::{
     EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp as NostrTimestamp,
@@ -2272,7 +2272,7 @@ fn recovery_warning_requires_qualified_local_observations_and_survives_local_com
                 .automatic_recovery_failed
         );
         let current = client.runtime.group_record(&group_id).unwrap().epoch;
-        let mut effects = marmot_account::AccountDeviceEffects::default();
+        let mut effects = marmot_session::AccountDeviceEffects::default();
         effects
             .events
             .push(cgka_traits::engine::GroupEvent::MessageReceived {
@@ -5931,8 +5931,8 @@ async fn failed_leave_push_compensation_body() {
     relay.release_publish();
     assert!(matches!(
         leave.await.unwrap(),
-        Err(AppError::Account(marmot_account::AccountError::Session(
-            cgka_session::SessionError::Engine(
+        Err(AppError::Account(marmot_session::AccountError::Session(
+            marmot_session::SessionError::Engine(
                 cgka_traits::EngineError::AdminCannotSelfRemove { .. }
             )
         )))
@@ -5969,8 +5969,8 @@ fn sole_admin_self_demote_surfaces_the_admin_policy_refusal() {
         // is, not as a payload-encoding fault.
         let err = client.self_demote_admin(&group_id).await.err().unwrap();
         match err {
-            AppError::Account(marmot_account::AccountError::Session(
-                cgka_session::SessionError::Engine(cgka_traits::EngineError::AdminDepletion {
+            AppError::Account(marmot_session::AccountError::Session(
+                marmot_session::SessionError::Engine(cgka_traits::EngineError::AdminDepletion {
                     ..
                 }),
             )) => {}
@@ -15905,7 +15905,7 @@ async fn a_drained_disband_sweeps_the_held_send_its_first_pass_never_reached() {
     )
     .unwrap();
 
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
             group_id: group_id.clone(),
             epoch: cgka_traits::EpochId(1),
@@ -16193,7 +16193,7 @@ async fn a_drained_member_departure_removes_that_members_group_push_tokens() {
     )
     .unwrap();
 
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved {
             group_id: group_id.clone(),
             epoch: cgka_traits::EpochId(1),
@@ -16247,7 +16247,7 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
         Some(SelfMembership::Member),
     );
 
-    let departure = marmot_account::AccountDeviceEffects {
+    let departure = marmot_session::AccountDeviceEffects {
         events: vec![
             cgka_traits::engine::GroupEvent::GroupStateChanged {
                 group_id: group_id.clone(),
@@ -16276,7 +16276,7 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
         "a drained self-eviction must record how the account left"
     );
 
-    let rejoin = marmot_account::AccountDeviceEffects {
+    let rejoin = marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::GroupJoined {
             group_id: group_id.clone(),
             via_welcome: MessageId::new(vec![0x7a; 32]),
@@ -16312,7 +16312,7 @@ async fn a_peer_member_added_leaves_stored_self_membership_alone() {
     let mut client = app.client("alice").await.unwrap();
     let group_id = client.create_group("peer added", &[]).await.unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
-    let state_change = |change| marmot_account::AccountDeviceEffects {
+    let state_change = |change| marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
             group_id: group_id.clone(),
             epoch: cgka_traits::EpochId(1),
@@ -16464,7 +16464,7 @@ async fn a_drained_disband_performs_the_terminal_push_sweep() {
             .is_err()
     );
     let departed = MemberId::new(hex::decode(&peer).unwrap());
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![
             cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved {
                 group_id: group_id.clone(),
@@ -16557,7 +16557,7 @@ async fn a_drained_invalidation_event_withdraws_the_timeline_record() {
     )
     .unwrap();
 
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::AppMessageInvalidated {
             group_id: group_id.clone(),
             message_id: source_message_id,
@@ -16631,7 +16631,7 @@ async fn replaying_a_drained_batch_the_seam_already_applied_is_a_no_op() {
     app.upsert_group_push_token("alice", &drained_seam_push_token(&group_id_hex, &peer, 1))
         .unwrap();
 
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![
             cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated {
                 group_id: group_id.clone(),
@@ -16713,7 +16713,7 @@ async fn a_drained_state_change_synthesizes_the_system_row_the_live_seam_does() 
     // One authenticated rename, twice: the row id is derived from the change
     // and its epoch, so the two seams take one epoch each rather than
     // converging on the same deterministic row.
-    let rename = |epoch: u64, name: &str| marmot_account::AccountDeviceEffects {
+    let rename = |epoch: u64, name: &str| marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
             group_id: group_id.clone(),
             epoch: cgka_traits::EpochId(epoch),
@@ -16959,8 +16959,8 @@ mod superseded_system_row_shapes {
 
     pub(super) fn batch(
         events: Vec<cgka_traits::engine::GroupEvent>,
-    ) -> marmot_account::AccountDeviceEffects {
-        marmot_account::AccountDeviceEffects {
+    ) -> marmot_session::AccountDeviceEffects {
+        marmot_session::AccountDeviceEffects {
             events,
             ..Default::default()
         }
@@ -18366,7 +18366,7 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
         .await
         .unwrap();
     assert!(fresh.failures.is_empty());
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
             authority: None,
             group_id: group_id.clone(),
@@ -18496,7 +18496,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             retention: None,
             encrypted_media_secret: None,
         };
-        let effects = marmot_account::AccountDeviceEffects {
+        let effects = marmot_session::AccountDeviceEffects {
             events: if fresh_first {
                 vec![fresh_event, historical_event]
             } else {
@@ -18875,7 +18875,7 @@ async fn a_resource_refusal_for_a_terminal_group_arms_no_recovery() {
     // copy, so this is the shape that actually reaches the arm site.
     make_group_terminal(&client, &group_id, true);
 
-    let mut effects = marmot_account::AccountDeviceEffects::default();
+    let mut effects = marmot_session::AccountDeviceEffects::default();
     effects.events.push(
         cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
             group_id: group_id.clone(),
@@ -18957,7 +18957,7 @@ async fn a_publish_failure_in_the_session_event_drain_still_arms_recovery() {
 
     // One drained batch that carries both a resource refusal for the live group
     // and a hard publish failure (its pending commit rolled back).
-    let mut effects = marmot_account::AccountDeviceEffects::default();
+    let mut effects = marmot_session::AccountDeviceEffects::default();
     effects.events.push(
         cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
             group_id: group_id.clone(),
@@ -18965,13 +18965,13 @@ async fn a_publish_failure_in_the_session_event_drain_still_arms_recovery() {
             resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
         },
     );
-    effects.failures.push(marmot_account::PublishFailure {
+    effects.failures.push(marmot_session::PublishFailure {
         message_id: cgka_traits::MessageId::new(vec![0xab; 32]),
         reason: "injected publish failure".to_owned(),
     });
     effects
         .pending
-        .push(marmot_account::PendingResolution::RolledBack {
+        .push(marmot_session::PendingResolution::RolledBack {
             pending: cgka_traits::engine_state::PendingStateRef::new(7),
         });
 
@@ -18997,9 +18997,9 @@ async fn a_publish_failure_in_the_session_event_drain_still_arms_recovery() {
 /// refusal the pass does not arm on becomes unrecoverable.
 fn a_refusal_riding_a_rolled_back_publish(
     group_id: &cgka_traits::GroupId,
-) -> marmot_account::AccountDeviceEffects {
+) -> marmot_session::AccountDeviceEffects {
     let message_id = cgka_traits::MessageId::new(vec![0xab; 32]);
-    let mut effects = marmot_account::AccountDeviceEffects::default();
+    let mut effects = marmot_session::AccountDeviceEffects::default();
     effects.events.push(
         cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
             group_id: group_id.clone(),
@@ -19007,13 +19007,13 @@ fn a_refusal_riding_a_rolled_back_publish(
             resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
         },
     );
-    effects.failures.push(marmot_account::PublishFailure {
+    effects.failures.push(marmot_session::PublishFailure {
         message_id,
         reason: "injected publish failure".to_owned(),
     });
     effects
         .pending
-        .push(marmot_account::PendingResolution::RolledBack {
+        .push(marmot_session::PendingResolution::RolledBack {
             pending: cgka_traits::engine_state::PendingStateRef::new(7),
         });
     effects
@@ -19261,8 +19261,8 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     let published_message_id = cgka_traits::MessageId::new(vec![0xcd; 32]);
     let failed_message_id = cgka_traits::MessageId::new(vec![0xee; 32]);
     let retention = AppMessageRetentionDecision::new(10, 0);
-    let effects = marmot_account::AccountDeviceEffects {
-        published_app_messages: vec![marmot_account::PublishedApplicationMessage {
+    let effects = marmot_session::AccountDeviceEffects {
+        published_app_messages: vec![marmot_session::PublishedApplicationMessage {
             authority: None,
             group_id: group_id.clone(),
             app_event_id: app_event_id.to_owned(),
@@ -19270,11 +19270,11 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
             source_epoch: cgka_traits::EpochId(1),
             retention,
         }],
-        failures: vec![marmot_account::PublishFailure {
+        failures: vec![marmot_session::PublishFailure {
             message_id: failed_message_id.clone(),
             reason: "unrelated sibling publish failed".to_owned(),
         }],
-        failed_app_messages: vec![marmot_account::FailedApplicationMessage {
+        failed_app_messages: vec![marmot_session::FailedApplicationMessage {
             group_id: group_id.clone(),
             app_event_id: failed_app_event_id.to_owned(),
             message_id: failed_message_id,
@@ -19677,9 +19677,9 @@ async fn a_publish_failure_during_a_convergence_retry_still_arms_recovery() {
 /// warning (mdk#428).
 fn a_refusal_riding_a_confirmed_but_partial_publish(
     group_id: &cgka_traits::GroupId,
-) -> marmot_account::AccountDeviceEffects {
+) -> marmot_session::AccountDeviceEffects {
     let message_id = cgka_traits::MessageId::new(vec![0xcd; 32]);
-    let mut effects = marmot_account::AccountDeviceEffects::default();
+    let mut effects = marmot_session::AccountDeviceEffects::default();
     effects.events.push(
         cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
             group_id: group_id.clone(),
@@ -19687,13 +19687,13 @@ fn a_refusal_riding_a_confirmed_but_partial_publish(
             resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
         },
     );
-    effects.failures.push(marmot_account::PublishFailure {
+    effects.failures.push(marmot_session::PublishFailure {
         message_id,
         reason: "insufficient publish acknowledgements".to_owned(),
     });
     effects
         .pending
-        .push(marmot_account::PendingResolution::Confirmed {
+        .push(marmot_session::PendingResolution::Confirmed {
             pending: cgka_traits::engine_state::PendingStateRef::new(7),
         });
     effects
@@ -19797,7 +19797,7 @@ async fn a_queued_send_is_not_failed_by_an_unrelated_failure_in_its_batch() {
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
     let group_id = client.create_group("queued send gate", &[]).await.unwrap();
-    let queued_for = |group_id: &cgka_traits::GroupId| cgka_session::QueuedIntentRef {
+    let queued_for = |group_id: &cgka_traits::GroupId| marmot_session::QueuedIntentRef {
         group_id: group_id.clone(),
         intent_id: cgka_traits::MessageId::new(vec![0x22; 32]),
     };
@@ -19816,7 +19816,7 @@ async fn a_queued_send_is_not_failed_by_an_unrelated_failure_in_its_batch() {
     failed.queued.push(queued_for(&group_id));
     failed
         .failed_app_messages
-        .push(marmot_account::FailedApplicationMessage {
+        .push(marmot_session::FailedApplicationMessage {
             group_id: group_id.clone(),
             app_event_id: "current-send".to_owned(),
             message_id: cgka_traits::MessageId::new(vec![0xab; 32]),
@@ -19880,8 +19880,8 @@ async fn a_relay_accepted_send_revives_its_local_publish_failure() {
         moderation_grant: false,
     };
     let published = |app_event_id: &str, group_id: &cgka_traits::GroupId| {
-        marmot_account::AccountDeviceEffects {
-            published_app_messages: vec![marmot_account::PublishedApplicationMessage {
+        marmot_session::AccountDeviceEffects {
+            published_app_messages: vec![marmot_session::PublishedApplicationMessage {
                 authority: None,
                 group_id: group_id.clone(),
                 app_event_id: app_event_id.to_owned(),
@@ -20007,11 +20007,11 @@ async fn the_arming_publish_gate_classifies_exactly_as_the_bare_publish_check() 
     let mut client = app.client("alice").await.unwrap();
     let group_id = client.create_group("gate parity", &[]).await.unwrap();
 
-    let clean = marmot_account::AccountDeviceEffects::default();
-    let mut failure_without_pending = marmot_account::AccountDeviceEffects::default();
+    let clean = marmot_session::AccountDeviceEffects::default();
+    let mut failure_without_pending = marmot_session::AccountDeviceEffects::default();
     failure_without_pending
         .failures
-        .push(marmot_account::PublishFailure {
+        .push(marmot_session::PublishFailure {
             message_id: cgka_traits::MessageId::new(vec![0xef; 32]),
             reason: "relay rejected".to_owned(),
         });
@@ -20045,8 +20045,8 @@ fn an_epoch_passage(
     group_id: &cgka_traits::GroupId,
     from: u64,
     to: u64,
-) -> marmot_account::AccountDeviceEffects {
-    let mut effects = marmot_account::AccountDeviceEffects::default();
+) -> marmot_session::AccountDeviceEffects {
+    let mut effects = marmot_session::AccountDeviceEffects::default();
     effects
         .events
         .push(cgka_traits::engine::GroupEvent::EpochChanged {
@@ -20068,9 +20068,9 @@ fn an_epoch_passage(
 fn a_convergence_reorg(
     group_id: &cgka_traits::GroupId,
     fork_source_epoch: u64,
-) -> marmot_account::AccountDeviceEffects {
+) -> marmot_session::AccountDeviceEffects {
     let invalidated_commit_id = cgka_traits::MessageId::new(vec![7u8; 32]);
-    let mut effects = marmot_account::AccountDeviceEffects::default();
+    let mut effects = marmot_session::AccountDeviceEffects::default();
     effects
         .events
         .push(cgka_traits::engine::GroupEvent::CommitRolledBack {
@@ -21664,8 +21664,8 @@ async fn shutdown_and_close_allows_another_process_to_open_root() {
 /// the inference the criterion forbids.
 #[test]
 fn a_retained_send_reports_accepted_pending_rather_than_an_empty_publish() {
-    let mut effects = marmot_account::AccountDeviceEffects::default();
-    effects.queued.push(cgka_session::QueuedIntentRef {
+    let mut effects = marmot_session::AccountDeviceEffects::default();
+    effects.queued.push(marmot_session::QueuedIntentRef {
         group_id: cgka_traits::GroupId::new(vec![0x11; 16]),
         intent_id: cgka_traits::MessageId::new(vec![0x22; 32]),
     });
@@ -22474,7 +22474,7 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
         "precondition: the source epoch was never cached while current"
     );
 
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
             authority: None,
             group_id: group_id.clone(),
@@ -22987,7 +22987,7 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                 drop(client);
                 client = client_on_app_relay_plane(&app, "alice").await;
             } else if handling == "failed effects" {
-                let mut effects = marmot_account::AccountDeviceEffects::default();
+                let mut effects = marmot_session::AccountDeviceEffects::default();
                 effects.events.push(
                     cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
                         group_id: route.group_id.clone(),
@@ -22996,13 +22996,13 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                             cgka_traits::ingest::InboundResourceLimit::TransportDeferredRetryBudget,
                     },
                 );
-                effects.failures.push(marmot_account::PublishFailure {
+                effects.failures.push(marmot_session::PublishFailure {
                     message_id: delivery.message.id.clone(),
                     reason: "injected".into(),
                 });
                 effects
                     .pending
-                    .push(marmot_account::PendingResolution::RolledBack {
+                    .push(marmot_session::PendingResolution::RolledBack {
                         pending: cgka_traits::engine_state::PendingStateRef::new(7),
                     });
                 assert!(

@@ -295,7 +295,7 @@ pub struct Engine<S: StorageProvider> {
     /// sites emit typed events at every state-relevant decision point so a
     /// later analyzer can reconstruct what each device saw and decided. The
     /// engine only records: the layer that built it owns the log's file,
-    /// rotation and end, through a shared handle it keeps (`cgka-session`
+    /// rotation and end, through a shared handle it keeps (`marmot-session`
     /// passes a clone of its `marmot_forensics::SharedRecorder`).
     pub(crate) recorder: Box<dyn ForensicRecorder>,
     pub(crate) audit_operation_counter: u64,

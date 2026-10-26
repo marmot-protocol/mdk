@@ -1402,7 +1402,7 @@ mod tests {
             (
                 classified(
                     SyncFailureStage::CgkaIngest,
-                    AppError::Account(marmot_account::AccountError::Engine(
+                    AppError::Account(marmot_session::AccountError::Engine(
                         EngineError::InvalidWelcome,
                     )),
                 ),

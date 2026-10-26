@@ -1,9 +1,9 @@
 //! Production-shaped account-device session wrapper.
 //!
-//! This crate wires an OpenMLS-backed engine to SQLCipher storage for one
+//! This module wires an OpenMLS-backed engine to SQLCipher storage for one
 //! Marmot account-device identity. Transport remains injected through
 //! `TransportPeeler`; actual network publish and relay sync stay above this
-//! crate.
+//! module.
 
 use std::{path::PathBuf, sync::Arc};
 

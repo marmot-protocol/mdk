@@ -12,7 +12,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cgka_traits::engine::{SupersededIntentKind, SupersededIntentOutcome};
 use cgka_traits::{GroupId, TransportEndpoint};
-use marmot_account::MaintenanceTiming;
+use marmot_app::MaintenanceTiming;
 use marmot_app::{
     AccountSetupRequest, AppError, AppMessageQuery, MarmotApp, MarmotAppConfig, MarmotAppEvent,
     MarmotAppRuntime,
@@ -3157,7 +3157,7 @@ mod tests {
         assert_eq!(protocol.category, SubjectFailureCategory::Protocol);
         assert!(!protocol.message.contains(marker));
 
-        let denied = app_error(AppError::Account(marmot_account::AccountError::Engine(
+        let denied = app_error(AppError::Account(marmot_app::AccountError::Engine(
             cgka_traits::error::EngineError::NotGroupAdmin {
                 group_id: GroupId::new(marker.as_bytes().to_vec()),
             },
