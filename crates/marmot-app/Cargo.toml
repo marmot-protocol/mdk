@@ -19,6 +19,9 @@ test-policy-overrides = [
 otlp-export = ["dep:opentelemetry-proto", "dep:prost"]
 # Internal-only surface used by the repeatable media transport benchmark.
 media-benchmarks = []
+# The lower-stack error table that host crates check their classifiers
+# against. Enable only as a dev-dependency.
+test-support = []
 
 [dependencies]
 async-trait.workspace = true

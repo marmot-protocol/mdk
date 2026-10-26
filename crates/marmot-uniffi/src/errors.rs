@@ -1211,6 +1211,34 @@ mod tests {
             "NIP-49 encryption failures must map to EncryptionFailed without duplicating the AccountHomeError prefix, got {ffi:?}"
         );
     }
+
+    /// MarmotKit's column of `marmot-app`'s lower-stack error table: the
+    /// variant follows what the error is, however the lower stack wrapped it.
+    #[test]
+    fn lower_stack_errors_cross_ffi_by_kind_not_by_wrapping() {
+        let mismatches: Vec<String> = marmot_app::error_kind_table::lower_stack_rows()
+            .into_iter()
+            .filter_map(|row| {
+                let ffi = MarmotKitError::from(&row.error);
+                let variant = variant_name(&ffi);
+                (variant != row.expected.marmotkit).then(|| {
+                    format!(
+                        "{}: {variant}, expected {}",
+                        row.name, row.expected.marmotkit
+                    )
+                })
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    fn variant_name(error: &MarmotKitError) -> String {
+        format!("{error:?}")
+            .split([' ', '{', '('])
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
 }
 
 impl From<marmot_app::ChatListWindowError> for MarmotKitError {

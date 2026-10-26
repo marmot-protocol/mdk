@@ -46,6 +46,7 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+marmot-app = { workspace = true, features = ["test-support"] }
 nostr-relay-builder.workspace = true
 nostr-sdk.workspace = true
 tempfile.workspace = true

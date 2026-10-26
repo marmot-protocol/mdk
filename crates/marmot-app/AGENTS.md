@@ -207,6 +207,13 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `src/user_blocks.rs` implements `BlockListSink`; publishing the account's own profile and follow list is
   `src/profile_publication.rs`. `directory()` builds a fresh service on each call with `DirectoryConfig` read from the
   app's configuration; anything the directory keeps between calls lives in `directory_state`, never in `directory()`.
+- Classify a lower-stack error by what it is, never by its wrapper (mdk#2602). Ask `AppError::as_engine_error`, or
+  `AccountError::as_engine_error` / `SessionError::as_engine_error` below it; do not match `AppError::Session(..)`
+  or `AppError::Account(..)` paths. `From<SessionError>` and `From<AccountError>` recognise the external-signer
+  sentinel by text, as `From<TransportAdapterError>` does, so build `AppError` from them with `?` or `From`, never
+  with the variant constructor. `src/error_kind_table.rs` lists every wrapping the lower stack produces with each
+  host's answer. This crate checks the sync class, privacy kind and wipe reason; `marmot-uniffi`, `marmot-c` and
+  `wn-cli` check their own columns over the same rows. A new wrapping or host classifier adds rows or a column.
 - Callers reach the directory through `app.directory()`, whose methods return `DirectoryError`; `MarmotApp` has no
   directory delegates. `From<DirectoryError> for AppError` in `src/error.rs` restores the variant, message and
   `privacy_safe_kind` the directory reported before it had its own type, so app paths that return `AppError` convert
@@ -410,6 +417,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   build).
 - `product-analytics-export`: product analytics export path.
 - `media-benchmarks`: internal surface for the media transport benchmarks.
+- `test-support`: exposes `error_kind_table` to the host crates' tests. Enable it only as a dev-dependency.
 
 ## Verification
 

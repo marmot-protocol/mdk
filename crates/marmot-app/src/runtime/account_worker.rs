@@ -9265,7 +9265,7 @@ mod tests {
         let mut schedule = LegacyMessagePromotionSchedule::new();
 
         run_legacy_message_promotion_batch_with(&mut schedule, |_| {
-            Err(cgka_session::SessionError::Storage(
+            Err(cgka_session::SessionError::from(
                 cgka_traits::storage::StorageError::Busy("test contention".into()),
             ))
         });
@@ -9281,7 +9281,7 @@ mod tests {
 
         run_legacy_message_promotion_batch_with(&mut schedule, |_| {
             calls += 1;
-            Err(cgka_session::SessionError::Storage(
+            Err(cgka_session::SessionError::from(
                 cgka_traits::storage::StorageError::Serialization("malformed legacy row".into()),
             ))
         });

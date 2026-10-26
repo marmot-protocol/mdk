@@ -13,6 +13,20 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
   changes a row's transfer state as soon as the engine reports it; progress-only
   replacements still arrive at most four per second. A timeout no longer loses
   a replacement that was waiting out that window (#2157).
+- The status a call returns now depends on what the error is, not on which MDK
+  layers wrapped it (mdk#2602). Three answers change:
+  - A busy, closed or full store that the account session reported itself now
+    returns `MARMOT_STATUS_STORAGE_BUSY`, `MARMOT_STATUS_STORAGE_CLOSED` or
+    `MARMOT_STATUS_STORAGE_FULL`, as it does when the engine reports it.
+    Before, it returned `MARMOT_STATUS_RUNTIME`.
+  - An external-signer rejection now returns
+    `MARMOT_STATUS_EXTERNAL_SIGNER_REJECTED` on every path. Before, a rejection
+    on paths other than transport publishes and account open, such as signing
+    an identity proof, returned `MARMOT_STATUS_RUNTIME`.
+  - Wipe outcome reasons follow the same rule. An engine storage failure reads
+    `local storage error`, an unknown engine group `unknown local group`, and
+    any other engine failure `session error`. Account failures outside the
+    engine still read `account error`.
 
 ## [0.14.0] - 2026-10-23
 

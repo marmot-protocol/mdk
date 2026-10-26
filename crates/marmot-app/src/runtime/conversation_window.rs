@@ -64,13 +64,7 @@ impl From<StorageError> for ConversationWindowError {
 }
 impl From<cgka_session::SessionError> for ConversationWindowError {
     fn from(error: cgka_session::SessionError) -> Self {
-        match error {
-            cgka_session::SessionError::Storage(error)
-            | cgka_session::SessionError::Engine(cgka_traits::EngineError::Storage(error)) => {
-                error.into()
-            }
-            error => AppError::from(error).into(),
-        }
+        AppError::from(error).into()
     }
 }
 impl From<ConversationOpenError> for ConversationWindowError {
@@ -97,10 +91,11 @@ impl ConversationWindowError {
             || matches!(self, Self::Query(error) if !matches!(error.as_ref(), ConversationOpenError::MessageNotFound))
             || matches!(self, Self::App(e) if matches!(e.as_ref(),
                 AppError::RuntimeStopping | AppError::TransportClosed | AppError::BlockingTask(_) | AppError::UnknownGroup(_) |
-                AppError::Session(cgka_session::SessionError::Engine(cgka_traits::EngineError::UnknownGroup(_))) |
                 AppError::AccountHome(marmot_account::AccountHomeError::AccountIdMismatch |
                     marmot_account::AccountHomeError::UnknownAccount(_)) |
-                AppError::Storage(StorageError::Closed(_) | StorageError::NotFound)))
+                AppError::Storage(StorageError::Closed(_) | StorageError::NotFound))
+                || matches!(e.as_engine_error(), Some(cgka_traits::EngineError::UnknownGroup(_) |
+                    cgka_traits::EngineError::Storage(StorageError::Closed(_) | StorageError::NotFound))))
     }
 }
 
@@ -393,10 +388,8 @@ fn capture_conversation_from_session(
     match capture() {
         Err(ConversationWindowError::App(error))
             if matches!(
-                error.as_ref(),
-                AppError::Session(cgka_session::SessionError::Engine(
-                    cgka_traits::EngineError::GroupNotHydrated(_)
-                ))
+                error.as_engine_error(),
+                Some(cgka_traits::EngineError::GroupNotHydrated(_))
             ) =>
         {
             // Background hydration owns recovery; no projection repair or

@@ -1166,7 +1166,17 @@ pub struct SignOutOutcome {
 /// wrap transparent transport/storage/IO errors whose `Display` text can embed
 /// exactly those identifiers, so we never interpolate `err` here — we classify
 /// it into a fixed phrase instead.
-fn wipe_failure_reason(err: &AppError) -> String {
+pub(crate) fn wipe_failure_reason(err: &AppError) -> String {
+    // An engine failure gets one phrase whichever lower-stack layer carried
+    // it (mdk#2602).
+    if let Some(engine) = err.as_engine_error() {
+        let category = match engine {
+            cgka_traits::EngineError::Storage(_) => "local storage error",
+            cgka_traits::EngineError::UnknownGroup(_) => "unknown local group",
+            _ => "session error",
+        };
+        return category.to_owned();
+    }
     let category = match err {
         AppError::RuntimeStopping => "runtime is shutting down",
         AppError::Transport(transport) => {
@@ -1185,7 +1195,6 @@ fn wipe_failure_reason(err: &AppError) -> String {
         }
         AppError::Io(_) => "filesystem error",
         AppError::Account(_) | AppError::AccountHome(_) => "account error",
-        AppError::Session(_) => "session error",
         AppError::UnknownGroup(_) => "unknown local group",
         AppError::MissingKeyPackage { .. } => "no published key package",
         _ => "operation failed",

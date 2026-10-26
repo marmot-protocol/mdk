@@ -9,6 +9,19 @@
   replacements still arrive at most four per second. A host that polled
   `attachmentTransferSnapshot` beside the feed to see `Ready` sooner can drop
   that poll (#2157).
+- `MarmotKitError` now depends on what an error is, not on which MDK layers
+  wrapped it (mdk#2602). Three answers change:
+  - A busy, closed or full store that the account session reported itself now
+    arrives as `StorageBusy`, `StorageClosed` or `StorageFull`, as it does when
+    the engine reports it. Before, it arrived as `Runtime`.
+  - An external-signer rejection now arrives as `ExternalSignerRejected` on
+    every path, as it already did on transport publishes and at account open.
+    Before, a rejection on other paths, such as signing an identity proof for
+    a KeyPackage or a group change, arrived as `Runtime`.
+  - Wipe outcome `reason` strings follow the same rule. An engine storage
+    failure reads `local storage error`, an unknown engine group `unknown
+    local group`, and any other engine failure `session error`. Account
+    failures outside the engine still read `account error`.
 
 ## 0.14.0 - 2026-10-23
 

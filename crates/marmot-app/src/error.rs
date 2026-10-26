@@ -102,11 +102,11 @@ pub enum AppError {
     #[error(transparent)]
     ProductAnalytics(#[from] crate::ProductAnalyticsError),
     #[error(transparent)]
-    Account(#[from] marmot_account::AccountError),
+    Account(marmot_account::AccountError),
     #[error(transparent)]
     AccountHome(#[from] AccountHomeError),
     #[error(transparent)]
-    Session(#[from] cgka_session::SessionError),
+    Session(cgka_session::SessionError),
     #[error(transparent)]
     Storage(#[from] cgka_traits::storage::StorageError),
     #[error(transparent)]
@@ -473,12 +473,39 @@ impl From<AppError> for DirectoryError {
     }
 }
 
+/// An external signer reports a rejection as text, which every layer passes
+/// through unchanged. So each lower-stack conversion recognises it by that
+/// text, wherever the rejection happened and however it was wrapped.
+fn is_external_signer_rejection(error: &impl std::fmt::Display) -> bool {
+    error.to_string().contains(crate::EXTERNAL_SIGNER_REJECTED)
+}
+
 impl From<TransportAdapterError> for AppError {
     fn from(error: TransportAdapterError) -> Self {
-        if error.to_string().contains(crate::EXTERNAL_SIGNER_REJECTED) {
+        if is_external_signer_rejection(&error) {
             Self::ExternalSignerRejected
         } else {
             Self::Transport(error)
+        }
+    }
+}
+
+impl From<AccountError> for AppError {
+    fn from(error: AccountError) -> Self {
+        if is_external_signer_rejection(&error) {
+            Self::ExternalSignerRejected
+        } else {
+            Self::Account(error)
+        }
+    }
+}
+
+impl From<cgka_session::SessionError> for AppError {
+    fn from(error: cgka_session::SessionError) -> Self {
+        if is_external_signer_rejection(&error) {
+            Self::ExternalSignerRejected
+        } else {
+            Self::Session(error)
         }
     }
 }
@@ -514,7 +541,7 @@ impl AppError {
             Self::ProductAnalytics(_) => "usage_diagnostics",
             Self::Account(error) => account_error_kind(error),
             Self::AccountHome(error) => account_home_error_kind(error),
-            Self::Session(error) => session_error_kind(error),
+            Self::Session(error) => engine_error_kind(error.as_engine_error()),
             Self::Storage(error) => storage_error_kind(error),
             Self::Transport(_) => "transport",
             Self::Io(_) => "io",
@@ -641,7 +668,7 @@ impl AppError {
                 _ => SyncErrorClass::Storage,
             },
             Self::Io(_) => SyncErrorClass::Storage,
-            Self::Session(error) => session_error_class(error),
+            Self::Session(error) => engine_error_class(error.as_engine_error()),
             Self::Account(error) => account_sync_error_class(error),
             Self::Transport(error) => transport_error_class(error),
             Self::RelayDirectory(_) | Self::DirectoryLookupIncomplete(_) => {
@@ -668,13 +695,13 @@ impl AppError {
         }
     }
 
+    /// The engine error inside a session or account error, however the lower
+    /// stack wrapped it. Code above the engine asks this rather than matching
+    /// wrapper paths, so moving a call between layers cannot change the answer.
     pub fn as_engine_error(&self) -> Option<&cgka_traits::error::EngineError> {
         match self {
-            Self::Account(marmot_account::AccountError::Engine(err))
-            | Self::Account(marmot_account::AccountError::Session(
-                cgka_session::SessionError::Engine(err),
-            ))
-            | Self::Session(cgka_session::SessionError::Engine(err)) => Some(err),
+            Self::Account(error) => error.as_engine_error(),
+            Self::Session(error) => Some(error.as_engine_error()),
             _ => None,
         }
     }
@@ -691,21 +718,15 @@ fn transport_error_class(error: &TransportAdapterError) -> SyncErrorClass {
 }
 
 fn account_sync_error_class(error: &AccountError) -> SyncErrorClass {
+    if let Some(error) = error.as_engine_error() {
+        return engine_error_class(error);
+    }
     match error {
-        AccountError::Session(error) => session_error_class(error),
-        AccountError::Engine(error) => engine_error_class(error),
         AccountError::Transport(error) => transport_error_class(error),
         AccountError::TransportRouting(_) | AccountError::WrongAccountDelivery => {
             SyncErrorClass::Protocol
         }
         _ => SyncErrorClass::Unknown,
-    }
-}
-
-fn session_error_class(error: &cgka_session::SessionError) -> SyncErrorClass {
-    match error {
-        cgka_session::SessionError::Storage(error) => storage_error_class(error),
-        cgka_session::SessionError::Engine(error) => engine_error_class(error),
     }
 }
 
@@ -735,15 +756,12 @@ fn engine_error_class(error: &cgka_traits::error::EngineError) -> SyncErrorClass
 }
 
 fn account_error_kind(error: &AccountError) -> &'static str {
+    // The wrapping depth is not the diagnosis: an engine failure has the
+    // engine's kind whichever layer carried it, so an operator greps one name.
+    if let Some(error) = error.as_engine_error() {
+        return engine_error_kind(error);
+    }
     match error {
-        // The wrapping depth is not the diagnosis. `as_engine_error` already
-        // treats these three shapes as one engine failure; the kind follows,
-        // so an operator greps one name instead of three.
-        AccountError::Session(error) => session_error_kind(error),
-        AccountError::Engine(cgka_traits::error::EngineError::Storage(error)) => {
-            storage_error_kind(error)
-        }
-        AccountError::Engine(error) => error.privacy_safe_kind(),
         AccountError::Transport(_) => "account_transport",
         AccountError::TransportRouting(_) => "account_transport_routing",
         AccountError::KeyPackage(_) => "account_key_package",
@@ -780,26 +798,21 @@ fn account_home_error_kind(error: &AccountHomeError) -> &'static str {
     }
 }
 
-/// Privacy-safe kind for a session failure.
+/// Privacy-safe kind for an engine failure, however the session and account
+/// layers wrapped it.
 ///
-/// `SessionError` is a two-variant passthrough, so the diagnostically useful
-/// name always lives one layer down. Collapsing it to a single `"session"`
-/// kind is what made the D5 field investigations blind.
-fn session_error_kind(error: &cgka_session::SessionError) -> &'static str {
+/// Collapsing session failures to a single `"session"` kind is what made the
+/// D5 field investigations blind, so the name always comes from the engine.
+fn engine_error_kind(error: &cgka_traits::error::EngineError) -> &'static str {
     match error {
-        // A storage failure is the same failure whichever layer wrapped it, so
-        // reuse the nine storage kinds at both depths. That keeps the one
-        // transient kind (`storage_busy`, the sole case
-        // `SessionError::is_transient` reports) distinguishable from the eight
-        // durable ones without a second transient/permanent axis to keep in
-        // sync.
-        cgka_session::SessionError::Storage(error)
-        | cgka_session::SessionError::Engine(cgka_traits::error::EngineError::Storage(error)) => {
-            storage_error_kind(error)
-        }
+        // Reuse the nine storage kinds. That keeps the one transient kind
+        // (`storage_busy`, the sole case `SessionError::is_transient` reports)
+        // distinguishable from the eight durable ones without a second
+        // transient/permanent axis to keep in sync.
+        cgka_traits::error::EngineError::Storage(error) => storage_error_kind(error),
         // Engine names come from the engine so an app tracing field and an
         // engine forensic audit row say the same word for the same failure.
-        cgka_session::SessionError::Engine(error) => error.privacy_safe_kind(),
+        error => error.privacy_safe_kind(),
     }
 }
 
@@ -944,7 +957,7 @@ mod tests {
     // this case, so the kind has to carry the same split.
     #[test]
     fn transient_session_storage_failure_reports_the_busy_storage_kind() {
-        let err = AppError::Session(cgka_session::SessionError::Storage(StorageError::Busy(
+        let err = AppError::from(cgka_session::SessionError::from(StorageError::Busy(
             "locked".into(),
         )));
         assert_eq!(err.privacy_safe_kind(), "storage_busy");
@@ -1004,11 +1017,11 @@ mod tests {
     #[test]
     fn session_kind_agrees_with_is_transient() {
         for error in [
-            cgka_session::SessionError::Storage(StorageError::Busy("locked".into())),
+            cgka_session::SessionError::from(StorageError::Busy("locked".into())),
             cgka_session::SessionError::Engine(EngineError::Storage(StorageError::Busy(
                 "locked".into(),
             ))),
-            cgka_session::SessionError::Storage(StorageError::Closed("shut".into())),
+            cgka_session::SessionError::from(StorageError::Closed("shut".into())),
             cgka_session::SessionError::Engine(EngineError::InvalidWelcome),
         ] {
             let transient = error.is_transient();

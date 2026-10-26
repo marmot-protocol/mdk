@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Changed
+
+- What an error reports depends on what it is, not on which lower-stack
+  layers wrapped it (mdk#2602). Three answers change:
+  - A storage failure that the account session reported itself is now the
+    engine's `EngineError::Storage`, which `AppError::as_engine_error`
+    returns. MarmotKit and the C ABI now report a busy, closed or full store
+    as `StorageBusy`, `StorageClosed` or `StorageFull` instead of `Runtime`,
+    and the CLI reports `engine_error` instead of `command_failed`.
+    `cgka_session::SessionError::Storage` is removed.
+  - Converting any session or account error into `AppError` now turns an
+    external-signer rejection into `AppError::ExternalSignerRejected`, as the
+    transport conversion already did. Before, only opening the session did
+    this. Elsewhere a rejection was a generic engine or account error.
+  - `WipeOutcome` failure reasons now follow the error's kind. An engine
+    storage failure reads `local storage error`, an unknown engine group
+    `unknown local group`, and any other engine failure `session error`,
+    whichever layer reported it. Account failures outside the engine still
+    read `account error`. The `error_code` logged when a read-marker update
+    fails follows the same rule: `read_marker_failed:storage`,
+    `read_marker_failed:unknown_group` or `read_marker_failed:session`.
+
 ### Fixed
 
 - The OpenMLS RustCrypto provider moves to the elliptic-curve 0.14 crates

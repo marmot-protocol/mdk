@@ -20,6 +20,9 @@ key derivation, relay sync, or UI projection.
   instant (mdk#2323). `open` must not open a second connection in that case.
 - Keep storage-only legacy-format promotion explicit and host-scheduled after readiness; do not add it to the
   session-open critical path or widen the generic engine storage API for it.
+- Every `SessionError` is an engine error. A storage failure the session meets itself converts to
+  `EngineError::Storage`, so hosts classify it as they do the engine's own (mdk#2602). Callers ask
+  `SessionError::as_engine_error`, not the variant.
 - Prefer behavior tests over internal state assertions.
 
 ## Verification
