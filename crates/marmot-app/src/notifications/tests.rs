@@ -114,6 +114,79 @@ fn token_records_by_server_keeps_hintless_records_for_10050_fallback() {
     assert_eq!(records.len(), 2);
 }
 
+fn device_token_record(
+    member_id_hex: &str,
+    leaf_index: u32,
+    device_token: &[u8],
+    owner_ts: i64,
+) -> GroupPushTokenRecord {
+    GroupPushTokenRecord {
+        group_id_hex: "ee".repeat(32),
+        member_id_hex: member_id_hex.to_owned(),
+        leaf_index,
+        platform: PushPlatform::Apns,
+        token_fingerprint: push_token_fingerprint(PushPlatform::Apns, device_token),
+        server_pubkey_hex: "aa".repeat(32),
+        relay_hint: Some("wss://hint.example".to_owned()),
+        encrypted_token: vec![leaf_index as u8; PUSH_ENCRYPTED_TOKEN_LEN],
+        owner_ts,
+        owner_sig: String::new(),
+        updated_at_ms: owner_ts,
+    }
+}
+
+fn selected_leaves(grouped: &BTreeMap<String, Vec<GroupPushTokenRecord>>) -> Vec<(String, u32)> {
+    grouped
+        .values()
+        .flatten()
+        .map(|record| (record.member_id_hex.clone(), record.leaf_index))
+        .collect()
+}
+
+#[test]
+fn token_records_by_server_keeps_every_sibling_leaf() {
+    let bob = "bb".repeat(32);
+    let tokens = vec![
+        device_token_record(&bob, 1, b"phone", 1),
+        device_token_record(&bob, 4, b"tablet", 1),
+    ];
+    let grouped = token_records_by_server(tokens, "dd".repeat(32).as_str());
+    assert_eq!(selected_leaves(&grouped), vec![(bob.clone(), 1), (bob, 4)]);
+}
+
+#[test]
+fn token_records_by_server_sends_one_push_per_device_token() {
+    let bob = "bb".repeat(32);
+    let carol = "cc".repeat(32);
+    let tokens = vec![
+        device_token_record(&bob, 1, b"phone", 10),
+        device_token_record(&bob, 2, b"tablet", 5),
+        device_token_record(&bob, 3, b"tablet", 5),
+        device_token_record(&bob, 4, b"phone", 20),
+        // Another account naming the same token is not collapsed into Bob's.
+        device_token_record(&carol, 5, b"phone", 1),
+    ];
+    let grouped = token_records_by_server(tokens, "dd".repeat(32).as_str());
+    // The newest owner_ts wins; equal stamps keep the lowest leaf.
+    assert_eq!(
+        selected_leaves(&grouped),
+        vec![(bob.clone(), 2), (bob, 4), (carol, 5)]
+    );
+}
+
+#[test]
+fn token_records_by_server_excludes_local_sibling_leaves() {
+    let local = "dd".repeat(32);
+    let bob = "bb".repeat(32);
+    let tokens = vec![
+        device_token_record(&bob, 1, b"bob-phone", 1),
+        device_token_record(&local, 0, b"local-phone", 1),
+        device_token_record(&local, 3, b"local-tablet", 1),
+    ];
+    let grouped = token_records_by_server(tokens, &local);
+    assert_eq!(selected_leaves(&grouped), vec![(bob, 1)]);
+}
+
 #[test]
 fn apns_token_encryption_uses_platform_byte_0x01() {
     let secret = server_secret();

@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2273,25 +2274,46 @@ pub(crate) fn group_debug_info(
     }
 }
 
+/// Select the stored token records one notification trigger wakes, grouped by
+/// notification server.
+///
+/// Storage holds one record per spec record key `(member, leaf, platform,
+/// server)`, so every sibling device leaf keeps its own push. Leaves of one
+/// member that share a token fingerprint name the same device token (for
+/// example a stale leaf left by a reinstall), so only one of them is sent:
+/// the newest `owner_ts`, which carries the owner's current relay hint, and
+/// the lowest leaf on a tie. Equal fingerprints under different members are
+/// all kept: a member signs whatever fingerprint it likes, so collapsing them
+/// would let one member suppress another member's push.
 pub(crate) fn token_records_by_server(
     tokens: Vec<GroupPushTokenRecord>,
     local_account_id_hex: &str,
 ) -> BTreeMap<String, Vec<GroupPushTokenRecord>> {
-    let mut grouped: BTreeMap<String, Vec<GroupPushTokenRecord>> = BTreeMap::new();
-    let mut keys = BTreeSet::new();
-    for token in tokens {
-        // Keep records without a relay hint: the trigger publisher falls back to
-        // the server account's published kind-10050 inbox relays, so a missing
-        // hint is not an immediate drop (per features/push-notifications.md).
-        if token.member_id_hex == local_account_id_hex {
-            continue;
-        }
-        let key = (
-            token.member_id_hex.clone(),
-            token.platform.as_str().to_owned(),
-            token.server_pubkey_hex.clone(),
+    // Keep records without a relay hint: the trigger publisher falls back to
+    // the server account's published kind-10050 inbox relays, so a missing
+    // hint is not an immediate drop (per features/push-notifications.md).
+    let tokens = tokens
+        .into_iter()
+        .filter(|token| token.member_id_hex != local_account_id_hex)
+        .collect::<Vec<_>>();
+    let rank = |token: &GroupPushTokenRecord| (token.owner_ts, Reverse(token.leaf_index));
+    let mut devices = BTreeMap::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let device = (
+            token.member_id_hex.as_str(),
+            token.platform.as_str(),
+            token.server_pubkey_hex.as_str(),
+            token.token_fingerprint.as_str(),
         );
-        if keys.insert(key) {
+        let kept = devices.entry(device).or_insert(index);
+        if rank(token) > rank(&tokens[*kept]) {
+            *kept = index;
+        }
+    }
+    let selected = devices.into_values().collect::<BTreeSet<_>>();
+    let mut grouped: BTreeMap<String, Vec<GroupPushTokenRecord>> = BTreeMap::new();
+    for (index, token) in tokens.into_iter().enumerate() {
+        if selected.contains(&index) {
             grouped
                 .entry(token.server_pubkey_hex.clone())
                 .or_default()
