@@ -12,6 +12,9 @@
 - Migration 0118 advances account storage to schema 118 (mdk#2611). It adds
   `token_fingerprint` and `owner_sig` to push tombstones, which existing
   tombstones leave NULL, and an empty `group_push_gossip_state` table.
+- Migration 0119 advances account storage to schema 119 (mdk#2611). It adds
+  `snapshot_owed_after_epoch` to `group_push_gossip_state`, which existing
+  rows leave NULL. `AccountGroupPushGossipState` gains the matching field.
 - `apply_group_push_token_tombstone` takes an `AccountGroupPushTokenTombstone`
   instead of eight arguments, and stores its optional removal proof.
 
@@ -29,6 +32,10 @@
   `record_group_push_gossip_announce` keep when this device's join became final
   and when it last announced, for its current membership. Writes need a joined group; the row goes when the device leaves
   or is removed, and with the group.
+- `record_group_push_snapshot_owed`, `owed_group_push_snapshots` and
+  `replace_group_push_snapshot_owed` keep the push snapshot this device owes a
+  group after a Commit of its own adds leaves: the latest source epoch wins,
+  and replacing or settling it needs the epoch it still holds.
 
 ## 0.14.0 - 2026-10-23
 

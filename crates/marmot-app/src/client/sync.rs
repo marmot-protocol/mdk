@@ -6753,6 +6753,7 @@ impl AppClient {
         if let Some(group_id) = super::push::member_add_group(event) {
             self.queue_push_registration_share_after_member_added(group_id)?;
         }
+        self.note_own_member_add(event);
         self.invalidate_terminal_pending_sends(event, summary, cleanup)?;
         if let Some(group_id) = self_arrival_group(event) {
             routes_dirty |= self.restore_joined_self_membership(group_id)?;

@@ -2024,6 +2024,7 @@ impl MarmotApp {
             pending_push_leaf_reconciliations: Default::default(),
             push_registration_share_queued: false,
             pending_member_add_push_shares: Default::default(),
+            pending_own_add_push_snapshots: Default::default(),
             pending_failed_sync_summary: SyncSummary::default(),
             pending_native_sync_summary: SyncSummary::default(),
             native_sync_deliveries: 0,
@@ -4065,7 +4066,6 @@ impl MarmotApp {
 
     /// Every tombstone stored for `group_id_hex`. Only those that kept their
     /// owner-signed removal may be relayed.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn group_push_token_tombstones(
         &self,
         account_ref: &str,
@@ -4079,6 +4079,77 @@ impl MarmotApp {
             .into_iter()
             .map(conversions::push_token_tombstone_from_account)
             .collect()
+    }
+
+    /// The epoch after which this device owes `group_id_hex` a push snapshot,
+    /// if it owes one.
+    pub(crate) fn group_push_snapshot_owed(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<u64>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .group_push_gossip_state(group_id_hex)?
+            .and_then(|state| state.snapshot_owed_after_epoch))
+    }
+
+    /// Every group this device owes a push snapshot, with the epoch its merged
+    /// epoch must pass first.
+    pub(crate) fn owed_group_push_snapshots(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<(String, u64)>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .owed_group_push_snapshots()?
+            .into_iter()
+            .filter_map(|state| {
+                state
+                    .snapshot_owed_after_epoch
+                    .map(|after_epoch| (state.group_id_hex, after_epoch))
+            })
+            .collect())
+    }
+
+    /// Record that this device owes `group_id_hex` a push snapshot once its
+    /// merged epoch passes `after_epoch`. The later of two owed epochs wins.
+    /// Returns false unless this device is a member of the projected group.
+    pub(crate) fn record_group_push_snapshot_owed(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        after_epoch: u64,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .record_group_push_snapshot_owed(group_id_hex, after_epoch)?)
+    }
+
+    /// Replace the owed snapshot epoch of `group_id_hex` with `replacement`
+    /// (`None` settles it) while it is still `expected`.
+    pub(crate) fn replace_group_push_snapshot_owed(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        expected: u64,
+        replacement: Option<u64>,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .replace_group_push_snapshot_owed(group_id_hex, expected, replacement)?)
     }
 
     /// Ingest inbound push-token gossip (kinds 447/448/449) into

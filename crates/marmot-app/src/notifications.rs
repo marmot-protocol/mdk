@@ -2444,5 +2444,8 @@ pub(crate) fn decrypt_push_token_for_test(
     Ok((platform, plaintext[3..3 + token_len].to_vec()))
 }
 
+mod lists;
+pub(crate) use lists::push_gossip_lists;
+
 #[cfg(test)]
 mod tests;

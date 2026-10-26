@@ -8,6 +8,15 @@
   `AccountIdentityProofRequest` and `AccountIdentityProofSigner`, so hosts
   reach the lower stack's error and signer types through `marmot_app`
   (mdk#2602). The old paths still work.
+- A device whose invite adds members now sends the group a push snapshot
+  once the Commit merges (mdk#2611): kind 448 lists of every token record it
+  holds, other members' included, and kind 449 lists of every tombstone that
+  kept its owner-signed removal. Entries go out exactly as their owners signed
+  them, so a new member learns the tokens of members who are offline. Lists
+  are split so each published group message fits 64 KiB with at most 32
+  entries. A device that holds neither sends nothing. The owed snapshot is
+  recorded before the Commit publishes, so a restart still sends it, and a
+  Commit that rolls back owes none.
 
 ### Changed
 

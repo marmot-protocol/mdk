@@ -83,3 +83,96 @@ pub fn join_config(max_past_epochs: usize) -> MlsGroupJoinConfig {
         .sender_ratchet_configuration(default_sender_ratchet_configuration())
         .build()
 }
+
+/// Serialized length of the `MLSMessage` that the engine sends for a
+/// `payload_len`-byte application payload in a group whose MLS group id is
+/// `group_id_len` bytes.
+///
+/// An application message is always a `PrivateMessage` (RFC 9420 section 6.3).
+/// Under the one ciphersuite the engine accepts
+/// (`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`: 64-byte Ed25519
+/// signatures, 16-byte AES-GCM tags), with no padding and no authenticated
+/// data, it is:
+///
+/// ```text
+/// MLSMessage     = version[2] wire_format[2] PrivateMessage
+/// PrivateMessage = <group_id> epoch[8] content_type[1] <authenticated_data: empty>
+///                  <encrypted_sender_data: SenderData[12] || tag[16]>
+///                  <ciphertext: <application_data> <signature[64]> || tag[16]>
+/// ```
+///
+/// `<x>` is `x` behind its MLS variable-length size prefix. A payload must stay
+/// below 2^30 bytes, the largest size that prefix encodes.
+pub fn application_message_len(group_id_len: usize, payload_len: usize) -> usize {
+    const SIGNATURE_LEN: usize = 64;
+    const AEAD_TAG_LEN: usize = 16;
+    const SENDER_DATA_LEN: usize = 4 + 4 + 4;
+    fn sized(len: usize) -> usize {
+        let prefix = match len {
+            0..64 => 1,
+            64..16_384 => 2,
+            _ => 4,
+        };
+        prefix + len
+    }
+    let ciphertext = sized(payload_len) + sized(SIGNATURE_LEN) + AEAD_TAG_LEN;
+    2 + 2
+        + sized(group_id_len)
+        + 8
+        + 1
+        + sized(0)
+        + sized(SENDER_DATA_LEN + AEAD_TAG_LEN)
+        + sized(ciphertext)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::DEFAULT_CIPHERSUITE;
+    use openmls::group::{GroupId, MlsGroup, MlsGroupCreateConfig};
+    use openmls::prelude::{BasicCredential, CredentialWithKey};
+    use openmls_basic_credential::SignatureKeyPair;
+    use tls_codec::Serialize as _;
+
+    /// The length model matches what OpenMLS writes, across every size-prefix
+    /// boundary of the group id, the payload and the ciphertext.
+    #[test]
+    fn application_message_len_matches_openmls() {
+        assert_eq!(default_join_config().padding_size(), 0);
+        let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+        let signer = SignatureKeyPair::new(DEFAULT_CIPHERSUITE.signature_algorithm()).unwrap();
+        let config = MlsGroupCreateConfig::builder()
+            .ciphersuite(DEFAULT_CIPHERSUITE)
+            .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(true)
+            .sender_ratchet_configuration(default_sender_ratchet_configuration())
+            .build();
+        assert_eq!(config.join_config().padding_size(), 0);
+        for group_id_len in [1, 16, 32, 63, 64, 255] {
+            let credential_with_key = CredentialWithKey {
+                credential: BasicCredential::new(b"length-model".to_vec()).into(),
+                signature_key: signer.public().into(),
+            };
+            let mut group = MlsGroup::new_with_group_id(
+                &provider,
+                &signer,
+                &config,
+                GroupId::from_slice(&vec![7; group_id_len]),
+                credential_with_key,
+            )
+            .unwrap();
+            for payload_len in [0, 1, 63, 64, 16_299, 16_300, 16_383, 16_384, 70_000] {
+                let message = group
+                    .create_message(&provider, &signer, &vec![b'x'; payload_len])
+                    .unwrap()
+                    .tls_serialize_detached()
+                    .unwrap();
+                assert_eq!(
+                    message.len(),
+                    application_message_len(group_id_len, payload_len),
+                    "group id {group_id_len} bytes, payload {payload_len} bytes"
+                );
+            }
+        }
+    }
+}

@@ -4220,6 +4220,7 @@ fn push_gossip_state_tracks_the_current_membership() {
         group_id_hex: "aa".to_owned(),
         joined_at_ms: Some(10),
         last_announced_at_ms: Some(50),
+        snapshot_owed_after_epoch: None,
     });
     assert_eq!(state("aa"), recorded);
     // Saving the projection again keeps a still-joined group's row.
@@ -4248,6 +4249,87 @@ fn push_gossip_state_tracks_the_current_membership() {
     assert_eq!(state("aa"), None);
     save(Vec::new());
     assert_eq!(state("bb"), None);
+}
+
+/// An owed push snapshot needs a joined group, keeps the latest owed epoch,
+/// is replaced or settled only while it still holds the expected epoch, and
+/// ends with the membership.
+#[test]
+fn push_snapshot_owed_keeps_the_latest_add_for_the_current_membership() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let owed = |group: &str| {
+        app.group_push_gossip_state(group)
+            .unwrap()
+            .and_then(|state| state.snapshot_owed_after_epoch)
+    };
+    let owed_groups = || {
+        app.owed_group_push_snapshots()
+            .unwrap()
+            .into_iter()
+            .map(|state| (state.group_id_hex, state.snapshot_owed_after_epoch))
+            .collect::<Vec<_>>()
+    };
+    assert!(!app.record_group_push_snapshot_owed("aa", 1).unwrap());
+    app.save_account_projection_state(
+        &StoredAccountState {
+            label: "alice".to_owned(),
+            seen_events: Vec::new(),
+            last_transport_timestamp: None,
+            groups: vec![group("aa", "alpha"), group("bb", "beta")],
+        },
+        16,
+        MAX_FUTURE_SKEW_SECS,
+    )
+    .unwrap();
+    assert_eq!(owed_groups(), Vec::new());
+
+    // An announce row owes nothing; recording keeps the other columns.
+    assert!(app.record_group_push_gossip_join("aa", 10).unwrap());
+    assert_eq!(owed("aa"), None);
+    assert!(app.record_group_push_snapshot_owed("aa", 5).unwrap());
+    assert!(app.record_group_push_snapshot_owed("aa", 3).unwrap());
+    assert_eq!(owed("aa"), Some(5));
+    assert_eq!(
+        app.group_push_gossip_state("aa")
+            .unwrap()
+            .unwrap()
+            .joined_at_ms,
+        Some(10)
+    );
+    assert!(
+        app.record_group_push_snapshot_owed("bb", u64::MAX >> 1)
+            .unwrap()
+    );
+    assert_eq!(
+        owed_groups(),
+        vec![
+            ("aa".to_owned(), Some(5)),
+            ("bb".to_owned(), Some(u64::MAX >> 1))
+        ]
+    );
+    assert!(app.record_group_push_snapshot_owed("bb", u64::MAX).is_err());
+
+    // A stale expectation changes nothing; a current one restores or settles.
+    assert!(!app.replace_group_push_snapshot_owed("aa", 4, None).unwrap());
+    assert_eq!(owed("aa"), Some(5));
+    assert!(
+        app.replace_group_push_snapshot_owed("aa", 5, Some(2))
+            .unwrap()
+    );
+    assert_eq!(owed("aa"), Some(2));
+    assert!(app.replace_group_push_snapshot_owed("aa", 2, None).unwrap());
+    assert_eq!(owed("aa"), None);
+    assert!(!app.replace_group_push_snapshot_owed("cc", 0, None).unwrap());
+    assert_eq!(owed_groups(), vec![("bb".to_owned(), Some(u64::MAX >> 1))]);
+
+    assert!(app.record_group_push_snapshot_owed("aa", 7).unwrap());
+    app.set_group_self_membership("aa", SelfMembership::Left)
+        .unwrap();
+    assert_eq!(owed("aa"), None);
+    assert!(!app.record_group_push_snapshot_owed("aa", 8).unwrap());
+    store.delete_local_group_data("bb").unwrap();
+    assert_eq!(owed_groups(), Vec::new());
 }
 
 #[test]

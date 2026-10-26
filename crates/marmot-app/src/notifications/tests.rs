@@ -997,6 +997,280 @@ fn stored_token_digests_are_checked_on_read_back() {
     );
 }
 
+fn stored_token(record: &GroupPushTokenRecord) -> StoredGroupPushToken {
+    StoredGroupPushToken {
+        record: record.clone(),
+        record_digest: Some(record.record_digest().unwrap()),
+    }
+}
+
+fn stored_tombstone(
+    group_id_hex: &str,
+    removal: &PushTokenRemovalRecord,
+) -> StoredPushTokenTombstone {
+    StoredPushTokenTombstone {
+        record_digest: removal.record_digest(group_id_hex).unwrap(),
+        removal: Some(removal.clone()),
+    }
+}
+
+/// Published size bound of the group message carrying one list `content`.
+fn list_published_len(
+    intent: crate::messages::AppMessageIntent,
+    sender_hex: &str,
+    group_id_len: usize,
+) -> usize {
+    let event = crate::messages::build_inner_event(&intent, sender_hex, u64::MAX).unwrap();
+    let inner = crate::messages::encode_inner_event(&event).unwrap();
+    lists::published_len_bound(group_id_len, inner.len())
+}
+
+/// A snapshot relays every stored record and tombstone exactly as its owner
+/// signed it, so a recipient verifies the relay as it would the owner's own
+/// update. A record whose stored digest its fields do not produce, and a
+/// tombstone without its removal proof, are left out.
+#[test]
+fn push_gossip_lists_relay_stored_entries_unchanged() {
+    let owner = Keys::generate();
+    let owner_id = owner.public_key().to_hex();
+    let relayer = Keys::generate().public_key().to_hex();
+    let group_id_hex = hex::encode([0xEF; 16]);
+    let server = "cd".repeat(32);
+    let now = unix_now_ms();
+    let records = [1, 2].map(|leaf| signed_token_record(&owner, &group_id_hex, leaf, &server, now));
+    let removal = signed_removal_record(&owner, &group_id_hex, 3, &server, now);
+    let mut unverified = stored_token(&signed_token_record(&owner, &group_id_hex, 4, &server, now));
+    unverified.record_digest = None;
+    let mut unsigned = stored_tombstone(
+        &group_id_hex,
+        &signed_removal_record(&owner, &group_id_hex, 5, &server, now),
+    );
+    unsigned.removal = None;
+
+    let lists = push_gossip_lists(
+        &[
+            stored_token(&records[0]),
+            unverified,
+            stored_token(&records[1]),
+        ],
+        &[unsigned, stored_tombstone(&group_id_hex, &removal)],
+        &relayer,
+        16,
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            lists.unverified_records,
+            lists.unsigned_tombstones,
+            lists.oversized_entries
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!((lists.token_lists.len(), lists.removal_lists.len()), (1, 1));
+
+    let verified = |kind, content: &str| {
+        verify_push_gossip_for_profile(
+            parse_push_gossip(kind, &group_id_hex, content).unwrap(),
+            &group_id_hex,
+            std::slice::from_ref(&owner_id),
+            ProtocolProfile::Current,
+        )
+    };
+    let PushGossipAction::Upsert(upserts) =
+        verified(MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST, &lists.token_lists[0])
+    else {
+        panic!("a token list upserts");
+    };
+    let signed = |record: &GroupPushTokenRecord| {
+        (
+            record.leaf_index,
+            record.relay_hint.clone(),
+            record.encrypted_token.clone(),
+            record.owner_ts,
+            record.owner_sig.clone(),
+        )
+    };
+    assert_eq!(
+        upserts.iter().map(signed).collect::<Vec<_>>(),
+        records.iter().map(signed).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        verified(
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+            &lists.removal_lists[0]
+        ),
+        PushGossipAction::Remove(vec![removal])
+    );
+    assert_eq!(
+        push_gossip_lists(&[], &[], &relayer, 16).unwrap(),
+        lists::PushGossipLists::default(),
+        "a device that holds nothing sends nothing"
+    );
+}
+
+/// The widest record entry this crate stores: an escape-heavy relay hint of
+/// `hint_len` characters, the widest leaf index and stamp.
+fn widest_token(group_id_hex: &str, server_index: usize, hint_len: usize) -> StoredGroupPushToken {
+    let hint = "\"\\\u{1}x"
+        .chars()
+        .cycle()
+        .take(hint_len)
+        .collect::<String>();
+    StoredGroupPushToken {
+        record: GroupPushTokenRecord {
+            group_id_hex: group_id_hex.to_owned(),
+            member_id_hex: "ab".repeat(32),
+            leaf_index: u32::MAX,
+            platform: PushPlatform::Apns,
+            token_fingerprint: push_token_fingerprint(PushPlatform::Apns, &[1]),
+            server_pubkey_hex: format!("{server_index:064x}"),
+            relay_hint: Some(hint),
+            encrypted_token: vec![0xFF; PUSH_ENCRYPTED_TOKEN_LEN],
+            owner_ts: i64::MIN,
+            owner_sig: "ef".repeat(64),
+            updated_at_ms: 0,
+        },
+        record_digest: Some("00".repeat(32)),
+    }
+}
+
+/// Each list fits the 64 KiB group message with at most 32 entries, packs as
+/// many entries as fit, and keeps storage order. One entry too large for a
+/// message on its own is left out; the largest one that fits is sent. Removals
+/// hit the 32-entry cap before the byte budget.
+#[test]
+fn push_gossip_lists_split_worst_case_entries_by_size_and_count() {
+    let sender = "ab".repeat(32);
+    for group_id_len in [16, 32, 255] {
+        let group_id_hex = hex::encode(vec![0xEF; group_id_len]);
+        let tokens = (0..100)
+            .map(|index| widest_token(&group_id_hex, index, (index * 211) % 4_000))
+            .collect::<Vec<_>>();
+        let lists = push_gossip_lists(&tokens, &[], &sender, group_id_len).unwrap();
+        assert_eq!(lists.oversized_entries, 0);
+        let parsed = lists
+            .token_lists
+            .iter()
+            .map(|content| {
+                serde_json::from_str::<PushTokenGossipPayload>(content)
+                    .unwrap()
+                    .tokens
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parsed
+                .iter()
+                .flatten()
+                .map(|entry| entry.server_pubkey_hex.clone())
+                .collect::<Vec<_>>(),
+            tokens
+                .iter()
+                .map(|stored| stored.record.server_pubkey_hex.clone())
+                .collect::<Vec<_>>(),
+            "every entry is sent once, in storage order"
+        );
+        for (index, content) in lists.token_lists.iter().enumerate() {
+            let len = list_published_len(
+                crate::messages::AppMessageIntent::PushTokenList {
+                    content: content.clone(),
+                },
+                &sender,
+                group_id_len,
+            );
+            assert!(
+                len <= lists::PUSH_GOSSIP_EVENT_MAX_BYTES,
+                "list {index} is {len} bytes"
+            );
+            assert!((1..=32).contains(&parsed[index].len()));
+            if let Some(next) = parsed.get(index + 1).and_then(|next| next.first()) {
+                let mut grown = parsed[index].clone();
+                grown.push(next.clone());
+                let grown = serde_json::to_string(&PushTokenGossipPayload {
+                    v: PUSH_VERSION.to_owned(),
+                    tokens: grown,
+                })
+                .unwrap();
+                assert!(
+                    list_published_len(
+                        crate::messages::AppMessageIntent::PushTokenList { content: grown },
+                        &sender,
+                        group_id_len
+                    ) > lists::PUSH_GOSSIP_EVENT_MAX_BYTES,
+                    "list {index} could not take the next entry"
+                );
+            }
+        }
+
+        // The largest hint whose lone entry fits, by direct measurement.
+        let alone = |hint_len| {
+            let entry =
+                PushTokenGossipEntry::from_record(&widest_token(&group_id_hex, 0, hint_len).record);
+            let content = serde_json::to_string(&PushTokenGossipPayload {
+                v: PUSH_VERSION.to_owned(),
+                tokens: vec![entry],
+            })
+            .unwrap();
+            list_published_len(
+                crate::messages::AppMessageIntent::PushTokenList { content },
+                &sender,
+                group_id_len,
+            )
+        };
+        let (mut low, mut high) = (0_usize, 65_536);
+        while low < high {
+            let mid = (low + high).div_ceil(2);
+            if alone(mid) <= lists::PUSH_GOSSIP_EVENT_MAX_BYTES {
+                low = mid
+            } else {
+                high = mid - 1
+            }
+        }
+        let largest = widest_token(&group_id_hex, 1, low);
+        let too_large = widest_token(&group_id_hex, 2, low + 1);
+        assert!(alone(low + 1) > lists::PUSH_GOSSIP_EVENT_MAX_BYTES);
+        let lists =
+            push_gossip_lists(&[too_large, largest.clone()], &[], &sender, group_id_len).unwrap();
+        assert_eq!(lists.oversized_entries, 1);
+        assert_eq!(lists.token_lists.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<PushTokenGossipPayload>(&lists.token_lists[0])
+                .unwrap()
+                .tokens,
+            vec![PushTokenGossipEntry::from_record(&largest.record)]
+        );
+    }
+
+    let group_id_hex = hex::encode([0xEF; 16]);
+    let removals = (0..70)
+        .map(|index| {
+            let removal = PushTokenRemovalRecord {
+                member_id_hex: "ab".repeat(32),
+                leaf_index: u32::MAX,
+                platform: PushPlatform::Apns,
+                token_fingerprint: push_token_fingerprint(PushPlatform::Apns, &[1]),
+                server_pubkey_hex: format!("{index:064x}"),
+                owner_ts: i64::MIN,
+                owner_sig: "ef".repeat(64),
+            };
+            stored_tombstone(&group_id_hex, &removal)
+        })
+        .collect::<Vec<_>>();
+    let lists = push_gossip_lists(&[], &removals, &sender, 16).unwrap();
+    assert_eq!(
+        lists
+            .removal_lists
+            .iter()
+            .map(
+                |content| serde_json::from_str::<PushTokenRemovalPayload>(content)
+                    .unwrap()
+                    .removals
+                    .len()
+            )
+            .collect::<Vec<_>>(),
+        vec![32, 32, 6]
+    );
+}
+
 #[test]
 fn mixed_entry_permutations_apply_the_same_valid_winner() {
     let owner = Keys::generate();

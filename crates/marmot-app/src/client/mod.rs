@@ -807,6 +807,10 @@ pub struct AppClient {
     /// Groups grown by an own command whose push-token share failed to queue;
     /// the account worker retries them.
     pub(super) pending_member_add_push_shares: std::collections::HashSet<GroupId>,
+    /// Groups where a merged Commit by this account added a member, with the
+    /// epoch that Commit started from, whose owed push snapshot failed to
+    /// record; the account worker retries them.
+    pub(super) pending_own_add_push_snapshots: HashMap<GroupId, u64>,
     /// App-visible outputs ingested during a sync whose account-projection
     /// checkpoint failed. A retained client keeps the matching projected state
     /// and outbox acknowledgements, then returns this summary after its next
@@ -2882,21 +2886,50 @@ impl AppClient {
                 return Err(error);
             }
         };
-        // The invite is staged locally but not canonical yet. Record every
-        // Welcome destination atomically before exposing the commit; if that
-        // persistence fails, roll back the staged MLS change and return the
-        // original error so a retry cannot create phantom local membership.
-        let welcome_intent_result = if cfg!(feature = "test-policy-overrides")
-            && self.app.config.dev_fail_invite_welcome_intent
-        {
-            Err(AppError::Publish(
-                "injected invite welcome intent failure".into(),
-            ))
-        } else {
-            self.record_welcome_delivery_intents(group_id, prepared.welcomes())
+        // The invite is staged locally but not canonical yet. Record the push
+        // snapshot the added leaves are owed once it merges, then every Welcome
+        // destination atomically, before exposing the commit; if either
+        // persistence fails, undo the other and roll back the staged MLS change,
+        // returning the original error so a retry cannot create phantom local
+        // membership.
+        // A staged commit's state carries the epoch it will reach.
+        let source_epoch = match self.runtime.epoch_state(group_id) {
+            Some(cgka_traits::EpochState::PendingPublish(pending)) => {
+                pending.epoch().0.checked_sub(1)
+            }
+            _ => None,
         };
-        let welcome_intents = match welcome_intent_result {
-            Ok(welcome_intents) => welcome_intents,
+        let push_snapshot = match source_epoch {
+            Some(source_epoch) if !prepared.welcomes().is_empty() => self
+                .record_push_snapshot_owed(group_id, source_epoch)
+                .map(Some),
+            _ => Ok(None),
+        };
+        let welcome_intent_result = match push_snapshot {
+            Ok(push_snapshot) => {
+                let welcome_intents = if cfg!(feature = "test-policy-overrides")
+                    && self.app.config.dev_fail_invite_welcome_intent
+                {
+                    Err(AppError::Publish(
+                        "injected invite welcome intent failure".into(),
+                    ))
+                } else {
+                    self.record_welcome_delivery_intents(group_id, prepared.welcomes())
+                };
+                match welcome_intents {
+                    Ok(welcome_intents) => Ok((welcome_intents, push_snapshot)),
+                    Err(error) => {
+                        if let Some(push_snapshot) = push_snapshot {
+                            self.restore_push_snapshot_owed(push_snapshot);
+                        }
+                        Err(error)
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let (welcome_intents, push_snapshot) = match welcome_intent_result {
+            Ok(staged) => staged,
             Err(error) => {
                 let rollback = self
                     .runtime
@@ -2966,9 +2999,20 @@ impl AppClient {
                 // let this in-memory slot independently publish Welcomes after
                 // a failed caller-visible commit attempt.
                 self.unpublished_welcome_delivery = None;
+                // A commit rolled back leaves the group at its source epoch
+                // with nothing pending, and never owes the snapshot.
+                if let Some(push_snapshot) = push_snapshot
+                    && self.runtime.epoch_state(group_id).is_some_and(|state| {
+                        !state.is_resolving_local_publish() && Some(state.epoch().0) == source_epoch
+                    })
+                {
+                    self.restore_push_snapshot_owed(push_snapshot);
+                }
                 return Err(error);
             }
         };
+        // The account worker sends the owed snapshot.
+        self.push_registration_share_queued |= push_snapshot.is_some();
 
         let local_refresh_started_at = Instant::now();
         let local_refresh = (|| {
@@ -3265,6 +3309,7 @@ impl AppClient {
         self.forget_pending_effect_projections(group_id);
         self.pending_push_leaf_reconciliations.remove(group_id);
         self.pending_member_add_push_shares.remove(group_id);
+        self.pending_own_add_push_snapshots.remove(group_id);
         self.app.presentation_signals.wake();
         // Deletion already committed. A failed transport refresh must not make
         // the caller believe the group still exists; ordinary maintenance retries.
@@ -4257,7 +4302,9 @@ impl AppClient {
                 (Family::MessageAction, "delete")
             }
             AppMessageIntent::Media { .. } => (Family::MessageAction, "media"),
-            AppMessageIntent::PushTokenUpdate { .. } => (Family::Notification, "update"),
+            AppMessageIntent::PushTokenUpdate { .. } | AppMessageIntent::PushTokenList { .. } => {
+                (Family::Notification, "update")
+            }
             AppMessageIntent::PushTokenRemoval { .. } => (Family::Notification, "remove"),
             AppMessageIntent::StreamStart { .. } => (Family::Stream, "start"),
             AppMessageIntent::StreamFinal { .. } => (Family::Stream, "finalize"),

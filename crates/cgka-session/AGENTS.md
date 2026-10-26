@@ -32,8 +32,8 @@ key derivation, relay sync, or UI projection.
   engine with a clone, and writes the open-time `recorder_health` row through it. Do not add audit pass-through
   methods; the runtime and the host record, rotate and finish through their own clones (mdk#2602, rule 5).
 - Re-export, under its engine name, each engine item a host names alongside the session: the configuration and signer
-  types, the group-authority types, and the KeyPackage metadata and inventory helpers. Hosts name these through this
-  crate, never `cgka_engine` (mdk#2602).
+  types, the group-authority types, the KeyPackage metadata and inventory helpers, and the application message size
+  model. Hosts name these through this crate, never `cgka_engine` (mdk#2602).
 - Prefer behavior tests over internal state assertions.
 
 ## Verification
