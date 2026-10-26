@@ -277,12 +277,14 @@ fn build_deferred_bench_client(
     identity: &[u8],
     storage: SqliteAccountStorage,
     peeler: DeferredBenchPeeler,
+    audit: &marmot_forensics::SharedRecorder,
 ) -> Engine<SqliteAccountStorage> {
     EngineBuilder::new(storage)
         .identity(pad32(identity))
         .account_identity_proof_signer(proof_signer(identity))
         .protocol_profile(ProtocolProfile::Current)
         .peeler(Box::new(peeler))
+        .recorder(Box::new(audit.clone()))
         .build()
         .expect("build deferred benchmark engine")
 }
@@ -778,8 +780,10 @@ fn reset_deferred_fingerprints(
     fingerprint
 }
 
+/// Start recording only once the fixture is set up, through the handle the
+/// engine was built with, as a host's audit switch does.
 fn install_benchmark_recorder(
-    engine: &mut Engine<SqliteAccountStorage>,
+    audit: &marmot_forensics::SharedRecorder,
     enabled: bool,
 ) -> Option<tempfile::TempDir> {
     if !enabled {
@@ -791,7 +795,7 @@ fn install_benchmark_recorder(
         "deferred-preflight-benchmark".into(),
     )
     .expect("open benchmark recorder");
-    engine.set_recorder(Box::new(recorder));
+    audit.swap(Box::new(recorder));
     Some(dir)
 }
 
@@ -811,8 +815,9 @@ fn prepare_deferred_preflight_fixture(
     );
     let storage = SqliteAccountStorage::in_memory().expect("matrix storage");
     let peeler = DeferredBenchPeeler::new();
+    let audit = marmot_forensics::SharedRecorder::disabled();
     let mut engine =
-        build_deferred_bench_client(identity.as_bytes(), storage.clone(), peeler.clone());
+        build_deferred_bench_client(identity.as_bytes(), storage.clone(), peeler.clone(), &audit);
     let key_packages = invitee_key_packages(members.saturating_sub(1));
     let (group_id, result) = rt
         .block_on(engine.create_group(create_request(key_packages)))
@@ -848,7 +853,8 @@ fn prepare_deferred_preflight_fixture(
             mark_backlog_unchanged(rt, &mut engine, &group_id);
             reset_deferred_fingerprints(&storage, &group_id, 4);
             drop(engine);
-            engine = build_deferred_bench_client(identity.as_bytes(), storage, peeler.clone());
+            engine =
+                build_deferred_bench_client(identity.as_bytes(), storage, peeler.clone(), &audit);
             engine
                 .hydrate_all_stored_groups()
                 .expect("hydrate restarted benchmark engine");
@@ -860,7 +866,7 @@ fn prepare_deferred_preflight_fixture(
     if matches!(case, DeferredPreflightCase::ChangedContext) {
         peeler.block_from_attempt(4);
     }
-    let audit_dir = install_benchmark_recorder(&mut engine, recorder_enabled);
+    let audit_dir = install_benchmark_recorder(&audit, recorder_enabled);
     DeferredPreflightFixture {
         engine,
         group_id,

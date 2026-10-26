@@ -3417,8 +3417,10 @@ async fn manual_self_update_confirms_on_first_ack_and_retries_unacked_relays_aud
     adapter.error_for_endpoints(vec![relay_b.clone()]);
     let wall = Arc::new(TestWallClock::new(100_000));
     let monotonic = Arc::new(TestMonotonicClock::default());
-    let mut session = current_session(database, &key, b"alice");
-    session.set_audit_recorder(v5_audit_recorder(&audit_path));
+    let session = current_session(database, &key, b"alice");
+    session
+        .audit_recorder()
+        .swap(v5_audit_recorder(&audit_path));
     let mut runtime = AccountDeviceRuntime::new(
         session,
         adapter.clone(),
@@ -3915,8 +3917,10 @@ async fn legacy_self_update_fanout_retries_after_lost_confirmation_marker() {
     let relay_a = TransportEndpoint("wss://group-a.example".into());
     let relay_b = TransportEndpoint("wss://group-b.example".into());
     let adapter = RecordingAdapter::default();
-    let mut session = current_session(database, &key, b"alice");
-    session.set_audit_recorder(v5_audit_recorder(&audit_path));
+    let session = current_session(database, &key, b"alice");
+    session
+        .audit_recorder()
+        .swap(v5_audit_recorder(&audit_path));
     let mut runtime = AccountDeviceRuntime::new(
         session,
         adapter.clone(),
@@ -4048,8 +4052,8 @@ async fn adapter_publish_failure_records_per_relay_causes() {
     let bob_kp = bob_session.fresh_key_package().await.unwrap();
     let bob_id = bob_session.self_id();
 
-    let mut session = current_session(dir.path().join("alice.sqlite"), &key, b"alice");
-    session.set_audit_recorder(Box::new(
+    let session = current_session(dir.path().join("alice.sqlite"), &key, b"alice");
+    session.audit_recorder().swap(Box::new(
         marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
             &audit_path,
             "11".repeat(16),
@@ -4329,8 +4333,8 @@ async fn frozen_self_update_publish_failure_records_per_relay_causes() {
     let group_id = created.group_id;
     drop(initial);
 
-    let mut session = current_session(database, &key, b"alice");
-    session.set_audit_recorder(Box::new(
+    let session = current_session(database, &key, b"alice");
+    session.audit_recorder().swap(Box::new(
         marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
             &audit_path,
             "11".repeat(16),

@@ -75,7 +75,8 @@ v5 file is rejected. Deploy the compatible receiver before activating v5 deliver
 | Area | Files |
 | --- | --- |
 | Schema and recorder trait | [`crates/marmot-forensics/src/audit.rs`](../../crates/marmot-forensics/src/audit.rs), [`crates/marmot-forensics/schema/audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json) |
-| Engine recorder installation point | [`crates/cgka-engine/src/engine.rs`](../../crates/cgka-engine/src/engine.rs), [`crates/cgka-session/src/lib.rs`](../../crates/cgka-session/src/lib.rs) |
+| Shared recorder handle | [`crates/marmot-forensics/src/audit/shared.rs`](../../crates/marmot-forensics/src/audit/shared.rs) |
+| Recorder installation point | [`crates/cgka-session/src/lib.rs`](../../crates/cgka-session/src/lib.rs) wraps the configured recorder in the account-device's `SharedRecorder` and builds the engine ([`engine.rs`](../../crates/cgka-engine/src/engine.rs)) with a clone |
 | Stable audit string helpers | [`crates/cgka-engine/src/audit_helpers.rs`](../../crates/cgka-engine/src/audit_helpers.rs) |
 | Engine audit call sites | [`engine.rs`](../../crates/cgka-engine/src/engine.rs), [`message_processor/`](../../crates/cgka-engine/src/message_processor), [`publish.rs`](../../crates/cgka-engine/src/publish.rs), [`distributed_convergence.rs`](../../crates/cgka-engine/src/distributed_convergence.rs), [`update_group_data.rs`](../../crates/cgka-engine/src/update_group_data.rs), [`upgrade.rs`](../../crates/cgka-engine/src/upgrade.rs), [`group_lifecycle.rs`](../../crates/cgka-engine/src/group_lifecycle.rs) |
 | Account publish audit call sites | [`crates/marmot-account/src/lib.rs`](../../crates/marmot-account/src/lib.rs) |
@@ -111,6 +112,13 @@ Important lifecycle behavior:
 - The recorder opens files with append mode and does not truncate existing logs.
 - Each recorder opening emits a `recorder_started` row. Session open also emits `engine_context` and
   `recorder_health` rows once the convergence policy has been installed.
+- One recorder serves the account-device. The engine, the account runtime and the app each hold a clone of one
+  `SharedRecorder`, so their rows share one writer, one recording session and one sequence. App rows go straight to
+  the app's clone, not through the runtime, the session or the engine.
+- The audit switch swaps the recorder for every clone; the swap closes the old file before it returns. An observed
+  graceful shutdown finishes the log: it writes `recording_session_stopped`, then swaps in the no-op recorder, so a
+  clone that outlives shutdown writes nothing and the next open starts a new session. Any other stop writes no stop
+  row, and the file closes when the account's client is dropped.
 
 The UniFFI bridge exposes:
 
@@ -279,7 +287,7 @@ Emitted when group-scoped settings/state should be explicit in the timeline, inc
 
 ### `recorder_health`
 
-Emitted by the session at open and available through `audit_recorder_health()`.
+Emitted by the session at open, through the shared recorder.
 
 | Field | Meaning |
 | --- | --- |

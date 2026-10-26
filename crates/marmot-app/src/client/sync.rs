@@ -28,7 +28,7 @@ use crate::{
 };
 use marmot_forensics::{
     AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillExecutionSeam,
-    EpochStallBackfillTrigger,
+    EpochStallBackfillTrigger, ForensicRecorder as _,
 };
 
 #[cfg(test)]
@@ -3964,7 +3964,7 @@ impl AppClient {
                 && let Ok(group) = client.runtime.group_record(group_id)
             {
                 let initial_join = probe.joined(receive.clone(), &group);
-                if initial_join && client.runtime.session().audit_v5_enabled() {
+                if initial_join && client.audit.records_v5() {
                     let admins = client.runtime.admin_pubkeys(group_id).ok();
                     probe.baseline(
                         &group,
@@ -7044,7 +7044,7 @@ impl AppClient {
                 );
                 if previous_group != updated_group
                     && let Some(probe) = &mut self.audit_v5_probe
-                    && (self.runtime.session().audit_v5_enabled() || cfg!(test))
+                    && (self.audit.records_v5() || cfg!(test))
                 {
                     probe.projected(event, marmot_forensics::v5::UpdateCause::WelcomeJoin);
                 }

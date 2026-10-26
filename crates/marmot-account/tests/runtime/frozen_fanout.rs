@@ -617,8 +617,8 @@ async fn assert_met_quorum_secondary_retry(newer_below_quorum: bool) {
     let alice_path = dir.path().join("alice.sqlite");
     let audit_path = dir.path().join("application-audit.jsonl");
     let open_alice = || {
-        let mut session = session(&alice_path, &key, b"alice-met-quorum-order");
-        session.set_audit_recorder(Box::new(marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
+        let session = session(&alice_path, &key, b"alice-met-quorum-order");
+        session.audit_recorder().swap(Box::new(marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
             &audit_path,
             "11".repeat(16),
             Some("22".repeat(16)),

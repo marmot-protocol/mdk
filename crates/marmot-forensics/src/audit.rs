@@ -33,6 +33,7 @@ use sha2::{Digest, Sha256};
 
 mod recovery;
 mod refusal;
+mod shared;
 pub use recovery::{
     EoseRepairReceiver, EoseRepairTrigger, RECOVERY_AUDIT_MAX_ENDPOINTS,
     RECOVERY_AUDIT_MAX_OBLIGATIONS, RecoveryAttemptScope, RecoveryGoalBound, RecoveryNeedChange,
@@ -43,6 +44,7 @@ pub use refusal::{
     SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES, SubscriptionRefusalCategory, SubscriptionRefusalEntry,
     SubscriptionRefusalOutcome, SubscriptionRefusalRoute,
 };
+pub use shared::SharedRecorder;
 
 pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
 

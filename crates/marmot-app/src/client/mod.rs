@@ -30,7 +30,7 @@ use marmot_account::{
     AccountError, CompletedWelcomePublishTask, PreparedSessionSend, PreparedWelcomePublishTask,
     TransportRoutingPolicy,
 };
-use marmot_forensics::AuditEventContext;
+use marmot_forensics::{AuditEventContext, ForensicRecorder as _};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use storage_sqlite::{PreparedGroupImageUploadRecord, PreparedGroupImageUploadState};
@@ -707,6 +707,9 @@ pub struct AppClient {
     pub(crate) audit_v5_probe: Option<audit_v5_probe::WelcomeProbe>,
     pub(crate) audit_v5_peel_slot:
         Option<std::sync::Arc<std::sync::Mutex<audit_v5_probe::PeelSlot>>>,
+    /// This client's own clone of the account-device's audit recorder. App
+    /// rows, rotation and the log's end go through it, not the runtime.
+    pub(crate) audit: marmot_forensics::SharedRecorder,
     /// Synthetic endpoint certificates for executor/completion contract tests.
     /// Never enabled by EOSE or by the production SDK adapter.
     #[cfg(test)]
@@ -2313,7 +2316,7 @@ impl AppClient {
         if let (Some(probe), Some(pending)) = (&mut self.audit_v5_probe, founding_probe) {
             probe.founding_prepared(pending, &group_id, &prepared.effects);
             audit_context.v5_welcome_refs = probe.take_validated_refs();
-            if self.runtime.session().audit_v5_enabled()
+            if self.audit.records_v5()
                 && let Ok(group) = self.runtime.group_record(&group_id)
             {
                 let admins = self.runtime.admin_pubkeys(&group_id).ok();
