@@ -1021,8 +1021,7 @@ mod tests {
 #[cfg(test)]
 mod directory_error_tests {
     //! `DirectoryError` converts back to the `AppError` the directory used
-    //! before it had its own type (step 3 of
-    //! `docs/marmot-architecture/review/brief-directory.md`).
+    //! before it had its own type.
 
     use cgka_traits::error::EngineError;
     use cgka_traits::storage::StorageError;

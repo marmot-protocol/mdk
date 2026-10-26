@@ -25,6 +25,10 @@ implementation checklist.
 
 ## Editing rules
 
+- Put plans in GitHub issues, not in `docs/`: PR sequences, extraction briefs, roadmaps and step lists. A change that
+  spans several PRs gets a tracking issue holding its plan and a checklist of its PRs. Docs describe how the system
+  works and why it is shaped that way; when a planned change lands, update the docs that describe the result. The
+  older `*-plan.md` pages predate this rule; do not start new ones.
 - Update `updated:` dates in front matter when changing a dated architecture page.
 - Keep spec-like language in `marmot-architecture/cgka-engine-spec.md`,
   `marmot-architecture/cgka-engine-canonicalization-contract.md`, and `marmot-architecture/distributed-convergence.md`.

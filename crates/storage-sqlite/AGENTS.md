@@ -19,8 +19,7 @@ not "fix" it into the per-account database.
 
 ## Layout
 
-The crate is split by which side owns each table; see the
-[step 4 brief](../../docs/marmot-architecture/review/brief-storage-boundaries.md).
+The crate is split by which side owns each table.
 
 | Folder | Holds |
 | --- | --- |

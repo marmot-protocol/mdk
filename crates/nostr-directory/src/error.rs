@@ -2,8 +2,7 @@
 //!
 //! Directory code returns [`DirectoryError`]. `marmot-app` converts it back to
 //! its `AppError` at the boundary, restoring the variant, message and
-//! `privacy_safe_kind` used before the directory had its own type (step 3 of
-//! `docs/marmot-architecture/review/brief-directory.md`).
+//! `privacy_safe_kind` used before the directory had its own type.
 
 use cgka_traits::error::EngineError;
 use cgka_traits::storage::StorageError;
