@@ -2764,6 +2764,15 @@ impl<S: StorageProvider> Engine<S> {
         Ok(())
     }
 
+    /// The engine's liveness check for a group-scoped record kept above the
+    /// engine: `UnknownGroup` for a quarantined group, the retryable
+    /// `GroupNotHydrated` for a seeded-but-unhydrated one. A layer that stores
+    /// such a record calls this before touching it, so only the engine
+    /// decides whether a group is live (mdk#2602).
+    pub fn check_group_live(&self, group_id: &GroupId) -> Result<(), EngineError> {
+        self.ensure_group_live(group_id)
+    }
+
     /// Run full per-group hydration for a group the session-open cheap pass
     /// only seeded (mdk#1161). No-op for live, quarantined, disbanded, or
     /// unknown groups — callers keep their existing handling for those.

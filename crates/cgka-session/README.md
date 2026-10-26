@@ -31,7 +31,8 @@ the default.
 - Exposes convergence advancement (`advance_convergence`, `advance_convergence_inputs`) so queued outbound work can be
   regenerated from canonical state.
 - Exposes durable maintenance, KeyPackage-lifecycle, group-evolution, and transport-fanout records for the account
-  layer above it.
+  layer above it, read and written on the session's own clone of the engine's connection. Group-scoped records ask the
+  engine whether the group is live first, so quarantined and unhydrated groups fail as they do on engine accessors.
 - Provides compact `group_authority` reads and `with_group_authority_snapshot` for composing host-owned persisted
   reads with current engine facts on this session's store. The callback is synchronous and read-only; unhydrated groups
   return `GroupNotHydrated`. It does not serve a frozen startup snapshot or start relay work.
@@ -55,7 +56,8 @@ cargo test -p cgka-session
 
 - `tests/session_lifecycle.rs` — encrypted open/create/confirm/close/reopen, Welcome and app-message ingest,
   auto-publish and SelfRemove re-proposal work, convergence releasing queued outbound work, disband requests, compact authority
-  capture, KeyPackage cutover on open, and the legacy-row promotion facade (using
+  capture, the account records' liveness gate and closed-store failures, KeyPackage cutover on open, and the legacy-row
+  promotion facade (using
   [`fixtures/session-promotion-v1.bin`](fixtures/README.md)).
 - `tests/nostr_stack.rs` — the production-shaped non-relay stack: SQLCipher storage, the real `NostrMlsPeeler`, and
   `NostrTransportAdapter` over an in-memory relay client. Covers inbox and group subscription routing, NIP-59 Welcome

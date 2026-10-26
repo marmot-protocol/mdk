@@ -59,7 +59,7 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 | `update_group_data.rs` | `SendIntent::UpdateGroupData`: stages an `AppDataUpdate` for `marmot.group.profile.v1`; admin-policy and routing updates are out of scope |
 | `disband.rs` | Durable terminal group-disband workflow |
 | `own_commit_intent.rs` | `OwnCommitIntent` records and re-issue of own commits superseded by branch selection (mdk#1734) |
-| `maintenance.rs` | Persistence helpers for account-device maintenance orchestration (scheduling lives above the engine) |
+| `maintenance.rs` | KeyPackage replacement staging and promotion (OpenMLS material and the lifecycle record in one transaction) and the own-leaf hash. Scheduling and the other account records live above the engine; it adds no storage forwards for them (mdk#2602) |
 | `group_authority.rs` | Advisory live-engine authority facts for conversation capture; mutations still validate authority |
 | `app_components.rs` | `app_data_dictionary` helpers, LeafNode/group `app_components` bytes, group profile and admin-policy bytes |
 | `account_identity_proof.rs` | Legacy LeafNode identity-proof extension + current app-data component; strict profile classification (mixed rejected) |
@@ -246,8 +246,10 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   reports `Blocked` without touching state; `retry_deferred_peels` skips the group. Those retained rows (like an
   `Unrecoverable` group's) are bounded by per-group deferred-peel caps alone and never charge the account-wide byte
   budget. Any new accessor or data path that reads group state needs the gate — a bypass can silently un-quarantine
-  via `set_stable`. Quarantine clears only through `retry_hydrate_quarantined_group` or an authenticated re-join
-  Welcome, both of which schedule retained input for replay.
+  via `set_stable`. `check_group_live` is the gate's public form: the session calls it before every group-scoped
+  account record it keeps on its own storage handle, so only the engine decides liveness (mdk#2602). Quarantine
+  clears only through `retry_hydrate_quarantined_group` or an authenticated re-join Welcome, both of which schedule
+  retained input for replay.
 - **Two-phase hydration (mdk#1161): session open seeds, full hydration promotes.**
   `hydrate_stable_groups_from_storage` is the cheap seed: per stored group it reads only the durable record (no MLS
   load, snapshot list, or message scan), seeds a provisional `Stable(record.epoch)` so `live_group_ids` keeps listing
