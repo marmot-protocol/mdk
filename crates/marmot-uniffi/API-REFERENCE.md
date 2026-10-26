@@ -4747,7 +4747,7 @@ pub fn marmot_deployment_neutral() -> MarmotDeploymentFfi
 
 A deployment with no services: recovery requires every relay on a route, onboarding searches only the host's discovery relays, there is no Open Ranking tier or KeyPackage client preference, moderation reporting refuses a destination, and the keychain service is `org.marmot-protocol.mdk`. With no media servers new groups stay text-only, and with no group-image server group images are refused. Start here and fill in the services your deployment operates.
 
-[Source](src/deployment.rs#L110)
+[Source](src/deployment.rs#L109)
 
 ### `marmot_deployment_white_noise`
 
@@ -4759,7 +4759,7 @@ pub fn marmot_deployment_white_noise() -> MarmotDeploymentFfi
 
 White Noise's deployment: its recovery relays, discovery indexers, media and image servers, Vertex Open Ranking, KeyPackage client preference, moderation label namespace and keychain service `com.marmot.whitenoise`. White Noise apps pass it to every constructor. Keep `keychain_service` unchanged for an existing install, or its account secrets are stranded.
 
-[Source](src/deployment.rs#L101)
+[Source](src/deployment.rs#L100)
 
 </details>
 
