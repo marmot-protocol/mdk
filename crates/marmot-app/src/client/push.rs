@@ -69,7 +69,7 @@ enum PushSnapshotState {
     Due,
     /// The Commit has not merged, or the group cannot take messages yet.
     NotYet,
-    /// The group ended or is gone: nobody is left to send it to.
+    /// The group ended: nobody is left to send it to.
     Void,
 }
 
@@ -549,9 +549,11 @@ impl AppClient {
     }
 
     /// Record that `event`, if it is a merged Commit by this account adding a
-    /// member, owes the group a push snapshot. This covers adds that reach no
-    /// invite command, such as queued invites, which convergence commits later.
-    /// A failed write is retried with the member-add shares.
+    /// member, owes the group a push snapshot. The invite command recorded it
+    /// before staging or queueing the Commit; this records the epoch the
+    /// Commit started from, which a queued invite cannot know in advance, and
+    /// wakes the account worker to send it. A failed write is retried with
+    /// the member-add shares.
     pub(crate) fn note_own_member_add(&mut self, event: &cgka_traits::engine::GroupEvent) {
         if let Some((group_id, after_epoch)) = own_member_add(event, &self.runtime.self_id()) {
             let owed = self
@@ -628,19 +630,57 @@ impl AppClient {
         }
     }
 
+    /// Leaving the group, or losing membership, deletes its owed snapshot with
+    /// the rest of its gossip state, so a row here belongs to a group this
+    /// device is still in, though perhaps not hydrated yet.
     fn push_snapshot_state(&self, group_id_hex: &str, after_epoch: u64) -> PushSnapshotState {
         let Ok(group_id) = hex::decode(group_id_hex).map(GroupId::new) else {
             return PushSnapshotState::Void;
         };
         match self.runtime.epoch_state(&group_id) {
-            None | Some(cgka_traits::EpochState::Disbanded(_)) => PushSnapshotState::Void,
-            Some(cgka_traits::EpochState::Stable { epoch })
-                if epoch.0 > after_epoch
-                    && !self.runtime.leave_in_progress(&group_id).unwrap_or(true) =>
-            {
-                PushSnapshotState::Due
-            }
-            Some(_) => PushSnapshotState::NotYet,
+            Some(cgka_traits::EpochState::Disbanded(_)) => return PushSnapshotState::Void,
+            Some(cgka_traits::EpochState::Stable { epoch }) if epoch.0 > after_epoch => {}
+            // Not hydrated or quarantined, still resolving a publish, or
+            // recovering.
+            _ => return PushSnapshotState::NotYet,
+        }
+        if self
+            .runtime
+            .group_record(&group_id)
+            .is_ok_and(|group| group.is_terminal())
+        {
+            return PushSnapshotState::Void;
+        }
+        // A queued invite, or one convergence superseded that waits for fresh
+        // KeyPackages, has not added its members yet, and a disband or block
+        // can still be undone.
+        let waiting = self.runtime.leave_in_progress(&group_id).unwrap_or(true)
+            || self
+                .runtime
+                .disbanding_in_progress(&group_id)
+                .unwrap_or(true)
+            || self
+                .runtime
+                .has_queued_outbound_intents(&group_id)
+                .unwrap_or(true)
+            || self
+                .runtime
+                .pending_reinvites()
+                .map(|reinvites| reinvites.iter().any(|record| record.group_id == group_id))
+                .unwrap_or(true)
+            || self
+                .app
+                .account_storage(&self.state.label)
+                .and_then(|storage| {
+                    Ok(storage
+                        .app_storage()
+                        .direct_conversation_has_blocked_user(group_id_hex)?)
+                })
+                .unwrap_or(true);
+        if waiting {
+            PushSnapshotState::NotYet
+        } else {
+            PushSnapshotState::Due
         }
     }
 
@@ -672,11 +712,13 @@ impl AppClient {
                 PushSnapshotState::Void => true,
                 PushSnapshotState::Due => match self.send_push_snapshot(&group_id_hex).await {
                     Ok(()) => true,
+                    // The group's state changed since it was checked; the
+                    // next check settles or sends the snapshot.
                     Err(
                         AppError::GroupRemoved(_)
                         | AppError::GroupDisbanding(_)
                         | AppError::UserBlocked,
-                    ) => true,
+                    ) => false,
                     Err(error) => {
                         tracing::warn!(
                             target: "marmot_app::notifications",

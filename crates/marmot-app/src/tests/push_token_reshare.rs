@@ -188,6 +188,28 @@ pub(super) struct Fixture {
 
 impl Fixture {
     pub(super) async fn new() -> Self {
+        Self::with_app(app_at).await
+    }
+
+    /// The fixture whose devices wait `ms` for a group's Commits to settle,
+    /// so a Commit received from a peer holds back this device's own.
+    pub(super) async fn with_settlement_quiescence_ms(ms: u64) -> Self {
+        Self::with_app(|dir, relay| {
+            MarmotApp::with_relay_and_config(
+                dir.path(),
+                RELAY,
+                MarmotAppConfig::white_noise()
+                    .with_dev_settlement_quiescence_ms(ms)
+                    .with_dev_scheduled_convergence_delay_ms(0),
+            )
+            .with_test_relay_client(relay)
+        })
+        .await
+    }
+
+    async fn with_app(
+        app_at: impl FnOnce(&tempfile::TempDir, Arc<ScriptedPushRelayClient>) -> MarmotApp,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
         let relay = Arc::new(ScriptedPushRelayClient::default());

@@ -15,8 +15,8 @@
   them, so a new member learns the tokens of members who are offline. Lists
   are split so each published group message fits 64 KiB with at most 32
   entries. A device that holds neither sends nothing. The owed snapshot is
-  recorded before the Commit publishes, so a restart still sends it, and a
-  Commit that rolls back owes none.
+  recorded before the invite's Commit is staged or queued, so a restart still
+  sends it once the Commit merges, and a Commit that rolls back owes none.
 
 ### Changed
 

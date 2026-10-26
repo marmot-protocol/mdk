@@ -286,9 +286,9 @@ async fn device_that_holds_nothing_sends_no_snapshot() {
     assert_eq!(owed(&fx.alice, &group_hex), None);
 }
 
-/// The owed snapshot and the Welcome intents are recorded together before the
-/// Commit is exposed: when either write fails, the other is undone and the
-/// Commit rolls back.
+/// The owed snapshot is recorded before the Commit is staged, and undone when
+/// the Welcome intents then fail to record and the Commit rolls back. Either
+/// failure leaves the earlier owed snapshot as it was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_invite_persistence_leaves_the_owed_snapshot_as_it_was() {
     let mut fx = Fixture::new().await;
@@ -352,8 +352,8 @@ async fn rejected_commit_owes_no_snapshot() {
     assert_eq!(group_message_count(&relay), before);
 }
 
-/// A merged member add by this account owes a snapshot even without an invite
-/// command, as when convergence commits a queued invite; a failed write is
+/// A merged member add by this account records the epoch its Commit started
+/// from, which a queued invite cannot know in advance; a failed write is
 /// retried. Another member's add owes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn own_member_add_event_owes_a_snapshot() {
@@ -398,4 +398,189 @@ async fn own_member_add_event_owes_a_snapshot() {
     assert!(fx.alice.client.take_queued_push_registration_share());
     assert!(fx.alice.client.pending_own_add_push_snapshots.is_empty());
     assert!(fx.alice.client.has_pending_push_registration_work());
+}
+
+/// A queued invite owes its snapshot from the invite command on, so the
+/// snapshot is sent after a restart even when the device never observed the
+/// merge of the Commit that convergence made from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_invite_owes_a_snapshot_across_a_restart() {
+    const QUIESCENCE_MS: u64 = 2_000;
+    let Fixture {
+        _dir,
+        relay,
+        group,
+        mut alice,
+        mut bob,
+        mut carol,
+        ..
+    } = Fixture::with_settlement_quiescence_ms(QUIESCENCE_MS).await;
+    let group_hex = hex::encode(group.as_slice());
+    // Bob's Commit opens a settlement window on Alice, which holds her invite
+    // back.
+    bob.client
+        .runtime
+        .send(cgka_traits::SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    alice.receive(&relay).await;
+    let epoch = current_epoch(&alice, &group);
+    alice
+        .client
+        .invite_members(&group, &[carol.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    assert!(
+        alice
+            .client
+            .runtime
+            .has_queued_outbound_intents(&group)
+            .unwrap()
+    );
+    assert_eq!(owed(&alice, &group_hex), Some(epoch));
+    let before = group_message_count(&relay);
+    assert!(!alice.client.send_owed_push_snapshots().await);
+    assert_eq!(
+        group_message_count(&relay),
+        before,
+        "the add has not merged"
+    );
+    assert_eq!(owed(&alice, &group_hex), Some(epoch));
+
+    // Convergence commits the queued invite below the app, whose projection
+    // never sees the merge.
+    tokio::time::sleep(Duration::from_millis(QUIESCENCE_MS + 200)).await;
+    alice
+        .client
+        .runtime
+        .advance_convergence(&group)
+        .await
+        .unwrap();
+    assert!(
+        !alice
+            .client
+            .runtime
+            .has_queued_outbound_intents(&group)
+            .unwrap()
+    );
+    assert!(current_epoch(&alice, &group) > epoch);
+    let app = alice.client.app.clone();
+    let (label, account_id_hex, cursor) = (
+        alice.label.clone(),
+        alice.account_id_hex.clone(),
+        alice.cursor,
+    );
+    drop(alice);
+
+    let mut alice = Device::open(&app, &label, &account_id_hex, cursor).await;
+    assert!(
+        !alice
+            .client
+            .retry_pending_push_registration_shares_best_effort()
+            .await
+    );
+    assert_eq!(owed(&alice, &group_hex), None);
+    carol.join(&relay, &group).await;
+    carol.receive(&relay).await;
+    assert!(
+        carol.token_leaves(&group).contains(&bob.leaf(&group)),
+        "the offline member's record arrived in the snapshot"
+    );
+    alice.receive(&relay).await;
+}
+
+/// A group that is not hydrated yet keeps its owed snapshot, which is sent
+/// once the group is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unhydrated_group_keeps_its_owed_snapshot() {
+    let Fixture {
+        _dir,
+        relay,
+        group,
+        mut alice,
+        bob,
+        mut carol,
+        ..
+    } = Fixture::new().await;
+    let group_hex = hex::encode(group.as_slice());
+    alice
+        .client
+        .invite_members(&group, &[carol.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    // Leave the snapshot as the only push work.
+    alice.client.share_push_registration().await.unwrap();
+    let app = alice.client.app.clone();
+    let (label, account_id_hex, cursor) = (
+        alice.label.clone(),
+        alice.account_id_hex.clone(),
+        alice.cursor,
+    );
+    drop(alice);
+
+    let plane = transport_nostr::MarmotRelayPlane::new(None, relay.clone());
+    let mut alice = app
+        .local_client_with_relay_plane_and_hydration(&label, &plane, None, true, None)
+        .await
+        .unwrap();
+    assert!(alice.runtime.epoch_state(&group).is_none());
+    let before = group_message_count(&relay);
+    assert!(!alice.send_owed_push_snapshots().await);
+    assert!(!alice.has_pending_push_registration_work());
+    assert_eq!(group_message_count(&relay), before);
+    assert!(
+        alice
+            .app
+            .group_push_snapshot_owed(&label, &group_hex)
+            .unwrap()
+            .is_some()
+    );
+
+    assert!(alice.runtime.ensure_group_hydrated(&group).unwrap());
+    assert!(
+        alice.has_pending_push_registration_work(),
+        "due once hydrated"
+    );
+    drop(alice);
+
+    let mut alice = Device::open(&app, &label, &account_id_hex, cursor).await;
+    assert!(!alice.client.send_owed_push_snapshots().await);
+    assert!(group_message_count(&relay) > before);
+    assert_eq!(owed(&alice, &group_hex), None);
+    carol.join(&relay, &group).await;
+    carol.receive(&relay).await;
+    assert!(carol.token_leaves(&group).contains(&bob.leaf(&group)));
+}
+
+/// A disband that is still in progress can fail and leave the group going, so
+/// it holds the owed snapshot back instead of settling it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disband_in_progress_keeps_the_owed_snapshot() {
+    let mut fx = Fixture::new().await;
+    let relay = fx.relay.clone();
+    let group = fx.group.clone();
+    let group_hex = fx.group_hex();
+    fx.alice
+        .client
+        .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    // Leave the snapshot as the only push work.
+    fx.alice.client.share_push_registration().await.unwrap();
+    fx.alice.client.disband_group(&group).await.unwrap();
+    assert!(
+        fx.alice
+            .client
+            .runtime
+            .disbanding_in_progress(&group)
+            .unwrap()
+    );
+
+    let before = group_message_count(&relay);
+    assert!(!fx.alice.client.send_owed_push_snapshots().await);
+    assert!(!fx.alice.client.has_pending_push_registration_work());
+    assert_eq!(group_message_count(&relay), before);
+    assert!(owed(&fx.alice, &group_hex).is_some());
 }

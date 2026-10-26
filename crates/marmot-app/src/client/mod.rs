@@ -2844,6 +2844,26 @@ impl AppClient {
         );
         self.tolerate_pre_send_sync_failure("invite_members", pre_send_sync)?;
 
+        // Record the push snapshot the added leaves are owed before the engine
+        // stages or queues their Commit, from an epoch no later than the one
+        // it starts from. A queued invite merges only when convergence drains
+        // it, possibly after a restart; a staged one is undone below if it
+        // never merges. The engine hydrates the group for the Commit anyway,
+        // and reports any hydration failure there.
+        let _ = self.runtime.ensure_group_hydrated(group_id);
+        let mut push_snapshot = match self.runtime.epoch_state(group_id) {
+            Some(state) => {
+                // A staged commit's state carries the epoch it will reach.
+                let after_epoch = if state.is_resolving_local_publish() {
+                    state.epoch().0.saturating_sub(1)
+                } else {
+                    state.epoch().0
+                };
+                Some(self.record_push_snapshot_owed(group_id, after_epoch)?)
+            }
+            None => None,
+        };
+
         let engine_publish_started_at = Instant::now();
         let commit = self
             .runtime
@@ -2857,8 +2877,17 @@ impl AppClient {
             )
             .await
             .map_err(AppError::from);
+        let adds_leaves = match &commit {
+            Ok(PreparedSessionSend::Commit(prepared)) => !prepared.welcomes().is_empty(),
+            Ok(PreparedSessionSend::Queued(_)) => true,
+            Err(_) => false,
+        };
+        if !adds_leaves && let Some(snapshot) = push_snapshot.take() {
+            self.restore_push_snapshot_owed(snapshot);
+        }
         let prepared = match commit {
             Ok(PreparedSessionSend::Commit(prepared)) => prepared,
+            // The owed snapshot waits for the queued Commit to merge.
             Ok(PreparedSessionSend::Queued(session_effects)) => {
                 let queued = self
                     .runtime
@@ -2886,12 +2915,6 @@ impl AppClient {
                 return Err(error);
             }
         };
-        // The invite is staged locally but not canonical yet. Record the push
-        // snapshot the added leaves are owed once it merges, then every Welcome
-        // destination atomically, before exposing the commit; if either
-        // persistence fails, undo the other and roll back the staged MLS change,
-        // returning the original error so a retry cannot create phantom local
-        // membership.
         // A staged commit's state carries the epoch it will reach.
         let source_epoch = match self.runtime.epoch_state(group_id) {
             Some(cgka_traits::EpochState::PendingPublish(pending)) => {
@@ -2899,38 +2922,25 @@ impl AppClient {
             }
             _ => None,
         };
-        let push_snapshot = match source_epoch {
-            Some(source_epoch) if !prepared.welcomes().is_empty() => self
-                .record_push_snapshot_owed(group_id, source_epoch)
-                .map(Some),
-            _ => Ok(None),
+        // The invite is staged locally but not canonical yet. Record every
+        // Welcome destination atomically before exposing the commit; if that
+        // persistence fails, roll back the staged MLS change and return the
+        // original error so a retry cannot create phantom local membership.
+        let welcome_intent_result = if cfg!(feature = "test-policy-overrides")
+            && self.app.config.dev_fail_invite_welcome_intent
+        {
+            Err(AppError::Publish(
+                "injected invite welcome intent failure".into(),
+            ))
+        } else {
+            self.record_welcome_delivery_intents(group_id, prepared.welcomes())
         };
-        let welcome_intent_result = match push_snapshot {
-            Ok(push_snapshot) => {
-                let welcome_intents = if cfg!(feature = "test-policy-overrides")
-                    && self.app.config.dev_fail_invite_welcome_intent
-                {
-                    Err(AppError::Publish(
-                        "injected invite welcome intent failure".into(),
-                    ))
-                } else {
-                    self.record_welcome_delivery_intents(group_id, prepared.welcomes())
-                };
-                match welcome_intents {
-                    Ok(welcome_intents) => Ok((welcome_intents, push_snapshot)),
-                    Err(error) => {
-                        if let Some(push_snapshot) = push_snapshot {
-                            self.restore_push_snapshot_owed(push_snapshot);
-                        }
-                        Err(error)
-                    }
-                }
-            }
-            Err(error) => Err(error),
-        };
-        let (welcome_intents, push_snapshot) = match welcome_intent_result {
-            Ok(staged) => staged,
+        let welcome_intents = match welcome_intent_result {
+            Ok(welcome_intents) => welcome_intents,
             Err(error) => {
+                if let Some(snapshot) = push_snapshot {
+                    self.restore_push_snapshot_owed(snapshot);
+                }
                 let rollback = self
                     .runtime
                     .rollback_prepared_session_commit(prepared)
