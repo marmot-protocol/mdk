@@ -375,13 +375,19 @@ async fn send_connection_reuse() {
             observed_triggers >= minimum_triggers,
             "expected at least {minimum_triggers} triggers, got {observed_triggers}"
         );
+        let mut contents = std::collections::HashSet::new();
         for event in events {
             let gift = nostr::nips::nip59::extract_rumor(&push_server, &event).unwrap();
             assert_eq!(gift.rumor.kind, Kind::Custom(446));
+            let content = BASE64_STANDARD.decode(&gift.rumor.content).unwrap();
             assert_eq!(
-                BASE64_STANDARD.decode(&gift.rumor.content).unwrap().len(),
-                marmot_app::PUSH_ENCRYPTED_TOKEN_LEN,
-                "each trigger carries the peer's single encrypted token"
+                content.len(),
+                2 * marmot_app::PUSH_ENCRYPTED_TOKEN_LEN,
+                "each trigger carries the peer's single encrypted token and one padding chunk"
+            );
+            assert!(
+                contents.insert(Sha256::digest(&content)),
+                "repeat triggers must not share content-hash dedup keys"
             );
         }
         eprintln!("push_summary minimum={minimum_triggers} verified={observed_triggers}");

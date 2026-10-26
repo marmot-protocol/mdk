@@ -5,6 +5,7 @@ use nostr_relay_builder::builder::{RateLimit, RelayBuilderNip42, RelayBuilderNip
 use nostr_relay_builder::prelude::{BoxedFuture, PolicyResult, WritePolicy};
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{Client, Event, Filter, Keys, Kind};
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -124,6 +125,7 @@ async fn push_batch_case(
     reader.add_relay(&url).await.unwrap();
     reader.connect().await;
     let mut known = std::collections::HashSet::new();
+    let mut contents = std::collections::HashSet::new();
     let mut samples = Vec::with_capacity(repeats);
     for _ in 0..repeats {
         let started = Instant::now();
@@ -140,13 +142,15 @@ async fn push_batch_case(
         .expect("notification publication exceeded its deadline");
         samples.push(started.elapsed().as_secs_f64() * 1000.0);
         let mut expected = expected.clone();
-        let mut expected_chunks = tokens.div_ceil(19);
+        let mut expected_chunks = tokens.div_ceil(18);
         if matches!(mode, PushRelay::RejectFirstChunk) {
             assert!(result.is_err(), "the rejected chunk must be reported");
             let rejected = rejection.0.get().unwrap();
             let gift = nostr::nips::nip59::extract_rumor(&server, rejected).unwrap();
             let content = BASE64_STANDARD.decode(gift.rumor.content).unwrap();
-            for token in content.chunks_exact(notifications::PUSH_ENCRYPTED_TOKEN_LEN) {
+            let (real, _) =
+                content.split_at(content.len() - notifications::PUSH_ENCRYPTED_TOKEN_LEN);
+            for token in real.chunks_exact(notifications::PUSH_ENCRYPTED_TOKEN_LEN) {
                 assert!(expected.remove(token));
             }
             expected_chunks -= 1;
@@ -176,7 +180,18 @@ async fn push_batch_case(
             let content = BASE64_STANDARD.decode(&gift.rumor.content).unwrap();
             assert_eq!(content.len() % notifications::PUSH_ENCRYPTED_TOKEN_LEN, 0);
             assert!(content.len() <= 19 * notifications::PUSH_ENCRYPTED_TOKEN_LEN);
-            for token in content.chunks_exact(notifications::PUSH_ENCRYPTED_TOKEN_LEN) {
+            assert!(
+                contents.insert(Sha256::digest(&content)),
+                "trigger content repeats, so content-hash dedup would drop it"
+            );
+            // Each wrap carries its real tokens and then one padding chunk.
+            let (real, padding) =
+                content.split_at(content.len() - notifications::PUSH_ENCRYPTED_TOKEN_LEN);
+            assert!(
+                !expected.contains(padding),
+                "padding must not be a real token"
+            );
+            for token in real.chunks_exact(notifications::PUSH_ENCRYPTED_TOKEN_LEN) {
                 assert!(actual.insert(token.to_vec()), "recipient appears twice");
             }
         }
@@ -196,11 +211,18 @@ async fn push_batch_case(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn push_batch_delivery() {
-    for tokens in [0, 19, 20, 128] {
+    for tokens in [0, 18, 19, 128] {
         push_batch_case(tokens, PushRelay::LiveSubscriptions, 1, None).await;
     }
     push_batch_case(128, PushRelay::StoppedSubscriptions, 1, None).await;
     push_batch_case(33, PushRelay::Authenticated, 1, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn push_repeat_triggers_differ() {
+    for tokens in [1, 19] {
+        push_batch_case(tokens, PushRelay::LiveSubscriptions, 2, None).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -226,7 +248,7 @@ async fn push_batch_scaling() {
         ("live_subscriptions", PushRelay::LiveSubscriptions),
         ("stopped_subscriptions", PushRelay::StoppedSubscriptions),
     ] {
-        for tokens in [0, 19, 20, 32, 33, 128, 512] {
+        for tokens in [0, 18, 19, 32, 33, 128, 512] {
             let samples = push_batch_case(tokens, mode, 9, endpoint.as_deref()).await;
             let mut measured = samples[1..].to_vec();
             measured.sort_by(f64::total_cmp);

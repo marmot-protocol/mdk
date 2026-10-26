@@ -582,7 +582,7 @@ impl AppClient {
                 .into_iter()
                 .map(|record| record.encrypted_token)
                 .collect::<Vec<_>>();
-            let mut chunks = notifications::notification_trigger_chunks(&encrypted_tokens);
+            let mut chunks = notifications::padded_notification_trigger_chunks(&encrypted_tokens);
             let server = &server_pubkey_hex;
             let endpoints = &endpoints;
             let fallback = fallback.as_ref();
@@ -594,7 +594,7 @@ impl AppClient {
                     let Some(chunk) = chunks.next() else { break };
                     publishes.push(async move {
                         let event =
-                            notifications::build_notification_gift_wrap(server, chunk).await?;
+                            notifications::build_notification_gift_wrap(server, &chunk).await?;
                         let observation = self.app.product_analytics.begin(
                             crate::ProductFamily::Notification,
                             "trigger",

@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- Push triggers carry one fresh random padding chunk per gift wrap
+  (mdk#2605). Senders reuse each recipient's stored token ciphertext, so
+  repeat triggers to the same recipients were byte-identical and
+  notification servers dropped all but the first in their ~5-minute
+  content-hash dedup window. Each gift wrap now holds at most 18 real tokens
+  plus the padding chunk.
+
 - The OpenMLS RustCrypto provider moves to the elliptic-curve 0.14 crates
   (crypto-bigint 0.7.6) and HPKE 0.8, fixing RUSTSEC-2026-0387. MDK's single
   X25519/Ed25519 ciphersuite never ran the affected arithmetic on secret data.

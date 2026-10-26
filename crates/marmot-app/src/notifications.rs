@@ -1063,8 +1063,21 @@ pub fn build_notification_rumor_content(tokens: &[Vec<u8>]) -> Result<String, Ap
     Ok(BASE64_STANDARD.encode(joined))
 }
 
-pub(crate) fn notification_trigger_chunks(tokens: &[Vec<u8>]) -> std::slice::Chunks<'_, Vec<u8>> {
-    tokens.chunks(PUSH_GIFT_WRAP_TOKEN_LIMIT)
+/// Splits a trigger's tokens into gift-wrap chunks, each ending in one fresh
+/// CSPRNG padding chunk. Stored token ciphertexts repeat across triggers and
+/// servers dedup on the decoded content hash, so an unpadded repeat trigger to
+/// the same tokens would be dropped as a replay.
+pub(crate) fn padded_notification_trigger_chunks(
+    tokens: &[Vec<u8>],
+) -> impl Iterator<Item = Vec<Vec<u8>>> + '_ {
+    tokens.chunks(PUSH_GIFT_WRAP_TOKEN_LIMIT - 1).map(|chunk| {
+        let mut padding = vec![0_u8; PUSH_ENCRYPTED_TOKEN_LEN];
+        OsRng.fill_bytes(&mut padding);
+        let mut padded = Vec::with_capacity(chunk.len() + 1);
+        padded.extend_from_slice(chunk);
+        padded.push(padding);
+        padded
+    })
 }
 
 pub async fn build_notification_gift_wrap(

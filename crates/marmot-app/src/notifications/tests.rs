@@ -269,8 +269,8 @@ async fn push_chunks_round_trip_at_wire_size_boundary() {
 
     let mut received = Vec::new();
     let mut chunk_sizes = Vec::new();
-    for chunk in notification_trigger_chunks(&tokens) {
-        let wrap = build_notification_gift_wrap(&server.public_key().to_hex(), chunk)
+    for chunk in padded_notification_trigger_chunks(&tokens) {
+        let wrap = build_notification_gift_wrap(&server.public_key().to_hex(), &chunk)
             .await
             .unwrap();
         let event = wrap.to_verified_nostr_event().unwrap();
@@ -283,10 +283,43 @@ async fn push_chunks_round_trip_at_wire_size_boundary() {
         let content = BASE64_STANDARD.decode(gift.rumor.content).unwrap();
         assert_eq!(content.len() % PUSH_ENCRYPTED_TOKEN_LEN, 0);
         chunk_sizes.push(content.len() / PUSH_ENCRYPTED_TOKEN_LEN);
-        received.extend(content);
+        let (real, padding) = content.split_at(content.len() - PUSH_ENCRYPTED_TOKEN_LEN);
+        assert!(!tokens.iter().any(|token| token == padding));
+        received.extend_from_slice(real);
     }
-    assert_eq!(chunk_sizes, [19, 1]);
+    // 18 real tokens plus one padding chunk fill the 19-chunk wire limit.
+    assert_eq!(chunk_sizes, [19, 3]);
     assert_eq!(received, tokens.concat());
+}
+
+#[test]
+fn trigger_padding_is_fresh_per_send_and_never_decrypts() {
+    let secret = server_secret();
+    let token = encrypted_push_token(
+        PushPlatform::Fcm,
+        b"opaque-fcm-token",
+        &server_pubkey_hex(&secret),
+    )
+    .unwrap();
+    let tokens = vec![token.clone()];
+    let first = padded_notification_trigger_chunks(&tokens).collect::<Vec<_>>();
+    let second = padded_notification_trigger_chunks(&tokens).collect::<Vec<_>>();
+    for chunks in [&first, &second] {
+        assert_eq!(chunks.len(), 1);
+        let [real, padding] = chunks[0].as_slice() else {
+            panic!("one real token and one padding chunk");
+        };
+        assert_eq!(real, &token);
+        assert!(decrypt_push_token_for_test(real, &secret).is_ok());
+        assert_eq!(padding.len(), PUSH_ENCRYPTED_TOKEN_LEN);
+        assert!(decrypt_push_token_for_test(padding, &secret).is_err());
+    }
+    // Servers dedup triggers on the decoded content's SHA-256.
+    let digest = |chunks: &[Vec<Vec<u8>>]| {
+        let content = build_notification_rumor_content(&chunks[0]).unwrap();
+        Sha256::digest(BASE64_STANDARD.decode(content).unwrap())
+    };
+    assert_ne!(digest(&first), digest(&second));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
