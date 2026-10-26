@@ -734,9 +734,14 @@ pub struct AppClient {
     pub(crate) send_telemetry: Option<AppPerformanceTelemetry>,
     pub(crate) app: MarmotApp,
     pub(crate) runtime: AppRuntime,
+    /// This client's own clone of the engine's connection, for storage-only
+    /// work the app schedules: the draft-commit observer and legacy message
+    /// promotion. It shares the engine's close state.
+    pub(crate) engine_storage: storage_sqlite::SqliteAccountStorage,
     pub(crate) maintenance_observation_generation: Option<crate::DiagnosticsPermit>,
     // Struct fields drop in declaration order. Keep the engine-owning runtime
-    // before this guard so ownership is released only after engine teardown.
+    // and the engine connection before this guard so ownership is released
+    // only after engine teardown.
     pub(crate) _session_guard: crate::AppAccountSessionGuard,
     pub(crate) adapter: MarmotRelayPlaneAccountAdapter,
     pub(crate) routing: AppTransportRouting,
@@ -1610,11 +1615,7 @@ impl AppClient {
             // Only the group's obligations: the full status also decodes every
             // transport fanout in the account, which made this loop quadratic
             // in the number of groups (mdk#2110).
-            let obligations = match self
-                .runtime
-                .session()
-                .maintenance_obligations_for_group(&group_id)
-            {
+            let obligations = match self.runtime.maintenance_obligations_for_group(&group_id) {
                 Ok(obligations) => obligations,
                 Err(_error) => {
                     tracing::warn!(
@@ -2101,7 +2102,6 @@ impl AppClient {
         };
         let requirements = self
             .runtime
-            .session()
             .create_key_package_requirements(&request)
             .map_err(cgka_session::SessionError::from)?;
         let key_package_started_at = Instant::now();
@@ -2267,7 +2267,7 @@ impl AppClient {
         let founding_probe = (self.audit_v5_enabled() || cfg!(test))
             .then_some(())
             .and_then(|()| {
-                (self.runtime.session().new_protocol_profile() == ProtocolProfile::Current)
+                (self.runtime.new_protocol_profile() == ProtocolProfile::Current)
                     .then(|| {
                         self.audit_v5_probe
                             .as_mut()
@@ -2779,7 +2779,6 @@ impl AppClient {
         let key_package_started_at = Instant::now();
         let requirements = self
             .runtime
-            .session()
             .invite_key_package_requirements(group_id)
             .map_err(cgka_session::SessionError::from)?;
         let key_packages = self
@@ -4564,7 +4563,7 @@ impl AppClient {
         }
         let _draft_guard = if let Some((revision, _)) = draft {
             let storage = self.app.draft_storage(&self.state.label)?;
-            self.runtime.session().set_message_draft_commit_observer(
+            self.engine_storage.set_message_draft_commit_observer(
                 self.app.draft_commit_observer(&self.state.label),
             );
             storage

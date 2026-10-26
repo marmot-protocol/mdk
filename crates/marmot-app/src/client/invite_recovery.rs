@@ -54,7 +54,6 @@ impl AppClient {
         let group = self.runtime.group_record(group_id)?;
         let rejoin_invitations = self
             .runtime
-            .session()
             .pending_group_rejoins_for(group_id)?
             .into_iter()
             .filter_map(|candidate| {
@@ -66,7 +65,7 @@ impl AppClient {
                 })
             })
             .collect();
-        let records = self.runtime.session().reinvite_recovery_records()?;
+        let records = self.runtime.reinvite_recovery_records()?;
         let mut pending_reinvites = 0u32;
         let mut failed_reinvites = 0u32;
         for record in records.iter().filter(|record| &record.group_id == group_id) {
@@ -75,7 +74,6 @@ impl AppClient {
                 for package in key_packages {
                     let metadata = self
                         .runtime
-                        .session()
                         .key_package_metadata(package)
                         .map_err(cgka_session::SessionError::from)?;
                     missing |= !group.members.iter().any(|member| {
@@ -115,11 +113,7 @@ impl AppClient {
         welcome_id: &cgka_traits::MessageId,
         token: &[u8],
     ) -> Result<crate::GroupRecoveryStatus, AppError> {
-        let group_id = self
-            .runtime
-            .session_mut()
-            .confirm_group_rejoin(welcome_id, token)
-            .await?;
+        let group_id = self.runtime.confirm_group_rejoin(welcome_id, token).await?;
         // GroupJoined is durably journaled by the engine, so a failed app
         // projection refresh is repaired by the ordinary reopen/drain path.
         let summary = self.drain_pending_session_events().await?;
@@ -145,9 +139,7 @@ impl AppClient {
             .ok_or(AppError::Session(cgka_session::SessionError::Engine(
                 cgka_traits::EngineError::InvalidWelcome,
             )))?;
-        self.runtime
-            .session_mut()
-            .decline_group_rejoin(welcome_id)?;
+        self.runtime.decline_group_rejoin(welcome_id)?;
         self.mark_recovery_status_changed(&candidate.group_id);
         Ok(())
     }
@@ -164,7 +156,7 @@ impl AppClient {
                     sender,
                     epoch,
                     ..
-                } if sender != &self.runtime.session().self_id()
+                } if sender != &self.runtime.self_id()
                     && self
                         .runtime
                         .group_record(group_id)
@@ -206,19 +198,14 @@ impl AppClient {
         {
             return Ok(());
         }
-        if self
-            .runtime
-            .session_mut()
-            .retry_rejoins_after_trusted_removal()
-            .await?
-        {
+        if self.runtime.retry_rejoins_after_trusted_removal().await? {
             let summary = self.drain_pending_session_events().await?;
             self.pending_applied_sync_summary.merge(summary);
         }
         let now_ms = super::sync::epoch_stall_now_ms();
         // One bounded lookup per seam; reserve before await so cancellations,
         // restarts and relay failures cannot spin or lose the original intent.
-        for record in self.runtime.session().pending_reinvites()? {
+        for record in self.runtime.pending_reinvites()? {
             if record
                 .reinvite
                 .as_ref()
@@ -226,16 +213,11 @@ impl AppClient {
             {
                 continue;
             }
-            if !self
-                .runtime
-                .session_mut()
-                .ensure_group_hydrated(&record.group_id)?
-            {
+            if !self.runtime.ensure_group_hydrated(&record.group_id)? {
                 continue;
             }
             if !self
                 .runtime
-                .session_mut()
                 .reserve_reinvite_lookup(&record.commit_id, now_ms)?
             {
                 if record
@@ -273,7 +255,6 @@ impl AppClient {
             for package in key_packages {
                 let metadata = self
                     .runtime
-                    .session()
                     .key_package_metadata(package)
                     .map_err(cgka_session::SessionError::from)?;
                 if !group.as_ref().is_some_and(|group| {
@@ -290,7 +271,6 @@ impl AppClient {
                 } else {
                     let requirements = match self
                         .runtime
-                        .session()
                         .invite_key_package_requirements(&record.group_id)
                     {
                         Ok(requirements) => requirements,
@@ -315,7 +295,6 @@ impl AppClient {
                 };
             match self
                 .runtime
-                .session_mut()
                 .reissue_invite_with_key_packages(&record.commit_id, packages)
             {
                 Ok(Some(report)) => {

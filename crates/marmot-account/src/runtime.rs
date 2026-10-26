@@ -13,8 +13,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cgka_session::{
-    AccountDeviceSession, CreateGroupEffects, IngestEffects, PublishWork, QueuedIntentRef,
-    SessionEffects, SessionError,
+    AccountDeviceSession, CanonicalGroupMembership, CreateGroupEffects, GroupAuthorityView,
+    HydrationProgress, IngestEffects, KeyPackageMetadata, KeyPackageRequirements, PublishWork,
+    QueuedIntentRef, SessionConfig, SessionEffects, SessionError, SessionOpenTimings,
+    SessionResult,
 };
 use cgka_traits::AppComponentId;
 use cgka_traits::engine::{
@@ -404,7 +406,7 @@ impl MaintenanceActivity {
     }
 }
 type PublicationProgressObserver =
-    Arc<dyn Fn(&AccountDeviceSession, &PublishedApplicationMessage) + Send + Sync>;
+    Arc<dyn Fn(GroupAuthorityView<'_>, &PublishedApplicationMessage) + Send + Sync>;
 type SecondaryRetryYield = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
 #[derive(Clone)]
 struct PublicationProgress {
@@ -465,7 +467,39 @@ where
     R: TransportRoutingPolicy,
     K: KeyPackagePublisher,
 {
+    /// Open the account-device session from `config`, then build the
+    /// transport half with `transport`, which runs only once the session is
+    /// open, and drive the session over it. This is the only production way
+    /// in: the host reaches the session through this runtime's methods.
+    ///
+    /// The session opens first because a host's transport can have effects
+    /// when it is built, such as registering the account's delivery route; a
+    /// failed open must not leave them behind.
+    pub fn open<E>(
+        config: SessionConfig,
+        transport: impl FnOnce() -> Result<(A, R, K), E>,
+    ) -> Result<Self, E>
+    where
+        E: From<SessionError>,
+    {
+        let session = AccountDeviceSession::open(config)?;
+        let (adapter, routing, key_packages) = transport()?;
+        Ok(Self::with_session(session, adapter, routing, key_packages))
+    }
+
+    /// Drive a session the caller opened. Tests open the session themselves
+    /// to set up scenarios.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(session: AccountDeviceSession, adapter: A, routing: R, key_packages: K) -> Self {
+        Self::with_session(session, adapter, routing, key_packages)
+    }
+
+    fn with_session(
+        session: AccountDeviceSession,
+        adapter: A,
+        routing: R,
+        key_packages: K,
+    ) -> Self {
         Self {
             audit: session.audit_recorder().clone(),
             session,
@@ -518,10 +552,14 @@ where
         self.maintenance_timing
     }
 
+    /// The session itself, for tests that drive it directly.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn session(&self) -> &AccountDeviceSession {
         &self.session
     }
 
+    /// The session itself, for tests that drive it directly.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn session_mut(&mut self) -> &mut AccountDeviceSession {
         &mut self.session
     }
@@ -696,6 +734,143 @@ where
         Ok(self
             .session
             .current_safe_export_epoch(group_id, component_id)?)
+    }
+
+    /// The one view of the session lent to code the host hands it to, such
+    /// as the publication-progress observer and conversation-window captures.
+    pub fn group_authority_view(&self) -> GroupAuthorityView<'_> {
+        self.session.group_authority_view()
+    }
+
+    pub fn self_id(&self) -> MemberId {
+        self.session.self_id()
+    }
+
+    pub fn open_timings(&self) -> &SessionOpenTimings {
+        self.session.open_timings()
+    }
+
+    pub fn unhydrated_group_ids(&self) -> Vec<GroupId> {
+        self.session.unhydrated_group_ids()
+    }
+
+    pub fn ensure_group_hydrated(&mut self, group_id: &GroupId) -> SessionResult<bool> {
+        self.session.ensure_group_hydrated(group_id)
+    }
+
+    pub fn hydrate_next_groups(
+        &mut self,
+        order: &[GroupId],
+        budget: usize,
+    ) -> SessionResult<HydrationProgress> {
+        self.session.hydrate_next_groups(order, budget)
+    }
+
+    pub fn key_package_metadata(
+        &self,
+        key_package: &KeyPackage,
+    ) -> Result<KeyPackageMetadata, EngineError> {
+        self.session.key_package_metadata(key_package)
+    }
+
+    pub fn invite_key_package_requirements(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<KeyPackageRequirements, EngineError> {
+        self.session.invite_key_package_requirements(group_id)
+    }
+
+    pub fn create_key_package_requirements(
+        &self,
+        request: &CreateGroupRequest,
+    ) -> Result<KeyPackageRequirements, EngineError> {
+        self.session.create_key_package_requirements(request)
+    }
+
+    pub fn maintenance_obligations_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Vec<MaintenanceObligation>> {
+        self.session.maintenance_obligations_for_group(group_id)
+    }
+
+    pub fn canonical_group_membership(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<CanonicalGroupMembership> {
+        self.session.canonical_group_membership(group_id)
+    }
+
+    pub fn leave_in_progress(&self, group_id: &GroupId) -> Result<bool, EngineError> {
+        self.session.leave_in_progress(group_id)
+    }
+
+    pub fn outbound_fanouts(&self) -> SessionResult<Vec<OutboundFanout>> {
+        self.session.outbound_fanouts()
+    }
+
+    pub fn outbound_fanouts_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Vec<OutboundFanout>> {
+        self.session.outbound_fanouts_for_group(group_id)
+    }
+
+    pub fn put_outbound_fanout(&self, fanout: &OutboundFanout) -> SessionResult<()> {
+        self.session.put_outbound_fanout(fanout)
+    }
+
+    pub async fn retry_rejoins_after_trusted_removal(&mut self) -> SessionResult<bool> {
+        self.session.retry_rejoins_after_trusted_removal().await
+    }
+
+    pub fn pending_group_rejoins_for(
+        &self,
+        group_id: &GroupId,
+    ) -> SessionResult<Vec<cgka_traits::welcome::PendingWelcome>> {
+        self.session.pending_group_rejoins_for(group_id)
+    }
+
+    pub async fn confirm_group_rejoin(
+        &mut self,
+        welcome_id: &cgka_traits::MessageId,
+        token: &[u8],
+    ) -> SessionResult<GroupId> {
+        self.session.confirm_group_rejoin(welcome_id, token).await
+    }
+
+    pub fn decline_group_rejoin(
+        &mut self,
+        welcome_id: &cgka_traits::MessageId,
+    ) -> SessionResult<()> {
+        self.session.decline_group_rejoin(welcome_id)
+    }
+
+    pub fn reinvite_recovery_records(
+        &self,
+    ) -> SessionResult<Vec<cgka_traits::storage::OwnCommitIntent>> {
+        self.session.reinvite_recovery_records()
+    }
+
+    pub fn pending_reinvites(&self) -> SessionResult<Vec<cgka_traits::storage::OwnCommitIntent>> {
+        self.session.pending_reinvites()
+    }
+
+    pub fn reserve_reinvite_lookup(
+        &mut self,
+        commit_id: &cgka_traits::MessageId,
+        now_ms: u64,
+    ) -> SessionResult<bool> {
+        self.session.reserve_reinvite_lookup(commit_id, now_ms)
+    }
+
+    pub fn reissue_invite_with_key_packages(
+        &mut self,
+        commit_id: &cgka_traits::MessageId,
+        packages: Vec<KeyPackage>,
+    ) -> SessionResult<Option<SupersededIntentReport>> {
+        self.session
+            .reissue_invite_with_key_packages(commit_id, packages)
     }
 
     pub async fn activate_transport(&self, since: Option<Timestamp>) -> AccountResult<()> {
@@ -3353,7 +3528,7 @@ where
             .clone();
         if let Some(observer) = observer {
             (observer.observe)(
-                &self.session,
+                self.session.group_authority_view(),
                 output
                     .published_app_messages
                     .last()

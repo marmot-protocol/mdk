@@ -409,7 +409,6 @@ impl AppClient {
     ) -> Result<(), AppError> {
         if self
             .runtime
-            .session()
             .leave_in_progress(group_id)
             .map_err(cgka_session::SessionError::from)?
         {
@@ -793,10 +792,7 @@ impl AppClient {
         if record.removed || record.disbanded.is_some() {
             return Ok(());
         }
-        let membership = self
-            .runtime
-            .session()
-            .canonical_group_membership(group_id)?;
+        let membership = self.runtime.canonical_group_membership(group_id)?;
         self.app.reconcile_group_push_token_leaves(
             &self.state.label,
             &hex::encode(group_id.as_slice()),

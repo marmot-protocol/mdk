@@ -3617,6 +3617,7 @@ dependencies = [
  "hex",
  "keyring-core",
  "libc",
+ "marmot-account",
  "marmot-forensics",
  "nostr 0.45.5",
  "rand 0.8.6",

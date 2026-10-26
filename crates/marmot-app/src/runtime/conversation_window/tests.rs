@@ -2236,7 +2236,7 @@ async fn publication_checkpoint_refreshes_epoch_and_dirty_rows_without_reviving_
     let observers = vec![Arc::downgrade(&observer)];
     publish_conversation_captures_from_session(
         &observers,
-        client.runtime.session(),
+        client.runtime.group_authority_view(),
         &f.app,
         "alice",
         &f.group,
@@ -2266,7 +2266,7 @@ async fn publication_checkpoint_refreshes_epoch_and_dirty_rows_without_reviving_
     ));
     publish_conversation_captures_from_session(
         &observers,
-        client.runtime.session(),
+        client.runtime.group_authority_view(),
         &f.app,
         "alice",
         &f.group,
@@ -2289,7 +2289,7 @@ async fn publication_checkpoint_refreshes_epoch_and_dirty_rows_without_reviving_
         .unwrap();
     publish_conversation_captures_from_session(
         &observers,
-        client.runtime.session(),
+        client.runtime.group_authority_view(),
         &f.app,
         "alice",
         &f.group,
@@ -2310,7 +2310,7 @@ async fn publication_checkpoint_refreshes_epoch_and_dirty_rows_without_reviving_
     ));
     publish_conversation_captures_from_session(
         &[Arc::downgrade(&wrong_store)],
-        client.runtime.session(),
+        client.runtime.group_authority_view(),
         &f.app,
         "alice",
         &f.group,
@@ -2331,7 +2331,7 @@ async fn publication_checkpoint_refreshes_epoch_and_dirty_rows_without_reviving_
     f.add(3);
     publish_conversation_captures_from_session(
         &observers,
-        cold.runtime.session(),
+        cold.runtime.group_authority_view(),
         &f.app,
         "alice",
         &f.group,

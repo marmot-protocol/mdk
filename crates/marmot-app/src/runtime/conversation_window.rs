@@ -252,7 +252,7 @@ impl AppClient {
             .retain(|capture| capture.strong_count() > 0);
         publish_conversation_captures_from_session(
             &self.conversation_captures,
-            self.runtime.session(),
+            self.runtime.group_authority_view(),
             &self.app,
             &self.state.label,
             group,
@@ -264,7 +264,7 @@ impl AppClient {
 /// closed windows across a network wait; each upgrade lasts one checkpoint.
 pub(crate) fn publish_conversation_captures_from_session(
     observers: &[Weak<SendCapture>],
-    session: &cgka_session::AccountDeviceSession,
+    view: cgka_session::GroupAuthorityView<'_>,
     app: &MarmotApp,
     label: &str,
     group: &GroupId,
@@ -295,7 +295,7 @@ pub(crate) fn publish_conversation_captures_from_session(
         // latest observers still require only their current-query capture.
         let latest = if latest_query != query {
             capture_conversation_from_session(
-                session,
+                view,
                 app,
                 label,
                 &observer.group,
@@ -308,7 +308,7 @@ pub(crate) fn publish_conversation_captures_from_session(
             None
         };
         if let Ok(captured) = capture_conversation_from_session(
-            session,
+            view,
             app,
             label,
             &observer.group,
@@ -334,7 +334,7 @@ pub(super) fn capture_conversation(
     epoch: &[u8],
 ) -> Result<CapturedConversation, ConversationWindowError> {
     capture_conversation_from_session(
-        client.runtime.session(),
+        client.runtime.group_authority_view(),
         &client.app,
         &client.state.label,
         group,
@@ -347,7 +347,7 @@ pub(super) fn capture_conversation(
 /// keyed read projection may be repaired locally outside that snapshot; cold
 /// engine authority never triggers hydration or uses cached permissions.
 fn capture_conversation_from_session(
-    session: &cgka_session::AccountDeviceSession,
+    view: cgka_session::GroupAuthorityView<'_>,
     app: &MarmotApp,
     label: &str,
     group: &GroupId,
@@ -356,7 +356,7 @@ fn capture_conversation_from_session(
 ) -> Result<CapturedConversation, ConversationWindowError> {
     let group_hex = hex::encode(group.as_slice());
     let capture = || {
-        session.with_group_authority_snapshot(group, |storage, authority| {
+        view.with_group_authority_snapshot(group, |storage, authority| {
             if storage
                 .app_storage()
                 .chat_presentation_version()?

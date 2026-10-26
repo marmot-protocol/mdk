@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use cgka_engine::{
     FeatureRegistry, canonicalization::CanonicalizationPolicy, key_package::key_package_metadata,
 };
-use cgka_session::{AccountDeviceSession, SessionConfig};
+use cgka_session::SessionConfig;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_QUIC_FANOUT_CAPABILITY, AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE,
     AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
@@ -1389,6 +1389,10 @@ struct KeyPackageRecord {
 
 struct OpenAppAccount {
     runtime: AppRuntime,
+    /// The app's own clone of the engine's connection, for the storage-only
+    /// work it schedules: the draft-commit observer and legacy message
+    /// promotion. Declared before the session guard, like the runtime.
+    engine_storage: SqliteAccountStorage,
     audit_v5_peel_slot: Arc<Mutex<client::audit_v5_probe::PeelSlot>>,
     session_guard: AppAccountSessionGuard,
     adapter: MarmotRelayPlaneAccountAdapter,
@@ -1998,6 +2002,7 @@ impl MarmotApp {
             app: self.clone(),
             maintenance_observation_generation: self.product_analytics.permit(),
             runtime: open.runtime,
+            engine_storage: open.engine_storage,
             _session_guard: open.session_guard,
             adapter: open.adapter,
             routing: open.routing,
@@ -4659,7 +4664,7 @@ impl MarmotApp {
         // privacy-safe derived values only: obfuscated identifiers, digests,
         // lengths, counts, reduced convergence data, and typed outcomes.
         let mut session_config = SessionConfig::with_storage(
-            engine_storage,
+            engine_storage.clone(),
             engine_storage_open,
             account_id.as_slice().to_vec(),
             peeler,
@@ -4703,77 +4708,83 @@ impl MarmotApp {
             session_config = session_config.recorder(recorder);
         }
         self.ensure_strict_cutover_replacement_intent_before_session_open(label)?;
-        let session = AccountDeviceSession::open(session_config)?;
+        // The session opens before the transport is built, as it always has:
+        // building the adapter registers the account's delivery route.
+        let mut transport = None;
+        let mut runtime = AccountDeviceRuntime::open(session_config, || {
+            let publish_client =
+                self.relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone());
+            let recovery_storage = self.account_storage(label)?;
+            let recovery_label = label.to_owned();
+            let recovery_marker: transport_nostr::AccountDeliveryRecoveryMarker =
+                Arc::new(move |marker_token, dropped, earliest_created_at| {
+                    recovery_storage
+                        .app_storage()
+                        .record_account_delivery_loss_bounded(
+                            &recovery_label,
+                            marker_token,
+                            dropped,
+                            unix_now_seconds(),
+                            earliest_created_at,
+                        )
+                        .map_err(|error| {
+                            if error.is_closed() {
+                                transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
+                            } else {
+                                transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
+                            }
+                        })
+                });
+            let spill_storage = self.account_storage(label)?;
+            let spill_store: transport_nostr::AccountDeliverySpillStore =
+                Arc::new(move |deliveries| {
+                    spill_storage
+                        .app_storage()
+                        .spill_account_deliveries(
+                            deliveries,
+                            client::delivery_spill::ACCOUNT_DELIVERY_SPILL_LIMITS,
+                            unix_now_seconds(),
+                        )
+                        .map(|dispositions| {
+                            dispositions
+                                .into_iter()
+                                .map(client::delivery_spill::plane_spill_disposition)
+                                .collect()
+                        })
+                        .map_err(|error| {
+                            if error.is_closed() {
+                                transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
+                            } else {
+                                transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
+                            }
+                        })
+                });
+            let adapter = relay_plane.account_adapter_with_recovery_marker(
+                account_id.clone(),
+                publish_client,
+                Some(recovery_marker),
+                Some(spill_store),
+            );
+            // The router spills what a raised cursor alone stopped a restart from
+            // fetching again, measured from this persisted floor.
+            adapter.open_transport_cursor(state.last_transport_timestamp);
 
-        let publish_client =
-            self.relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone());
-        let recovery_storage = self.account_storage(label)?;
-        let recovery_label = label.to_owned();
-        let recovery_marker: transport_nostr::AccountDeliveryRecoveryMarker =
-            Arc::new(move |marker_token, dropped, earliest_created_at| {
-                recovery_storage
-                    .app_storage()
-                    .record_account_delivery_loss_bounded(
-                        &recovery_label,
-                        marker_token,
-                        dropped,
-                        unix_now_seconds(),
-                        earliest_created_at,
-                    )
-                    .map_err(|error| {
-                        if error.is_closed() {
-                            transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
-                        } else {
-                            transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
-                        }
-                    })
-            });
-        let spill_storage = self.account_storage(label)?;
-        let spill_store: transport_nostr::AccountDeliverySpillStore = Arc::new(move |deliveries| {
-            spill_storage
-                .app_storage()
-                .spill_account_deliveries(
-                    deliveries,
-                    client::delivery_spill::ACCOUNT_DELIVERY_SPILL_LIMITS,
-                    unix_now_seconds(),
-                )
-                .map(|dispositions| {
-                    dispositions
-                        .into_iter()
-                        .map(client::delivery_spill::plane_spill_disposition)
-                        .collect()
-                })
-                .map_err(|error| {
-                    if error.is_closed() {
-                        transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
-                    } else {
-                        transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
-                    }
-                })
-        });
-        let adapter = relay_plane.account_adapter_with_recovery_marker(
-            account_id.clone(),
-            publish_client,
-            Some(recovery_marker),
-            Some(spill_store),
-        );
-        // The router spills what a raised cursor alone stopped a restart from
-        // fetching again, measured from this persisted floor.
-        adapter.open_transport_cursor(state.last_transport_timestamp);
-
-        let key_packages = AppKeyPackagePublisher {
-            app: self.clone(),
-            account_label: label.to_owned(),
-            signer: signer.clone(),
-        };
-        let routing = self.routing_for(&state)?;
-        let mut runtime =
-            AccountDeviceRuntime::new(session, adapter.clone(), routing.clone(), key_packages);
+            let key_packages = AppKeyPackagePublisher {
+                app: self.clone(),
+                account_label: label.to_owned(),
+                signer: signer.clone(),
+            };
+            let routing = self.routing_for(&state)?;
+            transport = Some((adapter.clone(), routing.clone()));
+            Ok::<_, AppError>((adapter, routing, key_packages))
+        })?;
+        let (adapter, routing) = transport.expect("an opened runtime built its transport");
         if let Some(timing) = dev_maintenance_timing(&self.config) {
             runtime = runtime.with_maintenance_timing(timing);
         }
         Ok(OpenAppAccount {
             runtime,
+            engine_storage,
             audit_v5_peel_slot,
             session_guard,
             adapter,

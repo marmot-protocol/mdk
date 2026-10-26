@@ -75,6 +75,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 transport-nostr = { workspace = true, features = ["test-support"] }
+marmot-account = { workspace = true, features = ["test-support"] }
 criterion.workspace = true
 media-store = { workspace = true, features = ["catalog-conformance", "test-support"] }
 nostr-directory = { workspace = true, features = ["test-support"] }

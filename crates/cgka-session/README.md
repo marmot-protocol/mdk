@@ -35,7 +35,8 @@ the default.
   engine whether the group is live first, so quarantined and unhydrated groups fail as they do on engine accessors.
 - Provides compact `group_authority` reads and `with_group_authority_snapshot` for composing host-owned persisted
   reads with current engine facts on this session's store. The callback is synchronous and read-only; unhydrated groups
-  return `GroupNotHydrated`. It does not serve a frozen startup snapshot or start relay work.
+  return `GroupNotHydrated`. It does not serve a frozen startup snapshot or start relay work. `GroupAuthorityView`
+  lends only that read, for code a host hands the session to.
 - Provides `canonical_group_membership` for startup reconciliation: authenticated leaf indexes and account
   identities, plus whether this device's own leaf is active. Pending roster projections do not replace those facts.
   Live termination and token cleanup use immutable engine effects captured at apply, rather than this reader.

@@ -47,6 +47,12 @@ upgrade).
 - Treat `KeyPackagePublisher` as provisional. The likely production direction is to move KeyPackage publication into the
   transport adapter family rather than keeping it as a separate app-core-owned publisher.
 - Keep `AccountDeviceSession` as the owner of engine state.
+- Keep `AccountDeviceRuntime` the only production way to the session (mdk#2602). Hosts open it with
+  `AccountDeviceRuntime::open`, which opens the session before it builds the host's transport. A session method a host
+  needs becomes a runtime forward with the session's exact signature: same return type, error type and generics.
+  Code a host hands the session to gets `group_authority_view()`, not the session. `session()`, `session_mut()` and
+  `new` exist only under the `test-support` feature, which this crate's tests and `marmot-app` enable as a
+  dev-dependency; never enable it in a normal dependency.
 - Keep CLI account-selection ergonomics and relay-list repair out of this crate; those belong in `wn` and `marmot-app`.
 - Replace account-home files only through the `io.rs` writers, and never change a published file in place while a reader
   can still open it. Owner-only files that hold no key material (setup journal and context, onboarding checkpoints) use
