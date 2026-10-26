@@ -1,9 +1,9 @@
 # marmot-account
 
-Account-device orchestration for Marmot. This crate sits between `cgka-session` and the app runtime (`marmot-app`): it
-owns the local account home, account records, signing-key storage, and the coordination between one
-`AccountDeviceSession` and a pluggable `TransportAdapter`. App and runtime developers embedding Marmot below
-`marmot-app` are the main audience.
+Account identity, files and secrets for Marmot: the local account home, account records, signing-key storage and
+NIP-49 export. The account-device runtime that drives a session over a transport lives in
+[`marmot-session`](../marmot-session/). `marmot-app`, the bindings, the CLI and the agent connector use this crate for
+account identity.
 
 ## What this crate does
 
@@ -15,14 +15,6 @@ owns the local account home, account records, signing-key storage, and the coord
   (patterned after White Noise) and a local file backend for deterministic tests and development.
 - Journals account setup and onboarding so an interrupted setup can resume or be cancelled cleanly.
 - Exports a signing key as a NIP-49 `ncryptsec` backup.
-- Opens one local `AccountDeviceSession` from a `SessionConfig` (`AccountDeviceRuntime::open`) and is the host's only
-  way to it. The `test-support` feature exposes the session itself, for tests that drive it directly.
-- Activates the transport account for that session.
-- Publishes fresh KeyPackages through an injected boundary, and drives KeyPackage generator upgrades.
-- Turns `SessionEffects.publish` work into `TransportPublishRequest`s, then confirms or rolls back pending session state
-  from the adapter's publish reports.
-- Keeps transport routing policy generic, so the first implementation can be Nostr without baking Nostr into the
-  session or engine crates.
 
 ## Account home
 
@@ -36,96 +28,12 @@ owns the local account home, account records, signing-key storage, and the coord
 - Relay-list discovery and repair belong above this crate in the Nostr account transport / app-runtime layer. CLI
   account selection belongs in presentation surfaces such as `wn`.
 
-## Routing model
-
-`TransportRoutingPolicy` is the transport-generic boundary. It answers:
-
-- which account inbox endpoints to subscribe to for welcomes;
-- which group subscriptions to keep active;
-- which endpoints should receive a given outbound transport message;
-- which endpoints should receive fresh KeyPackages;
-- how many publish acknowledgements are required before pending work is confirmed.
-
-A production Nostr implementation should derive those answers from Nostr state rather than hard-coded configuration:
-
-- account inbox relays are the user's always-on welcome / gift-wrap relays;
-- group subscriptions and group-message publish targets come from the group's current
-  `marmot.transport.nostr.routing.v1` app component;
-- KeyPackage publication targets come from the user's kind `10002` NIP-65 relay list (the same outbox relays the
-  account publishes through); there is no dedicated KeyPackage relay list;
-- publish acknowledgement thresholds remain app policy over the chosen endpoint set.
-
-`StaticTransportRouting` is only the simple configured implementation used by tests and early harnesses.
-
-`KeyPackagePublisher` is a provisional boundary. The likely production shape moves KeyPackage publication into the
-transport adapter family, so the account runtime can ask the active transport to publish a KeyPackage without knowing
-whether that means Marmot Nostr kind `30443`, another relay-plane format, or a future non-Nostr transport.
-
-## Own-leaf maintenance
-
-Secondary maintenance write failures do not discard committed session effects. `run_due_maintenance` retries the
-owning group's reconciliation and reconstructs missing deadlines for enrolled live copies after restoration or reopen.
-Ordinary epoch activity uses the durable rotation baseline; an observed restoration starts a fresh period.
-
-An obligation stays live until its next deadline is durable. After reopen, the canonical leaf hash identifies rotations
-that already committed, so completing their bookkeeping does not publish another MLS commit. Repaired deadlines stay
-within the 24–36-day policy window and do not reuse failed or completed periodic obligation IDs.
-
-## Refreshing stale leaves
-
-A new build can support an app component that existing groups predate. A group can start requiring a component only
-once every member's leaf advertises it (the spec's "Enabling a Component in an Existing Group").
-
-For every live group, enrolled or not, `run_due_maintenance` schedules a leaf refresh when the own leaf advertises fewer
-components than the build supports:
-
-- **When.** The self-update runs at a random time within 5 days, so a release does not make every member of a group
-  commit at once. The due time is stored on the group's maintenance record, so a restart keeps the sampled delay.
-- **How.** The self-update goes through the ordinary obligation pipeline, so every commit hold applies, and it
-  re-advertises the supported set. Any own self-update already in flight satisfies the refresh.
-- **Cost.** The engine is queried for each group at most every ten minutes unless a due time has arrived. A group whose
-  state cannot be read is skipped for that tick without stopping maintenance for the rest of the account.
-
-Maintenance only refreshes leaves. Requiring a component in a group is a separate admin step, and nothing here does
-it.
-
-## KeyPackage generator upgrades
-
-The lifecycle records the KeyPackage generator revision independently of app versions. Records written before revision
-tracking default to zero; revision 1 regenerates packages to omit RFC 9420 default capability advertisements.
-`MarmotApp` attempts the upgrade on account activation, and `run_due_maintenance` retries durable publication work.
-Embedders that use `AccountDeviceRuntime` directly must drive maintenance themselves.
-
-- Fresh private material, its revision, and replacement intent are stored atomically before signing/publication.
-- Only a relay acknowledgement promotes the current revision; remaining targets keep their existing fanout retries.
-- An old pending replacement is superseded with a strictly newer authoring timestamp in the same stable slot. Its
-  private bundle is retained until expiry, because publication may already have occurred.
-- Previous unused current bundles keep their existing expiry/consumption policy.
-- Ordinary releases do not bump the generator revision.
-- Paused maintenance can finish a prepared current-revision publication, but waits for resume before replacing an
-  older pending revision, because that requires generating new private material.
-
-## Queued sends and relay retries
-
-Frozen relay events retain their original bytes, targets and retry order until each outstanding obligation resolves.
-Once a group's required acknowledgements and MLS confirmation are complete, a secondary relay's replication retry no
-longer blocks new engine-queued application sends. This uses the same publication boundary as foreground sends.
-An unmet quorum or pending MLS confirmation still blocks the queued drain, including obligations behind an older
-completed-quorum event. Incoming convergence can settle while that publication barrier remains.
-
-Ordinary lower-level convergence calls still await due relay attempts. Owners using
-`advance_convergence_with_publication_progress_and_yield` can supply a signal that ends optional secondary waits
-after required acknowledgements and MLS confirmation. The signal remains latched for that pass; a later quiet pass
-can resume replication. A cancelled attempt keeps its exact bytes and targets, conservative exposure state, and
-ordinary retry backoff. An attempt skipped before starting keeps its existing deadline. This does not cancel engine
-steps, bypass required publication barriers, or guarantee zero network delay or universal per-relay FIFO delivery.
-
 ## What it does not do
 
+- No MLS state, session, transport or publish work (see `marmot-session`).
 - No UI projection or message database (see `marmot-app`).
 - No account-recovery or key-migration UX.
-- No derivation of full MIP-00 KeyPackage metadata from fresh engine KeyPackage bytes yet.
-- No relay auth, relay-list discovery, relay-list repair, or relay health scoring.
+- No relay-list discovery or relay-list repair.
 
 ## Run the tests
 

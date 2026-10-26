@@ -1,5 +1,6 @@
 use cgka_traits::{TransportAdapterError, storage::StorageError};
-use marmot_account::{AccountError, AccountHomeError};
+use marmot_account::AccountHomeError;
+use marmot_session::AccountError;
 
 use crate::MissingRelayListKind;
 use crate::app_telemetry::{SyncErrorClass, SyncFailureClassification};
@@ -102,11 +103,11 @@ pub enum AppError {
     #[error(transparent)]
     ProductAnalytics(#[from] crate::ProductAnalyticsError),
     #[error(transparent)]
-    Account(marmot_account::AccountError),
+    Account(marmot_session::AccountError),
     #[error(transparent)]
     AccountHome(#[from] AccountHomeError),
     #[error(transparent)]
-    Session(cgka_session::SessionError),
+    Session(marmot_session::SessionError),
     #[error(transparent)]
     Storage(#[from] cgka_traits::storage::StorageError),
     #[error(transparent)]
@@ -454,7 +455,7 @@ impl From<DirectoryError> for AppError {
                 Self::MissingKeyPackage { account, reason }
             }
             DirectoryError::KeyPackageRequirements(error) => {
-                Self::from(cgka_session::SessionError::from(error))
+                Self::from(marmot_session::SessionError::from(error))
             }
             DirectoryError::Resource(error) => *error
                 .into_inner()
@@ -500,8 +501,8 @@ impl From<AccountError> for AppError {
     }
 }
 
-impl From<cgka_session::SessionError> for AppError {
-    fn from(error: cgka_session::SessionError) -> Self {
+impl From<marmot_session::SessionError> for AppError {
+    fn from(error: marmot_session::SessionError) -> Self {
         if is_external_signer_rejection(&error) {
             Self::ExternalSignerRejected
         } else {
@@ -847,7 +848,7 @@ mod tests {
     #[test]
     fn invalid_key_package_capabilities_preserve_member_and_protocol_classification() {
         let member = cgka_traits::MemberId::new(vec![0xBB; 32]);
-        let error = AppError::Session(cgka_session::SessionError::Engine(
+        let error = AppError::Session(marmot_session::SessionError::Engine(
             EngineError::InvalidKeyPackageCapabilities {
                 member: member.clone(),
             },
@@ -957,7 +958,7 @@ mod tests {
     // this case, so the kind has to carry the same split.
     #[test]
     fn transient_session_storage_failure_reports_the_busy_storage_kind() {
-        let err = AppError::from(cgka_session::SessionError::from(StorageError::Busy(
+        let err = AppError::from(marmot_session::SessionError::from(StorageError::Busy(
             "locked".into(),
         )));
         assert_eq!(err.privacy_safe_kind(), "storage_busy");
@@ -969,7 +970,7 @@ mod tests {
     // tracing field to an engine audit row.
     #[test]
     fn session_engine_failure_reports_the_engine_kind() {
-        let err = AppError::Session(cgka_session::SessionError::Engine(
+        let err = AppError::Session(marmot_session::SessionError::Engine(
             EngineError::ForkedEpoch {
                 group_id: GroupId::new(vec![1u8; 16]),
                 last_stable: EpochId(7),
@@ -985,7 +986,7 @@ mod tests {
     // is visible at the other.
     #[test]
     fn transient_storage_failure_wrapped_by_the_engine_reports_the_same_kind() {
-        let err = AppError::Session(cgka_session::SessionError::Engine(EngineError::Storage(
+        let err = AppError::Session(marmot_session::SessionError::Engine(EngineError::Storage(
             StorageError::Busy("locked".into()),
         )));
         assert_eq!(err.privacy_safe_kind(), "storage_busy");
@@ -997,11 +998,11 @@ mod tests {
     // names depending on how deep it was wrapped.
     #[test]
     fn account_wrapped_session_failures_report_the_same_kind_as_unwrapped_ones() {
-        let direct = AppError::Session(cgka_session::SessionError::Engine(
+        let direct = AppError::Session(marmot_session::SessionError::Engine(
             EngineError::InvalidWelcome,
         ));
         let via_account_session = AppError::Account(AccountError::Session(
-            cgka_session::SessionError::Engine(EngineError::InvalidWelcome),
+            marmot_session::SessionError::Engine(EngineError::InvalidWelcome),
         ));
         let via_account_engine =
             AppError::Account(AccountError::Engine(EngineError::InvalidWelcome));
@@ -1017,12 +1018,12 @@ mod tests {
     #[test]
     fn session_kind_agrees_with_is_transient() {
         for error in [
-            cgka_session::SessionError::from(StorageError::Busy("locked".into())),
-            cgka_session::SessionError::Engine(EngineError::Storage(StorageError::Busy(
+            marmot_session::SessionError::from(StorageError::Busy("locked".into())),
+            marmot_session::SessionError::Engine(EngineError::Storage(StorageError::Busy(
                 "locked".into(),
             ))),
-            cgka_session::SessionError::from(StorageError::Closed("shut".into())),
-            cgka_session::SessionError::Engine(EngineError::InvalidWelcome),
+            marmot_session::SessionError::from(StorageError::Closed("shut".into())),
+            marmot_session::SessionError::Engine(EngineError::InvalidWelcome),
         ] {
             let transient = error.is_transient();
             let kind = AppError::Session(error).privacy_safe_kind();
@@ -1130,7 +1131,7 @@ mod directory_error_tests {
             // A KeyPackage requirements failure: the app's session-error step.
             (
                 DirectoryError::KeyPackageRequirements(EngineError::UnknownPending),
-                AppError::from(cgka_session::SessionError::from(
+                AppError::from(marmot_session::SessionError::from(
                     EngineError::UnknownPending,
                 )),
             ),
@@ -1138,7 +1139,7 @@ mod directory_error_tests {
                 DirectoryError::KeyPackageRequirements(EngineError::Storage(StorageError::Busy(
                     "engine".into(),
                 ))),
-                AppError::from(cgka_session::SessionError::from(EngineError::Storage(
+                AppError::from(marmot_session::SessionError::from(EngineError::Storage(
                     StorageError::Busy("engine".into()),
                 ))),
             ),

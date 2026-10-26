@@ -1,8 +1,14 @@
-# AGENTS.md - crates/cgka-session/tests
+# AGENTS.md - crates/marmot-session/tests
 
 Session integration tests exercise the public `AccountDeviceSession` boundary. Keep helper code in `support/` and do
 not reach into engine, storage, adapter, or peeler internals. File coverage is summarized in
 [`../README.md#tests`](../README.md#tests).
+
+## Runtime tests
+
+`runtime.rs` drives `AccountDeviceRuntime` over a real session and a scripted transport; the files under `runtime/` are
+pulled into that one binary with `include!`. They set up scenarios through the session accessors that the
+`test-support` feature exposes, which this crate enables for its own tests as a dev-dependency.
 
 ## Nostr stack harness
 
@@ -25,5 +31,5 @@ Never connect to real relays from these tests.
 ## Verification
 
 ```sh
-cargo test -p cgka-session
+cargo test -p marmot-session
 ```

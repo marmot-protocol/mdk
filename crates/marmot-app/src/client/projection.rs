@@ -228,7 +228,7 @@ impl AppClient {
     /// event cannot rebuild the projection or reinstall a terminal route.
     pub(crate) fn clear_terminal_local_group_deletion_frontiers(
         &self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
         for event in &effects.events {
@@ -648,7 +648,7 @@ impl AppClient {
                 {
                     // The durable terminal record repairs this again on reopen;
                     // retain the event for the session worker's bounded retry too.
-                    self.retain_applied_effects(&marmot_account::AccountDeviceEffects {
+                    self.retain_applied_effects(&marmot_session::AccountDeviceEffects {
                         events: vec![event],
                         ..Default::default()
                     });
@@ -802,7 +802,7 @@ impl AppClient {
     #[cfg(test)]
     pub(crate) fn finalize_published_app_message_source_retention(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<Vec<crate::AppProjectionUpdate>, AppError> {
         self.finalize_published_app_message_source_retention_with_status(effects)
             .map(|(updates, _)| updates)
@@ -812,7 +812,7 @@ impl AppClient {
     /// be retried independently through the durable accepted fanout.
     pub(super) fn finalize_published_app_message_source_retention_with_status(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<(Vec<crate::AppProjectionUpdate>, bool), AppError> {
         if effects.published_app_messages.is_empty() {
             return Ok((Vec::new(), true));
@@ -913,7 +913,7 @@ impl AppClient {
     /// instead would delete the only evidence the revival needs.
     fn revive_published_local_send(
         &self,
-        published: &marmot_account::PublishedApplicationMessage,
+        published: &marmot_session::PublishedApplicationMessage,
         group_id_hex: &str,
     ) -> Result<Option<crate::AppProjectionUpdate>, AppError> {
         if !self
@@ -1024,7 +1024,7 @@ impl AppClient {
     /// fail. The canonical activity remains valid even if that refresh fails.
     pub(crate) fn queue_own_group_system_projection_updates(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) {
         // Gate on having published a commit: own send paths always carry a
         // report. Reportless convergence effects are synthesized by the inbound

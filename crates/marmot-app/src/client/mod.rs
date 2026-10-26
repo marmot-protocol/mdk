@@ -3,7 +3,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cgka_session::{PublishWork, SessionEffects};
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY, AgentTextStreamQuicPolicyV1,
 };
@@ -26,11 +25,11 @@ use cgka_traits::{
 };
 #[cfg(test)]
 use futures::StreamExt;
-use marmot_account::{
-    AccountError, CompletedWelcomePublishTask, PreparedSessionSend, PreparedWelcomePublishTask,
-    TransportRoutingPolicy,
-};
 use marmot_forensics::{AuditEventContext, ForensicRecorder as _};
+use marmot_session::{
+    AccountError, CompletedWelcomePublishTask, PreparedSessionSend, PreparedWelcomePublishTask,
+    PublishWork, SessionEffects, TransportRoutingPolicy,
+};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use storage_sqlite::{PreparedGroupImageUploadRecord, PreparedGroupImageUploadState};
@@ -1341,7 +1340,7 @@ impl AppClient {
             self.runtime.sweep_expired_key_package_private_material()?;
             let summary = self
                 .runtime
-                .maintenance_run_summary(&marmot_account::AccountDeviceEffects::default())?;
+                .maintenance_run_summary(&marmot_session::AccountDeviceEffects::default())?;
             return Ok(maintenance_run_summary_from_account(summary));
         }
         // Drain edges between ticks too. A new consent generation establishes a
@@ -1499,7 +1498,7 @@ impl AppClient {
     /// Preserve committed maintenance effects before best-effort invite recovery.
     pub(crate) async fn finish_maintenance_effects(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<crate::MaintenanceRunSummary, AppError> {
         // Retention observes recovery evidence once, before any fallible reads.
         // Keep committed activity even if native projection or summary reads fail.
@@ -1512,7 +1511,7 @@ impl AppClient {
     /// Build maintenance counters after retaining the tick's committed effects.
     fn summarize_maintenance(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<crate::MaintenanceRunSummary, AppError> {
         let summary = self.runtime.maintenance_run_summary(effects)?;
         // The summary includes this pass's failed executions. Backlog counts only
@@ -2103,7 +2102,7 @@ impl AppClient {
         let requirements = self
             .runtime
             .create_key_package_requirements(&request)
-            .map_err(cgka_session::SessionError::from)?;
+            .map_err(marmot_session::SessionError::from)?;
         let key_package_started_at = Instant::now();
         let key_packages = self
             .app
@@ -2140,7 +2139,7 @@ impl AppClient {
         let creator = self.app.account_home().account(&self.state.label)?;
         let mut founding_selections = Vec::with_capacity(members.len());
         for member in &members {
-            let metadata = cgka_session::key_package_metadata(member)
+            let metadata = marmot_session::key_package_metadata(member)
                 .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
             if metadata.credential_identity_hex == creator.account_id_hex {
                 return Err(AppError::GroupCreateIncludesCreator);
@@ -2780,7 +2779,7 @@ impl AppClient {
         let requirements = self
             .runtime
             .invite_key_package_requirements(group_id)
-            .map_err(cgka_session::SessionError::from)?;
+            .map_err(marmot_session::SessionError::from)?;
         let key_packages = self
             .app
             .directory()
@@ -4777,7 +4776,7 @@ impl AppClient {
     /// own locals.
     pub(crate) async fn observe_recovery_evidence_then_gate_send_publish(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
         group_id: &GroupId,
         app_event_id: &str,
     ) -> Result<(), AppError> {
@@ -5921,7 +5920,7 @@ impl AppClient {
     pub(crate) async fn observe_convergence_retry_effects(
         &mut self,
         group_id: &GroupId,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<SendSummary, AppError> {
         // Manual and scheduled retries consume the same one-shot native events.
         // Reuse their complete observer, including reportless membership effects,
@@ -6818,7 +6817,7 @@ impl AppClient {
     /// broadcast as `GroupChangeSuperseded` events (mdk#1734).
     pub(crate) fn note_superseded_intent_reports(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) {
         for report in &effects.superseded_intents {
             if report.outcome == cgka_traits::engine::SupersededIntentOutcome::ReinviteRequired {
@@ -6851,7 +6850,7 @@ impl AppClient {
         std::mem::take(&mut self.pending_superseded_change_events)
     }
 
-    fn remember_published_reports(&mut self, effects: &marmot_account::AccountDeviceEffects) {
+    fn remember_published_reports(&mut self, effects: &marmot_session::AccountDeviceEffects) {
         self.note_superseded_intent_reports(effects);
         self.pending_convergence_groups
             .extend(effects.pending_convergence.iter().cloned());
@@ -6880,7 +6879,7 @@ impl AppClient {
     fn record_welcome_delivery_failures(
         &mut self,
         group_id_hex: &str,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         if effects.welcome_failures.is_empty() {
             return Ok(());
@@ -6914,7 +6913,7 @@ impl AppClient {
     /// are authoritative; the app repair table is convenience-only and is
     /// rebuilt on demand or populated only for actual delivery failures.
     fn founding_welcome_delivery_intent_ids(
-        effects: &cgka_session::SessionEffects,
+        effects: &marmot_session::SessionEffects,
     ) -> Result<Vec<String>, AppError> {
         let mut message_ids = Vec::new();
         for work in &effects.publish {
@@ -6992,7 +6991,7 @@ impl AppClient {
     fn clear_delivered_founding_welcome_intents(
         &mut self,
         message_ids: &[String],
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         if message_ids.is_empty() {
             return Ok(());
@@ -7574,7 +7573,7 @@ mod post_canonical_create_tests {
         .expect_err("unsupported retention must fail before founding side effects");
         assert!(matches!(
             error,
-            AppError::Account(marmot_account::AccountError::Engine(
+            AppError::Account(marmot_session::AccountError::Engine(
                 cgka_traits::EngineError::MissingRequiredCapabilities { ref required, .. }
             )) if required
                 .app_components

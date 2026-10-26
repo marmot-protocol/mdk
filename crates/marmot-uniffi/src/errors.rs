@@ -900,7 +900,7 @@ mod tests {
     // field was added to eliminate.
     // Asserted against `from_engine_error` directly rather than through an
     // `AppError`: a leave failure arrives wrapped as
-    // `AppError::Session(SessionError::Engine(..))`, and `cgka-session` is not a
+    // `AppError::Session(SessionError::Engine(..))`, and `marmot-session` is not a
     // dependency of this crate. `From<AppError>` funnels every such error through
     // `as_engine_error()` into this same function (see above), so this covers the
     // mapping without pulling in a crate just to construct a wrapper.

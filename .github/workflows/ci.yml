@@ -409,8 +409,11 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
+      # marmot-account holds the keychain code. marmot-session holds the
+      # account runtime, which this step linted as part of marmot-account
+      # before the runtime moved there.
       - name: Check iOS account keychain code
-        run: cargo clippy -p marmot-account --target aarch64-apple-ios --locked -- -D warnings
+        run: cargo clippy -p marmot-account -p marmot-session --target aarch64-apple-ios --locked -- -D warnings
 
   # The broader integration matrix explicitly enables test-policy-overrides.
   # This focused default-feature job proves ordinary debug/release consumers
@@ -1227,13 +1230,17 @@ jobs:
       # The Windows code lives in fs-private, account file replacement and
       # local audit delivery, and is covered by those crates' unit tests,
       # marmot-account's home tests and marmot-forensics' audit tests.
-      # marmot-account's runtime binary is excluded: its publish, fanout and
-      # maintenance scenarios are platform-neutral, run on Linux CI, and took
-      # over 30 minutes here.
       - name: Test filesystem, account replacement, and audit delivery
         run: >-
           cargo nextest run --locked -p fs-private -p marmot-account -p marmot-forensics
-          -E 'not (package(marmot-account) & binary(runtime))'
+
+      # The account runtime's unit tests, which ran in the step above until the
+      # runtime moved from marmot-account to marmot-session. Only the library
+      # runs: marmot-session's test binaries, the runtime's publish, fanout and
+      # maintenance scenarios and the session's, are platform-neutral and run
+      # on Linux CI, and the runtime's took over 30 minutes here.
+      - name: Test account runtime units
+        run: cargo nextest run --locked -p marmot-session --lib
 
       - name: Test runtime root ownership
         run: >-

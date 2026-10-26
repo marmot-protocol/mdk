@@ -12,12 +12,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cgka_session::{
-    AccountDeviceSession, CanonicalGroupMembership, CreateGroupEffects, GroupAuthorityView,
-    HydrationProgress, IngestEffects, KeyPackageMetadata, KeyPackageRequirements, PublishWork,
-    QueuedIntentRef, SessionConfig, SessionEffects, SessionError, SessionOpenTimings,
-    SessionResult,
-};
 use cgka_traits::AppComponentId;
 use cgka_traits::engine::{
     CreateGroupRequest, GroupEvent, GroupHydrationQuarantineReason, KeyPackage, SendIntent,
@@ -56,6 +50,12 @@ use crate::key_package::{KeyPackagePublication, KeyPackagePublisher, NoopKeyPack
 use crate::routing::{
     StaticTransportRouting, TransportRoutingPolicy, publish_target_group_id, publish_target_kind,
     publish_target_relay_urls,
+};
+use crate::session::{
+    AccountDeviceSession, CanonicalGroupMembership, CreateGroupEffects, GroupAuthorityView,
+    HydrationProgress, IngestEffects, KeyPackageMetadata, KeyPackageRequirements, PublishWork,
+    QueuedIntentRef, SessionConfig, SessionEffects, SessionError, SessionOpenTimings,
+    SessionResult,
 };
 use crate::time::{
     MaintenanceRandom, MonotonicClock, OsMaintenanceRandom, SystemMonotonicClock, SystemWallClock,
@@ -4654,7 +4654,7 @@ where
     }
 
     /// Outstanding Welcome obligations and tracked IDs from one engine scan.
-    pub fn welcome_delivery_index(&self) -> AccountResult<cgka_session::WelcomeDeliveryIndex> {
+    pub fn welcome_delivery_index(&self) -> AccountResult<crate::session::WelcomeDeliveryIndex> {
         Ok(self.session.welcome_delivery_index()?)
     }
 

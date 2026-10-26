@@ -277,7 +277,7 @@ peel runs. `Engine::retry_deferred_peels` offers those contexts to every retaine
   converge owes no periodic maintenance. The app's `reconcile_live_engine_groups` therefore neither re-adds nor repairs
   an unprojected removed copy; it resurfaces on re-add only.
 - **Both legs of the account maintenance sweep skip a group the engine will not serve.** In
-  `marmot-account::run_due_maintenance`, the per-group rotation pass and the account-wide obligation pass both *skip*
+  `marmot-session::run_due_maintenance`, the per-group rotation pass and the account-wide obligation pass both *skip*
   rather than abort on `GroupNotHydrated` (seeded-but-unhydrated under `defer_group_hydration`) and `UnknownGroup`
   (quarantined): both are retryable, and one dead group must not stop work for every group behind it. The obligation
   pass fails an obligation terminally with `local_member_removed` when the durable record has gone terminal, and

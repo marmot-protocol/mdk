@@ -410,7 +410,7 @@ impl AppClient {
         if self
             .runtime
             .leave_in_progress(group_id)
-            .map_err(cgka_session::SessionError::from)?
+            .map_err(marmot_session::SessionError::from)?
         {
             return Ok(());
         }

@@ -276,7 +276,7 @@ async fn held_hydration_body() {
             .group_member_ids_page(BENCH_ACCOUNT, &[group_ids[0].clone(), unknown])
             .await,
         Err(AppError::UnknownGroup(_))
-            | Err(AppError::Session(cgka_session::SessionError::Engine(
+            | Err(AppError::Session(marmot_session::SessionError::Engine(
                 cgka_traits::error::EngineError::UnknownGroup(_)
             )))
     ));

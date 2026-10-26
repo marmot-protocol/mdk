@@ -76,10 +76,10 @@ v5 file is rejected. Deploy the compatible receiver before activating v5 deliver
 | --- | --- |
 | Schema and recorder trait | [`crates/marmot-forensics/src/audit.rs`](../../crates/marmot-forensics/src/audit.rs), [`crates/marmot-forensics/schema/audit-log-event.v4.schema.json`](../../crates/marmot-forensics/schema/audit-log-event.v4.schema.json) |
 | Shared recorder handle | [`crates/marmot-forensics/src/audit/shared.rs`](../../crates/marmot-forensics/src/audit/shared.rs) |
-| Recorder installation point | [`crates/cgka-session/src/lib.rs`](../../crates/cgka-session/src/lib.rs) wraps the configured recorder in the account-device's `SharedRecorder` and builds the engine ([`engine.rs`](../../crates/cgka-engine/src/engine.rs)) with a clone |
+| Recorder installation point | [`crates/marmot-session/src/session.rs`](../../crates/marmot-session/src/session.rs) wraps the configured recorder in the account-device's `SharedRecorder` and builds the engine ([`engine.rs`](../../crates/cgka-engine/src/engine.rs)) with a clone |
 | Stable audit string helpers | [`crates/cgka-engine/src/audit_helpers.rs`](../../crates/cgka-engine/src/audit_helpers.rs) |
 | Engine audit call sites | [`engine.rs`](../../crates/cgka-engine/src/engine.rs), [`message_processor/`](../../crates/cgka-engine/src/message_processor), [`publish.rs`](../../crates/cgka-engine/src/publish.rs), [`distributed_convergence.rs`](../../crates/cgka-engine/src/distributed_convergence.rs), [`update_group_data.rs`](../../crates/cgka-engine/src/update_group_data.rs), [`upgrade.rs`](../../crates/cgka-engine/src/upgrade.rs), [`group_lifecycle.rs`](../../crates/cgka-engine/src/group_lifecycle.rs) |
-| Account publish audit call sites | [`crates/marmot-account/src/lib.rs`](../../crates/marmot-account/src/lib.rs) |
+| Account publish audit call sites | [`crates/marmot-session/src/runtime.rs`](../../crates/marmot-session/src/runtime.rs) |
 | App settings, file identities, listing, upload | [`crates/marmot-app/src/lib.rs`](../../crates/marmot-app/src/lib.rs), [`crates/marmot-app/src/config.rs`](../../crates/marmot-app/src/config.rs), [`crates/storage-sqlite/src/shared.rs`](../../crates/storage-sqlite/src/shared.rs) |
 | Runtime tracker scheduling | [`crates/marmot-app/src/runtime/`](../../crates/marmot-app/src/runtime) |
 | UniFFI bridge | [`crates/marmot-uniffi/src/lib.rs`](../../crates/marmot-uniffi/src/lib.rs), [`crates/marmot-uniffi/src/conversions/`](../../crates/marmot-uniffi/src/conversions) |

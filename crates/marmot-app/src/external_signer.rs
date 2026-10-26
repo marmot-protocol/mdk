@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
-use cgka_session::{AccountIdentityProofRequest, AccountIdentityProofSigner};
+use marmot_session::{AccountIdentityProofRequest, AccountIdentityProofSigner};
 use nostr::prelude::{Event, FinalizeEvent, PublicKey, Signature, UnsignedEvent};
 use transport_nostr_peeler::{MarmotNostrSigner, MarmotSignerError, SignerFuture};
 
