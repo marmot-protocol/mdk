@@ -44,6 +44,8 @@ the default.
 - Wraps the configured forensic recorder in the account-device's `SharedRecorder`, builds the engine with a clone,
   and writes the open-time `recorder_health` row. `audit_recorder()` hands out the handle; the runtime and the host
   record, rotate and finish the log through their own clones.
+- Re-exports the engine types its configuration, signer and group-authority reads expose, and the KeyPackage
+  metadata and inventory helpers, so hosts never name `cgka-engine` directly.
 
 It does **not** do account key derivation, recovery, or key rotation; relay sync, network publish, or transport
 adaptation; or UI projection and application databases. Those live above this crate (see

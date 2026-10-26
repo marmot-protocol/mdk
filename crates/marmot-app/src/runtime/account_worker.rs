@@ -7155,9 +7155,9 @@ fn convergence_settlement_delay(app: &MarmotApp) -> Duration {
     let quiescence_ms = if cfg!(feature = "test-policy-overrides") {
         app.config
             .dev_settlement_quiescence_ms
-            .unwrap_or(cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS)
+            .unwrap_or(cgka_session::V1_SETTLEMENT_QUIESCENCE_MS)
     } else {
-        cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS
+        cgka_session::V1_SETTLEMENT_QUIESCENCE_MS
     };
     Duration::from_millis(quiescence_ms.saturating_add(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS))
 }

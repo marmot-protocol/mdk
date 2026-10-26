@@ -747,8 +747,8 @@ mod tests {
     use super::MarmotKitError;
     use cgka_traits::error::EngineError;
     use cgka_traits::storage::StorageError;
-    use marmot_account::{AccountError, AccountHomeError};
-    use marmot_app::AppError;
+    use marmot_account::AccountHomeError;
+    use marmot_app::{AccountError, AppError};
 
     #[test]
     fn attachment_configuration_and_account_errors_stay_typed() {

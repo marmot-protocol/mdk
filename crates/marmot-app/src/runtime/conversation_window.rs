@@ -12,7 +12,7 @@ use crate::conversation_presentation::{
 use crate::drafts::MessageDraftInvalidation;
 use crate::{AppClient, AppError, MarmotApp, MarmotAppEvent, SelectedMessageDraft};
 use crate::{AppPerformanceTelemetry, RuntimePerformanceOperation as RuntimeOp};
-use cgka_engine::group_authority::GroupAuthoritySnapshot;
+use cgka_session::GroupAuthoritySnapshot;
 use cgka_traits::{GroupId, StorageError};
 use std::{
     sync::{Arc, Mutex, Weak},

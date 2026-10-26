@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- The crate root re-exports `AccountError`, `SessionError`,
+  `AccountIdentityProofRequest` and `AccountIdentityProofSigner`, so hosts
+  reach the lower stack's error and signer types through `marmot_app`
+  (mdk#2602). The old paths still work.
+
 ### Changed
 
 - What an error reports depends on what it is, not on which lower-stack
