@@ -166,10 +166,12 @@ fn failure_hint(state: AttachmentTransferState) -> Option<&'static str> {
             "Native acquisition is blocked or paused. Review account media permissions and group policy in MDK.",
         ),
         Removed | CleanedBySetting | PreviouslyAcquiredUnavailable | CompletedUnretained => Some(
-            "No retained body is available. Use MDK's explicit Download again control if recovery is wanted.",
+            "No retained body is available. For recovery, use the host application's explicit Download again control; download_attachment cannot rearm this state.",
         ),
         StorageBlocked => Some("Free disk space for native acquisition, then retry."),
-        Cancelled => Some("Acquisition was cancelled. Use MDK's explicit Retry control to resume."),
+        Cancelled => Some(
+            "Acquisition was cancelled. For recovery, use the host application's explicit Retry control; download_attachment cannot rearm this state.",
+        ),
         _ => None,
     }
 }
@@ -210,5 +212,30 @@ impl Drop for AttachmentReplyLease {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_attachment_hints_require_host_controls() {
+        use AttachmentTransferState::*;
+        for (state, control) in [
+            (Removed, "Download again"),
+            (CleanedBySetting, "Download again"),
+            (PreviouslyAcquiredUnavailable, "Download again"),
+            (CompletedUnretained, "Download again"),
+            (Cancelled, "Retry"),
+        ] {
+            let hint = failure_hint(state).unwrap();
+            assert!(hint.contains(&format!("host application's explicit {control} control")));
+            assert!(hint.contains("download_attachment cannot rearm this state"));
+        }
+        assert_eq!(
+            failure_hint(StorageBlocked),
+            Some("Free disk space for native acquisition, then retry.")
+        );
     }
 }
