@@ -16,6 +16,12 @@ const PUSH_PUBLISH_CONCURRENCY: usize = 4;
 /// The group a merged Commit may have grown: a member add, or a Commit that
 /// branch selection re-adopted after withdrawing it. Either way a member may
 /// now hold no record of this device's token.
+///
+/// The re-share is edge-triggered from these in-memory engine events. A crash
+/// or a failed queue write at a narrow moment loses it, and the new member
+/// then misses this token as before mdk#2604; token requests (mdk#2611) are
+/// what repair that. `MemberAdded` is per account, so a new device of an
+/// existing member never triggers it.
 pub(crate) fn member_add_group(event: &cgka_traits::engine::GroupEvent) -> Option<&GroupId> {
     match event {
         cgka_traits::engine::GroupEvent::GroupStateChanged {
