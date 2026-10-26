@@ -160,7 +160,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     retry. The predicate's own margin is a `cgka-traits` unit test
 
 - **File:** `audit_log.rs`
-  - **Owns:** Append-only forensic audit log wiring — recorder install, JSONL round-trip, and no-op default behavior
+  - **Owns:** Append-only forensic audit log wiring — recorder install, JSONL round-trip, no-op default behavior, and
+    the in-flight operation context: a send or group creation dropped mid-await leaves no context for later rows
 
 ```sh
 cargo test -p cgka-engine

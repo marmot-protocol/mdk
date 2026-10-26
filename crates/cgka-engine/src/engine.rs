@@ -71,6 +71,42 @@ enum SendAcceptance {
     QueueAppMessage,
 }
 
+/// Holds the engine for one local operation and keeps its audit context as
+/// [`Engine::current_audit_context`] while it does. Dropping the scope clears
+/// the context on every exit, including a future dropped mid-await, so a
+/// cancelled operation cannot lend its context to later rows that carry none
+/// of their own. The operation calls the engine through the scope.
+struct OperationAuditScope<'a, S: StorageProvider> {
+    engine: &'a mut Engine<S>,
+}
+
+impl<'a, S: StorageProvider> OperationAuditScope<'a, S> {
+    fn enter(engine: &'a mut Engine<S>, context: AuditEventContext) -> Self {
+        engine.current_audit_context = Some(context);
+        Self { engine }
+    }
+}
+
+impl<S: StorageProvider> std::ops::Deref for OperationAuditScope<'_, S> {
+    type Target = Engine<S>;
+
+    fn deref(&self) -> &Engine<S> {
+        self.engine
+    }
+}
+
+impl<S: StorageProvider> std::ops::DerefMut for OperationAuditScope<'_, S> {
+    fn deref_mut(&mut self) -> &mut Engine<S> {
+        self.engine
+    }
+}
+
+impl<S: StorageProvider> Drop for OperationAuditScope<'_, S> {
+    fn drop(&mut self) {
+        self.engine.current_audit_context = None;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct SystemWallClock;
 
@@ -260,11 +296,13 @@ pub struct Engine<S: StorageProvider> {
     /// reconstruct what each device saw and decided.
     pub(crate) recorder: Box<dyn ForensicRecorder>,
     pub(crate) audit_operation_counter: u64,
-    /// Audit context for the in-flight local operation. The
-    /// `*_with_audit_context` entry points set this around their `do_*` call so
-    /// the secondary rows those emit (e.g. `message_state_changed`,
-    /// `group_context`) inherit the operation's `human_action` instead of
-    /// landing context-free. `None` outside a human-initiated operation.
+    /// Audit context for the in-flight local operation. The send and
+    /// create-group `*_with_audit_context` entry points set this through an
+    /// [`OperationAuditScope`] around their `do_*` call so the secondary rows
+    /// those emit (e.g. `message_state_changed`, `group_context`) inherit the
+    /// operation's `human_action` instead of landing context-free. `None`
+    /// outside a human-initiated operation, including after one is dropped
+    /// mid-await.
     pub(crate) current_audit_context: Option<AuditEventContext>,
 
     /// Stored groups that failed session-open hydration and were skipped so the
@@ -1133,20 +1171,21 @@ impl<S: StorageProvider> Engine<S> {
                 intent_kind: intent_kind.clone(),
             },
         });
-        self.current_audit_context = Some(context.clone());
-        let result = match acceptance {
-            SendAcceptance::Prepare => self.do_send(intent).await,
-            SendAcceptance::QueueAppMessage => {
-                let SendIntent::AppMessage {
-                    group_id, payload, ..
-                } = intent
-                else {
-                    unreachable!("queue app-message acceptance constructs an AppMessage intent")
-                };
-                self.do_queue_app_message(group_id, payload)
+        let result = {
+            let mut engine = OperationAuditScope::enter(self, context.clone());
+            match acceptance {
+                SendAcceptance::Prepare => engine.do_send(intent).await,
+                SendAcceptance::QueueAppMessage => {
+                    let SendIntent::AppMessage {
+                        group_id, payload, ..
+                    } = intent
+                    else {
+                        unreachable!("queue app-message acceptance constructs an AppMessage intent")
+                    };
+                    engine.do_queue_app_message(group_id, payload)
+                }
             }
         };
-        self.current_audit_context = None;
         match &result {
             Ok(send_result) => {
                 self.recorder.record(AuditRecord {
@@ -1212,21 +1251,23 @@ impl<S: StorageProvider> Engine<S> {
                 initial_admin_count: req.initial_admins.len() as u64,
             },
         );
-        self.current_audit_context = Some(context.clone());
-        let result = self.do_create_group(req, optional_app_components).await;
+        // The outcome rows below stay inside the scope: the trailing
+        // `group_context` row carries no context of its own and inherits it.
+        let mut engine = OperationAuditScope::enter(self, context.clone());
+        let result = engine.do_create_group(req, optional_app_components).await;
         match &result {
             Ok((group_id, send_result)) => {
                 let mut outcome_context = context.clone();
-                outcome_context.group = self.audit_group_context_snapshot(group_id);
-                self.audit_group_with_context(
+                outcome_context.group = engine.audit_group_context_snapshot(group_id);
+                engine.audit_group_with_context(
                     group_id,
                     outcome_context.clone(),
                     crate::audit_helpers::create_group_outcome_event(send_result),
                 );
                 for (msg_id, expectation) in
-                    self.recipient_expectation_records(group_id, send_result)
+                    engine.recipient_expectation_records(group_id, send_result)
                 {
-                    self.audit_group_with_context(
+                    engine.audit_group_with_context(
                         group_id,
                         outcome_context.clone(),
                         AuditEventKind::RecipientExpectation {
@@ -1235,10 +1276,10 @@ impl<S: StorageProvider> Engine<S> {
                         },
                     );
                 }
-                self.audit_group_context(group_id, "create_group");
+                engine.audit_group_context(group_id, "create_group");
             }
             Err(err) => {
-                self.audit_with_context(
+                engine.audit_with_context(
                     None,
                     Some(context),
                     AuditEventKind::CreateGroupError {
@@ -1248,7 +1289,7 @@ impl<S: StorageProvider> Engine<S> {
                 );
             }
         }
-        self.current_audit_context = None;
+        drop(engine);
         result
     }
 
