@@ -5,9 +5,9 @@
 //! wrapped it (mdk#2602). Each row builds one error through the conversions
 //! the session and account layers use, and states the answers hosts read from
 //! it. No one crate can see every classifier, so each checks its own columns
-//! over these rows: `marmot-app` the sync class, the privacy kind and the wipe
-//! reason, `marmot-uniffi` MarmotKit, `marmot-c` the C status and `wn-cli` the
-//! CLI code. A call that moves between layers keeps its answers; a change to
+//! over these rows: `marmot-app` the sync class, the privacy kind, the wipe
+//! reason and the read-marker code, `marmot-uniffi` MarmotKit, `marmot-c` the
+//! C status and `wn-cli` the CLI code. A call that moves between layers keeps its answers; a change to
 //! any answer fails the crate that owns it.
 
 use cgka_session::SessionError;
@@ -41,6 +41,8 @@ pub struct HostAnswers {
     pub privacy_kind: &'static str,
     /// The failure reason a `WipeOutcome` reports.
     pub wipe_reason: &'static str,
+    /// The code logged when a read-marker update fails.
+    pub read_marker_code: &'static str,
 }
 
 /// An external-signer rejection, wherever the lower stack meets it: the
@@ -52,12 +54,16 @@ const SIGNER_REJECTED: HostAnswers = HostAnswers {
     sync_class: SyncErrorClass::Cancelled,
     privacy_kind: "external_signer_rejected",
     wipe_reason: "operation failed",
+    read_marker_code: "read_marker_failed:external_signer_rejected",
 };
+
+/// A storage failure kind: its name, how to build one, and its answers.
+type StorageKind = (&'static str, fn() -> StorageError, HostAnswers);
 
 /// The rows. Each call builds fresh errors, since `AppError` is not `Clone`.
 pub fn lower_stack_rows() -> Vec<ErrorKindRow> {
     let mut rows = Vec::new();
-    let storage_kinds: [(&str, fn() -> StorageError, HostAnswers); 5] = [
+    let storage_kinds: [StorageKind; 5] = [
         (
             "busy",
             || StorageError::Busy("database is locked".into()),
@@ -68,6 +74,7 @@ pub fn lower_stack_rows() -> Vec<ErrorKindRow> {
                 sync_class: SyncErrorClass::StorageBusy,
                 privacy_kind: "storage_busy",
                 wipe_reason: "local storage error",
+                read_marker_code: "read_marker_failed:storage",
             },
         ),
         (
@@ -80,6 +87,7 @@ pub fn lower_stack_rows() -> Vec<ErrorKindRow> {
                 sync_class: SyncErrorClass::Storage,
                 privacy_kind: "storage_closed",
                 wipe_reason: "local storage error",
+                read_marker_code: "read_marker_failed:storage",
             },
         ),
         (
@@ -92,6 +100,7 @@ pub fn lower_stack_rows() -> Vec<ErrorKindRow> {
                 sync_class: SyncErrorClass::StorageCapacity,
                 privacy_kind: "storage_capacity",
                 wipe_reason: "local storage error",
+                read_marker_code: "read_marker_failed:storage",
             },
         ),
         (
@@ -104,6 +113,7 @@ pub fn lower_stack_rows() -> Vec<ErrorKindRow> {
                 sync_class: SyncErrorClass::StorageCorruption,
                 privacy_kind: "storage_corruption",
                 wipe_reason: "local storage error",
+                read_marker_code: "read_marker_failed:storage",
             },
         ),
         (
@@ -116,6 +126,7 @@ pub fn lower_stack_rows() -> Vec<ErrorKindRow> {
                 sync_class: SyncErrorClass::Storage,
                 privacy_kind: "storage_backend",
                 wipe_reason: "local storage error",
+                read_marker_code: "read_marker_failed:storage",
             },
         ),
     ];
@@ -151,6 +162,7 @@ pub fn lower_stack_rows() -> Vec<ErrorKindRow> {
             sync_class: SyncErrorClass::Unknown,
             privacy_kind: "unknown_group",
             wipe_reason: "unknown local group",
+            read_marker_code: "read_marker_failed:unknown_group",
         },
     );
     push_engine_wrappings(
@@ -164,6 +176,7 @@ pub fn lower_stack_rows() -> Vec<ErrorKindRow> {
             sync_class: SyncErrorClass::Protocol,
             privacy_kind: "invalid_welcome",
             wipe_reason: "session error",
+            read_marker_code: "read_marker_failed:session",
         },
     );
 
@@ -218,6 +231,7 @@ pub fn lower_stack_rows() -> Vec<ErrorKindRow> {
             sync_class: SyncErrorClass::Protocol,
             privacy_kind: "invalid_account_identity_proof",
             wipe_reason: "session error",
+            read_marker_code: "read_marker_failed:session",
         },
     );
     push_engine_wrappings(
@@ -231,6 +245,7 @@ pub fn lower_stack_rows() -> Vec<ErrorKindRow> {
             sync_class: SyncErrorClass::Unknown,
             privacy_kind: "other",
             wipe_reason: "session error",
+            read_marker_code: "read_marker_failed:session",
         },
     );
     rows

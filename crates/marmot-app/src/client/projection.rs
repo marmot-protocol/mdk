@@ -1596,3 +1596,22 @@ impl super::AppClient {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod read_marker_error_code_tests {
+    use super::read_marker_error_code;
+    use crate::error_kind_table::lower_stack_rows;
+
+    #[test]
+    fn read_marker_codes_follow_the_error_not_its_wrapping() {
+        let mismatches: Vec<String> = lower_stack_rows()
+            .into_iter()
+            .filter_map(|row| {
+                let actual = read_marker_error_code(&row.error);
+                let expected = row.expected.read_marker_code;
+                (actual != expected).then(|| format!("{}: {actual}, expected {expected}", row.name))
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+}

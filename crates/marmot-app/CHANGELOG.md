@@ -20,7 +20,9 @@
     storage failure reads `local storage error`, an unknown engine group
     `unknown local group`, and any other engine failure `session error`,
     whichever layer reported it. Account failures outside the engine still
-    read `account error`.
+    read `account error`. The `error_code` logged when a read-marker update
+    fails follows the same rule: `read_marker_failed:storage`,
+    `read_marker_failed:unknown_group` or `read_marker_failed:session`.
 
 ### Fixed
 

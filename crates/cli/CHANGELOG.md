@@ -22,8 +22,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 ### Changed
 
 - JSON error codes now depend on what an error is, not on which MDK layers wrapped it (mdk#2602). Two codes change.
-  A storage failure that the account session reported itself now reports `engine_error`, as it does when the engine
-  reports it. Before, it reported `command_failed`. An external-signer rejection now reports `command_failed`, with
+  A storage failure from the account session or the engine now always reports `engine_error`. Before, some paths
+  reported `command_failed`. An external-signer rejection now reports `command_failed`, with
   the external-signer rejection message, on every path. Before, a rejection while signing an identity proof reported
   `engine_error`.
 - `wn-agent` (serve) without `--relay` now reads `MARMOT_RELAYS` and then falls back to the White Noise relays, the
