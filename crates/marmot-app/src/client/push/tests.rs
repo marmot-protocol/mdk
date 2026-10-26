@@ -235,6 +235,111 @@ async fn push_drains_after_rejection() {
     push_batch_case(128, PushRelay::RejectFirstChunk, 1, None).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_trigger_wakes_each_sibling_device_once() {
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let home = tempfile::tempdir().unwrap();
+    AccountHome::open(home.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relays_and_config(
+        home.path(),
+        vec![url.clone()],
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+    );
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("siblings", &[]).await.unwrap();
+    let alice = app.account_home().account("alice").unwrap().account_id_hex;
+    let bob = "bb".repeat(32);
+    let server = Keys::generate();
+    // (member, leaf, device token, owner_ts, expected in the trigger)
+    let records = [
+        (&bob, 1, "phone", 1, false),
+        (&bob, 2, "tablet", 1, true),
+        (&bob, 4, "phone", 2, true),
+        (&alice, 0, "alice-phone", 1, false),
+        (&alice, 3, "alice-tablet", 1, false),
+    ];
+    let mut expected = std::collections::BTreeSet::new();
+    let mut excluded = std::collections::BTreeSet::new();
+    for (member, leaf_index, device_token, owner_ts, sent) in records {
+        let mut encrypted_token = vec![0; notifications::PUSH_ENCRYPTED_TOKEN_LEN];
+        encrypted_token[0] = u8::from(member == &alice);
+        encrypted_token[1] = leaf_index as u8;
+        if sent {
+            expected.insert(encrypted_token.clone());
+        } else {
+            excluded.insert(encrypted_token.clone());
+        }
+        app.upsert_group_push_token(
+            "alice",
+            &GroupPushTokenRecord {
+                group_id_hex: hex::encode(group.as_slice()),
+                member_id_hex: member.clone(),
+                leaf_index,
+                platform: PushPlatform::Apns,
+                token_fingerprint: notifications::push_token_fingerprint(
+                    PushPlatform::Apns,
+                    device_token.as_bytes(),
+                ),
+                server_pubkey_hex: server.public_key().to_hex(),
+                relay_hint: Some(url.clone()),
+                encrypted_token,
+                owner_ts,
+                owner_sig: String::new(),
+                updated_at_ms: owner_ts,
+            },
+        )
+        .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client.relay_plane.relay_health().await.connected != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    client
+        .publish_notification_trigger(&group, NotificationTrigger::NewMessage)
+        .await
+        .unwrap();
+    let reader = crate::network_proxy::nostr_builder().build();
+    reader.add_relay(&url).await.unwrap();
+    reader.connect().await;
+    let events = reader
+        .fetch_events(nostr_sdk::prelude::ReqTarget::single(
+            &url,
+            [Filter::new()
+                .kind(Kind::GiftWrap)
+                .pubkey(server.public_key())],
+        ))
+        .timeout(Duration::from_secs(5))
+        .await
+        .unwrap();
+    let mut sent = Vec::new();
+    for event in events {
+        let gift = nostr::nips::nip59::extract_rumor(&server, &event).unwrap();
+        let content = BASE64_STANDARD.decode(&gift.rumor.content).unwrap();
+        sent.extend(
+            content
+                .chunks_exact(notifications::PUSH_ENCRYPTED_TOKEN_LEN)
+                .map(<[u8]>::to_vec),
+        );
+    }
+    for token in &expected {
+        let copies = sent.iter().filter(|chunk| *chunk == token).count();
+        assert_eq!(copies, 1, "each distinct sibling device is woken once");
+    }
+    assert!(
+        !sent.iter().any(|chunk| excluded.contains(chunk)),
+        "a superseded same-token leaf and the sender's own leaves are not woken"
+    );
+    reader.shutdown().await;
+    client.relay_plane.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "notification publication scaling diagnostic; PUSH_RELAY selects an external relay"]
 async fn push_batch_scaling() {
