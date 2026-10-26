@@ -287,6 +287,29 @@ impl AgentConnector {
                 )
                 .await
             }
+            AgentControlRequest::GroupCreateCapabilities => {
+                Ok(AgentControlResponse::GroupCreateCapabilities {
+                    initial_admins: true,
+                })
+            }
+            AgentControlRequest::GroupCreateWithAdmins {
+                account_id_hex,
+                name,
+                members,
+                admins,
+                description,
+                relays,
+            } => {
+                self.create_group_response(
+                    &account_id_hex,
+                    name,
+                    members,
+                    admins,
+                    description,
+                    relays,
+                )
+                .await
+            }
             AgentControlRequest::GroupCreate {
                 account_id_hex,
                 name,
@@ -294,8 +317,15 @@ impl AgentConnector {
                 description,
                 relays,
             } => {
-                self.create_group_response(&account_id_hex, name, members, description, relays)
-                    .await
+                self.create_group_response(
+                    &account_id_hex,
+                    name,
+                    members,
+                    Vec::new(),
+                    description,
+                    relays,
+                )
+                .await
             }
             AgentControlRequest::GroupLeave {
                 account_id_hex,

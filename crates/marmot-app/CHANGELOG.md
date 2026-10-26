@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `AppCreateGroupOptions` adds `initial_admins` for founding co-admin selection.
+  Add the field to exhaustive struct literals, or use `..Default::default()`
+  to retain creator-only admin defaults.
+- `AppError` adds `GroupCreateAdminNotMember` for founding admin references
+  outside the founding membership. Update exhaustive error matches.
+
 ### Changed
 
 - What an error reports depends on what it is, not on which lower-stack

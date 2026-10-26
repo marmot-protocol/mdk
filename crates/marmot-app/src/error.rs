@@ -137,6 +137,8 @@ pub enum AppError {
     /// The creator is already an MLS member and cannot be added again.
     #[error("group members must not include the creator")]
     GroupCreateIncludesCreator,
+    #[error("initial admins must be founding members")]
+    GroupCreateAdminNotMember,
     #[error("unknown local group")]
     UnknownGroup(String),
     /// Invite acceptance requires a current, non-terminal membership projection
@@ -552,6 +554,7 @@ impl AppError {
             Self::MissingMemberInboxRoute(_) => "missing_member_inbox_route",
             Self::DirectoryLookupIncomplete(_) => "directory_lookup_incomplete",
             Self::GroupCreateIncludesCreator => "group_create_includes_creator",
+            Self::GroupCreateAdminNotMember => "group_create_admin_not_member",
             Self::UnknownGroup(_) => "unknown_group",
             Self::GroupInviteNotPending => "group_invite_not_pending",
             Self::CreatedGroupProjectionUnavailable(_) => "created_group_projection_unavailable",

@@ -1438,6 +1438,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::MissingMemberInboxRoute(_) => "read_marker_failed:missing_member_inbox_route",
         AppError::DirectoryLookupIncomplete(_) => "read_marker_failed:directory_lookup_incomplete",
         AppError::GroupCreateIncludesCreator => "read_marker_failed:group_create_includes_creator",
+        AppError::GroupCreateAdminNotMember => "read_marker_failed:group_create_admin_not_member",
         AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",
         AppError::GroupInviteNotPending => "read_marker_failed:group_invite_not_pending",
         AppError::CreatedGroupProjectionUnavailable(_) => {
