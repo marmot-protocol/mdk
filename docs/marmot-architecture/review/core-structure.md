@@ -11,7 +11,8 @@ status: draft for discussion
 This page asks one question of the core crates (`traits`, `cgka-engine`, `cgka-session`, `marmot-account`,
 `storage-sqlite`, `marmot-app` and the Nostr transport): is each one shaped for what it is supposed to do? It ranks
 the biggest gaps between what each crate is documented to be and what it contains, and it proposes a target crate map.
-The steps toward it, and each step's plan, are tracked in [#2360](https://github.com/marmot-protocol/mdk/issues/2360).
+The steps toward it are tracked in [#2360](https://github.com/marmot-protocol/mdk/issues/2360); each step's plan and PR
+checklist is its own issue, linked from there (step 5's is #2602).
 Baseline `ab1de296f`.
 
 Line counts are production code. They exclude test files and inline `#[cfg(test)]` blocks, so they are lower than
