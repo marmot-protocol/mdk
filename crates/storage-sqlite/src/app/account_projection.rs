@@ -2954,8 +2954,8 @@ impl SqliteAppStorage {
     /// Apply an owner-verified removal: when its `(owner_ts, record_digest)` stamp
     /// is strictly greater than both the live record and any existing tombstone
     /// for the key, delete the live record and write/refresh the durable
-    /// tombstone, including its removal proof. Returns whether the removal was
-    /// applied.
+    /// tombstone, including its removal proof. The same removal again only
+    /// fills in a missing proof. Returns whether the removal was applied.
     pub fn apply_group_push_token_tombstone(
         &self,
         tombstone: &AccountGroupPushTokenTombstone,
@@ -2977,6 +2977,31 @@ impl SqliteAppStorage {
                 push_stamp_strictly_newer(incoming, stored.as_ref().map(|(t, d)| (*t, d.as_str())))
             };
             if !strictly_newer(&existing) || !strictly_newer(&live) {
+                // An equal stamp is the same signed removal, so it may bring the
+                // proof a tombstone written before migration 0118 lacks.
+                if let Some(proof) = &tombstone.removal_proof
+                    && existing
+                        .as_ref()
+                        .is_some_and(|(ts, digest)| (*ts, digest.as_str()) == incoming)
+                {
+                    tx.execute_cached(
+                        "UPDATE group_push_token_tombstones
+                         SET token_fingerprint = ?6, owner_sig = ?7
+                         WHERE group_id_hex = ?1 AND member_id_hex = ?2 AND leaf_index = ?3
+                           AND platform = ?4 AND server_pubkey_hex = ?5 AND owner_sig IS NULL",
+                        params![
+                            key.group_id_hex,
+                            key.member_id_hex,
+                            u32_to_i64(key.leaf_index),
+                            i64::from(key.platform),
+                            key.server_pubkey_hex,
+                            &proof.token_fingerprint,
+                            &proof.owner_sig,
+                        ],
+                    )
+                    .storage()?;
+                    tx.commit().storage()?;
+                }
                 return Ok(false);
             }
             delete_push_token(&tx, key)?;

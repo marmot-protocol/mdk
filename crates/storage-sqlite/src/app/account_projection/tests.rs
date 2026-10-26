@@ -4094,7 +4094,8 @@ fn member_cleanup_clears_tokens_and_tombstones() {
 
 /// A tombstone keeps the removal's fingerprint and signature, so it can be
 /// relayed. A newer removal replaces them; an older one changes nothing. A
-/// tombstone written without them lists as unrelayable.
+/// tombstone written without them lists as unrelayable until the same removal
+/// arrives again with them.
 #[test]
 fn push_tombstones_keep_their_removal_proof_and_list_per_group() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
@@ -4135,7 +4136,46 @@ fn push_tombstones_keep_their_removal_proof_and_list_per_group() {
     }
     assert_eq!(
         store.group_push_token_tombstones(&g).unwrap(),
-        vec![relayable(300, "r3", "sig-300"), local_only]
+        vec![relayable(300, "r3", "sig-300"), local_only.clone()]
+    );
+
+    // Only the same removal, at an equal stamp, fills in the missing proof.
+    let with_proof = |owner_ts: i64, digest: &str| AccountGroupPushTokenTombstone {
+        removal_proof: Some(proof("fp", "sig-local")),
+        ..push_tombstone(&g, &m, 1, owner_ts, digest)
+    };
+    for other_removal in [with_proof(300, "r0"), with_proof(299, "r4")] {
+        assert!(
+            !store
+                .apply_group_push_token_tombstone(&other_removal)
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        store.group_push_token_tombstones(&g).unwrap()[1],
+        local_only
+    );
+    assert!(
+        !store
+            .apply_group_push_token_tombstone(&with_proof(300, "r4"))
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_push_token_tombstones(&g).unwrap()[1],
+        with_proof(300, "r4")
+    );
+    assert!(
+        !store
+            .apply_group_push_token_tombstone(&AccountGroupPushTokenTombstone {
+                removal_proof: Some(proof("fp", "sig-other")),
+                ..with_proof(300, "r4")
+            })
+            .unwrap()
+    );
+    assert_eq!(
+        store.group_push_token_tombstones(&g).unwrap()[1],
+        with_proof(300, "r4"),
+        "a stored proof is never replaced at an equal stamp"
     );
 
     // A strictly newer record clears the tombstone, proof and all.
@@ -4179,15 +4219,18 @@ fn push_gossip_state_tracks_the_current_membership() {
     assert!(app.record_group_push_gossip_snapshot("aa", 30).unwrap());
     assert!(app.record_group_push_gossip_announce("aa", 50).unwrap());
     assert!(app.record_group_push_gossip_announce("aa", 40).unwrap());
-    assert_eq!(
-        state("aa"),
-        Some(AccountGroupPushGossipState {
-            group_id_hex: "aa".to_owned(),
-            joined_at_ms: Some(10),
-            snapshot_received_at_ms: Some(5),
-            last_announced_at_ms: Some(50),
-        })
-    );
+    let recorded = Some(AccountGroupPushGossipState {
+        group_id_hex: "aa".to_owned(),
+        joined_at_ms: Some(10),
+        snapshot_received_at_ms: Some(5),
+        last_announced_at_ms: Some(50),
+    });
+    assert_eq!(state("aa"), recorded);
+    // Saving the projection again keeps a still-joined group's row.
+    let mut renamed = group("aa", "renamed");
+    renamed.member_count = Some(3);
+    save(vec![renamed, group("bb", "beta")]);
+    assert_eq!(state("aa"), recorded);
 
     for membership in [SelfMembership::Left, SelfMembership::Removed] {
         app.set_group_self_membership("aa", SelfMembership::Member)

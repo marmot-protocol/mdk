@@ -848,7 +848,8 @@ fn removal_payload(removals: &[&PushTokenRemovalRecord]) -> String {
 
 /// Any member can relay a stored tombstone in a kind 449 that recipients
 /// verify under the group's owner-proof rules, legacy proof forms included. A
-/// tombstone written before migration 0118 lists as local-only.
+/// tombstone written before migration 0118 lists as local-only until the same
+/// removal arrives again.
 #[test]
 fn stored_tombstones_relay_as_owner_verified_removals() {
     let owner = Keys::generate();
@@ -878,12 +879,10 @@ fn stored_tombstones_relay_as_owner_verified_removals() {
         ProtocolProfile::Legacy,
     )
     .unwrap();
-    let mut local_only = crate::conversions::account_push_token_tombstone_from_removal(
-        &group_id_hex,
-        &signed_removal_record(&owner, &group_id_hex, 3, &server, 100),
-        1,
-    )
-    .unwrap();
+    let earlier = signed_removal_record(&owner, &group_id_hex, 3, &server, 100);
+    let mut local_only =
+        crate::conversions::account_push_token_tombstone_from_removal(&group_id_hex, &earlier, 1)
+            .unwrap();
     local_only.removal_proof = None;
     app.account_storage("alice")
         .unwrap()
@@ -897,10 +896,28 @@ fn stored_tombstones_relay_as_owner_verified_removals() {
     assert_eq!(stored.len(), 3);
     assert_eq!(
         stored[2].removal, None,
-        "pre-0118 tombstones stay local-only"
+        "pre-0118 tombstones start local-only"
     );
     assert_eq!(stored[2].record_digest, local_only.record_digest);
-    for (tombstone, original) in stored.iter().zip([&current, &raw_legacy]) {
+
+    // A member relaying the same removal later makes it relayable here too.
+    app.ingest_push_gossip_message(
+        "alice",
+        &push_gossip_message(
+            &owner,
+            &group_id,
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+            removal_payload(&[&earlier]),
+        ),
+        &leaves,
+        ProtocolProfile::Current,
+    )
+    .unwrap();
+    let stored = app
+        .group_push_token_tombstones("alice", &group_id_hex)
+        .unwrap();
+    assert_eq!(stored.len(), 3);
+    for (tombstone, original) in stored.iter().zip([&current, &raw_legacy, &earlier]) {
         let removal = tombstone.removal.as_ref().expect("tombstone is relayable");
         assert_eq!(
             removal, original,
@@ -936,9 +953,9 @@ fn stored_tombstones_relay_as_owner_verified_removals() {
     };
     assert_eq!(
         verified(ProtocolProfile::Legacy),
-        vec![current.clone(), raw_legacy]
+        vec![current.clone(), raw_legacy, earlier.clone()]
     );
-    assert_eq!(verified(ProtocolProfile::Current), vec![current]);
+    assert_eq!(verified(ProtocolProfile::Current), vec![current, earlier]);
 }
 
 /// Read-back returns a record's stored digest only while the record's fields
