@@ -1147,14 +1147,7 @@ impl AppClient {
         self.queue_own_group_system_projection_updates(effects);
         // Member adds reach this boundary only as activity, never through the
         // shared projection seam, so queue their push-token shares here.
-        if let Err(error) = self.queue_push_registration_shares_for_member_adds(&effects.events) {
-            tracing::warn!(
-                target: "marmot_app::notifications",
-                method = "observe_native_membership_effects",
-                error_kind = error.privacy_safe_kind(),
-                "push token share after a member add was not queued"
-            );
-        }
+        self.queue_push_registration_shares_for_member_adds(&effects.events);
         let routes_dirty = self.retry_applied_effect_projections_buffered().await?;
         let routes_changed = self.refresh_group_routes()?.routing_changed;
         if routes_dirty || routes_changed {
@@ -6759,12 +6752,7 @@ impl AppClient {
                 .app
                 .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[]);
         }
-        if let cgka_traits::engine::GroupEvent::GroupStateChanged {
-            group_id,
-            change: cgka_traits::engine::GroupStateChange::MemberAdded { .. },
-            ..
-        } = event
-        {
+        if let Some(group_id) = super::push::member_add_group(event) {
             self.queue_push_registration_share_after_member_added(group_id)?;
         }
         self.invalidate_terminal_pending_sends(event, summary, cleanup)?;

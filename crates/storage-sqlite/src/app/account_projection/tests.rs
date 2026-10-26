@@ -2809,6 +2809,99 @@ fn push_registration_completion_is_version_guarded_and_membership_scoped() {
     assert_eq!(store.pending_push_registration_removals().unwrap().len(), 2);
 }
 
+/// Re-queueing republishes a completed share of the label's current revision,
+/// only while native push is on and only for joined groups; another label's
+/// registration in the same database neither joins nor breaks the insert.
+#[test]
+fn current_push_registration_share_requeues_a_completed_revision() {
+    let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    store
+        .save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![group("aa", "alpha"), group("bb", "beta")],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    store
+        .set_group_self_membership("bb", SelfMembership::Left)
+        .unwrap();
+    let registration = |label: &str, fingerprint: &str, at: i64| AccountPushRegistration {
+        account_label: label.to_owned(),
+        account_id_hex: "11".repeat(32),
+        platform: 1,
+        token_fingerprint: fingerprint.to_owned(),
+        server_pubkey_hex: "22".repeat(32),
+        relay_hint: None,
+        created_at_ms: at,
+        updated_at_ms: at,
+        last_shared_at_ms: None,
+    };
+    store
+        .upsert_push_registration(registration("legacy", "legacy", 30), vec![3])
+        .unwrap();
+    store
+        .set_native_push_enabled("legacy", &"11".repeat(32), true)
+        .unwrap();
+    store
+        .upsert_push_registration(registration("alice", "first", 10), vec![1])
+        .unwrap();
+    assert!(
+        !store
+            .queue_current_push_registration_share_for_group("alice", "aa", 40)
+            .unwrap(),
+        "native push is off"
+    );
+    store
+        .set_native_push_enabled("alice", &"11".repeat(32), true)
+        .unwrap();
+    for (fingerprint, at) in [("first", 10), ("legacy", 30)] {
+        store
+            .complete_push_registration_share("aa", fingerprint, at)
+            .unwrap();
+    }
+    assert!(
+        store
+            .mark_push_registration_shared("alice", "first", 10, 11)
+            .unwrap()
+    );
+
+    assert!(
+        store
+            .queue_current_push_registration_share_for_group("alice", "aa", 40)
+            .unwrap()
+    );
+    assert_eq!(
+        store.pending_push_registration_shares("first", 10).unwrap(),
+        vec!["aa".to_owned()]
+    );
+    assert!(
+        store
+            .pending_push_registration_shares("legacy", 30)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .push_registration("alice")
+            .unwrap()
+            .unwrap()
+            .registration
+            .last_shared_at_ms,
+        None
+    );
+    assert!(
+        !store
+            .queue_current_push_registration_share_for_group("alice", "bb", 40)
+            .unwrap(),
+        "a departed group is not shared with"
+    );
+}
+
 #[test]
 fn push_registration_rotation_and_clear_queue_durable_removals() {
     let store = SqliteAccountStorage::in_memory().unwrap().app_storage();

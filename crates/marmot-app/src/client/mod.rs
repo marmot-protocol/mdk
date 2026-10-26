@@ -796,6 +796,9 @@ pub struct AppClient {
     /// Set when an observed member add queued a push-token share, so the
     /// account worker arms its push retry timer.
     pub(super) push_registration_share_queued: bool,
+    /// Groups grown by an own command whose push-token share failed to queue;
+    /// the account worker retries them.
+    pub(super) pending_member_add_push_shares: std::collections::HashSet<GroupId>,
     /// App-visible outputs ingested during a sync whose account-projection
     /// checkpoint failed. A retained client keeps the matching projected state
     /// and outbox acknowledgements, then returns this summary after its next
@@ -3259,6 +3262,7 @@ impl AppClient {
         self.pending_convergence_groups.remove(group_id);
         self.forget_pending_effect_projections(group_id);
         self.pending_push_leaf_reconciliations.remove(group_id);
+        self.pending_member_add_push_shares.remove(group_id);
         self.app.presentation_signals.wake();
         // Deletion already committed. A failed transport refresh must not make
         // the caller believe the group still exists; ordinary maintenance retries.

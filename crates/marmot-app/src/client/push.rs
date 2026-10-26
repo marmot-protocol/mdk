@@ -13,6 +13,21 @@ mod tests;
 
 const PUSH_PUBLISH_CONCURRENCY: usize = 4;
 
+/// The group a merged Commit may have grown: a member add, or a Commit that
+/// branch selection re-adopted after withdrawing it. Either way a member may
+/// now hold no record of this device's token.
+pub(crate) fn member_add_group(event: &cgka_traits::engine::GroupEvent) -> Option<&GroupId> {
+    match event {
+        cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id,
+            change: cgka_traits::engine::GroupStateChange::MemberAdded { .. },
+            ..
+        }
+        | cgka_traits::engine::GroupEvent::GroupStateRevalidated { group_id, .. } => Some(group_id),
+        _ => None,
+    }
+}
+
 impl AppClient {
     pub(crate) async fn upsert_and_share_push_registration(
         &mut self,
@@ -410,24 +425,40 @@ impl AppClient {
         Ok(())
     }
 
-    /// Queue one share per group that a merged Commit in `events` grew.
+    /// Queue one share per group that `events` may have grown. A
+    /// group whose queue write fails is kept for the account worker to retry.
     pub(crate) fn queue_push_registration_shares_for_member_adds(
         &mut self,
         events: &[cgka_traits::engine::GroupEvent],
-    ) -> Result<(), AppError> {
-        let mut groups = std::collections::HashSet::new();
+    ) {
         for event in events {
-            if let cgka_traits::engine::GroupEvent::GroupStateChanged {
-                group_id,
-                change: cgka_traits::engine::GroupStateChange::MemberAdded { .. },
-                ..
-            } = event
-                && groups.insert(group_id)
-            {
-                self.queue_push_registration_share_after_member_added(group_id)?;
+            if let Some(group_id) = member_add_group(event) {
+                self.pending_member_add_push_shares.insert(group_id.clone());
             }
         }
-        Ok(())
+        self.retry_pending_member_add_push_shares();
+    }
+
+    /// Queue the shares owed for member adds whose earlier queue write failed.
+    pub(crate) fn retry_pending_member_add_push_shares(&mut self) {
+        let groups: Vec<_> = self
+            .pending_member_add_push_shares
+            .iter()
+            .cloned()
+            .collect();
+        for group_id in groups {
+            match self.queue_push_registration_share_after_member_added(&group_id) {
+                Ok(()) => {
+                    self.pending_member_add_push_shares.remove(&group_id);
+                }
+                Err(error) => tracing::warn!(
+                    target: "marmot_app::notifications",
+                    method = "retry_pending_member_add_push_shares",
+                    error_kind = error.privacy_safe_kind(),
+                    "push token share after a member add was not queued"
+                ),
+            }
+        }
     }
 
     /// Whether a member add queued a share since the last call.

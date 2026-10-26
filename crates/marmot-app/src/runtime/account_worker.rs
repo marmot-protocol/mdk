@@ -2101,6 +2101,7 @@ async fn run_app_runtime_account_worker(
             &command_tx,
         );
         // A member add on any ingest or send path queued a share.
+        client.retry_pending_member_add_push_shares();
         if client.take_queued_push_registration_share() {
             scheduled_push_retry.observe_pending(true, &command_tx);
         }

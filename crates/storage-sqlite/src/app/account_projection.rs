@@ -2634,12 +2634,13 @@ impl SqliteAppStorage {
         })
     }
 
-    /// Queue the current registration for one joined group again when native
-    /// push is on. A member added by a merged Commit cannot read this device's
-    /// earlier share. The queue holds only unfinished work, so a revision whose
-    /// share already completed is published again.
+    /// Queue `account_label`'s current registration for one joined group again
+    /// when native push is on. A member added by a merged Commit cannot read
+    /// this device's earlier share. The queue holds only unfinished work, so a
+    /// revision whose share already completed is published again.
     pub fn queue_current_push_registration_share_for_group(
         &self,
+        account_label: &str,
         group_id_hex: &str,
         queued_at_ms: i64,
     ) -> StorageResult<bool> {
@@ -2653,26 +2654,31 @@ impl SqliteAppStorage {
                      )
                      SELECT account_groups.group_id_hex,
                             push_registration.token_fingerprint,
-                            push_registration.updated_at_ms, ?2, NULL
+                            push_registration.updated_at_ms, ?3, NULL
                      FROM account_groups
                      CROSS JOIN push_registration
                      JOIN notification_settings
                        ON notification_settings.account_label = push_registration.account_label
-                     WHERE account_groups.group_id_hex = ?1
+                     WHERE account_groups.group_id_hex = ?2
                        AND account_groups.self_membership = 'member'
+                       AND push_registration.account_label = ?1
                        AND notification_settings.native_push_enabled = 1
                      ON CONFLICT(group_id_hex) DO UPDATE SET
                         token_fingerprint = excluded.token_fingerprint,
                         registration_updated_at_ms = excluded.registration_updated_at_ms,
                         queued_at_ms = excluded.queued_at_ms,
                         last_attempted_at_ms = NULL",
-                    params![group_id_hex, queued_at_ms],
+                    params![account_label, group_id_hex, queued_at_ms],
                 )
                 .storage()?
                 > 0;
             if queued {
-                conn.execute_cached("UPDATE push_registration SET last_shared_at_ms = NULL", [])
-                    .storage()?;
+                conn.execute_cached(
+                    "UPDATE push_registration SET last_shared_at_ms = NULL
+                     WHERE account_label = ?1",
+                    params![account_label],
+                )
+                .storage()?;
             }
             Ok(queued)
         })

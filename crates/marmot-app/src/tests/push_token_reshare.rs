@@ -93,6 +93,24 @@ impl Device {
         )
     }
 
+    /// A second connection to this device's database, for injecting faults.
+    fn raw_connection(&self) -> rusqlite::Connection {
+        let app = &self.client.app;
+        let path = app.account_storage_path(&self.label);
+        let keys = app.account_home().load_signing_keys(&self.label).unwrap();
+        let key = app
+            .sqlcipher_key(&self.label, &keys, &path, SqlcipherDatabaseKind::Session)
+            .unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &key,
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
+        connection
+    }
+
     /// `(member, leaf)` of every token record this device holds for `group`,
     /// its own record included.
     fn token_leaves(&self, group: &GroupId) -> BTreeSet<(String, u32)> {
@@ -320,6 +338,63 @@ async fn offline_member_shares_once_after_catching_up_past_every_add() {
         assert!(leaves.contains(&fx.alice.leaf(&group)));
         assert!(leaves.contains(&fx.bob.leaf(&group)));
     }
+}
+
+/// A share that fails to queue after this device's own add is retried, not
+/// lost: own commands see member adds only once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_share_queue_after_own_add_is_retried() {
+    let mut fx = Fixture::new().await;
+    let group = fx.group.clone();
+    let connection = fx.alice.raw_connection();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_share_queue BEFORE INSERT ON pending_push_registration_shares
+             BEGIN SELECT RAISE(FAIL, 'injected share queue failure'); END;",
+        )
+        .unwrap();
+    fx.alice
+        .client
+        .invite_members(&group, &[fx.carol.account_id_hex.as_str()])
+        .await
+        .unwrap();
+    assert!(fx.alice.pending_shares().is_empty());
+    assert!(!fx.alice.client.take_queued_push_registration_share());
+    fx.alice.client.retry_pending_member_add_push_shares();
+    assert!(fx.alice.pending_shares().is_empty());
+
+    connection
+        .execute_batch("DROP TRIGGER fail_share_queue")
+        .unwrap();
+    fx.alice.client.retry_pending_member_add_push_shares();
+    assert_eq!(fx.alice.pending_shares(), vec![fx.group_hex()]);
+    assert!(fx.alice.client.take_queued_push_registration_share());
+    assert!(fx.alice.client.pending_member_add_push_shares.is_empty());
+}
+
+/// A Commit that branch selection re-adopts after withdrawing it may restore
+/// an add without a fresh `MemberAdded`, so its group is shared with again on
+/// both the projection seam and the command boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readopted_commit_queues_a_share() {
+    let mut fx = Fixture::new().await;
+    let revalidated = cgka_traits::engine::GroupEvent::GroupStateRevalidated {
+        group_id: fx.group.clone(),
+        epoch: cgka_traits::EpochId(1),
+        revalidated_commit_id: MessageId::new(vec![7; 32]),
+    };
+    fx.alice
+        .client
+        .observe_event_projection_effects(&revalidated, &mut SyncSummary::default())
+        .unwrap();
+    assert_eq!(fx.alice.pending_shares(), vec![fx.group_hex()]);
+    assert!(fx.alice.client.take_queued_push_registration_share());
+
+    fx.bob
+        .client
+        .queue_push_registration_shares_for_member_adds(std::slice::from_ref(&revalidated));
+    assert_eq!(fx.bob.pending_shares(), vec![fx.group_hex()]);
+    assert!(fx.bob.client.take_queued_push_registration_share());
 }
 
 /// The one-time upgrade repair queues every joined group again, so a member
