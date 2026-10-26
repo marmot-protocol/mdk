@@ -21,18 +21,23 @@ use cgka_traits::{
     GroupId, MemberId, TransportAccountActivation, TransportAdapter, TransportAdapterError,
     TransportEndpoint, TransportGroupSubscription, TransportGroupSync,
 };
+use futures::StreamExt;
 use limit_relay::{LimitConfig, LimitRelay, LimitStats, NegFault, RejectStyle, ReqOutcome, reason};
-use nostr_relay_builder::prelude::{MemoryDatabase, MemoryDatabaseOptions, NostrDatabase};
+use nostr_relay_builder::prelude::{
+    MemoryDatabase, MemoryDatabaseOptions, NostrDatabase, RateLimit,
+};
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{
-    Client, ClientMessage, EventBuilder, FinalizeEvent, Keys, Kind, RelayOptions, SubscriptionId,
-    Tag,
+    Client, ClientMessage, ClientNotification, EventBuilder, FinalizeEvent, Keys, Kind,
+    NotificationUpdate, RelayMessage, RelayOptions, SubscriptionId, Tag,
 };
 use tokio::task::JoinHandle;
 use transport_nostr_adapter::{
-    GROUP_BATCH_ROUTES, NostrReconciliationFailure, NostrReconciliationProgress, NostrRelayClient,
-    NostrSdkRelayClient, NostrSubscription, NostrTransportAdapter, RELAY_REPLAY_PAGE_LIMIT,
-    SubscriptionAttempt, SubscriptionRouteKind,
+    GROUP_BATCH_ROUTES, NostrAcquisitionCancellation, NostrNotificationLossFloor,
+    NostrReconciliationFailure, NostrReconciliationProgress, NostrRelayClient,
+    NostrSdkNotification, NostrSdkRelayClient, NostrSubscription, NostrTransportAdapter,
+    RELAY_REPLAY_PAGE_LIMIT, ReplayCaptureOutcome, ReplayCapturePlan, ReplayRestart,
+    SubscriptionAttempt, SubscriptionRouteKind, dispatch_sdk_replay,
 };
 
 const QUIET: Duration = Duration::from_millis(600);
@@ -44,6 +49,12 @@ const SINCE: u64 = 1_700_000_000 - 30 * 24 * 60 * 60;
 /// and four full batches (200 groups) fill it exactly.
 const SMALL_REQ_LIMIT: usize = 5;
 const UNTIL: u64 = 1_700_200_000;
+const RETAINED_EVENT_CAPACITY: usize = 8_192;
+
+enum FixtureNotifications {
+    Forwarded,
+    Manual,
+}
 
 struct Fixture {
     _upstream: LocalRelay,
@@ -52,21 +63,41 @@ struct Fixture {
     limit: LimitRelay,
     sdk: NostrSdkRelayClient,
     adapter: NostrTransportAdapter,
-    forwarder: JoinHandle<()>,
+    forwarder: Option<JoinHandle<()>>,
     account: MemberId,
 }
 
 impl Fixture {
     async fn new(config: LimitConfig, fast_reconnect: bool) -> Self {
+        let fixture = Self::with_forwarder(config, FixtureNotifications::Forwarded).await;
+        if fast_reconnect {
+            // Preserve the test's fast SDK retry before subscription I/O.
+            fixture
+                .sdk
+                .client()
+                .add_relay(fixture.limit.url())
+                .opts(fast_retry_options())
+                .await
+                .unwrap();
+        }
+        fixture
+    }
+
+    async fn with_forwarder(config: LimitConfig, notifications: FixtureNotifications) -> Self {
         let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
             events: true,
-            max_events: Some(8_192),
+            max_events: Some(RETAINED_EVENT_CAPACITY),
         });
         // The limit proxy owns the 500 clamp; lift the upstream's own default
         // per-filter limit (also 500) so the clamp can be switched off.
         let upstream = LocalRelay::new(
             RelayBuilder::default()
                 .database(database.clone())
+                // Backlog publication must not hit the upstream's 60/min default.
+                .rate_limit(RateLimit {
+                    notes_per_minute: RETAINED_EVENT_CAPACITY as u32,
+                    ..RateLimit::default()
+                })
                 .default_filter_limit(100_000),
         );
         upstream.run().await.unwrap();
@@ -75,19 +106,13 @@ impl Fixture {
         // Mirrors the production per-account context, which is built with
         // `from_builder` (an owned relay pool).
         let sdk = NostrSdkRelayClient::from_builder(Client::builder());
-        if fast_reconnect {
-            // Pre-registering the relay keeps the adapter from pinning its 5 s
-            // production retry interval (it only pins relays it adds), so a
-            // forced drop reconnects in well under a second. Retry timing does
-            // not change which REQs the SDK re-sends.
-            sdk.client()
-                .add_relay(limit.url())
-                .opts(fast_retry_options())
-                .await
-                .unwrap();
-        }
         let adapter = NostrTransportAdapter::new(Arc::new(sdk.clone()));
-        let forwarder = sdk.spawn_notification_forwarder(adapter.clone());
+        let forwarder = match notifications {
+            FixtureNotifications::Forwarded => {
+                Some(sdk.spawn_notification_forwarder(adapter.clone()))
+            }
+            FixtureNotifications::Manual => None,
+        };
         let account = MemberId::new(Keys::generate().public_key().to_bytes().to_vec());
         Self {
             _upstream: upstream,
@@ -129,8 +154,11 @@ impl Fixture {
     }
 
     async fn shutdown(self) {
-        self.forwarder.abort();
-        self.sdk.client().shutdown().await;
+        if let Some(forwarder) = self.forwarder {
+            forwarder.abort();
+            let _ = forwarder.await;
+        }
+        self.sdk.shutdown().await;
     }
 }
 
@@ -188,6 +216,9 @@ async fn delivered_groups(
         let next = deadline.min(tokio::time::Instant::now() + IDLE);
         match tokio::time::timeout_at(next, adapter.receive()).await {
             Ok(Ok(Some(delivery))) => {
+                adapter
+                    .ack_replay_delivery(&delivery.account_id, &delivery.message.id)
+                    .await;
                 if let Some(group) = delivery.group_id_hint {
                     delivered.insert(group.as_slice().to_vec());
                 }
@@ -297,7 +328,18 @@ async fn a_thousand_groups_fit_in_a_few_reqs_and_every_group_delivers() {
     assert_filter_shapes(&stats);
     assert_eq!(stats.total_reqs, live_reqs(G));
     assert_eq!(stats.rejections_total(), 0);
-    assert_eq!(delivered.len(), G);
+    assert_eq!(
+        delivered.len(),
+        G,
+        "forwarder_finished={} loss={:?}",
+        fx.forwarder.as_ref().is_some_and(|task| task.is_finished()),
+        fx.sdk
+            .notification_loss()
+            .unwrap()
+            .borrow()
+            .as_ref()
+            .map(|loss| (loss.receiver_generation, loss.cumulative_skipped))
+    );
     assert!(eose.complete());
     fx.shutdown().await;
 }
@@ -361,6 +403,7 @@ async fn reconciliation_neg_open_and_id_fetches_are_production_shaped() {
             SINCE,
             UNTIL,
             &Cursor::default(),
+            tokio::time::Instant::now() + SETTLE_TIMEOUT,
         )
         .await
         .unwrap();
@@ -410,6 +453,7 @@ async fn reconciliation_on_a_full_socket_under_both_neg_policies() {
                 SINCE,
                 UNTIL,
                 &Cursor::default(),
+                tokio::time::Instant::now() + SETTLE_TIMEOUT,
             )
             .await;
         let stats = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
@@ -472,6 +516,7 @@ async fn recovery_finds_room_beside_199_batched_groups() {
             SINCE,
             UNTIL,
             &Cursor::default(),
+            tokio::time::Instant::now() + SETTLE_TIMEOUT,
         )
         .await
         .unwrap();
@@ -712,6 +757,966 @@ async fn reconnect_storm_at_the_limit_does_not_resend_the_refused_req() {
 // (d) Aborted / failed activation leak (#2262)
 // ---------------------------------------------------------------------------
 
+/// The SDK restores its own REQs after a transport-only reconnect. The adapter
+/// and SDK context remain alive, so their completed initial replay must not let
+/// a clamped newest-first replay escape before its older pages are acquired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn warm_reconnect_backlog600() {
+    const STORED: usize = 600;
+    const START: u64 = 1_700_000_000;
+    let fx = Fixture::new(LimitConfig::default(), false).await;
+    let url = fx.limit.url();
+    let group = groups(1, &url).remove(0);
+    let mut activation = fx.activation(std::slice::from_ref(&url), vec![group.clone()]);
+    activation.since = Some(cgka_traits::Timestamp(SINCE));
+    fx.adapter.activate_account(activation).await.unwrap();
+    await_account_eose(&fx).await;
+    let initial = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    assert_eq!(initial.active_now(), live_reqs(1));
+    assert_eq!(initial.total_reqs, live_reqs(1));
+    let relay = fx.sdk.client().relay(url.as_str()).await.unwrap().unwrap();
+    let original_ids = relay
+        .subscriptions()
+        .await
+        .into_keys()
+        .collect::<HashSet<_>>();
+    assert_eq!(original_ids.len(), live_reqs(1));
+
+    // An explicit SDK disconnect prevents its retry loop from racing backlog
+    // publication. Neither the adapter nor the existing REQs are reopened.
+    relay.disconnect();
+    assert!(
+        fx.limit
+            .wait_for(SETTLE_TIMEOUT, |stats| stats.open_connections() == 0)
+            .await,
+        "the SDK transport stays disconnected during publication"
+    );
+    let publisher = Client::default();
+    publisher.add_relay(fx.upstream_url.as_str()).await.unwrap();
+    publisher.connect().await;
+    let keys = Keys::generate();
+    let mut expected = Vec::with_capacity(STORED);
+    let publication_relay = nostr_sdk::prelude::RelayUrl::parse(&fx.upstream_url).unwrap();
+    for index in 0..STORED {
+        // Three events per second, not a saturated 500-event timestamp tie.
+        let timestamp = START + index as u64 / 3;
+        let event = EventBuilder::new(Kind::MlsGroupMessage, format!("offline-{index}"))
+            .tags([Tag::custom("h", [hex::encode(route(0))])])
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(timestamp))
+            .finalize(&keys)
+            .unwrap();
+        let published = publisher.send_event(&event).await.unwrap();
+        assert!(
+            published.success.contains_key(&publication_relay),
+            "every offline event must be accepted, not just sent: {:?}",
+            published.failed
+        );
+        expected.push((timestamp, event.id.to_bytes()));
+    }
+    expected.sort_unstable();
+    let offline = fx.limit.stats();
+    assert_eq!(offline.open_connections(), 0);
+    assert_eq!(offline.connections.len(), initial.connections.len());
+    assert_eq!(offline.total_reqs, initial.total_reqs);
+    assert!(
+        relay
+            .subscriptions()
+            .await
+            .into_keys()
+            .collect::<HashSet<_>>()
+            == original_ids,
+        "disconnect retains exactly the SDK's existing subscription ids"
+    );
+    assert!(
+        tokio::time::timeout(QUIET, fx.adapter.receive())
+            .await
+            .is_err(),
+        "the independent publisher cannot deliver through a disconnected transport"
+    );
+
+    relay.connect();
+    assert!(
+        fx.limit
+            .wait_for(SETTLE_TIMEOUT, |stats| {
+                stats.connections.len() > initial.connections.len()
+                    && stats.active_now() >= original_ids.len()
+            })
+            .await,
+        "the same SDK context restores its registered subscriptions"
+    );
+    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+    for (position, (timestamp, id)) in expected.iter().enumerate() {
+        let delivery = tokio::time::timeout_at(deadline, fx.adapter.receive())
+            .await
+            .unwrap_or_else(|_| {
+                let stats = fx.limit.stats();
+                panic!("offline replay stopped at {position}/{STORED}; forwarder_finished={}; SDK_loss={:?}; REQs={}, active={}, clamped={}",
+                    fx.forwarder.as_ref().is_some_and(JoinHandle::is_finished),
+                    fx.sdk.notification_loss().unwrap().borrow().as_ref(),
+                    stats.total_reqs, stats.active_now(), stats.clamped_filters);
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            delivery.message.timestamp.0, *timestamp,
+            "position {position}"
+        );
+        assert!(
+            delivery.message.id.as_slice() == id,
+            "every offline event arrives once in timestamp/id order at position {position}"
+        );
+        assert!(delivery.account_id == fx.account);
+        assert!(delivery.group_id_hint.as_ref() == Some(&group.group_id));
+        fx.adapter
+            .ack_replay_delivery(&fx.account, &delivery.message.id)
+            .await;
+    }
+    await_account_eose(&fx).await;
+
+    let live_timestamp = START + STORED as u64;
+    let live = EventBuilder::new(Kind::MlsGroupMessage, "live after warm reconnect")
+        .tags([Tag::custom("h", [hex::encode(route(0))])])
+        .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(live_timestamp))
+        .finalize(&keys)
+        .unwrap();
+    publisher.send_event(&live).await.unwrap();
+    let delivery = tokio::time::timeout(SETTLE_TIMEOUT, fx.adapter.receive())
+        .await
+        .expect("the next live marker follows all offline history")
+        .unwrap()
+        .unwrap();
+    assert!(delivery.message.id.as_slice() == live.id.to_bytes());
+    assert_eq!(delivery.message.timestamp.0, live_timestamp);
+    assert!(delivery.account_id == fx.account);
+    assert!(delivery.group_id_hint.as_ref() == Some(&group.group_id));
+    fx.adapter
+        .ack_replay_delivery(&fx.account, &delivery.message.id)
+        .await;
+    assert!(
+        tokio::time::timeout(QUIET, fx.adapter.receive())
+            .await
+            .is_err(),
+        "neither restored raw copies nor backward pages duplicate admission"
+    );
+    {
+        let status = fx.adapter.take_replay_status(&fx.account).await;
+        assert!(
+            !status.pending,
+            "every historical and live delivery was placed"
+        );
+        assert!(
+            status.loss.is_none(),
+            "healthy reconnect has no admission loss"
+        );
+    }
+    let restored = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    assert_eq!(restored.open_connections(), 1);
+    assert_eq!(restored.active_now(), original_ids.len());
+    assert!(
+        relay
+            .subscriptions()
+            .await
+            .into_keys()
+            .collect::<HashSet<_>>()
+            == original_ids,
+        "paging leaves exactly the original physical live subscriptions"
+    );
+    for id in &original_ids {
+        assert_eq!(
+            restored
+                .req_log
+                .iter()
+                .filter(|record| {
+                    record.connection >= initial.connections.len()
+                        && record.subscription_id == id.as_str()
+                })
+                .count(),
+            1,
+            "each original REQ is restored once without adapter reactivation"
+        );
+    }
+    assert_eq!(restored.reqs_with_active_id, 0);
+    assert_eq!(restored.rejections_total(), 0);
+    assert!(
+        restored.total_reqs > initial.total_reqs + original_ids.len(),
+        "the clamped restored replay fetched older history"
+    );
+    assert_eq!(restored.neg_opens, 0, "warm replay does not use NIP-77");
+    publisher.shutdown().await;
+    fx.shutdown().await;
+}
+
+async fn await_account_eose(fx: &Fixture) {
+    tokio::time::timeout(SETTLE_TIMEOUT, async {
+        while !fx
+            .adapter
+            .account_subscription_eose(&fx.account)
+            .await
+            .complete()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the account's actual relay replay completes");
+}
+
+/// Hold actual native SDK EOSE payloads at the consumer while the socket
+/// reconnects. A newer ordered connection marker must fence those queued
+/// payloads, even though the SDK restored precisely the same physical REQs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_eose_after_reconnect() {
+    const STORED: usize = 12;
+    const START: u64 = 1_700_000_000;
+    let fx = Fixture::with_forwarder(LimitConfig::default(), FixtureNotifications::Manual).await;
+    // This is the first receiver, installed before subscription I/O, not a
+    // replacement reader and not a copy of a forwarder's dispatched payloads.
+    let mut source = fx.sdk.notifications();
+    let url = fx.limit.url();
+    let group = groups(1, &url).remove(0);
+    let mut activation = fx.activation(std::slice::from_ref(&url), vec![group.clone()]);
+    activation.since = Some(cgka_traits::Timestamp(SINCE));
+    fx.adapter.activate_account(activation).await.unwrap();
+    let mut held_eose = Vec::new();
+    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+    while held_eose.len() < live_reqs(1) {
+        let update = tokio::time::timeout_at(deadline, source.next())
+            .await
+            .expect("initial real SDK EOSE reaches the held consumer")
+            .expect("the native receiver remains alive");
+        let NotificationUpdate::Notification(notification) = update else {
+            panic!("the small initial replay must not lose notifications");
+        };
+        if matches!(
+            &notification,
+            NostrSdkNotification::Payload {
+                notification: ClientNotification::Message { message, .. }, ..
+            } if matches!(message.as_ref(), RelayMessage::EndOfStoredEvents(_))
+        ) {
+            held_eose.push(notification);
+        } else {
+            assert!(
+                !dispatch_sdk_replay(notification, &fx.adapter, None, &|reason| fx
+                    .sdk
+                    .subscription_refusal(reason))
+                .await
+            );
+        }
+    }
+    let old_epoch = held_eose
+        .iter()
+        .map(|notification| {
+            let NostrSdkNotification::Payload { epoch, .. } = notification else {
+                unreachable!("only genuine EOSE payloads are held");
+            };
+            *epoch
+        })
+        .max()
+        .unwrap();
+    let initial = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    let relay = fx.sdk.client().relay(url.as_str()).await.unwrap().unwrap();
+    let original_ids = relay
+        .subscriptions()
+        .await
+        .into_keys()
+        .collect::<HashSet<_>>();
+    assert_eq!(original_ids.len(), live_reqs(1));
+    assert_eq!(
+        fx.adapter
+            .account_subscription_eose(&fx.account)
+            .await
+            .with_eose,
+        0
+    );
+    relay.disconnect();
+    assert!(
+        fx.limit
+            .wait_for(SETTLE_TIMEOUT, |stats| stats.open_connections() == 0)
+            .await
+    );
+    let publisher = Client::default();
+    publisher.add_relay(fx.upstream_url.as_str()).await.unwrap();
+    publisher.connect().await;
+    let keys = Keys::generate();
+    let mut expected = Vec::with_capacity(STORED);
+    let publication_relay = nostr_sdk::prelude::RelayUrl::parse(&fx.upstream_url).unwrap();
+    for index in 0..STORED {
+        let timestamp = START + index as u64 / 2;
+        let event = EventBuilder::new(Kind::MlsGroupMessage, format!("held-eose-{index}"))
+            .tags([Tag::custom("h", [hex::encode(route(0))])])
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(timestamp))
+            .finalize(&keys)
+            .unwrap();
+        let published = publisher.send_event(&event).await.unwrap();
+        assert!(
+            published.success.contains_key(&publication_relay),
+            "held-consumer history must be retained: {:?}",
+            published.failed
+        );
+        expected.push((timestamp, event.id.to_bytes()));
+    }
+    expected.sort_unstable();
+    assert_eq!(fx.limit.stats().open_connections(), 0);
+    relay.connect();
+    assert!(
+        fx.limit
+            .wait_for(SETTLE_TIMEOUT, |stats| {
+                stats.connections.len() > initial.connections.len()
+                    && stats.active_now() == original_ids.len()
+            })
+            .await
+    );
+
+    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+    loop {
+        let update = tokio::time::timeout_at(deadline, source.next())
+            .await
+            .expect("the new connection marker reaches the backlogged consumer")
+            .expect("the native receiver remains alive across reconnect");
+        let NotificationUpdate::Notification(notification) = update else {
+            panic!("holding two EOSE payloads must not overflow the native receiver");
+        };
+        let new_connection = matches!(
+            &notification,
+            NostrSdkNotification::Replay { endpoint, epoch, .. }
+                if endpoint.0 == url && *epoch > old_epoch
+        );
+        assert!(
+            !dispatch_sdk_replay(notification, &fx.adapter, None, &|reason| fx
+                .sdk
+                .subscription_refusal(reason))
+            .await
+        );
+        if new_connection {
+            break;
+        }
+    }
+    for notification in held_eose {
+        // Deliver the original payload exactly once, after the real new
+        // connection marker but before its stored events/EOSE are consumed.
+        assert!(
+            !dispatch_sdk_replay(notification, &fx.adapter, None, &|reason| fx
+                .sdk
+                .subscription_refusal(reason))
+            .await
+        );
+        let coverage = fx.adapter.account_subscription_eose(&fx.account).await;
+        assert_eq!(
+            coverage.with_eose, 0,
+            "old source EOSE cannot open the new frontier"
+        );
+        assert_eq!(coverage.relay_subscription_attempts_with_eose, 0);
+        assert!(!coverage.complete());
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), fx.adapter.receive())
+            .await
+            .is_err()
+    );
+
+    tokio::time::timeout_at(deadline, async {
+        let mut received = 0;
+        while received < expected.len() || !fx.adapter.account_subscription_eose(&fx.account).await.complete() {
+            tokio::select! {
+                update = source.next() => {
+                    let NotificationUpdate::Notification(notification) = update.expect("the native receiver remains alive through replay") else {
+                        panic!("the small reconnect replay must not lose notifications");
+                    };
+                    assert!(!dispatch_sdk_replay(notification, &fx.adapter, None, &|reason| fx.sdk.subscription_refusal(reason)).await);
+                }
+                delivery = fx.adapter.receive(), if received < expected.len() => {
+                    let delivery = delivery.unwrap().unwrap();
+                    let (timestamp, id) = &expected[received];
+                    assert_eq!(delivery.message.timestamp.0, *timestamp);
+                    assert_eq!(delivery.message.id.as_slice(), id.as_slice());
+                    assert_eq!(delivery.account_id, fx.account);
+                    assert_eq!(delivery.group_id_hint.as_ref(), Some(&group.group_id));
+                    fx.adapter.ack_replay_delivery(&fx.account, &delivery.message.id).await;
+                    received += 1;
+                }
+            }
+        }
+    }).await.expect("new-generation history is admitted and placed in full before certification");
+    assert!(
+        tokio::time::timeout(QUIET, fx.adapter.receive())
+            .await
+            .is_err()
+    );
+    {
+        let status = fx.adapter.take_replay_status(&fx.account).await;
+        assert!(!status.pending);
+        assert!(
+            status.loss.is_none(),
+            "stale EOSE rejection is not admission loss"
+        );
+    }
+    let restored = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    assert_eq!(restored.active_now(), original_ids.len());
+    assert!(
+        relay
+            .subscriptions()
+            .await
+            .into_keys()
+            .collect::<HashSet<_>>()
+            == original_ids
+    );
+    assert_eq!(restored.total_reqs - initial.total_reqs, original_ids.len());
+    assert_eq!(restored.reqs_with_active_id, 0);
+    assert_eq!(restored.neg_opens, 0);
+    publisher.shutdown().await;
+    fx.shutdown().await;
+}
+
+/// Replacing a reader cannot wait for another EOSE on unchanged live REQs.
+/// The owner must grant a refetch of SDK-seen history across the new epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reader_loss_refetches_seen() {
+    const STORED: usize = 200;
+    const START: u64 = 1_700_000_000;
+    let fx = Fixture::with_forwarder(LimitConfig::default(), FixtureNotifications::Manual).await;
+    let mut source = fx.sdk.notifications();
+    let url = fx.limit.url();
+    let group = groups(1, &url).remove(0);
+    let keys = Keys::generate();
+    let mut expected = Vec::with_capacity(STORED);
+    for index in 0..STORED {
+        let timestamp = START + index as u64 / 3;
+        let event = EventBuilder::new(Kind::MlsGroupMessage, format!("lost-reader-{index}"))
+            .tags([Tag::custom("h", [hex::encode(route(0))])])
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(timestamp))
+            .finalize(&keys)
+            .unwrap();
+        fx.database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+        expected.push((timestamp, event.id.to_bytes()));
+    }
+    expected.sort_unstable();
+    let mut activation = fx.activation(std::slice::from_ref(&url), vec![group.clone()]);
+    activation.since = Some(cgka_traits::Timestamp(SINCE));
+    fx.adapter.activate_account(activation).await.unwrap();
+    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+    let mut eose = 0;
+    let mut cached = HashSet::new();
+    let mut held_eose = Vec::new();
+    let mut held_raw = None;
+    while eose < live_reqs(1) {
+        let update = tokio::time::timeout_at(deadline, source.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let NotificationUpdate::Notification(notification) = update else {
+            panic!("the native reader must receive the small initial range intact");
+        };
+        match notification {
+            boundary @ NostrSdkNotification::Replay { .. } => {
+                assert!(
+                    !dispatch_sdk_replay(boundary, &fx.adapter, None, &|reason| fx
+                        .sdk
+                        .subscription_refusal(reason))
+                    .await
+                );
+            }
+            NostrSdkNotification::Payload {
+                notification: ClientNotification::Event { event, .. },
+                ..
+            } => {
+                if event.kind == Kind::MlsGroupMessage {
+                    cached.insert(event.id.to_bytes());
+                }
+            }
+            payload @ NostrSdkNotification::Payload {
+                notification: ClientNotification::Message { .. },
+                ..
+            } => {
+                let NostrSdkNotification::Payload {
+                    notification: ClientNotification::Message { message, .. },
+                    ..
+                } = &payload
+                else {
+                    unreachable!();
+                };
+                match message.as_ref() {
+                    RelayMessage::EndOfStoredEvents(_) => {
+                        eose += 1;
+                        held_eose.push(payload);
+                    }
+                    RelayMessage::Event { event, .. }
+                        if event.id.to_bytes() == expected.last().unwrap().1 =>
+                    {
+                        // Retain real ciphertext for the cutover to discard;
+                        // empty input alone must never manufacture core loss.
+                        assert!(held_raw.is_none());
+                        assert!(
+                            !dispatch_sdk_replay(payload.clone(), &fx.adapter, None, &|reason| fx
+                                .sdk
+                                .subscription_refusal(reason))
+                            .await
+                        );
+                        held_raw = Some(payload);
+                    }
+                    _ => {}
+                }
+            }
+            NostrSdkNotification::Payload { .. } | NostrSdkNotification::Shutdown => {
+                panic!("the real SDK must remain alive through the initial replay");
+            }
+        }
+    }
+    assert!(
+        cached == expected.iter().map(|(_, id)| *id).collect::<HashSet<_>>(),
+        "the SDK saw exactly the history deliberately withheld from the adapter"
+    );
+    let held_raw = held_raw.expect("the newest real raw copy is staged before the gap");
+    let NostrSdkNotification::Payload {
+        epoch: old_epoch, ..
+    } = &held_raw
+    else {
+        unreachable!();
+    };
+    let old_epoch = *old_epoch;
+    let (old_generation, stale_sources, original_floors) = {
+        let status = fx.adapter.take_replay_status(&fx.account).await;
+        assert!(
+            status.pending,
+            "the staged newer copy must wait for the whole range"
+        );
+        assert!(status.loss.is_none());
+        let mut sources = Vec::new();
+        let mut original_floors = BTreeMap::new();
+        for source in status.sources() {
+            assert!(
+                source.since() <= SINCE,
+                "recovery cannot narrow an issued query's floor"
+            );
+            original_floors.insert(source.group_routes().next().copied(), source.since());
+            sources.extend(source.endpoints().map(|endpoint| endpoint.capture_token()));
+        }
+        (status.generation(), sources, original_floors)
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), fx.adapter.receive())
+            .await
+            .is_err()
+    );
+    let initial = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    let relay = fx.sdk.client().relay(url.as_str()).await.unwrap().unwrap();
+    let original_ids = relay
+        .subscriptions()
+        .await
+        .into_keys()
+        .collect::<HashSet<_>>();
+    assert_eq!(original_ids.len(), live_reqs(1));
+    for id in &original_ids {
+        assert_eq!(relay.subscription_received_eose(id).await, Some(true));
+    }
+    drop(source);
+
+    let mut source = fx.sdk.notifications();
+    let update = tokio::time::timeout(SETTLE_TIMEOUT, source.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let NotificationUpdate::Notification(boundary) = update else {
+        panic!("reader replacement emits an ordered boundary, not fabricated skipped bytes");
+    };
+    let NostrSdkNotification::Replay {
+        epoch,
+        reason: ReplayRestart::ReceiverLoss,
+        ..
+    } = &boundary
+    else {
+        panic!("reader replacement must fence the old native epoch");
+    };
+    assert!(epoch[0] > old_epoch[0]);
+    assert_eq!(epoch[1], old_epoch[1], "reader loss is not a reconnect");
+    assert!(
+        !dispatch_sdk_replay(boundary, &fx.adapter, None, &|reason| fx
+            .sdk
+            .subscription_refusal(reason))
+        .await
+    );
+    for stale in std::iter::once(held_raw).chain(held_eose) {
+        assert!(
+            !dispatch_sdk_replay(stale, &fx.adapter, None, &|reason| fx
+                .sdk
+                .subscription_refusal(reason))
+            .await
+        );
+    }
+    let coverage = fx.adapter.account_subscription_eose(&fx.account).await;
+    assert_eq!(coverage.with_eose, 0);
+    assert_eq!(coverage.relay_subscription_attempts_with_eose, 0);
+    assert!(
+        !coverage.complete(),
+        "old raw EOSE cannot certify the replacement epoch"
+    );
+    let credit = Arc::new(
+        Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        fx.adapter
+            .capture_replay(
+                &fx.account,
+                ReplayCapturePlan {
+                    attempt_serial: 1,
+                    sources: stale_sources,
+                    credit: credit.clone(),
+                },
+                NostrAcquisitionCancellation::new(),
+            )
+            .await
+            .unwrap(),
+        ReplayCaptureOutcome::Stale,
+        "the owner cannot reuse capabilities from before the reader gap"
+    );
+    let sources = {
+        let status = fx.adapter.take_replay_status(&fx.account).await;
+        assert!(status.generation() > old_generation);
+        assert!(
+            matches!(status.loss, Some(NostrNotificationLossFloor::Since(floor)) if floor <= START),
+            "actual discarded ciphertext keeps its original loss floor"
+        );
+        let mut sources = Vec::new();
+        for source in status.sources() {
+            assert_eq!(
+                source.since(),
+                original_floors[&source.group_routes().next().copied()]
+            );
+            for endpoint in source.endpoints() {
+                assert!(!endpoint.admitted());
+                sources.push(endpoint.capture_token());
+            }
+        }
+        assert_eq!(sources.len(), live_reqs(1));
+        sources
+    };
+    let waiting = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    assert_eq!(
+        waiting.total_reqs, initial.total_reqs,
+        "ReceiverLoss and a stale grant cannot start autonomous recovery IO"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), fx.adapter.receive())
+            .await
+            .is_err(),
+        "neither stale raw copies nor an ungranted fence may release history"
+    );
+    let capture = tokio::spawn({
+        let adapter = fx.adapter.clone();
+        let account = fx.account.clone();
+        async move {
+            adapter
+                .capture_replay(
+                    &account,
+                    ReplayCapturePlan {
+                        attempt_serial: 2,
+                        sources,
+                        credit,
+                    },
+                    NostrAcquisitionCancellation::new(),
+                )
+                .await
+                .unwrap()
+        }
+    });
+    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+    for (timestamp, id) in expected {
+        let delivery = tokio::time::timeout_at(deadline, fx.adapter.receive())
+            .await
+            .expect(
+                "the owner grant refetches SDK-seen lost history, including older missing copies",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.message.timestamp.0, timestamp);
+        assert!(delivery.message.id.as_slice() == id);
+        assert!(delivery.account_id == fx.account);
+        assert!(delivery.group_id_hint.as_ref() == Some(&group.group_id));
+        fx.adapter
+            .ack_replay_delivery(&fx.account, &delivery.message.id)
+            .await;
+    }
+    assert_eq!(
+        tokio::time::timeout_at(deadline, capture)
+            .await
+            .unwrap()
+            .unwrap(),
+        ReplayCaptureOutcome::Complete
+    );
+    await_account_eose(&fx).await;
+    assert!(
+        tokio::time::timeout(QUIET, fx.adapter.receive())
+            .await
+            .is_err()
+    );
+    {
+        let status = fx.adapter.take_replay_status(&fx.account).await;
+        assert!(!status.pending);
+        assert!(status.sources().all(|source| source.admitted()));
+        assert!(
+            status.loss.is_none(),
+            "capture does not manufacture or re-charge the already imported byte loss"
+        );
+    }
+    assert!(
+        tokio::time::timeout(QUIET, source.next()).await.is_err(),
+        "private capture replies cannot appear as live raw copies or EOSE"
+    );
+    let restored = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    assert_eq!(
+        restored.connections.len(),
+        initial.connections.len(),
+        "no transport reconnect can supply a replacement EOSE"
+    );
+    assert!(
+        relay
+            .subscriptions()
+            .await
+            .into_keys()
+            .collect::<HashSet<_>>()
+            == original_ids
+    );
+    assert_eq!(restored.active_now(), original_ids.len());
+    assert_eq!(restored.total_reqs - initial.total_reqs, live_reqs(1));
+    assert_eq!(restored.reqs_with_active_id, 0);
+    assert!(
+        restored
+            .req_log
+            .iter()
+            .skip(initial.req_log.len())
+            .all(|record| {
+                !original_ids
+                    .iter()
+                    .any(|id| id.as_str() == record.subscription_id)
+            })
+    );
+    for id in &original_ids {
+        assert_eq!(relay.subscription_received_eose(id).await, Some(true));
+    }
+    assert_eq!(restored.neg_opens, 0);
+    fx.shutdown().await;
+}
+
+/// Collect B's real native frames before advancing virtual time: socket timing
+/// cannot decide whether its first consumer-visible Connected boundary is late.
+async fn sdk_late_replay_proof(stored: usize) {
+    const START: u64 = 1_700_000_000;
+    let fx = Fixture::with_forwarder(LimitConfig::default(), FixtureNotifications::Manual).await;
+    let empty = LocalRelay::new(RelayBuilder::default());
+    empty.run().await.unwrap();
+    let a = empty.url().await.to_string();
+    let b = fx.limit.url();
+    // Attach the transport to already-connected SDK relays. Its first visible
+    // generation has no earlier zero/Connected pair to reopen the waiting lease.
+    for endpoint in [&a, &b] {
+        fx.sdk.client().add_relay(endpoint.as_str()).await.unwrap();
+    }
+    fx.sdk.client().connect().await;
+    tokio::time::timeout(SETTLE_TIMEOUT, async {
+        while !fx
+            .sdk
+            .client()
+            .relays()
+            .await
+            .values()
+            .all(|relay| relay.status() == nostr_sdk::prelude::RelayStatus::Connected)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both SDK connections exist before the transport source");
+    let mut source = fx.sdk.notifications();
+    let mut group = groups(1, &a).remove(0);
+    group.endpoints.push(TransportEndpoint(b.clone()));
+    let keys = Keys::generate();
+    let mut expected = Vec::with_capacity(stored);
+    for index in 0..stored {
+        let event = EventBuilder::new(Kind::MlsGroupMessage, format!("late-initial-B-{index}"))
+            .tags([Tag::custom("h", [hex::encode(route(0))])])
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
+                START + index as u64,
+            ))
+            .finalize(&keys)
+            .unwrap();
+        fx.database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+        expected.push(
+            transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&event)
+                .unwrap()
+                .to_transport_message()
+                .unwrap(),
+        );
+    }
+    expected.sort_unstable_by(|left, right| {
+        (left.timestamp, left.id.as_slice()).cmp(&(right.timestamp, right.id.as_slice()))
+    });
+    let mut activation = fx.activation(std::slice::from_ref(&a), vec![group.clone()]);
+    activation.since = Some(cgka_traits::Timestamp(SINCE));
+    fx.adapter.activate_account(activation).await.unwrap();
+    let id = fx
+        .adapter
+        .group_route_subscription_id(&fx.account, &group.transport_group_id)
+        .await
+        .unwrap();
+    let mut held = Vec::new();
+    let mut ended = HashSet::new();
+    let mut raw_b = 0;
+    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+    while ended.len() < 2 {
+        let update = tokio::time::timeout_at(deadline, source.next())
+            .await
+            .expect("both real relays send their initial stored boundary")
+            .expect("native SDK receiver remains alive");
+        let NotificationUpdate::Notification(notification) = update else {
+            panic!("the bounded native replay must not lose frames");
+        };
+        let endpoint = match &notification {
+            NostrSdkNotification::Replay { endpoint, .. } => endpoint.0.as_str(),
+            NostrSdkNotification::Payload {
+                notification:
+                    ClientNotification::Event { relay_url, .. }
+                    | ClientNotification::Message { relay_url, .. },
+                ..
+            } => relay_url.as_str(),
+            _ => panic!("neither live relay shuts the native receiver down"),
+        };
+        if let NostrSdkNotification::Payload {
+            notification: ClientNotification::Message { message, .. },
+            ..
+        } = &notification
+        {
+            match message.as_ref() {
+                RelayMessage::EndOfStoredEvents(subscription) if subscription.as_str() == id => {
+                    ended.insert(endpoint.to_owned());
+                }
+                RelayMessage::Event { .. } if endpoint == b => raw_b += 1,
+                _ => {}
+            }
+        }
+        if endpoint == b {
+            held.push(notification);
+        } else {
+            assert_eq!(endpoint, a);
+            assert!(
+                !dispatch_sdk_replay(notification, &fx.adapter, None, &|reason| fx
+                    .sdk
+                    .subscription_refusal(reason))
+                .await
+            );
+        }
+    }
+    assert_eq!(
+        raw_b,
+        stored.min(RELAY_REPLAY_PAGE_LIMIT),
+        "the withheld frames are the actual clamped wire range"
+    );
+    assert_eq!(
+        fx.adapter
+            .subscription_endpoint_eose(&id, &group.endpoints[0])
+            .await,
+        Some(true)
+    );
+    assert_eq!(
+        fx.adapter
+            .subscription_endpoint_eose(&id, &group.endpoints[1])
+            .await,
+        Some(false)
+    );
+
+    tokio::time::pause();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(31)).await;
+    let mut loss = fx.adapter.take_replay_status(&fx.account).await.loss;
+    for notification in held {
+        assert!(
+            !dispatch_sdk_replay(notification, &fx.adapter, None, &|reason| fx
+                .sdk
+                .subscription_refusal(reason))
+            .await
+        );
+    }
+    tokio::time::resume();
+
+    let (pending, current_loss) = {
+        let status = fx.adapter.take_replay_status(&fx.account).await;
+        (status.pending, status.loss)
+    };
+    loss = current_loss.or(loss);
+    let mut delivered = Vec::new();
+    if pending || loss.is_none() {
+        let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+        while delivered.len() < expected.len() {
+            let Ok(delivery) = tokio::time::timeout_at(deadline, fx.adapter.receive()).await else {
+                break;
+            };
+            let delivery = delivery.unwrap().unwrap();
+            assert_eq!(delivery.account_id, fx.account);
+            assert_eq!(delivery.group_id_hint.as_ref(), Some(&group.group_id));
+            fx.adapter
+                .ack_replay_delivery(&fx.account, &delivery.message.id)
+                .await;
+            delivered.push(delivery.message);
+        }
+    }
+    {
+        let status = fx.adapter.take_replay_status(&fx.account).await;
+        loss = status.loss.or(loss);
+    }
+    if delivered == expected {
+        await_account_eose(&fx).await;
+    } else {
+        assert!(
+            delivered.is_empty(),
+            "late native stored copies cannot release a newer partial range"
+        );
+        assert_eq!(
+            loss,
+            Some(transport_nostr_adapter::NostrNotificationLossFloor::Since(
+                SINCE
+            ))
+        );
+        assert_eq!(
+            fx.adapter
+                .subscription_endpoint_eose(&id, &group.endpoints[1])
+                .await,
+            Some(false)
+        );
+        assert_eq!(fx.adapter.subscription_synced(&id).await, Some(false));
+        assert!(
+            !fx.adapter
+                .account_subscription_eose(&fx.account)
+                .await
+                .complete()
+        );
+    }
+    assert!(
+        tokio::time::timeout(QUIET, fx.adapter.receive())
+            .await
+            .is_err(),
+        "no SDK cache copy bypasses late-source admission"
+    );
+    drop(source);
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn sdk_late_short_keeps_proof() {
+    sdk_late_replay_proof(3).await;
+}
+
+#[tokio::test]
+async fn sdk_late_clamp_keeps_proof() {
+    sdk_late_replay_proof(600).await;
+}
+
 /// A relay endpoint nostr-sdk refuses to operate: a closed port that has
 /// failed enough connection attempts for `ensure_operational` to reject
 /// sends with "not connected".
@@ -728,6 +1733,23 @@ async fn dead_relay(sdk: &NostrSdkRelayClient) -> String {
     // `ensure_operational` needs >1 failed attempt and the connect timeout
     // elapsed since wake-up, measured in whole seconds.
     tokio::time::sleep(Duration::from_millis(2_500)).await;
+    url
+}
+
+/// A relay the account's pool has banned. nostr-sdk refuses every REQ for it,
+/// and no reconnect cures that, so its route's subscribe fails. An
+/// unreachable relay would not: the client keeps its REQ owed (#1951).
+async fn banned_relay(sdk: &NostrSdkRelayClient) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    drop(listener);
+    sdk.client().add_relay(url.as_str()).await.unwrap();
+    sdk.client()
+        .relay(url.as_str())
+        .await
+        .unwrap()
+        .expect("the relay was just added")
+        .ban();
     url
 }
 
@@ -791,8 +1813,8 @@ async fn leak_check(fx: &Fixture, group_count: usize, label: &str) -> LeakCheck 
     check
 }
 
-/// One group route that nostr-sdk cannot operate fails `subscribe_all`: its own
-/// batch, since its endpoints differ. Every REQ its sibling tasks handed to
+/// One group route that nostr-sdk refuses for good fails `subscribe_all`: its
+/// own batch, since its endpoints differ. Every REQ its sibling tasks handed to
 /// the SDK must be closed by the rollback, and
 /// none may come back on reconnect (#2262). Before the fix `subscribe_all`
 /// aborted the siblings mid-flight and tracked ids only after the SDK call, so
@@ -802,7 +1824,7 @@ async fn failed_activation_rollback_leaves_no_untracked_reqs() {
     const G: usize = 150;
     const ATTEMPTS: usize = 12;
     let fx = Fixture::new(LimitConfig::default(), true).await;
-    let dead = dead_relay(&fx.sdk).await;
+    let banned = banned_relay(&fx.sdk).await;
     let url = fx.limit.url();
     let mut failures = 0;
     let mut active_after_rollback = Vec::new();
@@ -811,7 +1833,7 @@ async fn failed_activation_rollback_leaves_no_untracked_reqs() {
         // Move the failing route through the batch so the abort lands at
         // different points in the siblings' progress.
         let failing = (attempt * 37 + 11) % G;
-        routes[failing].endpoints = vec![TransportEndpoint(dead.clone())];
+        routes[failing].endpoints = vec![TransportEndpoint(banned.clone())];
         let result = fx
             .adapter
             .activate_account(fx.activation(std::slice::from_ref(&url), routes))
@@ -824,7 +1846,7 @@ async fn failed_activation_rollback_leaves_no_untracked_reqs() {
         "[d] failed activations={failures}/{ATTEMPTS} live REQs after each rollback={active_after_rollback:?} {}",
         fx.limit.stats().summary()
     );
-    assert_eq!(failures, ATTEMPTS, "the dead route fails each activation");
+    assert_eq!(failures, ATTEMPTS, "the banned route fails each activation");
     let check = leak_check(&fx, G, "after failed activations").await;
     assert!(
         active_after_rollback.iter().all(|&active| active == 0),
@@ -1051,14 +2073,24 @@ fn route_on(endpoints: &[String], account: &MemberId) -> NostrSubscription {
     }
 }
 
-/// One reconciliation pass as the recovery owner runs it, optionally dropped
-/// after `budget`.
-async fn reconcile_pass(fx: &Fixture, endpoints: &[String], budget: Option<Duration>) -> Pass {
+/// One reconciliation pass as the recovery owner runs it, with the caller's
+/// `allowance`, optionally dropped after `budget`.
+async fn reconcile_pass(
+    fx: &Fixture,
+    endpoints: &[String],
+    allowance: Duration,
+    budget: Option<Duration>,
+) -> Pass {
     let cursor = Cursor::default();
     let started = Instant::now();
-    let pass =
-        fx.sdk
-            .reconcile_subscription(route_on(endpoints, &fx.account), &[], SINCE, UNTIL, &cursor);
+    let pass = fx.sdk.reconcile_subscription(
+        route_on(endpoints, &fx.account),
+        &[],
+        SINCE,
+        UNTIL,
+        &cursor,
+        tokio::time::Instant::now() + allowance,
+    );
     let result = match budget {
         Some(budget) => tokio::time::timeout(budget, pass).await.ok(),
         None => Some(pass.await),
@@ -1130,6 +2162,285 @@ async fn neg_sessions_after_pass(fx: &Fixture) -> usize {
     fx.limit.stats().neg_active_now()
 }
 
+/// A healthy relay may need longer than the former 500 ms first reply and
+/// two-second route ceilings to compare and serve its exact-ID history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delayed_relay_returns_history() {
+    const STORED: usize = 10;
+    let (fx, url) = connected_fixture(LimitConfig::default(), 0).await;
+    let keys = Keys::generate();
+    let mut expected = HashSet::new();
+    for index in 0..STORED {
+        let event = EventBuilder::new(Kind::MlsGroupMessage, format!("history-{index}"))
+            .tags([Tag::custom("h", [hex::encode(route(0))])])
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(
+                1_700_000_000 + index as u64,
+            ))
+            .finalize(&keys)
+            .unwrap();
+        expected.insert((event.id.to_hex(), event.content.clone()));
+        fx.database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+    }
+    fx.limit.set_client_delay(Duration::from_millis(1_200));
+    let result = fx
+        .sdk
+        .reconcile_subscription(
+            reconciliation_route(&url, &fx.account),
+            &[],
+            SINCE,
+            UNTIL,
+            &Cursor::default(),
+            tokio::time::Instant::now() + SETTLE_TIMEOUT,
+        )
+        .await;
+    // Do not delay cleanup frames or fixture teardown, even on a failed pass.
+    fx.limit.set_client_delay(Duration::ZERO);
+    let lingering = neg_sessions_after_pass(&fx).await;
+    let stats = fx.limit.stats();
+    fx.shutdown().await;
+
+    let (summary, events) = result.unwrap();
+    assert_eq!(summary.relays_succeeded, 1);
+    assert_eq!(summary.relays_failed, 0);
+    assert!(summary.failed_endpoints.is_empty());
+    assert!(summary.incomplete_endpoints.is_empty());
+    assert!(summary.endpoint_failures.is_empty());
+    assert!(!summary.order_unproven);
+    assert_eq!(summary.remote_items, STORED);
+    assert_eq!(summary.received_items, STORED);
+    assert_eq!(events.len(), STORED);
+    let returned = events
+        .into_iter()
+        .map(|event| (event.event.id, event.event.content))
+        .collect::<HashSet<_>>();
+    assert!(
+        returned == expected,
+        "every expected ID and payload is returned"
+    );
+    assert!(stats.neg_opens > 0);
+    assert!(stats.total_reqs > 0, "history uses an exact-ID fetch");
+    assert_eq!(stats.rejections_total(), 0);
+    assert_eq!(lingering, 0);
+}
+
+/// One relay answers its first NEG round and then goes silent; the other
+/// compares at once. The silent one is cut short of the pass deadline, so the
+/// history the healthy relay claimed is still fetched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_relay_leaves_time_to_fetch_the_others_history() {
+    const STORED: usize = 10;
+    let (fx, stalled) = connected_fixture(LimitConfig::default(), STORED).await;
+    let healthy = LimitRelay::start(fx.upstream_url.clone(), LimitConfig::default()).await;
+    fx.sdk
+        .client()
+        .add_relay(healthy.url())
+        .opts(fast_retry_options())
+        .await
+        .unwrap();
+    fx.sdk.client().connect().await;
+    assert!(
+        healthy
+            .wait_for(SETTLE_TIMEOUT, |s| s.open_connections() == 1)
+            .await
+    );
+    fx.limit.set_neg_fault(NegFault::StallAfterReply);
+    let rounds_before = fx.limit.stats().neg_fingerprint_rounds;
+    let (summary, events) = fx
+        .sdk
+        .reconcile_subscription(
+            route_on(&[stalled, healthy.url()], &fx.account),
+            &[],
+            SINCE,
+            UNTIL,
+            &Cursor::default(),
+            tokio::time::Instant::now() + STORM_WINDOW,
+        )
+        .await
+        .unwrap();
+    let stalled_rounds = fx.limit.stats().neg_fingerprint_rounds - rounds_before;
+    fx.limit.set_neg_fault(NegFault::None);
+    fx.shutdown().await;
+
+    assert!(
+        stalled_rounds > 0,
+        "the relay stalled after its first reply"
+    );
+    assert_eq!(events.len(), STORED, "{summary:?}");
+    assert_eq!(summary.relays_succeeded, 1, "{summary:?}");
+    assert_eq!(
+        summary
+            .endpoint_failures
+            .iter()
+            .map(|failure| failure.failure)
+            .collect::<Vec<_>>(),
+        [NostrReconciliationFailure::RouteTimeout]
+    );
+}
+
+/// A saturated silent relay must not spend another endpoint's credits. Waiting
+/// calls expire or cancel without opening NEG, and cancelling owners releases
+/// their credits so real history can be recovered on the same connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn neg_waits_cancel_and_isolate() {
+    let (fx, url) = connected_fixture(
+        LimitConfig {
+            max_neg_sessions: 8,
+            ..Default::default()
+        },
+        0,
+    )
+    .await;
+    let event = EventBuilder::new(Kind::MlsGroupMessage, "recover-after-cancel")
+        .tags([Tag::custom("h", [hex::encode(route(0))])])
+        .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(1_700_000_000))
+        .finalize(&Keys::generate())
+        .unwrap();
+    let expected = (event.id.to_hex(), event.content.clone());
+    fx.database
+        .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+        .await
+        .unwrap();
+    fx.limit.set_neg_fault(NegFault::SilentOpen);
+    let mut owners = Vec::new();
+    for index in 0..8 {
+        let sdk = fx.sdk.clone();
+        let mut subscription = reconciliation_route(&url, &fx.account);
+        if let NostrSubscription::Group {
+            transport_group_id,
+            group_id: id,
+            ..
+        } = &mut subscription
+        {
+            *transport_group_id = route(index);
+            *id = group_id(index);
+        }
+        owners.push(tokio::spawn(async move {
+            sdk.reconcile_subscription(
+                subscription,
+                &[],
+                SINCE,
+                UNTIL,
+                &Cursor::default(),
+                tokio::time::Instant::now() + SETTLE_TIMEOUT,
+            )
+            .await
+        }));
+    }
+    assert!(
+        fx.limit
+            .wait_for(Duration::from_secs(2), |s| s.neg_active_now() == 8)
+            .await
+    );
+
+    let healthy = LimitRelay::start(fx.upstream_url.clone(), LimitConfig::default()).await;
+    fx.sdk.client().add_relay(healthy.url()).await.unwrap();
+    fx.sdk.client().connect().await;
+    assert!(
+        healthy
+            .wait_for(Duration::from_secs(2), |s| s.open_connections() == 1)
+            .await
+    );
+    let (summary, recovered) = fx
+        .sdk
+        .reconcile_subscription(
+            reconciliation_route(&healthy.url(), &fx.account),
+            &[],
+            SINCE,
+            UNTIL,
+            &Cursor::default(),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.relays_failed, 0);
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(
+        (
+            recovered[0].event.id.clone(),
+            recovered[0].event.content.clone()
+        ),
+        expected
+    );
+
+    let failures =
+        failure_classes(&fx, std::slice::from_ref(&url), Duration::from_millis(80)).await;
+    assert!(
+        owners.iter().all(|owner| !owner.is_finished()),
+        "owners must still hold their permits (SDK first-reply timeout is 5 s)"
+    );
+    assert_eq!(failures, vec![NostrReconciliationFailure::RouteTimeout]);
+    assert_eq!(
+        fx.limit.stats().neg_opens,
+        8,
+        "expired wait cannot open NEG"
+    );
+    let queued = {
+        let sdk = fx.sdk.clone();
+        let subscription = reconciliation_route(&url, &fx.account);
+        tokio::spawn(async move {
+            sdk.reconcile_subscription(
+                subscription,
+                &[],
+                SINCE,
+                UNTIL,
+                &Cursor::default(),
+                tokio::time::Instant::now() + SETTLE_TIMEOUT,
+            )
+            .await
+        })
+    };
+    // Let the queued call enter its wait while all eight relay sessions remain live.
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    queued.abort();
+    assert!(queued.await.unwrap_err().is_cancelled());
+    assert_eq!(fx.limit.stats().neg_opens, 8);
+    for owner in &owners {
+        owner.abort();
+    }
+    for owner in owners {
+        assert!(owner.await.unwrap_err().is_cancelled());
+    }
+    // Cancellation queues wire cleanup; observe it before reusing the relay cap.
+    assert!(
+        fx.limit
+            .wait_for(Duration::from_secs(2), |s| s.neg_active_now() == 0)
+            .await
+    );
+    fx.limit.set_neg_fault(NegFault::None);
+    let (summary, recovered) = fx
+        .sdk
+        .reconcile_subscription(
+            reconciliation_route(&url, &fx.account),
+            &[],
+            SINCE,
+            UNTIL,
+            &Cursor::default(),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.relays_failed, 0);
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(
+        (
+            recovered[0].event.id.clone(),
+            recovered[0].event.content.clone()
+        ),
+        expected
+    );
+    assert_eq!(neg_sessions_after_pass(&fx).await, 0);
+    assert_eq!(fx.limit.stats().neg_cap_notices, 0);
+    assert_eq!(
+        fx.limit.stats().connections.len(),
+        1,
+        "credits survive without reconnect"
+    );
+    fx.shutdown().await;
+}
+
 /// Hundreds of completed passes on one connection: the NEG session count
 /// returns to zero after every pass and never approaches the 200 cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1140,7 +2451,7 @@ async fn neg_sessions_return_to_zero_after_each_completed_pass() {
     let mut unhealthy = 0;
     let started = Instant::now();
     for _ in 0..PASSES {
-        let pass = reconcile_pass(&fx, std::slice::from_ref(&url), None).await;
+        let pass = reconcile_pass(&fx, std::slice::from_ref(&url), SETTLE_TIMEOUT, None).await;
         unhealthy += usize::from(!pass.healthy());
         lingering.push(neg_sessions_after_pass(&fx).await);
     }
@@ -1182,7 +2493,7 @@ async fn neg_sessions_are_freed_on_every_failure_path() {
         ("completion", NegFault::None, None, 3),
         ("neg_err", NegFault::ErrOnOpen, None, 3),
         ("first_reply_timeout", NegFault::SilentOpen, None, 3),
-        ("route_deadline", NegFault::FingerprintThenStall, None, 2),
+        ("route_deadline", NegFault::FingerprintLoop, None, 2),
         (
             "dropped_awaiting_reply",
             NegFault::SilentOpen,
@@ -1199,17 +2510,30 @@ async fn neg_sessions_are_freed_on_every_failure_path() {
     let mut report = Vec::new();
     for (label, fault, budget, passes) in cases {
         fx.limit.set_neg_fault(fault);
+        let rounds_before = fx.limit.stats().neg_fingerprint_rounds;
+        // A comparison that never converges runs to the caller's deadline.
+        let allowance = if fault == NegFault::FingerprintLoop {
+            STORM_WINDOW
+        } else {
+            SETTLE_TIMEOUT
+        };
         let mut latencies = Vec::new();
         let mut outcomes = Vec::new();
         for _ in 0..passes {
-            let pass = reconcile_pass(&fx, endpoints, budget).await;
+            let pass = reconcile_pass(&fx, endpoints, allowance, budget).await;
             latencies.push(pass.elapsed.as_millis());
             outcomes.push(format!("{:?}", pass.outcome));
         }
         let lingering = neg_sessions_after_pass(&fx).await;
+        if fault == NegFault::FingerprintLoop {
+            assert!(
+                fx.limit.stats().neg_fingerprint_rounds - rounds_before > passes,
+                "route deadline cleanup must follow multiple active NEG rounds"
+            );
+        }
         fx.limit.set_neg_fault(NegFault::None);
         let notices_before = fx.limit.stats().neg_cap_notices;
-        let probe = reconcile_pass(&fx, endpoints, None).await;
+        let probe = reconcile_pass(&fx, endpoints, SETTLE_TIMEOUT, None).await;
         let probe_lingering = neg_sessions_after_pass(&fx).await;
         let notices = fx.limit.stats().neg_cap_notices - notices_before;
         eprintln!(
@@ -1239,7 +2563,7 @@ async fn neg_sessions_are_freed_on_every_failure_path() {
 async fn timed_failures(fx: &Fixture, endpoints: &[String], passes: usize) -> Vec<(u128, String)> {
     let mut out = Vec::new();
     for _ in 0..passes {
-        let pass = reconcile_pass(fx, endpoints, None).await;
+        let pass = reconcile_pass(fx, endpoints, SETTLE_TIMEOUT, None).await;
         out.push((pass.elapsed.as_millis(), format!("{:?}", pass.outcome)));
     }
     out
@@ -1252,7 +2576,7 @@ fn all_failed(results: &[(u128, String)], endpoints: usize) -> bool {
 
 /// The relay answers NEG-OPEN with strfry's NEG-cap NOTICE (no session id).
 /// nostr-sdk's first-reply check ignores that NOTICE, so the pass waits out
-/// the 500 ms first-reply timeout and the endpoint counts as failed.
+/// the first-reply timeout and the endpoint counts as failed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn neg_cap_notice_fails_after_the_first_reply_timeout() {
     let config = LimitConfig {
@@ -1279,8 +2603,10 @@ async fn neg_cap_notice_fails_after_the_first_reply_timeout() {
         stats.summary()
     );
     assert!(all_failed(&results, 2), "{results:?}");
+    // The five-second first-reply timeout ends each pass, not the caller's
+    // longer deadline.
     assert!(
-        results.iter().all(|(ms, _)| (450..1_500).contains(ms)),
+        results.iter().all(|(ms, _)| (4_900..6_500).contains(ms)),
         "{results:?}"
     );
     assert!(stats.neg_cap_notices >= 3);
@@ -1349,7 +2675,11 @@ async fn fast_and_slow_reconciliation_failure_paths() {
 }
 
 /// One pass's failure class per endpoint, in endpoint order.
-async fn failure_classes(fx: &Fixture, endpoints: &[String]) -> Vec<NostrReconciliationFailure> {
+async fn failure_classes(
+    fx: &Fixture,
+    endpoints: &[String],
+    allowance: Duration,
+) -> Vec<NostrReconciliationFailure> {
     let (summary, _) = fx
         .sdk
         .reconcile_subscription(
@@ -1358,6 +2688,7 @@ async fn failure_classes(fx: &Fixture, endpoints: &[String]) -> Vec<NostrReconci
             SINCE,
             UNTIL,
             &Cursor::default(),
+            tokio::time::Instant::now() + allowance,
         )
         .await
         .unwrap();
@@ -1403,14 +2734,32 @@ async fn reconciliation_names_why_each_relay_failed() {
             )),
         ),
         (NegFault::SilentOpen, Failure::FirstReplyTimeout),
-        (NegFault::FingerprintThenStall, Failure::RouteTimeout),
+        (NegFault::StallAfterReply, Failure::RouteTimeout),
+        (NegFault::FingerprintLoop, Failure::RouteTimeout),
     ] {
         fx.limit.set_neg_fault(fault);
+        let rounds_before = fx.limit.stats().neg_fingerprint_rounds;
+        let allowance = if matches!(fault, NegFault::StallAfterReply | NegFault::FingerprintLoop) {
+            STORM_WINDOW
+        } else {
+            SETTLE_TIMEOUT
+        };
         observed.push((
             format!("{fault:?}"),
-            failure_classes(&fx, one).await,
+            failure_classes(&fx, one, allowance).await,
             expected,
         ));
+        if fault == NegFault::StallAfterReply {
+            assert!(
+                fx.limit.stats().neg_fingerprint_rounds > rounds_before,
+                "the client processed the initial reply before the relay stalled"
+            );
+        } else if fault == NegFault::FingerprintLoop {
+            assert!(
+                fx.limit.stats().neg_fingerprint_rounds > rounds_before + 1,
+                "the route deadline must end an active, nonconverging comparison"
+            );
+        }
     }
     fx.limit.set_neg_fault(NegFault::None);
 
@@ -1434,18 +2783,18 @@ async fn reconciliation_names_why_each_relay_failed() {
         .await;
     observed.push((
         "neg_cap".into(),
-        failure_classes(&fx, &[capped.url()]).await,
+        failure_classes(&fx, &[capped.url()], SETTLE_TIMEOUT).await,
         Failure::NegCapNotice,
     ));
     observed.push((
         "not_in_pool".into(),
-        failure_classes(&fx, &["ws://127.0.0.1:9".to_owned()]).await,
+        failure_classes(&fx, &["ws://127.0.0.1:9".to_owned()], SETTLE_TIMEOUT).await,
         Failure::NotInPool,
     ));
     let dead = dead_relay(&fx.sdk).await;
     observed.push((
         "not_operational".into(),
-        failure_classes(&fx, &[dead]).await,
+        failure_classes(&fx, &[dead], SETTLE_TIMEOUT).await,
         Failure::NotOperational,
     ));
     eprintln!("[g] failure classes: {observed:?}");
@@ -1460,6 +2809,163 @@ async fn reconciliation_names_why_each_relay_failed() {
 // (h) The 500-event REQ clamp (#2263)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
+enum OrderedReplay {
+    Activation,
+    Sync,
+    Maintenance,
+}
+
+/// Multiple newest-first relay pages must become one ascending replay, not
+/// individually sorted pages. Ties exercise the event-id secondary key.
+async fn assert_replay_before_live(mode: OrderedReplay) {
+    const STORED: usize = 2_200;
+    const START: u64 = 1_700_000_000;
+    let fx = Fixture::new(LimitConfig::default(), false).await;
+    let keys = Keys::generate();
+    let mut expected = Vec::with_capacity(STORED + 1);
+    for index in 0..STORED {
+        let timestamp = START + index as u64 / 3;
+        let event = EventBuilder::new(Kind::MlsGroupMessage, format!("ordered-{index}"))
+            .tags([Tag::custom("h", [hex::encode(route(0))])])
+            .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(timestamp))
+            .finalize(&keys)
+            .unwrap();
+        expected.push((timestamp, event.id.to_bytes()));
+        fx.database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+    }
+    expected.sort_unstable();
+    let url = fx.limit.url();
+    let group = groups(1, &url).remove(0);
+    let publisher = Client::default();
+    publisher.add_relay(fx.upstream_url.as_str()).await.unwrap();
+    publisher.connect().await;
+    fx.adapter
+        .activate_account(fx.activation(
+            std::slice::from_ref(&url),
+            if matches!(mode, OrderedReplay::Activation) {
+                vec![group.clone()]
+            } else {
+                Vec::new()
+            },
+        ))
+        .await
+        .unwrap();
+    let maintenance_id = match mode {
+        OrderedReplay::Activation => None,
+        OrderedReplay::Sync => {
+            fx.adapter
+                .sync_account_groups(group_sync(&fx, vec![group.clone()]))
+                .await
+                .unwrap();
+            None
+        }
+        OrderedReplay::Maintenance => Some(
+            fx.adapter
+                .install_group_maintenance_recovery_subscription(&fx.account, &group, 1, None)
+                .await
+                .unwrap(),
+        ),
+    };
+
+    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+    let first = tokio::time::timeout_at(deadline, fx.adapter.receive())
+        .await
+        .expect("replay starts within the deadline")
+        .unwrap()
+        .unwrap();
+    // History exceeds the delivery queue: while this consumer is stopped,
+    // release must block and the post-EOSE live notification cannot overtake it.
+    let live_timestamp = START + STORED as u64;
+    let live = EventBuilder::new(Kind::MlsGroupMessage, "live during replay release")
+        .tags([Tag::custom("h", [hex::encode(route(0))])])
+        .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(live_timestamp))
+        .finalize(&keys)
+        .unwrap();
+    publisher.send_event(&live).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    expected.push((live_timestamp, live.id.to_bytes()));
+    let mut delivery = first;
+    for (position, (timestamp, id)) in expected.into_iter().enumerate() {
+        if position != 0 {
+            delivery = tokio::time::timeout_at(deadline, fx.adapter.receive())
+                .await
+                .expect("all history and the live tail arrive within the deadline")
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            delivery.message.timestamp.0, timestamp,
+            "position {position}"
+        );
+        assert!(
+            delivery.message.id == cgka_traits::MessageId::new(id.to_vec()),
+            "unexpected event or event-id tie order at position {position}"
+        );
+        assert!(delivery.account_id == fx.account);
+        assert!(delivery.group_id_hint.as_ref() == Some(&group.group_id));
+        fx.adapter
+            .ack_replay_delivery(&fx.account, &delivery.message.id)
+            .await;
+    }
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            let complete = if let Some(id) = &maintenance_id {
+                fx.adapter
+                    .subscription_endpoint_eose(id, &TransportEndpoint(url.clone()))
+                    .await
+                    == Some(true)
+            } else {
+                fx.adapter
+                    .account_subscription_eose(&fx.account)
+                    .await
+                    .complete()
+            };
+            if complete {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("coverage completes after the ordered replay is placed");
+    if let Some(id) = &maintenance_id {
+        assert_eq!(fx.adapter.subscription_synced(id).await, Some(true));
+    }
+    let stats = fx.limit.stats();
+    assert!(stats.clamped_filters > 0);
+    assert!(
+        stats.total_reqs >= 6,
+        "multiple backward pages were fetched"
+    );
+    assert_eq!(stats.neg_opens, 0, "replay does not require NIP-77");
+    assert!(
+        tokio::time::timeout(QUIET, fx.adapter.receive())
+            .await
+            .is_err()
+    );
+    publisher.shutdown().await;
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn activation_replay_is_ordered() {
+    assert_replay_before_live(OrderedReplay::Activation).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn synced_replay_is_ordered() {
+    assert_replay_before_live(OrderedReplay::Sync).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maintenance_replay_is_ordered() {
+    assert_replay_before_live(OrderedReplay::Maintenance).await;
+}
+
 /// Distinct messages delivered until the adapter goes quiet.
 async fn distinct_deliveries(adapter: &NostrTransportAdapter, wait: Duration) -> usize {
     const IDLE: Duration = Duration::from_millis(1_500);
@@ -1469,6 +2975,9 @@ async fn distinct_deliveries(adapter: &NostrTransportAdapter, wait: Duration) ->
         let next = deadline.min(tokio::time::Instant::now() + IDLE);
         match tokio::time::timeout_at(next, adapter.receive()).await {
             Ok(Ok(Some(delivery))) => {
+                adapter
+                    .ack_replay_delivery(&delivery.account_id, &delivery.message.id)
+                    .await;
                 seen.insert(delivery.message.id);
             }
             _ => return seen.len(),
@@ -1546,6 +3055,138 @@ async fn store_events_per_group(database: &MemoryDatabase, groups: usize, per_gr
     }
 }
 
+/// One live batch holds more than the aggregate admission budget, although
+/// each group's complete history fits. Release one ordered group at a time
+/// instead of accumulating the whole batch before admitting any history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_replay_over_buffer() {
+    const GROUPS: usize = 6;
+    const PER_GROUP: usize = 600;
+    const CONTENT_BYTES: usize = 10 * 1024;
+    const BUFFER_BYTES: usize = 32 * 1024 * 1024;
+    const START: u64 = 1_700_000_000;
+    let fx = Fixture::new(LimitConfig::default(), false).await;
+    let keys = Keys::generate();
+    let padding = "x".repeat(CONTENT_BYTES - 8);
+    let mut expected = Vec::with_capacity(GROUPS);
+    for group in 0..GROUPS {
+        let mut history = Vec::with_capacity(PER_GROUP);
+        for index in 0..PER_GROUP {
+            // Three tied events per group, eighteen across the batch: well
+            // below the 500-event same-second saturation boundary.
+            let timestamp = START + index as u64 / 3;
+            let event = EventBuilder::new(Kind::MlsGroupMessage, format!("{index:08}{padding}"))
+                .tags([Tag::custom("h", [hex::encode(route(group))])])
+                .custom_created_at(nostr_sdk::prelude::Timestamp::from_secs(timestamp))
+                .finalize(&keys)
+                .unwrap();
+            history.push((timestamp, event.id.to_bytes()));
+            fx.database
+                .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+                .await
+                .unwrap();
+        }
+        history.sort_unstable();
+        expected.push(history);
+    }
+    let url = fx.limit.url();
+    let subscriptions = groups(GROUPS, &url);
+    let mut activation = fx.activation(std::slice::from_ref(&url), subscriptions.clone());
+    activation.since = Some(cgka_traits::Timestamp(SINCE));
+    fx.adapter.activate_account(activation).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+    let mut positions = [0; GROUPS];
+    let mut payload_bytes = [0; GROUPS];
+    for received in 0..GROUPS * PER_GROUP {
+        let delivery = tokio::time::timeout_at(deadline, fx.adapter.receive())
+            .await
+            .unwrap_or_else(|_| {
+                let stats = fx.limit.stats();
+                panic!("co-batched replay stopped at {received}, positions={positions:?}; forwarder_finished={}; SDK_loss={:?}; REQs={}, active={}, clamped={}",
+                    fx.forwarder.as_ref().is_some_and(JoinHandle::is_finished),
+                    fx.sdk.notification_loss().unwrap().borrow().as_ref(),
+                    stats.total_reqs, stats.active_now(), stats.clamped_filters);
+            })
+            .unwrap()
+            .unwrap();
+        assert!(delivery.account_id == fx.account);
+        let group = subscriptions
+            .iter()
+            .position(|group| delivery.group_id_hint.as_ref() == Some(&group.group_id))
+            .expect("delivery belongs to a subscribed MLS group");
+        let position = positions[group];
+        let (timestamp, id) = expected[group]
+            .get(position)
+            .expect("no group delivers more than its stored history");
+        assert_eq!(delivery.message.timestamp.0, *timestamp);
+        assert!(
+            delivery.message.id.as_slice() == id,
+            "every event arrives exactly once in timestamp/id order within its group"
+        );
+        positions[group] += 1;
+        payload_bytes[group] += delivery.message.payload.len();
+        fx.adapter
+            .ack_replay_delivery(&fx.account, &delivery.message.id)
+            .await;
+    }
+    assert!(positions.into_iter().all(|count| count == PER_GROUP));
+    assert!(payload_bytes.iter().all(|bytes| *bytes < BUFFER_BYTES));
+    assert!(payload_bytes.iter().sum::<usize>() > BUFFER_BYTES);
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            if fx
+                .adapter
+                .account_subscription_eose(&fx.account)
+                .await
+                .complete()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every route's history completes after placement");
+    {
+        let status = fx.adapter.take_replay_status(&fx.account).await;
+        assert!(!status.pending, "all received history was placed");
+        assert!(
+            status.loss.is_none(),
+            "batch size creates no admission loss"
+        );
+    }
+    assert!(
+        tokio::time::timeout(QUIET, fx.adapter.receive())
+            .await
+            .is_err(),
+        "no duplicate history remains after every expected event"
+    );
+
+    // The shared initial page reaches second 172. Each route's inclusive
+    // backward window therefore holds 519 events: one full page and a short
+    // final page, while only the inbox and one GroupBatch stay live.
+    flush_client_frames(&fx).await;
+    let stats = fx.limit.stats();
+    assert_eq!(stats.total_reqs, live_reqs(GROUPS) + 2 * GROUPS);
+    assert_eq!(stats.distinct_req_ids(), stats.total_reqs);
+    assert_eq!(stats.active_now(), live_reqs(GROUPS));
+    assert_eq!(stats.closes, 2 * GROUPS);
+    assert_eq!(stats.max_tag_values_seen, GROUPS);
+    assert_eq!(stats.clamped_filters, stats.total_reqs);
+    assert_eq!(stats.rejections_total(), 0);
+    assert_eq!(stats.reqs_with_active_id, 0);
+    assert_eq!(stats.neg_opens, 0, "replay does not require NIP-77");
+    assert!(
+        stats
+            .req_log
+            .iter()
+            .all(|request| { request.filters == 1 && request.outcome == ReqOutcome::Accepted })
+    );
+    assert_filter_shapes(&stats);
+    fx.shutdown().await;
+}
+
 fn group_sync(fx: &Fixture, groups: Vec<TransportGroupSubscription>) -> TransportGroupSync {
     TransportGroupSync {
         account_id: fx.account.clone(),
@@ -1554,11 +3195,12 @@ fn group_sync(fx: &Fixture, groups: Vec<TransportGroupSubscription>) -> Transpor
     }
 }
 
-/// Any change of routes repacks every group batch: the new batches go out
-/// and then the ones they replace close. A left group leaves the filters at
-/// once, and the batch count stays the packed count however routes change.
+/// A change of routes repacks the family it touches in full, here every
+/// route on the one relay and floor: the new batches go out and then the
+/// ones they replace close. A left group leaves the filters at once, and the
+/// batch count stays the packed count however routes change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_group_sync_repacks_every_batch() {
+async fn a_group_sync_repacks_its_family_in_full() {
     let fx = Fixture::new(LimitConfig::default(), false).await;
     let url = fx.limit.url();
     let all = groups(GROUP_BATCH_ROUTES + 10, &url);
@@ -1609,6 +3251,65 @@ async fn a_group_sync_repacks_every_batch() {
         .unwrap();
     let after = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
     assert_eq!(after.total_reqs, unchanged.total_reqs);
+    fx.shutdown().await;
+}
+
+/// A group sync re-sends only the family it changes, so during the repack a
+/// relay holds the live REQs plus that family's new batches alone. Joining
+/// a current group re-sends the current routes' two batches, and the two
+/// batches of retained routes at their own floor on the same relay stay
+/// live as they are, replay complete or not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_sync_resends_only_the_changed_family() {
+    const ROUTES: usize = GROUP_BATCH_ROUTES + 10;
+    const FAMILY_BATCHES: usize = ROUTES.div_ceil(GROUP_BATCH_ROUTES);
+    let fx = Fixture::new(LimitConfig::default(), false).await;
+    let url = fx.limit.url();
+    let since = Some(cgka_traits::Timestamp(1_700_000_000));
+    let mut all = groups(2 * ROUTES + 1, &url);
+    let mut retained = all.split_off(ROUTES + 1);
+    for route in &mut retained {
+        route.retained_since = Some(cgka_traits::Timestamp(1_600_000_000));
+    }
+    let joined = all.split_off(ROUTES);
+    let current = all;
+    let activation = TransportAccountActivation {
+        since,
+        ..fx.activation(
+            std::slice::from_ref(&url),
+            [current.clone(), retained.clone()].concat(),
+        )
+    };
+    fx.adapter.activate_account(activation).await.unwrap();
+    let before = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    let live = 1 + 2 * FAMILY_BATCHES;
+    assert_eq!(before.active_now(), live);
+
+    fx.adapter
+        .sync_account_groups(TransportGroupSync {
+            since,
+            ..group_sync(&fx, [current, joined, retained].concat())
+        })
+        .await
+        .unwrap();
+    let after = fx.limit.wait_quiet(QUIET, SETTLE_TIMEOUT).await;
+    eprintln!("[h] one family re-sent {}", after.summary());
+    assert_eq!(
+        after.total_reqs - before.total_reqs,
+        FAMILY_BATCHES,
+        "only the current family's batches go out"
+    );
+    assert_eq!(
+        after.closes - before.closes,
+        FAMILY_BATCHES,
+        "and only its old batches close"
+    );
+    assert_eq!(after.active_now(), live);
+    assert!(
+        after.peak_active() <= live + FAMILY_BATCHES,
+        "the repack holds the changed family's batches twice, no other"
+    );
+    assert_eq!(after.rejections_total(), 0);
     fx.shutdown().await;
 }
 
@@ -1748,7 +3449,11 @@ async fn a_route_that_saturates_alone_does_not_stop_the_others_paging() {
         "[h] one saturated route delivered={delivered}/{stored} complete={complete} {}",
         fx.limit.stats().summary()
     );
-    assert_eq!(delivered, stored, "every route's history arrives");
+    assert_eq!(
+        delivered,
+        stored - RELAY_REPLAY_PAGE_LIMIT,
+        "complete routes deliver, but the saturated route withholds its partial replay"
+    );
     assert!(!complete, "the saturated route keeps the batch incomplete");
     fx.shutdown().await;
 }
@@ -1891,7 +3596,8 @@ async fn stored_replay_beyond_500_is_paged_before_counting_complete() {
 /// More than a page of events sharing one second saturates the inclusive
 /// `until` bound: the backward page cannot move past that second, so the rest
 /// of it and everything older stay unfetched. Coverage must stay incomplete
-/// rather than count that relay's EOSE.
+/// rather than count that relay's EOSE, and the newer partial history must
+/// remain withheld rather than advancing a ratchet past inaccessible history.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn saturated_boundary_second_keeps_replay_incomplete() {
     const BOUNDARY: u64 = 1_700_100_000;
@@ -1899,7 +3605,10 @@ async fn saturated_boundary_second_keeps_replay_incomplete() {
     let boundary = std::iter::repeat_n(BOUNDARY, 600);
     let (delivered, complete, _) =
         replay_one_group_at(older.chain(boundary), Some(limit_relay::REQ_LIMIT_CLAMP)).await;
-    assert!(delivered < 700, "the clamp hides part of the window");
+    assert_eq!(
+        delivered, 0,
+        "an incomplete replay cannot release its newer tail"
+    );
     assert!(!complete, "a saturated boundary must not count as coverage");
 }
 

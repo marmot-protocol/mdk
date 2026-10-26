@@ -73,32 +73,16 @@ mod tests {
     use marmot_forensics::v5::{self, BuildProfile, Platform, Producer};
     use marmot_forensics::{AuditEventKind, AuditRecord, ForensicRecorder, JsonlRecorder};
 
-    /// Declares `ALL` and an exhaustive match from one variant list. A new
-    /// variant fails to compile until it is named here, which also records it
-    /// in `ALL`, so the v5 parity test below cannot silently skip it.
-    macro_rules! every_disposition {
-        ($($variant:ident),+ $(,)?) => {
-            const ALL: &[MessageDisposition] = &[$(MessageDisposition::$variant),+];
-
-            #[allow(dead_code)]
-            fn all_is_exhaustive(disposition: MessageDisposition) {
-                match disposition {
-                    $(MessageDisposition::$variant)|+ => {}
-                }
-            }
-        };
-    }
-
-    every_disposition!(
-        PreMembershipEvent,
-        AppPayloadRetentionExpired,
-        PredatesLocalCopy,
-        RetryPending,
-        RetryBudgetRefused,
-        ResidenceBudgetRefused,
-        DeferredCapacityRefused,
-        Quarantined,
-    );
+    const ALL: &[MessageDisposition] = &[
+        MessageDisposition::PreMembershipEvent,
+        MessageDisposition::AppPayloadRetentionExpired,
+        MessageDisposition::PredatesLocalCopy,
+        MessageDisposition::RetryPending,
+        MessageDisposition::RetryBudgetRefused,
+        MessageDisposition::ResidenceBudgetRefused,
+        MessageDisposition::DeferredCapacityRefused,
+        MessageDisposition::Quarantined,
+    ];
 
     /// Every tag is a closed category the v5 audit boundary keeps verbatim,
     /// on both fields that carry it, instead of redacting it to

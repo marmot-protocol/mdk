@@ -3161,7 +3161,8 @@
         "maintenance",
         "explicit_history",
         "known_event",
-        "incremental_history"
+        "incremental_history",
+        "subscription_replay"
       ]
     },
     "Operational_recoveryNeedChange": {
@@ -5127,6 +5128,7 @@
         }
       }
     },
+
     "OperationalEvent_subscription_refused": {
       "type": "object",
       "additionalProperties": false,

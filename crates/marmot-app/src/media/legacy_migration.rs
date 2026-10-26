@@ -36,6 +36,12 @@ pub(crate) struct LegacyMigrationProgress {
     moved: bool,
     /// Observers heard that the move finished; reset when it moves again.
     complete_announced: bool,
+    /// While the database compacts: the usage measured just before, which
+    /// usage reads return instead of waiting for the busy database.
+    pub(crate) compacting: Option<storage_sqlite::AttachmentStorageUsage>,
+    /// The live-size cap holding compaction back was logged for this
+    /// account in this process.
+    pub(crate) compaction_cap_logged: bool,
 }
 
 pub(crate) type SharedLegacyMigration = Arc<Mutex<LegacyMigrationProgress>>;
@@ -43,6 +49,9 @@ pub(crate) type SharedLegacyMigration = Arc<Mutex<LegacyMigrationProgress>>;
 impl LegacyMigrationProgress {
     /// The state to report, given the database's view of it.
     pub(crate) fn state(&self, stored: AttachmentMigrationState) -> AttachmentMigrationState {
+        if self.compacting.is_some() {
+            return AttachmentMigrationState::Compacting;
+        }
         match stored {
             AttachmentMigrationState::NotNeeded if self.moved => AttachmentMigrationState::Complete,
             AttachmentMigrationState::Running { .. } => match self.paused {

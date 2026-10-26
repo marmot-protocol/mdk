@@ -3,7 +3,7 @@
 use agent_control::AgentControlError;
 use cgka_traits::error::EngineError;
 use marmot_account::AccountHomeError;
-use marmot_app::AppError;
+use marmot_app::{AppError, DirectoryError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectorError {
@@ -61,6 +61,13 @@ pub enum ConnectorError {
     StreamPreviewIdempotencyConflict,
 }
 
+/// Directory failures take the `AppError` codes they convert to.
+impl From<DirectoryError> for ConnectorError {
+    fn from(error: DirectoryError) -> Self {
+        Self::App(error.into())
+    }
+}
+
 impl ConnectorError {
     pub fn code(&self) -> &'static str {
         match self {
@@ -72,6 +79,9 @@ impl ConnectorError {
             Self::App(AppError::AgentStreamSendFailed(_)) => "stream_send_failed",
             Self::App(AppError::InvalidGroupProfile(_)) => "invalid_group_profile",
             Self::App(AppError::InvalidEditTarget) => "invalid_edit_target",
+            Self::App(AppError::MissingRelayLists(_) | AppError::MissingDefaultRelays) => {
+                "missing_relay_lists"
+            }
             Self::App(error)
                 if matches!(
                     error.as_engine_error(),
@@ -131,6 +141,10 @@ impl ConnectorError {
             Self::App(AppError::InvalidEditTarget) => {
                 "edit target must be an available chat message this account sent"
             }
+            Self::App(AppError::MissingRelayLists(_) | AppError::MissingDefaultRelays) => {
+                "account relay lists are missing or empty; give wn-agent relays to publish them \
+                 (--relay or MARMOT_RELAYS), or publish complete lists from another client"
+            }
             Self::App(error)
                 if matches!(
                     error.as_engine_error(),
@@ -162,7 +176,9 @@ impl ConnectorError {
             Self::StreamPreviewIdempotencyConflict => {
                 "stream preview idempotency key was reused with different inputs"
             }
-            Self::Io(_) => "connector I/O failed",
+            Self::Io(error) => {
+                crate::socket::socket_rejection(error).unwrap_or("connector I/O failed")
+            }
             Self::App(AppError::ReactionNotFound) => "no matching reaction to remove",
             Self::App(AppError::MediaUploadTimedOut) => "media upload timed out before publication",
             Self::AccountHome(_) | Self::App(_) => "connector request failed",

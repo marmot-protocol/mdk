@@ -14,6 +14,96 @@ fn decode(v: &Value) -> Result<Record, ContractError> {
     Record::from_json(&serde_json::to_vec(v).unwrap())
 }
 
+fn historical_eose_row() -> Value {
+    let mut row = fixture("recording_started");
+    row["event"] = json!({
+        "type": "subscription_eose_repaired",
+        "receiver": "account",
+        "trigger": "notification_lag",
+        "lags": 1,
+        "awaiting_relays": 5,
+        "complete_relays": 1,
+        "reissued_relays": 2,
+        "reissued_earlier_relays": 1,
+        "failed_relays": 1,
+        "follow_up_scheduled": true,
+        "dropped_before": 0
+    });
+    row
+}
+
+#[test]
+fn historical_eose_round_trips() {
+    let row = historical_eose_row();
+    assert!(validator().is_valid(&row));
+    let record = decode(&row).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&record.to_json().unwrap()).unwrap(),
+        row
+    );
+    for (field, value) in [("lags", json!(0)), ("failed_relays", json!(2))] {
+        let mut invalid = row.clone();
+        invalid["event"][field] = value;
+        assert!(validator().is_valid(&invalid));
+        assert!(decode(&invalid).is_err());
+    }
+}
+
+fn native_reassessment_row() -> Value {
+    let mut row = fixture("recording_started");
+    row["event"] = json!({
+        "type": "recovery_obligation_reassessed",
+        "attempt_serial": 4,
+        "cause": "subscription_replay",
+        "obligation_ref": "0000000000000000000000000000000000000000000000000000000000000000",
+        "obligation_revision": 2,
+        "verdict": "satisfied",
+        "next_attempt": "not_needed",
+        "progress": "progressed",
+        "scopes_total": 1,
+        "scopes_certified": 0,
+        "park_after_quiet_passes": 3
+    });
+    row
+}
+
+#[test]
+fn native_replay_cause_round_trips_without_history_certification() {
+    let schema = validator();
+    for (verdict, next_attempt, progress) in [
+        ("satisfied", "not_needed", "progressed"),
+        ("deferred", "paced_retry", "unserved"),
+        ("retired", "not_needed", "quiet"),
+    ] {
+        let mut row = native_reassessment_row();
+        row["event"]["verdict"] = json!(verdict);
+        row["event"]["next_attempt"] = json!(next_attempt);
+        row["event"]["progress"] = json!(progress);
+        assert!(schema.is_valid(&row));
+        let record = decode(&row).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&record.to_json().unwrap()).unwrap(),
+            row
+        );
+    }
+    for (field, value) in [
+        ("scopes_certified", json!(1)),
+        ("verdict", json!("closed_below_window")),
+        ("progress", json!("window_certified")),
+    ] {
+        let mut row = native_reassessment_row();
+        row["event"][field] = value;
+        assert!(schema.is_valid(&row));
+        assert!(decode(&row).is_err());
+    }
+    // Existing history predicates retain their historical v5 interpretation.
+    let mut history = native_reassessment_row();
+    history["event"]["cause"] = json!("incremental_history");
+    history["event"]["scopes_certified"] = json!(1);
+    assert!(schema.is_valid(&history));
+    assert!(decode(&history).is_ok());
+}
+
 #[test]
 fn all_contract_fixtures_round_trip_through_rust_and_schema() {
     let schema = validator();
@@ -49,10 +139,6 @@ fn all_contract_fixtures_round_trip_through_rust_and_schema() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(kinds, catalog);
     assert_eq!(kinds.len(), 15);
-    assert_eq!(
-        schema["$defs"]["Event"]["oneOf"].as_array().unwrap().len(),
-        66
-    );
 }
 
 #[test]

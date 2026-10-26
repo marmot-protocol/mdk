@@ -34,8 +34,8 @@ const LEGACY_BODIES: &str = "retained_attachment_bytes b
 /// Where moving legacy attachment bodies into the media store stands.
 ///
 /// The database alone knows [`Self::NotNeeded`] and [`Self::Running`]; the
-/// app runtime reports [`Self::Paused`] and [`Self::Complete`] from what its
-/// migration batches saw.
+/// app runtime reports [`Self::Paused`], [`Self::Compacting`] and
+/// [`Self::Complete`] from what its maintenance saw.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AttachmentMigrationState {
     /// No legacy bodies remain, and this runtime moved none.
@@ -48,6 +48,9 @@ pub enum AttachmentMigrationState {
     /// resumes once `needed_bytes` more are free. Deleting attachments frees
     /// space (file-backed ones at once) or shrinks what is left to move.
     Paused { needed_bytes: u64 },
+    /// The account database is being compacted to return its free pages to
+    /// the filesystem. The database is busy until it finishes.
+    Compacting,
     /// This runtime moved the last legacy body.
     Complete,
 }

@@ -38,6 +38,7 @@ include = [
     "MarmotAttachmentAcquisitionMode",
     "MarmotAttachmentControl",
     "MarmotAttachmentHistoryChange",
+    "MarmotAttachmentKeepMedia",
     "MarmotChatListPageDirection",
     "MarmotConversationOpenMode",
     "MarmotConversationPageDirection",

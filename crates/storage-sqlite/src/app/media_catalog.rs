@@ -424,6 +424,16 @@ impl PublishTarget for SlotPublication {
 }
 
 impl SqliteAppStorage {
+    /// The ready file holding this content in `category`, if any: the one a
+    /// publication would reuse. Verify it before giving up another copy.
+    pub fn ready_media_file(
+        &self,
+        category: Category,
+        digest: &[u8; 32],
+    ) -> StorageResult<Option<FileId>> {
+        Ok(ready_twin(&*self.lock()?, category, digest, None)?.map(|(id, _)| id))
+    }
+
     /// Removes slot `token`'s media reference. Returns the ids whose rows
     /// (keys) the removal deleted, for the store to unlink once this commits.
     pub fn release_media_reference(&self, token: &[u8]) -> StorageResult<Vec<FileId>> {

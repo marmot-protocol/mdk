@@ -6,16 +6,11 @@
 //! crash-safe salt-write/rekey sequence, and recovery for interrupted or
 //! pre-fix bricked migrations.
 //!
-//! Every one of those recovery opens pays the full SQLCipher passphrase KDF
-//! (PBKDF2-HMAC-SHA512, 256k iterations at the pinned `cipher_compatibility =
-//! 4`). To keep the healthy steady state from paying that KDF twice per open,
-//! a successful "this database opens under the v2 key" verdict is cached
-//! in-process per database file and salt (mdk#1439). The cache is advisory
-//! only: a durable migration marker or a missing verdict always re-runs the
-//! recovery probe, so the crash windows keep the mdk#568 self-heal. Key
-//! presentation (passphrase vs raw key) and the KDF work factor are unchanged;
-//! that decision is recorded in
-//! `docs/marmot-architecture/storage-format-v2.md`.
+//! HKDF output is presented as a raw 256-bit SQLCipher key. Existing salted
+//! passphrase databases are rekeyed once under a durable, versioned marker.
+//! Recovery probes the raw key first, then the salted passphrase and legacy
+//! key. Successful raw-key verdicts are cached in-process (mdk#1439); either
+//! migration marker always forces recovery (mdk#568).
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
@@ -39,6 +34,8 @@ pub(crate) use open_lock::{DatabaseOpenGuard, database_open_lock};
 
 const SQLCIPHER_SALT_SUFFIX: &str = ".salt";
 const SQLCIPHER_MIGRATION_MARKER_SUFFIX: &str = ".salt-migrating";
+const SQLCIPHER_RAW_MARKER_SUFFIX: &str = ".raw-key-migrating";
+const SQLCIPHER_RAW_MARKER_V1: &[u8] = b"raw-key-v1\n";
 const SQLCIPHER_SALT_LEN: usize = 32;
 const SQLCIPHER_KEY_LEN: usize = 32;
 
@@ -50,18 +47,15 @@ const SQLCIPHER_KEY_LEN: usize = 32;
 const SQLCIPHER_V2_VERDICT_CACHE_CAPACITY: usize = 256;
 
 /// Aggregate, privacy-safe counters for the opt-in app-performance export:
-/// every run of the interrupted-migration probe is one full keyed open paying
-/// the SQLCipher passphrase KDF, and every skip is one KDF avoided via a
-/// cached verdict (mdk#1439). Counts only — no paths, accounts, or keys.
+/// every run is a raw-key recovery probe and every skip uses a cached verdict.
+/// Passphrase KDFs run only while upgrading old databases. Counts only, no keys.
 static SQLCIPHER_MIGRATION_PROBE_RUNS: AtomicU64 = AtomicU64::new(0);
 static SQLCIPHER_MIGRATION_PROBE_SKIPS: AtomicU64 = AtomicU64::new(0);
 
 /// Process-local cache of probe verdicts: database file -> salt whose derived
-/// v2 key was *observed* to open that database earlier in this process (a
-/// successful probe, or a legacy -> v2 rekey this process performed). A verdict
-/// lets the healthy steady-state path skip the recovery probe — a full second
-/// keyed open that pays the same 256k-iteration passphrase KDF as the real open
-/// (mdk#1439).
+/// raw v2 key was *observed* to open that database earlier in this process (a
+/// successful probe, or a rekey this process performed). A verdict lets the
+/// healthy steady-state path skip the second keyed open (mdk#1439).
 ///
 /// Safety rules:
 /// - A verdict is recorded only after the database at that path was observed
@@ -213,9 +207,9 @@ impl MarmotApp {
     ) -> Result<SqlCipherKey, AppError> {
         let db_path = database.path;
         let salt = self.sqlcipher_salt(label, keys, db_path, kind)?;
-        Ok(SqlCipherKey::new(derive_sqlcipher_key_material(
+        Ok(SqlCipherKey::raw(*derive_sqlcipher_key_material(
             label, keys, &salt, kind,
-        )?)?)
+        )?))
     }
 
     pub(crate) fn external_sqlcipher_key(
@@ -236,13 +230,24 @@ impl MarmotApp {
         };
         let secret = self.account_home().external_database_secret(label, mode)?;
         let salt = self.external_sqlcipher_salt(db_path)?;
-        Ok(SqlCipherKey::new(derive_external_sqlcipher_key_material(
-            label,
-            account_id_hex,
-            &secret,
-            &salt,
-            kind,
-        )?)?)
+        let material =
+            derive_external_sqlcipher_key_material(label, account_id_hex, &secret, &salt, kind)?;
+        let raw_key = SqlCipherKey::raw(*material);
+        if db_path.exists() {
+            if !sqlcipher_raw_marker_path(db_path).exists()
+                && sqlcipher_v2_verdict_cached(db_path, &salt)
+            {
+                SQLCIPHER_MIGRATION_PROBE_SKIPS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                if !probe_raw_sqlcipher(db_path, &raw_key)? {
+                    let passphrase = SqlCipherKey::new(hex::encode(&material))?;
+                    rekey_legacy_sqlcipher_database(db_path, &passphrase, &raw_key)?;
+                }
+                clear_raw_sqlcipher_marker(db_path)?;
+                sqlcipher_v2_verdict_record(db_path, &salt);
+            }
+        }
+        Ok(raw_key)
     }
 
     #[cfg(test)]
@@ -309,21 +314,20 @@ impl MarmotApp {
             //     before the rekey and the process crashed in between. No marker
             //     was written back then, so a marker check alone never recovers
             //     these already-bricked accounts.
-            // `finish_interrupted_sqlcipher_migration` probes the v2 key first
-            // (a cheap no-op logically when the database is already migrated or
-            // freshly v2-keyed — but a full keyed open paying the passphrase KDF
-            // physically) and only re-runs the legacy -> v2 rekey when that
-            // probe fails.
+            // Probe the raw key first; old salted passphrase and legacy keys
+            // are attempted only when that probe fails.
             //
             // The probe must run whenever the migration marker exists or this
             // process has not yet established that this database opens under
             // the v2 key for this salt — those are the crash windows the mdk#568
             // self-heal exists for. Once a verdict has been established, the
             // healthy steady-state path skips the probe so a repeated open of
-            // the same database pays the SQLCipher KDF once, not twice
-            // (mdk#1439).
+            // the same database avoids a second keyed open (mdk#1439).
             if db_path.exists() {
-                if !marker_path.exists() && sqlcipher_v2_verdict_cached(db_path, &salt) {
+                if !marker_path.exists()
+                    && !sqlcipher_raw_marker_path(db_path).exists()
+                    && sqlcipher_v2_verdict_cached(db_path, &salt)
+                {
                     SQLCIPHER_MIGRATION_PROBE_SKIPS.fetch_add(1, Ordering::Relaxed);
                 } else {
                     let observation = self.product_analytics.begin(
@@ -371,7 +375,7 @@ impl MarmotApp {
             write_sqlcipher_salt(&salt_path, &salt)?;
             let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(label, keys, kind))?;
             let new_key =
-                SqlCipherKey::new(derive_sqlcipher_key_material(label, keys, &salt, kind)?)?;
+                SqlCipherKey::raw(*derive_sqlcipher_key_material(label, keys, &salt, kind)?);
             let observation = self.product_analytics.begin(
                 crate::ProductFamily::Storage,
                 "recovery",
@@ -386,14 +390,9 @@ impl MarmotApp {
                     "failure"
                 });
             }
-            if let Err(err) = rekey {
-                // `PRAGMA rekey` is transactional and rolls back on error, so
-                // the database is still legacy-keyed. Roll back our sidecars so
-                // the next open retries cleanly from the legacy key.
-                let _ = fs::remove_file(&salt_path);
-                let _ = fs::remove_file(&marker_path);
-                return Err(err);
-            }
+            // Keep the durable salt and markers: even an error after a
+            // committed rekey must leave the new key reproducible.
+            rekey?;
             // The rekey committed: the database is now v2-keyed under this
             // salt, so later opens in this process can skip the probe.
             sqlcipher_v2_verdict_record(db_path, &salt);
@@ -433,6 +432,41 @@ fn read_sqlcipher_salt(path: &Path) -> Result<[u8; SQLCIPHER_SALT_LEN], AppError
     bytes.try_into().map_err(|_| {
         AppError::SqlcipherKeyDerivation(format!("invalid salt length in {}", path.display()))
     })
+}
+
+fn sqlcipher_raw_marker_path(db_path: &Path) -> PathBuf {
+    let mut name = db_path.file_name().unwrap_or_default().to_os_string();
+    name.push(SQLCIPHER_RAW_MARKER_SUFFIX);
+    db_path.with_file_name(name)
+}
+
+fn check_raw_sqlcipher_marker(db_path: &Path) -> Result<(), AppError> {
+    match fs::read(sqlcipher_raw_marker_path(db_path)) {
+        Ok(bytes) if bytes == SQLCIPHER_RAW_MARKER_V1 => Ok(()),
+        Ok(_) => Err(AppError::SqlcipherKeyDerivation(
+            "unsupported SQLCipher raw-key migration version".to_owned(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn sync_sqlcipher_directory(db_path: &Path) -> Result<(), AppError> {
+    #[cfg(unix)]
+    if let Some(parent) = db_path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = db_path;
+    Ok(())
+}
+
+fn clear_raw_sqlcipher_marker(db_path: &Path) -> Result<(), AppError> {
+    match fs::remove_file(sqlcipher_raw_marker_path(db_path)) {
+        Ok(()) => sync_sqlcipher_directory(db_path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Publish complete private bytes without ever replacing existing key material.
@@ -523,14 +557,8 @@ fn write_sqlcipher_migration_marker(path: &Path) -> Result<(), AppError> {
     }
 }
 
-/// Recover from a salt-migration that was interrupted before its marker was
-/// cleared. The salt is already durable, so the v2 key is reproducible. The
-/// on-disk database is in one of two states: either already rekeyed to the v2
-/// key (the rekey committed but the process died before the marker was
-/// removed), or still legacy-keyed (the rekey transaction never committed and
-/// rolled back). Probe with the v2 key first; if it opens, the migration is
-/// complete. If not, re-run the legacy -> v2 rekey. Idempotent: safe to run
-/// repeatedly.
+/// Recover either rekey generation. The durable salt reproduces both the raw
+/// key and its former hex passphrase; pre-salt databases use the legacy key.
 fn finish_interrupted_sqlcipher_migration(
     label: &str,
     keys: &nostr::prelude::Keys,
@@ -544,25 +572,33 @@ fn finish_interrupted_sqlcipher_migration(
         return Ok(false);
     }
 
-    let new_key = SqlCipherKey::new(derive_sqlcipher_key_material(label, keys, salt, kind)?)?;
+    let material = derive_sqlcipher_key_material(label, keys, salt, kind)?;
+    let new_key = SqlCipherKey::raw(*material);
+    if probe_raw_sqlcipher(db_path, &new_key)? {
+        clear_raw_sqlcipher_marker(db_path)?;
+        return Ok(false);
+    }
 
-    // Does the database already open under the v2 key? This probe is a full
-    // keyed open and pays the complete SQLCipher passphrase KDF (mdk#1439), so
-    // it is counted for the aggregate telemetry counters and only runs when no
-    // cached verdict covers this database+salt pair.
+    let passphrase = SqlCipherKey::new(hex::encode(&material))?;
+    let conn = Connection::open(db_path)?;
+    if open_hardened_sqlcipher(&conn, &passphrase, SqlCipherHardening::cipher_only()).is_ok() {
+        rekey_sqlcipher_connection(db_path, &conn, &new_key)?;
+        return Ok(true);
+    }
+    drop(conn);
+
+    let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(label, keys, kind))?;
+    rekey_legacy_sqlcipher_database(db_path, &legacy_key, &new_key).map(|()| true)
+}
+
+fn probe_raw_sqlcipher(db_path: &Path, key: &SqlCipherKey) -> Result<bool, AppError> {
+    check_raw_sqlcipher_marker(db_path)?;
+    fs_private::ensure_private_db_files(db_path)?;
     let conn = Connection::open(db_path)?;
     SQLCIPHER_MIGRATION_PROBE_RUNS.fetch_add(1, Ordering::Relaxed);
     #[cfg(test)]
     record_probe_attempt_for_test(db_path);
-    if open_hardened_sqlcipher(&conn, &new_key, SqlCipherHardening::cipher_only()).is_ok() {
-        return Ok(false);
-    }
-    drop(conn);
-
-    // Still legacy-keyed: re-run the rekey. `PRAGMA rekey` is transactional, so
-    // a crash here simply leaves the marker in place for the next attempt.
-    let legacy_key = SqlCipherKey::new(legacy_sqlcipher_key_material(label, keys, kind))?;
-    rekey_legacy_sqlcipher_database(db_path, &legacy_key, &new_key).map(|()| true)
+    Ok(open_hardened_sqlcipher(&conn, key, SqlCipherHardening::cipher_only()).is_ok())
 }
 
 fn derive_sqlcipher_key_material(
@@ -570,10 +606,8 @@ fn derive_sqlcipher_key_material(
     keys: &nostr::prelude::Keys,
     salt: &[u8; SQLCIPHER_SALT_LEN],
     kind: SqlcipherDatabaseKind,
-) -> Result<String, AppError> {
-    // The account-secret copy and the raw derived key are wiped on drop; the
-    // returned hex string is moved straight into `SqlCipherKey`, which
-    // zeroizes it.
+) -> Result<Zeroizing<[u8; SQLCIPHER_KEY_LEN]>, AppError> {
+    // Both the account-secret copy and the derived key are wiped on drop.
     let secret = Zeroizing::new(keys.secret_key().to_secret_bytes());
     let hkdf = Hkdf::<Sha256>::new(Some(salt), secret.as_ref());
     let mut info = Vec::new();
@@ -584,7 +618,7 @@ fn derive_sqlcipher_key_material(
     let mut output = Zeroizing::new([0_u8; SQLCIPHER_KEY_LEN]);
     hkdf.expand(&info, output.as_mut())
         .map_err(|_| AppError::SqlcipherKeyDerivation("HKDF output length rejected".to_owned()))?;
-    Ok(hex::encode(&output))
+    Ok(output)
 }
 
 fn derive_external_sqlcipher_key_material(
@@ -593,7 +627,7 @@ fn derive_external_sqlcipher_key_material(
     secret: &[u8; SQLCIPHER_KEY_LEN],
     salt: &[u8; SQLCIPHER_SALT_LEN],
     kind: SqlcipherDatabaseKind,
-) -> Result<String, AppError> {
+) -> Result<Zeroizing<[u8; SQLCIPHER_KEY_LEN]>, AppError> {
     let account_id = hex::decode(account_id_hex)?;
     let hkdf = Hkdf::<Sha256>::new(Some(salt), secret);
     let mut info = Vec::new();
@@ -604,7 +638,7 @@ fn derive_external_sqlcipher_key_material(
     let mut output = Zeroizing::new([0_u8; SQLCIPHER_KEY_LEN]);
     hkdf.expand(&info, output.as_mut())
         .map_err(|_| AppError::SqlcipherKeyDerivation("HKDF output length rejected".to_owned()))?;
-    Ok(hex::encode(&output))
+    Ok(output)
 }
 
 fn legacy_sqlcipher_key_material(
@@ -634,13 +668,34 @@ fn rekey_legacy_sqlcipher_database(
     legacy_key: &SqlCipherKey,
     new_key: &SqlCipherKey,
 ) -> Result<(), AppError> {
+    fs_private::ensure_private_db_files(db_path)?;
     let conn = Connection::open(db_path)?;
     // Pin cipher_compatibility and enable cipher_memory_security before keying,
     // matching storage-sqlite, so the rekey open does not depend on SQLCipher
     // defaults and key material is wiped from the heap.
     open_hardened_sqlcipher(&conn, legacy_key, SqlCipherHardening::cipher_only())?;
+    rekey_sqlcipher_connection(db_path, &conn, new_key)
+}
+
+fn rekey_sqlcipher_connection(
+    db_path: &Path,
+    conn: &Connection,
+    new_key: &SqlCipherKey,
+) -> Result<(), AppError> {
+    check_raw_sqlcipher_marker(db_path)?;
+    match write_private_new(&sqlcipher_raw_marker_path(db_path), SQLCIPHER_RAW_MARKER_V1) {
+        Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        result => result?,
+    }
+    sync_sqlcipher_directory(db_path)?;
+    conn.pragma_update(None, "secure_delete", true)?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
     conn.pragma_update(None, "rekey", new_key.as_secret_str())?;
-    Ok(())
+    // Reopen before clearing intent or recording a cached verdict. This
+    // verification is not an interrupted-migration probe for telemetry.
+    let verified = Connection::open(db_path)?;
+    open_hardened_sqlcipher(&verified, new_key, SqlCipherHardening::cipher_only())?;
+    clear_raw_sqlcipher_marker(db_path)
 }
 
 pub(crate) fn remove_sqlite_file_set(path: &Path) -> Result<(), AppError> {
@@ -1078,8 +1133,7 @@ mod tests {
         OsRng.fill_bytes(&mut salt);
         write_sqlcipher_salt(&sqlcipher_salt_path(db_path), &salt).unwrap();
         let v2_key =
-            SqlCipherKey::new(derive_sqlcipher_key_material(label, keys, &salt, kind).unwrap())
-                .unwrap();
+            SqlCipherKey::raw(*derive_sqlcipher_key_material(label, keys, &salt, kind).unwrap());
         let conn = Connection::open(db_path).unwrap();
         open_hardened_sqlcipher(&conn, &v2_key, SqlCipherHardening::cipher_only()).unwrap();
         conn.execute_batch(
@@ -1092,8 +1146,7 @@ mod tests {
     #[test]
     fn sqlcipher_probe_runs_at_most_once_for_healthy_v2_database_across_opens() {
         // mdk#1439 acceptance: a healthy v2-keyed database opened repeatedly in
-        // one process runs the interrupted-migration probe — a full keyed open
-        // paying the 256k-iteration passphrase KDF — at most once. The first
+        // one process runs the interrupted-migration raw-key probe at most once. The first
         // open establishes the verdict; later opens reuse it.
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -1366,6 +1419,289 @@ mod tests {
         assert!(!cache.contains(&path, &salt_a));
         assert!(cache.contains(&path, &salt_b));
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn raw_rekey_and_downgrade() {
+        // No marker, intent durable, and rekey committed before process death.
+        for kind in [
+            SqlcipherDatabaseKind::Session,
+            SqlcipherDatabaseKind::AccountProjection,
+            SqlcipherDatabaseKind::DirectoryCache,
+        ] {
+            for crash_window in 0..3 {
+                let dir = tempfile::tempdir().unwrap();
+                let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+                app.account_home().create_account("alice").unwrap();
+                let keys = app.account_home().load_signing_keys("alice").unwrap();
+                let path = dir.path().join("old.sqlite");
+                let salt = [0x5a; SQLCIPHER_SALT_LEN];
+                write_sqlcipher_salt(&sqlcipher_salt_path(&path), &salt).unwrap();
+                let material = derive_sqlcipher_key_material("alice", &keys, &salt, kind).unwrap();
+                let passphrase = SqlCipherKey::new(hex::encode(&material)).unwrap();
+                let raw = SqlCipherKey::raw(*material);
+                {
+                    let conn = Connection::open(&path).unwrap();
+                    open_hardened_sqlcipher(&conn, &passphrase, SqlCipherHardening::cipher_only())
+                        .unwrap();
+                    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+                    conn.execute_batch(
+                        "CREATE TABLE marker (value TEXT NOT NULL);
+                         INSERT INTO marker VALUES ('kept');",
+                    )
+                    .unwrap();
+                    if crash_window != 0 {
+                        write_private_new(
+                            &sqlcipher_raw_marker_path(&path),
+                            SQLCIPHER_RAW_MARKER_V1,
+                        )
+                        .unwrap();
+                    }
+                    if crash_window == 2 {
+                        conn.pragma_update(None, "rekey", raw.as_secret_str())
+                            .unwrap();
+                    }
+                }
+
+                let recovered = app.sqlcipher_key("alice", &keys, &path, kind).unwrap();
+                assert!(!sqlcipher_raw_marker_path(&path).exists());
+                {
+                    let conn = Connection::open(&path).unwrap();
+                    open_hardened_sqlcipher(&conn, &recovered, SqlCipherHardening::cipher_only())
+                        .unwrap();
+                    let value: String = conn
+                        .query_row("SELECT value FROM marker", [], |row| row.get(0))
+                        .unwrap();
+                    assert_eq!(value, "kept");
+                    // Explicit offline downgrade: original hex passphrase, not x'...'.
+                    conn.pragma_update(None, "synchronous", "FULL").unwrap();
+                    conn.pragma_update(None, "rekey", passphrase.as_secret_str())
+                        .unwrap();
+                }
+                let conn = Connection::open(&path).unwrap();
+                open_hardened_sqlcipher(&conn, &passphrase, SqlCipherHardening::cipher_only())
+                    .unwrap();
+                let value: String = conn
+                    .query_row("SELECT value FROM marker", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(value, "kept");
+                drop(conn);
+                let conn = Connection::open(&path).unwrap();
+                assert!(
+                    open_hardened_sqlcipher(&conn, &raw, SqlCipherHardening::cipher_only())
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_marker_forces_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        app.account_home().create_account("alice").unwrap();
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let path = dir.path().join("raw.sqlite");
+        let kind = SqlcipherDatabaseKind::Session;
+        create_healthy_v2_database("alice", &keys, &path, kind);
+        app.sqlcipher_key("alice", &keys, &path, kind).unwrap();
+        write_private_new(&sqlcipher_raw_marker_path(&path), SQLCIPHER_RAW_MARKER_V1).unwrap();
+        app.sqlcipher_key("alice", &keys, &path, kind).unwrap();
+        assert_eq!(probe_attempts_for_test(&path), 2);
+        assert!(!sqlcipher_raw_marker_path(&path).exists());
+        write_private_new(&sqlcipher_raw_marker_path(&path), b"raw-key-v99\n").unwrap();
+        assert!(app.sqlcipher_key("alice", &keys, &path, kind).is_err());
+        assert!(sqlcipher_raw_marker_path(&path).exists());
+    }
+
+    #[test]
+    fn failed_rekey_keeps_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        app.account_home().create_account("alice").unwrap();
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let path = dir.path().join("locked.sqlite");
+        let kind = SqlcipherDatabaseKind::Session;
+        let legacy =
+            SqlCipherKey::new(legacy_sqlcipher_key_material("alice", &keys, kind)).unwrap();
+        let blocker = Connection::open(&path).unwrap();
+        open_hardened_sqlcipher(&blocker, &legacy, SqlCipherHardening::cipher_only()).unwrap();
+        blocker
+            .execute_batch(
+                "CREATE TABLE marker (value TEXT NOT NULL);
+             INSERT INTO marker VALUES ('kept');
+             BEGIN IMMEDIATE;",
+            )
+            .unwrap();
+
+        assert!(app.sqlcipher_key("alice", &keys, &path, kind).is_err());
+        let salt = read_sqlcipher_salt(&sqlcipher_salt_path(&path)).unwrap();
+        assert!(sqlcipher_migration_marker_path(&path).exists());
+        assert!(sqlcipher_raw_marker_path(&path).exists());
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+
+        let recovered = app.sqlcipher_key("alice", &keys, &path, kind).unwrap();
+        assert_eq!(
+            read_sqlcipher_salt(&sqlcipher_salt_path(&path)).unwrap(),
+            salt
+        );
+        assert!(!sqlcipher_migration_marker_path(&path).exists());
+        assert!(!sqlcipher_raw_marker_path(&path).exists());
+        let conn = Connection::open(&path).unwrap();
+        open_hardened_sqlcipher(&conn, &recovered, SqlCipherHardening::cipher_only()).unwrap();
+        let value: String = conn
+            .query_row("SELECT value FROM marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "kept");
+    }
+
+    #[test]
+    fn raw_rekey_wal_crash_recovers() {
+        const CRASH_ROOT: &str = "MDK_SQLCIPHER_WAL_CRASH_ROOT";
+        let kind = SqlcipherDatabaseKind::Session;
+        if let Some(root) = std::env::var_os(CRASH_ROOT) {
+            let root = PathBuf::from(root);
+            let path = root.join("crashed.sqlite");
+            let home = AccountHome::open(&root);
+            let keys = home.load_signing_keys("alice").unwrap();
+            let salt = read_sqlcipher_salt(&sqlcipher_salt_path(&path)).unwrap();
+            let material = derive_sqlcipher_key_material("alice", &keys, &salt, kind).unwrap();
+            let old_key = SqlCipherKey::new(hex::encode(&material)).unwrap();
+            let conn = Connection::open(&path).unwrap();
+            open_hardened_sqlcipher(&conn, &old_key, SqlCipherHardening::cipher_only()).unwrap();
+            conn.execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+                 PRAGMA synchronous=FULL;
+                 INSERT INTO marker VALUES ('wal-committed');",
+            )
+            .unwrap();
+            write_private_new(&sqlcipher_raw_marker_path(&path), SQLCIPHER_RAW_MARKER_V1).unwrap();
+            sync_sqlcipher_directory(&path).unwrap();
+            conn.pragma_update(None, "rekey", SqlCipherKey::raw(*material).as_secret_str())
+                .unwrap();
+            // Skip SQLite's close-time checkpoint, leaving committed raw-key WAL
+            // frames over the old-key main file, as after process death.
+            std::process::exit(0);
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        app.account_home().create_account("alice").unwrap();
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let path = dir.path().join("crashed.sqlite");
+        let salt = [0x5a; SQLCIPHER_SALT_LEN];
+        write_sqlcipher_salt(&sqlcipher_salt_path(&path), &salt).unwrap();
+        let material = derive_sqlcipher_key_material("alice", &keys, &salt, kind).unwrap();
+        let old_key = SqlCipherKey::new(hex::encode(&material)).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            open_hardened_sqlcipher(&conn, &old_key, SqlCipherHardening::cipher_only()).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE marker (value TEXT NOT NULL);
+                 INSERT INTO marker VALUES ('kept');",
+            )
+            .unwrap();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sqlcipher::tests::raw_rekey_wal_crash_recovers",
+                "--nocapture",
+            ])
+            .env(CRASH_ROOT, dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(path.with_file_name("crashed.sqlite-wal").exists());
+        assert!(sqlcipher_raw_marker_path(&path).exists());
+
+        let recovered = app.sqlcipher_key("alice", &keys, &path, kind).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        open_hardened_sqlcipher(&conn, &recovered, SqlCipherHardening::cipher_only()).unwrap();
+        let values: String = conn
+            .query_row(
+                "SELECT group_concat(value, ',') FROM (SELECT value FROM marker ORDER BY rowid)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(values, "kept,wal-committed");
+        let integrity: String = conn
+            .pragma_query_value(None, "integrity_check", |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert!(!sqlcipher_raw_marker_path(&path).exists());
+    }
+
+    #[test]
+    fn external_raw_rekey_recovers() {
+        for crash_window in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+            let public_key = nostr::prelude::Keys::generate().public_key().to_hex();
+            let account = app
+                .account_home()
+                .add_external_signer_account(&public_key)
+                .unwrap();
+            let path = app.account_storage_path(&account.label);
+            let salt = app.external_sqlcipher_salt(&path).unwrap();
+            let secret = app
+                .account_home()
+                .external_database_secret(
+                    &account.label,
+                    marmot_account::ExternalSecretMode::Create,
+                )
+                .unwrap();
+            let material = derive_external_sqlcipher_key_material(
+                &account.label,
+                &account.account_id_hex,
+                &secret,
+                &salt,
+                SqlcipherDatabaseKind::Session,
+            )
+            .unwrap();
+            let passphrase = SqlCipherKey::new(hex::encode(&material)).unwrap();
+            {
+                let conn = Connection::open(&path).unwrap();
+                open_hardened_sqlcipher(&conn, &passphrase, SqlCipherHardening::cipher_only())
+                    .unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE marker (value TEXT); INSERT INTO marker VALUES ('kept');",
+                )
+                .unwrap();
+                if crash_window != 0 {
+                    write_private_new(&sqlcipher_raw_marker_path(&path), SQLCIPHER_RAW_MARKER_V1)
+                        .unwrap();
+                }
+                if crash_window == 2 {
+                    conn.pragma_update(None, "rekey", SqlCipherKey::raw(*material).as_secret_str())
+                        .unwrap();
+                }
+            }
+            let lock = database_open_lock(&path);
+            let guard = lock.lock();
+            let key = app
+                .external_sqlcipher_key(
+                    &account.label,
+                    &account.account_id_hex,
+                    &guard,
+                    SqlcipherDatabaseKind::Session,
+                )
+                .unwrap();
+            let conn = Connection::open(&path).unwrap();
+            open_hardened_sqlcipher(&conn, &key, SqlCipherHardening::cipher_only()).unwrap();
+            let value: String = conn
+                .query_row("SELECT value FROM marker", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, "kept");
+            assert!(!sqlcipher_raw_marker_path(&path).exists());
+        }
     }
 
     #[test]

@@ -33,7 +33,9 @@ pub(crate) async fn profile_command_with_runtime(
     ensure_local_signing(&account)?;
     match command {
         ProfileCommand::Show => {
-            let entry = app.directory_entry_for_account_id(&account.account_id_hex)?;
+            let entry = app
+                .directory()
+                .directory_entry_for_account_id(&account.account_id_hex)?;
             Ok(CommandOutput {
                 plain: terminal_safe_json_display(
                     &serde_json::to_string_pretty(&entry)
@@ -76,6 +78,7 @@ pub(crate) async fn profile_command_with_runtime(
             let relay = relay.ok_or(WnError::MissingRelay)?;
             let endpoint = TransportEndpoint(validate_relay_url(&relay)?);
             let mut profile = app
+                .directory()
                 .fetch_current_user_profile_for_account_id(
                     &account.account_id_hex,
                     vec![endpoint.clone()],

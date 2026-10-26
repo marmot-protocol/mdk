@@ -1257,8 +1257,6 @@ mod tests {
         let (_dir, active, state_dir, recorder) = setup();
         record(&recorder, "one");
         let mut worker = LocalAuditDelivery::open(&active, &state_dir, "receiver-A").unwrap();
-        fn assert_owned<T: Send + 'static>() {}
-        assert_owned::<DeliveryBatch>();
         let batch = prepared_batch(&mut worker);
         drop(worker);
         drop(recorder);

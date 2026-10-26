@@ -46,6 +46,10 @@ pub enum AttachmentTransferState {
     /// ciphertext checkpoints stay; the worker readmits the job once space is
     /// available, and explicit Retry readmits it at once.
     StorageBlocked,
+    /// The account's "Keep media" setting removed the body because the
+    /// message is older than its window (mdk#2314 step 10). Download again
+    /// is allowed, as for `Removed`.
+    CleanedBySetting,
 }
 /// Free space beyond a parked job's recorded target before it is readmitted,
 /// so measurement noise cannot flip a row between parked and queued each tick.
@@ -295,7 +299,7 @@ impl SqliteAppStorage {
                     false,
                 ));
             }
-            match self.request_attachment_acquisition(group, selected, digest, now)? {
+            match self.request_automatic_acquisition(group, selected, digest, now)? {
                 AttachmentDemand::Requested(reference) => {
                     self.lock()?.execute("UPDATE attachment_acquisition SET automatic_history=1 WHERE token=?1", [&reference.token]).storage()?;
                     Ok((
@@ -310,7 +314,19 @@ impl SqliteAppStorage {
                     true,
                 ))
                 },
-                AttachmentDemand::Suppressed | AttachmentDemand::Unavailable => Ok((None, false)),
+                // Past the "Keep media" window: report the slot as cleaned.
+                AttachmentDemand::Suppressed => Ok((
+                    self.attachment_transfer_status(
+                        group,
+                        &selected.message_id_hex,
+                        &selected.source_message_id_hex,
+                        index,
+                        now,
+                        automatic,
+                    )?,
+                    false,
+                )),
+                AttachmentDemand::Unavailable => Ok((None, false)),
             }
         })
     }
@@ -420,7 +436,7 @@ impl SqliteAppStorage {
                 .execute(
                     &format!(
                         "UPDATE attachment_acquisition AS q SET
-                    explicit_request=1,priority_at=?2,permission_paused=0,
+                    explicit_request=1,priority_at=?2,keep_from=?2,permission_paused=0,
                     state=CASE WHEN state=5 THEN 0 ELSE state END,
                     due=CASE WHEN state=5 THEN max(?2,retry_not_before) ELSE due END
                     WHERE token=?1 AND explicit_request=0 AND cancelled=0
@@ -517,7 +533,7 @@ impl SqliteAppStorage {
             let conn=self.lock()?;
             if !matches_store(&conn,reference)? {return Ok(false);}
             let parked = partial::storage_parked(&conn, &reference.token)?;
-            let retried = conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,permission_paused=0,retry_not_before=0,preparation_deferrals=0,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
+            let retried = conn.execute(&format!("UPDATE attachment_acquisition AS q SET cancelled=0,state=CASE WHEN state=1 THEN 1 ELSE 0 END,due=CASE WHEN state=1 THEN due ELSE ?2 END,attempt=CASE WHEN state=1 THEN attempt ELSE NULL END,explicit_request=1,keep_from=?2,size_blocked_max=NULL,storage_blocked_headroom=NULL,storage_park_count=0,permission_paused=0,retry_not_before=0,preparation_deferrals=0,acquisition_attempts=CASE WHEN state=1 THEN acquisition_attempts ELSE 0 END,network_attempts=CASE WHEN state=1 THEN network_attempts ELSE 0 END,body_completed=CASE WHEN state=1 THEN body_completed ELSE 0 END
                 WHERE token=?1 AND (state IN(0,1,2,4,5) OR (state=3 AND NOT {RETAINED_BODY})) AND {SOURCE_MATCH} AND {ACCEPTED} AND (expires_at IS NULL OR expires_at>?2)"),
                 params![reference.token,u64_to_i64(now)?]).storage()?==1;
             if retried && parked {
@@ -549,7 +565,7 @@ impl SqliteAppStorage {
             if !matches_store(&conn,reference)? {return Ok(None);}
             let source=conn.query_row("SELECT group_id_hex,message_id_hex,attachment_index FROM attachment_acquisition WHERE token=?1",[&reference.token],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,u32>(2)?))).optional().storage()?;
             match source {
-                Some((g,m,i)) => super::storage_usage::remove_slot(&conn,&g,&m,i),
+                Some((g,m,i)) => super::storage_usage::remove_slot(&conn,&g,&m,i,super::storage_usage::RemovalReason::ByYou),
                 None => Ok(None),
             }
         })
@@ -887,7 +903,7 @@ fn transfer_status(
         *next_expiry = Some(next_expiry.map_or(expiry, |old| old.min(expiry)));
     }
 
-    let removed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM attachment_removal_suppression WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3)",params![group,message,index],|r|r.get(0)).storage()?;
+    let removed:Option<i64>=conn.query_row("SELECT reason FROM attachment_removal_suppression WHERE group_id_hex=?1 AND message_id_hex=?2 AND attachment_index=?3",params![group,message,index],|r|r.get(0)).optional().storage()?;
     let status=conn.query_row(&format!("SELECT token,state,cancelled,explicit_request,size_blocked_max,progress_epoch,progress_received,progress_total,progress_phase,due,body_completed,network_attempts,{RETAINED_BODY},acquisition_attempts,automatic_history,permission_paused,storage_blocked_headroom
                 FROM attachment_acquisition q WHERE group_id_hex=?1 AND message_id_hex=?2 AND source_message_id_hex=?3 AND attachment_index=?4 AND {SOURCE_MATCH}"),params![group,message,source,index],|r| {
                 let stored_state = r.get::<_,u8>(1)?;
@@ -946,10 +962,12 @@ fn transfer_status(
         None => AttachmentTransferStatus {
             reference: None,
             automatic_media_type: Some(slot_media_type(&slot)),
-            state: if removed {
-                AttachmentTransferState::Removed
-            } else {
-                AttachmentTransferState::NotRequested
+            state: match removed {
+                Some(reason) if reason == super::storage_usage::RemovalReason::BySetting as i64 => {
+                    AttachmentTransferState::CleanedBySetting
+                }
+                Some(_) => AttachmentTransferState::Removed,
+                None => AttachmentTransferState::NotRequested,
             },
             attempt: 0,
             received: 0,

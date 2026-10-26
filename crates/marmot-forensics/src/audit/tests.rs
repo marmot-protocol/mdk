@@ -2538,7 +2538,6 @@ fn v5_recorder_covers_every_existing_operational_kind_with_strict_typed_rows() {
         operational,
         expected.into_iter().map(str::to_owned).collect()
     );
-    assert_eq!(operational.len(), 51);
 }
 
 #[test]

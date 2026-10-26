@@ -794,7 +794,7 @@ impl<S: StorageProvider> Engine<S> {
     /// a typed `StaleReason` inside `Ok(IngestOutcome::Stale { .. })`.
     pub(crate) async fn do_ingest(
         &mut self,
-        msg: TransportMessage,
+        msg: &TransportMessage,
     ) -> Result<IngestOutcome, EngineError> {
         // Clear a marker left by cancellation/panic in an earlier ingest; only
         // the current call may suppress its own seen-cache insertion.
@@ -815,9 +815,9 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
         if self.sent_message_ids.contains(&msg.id) {
-            let group_id = record_group_id(&msg);
+            let group_id = record_group_id(msg);
             self.persist_transport_message_for_existing_group(
-                &msg,
+                msg,
                 &group_id,
                 EpochId(0),
                 MessageState::Sent,
@@ -829,10 +829,10 @@ impl<S: StorageProvider> Engine<S> {
 
         let outcome = match &msg.envelope {
             TransportEnvelope::Welcome { recipient } => {
-                self.ingest_welcome(&msg, recipient.clone()).await?
+                self.ingest_welcome(msg, recipient.clone()).await?
             }
             TransportEnvelope::GroupMessage { transport_group_id } => {
-                self.ingest_group_message(&msg, transport_group_id.clone())
+                self.ingest_group_message(msg, transport_group_id.clone())
                     .await?
             }
         };

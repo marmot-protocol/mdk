@@ -1,7 +1,8 @@
 //! Account-worker side of the durable delivery spill.
 //!
-//! Spilled rows are read back in small batches and alternated with live
-//! deliveries, so neither backlog starves the other. A row is removed only
+//! Ordinary spilled rows alternate with live deliveries. Retained group rows
+//! belong to the recovery owner's ordered native ingress until admitted.
+//! A row is removed only
 //! once its event is in the seen index, the same test dedup uses, so a newer
 //! live delivery can move the cursor past a spilled one without losing it.
 //! Rows whose ingest left no durable trace are retried later with backoff.
@@ -108,6 +109,15 @@ impl DeliverySpillReader {
 }
 
 impl AppClient {
+    pub(super) fn exclude_retained_spill(&mut self) {
+        self.delivery_spill.buffered.retain(|row| {
+            !self
+                .recovery_owner
+                .retained_spill
+                .contains_key(&row.delivery.message.id)
+        });
+    }
+
     /// A delivery that is ready without waiting: while spilled rows remain,
     /// alternate a queued live delivery with the oldest spilled one.
     pub(super) fn take_ready_delivery(
@@ -135,9 +145,14 @@ impl AppClient {
                 .app
                 .account_storage(&self.state.label)
                 .and_then(|storage| {
-                    Ok(storage
-                        .app_storage()
-                        .spilled_account_deliveries(SPILL_READ_BATCH, unix_now_seconds())?)
+                    Ok(storage.app_storage().spilled_account_deliveries(
+                        if self.recovery_owner.retained_spill.is_empty() {
+                            SPILL_READ_BATCH
+                        } else {
+                            ACCOUNT_DELIVERY_SPILL_LIMITS.max_rows as usize
+                        },
+                        unix_now_seconds(),
+                    )?)
                 });
             #[cfg(test)]
             let read = if std::mem::take(&mut self.delivery_spill.fail_next_read) {
@@ -163,7 +178,7 @@ impl AppClient {
     /// Buffer one read. Undecodable rows become queue loss first. If that
     /// fails, the whole batch stays durable and is read again after a paced
     /// retry, so a quiet receive neither spins nor waits forever.
-    fn absorb_spill_batch(&mut self, batch: storage_sqlite::SpilledDeliveryBatch) {
+    fn absorb_spill_batch(&mut self, mut batch: storage_sqlite::SpilledDeliveryBatch) {
         if !batch.undecodable.is_empty() {
             if self.discard_spilled_deliveries(&batch.undecodable).is_err() {
                 self.delivery_spill.maybe_rows = false;
@@ -178,7 +193,14 @@ impl AppClient {
                 "discarded undecodable spilled deliveries as queue loss",
             );
         }
-        self.delivery_spill.maybe_rows = batch.more;
+        self.delivery_spill.maybe_rows =
+            batch.more && self.recovery_owner.retained_spill.is_empty();
+        batch.deliveries.retain(|row| {
+            !self
+                .recovery_owner
+                .retained_spill
+                .contains_key(&row.delivery.message.id)
+        });
         if let Some(at) = batch.next_retry_at {
             self.schedule_spill_retry(at);
         }
@@ -206,13 +228,34 @@ impl AppClient {
         let Some((seq, event_id)) = self.delivery_spill.in_flight.take() else {
             return;
         };
+        self.settle_spill_row(seq, &event_id);
+    }
+
+    pub(super) fn settle_spill_row(&mut self, seq: i64, event_id: &str) {
+        if self.try_settle_spill_row(seq, event_id).is_err() {
+            self.schedule_spill_retry(unix_now_seconds().saturating_add(SPILL_SETTLE_RETRY_SECS));
+            tracing::warn!(
+                target: "marmot_app::client::delivery_spill",
+                method = "settle_spilled_delivery",
+                error_kind = "spill_row_settlement_failed",
+                "spilled delivery row kept after ingest; it will be read again",
+            );
+        }
+    }
+
+    /// Native ingress retains its loan and sequence mapping on settlement failure.
+    pub(super) fn try_settle_spill_row(
+        &mut self,
+        seq: i64,
+        event_id: &str,
+    ) -> Result<(), AppError> {
         // An unreadable receipt view proves nothing either way. The row is
         // read again later without spending one of its attempts.
         let admitted = self
             .transport_receipts()
-            .map(|receipts| receipts.contains(&event_id));
+            .map(|receipts| receipts.contains(event_id));
         let now = unix_now_seconds();
-        let settled = (|| -> Result<(), AppError> {
+        (|| -> Result<(), AppError> {
             let admitted = admitted?;
             let storage = self.app.account_storage(&self.state.label)?.app_storage();
             if admitted {
@@ -234,16 +277,7 @@ impl AppClient {
                 "spilled delivery was never admitted; recorded as queue loss after its last retry",
             );
             Ok(())
-        })();
-        if settled.is_err() {
-            self.schedule_spill_retry(now.saturating_add(SPILL_SETTLE_RETRY_SECS));
-            tracing::warn!(
-                target: "marmot_app::client::delivery_spill",
-                method = "settle_spilled_delivery",
-                error_kind = "spill_row_settlement_failed",
-                "spilled delivery row kept after ingest; it will be read again",
-            );
-        }
+        })()
     }
 
     fn schedule_spill_retry(&mut self, at: u64) {
@@ -253,7 +287,7 @@ impl AppClient {
 
     /// Remove rows and turn them into a queue-loss obligation in one
     /// transaction, then fence the cursor until recovery settles that loss.
-    fn discard_spilled_deliveries(&mut self, seqs: &[i64]) -> Result<(), AppError> {
+    pub(super) fn discard_spilled_deliveries(&mut self, seqs: &[i64]) -> Result<(), AppError> {
         use rand::RngCore;
         #[cfg(test)]
         if std::mem::take(&mut self.delivery_spill.fail_next_discard) {
@@ -378,6 +412,71 @@ mod tests {
                 .unwrap()
                 .deliveries
                 .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retained_spill_inbox_fair() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        app.relay_plane =
+            MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay, true);
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let storage = app.account_storage("alice").unwrap().app_storage();
+        let now = unix_now_seconds();
+        let mut rows = (1..=34).map(delivery).collect::<Vec<_>>();
+        let mut inbox = delivery(35);
+        inbox.message.envelope = TransportEnvelope::Welcome {
+            recipient: MemberId::new(vec![0xAA; 32]),
+        };
+        rows.push(inbox.clone());
+        storage
+            .spill_account_deliveries(&rows, ACCOUNT_DELIVERY_SPILL_LIMITS, now)
+            .unwrap();
+        // A buffered prefix from an earlier ordinary read also belongs to
+        // native ingress once it registers its retained supplements.
+        client.absorb_spill_batch(storage.spilled_account_deliveries(32, now).unwrap());
+        let stored = storage
+            .spilled_account_deliveries(100, now)
+            .unwrap()
+            .deliveries;
+        for row in stored.iter().take(34) {
+            client
+                .recovery_owner
+                .retained_spill
+                .insert(row.delivery.message.id.clone(), row.seq);
+        }
+        client.exclude_retained_spill();
+        assert_eq!(client.next_spilled_delivery().unwrap(), Some(inbox));
+        assert!(client.next_spilled_delivery().unwrap().is_none());
+        assert_eq!(
+            storage
+                .spilled_account_deliveries(100, now)
+                .unwrap()
+                .deliveries
+                .len(),
+            35
+        );
+
+        // Native settlement uses precisely the ordinary durable-receipt test.
+        client.remember_seen_event(hex::encode([1_u8; 32]));
+        client.settle_spill_row(stored[0].seq, &hex::encode([1_u8; 32]));
+        client.settle_spill_row(stored[1].seq, &hex::encode([2_u8; 32]));
+        let due = storage.spilled_account_deliveries(100, now).unwrap();
+        assert!(!due.deliveries.iter().any(|row| row.seq == stored[0].seq));
+        assert!(!due.deliveries.iter().any(|row| row.seq == stored[1].seq));
+        assert!(
+            storage
+                .spilled_account_deliveries(100, i64::MAX as u64)
+                .unwrap()
+                .deliveries
+                .iter()
+                .any(|row| row.seq == stored[1].seq)
         );
     }
 

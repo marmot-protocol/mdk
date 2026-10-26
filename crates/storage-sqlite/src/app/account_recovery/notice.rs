@@ -276,6 +276,7 @@ mod tests {
                 first_boundary: false,
             }],
             retained_known_event: false,
+            replay_admitted: false,
         };
         assert!(
             !store
@@ -325,6 +326,7 @@ mod tests {
                 token,
                 endpoints: Vec::new(),
                 retained_known_event: false,
+                replay_admitted: false,
             })
             .collect::<Vec<_>>();
         assert!(

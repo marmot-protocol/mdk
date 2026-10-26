@@ -64,8 +64,9 @@ order and the roles agents most often need.
 
 - **Path:** `review/`
   - **Role:** The 2026-10 architecture review: `README.md` (scope, lenses, evidence rules), `00-system-map.md` and
-    `map-*.md` (Pass 0, descriptive and pinned to a baseline commit), and later per-system review pages. Keep the
-    map descriptive; findings and recommendations belong on the Pass 1 and Pass 2 pages.
+    `map-*.md` (Pass 0, descriptive and pinned to a baseline commit), the Pass 1 system pages, and `core-structure.md`
+    (findings and the target crate structure). Keep the map descriptive; findings and recommendations belong on the
+    Pass 1 and Pass 2 pages. Each extraction step's plan is a tracking issue linked from mdk#2360, not a page here.
 
 - **Path:** `further-context/`
   - **Role:** Older or deeper context. Check status and dates before relying on it.
@@ -137,6 +138,7 @@ order and the roles agents most often need.
 
 ## Conventions
 
+- Put plans in GitHub issues, not here; see `../AGENTS.md`.
 - Use `CgkaEngine`, `TransportPeeler`, and `TransportAdapter` consistently.
 - Treat `storage-sqlite` as the current persistent backend.
 - Keep Nostr language separated into identity, app message format, and transport roles.

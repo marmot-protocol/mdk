@@ -1951,9 +1951,17 @@ impl<S: StorageProvider> Engine<S> {
         // it normally.
         self.valid_proposal_groups.remove(group_id);
         self.remember_canonicalization_result_messages(&result);
-        if self
-            .has_pending_canonical_applications(group_id)
-            .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
+        // A selected context can unlock raw ciphertext, not just applications
+        // already unwrapped by the pass. Preserve its ordinary retry wake.
+        let peel_ready = result.selected_tip.is_some()
+            && self
+                .deferred_peel_cutoff_delay_ms(group_id)
+                .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
+                == Some(0);
+        if peel_ready
+            || self
+                .has_pending_canonical_applications(group_id)
+                .map_err(|error| OpenMlsProjectionError::Replay(error.to_string()))?
         {
             self.schedule_pending_convergence_group(group_id);
         }
@@ -2728,7 +2736,7 @@ pub(crate) mod tests {
             hasher.update(b"cgka-engine-seen-id-unit-test");
             hasher.update(counter.to_be_bytes());
             material.copy_from_slice(&hasher.finalize());
-            if let Ok(sk) = k256::schnorr::SigningKey::from_bytes(&material) {
+            if let Ok(sk) = k256::schnorr::SigningKey::from_slice(&material) {
                 return sk;
             }
             counter += 1;

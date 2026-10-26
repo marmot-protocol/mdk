@@ -68,6 +68,8 @@ struct BenchReport {
     /// completed group command that defines command readiness. Zero for the
     /// zero-group case.
     group_read: Duration,
+    /// Worker-routed reconciliation, outside the session-open metric.
+    pending_welcome_query: Duration,
     /// Stage sums from the runtime's `AppPerformanceSnapshot` (one account,
     /// so each stage holds exactly one startup sample).
     account_open_wait_ms: u64,
@@ -82,7 +84,7 @@ impl BenchReport {
         println!(
             "MDK_BENCH startup_scaling case={case} groups={} roster={} messages_per_group={} \
              database_bytes={} database_footprint_bytes={} chat_list_ms={} ready_ms={} \
-             group_read_ms={} account_open_wait_ms={} \
+             group_read_ms={} pending_welcome_query_ms={} account_open_wait_ms={} \
              session_open_ms={} group_hydration_ms={} profile_load_ms={} \
              read_snapshot_ms={}",
             self.groups,
@@ -93,6 +95,7 @@ impl BenchReport {
             self.chat_list.as_millis(),
             self.start_ready.as_millis(),
             self.group_read.as_millis(),
+            self.pending_welcome_query.as_millis(),
             self.account_open_wait_ms,
             self.session_open_ms,
             self.group_hydration_ms,
@@ -199,6 +202,14 @@ async fn run_case(groups: usize, roster: usize, messages_per_group: usize) -> Be
         None => Duration::ZERO,
     };
 
+    let pending_started = Instant::now();
+    let pending = runtime
+        .pending_welcome_deliveries(BENCH_ACCOUNT)
+        .await
+        .unwrap();
+    let pending_welcome_query = pending_started.elapsed();
+    assert!(pending.is_empty(), "all fixture Welcomes were acknowledged");
+
     let snapshot = runtime
         .shared_services()
         .app_performance_telemetry()
@@ -212,6 +223,7 @@ async fn run_case(groups: usize, roster: usize, messages_per_group: usize) -> Be
         chat_list,
         start_ready,
         group_read,
+        pending_welcome_query,
         account_open_wait_ms: snapshot.account_open.duration_ms.sum_ms,
         session_open_ms: snapshot.account_session_open.duration_ms.sum_ms,
         group_hydration_ms: snapshot.account_group_hydration.duration_ms.sum_ms,
@@ -290,4 +302,17 @@ fn startup_scaling_roster_64() {
 #[ignore = "startup scaling benchmark; run via `just bench-startup`"]
 fn startup_scaling_messages_32() {
     run_bench("messages_32", 10, 1, 32);
+}
+
+#[test]
+#[ignore = "retained-history startup measurement; no timing threshold"]
+fn startup_retained_history() {
+    let messages = std::env::var("MDK_STARTUP_HISTORY_MESSAGES")
+        .map(|value| {
+            value
+                .parse()
+                .expect("MDK_STARTUP_HISTORY_MESSAGES must be a count")
+        })
+        .unwrap_or(10_000);
+    run_bench("retained_history", 1, 1, messages);
 }

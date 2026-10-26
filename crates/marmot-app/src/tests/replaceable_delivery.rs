@@ -248,16 +248,18 @@ async fn rapid_profile_saves_cache_the_authored_timestamp() {
     );
     // A late copy of the second save must not replace the third.
     let account_id_hex = app.account_home().account(&label).unwrap().account_id_hex;
-    app.remember_directory_profile_if_newer(
-        &account_id_hex,
-        &UserProfileMetadata {
-            name: Some("Second".into()),
-            created_at: authored - 1,
-            ..UserProfileMetadata::default()
-        },
-    )
-    .unwrap();
+    app.directory()
+        .remember_directory_profile_if_newer_for_test(
+            &account_id_hex,
+            &UserProfileMetadata {
+                name: Some("Second".into()),
+                created_at: authored - 1,
+                ..UserProfileMetadata::default()
+            },
+        )
+        .unwrap();
     let cached = app
+        .directory()
         .directory_entry_for_account_id(&account_id_hex)
         .unwrap()
         .and_then(|entry| entry.profile)
@@ -431,6 +433,7 @@ async fn repeated_bootstrap_caches_the_authored_profile_timestamp() {
         .unwrap();
     let account_id_hex = app.account_home().account(&label).unwrap().account_id_hex;
     let cached = app
+        .directory()
         .directory_entry_for_account_id(&account_id_hex)
         .unwrap()
         .and_then(|entry| entry.profile)

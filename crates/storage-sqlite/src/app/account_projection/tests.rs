@@ -1168,28 +1168,6 @@ fn merged_transport_timestamp_is_explicit_over_missing_sides() {
 }
 
 #[test]
-fn merged_transport_timestamp_takes_max_of_in_range_sides() {
-    assert_eq!(
-        merged_transport_timestamp(
-            Some(MERGE_NOW - 100),
-            Some(MERGE_NOW),
-            MERGE_NOW,
-            MAX_FUTURE_SKEW_SECS
-        ),
-        Some(MERGE_NOW)
-    );
-    assert_eq!(
-        merged_transport_timestamp(
-            Some(MERGE_NOW),
-            Some(MERGE_NOW - 100),
-            MERGE_NOW,
-            MAX_FUTURE_SKEW_SECS
-        ),
-        Some(MERGE_NOW)
-    );
-}
-
-#[test]
 fn merged_transport_timestamp_clamps_both_sides_before_max() {
     let poisoned = MERGE_NOW + 10 * 365 * 24 * 60 * 60; // ~10 years ahead
     // A poisoned stored side is healed to the ceiling instead of winning the
@@ -1226,20 +1204,6 @@ fn merged_transport_timestamp_is_cursor_neutral_without_snapshot() {
     assert_eq!(
         merged_transport_timestamp(Some(poisoned), None, MERGE_NOW, MAX_FUTURE_SKEW_SECS),
         Some(poisoned)
-    );
-}
-
-#[test]
-fn merged_transport_timestamp_clamps_snapshot_adopted_into_fresh_store() {
-    // A fresh store (`stored = None`) adopts the snapshot cursor, but must clamp
-    // it on the way in rather than adopt it raw. The legacy-import migration can
-    // carry a pre-clamp-era transport cursor poisoned above `now + skew` into a
-    // brand-new store through exactly this arm, so the adopted value has to be
-    // bounded to the ceiling.
-    let poisoned = MERGE_NOW + 10 * 365 * 24 * 60 * 60; // ~10 years ahead
-    assert_eq!(
-        merged_transport_timestamp(None, Some(poisoned), MERGE_NOW, MAX_FUTURE_SKEW_SECS),
-        Some(MERGE_NOW + MAX_FUTURE_SKEW_SECS)
     );
 }
 

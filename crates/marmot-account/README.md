@@ -28,7 +28,8 @@ owns the local account home, account records, signing-key storage, and the coord
 
 - `create_nostr_account`, `import_nostr_account`, and `add_public_account` use the Nostr public key as the record label
   for product-facing app surfaces. The older label-taking helpers remain for deterministic lab setup.
-- Real app surfaces should use `AccountHome::open_with_keychain` or `open_with_default_keychain`. Tests and local labs
+- Real app surfaces should use `AccountHome::open_with_keychain` with their deployment's keychain service name
+  (`MarmotDeployment::keychain_service` in `marmot-app`; this crate compiles in no default). Tests and local labs
   can use `AccountHome::open`, which uses the local file secret store.
 - Relay-list discovery and repair belong above this crate in the Nostr account transport / app-runtime layer. CLI
   account selection belongs in presentation surfaces such as `wn`.

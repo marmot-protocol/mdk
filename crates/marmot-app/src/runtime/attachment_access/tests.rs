@@ -1005,6 +1005,63 @@ async fn removal_by_age_covers_legacy_bodies() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+/// Choosing a "Keep media" window removes what is already past it before the
+/// call returns, freeing the file at once, and the attachment shows as
+/// cleaned by the setting. Forever removes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keep_media_cleans_past_the_window_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    // The fixture message was received at 10, long before any window.
+    seed_file_backed(&app, &store, &[6u8; 8192]);
+    let runtime = app.runtime();
+    let group = GroupId::new(vec![0xab; 16]);
+    assert_eq!(
+        runtime.attachment_keep_media("alice").await.unwrap(),
+        crate::AttachmentKeepMedia::Forever
+    );
+    assert_eq!(
+        runtime
+            .set_attachment_keep_media("alice", crate::AttachmentKeepMedia::Forever)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(media_files_on_disk(&app), 1);
+
+    assert_eq!(
+        runtime
+            .set_attachment_keep_media("alice", crate::AttachmentKeepMedia::SixMonths)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        runtime.attachment_keep_media("alice").await.unwrap(),
+        crate::AttachmentKeepMedia::SixMonths
+    );
+    assert_eq!(
+        media_files_on_disk(&app),
+        0,
+        "freed before the call returns"
+    );
+    let status = runtime
+        .attachment_transfer_snapshot("alice", &group, vec![target()])
+        .await
+        .unwrap()
+        .remove(0)
+        .unwrap();
+    assert_eq!(
+        status.state,
+        crate::AttachmentTransferState::CleanedBySetting
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 // Moving legacy bodies into the media store (mdk#2314 step 6).
 
 /// A second connection to alice's database, for damaging rows directly.
@@ -1394,6 +1451,226 @@ async fn a_damaged_stored_twin_does_not_replace_the_database_copy() {
     assert!(migrate_legacy(&app, &store, u64::MAX / 2));
     assert_eq!(store.app_storage().legacy_attachment_bytes().unwrap(), 0);
     assert_eq!(read_whole(&runtime, legacy_slot(0x52)).await.unwrap(), body);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+// Returning freed database pages to the filesystem (mdk#2314 step 6).
+
+/// Runs the maintenance pass the worker runs after a migration batch, with
+/// plenty of free disk. Whether it woke observers.
+/// The worker's compaction step with plenty of free disk: whether it was
+/// attempted, and whether it woke observers.
+fn compact_if_due(app: &MarmotApp, store: &SqliteAccountStorage) -> (bool, bool) {
+    let woke = std::sync::atomic::AtomicBool::new(false);
+    let attempted = crate::media::storage_compaction::compact_if_due(
+        &store.app_storage(),
+        1024,
+        &|| Ok(u64::MAX / 2),
+        &app.legacy_media_migration("alice"),
+        &|| woke.store(true, std::sync::atomic::Ordering::Release),
+    );
+    (
+        attempted == crate::media::storage_compaction::CompactionAttempt::Done,
+        woke.load(std::sync::atomic::Ordering::Acquire),
+    )
+}
+
+/// Once moved legacy bodies leave enough free pages, the database is
+/// compacted once: it shrinks on disk, switches to incremental mode, and
+/// keeps every attachment readable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moved_legacy_bodies_are_compacted_out_of_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    // An account created before new databases started incremental.
+    store.app_storage().make_non_incremental_for_test().unwrap();
+    let body = vec![11u8; 6_000_000];
+    seed_at(&store.app_storage(), legacy_slot(0x61), &body);
+    assert!(migrate_legacy(&app, &store, u64::MAX / 2));
+    let before = store.app_storage().database_space().unwrap();
+    assert!(!before.incremental);
+    assert!(before.free_bytes() >= 6_000_000);
+
+    assert_eq!(
+        compact_if_due(&app, &store),
+        (true, true),
+        "start and end wake observers"
+    );
+    let after = store.app_storage().database_space().unwrap();
+    assert!(after.incremental);
+    assert!(after.file_bytes() + 6_000_000 <= before.file_bytes());
+    assert_eq!(compact_if_due(&app, &store), (false, false), "only once");
+    let runtime = app.runtime();
+    let usage = runtime.attachment_storage_usage("alice").await.unwrap();
+    assert_eq!(usage.migration, AttachmentMigrationState::Complete);
+    assert_eq!(usage.database_free_bytes, 0);
+    assert_eq!(read_whole(&runtime, legacy_slot(0x61)).await.unwrap(), body);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// While the database compacts, usage answers from the snapshot taken just
+/// before, as `Compacting`, without waiting for the connection the `VACUUM`
+/// holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_reports_compacting_from_its_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    seed_at(&store.app_storage(), legacy_slot(0x62), &[1u8; 2000]);
+    let snapshot = store
+        .app_storage()
+        .attachment_storage_usage(crate::unix_now_seconds())
+        .unwrap();
+    app.legacy_media_migration("alice")
+        .lock()
+        .unwrap()
+        .compacting = Some(snapshot.clone());
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = store.app_storage();
+    let holding =
+        std::thread::spawn(move || holder.hold_connection_for_test(&held_tx, &release_rx));
+    held_rx.recv().unwrap();
+    let runtime = app.runtime();
+    let usage = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        runtime.attachment_storage_usage("alice"),
+    )
+    .await
+    .expect("usage does not wait for the held connection")
+    .unwrap();
+    assert_eq!(usage.migration, AttachmentMigrationState::Compacting);
+    assert_eq!(usage.legacy_bytes, snapshot.legacy_bytes);
+    release_tx.send(()).unwrap();
+    holding.join().unwrap();
+    app.legacy_media_migration("alice")
+        .lock()
+        .unwrap()
+        .compacting = None;
+    assert!(matches!(
+        runtime
+            .attachment_storage_usage("alice")
+            .await
+            .unwrap()
+            .migration,
+        AttachmentMigrationState::Running { .. }
+    ));
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// After compaction, a bulk removal of legacy bodies returns their pages
+/// before the call returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bulk_removal_reclaims_pages_once_the_database_is_incremental() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    store.app_storage().compact_database().unwrap();
+    seed_at(
+        &store.app_storage(),
+        legacy_slot(0x63),
+        &vec![12u8; 3_000_000],
+    );
+    let runtime = app.runtime();
+    assert_eq!(
+        runtime
+            .remove_attachments_older_than("alice", 11, None)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(store.app_storage().database_space().unwrap().free_pages, 0);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Closing storage (a host about to suspend) does not wait out a compaction,
+/// even when a media sweep is blocked behind it holding its store's sweep
+/// lock, which the media store's close takes before the databases close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_storage_cuts_short_a_compaction_with_a_sweep_behind_it() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    seed_file_backed(&app, &store, &[4u8; 4096]);
+    let media = app.account_media_store("alice", &store).unwrap();
+
+    let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+    let compacting = store.app_storage();
+    // A real compaction, paused after its closing check and before its copy:
+    // the close below begins in exactly that window.
+    let compaction = std::thread::spawn(move || {
+        let probe = compacting.clone();
+        compacting.compact_database_pausing_for_test(&|| {
+            let _ = paused_tx.send(());
+            while !probe.is_closing_for_test() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        })
+    });
+    paused_rx.recv().unwrap();
+    let sweep = std::thread::spawn(move || media.sweep(256));
+    // Let the sweep take its lock and block on the held connection.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let closing_app = app.clone();
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = closed_tx.send(closing_app.close_storage());
+    });
+    let closed = closed_rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("close_storage finished without waiting out the compaction");
+    assert!(closed.is_ok());
+    assert!(compaction.join().unwrap().is_err(), "the copy stopped");
+    assert!(sweep.join().unwrap().is_err(), "the sweep failed as closed");
+}
+
+/// A WAL truncate owed when an earlier process ended is recorded nowhere: the
+/// first maintenance pass of a worker truncates once on an incremental
+/// database, while later passes leave a WAL with nothing owed alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_maintenance_pass_settles_a_leftover_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let store = app.account_storage("alice").unwrap();
+    assert!(store.app_storage().compact_database().unwrap());
+    // Leave frames in the WAL, as a crash after a blocked truncate would.
+    seed_at(&store.app_storage(), legacy_slot(0x71), &[5u8; 20_000]);
+    let wal = || {
+        let mut path = app.account_storage_path("alice").into_os_string();
+        path.push("-wal");
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    };
+    assert!(wal() > 0);
+    assert!(!store.app_storage().wal_truncate_pending());
+
+    assert!(crate::media::storage_compaction::reclaim(
+        &store.app_storage(),
+        false
+    ));
+    assert!(wal() > 0, "nothing owed, nothing truncated");
+    assert!(
+        crate::media::storage_compaction::reclaim(&store.app_storage(), true),
+        "settled"
+    );
+    assert_eq!(wal(), 0, "the first pass truncated");
+    let runtime = app.runtime();
     runtime.shutdown_and_close().await.unwrap();
 }
 

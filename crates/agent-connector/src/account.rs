@@ -218,6 +218,7 @@ impl AgentConnector {
         // refusing the publish here is not an option.
         let cached = self
             .app
+            .directory()
             .directory_entry_for_account_id(&account.account_id_hex)?
             .and_then(|entry| entry.profile);
         let mut profile = match (cached, published) {

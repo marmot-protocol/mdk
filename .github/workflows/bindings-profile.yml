@@ -18,8 +18,6 @@ on:
       - crates/marmot-uniffi/**
       - "!crates/marmot-uniffi/*.md"
       - "!crates/marmot-uniffi/**/*.md"
-  schedule:
-    - cron: "37 3 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -74,8 +72,8 @@ jobs:
             echo "source_sha=$source_sha"
             echo "builder_sha=$source_sha"
           } >> "$GITHUB_OUTPUT"
-      # Full candidate packages are opt-in on PRs; master, scheduled and
-      # manual runs retain complete Android and Apple artifact validation.
+      # Full candidate packages are opt-in on PRs; master and manual runs
+      # retain complete Android and Apple artifact validation.
       - name: Select candidate packaging lanes
         id: lanes
         env:
@@ -597,7 +595,7 @@ jobs:
           fi
           echo "Validated selected candidate packages for $SOURCE_SHA"
 
-      - name: Report master or scheduled failure
+      - name: Report master failure
         if: failure() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
         env:
           GH_TOKEN: ${{ github.token }}

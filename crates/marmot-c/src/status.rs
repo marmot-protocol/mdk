@@ -162,6 +162,9 @@ pub enum MarmotStatus {
     /// or the volume or database is full. A send refuses an attachment it
     /// cannot stage before uploading anything; retry once space is free.
     StorageFull = 106,
+    /// The current kind-3 contact list has at least 2,048 follows, more than
+    /// MDK reads from one list; a follow or unfollow published nothing.
+    FollowListTooLarge = 107,
 }
 
 thread_local! {
@@ -272,6 +275,7 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
         MarmotKitError::MediaDownloadFailed { .. } => MarmotStatus::MediaDownloadFailed,
         MarmotKitError::InvalidKeyPackageEvent { .. } => MarmotStatus::InvalidKeyPackageEvent,
         MarmotKitError::FollowListUnavailable => MarmotStatus::FollowListUnavailable,
+        MarmotKitError::FollowListTooLarge => MarmotStatus::FollowListTooLarge,
         MarmotKitError::RuntimeBusy => MarmotStatus::RuntimeBusy,
         MarmotKitError::AccountSessionBusy => MarmotStatus::AccountSessionBusy,
         MarmotKitError::AccountSetupRecoveryRequired => MarmotStatus::AccountSetupRecoveryRequired,
@@ -453,6 +457,7 @@ mod tests {
                 details: "d".into(),
             },
             MarmotKitError::FollowListUnavailable,
+            MarmotKitError::FollowListTooLarge,
             MarmotKitError::TransportClosed,
             MarmotKitError::RuntimeBusy,
             MarmotKitError::AccountSessionBusy,
@@ -550,7 +555,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            97,
+            98,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -579,6 +584,10 @@ mod tests {
                 details: "d".into()
             }) as i32,
             106
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::FollowListTooLarge) as i32,
+            107
         );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,

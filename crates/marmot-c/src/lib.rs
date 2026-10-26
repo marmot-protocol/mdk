@@ -54,16 +54,18 @@ pub enum MarmotRelayPolicy {
     AllowLoopbackRelaysAndBlobs = 2,
 }
 
-/// Create a client with an explicit relay policy and optional host secret store.
-/// `store == NULL` selects the platform keychain. Loopback opt-in does not
+/// Create a client with an explicit relay policy, optional host secret store
+/// and the required deployment. `store == NULL` selects the platform keychain
+/// under the deployment's keychain service. Loopback opt-in does not
 /// permit private/link-local relays or plaintext public endpoints.
 /// Ownership of the store transfers only on success, as with
 /// `marmot_client_new_with_secret_store`.
 ///
 /// # Safety
 /// Strings and arrays must be valid for the call; `store` must be NULL or a
-/// valid vtable; `out_client` must be writable. Pass a `MarmotRelayPolicy`
-/// discriminant as `relay_policy`; unknown values are rejected.
+/// valid vtable; `deployment` as for marmot_client_new; `out_client` must be
+/// writable. Pass a `MarmotRelayPolicy` discriminant as `relay_policy`;
+/// unknown values are rejected.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_client_new_with_options(
     root_path: *const c_char,
@@ -71,12 +73,17 @@ pub unsafe extern "C" fn marmot_client_new_with_options(
     relay_urls_len: usize,
     relay_policy: u32,
     store: *const MarmotSecretStore,
+    deployment: *const deployment::MarmotDeployment,
     out_client: *mut *mut MarmotClient,
 ) -> MarmotStatus {
     ffi_guard(|| {
         if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
             return status;
         }
+        let deployment = match unsafe { required_deployment(deployment) } {
+            Ok(deployment) => deployment,
+            Err(status) => return status,
+        };
         let policy = match relay_policy {
             0 => marmot_uniffi::RelayPolicyFfi::PublicOnly,
             1 => marmot_uniffi::RelayPolicyFfi::AllowLoopback,
@@ -99,7 +106,9 @@ pub unsafe extern "C" fn marmot_client_new_with_options(
                 let store = store
                     .as_ref()
                     .map(|store| Arc::clone(store) as Arc<dyn marmot_uniffi::SecretStore>);
-                move |root, relays| Marmot::new_with_options(root, relays, policy, store)
+                move |root, relays| {
+                    Marmot::new_with_options(root, relays, policy, store, deployment)
+                }
             })
         };
         if status == MarmotStatus::Ok
@@ -146,6 +155,24 @@ pub(crate) fn block_on_handle<F: Future>(handle: &tokio::runtime::Handle, fut: F
 /// lost).
 pub(crate) unsafe fn preflight_out_ptr<T>(out: *mut *mut T) -> Result<(), MarmotStatus> {
     unsafe { write_out(out, std::ptr::null_mut()) }
+}
+
+/// Copy the required deployment argument. Every constructor reads it before
+/// anything opens, so a NULL deployment never reaches the platform keychain
+/// under a name the host didn't choose.
+///
+/// # Safety
+/// `deployment` must be NULL or a live `MarmotDeployment`.
+pub(crate) unsafe fn required_deployment(
+    deployment: *const deployment::MarmotDeployment,
+) -> Result<marmot_uniffi::MarmotDeploymentFfi, MarmotStatus> {
+    match unsafe { deployment.as_ref() } {
+        Some(deployment) => Ok(deployment.inner.clone()),
+        None => {
+            set_last_error("deployment argument was NULL");
+            Err(MarmotStatus::NullPointer)
+        }
+    }
 }
 
 /// Validate a required out-pointer whose type has no meaningful zero
@@ -203,29 +230,43 @@ pub(crate) unsafe fn write_out<T>(out: *mut T, value: T) -> Result<(), MarmotSta
 }
 
 /// Create a Marmot client rooted at `root_path`, connected to
-/// `relay_urls` (`relay_urls_len` entries). On success writes the new
-/// handle to `out_client`. Uses the platform keychain-backed account
-/// store, matching the UniFFI constructor.
+/// `relay_urls` (`relay_urls_len` entries), with the required `deployment`
+/// (copied during the call). On success writes the new handle to
+/// `out_client`. Account secrets live in the platform keychain under the
+/// deployment's keychain service, matching the UniFFI constructor. Every
+/// constructor takes the deployment as its last argument before the output.
 ///
 /// # Safety
 /// `root_path` must be a valid NUL-terminated UTF-8 string; `relay_urls`
 /// must point to `relay_urls_len` valid strings (or be NULL with length
-/// 0); `out_client` must be a valid pointer.
+/// 0); `deployment` must be a live handle from marmot_deployment_white_noise
+/// or marmot_deployment_neutral (NULL is MARMOT_STATUS_NULL_POINTER, checked
+/// before anything opens); `out_client` must be a valid pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_client_new(
     root_path: *const c_char,
     relay_urls: *const *const c_char,
     relay_urls_len: usize,
+    deployment: *const deployment::MarmotDeployment,
     out_client: *mut *mut MarmotClient,
 ) -> MarmotStatus {
-    ffi_guard(|| unsafe {
-        open_client(
-            root_path,
-            relay_urls,
-            relay_urls_len,
-            out_client,
-            Marmot::new,
-        )
+    ffi_guard(|| {
+        if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
+            return status;
+        }
+        let deployment = match unsafe { required_deployment(deployment) } {
+            Ok(deployment) => deployment,
+            Err(status) => return status,
+        };
+        unsafe {
+            open_client(
+                root_path,
+                relay_urls,
+                relay_urls_len,
+                out_client,
+                move |root, relays| Marmot::new(root, relays, deployment),
+            )
+        }
     })
 }
 
@@ -250,12 +291,17 @@ pub unsafe extern "C" fn marmot_client_new_with_cursor_persistence(
     relay_urls: *const *const c_char,
     relay_urls_len: usize,
     cursor_persistence: u32,
+    deployment: *const deployment::MarmotDeployment,
     out_client: *mut *mut MarmotClient,
 ) -> MarmotStatus {
     ffi_guard(|| {
         if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
             return status;
         }
+        let deployment = match unsafe { required_deployment(deployment) } {
+            Ok(deployment) => deployment,
+            Err(status) => return status,
+        };
         let cursor_persistence = match MarmotCursorPersistence::from_c(cursor_persistence) {
             Ok(value) => value,
             Err(status) => return status,
@@ -271,6 +317,7 @@ pub unsafe extern "C" fn marmot_client_new_with_cursor_persistence(
                         root_path,
                         relay_urls,
                         cursor_persistence.into(),
+                        deployment,
                     )
                 },
             )
@@ -297,19 +344,25 @@ pub unsafe extern "C" fn marmot_client_new_with_cursor_persistence(
 /// # Safety
 /// `root_path` must be a valid NUL-terminated UTF-8 string; `relay_urls`
 /// must point to `relay_urls_len` valid strings (or be NULL with length
-/// 0); `store` and `out_client` must be valid pointers.
+/// 0); `store` and `out_client` must be valid pointers; `deployment` as for
+/// marmot_client_new.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_client_new_with_secret_store(
     root_path: *const c_char,
     relay_urls: *const *const c_char,
     relay_urls_len: usize,
     store: *const MarmotSecretStore,
+    deployment: *const deployment::MarmotDeployment,
     out_client: *mut *mut MarmotClient,
 ) -> MarmotStatus {
     ffi_guard(|| {
         if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
             return status;
         }
+        let deployment = match unsafe { required_deployment(deployment) } {
+            Ok(deployment) => deployment,
+            Err(status) => return status,
+        };
         let store = match unsafe { CSecretStore::from_c(store) } {
             Ok(store) => Arc::new(store),
             Err(status) => return status,
@@ -318,7 +371,7 @@ pub unsafe extern "C" fn marmot_client_new_with_secret_store(
             open_client(root_path, relay_urls, relay_urls_len, out_client, {
                 let store = Arc::clone(&store);
                 move |root_path, relay_urls| {
-                    Marmot::new_with_secret_store(root_path, relay_urls, store)
+                    Marmot::new_with_secret_store(root_path, relay_urls, store, deployment)
                 }
             })
         };
@@ -333,12 +386,14 @@ pub unsafe extern "C" fn marmot_client_new_with_secret_store(
 
 /// Open with an optional public client name for newly prepared KeyPackages.
 /// NULL or whitespace-only `client_name` omits the tag. Signed retries keep
-/// their original tags. NULL `store` selects the platform keychain.
+/// their original tags. NULL `store` selects the platform keychain under the
+/// deployment's keychain service.
 /// Store ownership transfers only on success, as with `marmot_client_new_with_secret_store`.
 ///
 /// # Safety
 /// Same pointer contracts as `marmot_client_new_with_secret_store`, except
 /// `store` may be NULL. `client_name` must be NULL or a valid UTF-8 C string.
+/// `deployment` as for marmot_client_new.
 /// `cursor_persistence` must be a `MarmotCursorPersistence` discriminant.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_client_new_with_client_name(
@@ -348,12 +403,17 @@ pub unsafe extern "C" fn marmot_client_new_with_client_name(
     client_name: *const c_char,
     cursor_persistence: u32,
     store: *const MarmotSecretStore,
+    deployment: *const deployment::MarmotDeployment,
     out_client: *mut *mut MarmotClient,
 ) -> MarmotStatus {
     ffi_guard(|| {
         if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
             return status;
         }
+        let deployment = match unsafe { required_deployment(deployment) } {
+            Ok(deployment) => deployment,
+            Err(status) => return status,
+        };
         let cursor = match MarmotCursorPersistence::from_c(cursor_persistence) {
             Ok(value) => value,
             Err(status) => return status,
@@ -376,7 +436,14 @@ pub unsafe extern "C" fn marmot_client_new_with_client_name(
                     .as_ref()
                     .map(|store| Arc::clone(store) as Arc<dyn marmot_uniffi::SecretStore>);
                 move |root, relays| {
-                    Marmot::new_with_client_name(root, relays, name, cursor.into(), store)
+                    Marmot::new_with_client_name(
+                        root,
+                        relays,
+                        name,
+                        cursor.into(),
+                        store,
+                        deployment,
+                    )
                 }
             })
         };
@@ -390,7 +457,9 @@ pub unsafe extern "C" fn marmot_client_new_with_client_name(
 }
 
 /// Borrowed construction options. Zero initialization selects public-only
-/// endpoints, an advancing cursor, no client label, and the platform keychain.
+/// endpoints, an advancing cursor, no client label, and the platform keychain
+/// (under the deployment's keychain service). The deployment itself is a
+/// separate, required argument.
 /// Use this struct only with the matching header/library version.
 #[repr(C)]
 pub struct MarmotClientOptions {
@@ -406,70 +475,21 @@ pub struct MarmotClientOptions {
     pub attachment_acquisition_mode: u32,
 }
 
-/// Create a client with combined relay, cursor, label and secret-storage options.
-/// NULL options uses defaults. Store ownership transfers only on success, with
-/// the same callback lifetime contract as marmot_client_new_with_secret_store.
+/// Create a client with combined relay, cursor, label and secret-storage
+/// options and the required deployment, which is copied during the call.
+/// NULL options uses defaults. With no secret store, the deployment's
+/// keychain service names the platform keychain. Store ownership transfers
+/// only on success, with the same callback lifetime contract as
+/// marmot_client_new_with_secret_store.
 ///
 /// # Safety
 /// Same root, relay and output pointer contracts as marmot_client_new.
 /// Non-NULL options must point to a readable MarmotClientOptions for this call;
 /// its label and store pointers obey marmot_client_new_with_client_name's contract.
+/// deployment must be a live handle from marmot_deployment_white_noise or
+/// marmot_deployment_neutral; NULL is MARMOT_STATUS_NULL_POINTER.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn marmot_client_new_with_configuration(
-    root_path: *const c_char,
-    relay_urls: *const *const c_char,
-    relay_urls_len: usize,
-    options: *const MarmotClientOptions,
-    out_client: *mut *mut MarmotClient,
-) -> MarmotStatus {
-    unsafe {
-        new_client_with_deployment(
-            root_path,
-            relay_urls,
-            relay_urls_len,
-            options,
-            std::ptr::null(),
-            out_client,
-        )
-    }
-}
-
-/// Create a client with `marmot_client_new_with_configuration`'s options and
-/// a deployment, copied during the call. NULL options uses defaults; a NULL
-/// deployment selects marmot_deployment_white_noise() until the neutral
-/// default lands. With no secret store, the deployment's keychain service
-/// names the platform keychain.
-///
-/// # Safety
-/// Same contract as marmot_client_new_with_configuration; deployment must be
-/// NULL or a live handle from marmot_deployment_white_noise or
-/// marmot_deployment_neutral.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn marmot_client_new_with_deployment(
-    root_path: *const c_char,
-    relay_urls: *const *const c_char,
-    relay_urls_len: usize,
-    options: *const MarmotClientOptions,
-    deployment: *const deployment::MarmotDeployment,
-    out_client: *mut *mut MarmotClient,
-) -> MarmotStatus {
-    unsafe {
-        new_client_with_deployment(
-            root_path,
-            relay_urls,
-            relay_urls_len,
-            options,
-            deployment,
-            out_client,
-        )
-    }
-}
-
-/// Shared body of the configuration constructors.
-///
-/// # Safety
-/// As marmot_client_new_with_deployment.
-unsafe fn new_client_with_deployment(
     root_path: *const c_char,
     relay_urls: *const *const c_char,
     relay_urls_len: usize,
@@ -481,6 +501,10 @@ unsafe fn new_client_with_deployment(
         if let Err(status) = unsafe { preflight_out_ptr(out_client) } {
             return status;
         }
+        let deployment = match unsafe { required_deployment(deployment) } {
+            Ok(deployment) => deployment,
+            Err(status) => return status,
+        };
         let defaults = MarmotClientOptions {
             attachment_acquisition_mode: 0,
             relay_policy: 0,
@@ -513,7 +537,6 @@ unsafe fn new_client_with_deployment(
             Ok(name) => name,
             Err(status) => return status,
         };
-        let deployment = unsafe { deployment.as_ref() }.map(|deployment| deployment.inner.clone());
         let store = if store.is_null() {
             None
         } else {

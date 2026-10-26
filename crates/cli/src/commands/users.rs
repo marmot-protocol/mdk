@@ -53,6 +53,7 @@ async fn run_users_command(
         UsersCommand::Show { pubkey } => {
             let account_id = parse_public_key(&pubkey)?;
             let entry = app
+                .directory()
                 .directory_entry_for_account_id(&account_id)?
                 .ok_or_else(|| AppError::MissingDirectoryEntry(account_id.clone()))?;
             Ok(CommandOutput {
@@ -183,7 +184,7 @@ async fn collect_user_search(
     app: &MarmotApp,
     params: UserSearchParams,
 ) -> Result<(Vec<UserDirectorySearchResult>, SearchCompleteness), WnError> {
-    let mut subscription = app.search_users(params).await?;
+    let mut subscription = app.directory().search_users(params).await?;
     let mut results = std::collections::BTreeMap::new();
     let mut completeness = SearchCompleteness::Complete;
     while let Some(update) = subscription.next_update().await {

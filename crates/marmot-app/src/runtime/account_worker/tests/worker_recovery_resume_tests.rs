@@ -8,6 +8,8 @@ use nostr_relay_builder::MockRelay;
 use std::sync::Mutex;
 use transport_nostr_adapter::NostrReconciliationProgress;
 
+const RECONCILIATION_CALLER_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Default)]
 struct ComparisonCursor(Mutex<Option<[u8; 32]>>);
 
@@ -79,18 +81,27 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
         .unwrap()
         .shutdown()
         .await;
+    let body = "comparison-owned body";
     runtime
-        .send_message(&bob.label, &group, b"comparison-owned body".to_vec())
+        .send_message(&bob.label, &group, body.as_bytes().to_vec())
         .await
         .unwrap();
 
     let mut client = app.client(&alice.label).await.unwrap();
-    // Register ordinary route state and wait for its startup replay to finish
-    // before dropping the queued delivery. Reconciliation must reacquire its
-    // bytes despite the first SDK sighting.
+    // Wait for wire acquisition, not MDK admission: native input deliberately
+    // retains this ciphertext until the owner consumes it. Reconciliation must
+    // still return bytes the SDK has seen but the account has not admitted.
     client.prepare_transport().await.unwrap();
     timeout(Duration::from_secs(10), async {
-        while !client.adapter.account_subscription_eose().await.complete() {
+        loop {
+            let observation = client.adapter.replay_admission().await;
+            let acquired = observation.active()
+                && observation.sources().next().is_some()
+                && observation.sources().all(|source| source.admitted());
+            drop(observation);
+            if acquired {
+                break;
+            }
             sleep(Duration::from_millis(25)).await;
         }
     })
@@ -130,7 +141,14 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
         endpoints: vec![TransportEndpoint(url)],
         retained_since: None,
     };
-    let (summary, mut events) = client
+    assert!(
+        app.messages(&alice.label)
+            .unwrap()
+            .iter()
+            .all(|message| message.plaintext != body),
+        "wire acquisition must not admit the missing plaintext"
+    );
+    let (summary, events) = client
         .adapter
         .reconcile_group_history(
             subscription.clone(),
@@ -138,25 +156,17 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
             inventory.since,
             crate::unix_now_seconds(),
             &ComparisonCursor::default(),
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
         )
         .await
         .unwrap()
         .expect("SDK reconciliation backend is configured");
     assert_eq!(summary.relays_succeeded, 1);
     assert_eq!(summary.relays_failed, 0);
-    assert!(
-        !events.is_empty(),
-        "the missing encrypted event is returned"
-    );
-    let event = events.remove(0);
-    let event_id: [u8; 32] = hex::decode(&event.event.id).unwrap().try_into().unwrap();
-    let route = storage_sqlite::TransportReconciliationRoute::Group(route);
-    assert!(
-        !storage
-            .app_storage()
-            .retained_recovery_event(&route, &event_id, None, crate::unix_now_seconds())
-            .unwrap()
-    );
+    let returned = events
+        .iter()
+        .map(|event| event.event.id.clone())
+        .collect::<std::collections::HashSet<_>>();
     assert!(
         timeout(Duration::from_millis(100), client.receive_next_delivery())
             .await
@@ -171,33 +181,41 @@ async fn comparison_result_waits_for_worker_submission_before_durable_admission(
             inventory.since,
             crate::unix_now_seconds(),
             &ComparisonCursor::default(),
+            tokio::time::Instant::now() + RECONCILIATION_CALLER_ALLOWANCE,
         )
         .await
         .unwrap()
         .unwrap();
+    let repeated = repeated
+        .into_iter()
+        .map(|event| event.event.id)
+        .collect::<std::collections::HashSet<_>>();
     assert!(
-        repeated
-            .iter()
-            .any(|candidate| candidate.event.id == hex::encode(event_id)),
+        returned.is_subset(&repeated),
         "a comparison result not admitted by the worker remains eligible"
     );
     assert!(
-        !storage
-            .app_storage()
-            .retained_recovery_event(&route, &event_id, None, crate::unix_now_seconds())
+        app.messages(&alice.label)
             .unwrap()
+            .iter()
+            .all(|message| message.plaintext != body),
+        "acquiring the same owned result twice must not admit its plaintext"
     );
 
-    let deliveries = client.adapter.recovered_deliveries(event).await.unwrap();
-    assert_eq!(deliveries.len(), 1, "the event routes to this account once");
-    for delivery in deliveries {
-        client.admit_recovered_delivery(delivery).await.unwrap();
+    for event in events {
+        for delivery in client.adapter.recovered_deliveries(event).await.unwrap() {
+            client
+                .admit_recovered_delivery(&delivery, crate::client::InventoryWrite::Immediate)
+                .await
+                .unwrap();
+        }
     }
     assert!(
-        storage
-            .app_storage()
-            .retained_recovery_event(&route, &event_id, None, crate::unix_now_seconds())
+        app.messages(&alice.label)
             .unwrap()
+            .iter()
+            .any(|message| { message.plaintext == body && message.sender == bob.account_id_hex }),
+        "only owner admission persists the genuine peer plaintext"
     );
     assert!(
         timeout(Duration::from_millis(100), client.receive_next_delivery())

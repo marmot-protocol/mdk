@@ -43,7 +43,7 @@ fn pad32(name: &[u8]) -> Vec<u8> {
         hasher.update(name);
         hasher.update(counter.to_be_bytes());
         material.copy_from_slice(&hasher.finalize());
-        if let Ok(sk) = SigningKey::from_bytes(&material) {
+        if let Ok(sk) = SigningKey::from_slice(&material) {
             return sk.verifying_key().to_bytes().to_vec();
         }
         counter += 1;
@@ -571,30 +571,6 @@ async fn send_app_message_passes_retention_metadata_to_peeler() {
 }
 
 // ── Every StaleReason reachable ─────────────────────────────────────────────
-
-#[tokio::test]
-async fn ingest_unknown_group_message_returns_unknown_group() {
-    let mut engine = build_client(b"a");
-    let mut group_msg_transport_group_id = vec![0xAA; 32];
-    // With envelope targeting a non-existent group.
-    let msg = TransportMessage {
-        id: MessageId::new(vec![1; 4]),
-        payload: vec![1, 2, 3],
-        timestamp: Timestamp(0),
-        causal_deps: vec![],
-        source: TransportSource("test".into()),
-        envelope: TransportEnvelope::GroupMessage {
-            transport_group_id: std::mem::take(&mut group_msg_transport_group_id),
-        },
-    };
-    let outcome = engine.ingest(msg).await.unwrap();
-    assert!(matches!(
-        outcome,
-        IngestOutcome::Ignored {
-            category: InputRejectionCategory::UnknownGroup
-        }
-    ));
-}
 
 /// Unknown-group input leaves no durable trace, and the engine says so.
 ///

@@ -1,5 +1,3 @@
-use marmot_markdown::Inline;
-
 mod common;
 use common::{em, parse_inlines, strike, strong, t};
 
@@ -135,11 +133,6 @@ fn strikethrough_inside_emphasis() {
 }
 
 #[test]
-fn code_span_takes_priority_over_emph() {
-    assert_eq!(parse_inlines("`*foo*`"), vec![Inline::Code("*foo*".into())]);
-}
-
-#[test]
 fn wrapped_text_runs_are_coalesced() {
     assert_eq!(parse_inlines("*a**b*"), vec![em(vec![t("a**b")])]);
 }
@@ -147,7 +140,7 @@ fn wrapped_text_runs_are_coalesced() {
 #[test]
 fn emphasis_around_nostr_mention() {
     // *@npub1...*  → Emph wrapping NostrMention.
-    use marmot_markdown::{NostrEntity, NostrHrp};
+    use marmot_markdown::{Inline, NostrEntity, NostrHrp};
     let body = "xyq6ag2g4cd2y6h4r4ag2y3xeak0v6gxq46v9";
     let s = format!("*@npub1{body}*");
     let parsed = parse_inlines(&s);

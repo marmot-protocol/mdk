@@ -64,6 +64,10 @@ pub enum AttachmentTransferStateFfi {
     /// Free disk cannot cover the publication reserve; checkpoints are kept and
     /// the job readmits once space frees or on explicit Retry.
     StorageBlocked,
+    /// The account's "Keep media" setting removed the body because the
+    /// message is older than its window. Download again is allowed, as for
+    /// `Removed`.
+    CleanedBySetting,
 }
 #[derive(Clone, uniffi::Record)]
 pub struct AttachmentTransferStatusFfi {
@@ -130,6 +134,9 @@ impl From<Option<app::AttachmentTransferStatus>> for AttachmentTransferStatusFfi
                     }
                     app::AttachmentTransferState::StorageBlocked => {
                         AttachmentTransferStateFfi::StorageBlocked
+                    }
+                    app::AttachmentTransferState::CleanedBySetting => {
+                        AttachmentTransferStateFfi::CleanedBySetting
                     }
                 },
                 attempt: v.attempt,

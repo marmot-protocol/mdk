@@ -517,17 +517,20 @@ async fn arming_a_backfill_records_one_epoch_stall_backfill_armed_row() {
         .await;
     }
 
-    // Each deferred delivery now also returns a pending scheduler edge. Drive
-    // the whole burst so the threshold-crossing delivery arms the backfill.
-    for _ in 0..BACKFILL_THRESHOLD {
-        timeout(NEXT_EVENT_DEADLINE, live.bob.next_event())
-            .await
-            .expect("next_event must return for each live deferred delivery")
-            .expect("next_event should not error");
-    }
-
     let mut audit_rows = AuditRowTracker::default();
-    let rows = audit_rows.new_rows(&live.app_bob, "bob");
+    let mut rows = Vec::new();
+    // Native admission can consume the whole burst in one bounded turn.
+    timeout(NEXT_EVENT_DEADLINE, async {
+        loop {
+            live.bob.sync().await.expect("live admission succeeds");
+            rows.extend(audit_rows.new_rows(&live.app_bob, "bob"));
+            if !rows_of_kind(&rows, "epoch_stall_backfill_armed").is_empty() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the burst arms recovery within the existing deadline");
     let armed = rows_of_kind(&rows, "epoch_stall_backfill_armed");
     assert_eq!(
         armed.len(),
@@ -598,13 +601,18 @@ async fn undecryptable_traffic_ingested_only_while_frozen_arms_on_the_next_advan
         )
         .await;
     }
-    for _ in 0..BACKFILL_THRESHOLD {
-        timeout(NEXT_EVENT_DEADLINE, frozen.next_event())
-            .await
-            .expect("next_event must return for each frozen deferred delivery")
-            .expect("next_event should not error");
-    }
-    let frozen_rows = audit_rows.new_rows(&app_frozen, "bob");
+    let mut frozen_rows = Vec::new();
+    timeout(NEXT_EVENT_DEADLINE, async {
+        loop {
+            frozen.sync().await.expect("frozen admission succeeds");
+            frozen_rows.extend(audit_rows.new_rows(&app_frozen, "bob"));
+            if ingested_message_ids(&frozen_rows).len() >= BACKFILL_THRESHOLD {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the Frozen wake retains the whole burst within the existing deadline");
     assert!(
         rows_of_kind(&frozen_rows, "epoch_stall_backfill_armed").is_empty(),
         "a Frozen wake tracks no stalls: {frozen_rows:?}"
@@ -708,13 +716,18 @@ async fn a_second_stall_burst_at_the_same_epoch_records_no_further_row() {
         )
         .await;
     }
-    for _ in 0..BACKFILL_THRESHOLD {
-        timeout(NEXT_EVENT_DEADLINE, live.bob.next_event())
-            .await
-            .expect("next_event must return for each first-burst delivery")
-            .expect("next_event should not error");
-    }
-    let arm_rows = audit_rows.new_rows(&live.app_bob, "bob");
+    let mut arm_rows = Vec::new();
+    timeout(NEXT_EVENT_DEADLINE, async {
+        loop {
+            live.bob.sync().await.expect("live admission succeeds");
+            arm_rows.extend(audit_rows.new_rows(&live.app_bob, "bob"));
+            if !rows_of_kind(&arm_rows, "epoch_stall_backfill_armed").is_empty() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the first burst arms recovery within the existing deadline");
     assert_eq!(
         rows_of_kind(&arm_rows, "epoch_stall_backfill_armed").len(),
         1,

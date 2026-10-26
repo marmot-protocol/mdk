@@ -350,15 +350,30 @@ async fn replay_budget_exhaustion_fails_closed_then_repairs_with_same_durable_in
     assert!(bob.tick().await.iter().all(Result::is_ok));
     assert!(observer.tick().await.iter().all(Result::is_ok));
 
-    alice.send_app(b"retained-witness".to_vec()).await;
-    bus.deliver_all();
-    assert!(bob.tick().await.iter().all(Result::is_ok));
-    assert!(observer.tick().await.iter().all(Result::is_ok));
-
+    // A pass leaves out delivered applications at or below its witness floor,
+    // the rival's fork epoch (mdk#2330), and with no application it reuses the
+    // BFS candidates instead of the fallback materialization. So Bob's rival
+    // stays in flight while the observer adopts Alice's branch and delivers an
+    // application sent on it, above the floor.
     let alice_pending = alice.self_update().await;
     let bob_pending = bob.self_update().await;
     alice.confirm(alice_pending).await;
     bob.confirm(bob_pending).await;
+    assert_eq!(bus.queued_len(), 2, "both rival commits are in flight");
+    assert!(bus.delay_queued(1, "bob-rival"));
+    bus.deliver_all();
+    assert!(observer.tick().await.iter().all(Result::is_ok));
+    assert_eq!(observer.epoch().0, 2, "the observer adopts Alice's commit");
+
+    alice.send_app(b"retained-witness".to_vec()).await;
+    bus.deliver_all();
+    assert!(observer.tick().await.iter().all(Result::is_ok));
+    assert_eq!(
+        observer.received_app_payloads(),
+        vec![b"retained-witness".to_vec()]
+    );
+
+    assert!(bus.release_delayed("bob-rival"));
     bus.deliver_all();
     let outcomes = observer.tick().await;
     assert!(

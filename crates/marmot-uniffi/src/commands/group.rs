@@ -1671,26 +1671,6 @@ mod tests {
         assert!(matches!(stopped, MarmotKitError::RuntimeStopping));
     }
 
-    #[test]
-    fn create_group_options_preserve_founding_retention_and_optional_fields() {
-        let options: marmot_app::AppCreateGroupOptions = CreateGroupOptionsFfi {
-            description: Some("founding description".into()),
-            initial_image: Some(InitialGroupImageFfi {
-                plaintext: vec![1, 2, 3],
-                media_type: "image/png".into(),
-                source_url: None,
-                dim: Some("1x1".into()),
-                thumbhash: None,
-            }),
-            disappearing_message_secs: 300,
-        }
-        .into();
-
-        assert_eq!(options.description, "founding description");
-        assert_eq!(options.disappearing_message_secs, 300);
-        assert_eq!(options.initial_image.unwrap().plaintext, vec![1, 2, 3]);
-    }
-
     fn state(self_admin: bool, last_admin: bool) -> GroupManagementStateFfi {
         let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
         let member_id = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";

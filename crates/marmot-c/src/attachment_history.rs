@@ -271,6 +271,7 @@ mod tests {
             vec![url.clone()],
             marmot_uniffi::RelayPolicyFfi::AllowLoopback,
             Some(Arc::new(Store::default())),
+            marmot_uniffi::marmot_deployment_white_noise(),
         )
         .unwrap();
         let client = MarmotClient {

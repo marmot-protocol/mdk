@@ -185,8 +185,9 @@ step 5.
 
 ## 5. Own the queue result
 
-A queue run takes about 30–35 minutes. If your host watches PRs for you, use
-that. Otherwise check every few minutes until the PR merges:
+A queue run takes about 30–35 minutes; one that fails stops at its first
+failed job, and the queue ejects the PR within minutes. If your host watches
+PRs for you, use that. Otherwise check every few minutes until the PR merges:
 
 ```sh
 gh api graphql -F owner='{owner}' -F repo='{repo}' -F n=<pr> -f query='
@@ -227,7 +228,8 @@ gh run list --workflow ci.yml --event merge_group --limit 50 \
   --jq '.[] | select(.headBranch | startswith("gh-readonly-queue/master/pr-<pr>-"))'
 ```
 
-Read the newest one with `gh run view <id> --log-failed`, and reproduce the
+Read the newest one with `gh run view <id> --log-failed`. The failed job is
+the cause; jobs shown as cancelled were stopped by it. Reproduce the
 failing test by name (`cargo nextest run -p <crate> -E 'test(=<name>)'`). Run
 `git fetch origin master` first: changes may have landed while your PR was in
 the queue, and every comparison below must use current master. Then decide

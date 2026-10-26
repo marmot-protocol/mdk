@@ -54,7 +54,7 @@ Sources: [account projection](../../../crates/storage-sqlite/src/account_project
 [timeline storage](../../../crates/storage-sqlite/src/timeline.rs),
 [chat-list storage](../../../crates/storage-sqlite/src/chat_list.rs),
 [unread migration and triggers](../../../crates/storage-sqlite/src/migrations/0059_chat_list_unread_membership.rs),
-[directory methods](../../../crates/marmot-app/src/directory/methods.rs),
+[directory methods](../../../crates/nostr-directory/src/methods.rs),
 [draft storage](../../../crates/storage-sqlite/src/message_drafts.rs),
 [app query/lifecycle wiring](../../../crates/marmot-app/src/lib.rs),
 [legacy importer source](../../../crates/marmot-app/src/projection.rs).

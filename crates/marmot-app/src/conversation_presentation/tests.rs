@@ -104,14 +104,16 @@ fn prepare(app: &MarmotApp, page: TimelinePage) -> ConversationPresentationPage 
         .unwrap()
 }
 fn profile(app: &MarmotApp, id: &str, name: &str, at: u64) {
-    let mut record = app.empty_directory_record(id);
+    let mut record = app.directory().empty_directory_record_for_test(id);
     record.profile = Some(UserProfileMetadata {
         display_name: Some(name.into()),
         picture: Some("https://example.com/avatar.png".into()),
         created_at: at,
         ..Default::default()
     });
-    app.save_directory_entry(&record).unwrap();
+    app.directory()
+        .save_directory_entry_for_test(&record)
+        .unwrap();
 }
 
 #[test]

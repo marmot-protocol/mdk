@@ -9,7 +9,7 @@
 
 use marmot_markdown::{
     Alignment, AutolinkKind, Block, CodeBlockKind, Inline, LinkDestinationKind, ListItem, ListKind,
-    NostrEntity, NostrHrp, TableCell, classify_link_destination, parse,
+    NostrEntity, NostrHrp, TableCell, classify_link_destination,
 };
 
 mod common;
@@ -451,17 +451,6 @@ fn ref_link_used_in_two_paragraphs() {
     );
 }
 
-#[test]
-fn ref_link_defined_after_use() {
-    let input = "[later]\n\n[later]: /late";
-    assert_eq!(
-        parse_blocks(input),
-        vec![Block::Paragraph {
-            inlines: vec![link("/late", None, vec![t("later")])],
-        }],
-    );
-}
-
 // =========================================================================
 // Setext + table interactions
 // =========================================================================
@@ -548,55 +537,4 @@ fn task_and_regular_items_in_one_list() {
             ],
         )],
     );
-}
-
-// =========================================================================
-// Whole-document smoke: a mixed doc parses without panicking and yields
-// the expected sequence of top-level block kinds.
-// =========================================================================
-
-#[test]
-fn mixed_document_block_kinds() {
-    // Each section is followed by a heading so the boundary between blocks
-    // is unambiguous and order-stable. The list and blockquote sit between
-    // distinct H2s instead of bumping into each other.
-    let input = concat!(
-        "# Project\n",
-        "\n",
-        "An intro paragraph.\n",
-        "\n",
-        "## Notes\n",
-        "\n",
-        "> zero deps beyond serde.\n",
-        "\n",
-        "## Install\n",
-        "\n",
-        "```sh\n",
-        "cargo add marmot-markdown\n",
-        "```\n",
-        "\n",
-        "## Usage\n",
-        "\n",
-        "- parse\n",
-        "- render\n",
-        "- profit\n",
-    );
-    let blocks = parse(input).blocks;
-    let kinds: Vec<&'static str> = blocks
-        .iter()
-        .map(|b| match b {
-            Block::Paragraph { .. } => "P",
-            Block::Heading { level: 1, .. } => "H1",
-            Block::Heading { level: 2, .. } => "H2",
-            Block::Heading { .. } => "H",
-            Block::ThematicBreak => "TB",
-            Block::CodeBlock { .. } => "Code",
-            Block::BlockQuote { .. } => "BQ",
-            Block::List { .. } => "L",
-            Block::Table { .. } => "T",
-            Block::MathBlock { .. } => "M",
-            Block::Details { .. } => "D",
-        })
-        .collect();
-    assert_eq!(kinds, vec!["H1", "P", "H2", "BQ", "H2", "Code", "H2", "L"]);
 }

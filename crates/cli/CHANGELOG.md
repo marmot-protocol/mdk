@@ -9,22 +9,138 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Added
+
+- `wn-agent doctor` checks a standalone connector setup without changing anything (mdk#2570). It prints one line per
+  check with `ok`, `warn`, `fail` or `unknown` and a next step: the home, socket directory and path, token file, how
+  many relays `wn-agent` would use and where they come from, local-signing accounts and account file modes, and, when
+  the daemon answers, its protocol, accounts, this device's KeyPackage, relay health and catch-up from
+  `diagnostic_status`. `--json` prints the same checks with stable ids. The output names no paths, account ids,
+  public keys, relay URLs or tokens, and the command exits nonzero when a check fails. A passing doctor does not show
+  that messages are delivered.
+
+### Changed
+
+- `wn-agent` (serve) without `--relay` now reads `MARMOT_RELAYS` and then falls back to the White Noise relays, the
+  same order `wn-agent bootstrap` uses (mdk#2550). Before, it ran with no relays, so an account imported with
+  `import-identity` could not start. `--no-default-relays` keeps the old behavior for offline and test runs. A
+  relay that is not a `wss://` URL now stops startup with `code=invalid_relay_url` and a `reason=`.
+
 ### Fixed
 
-- An invite built from a KeyPackage the invitee had just replaced is no longer silently ignored (mdk#2344). After a
-  Welcome consumes a KeyPackage, its private key now stays usable for 24 hours after the replacement is published
-  (or until the KeyPackage expires, if sooner), so a Welcome an inviter built from the old publication can still be
-  joined. Before, the key was deleted as soon as the replacement was published, and the invitee never joined.
+- `wn-agent` no longer replaces an imported identity's published relay lists on its first start (mdk#2550). With no
+  cached copy of the account's kind 10002 or 10050 list, it published a new list naming only its own relays. It now
+  reads the published lists from its relays and adopts them. It publishes a list only when every relay answered and
+  none holds one, and stops with `code=relay_list_inconclusive` when a relay does not answer.
+- `wn-agent` startup failures name their cause (mdk#2550). An account with no relay lists on a daemon with no relays
+  reports `code=missing_relay_lists` instead of `app_error`. Every failure line now carries a fixed `detail=`
+  message, and the socket refusals (a world-accessible or group-writable socket directory, a file in the socket's
+  place, a socket already in use), which printed only an `io_kind=`, say what to change. The line still carries no
+  paths, account ids or relay URLs.
+
+## [0.14.0] - 2026-10-23
+
+Update generated Swift/Kotlin bindings, native libraries and C headers together. Account storage advances through
+migration 116 and the directory cache through migration 2. On first open, every encrypted account database is rekeyed
+to a raw SQLCipher key, which 0.13.0 and older binaries cannot open; back up before upgrade because downgrade is
+unsupported. Upgrade `wn-agent` and its Hermes, OpenClaw and terminal-harness plugins together: an older `wn-agent`
+closes the control socket without an error on a request it cannot parse, such as `edit_message` (mdk#2242). See the
+[release notes](../../docs/release/0.14.0.md) and the
+[client upgrade guide](../../docs/integration/0.14.0.md).
+
+### Added
+
+- `wn groups commit-delivery <group-hex>` shows the oldest group change still owed to a group relay: the relays owing
+  it, `relay_count` and `since` (when the first relay accepted it, in Unix seconds). `delivered` is `true` when
+  nothing is owed (mdk#2255). `wn groups` (and the hidden `wn group`) take `--accept-stale` and `--accept-undelivered`
+  to make a group change past the `group_catching_up` and `group_commit_undelivered` refusals below.
+
+- Agent control adds `edit_message` (`account_id_hex`, `group_id_hex`, `target_message_id_hex`, `text`), so an agent
+  can update one status message in place. It answers `final_sent` with the edit event's ids; keep passing the original
+  message id to later edits. Only an available chat message the calling account sent can be edited: anything else is
+  refused with `invalid_edit_target` and nothing is published. OpenClaw's `message` tool adds `action: "edit"`, and
+  the Hermes control client adds `edit_message`. Rust `agent-control` matches must handle the new variant. (#2300)
+
+### Changed
+
+- **Breaking (JSON):** group changes (membership, admins, profile, image, retention, disbanding) on a group that may
+  have moved past this device fail with `group_catching_up` (carrying `group_id`) instead of committing from the
+  stale epoch and forking the group (mdk#2258). Retry once the group has synced, or pass `--accept-stale` to make the
+  change anyway. Scheduled self-updates wait up to a day; messages and leave are not affected. MarmotKit reports it as
+  `GroupCatchingUp`.
+
+- **Breaking (JSON):** once a group's last change has been owed to a group relay for two minutes, group changes fail
+  with `group_commit_undelivered` (carrying `group_id`) instead of building on a change that members on that relay
+  cannot see (mdk#2255). MDK keeps retrying the owed relays. Retry once they accept it, or pass
+  `--accept-undelivered` to make the change anyway; `wn groups commit-delivery` shows what is owed. Scheduled
+  self-updates wait up to an hour; messages and leave are not affected. MarmotKit reports it as
+  `GroupCommitUndelivered`.
+
+- **Breaking (JSON):** invites and key-package lookups whose relay lookup ran out of time or relay coverage fail with
+  `directory_lookup_incomplete` and the affected `account_id` instead of `relay_directory_failed` (mdk#2302). Retry;
+  nothing is known to be missing.
+
+- **Breaking (JSON):** inviting an account that has published only obsolete KeyPackages fails with
+  `missing_key_package` and `reason: "obsolete_only"` instead of `invalid_key_package_event` (mdk#1975), and
+  `repair.remote` asks the recipient to update their app. Other missing packages report `reason: "not_found"`.
+
+- **Breaking (downgrade):** every encrypted account database, including the directory cache and external-signer
+  databases, is rekeyed on first open from the HKDF hex passphrase to a raw SQLCipher key, which skips SQLCipher's
+  256,000-iteration PBKDF2 on every later open. The rekey is crash-safe. 0.13.0 and older binaries cannot open a
+  rekeyed database: to downgrade, follow the
+  [offline downgrade](../../docs/marmot-architecture/storage-format-v2.md#offline-downgrade) procedure, and keep the
+  secret-store credential and `.salt` sidecars. (#2549)
+
+- QUIC brokers are verified against the bundled Mozilla roots (`webpki-roots`) that relays and HTTP already use, on
+  every platform, instead of the OS certificate verifier (mdk#2324). This fixes an abort when watching an agent stream
+  on Android with a CA-signed broker: the OS verifier panics there because MarmotKit never sets up its JNI state. A
+  broker behind a private or enterprise CA that only the OS trust store accepted must now be pinned by passing that
+  CA's root certificate as `--server-cert-der-hex` to `wn stream` or as `server_cert_der` to MarmotKit. `wn-agent` has
+  no pin option: with such a broker in `MARMOT_QUIC_CANDIDATES` it loses live previews, though durable final replies
+  still send.
+
+- `wn` and `wn-agent` take White Noise's services, including the keychain service name, from an explicit White Noise
+  deployment, so nothing changes for them now that the library default is neutral. The build-time
+  `MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS` override is gone: a `wn` or `wn-agent` built with it now gives new groups
+  White Noise's media servers. Change an existing group's servers with `wn media set-endpoints`. (#2493)
+
 - MarmotKit (Swift and Kotlin) runs MDK on its own multi-thread Tokio runtime: 2–4 worker threads named
   `marmotkit-rt`. Before, every account worker, relay task and timer shared UniFFI's single
   `async-compat/tokio-1` fallback thread, and part of each async call ran on the Swift or Kotlin thread awaiting it,
   which could be the main thread. Generated bindings are unchanged. `SecretStore` and external-signer callbacks,
   already required to be thread-safe, can now run concurrently on more threads. See the
   [threading model](../marmot-uniffi/README.md#threading-model).
-- `wn messages edit` refuses, publishing nothing, unless the target is an available chat message this account sent, and reports `invalid_edit_target` in JSON output. Before, it published an edit of another account's message, a reaction or a deleted message that every recipient ignored.
-- Invites and key-package lookups whose relay lookup ran out of time or relay coverage now fail
-  with JSON code `directory_lookup_incomplete` and the affected `account_id` instead of
-  `relay_directory_failed` (mdk#2302). Retry; nothing is known to be missing.
+
+### Removed
+
+- **Breaking (JSON):** `wn messages sweep-expired` no longer reports the `deferred_scan_exhausted` group status
+  (mdk#2425). The sweep no longer pages history, so it has no page cap to hit.
+
+### Fixed
+
+- The disappearing-message sweep, including `wn messages sweep-expired`, no longer prunes a message the unread
+  projection still counts unread (mdk#2425). Before, a received message that shared the read marker's second, or
+  arrived later while its sender's clock ran behind the marker, could be deleted unread.
+
+- `wn follows add` / `remove` and the MarmotKit `follow_user` / `unfollow_user` keep petnames, relay hints, other tags
+  and the content of the account's kind-3 contact list, changing only the followed account's `p` tag (mdk#2268).
+  A list with 2,048 follows or more, the most MDK reads from one list, is refused with `follow_list_too_large`
+  instead of being republished cut to 2,048 follows.
+
+- An invite built from a KeyPackage the invitee had just replaced is no longer silently ignored (mdk#2344). After a
+  Welcome consumes a KeyPackage, its private key now stays usable for 24 hours after the replacement is published
+  (or until the KeyPackage expires, if sooner), so a Welcome an inviter built from the old publication can still be
+  joined. Before, the key was deleted as soon as the replacement was published, and the invitee never joined.
+
+- `wn messages edit` refuses, publishing nothing, unless the target is an available chat message this account sent,
+  and reports `invalid_edit_target` in JSON output. Before, it published an edit of another account's message, a
+  reaction or a deleted message that every recipient ignored.
+
+- Applying a group change no longer slows down with the number of messages delivered since the
+  last few changes (mdk#2330). In a group with 50,000 such messages, ingesting a commit and
+  converging it took about 2.6 s and now takes about 9 ms. Account storage migration 111 adds two
+  indexed columns to message rows; rows written earlier are filled in by background maintenance.
+
 - `wn-claude`, `wn-codex`, `wn-goose`, `wn-opencode` and `wn-pi` now bound
   each backend turn's output: 4 MiB per stdout record, 64 MiB of stdout, 1 MiB
   of assistant text and 256 reply chunks. A backend that exceeds a limit is
@@ -32,25 +148,16 @@ versioning through the workspace version in the root `Cargo.toml`.
   Before, one newline-free record or an endless stream of replies could exhaust
   connector memory or flood the chat. See the
   [terminal harness output limits](../../integrations/terminal-harness/README.md#output-limits).
-- Inviting an account that has published only obsolete KeyPackages now fails with JSON code
-  `missing_key_package` and `reason: "obsolete_only"` instead of `invalid_key_package_event`
-  (mdk#1975), and `repair.remote` tells the caller to ask the recipient to update their app.
-  Other missing packages report
-  `reason: "not_found"`.
-- Group changes on a group that may have moved past this device now fail with the JSON error code
-  `group_catching_up` (carrying `group_id`) instead of committing from the stale epoch and forking
-  the group (mdk#2258). Retry once the group has synced, or pass `--accept-stale` to `wn groups` to
-  make the change anyway. MarmotKit reports it as `GroupCatchingUp`.
-- Group changes while the group's last change has not reached every group relay now fail with the
-  JSON error code `group_commit_undelivered` (carrying `group_id`), instead of building on a change
-  that members on those relays cannot see (mdk#2255). MDK keeps retrying those relays. Retry once
-  they accept it, or pass `--accept-undelivered` to `wn groups` to make the change anyway.
-  `wn groups commit-delivery <group-hex>` lists the relays still owed the change. MarmotKit reports
-  it as `GroupCommitUndelivered`.
-- Applying a group change no longer slows down with the number of messages delivered since the
-  last few changes (mdk#2330). In a group with 50,000 such messages, ingesting a commit and
-  converging it took about 2.6 s and now takes about 9 ms. Account storage migration 111 adds two
-  indexed columns to message rows; rows written earlier are filled in by background maintenance.
+
+- OpenClaw's `delete` action, like `edit`, acts only in the host-authorized conversation: the explicit `to`, the
+  current target or the bound turn's channel. A message the agent sent to another conversation is refused. Before,
+  the send-time cache won, so a turn bound to one group could delete the agent's own message in another. (#2306)
+
+- Hermes accepts the `final_sent` answer `wn-agent` gives `delete_message`. Before, every agent delete of its own
+  message raised `unexpected_response` and Hermes reported it as failed. (#2301)
+
+- The Hermes adapter's `disconnect()` no longer hangs on Python 3.11 when a cancellation lands just as an
+  inbound-spool wakeup or control frame arrives; its bounded waits use `asyncio.timeout`. (#2383)
 
 ## [0.13.0] - 2026-10-12
 
@@ -2828,7 +2935,8 @@ Initial release of the `dm` command-line app, the `dmd` background daemon, and t
 - Local installation docs for `cargo install --path crates/cli --locked --bins`.
 - Homebrew release checklist and namespaced tap packaging path for `marmot-protocol/tap/darkmatter`.
 
-[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/marmot-protocol/mdk/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/marmot-protocol/mdk/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/marmot-protocol/mdk/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/marmot-protocol/mdk/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/marmot-protocol/mdk/compare/v0.10.4...v0.11.0

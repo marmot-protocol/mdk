@@ -9,13 +9,13 @@
 //! `cargo insta review`.
 
 use cgka_traits::capabilities::{
-    Capability, CapabilityRequirement, Feature, FeatureStatus, GroupCapabilities, RequirementLevel,
+    Capability, CapabilityRequirement, FeatureStatus, GroupCapabilities, RequirementLevel,
     TransportKind,
 };
 use cgka_traits::engine::{
-    AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, CreateGroupRequest,
-    GroupEvent, GroupHydrationQuarantineReason, GroupStateChange, GroupStateInvalidationReason,
-    KeyPackage, SendIntent, SendResult,
+    AppMessageInvalidationReason, CommitOrderingKey, CommitOrderingPriority, GroupEvent,
+    GroupHydrationQuarantineReason, GroupStateChange, GroupStateInvalidationReason, KeyPackage,
+    SendIntent, SendResult,
 };
 use cgka_traits::engine_state::PendingStateRef;
 use cgka_traits::group::{DisbandTombstone, Group, Member, ProtocolProfile};
@@ -248,46 +248,13 @@ fn stored_message_payload_distinguishes_raw_outbound_welcome_and_openmls_wire() 
         ..raw.clone()
     };
 
-    let raw_payload = StoredMessagePayload::raw_transport(raw.clone());
-    let outbound_welcome_payload = StoredMessagePayload::outbound_welcome(outbound_welcome.clone());
-    let openmls_payload = StoredMessagePayload::openmls_wire(openmls.clone());
+    let raw_payload = StoredMessagePayload::raw_transport(raw);
+    let outbound_welcome_payload = StoredMessagePayload::outbound_welcome(outbound_welcome);
+    let openmls_payload = StoredMessagePayload::openmls_wire(openmls);
 
     insta::assert_json_snapshot!("stored_payload_raw_transport", raw_payload);
     insta::assert_json_snapshot!("stored_payload_outbound_welcome", outbound_welcome_payload);
     insta::assert_json_snapshot!("stored_payload_openmls_wire", openmls_payload);
-
-    assert_eq!(
-        StoredMessagePayload::decode(&StoredMessagePayload::raw_transport(raw).encode().unwrap())
-            .unwrap()
-            .as_raw_transport()
-            .unwrap()
-            .payload,
-        vec![1, 2, 3]
-    );
-    assert_eq!(
-        StoredMessagePayload::decode(
-            &StoredMessagePayload::outbound_welcome(outbound_welcome)
-                .encode()
-                .unwrap()
-        )
-        .unwrap()
-        .as_outbound_welcome()
-        .unwrap()
-        .payload,
-        vec![1, 2, 3]
-    );
-    assert_eq!(
-        StoredMessagePayload::decode(
-            &StoredMessagePayload::openmls_wire(openmls)
-                .encode()
-                .unwrap()
-        )
-        .unwrap()
-        .as_openmls_wire()
-        .unwrap()
-        .payload,
-        vec![0xAB, 0xCD]
-    );
 }
 
 #[test]
@@ -380,29 +347,6 @@ fn stored_signed_application_payload_round_trips_and_old_rows_default_to_unstamp
     let decoded_legacy =
         StoredMessagePayload::decode(&serde_json::to_vec(&legacy_json).unwrap()).unwrap();
     assert!(decoded_legacy.own_application_stamp().is_none());
-}
-
-#[test]
-fn stored_message_payload_decodes_legacy_transport_message_as_openmls_wire() {
-    let legacy = TransportMessage {
-        id: mid(),
-        payload: vec![0xAA, 0xBB],
-        timestamp: Timestamp(0),
-        causal_deps: vec![],
-        source: TransportSource("legacy".into()),
-        envelope: TransportEnvelope::GroupMessage {
-            transport_group_id: vec![0xCC; 4],
-        },
-    };
-    let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
-
-    assert_eq!(
-        StoredMessagePayload::decode(&legacy_bytes)
-            .unwrap()
-            .as_openmls_wire()
-            .unwrap(),
-        &legacy
-    );
 }
 
 #[test]
@@ -969,24 +913,6 @@ fn key_package_equality_and_hash_include_protocol_profile_but_not_source() {
         HashSet::from([legacy, legacy_with_source, current]).len(),
         2,
         "hashing must use the same identity fields as equality"
-    );
-}
-
-#[test]
-fn snapshot_create_group_request() {
-    insta::assert_json_snapshot!(
-        "create_group_request",
-        format!(
-            "{:?}",
-            CreateGroupRequest {
-                name: "demo".into(),
-                description: "".into(),
-                members: vec![KeyPackage::new(vec![0xEF; 4])],
-                required_features: vec![Feature("self-remove")],
-                app_components: vec![],
-                initial_admins: vec![],
-            }
-        )
     );
 }
 

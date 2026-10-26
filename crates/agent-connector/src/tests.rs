@@ -365,14 +365,16 @@ async fn connector_profile_publish_rejects_hostile_optional_fields_without_publi
     }
 
     // A rejected publish must not leave a half-written profile on the relay.
-    app.refresh_profile_for_account_id(
-        &account.account_id_hex,
-        vec![crate::validation::endpoint(&relay_url)],
-    )
-    .await
-    .unwrap();
+    app.directory()
+        .refresh_profile_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&relay_url)],
+        )
+        .await
+        .unwrap();
     assert!(
-        app.directory_entry_for_account_id(&account.account_id_hex)
+        app.directory()
+            .directory_entry_for_account_id(&account.account_id_hex)
             .unwrap()
             .and_then(|entry| entry.profile)
             .is_none(),
@@ -1215,12 +1217,72 @@ async fn connector_socket_bind_preserves_existing_non_socket_path() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("dev").join("wn-agent.sock");
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    // A private parent, so the bind reaches the path itself instead of
+    // refusing a umask-default directory first.
+    std::fs::set_permissions(
+        socket.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     std::fs::write(&socket, b"not a socket").unwrap();
 
     let error = bind_connector_socket(&socket).unwrap_err();
 
     assert_eq!(error.code(), "io_error");
+    assert!(
+        error
+            .client_message()
+            .starts_with("the control socket path exists and is not a Unix socket")
+    );
     assert_eq!(std::fs::read(&socket).unwrap(), b"not a socket");
+}
+
+#[tokio::test]
+async fn connector_socket_bind_names_a_live_socket_without_removing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let _live = bind_connector_socket(&socket).unwrap();
+
+    let error = bind_connector_socket(&socket).unwrap_err();
+
+    assert_eq!(error.code(), "io_error");
+    assert!(
+        error
+            .client_message()
+            .starts_with("the control socket is already in use")
+    );
+    assert!(socket.exists());
+}
+
+#[tokio::test]
+async fn connector_socket_bind_explains_a_world_accessible_directory_without_chmodding_it() {
+    // A socket placed directly in a 0755 home: the home is not connector-owned,
+    // so its mode is kept and the bind refuses it. A short base keeps the
+    // socket path under the platform limit.
+    let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let error = bind_connector_socket(&home.join("wn-agent.sock")).unwrap_err();
+
+    assert_eq!(error.code(), "io_error");
+    let crate::ConnectorError::Io(io) = &error else {
+        panic!("expected an I/O rejection: {error:?}");
+    };
+    assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        error
+            .client_message()
+            .starts_with("the control socket directory must not be world-accessible")
+    );
+    assert!(
+        !error
+            .client_message()
+            .contains(dir.path().to_str().unwrap())
+    );
+    assert_eq!(home.metadata().unwrap().permissions().mode() & 0o777, 0o755);
+    assert!(!home.join("wn-agent.sock").exists());
 }
 
 #[tokio::test]
@@ -1374,6 +1436,11 @@ async fn connector_socket_bind_rejects_unconfigured_group_writable_parent() {
         .expect_err("unexpected group write access must be rejected");
 
     assert_eq!(error.code(), "io_error");
+    assert!(
+        error
+            .client_message()
+            .starts_with("the control socket directory is group-writable")
+    );
     assert!(!shared_parent.join("wn-agent.sock").exists());
 }
 
@@ -3339,6 +3406,7 @@ async fn connector_socket_publishes_key_package() {
     assert_eq!(account_id_hex, account.account_id_hex);
     assert!(key_package_bytes > 0);
     let fetched = app
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &account.account_id_hex,
             vec![crate::validation::endpoint(&relay_url)],
@@ -3405,13 +3473,15 @@ async fn connector_socket_publishes_profile_metadata() {
     assert_eq!(name, "Hermes Agent");
     assert_eq!(display_name.as_deref(), Some("Hermes Agent"));
 
-    app.refresh_profile_for_account_id(
-        &account.account_id_hex,
-        vec![crate::validation::endpoint(&relay_url)],
-    )
-    .await
-    .unwrap();
+    app.directory()
+        .refresh_profile_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&relay_url)],
+        )
+        .await
+        .unwrap();
     let profile = app
+        .directory()
         .directory_entry_for_account_id(&account.account_id_hex)
         .unwrap()
         .and_then(|entry| entry.profile)
@@ -3466,13 +3536,15 @@ async fn connector_profile_publish_preserves_fields_the_request_did_not_name() {
         .await
         .unwrap();
 
-    app.refresh_profile_for_account_id(
-        &account.account_id_hex,
-        vec![crate::validation::endpoint(&relay_url)],
-    )
-    .await
-    .unwrap();
+    app.directory()
+        .refresh_profile_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&relay_url)],
+        )
+        .await
+        .unwrap();
     let profile = app
+        .directory()
         .directory_entry_for_account_id(&account.account_id_hex)
         .unwrap()
         .and_then(|entry| entry.profile)
@@ -3524,11 +3596,13 @@ async fn connector_profile_publish_falls_back_to_the_cached_profile_when_the_rea
     .unwrap();
     // The published profile reaches the local cache the way it does on a real
     // device: a directory refresh remembers what the relay holds.
-    app.refresh_profile_for_account_id(&account.account_id_hex, vec![published_endpoint.clone()])
+    app.directory()
+        .refresh_profile_for_account_id(&account.account_id_hex, vec![published_endpoint.clone()])
         .await
         .unwrap();
     assert_eq!(
-        app.directory_entry_for_account_id(&account.account_id_hex)
+        app.directory()
+            .directory_entry_for_account_id(&account.account_id_hex)
             .unwrap()
             .and_then(|entry| entry.profile)
             .and_then(|profile| profile.about),
@@ -3558,13 +3632,15 @@ async fn connector_profile_publish_falls_back_to_the_cached_profile_when_the_rea
         .await
         .unwrap();
 
-    app.refresh_profile_for_account_id(
-        &account.account_id_hex,
-        vec![crate::validation::endpoint(&read_url)],
-    )
-    .await
-    .unwrap();
+    app.directory()
+        .refresh_profile_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&read_url)],
+        )
+        .await
+        .unwrap();
     let profile = app
+        .directory()
         .directory_entry_for_account_id(&account.account_id_hex)
         .unwrap()
         .and_then(|entry| entry.profile)
@@ -3637,10 +3713,12 @@ async fn connector_profile_publish_prefers_the_newer_cached_profile_over_a_laggi
     .unwrap();
     // The newer edit reaches the cache the way it does on a real device: a
     // directory refresh remembers what the current relay holds.
-    app.refresh_profile_for_account_id(&account.account_id_hex, vec![current_endpoint.clone()])
+    app.directory()
+        .refresh_profile_for_account_id(&account.account_id_hex, vec![current_endpoint.clone()])
         .await
         .unwrap();
     let cached = app
+        .directory()
         .directory_entry_for_account_id(&account.account_id_hex)
         .unwrap()
         .and_then(|entry| entry.profile)
@@ -3655,6 +3733,7 @@ async fn connector_profile_publish_prefers_the_newer_cached_profile_over_a_laggi
     // Pin the premise: the copy this publish reads is the older one, and the
     // cache is not older than it.
     let read_copy = app
+        .directory()
         .fetch_current_user_profile_for_account_id(
             &account.account_id_hex,
             vec![lagging_endpoint.clone()],
@@ -3693,6 +3772,7 @@ async fn connector_profile_publish_prefers_the_newer_cached_profile_over_a_laggi
 
     // Read what the lagging relay now holds, straight from the relay.
     let published = app
+        .directory()
         .fetch_current_user_profile_for_account_id(
             &account.account_id_hex,
             vec![lagging_endpoint.clone()],
@@ -3812,6 +3892,7 @@ async fn connector_start_publishes_key_package_for_existing_local_account() {
     connector.start().await.unwrap();
 
     let fetched = app
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &account.account_id_hex,
             vec![crate::validation::endpoint(&relay_url)],
@@ -8085,6 +8166,7 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
     let published = timeout(Duration::from_secs(15), async {
         loop {
             let status = app
+                .directory()
                 .fetch_current_account_relay_list_status_for_account_id(
                     &account.account_id_hex,
                     publication_route.clone(),
@@ -8133,6 +8215,7 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
     // The relay being adopted must actually receive the event that names it: it
     // is not in the account's pre-edit outbox, so the route has to include it.
     let added_copy = app
+        .directory()
         .fetch_current_account_relay_list_status_for_account_id(
             &account.account_id_hex,
             vec![crate::validation::endpoint(&added_url)],
@@ -8164,6 +8247,7 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
         .await
         .unwrap();
     let published = app
+        .directory()
         .fetch_current_account_relay_list_status_for_account_id(
             &account.account_id_hex,
             publication_route,
@@ -8409,6 +8493,7 @@ async fn connector_relay_list_edit_starts_from_the_newer_cached_list() {
     // Pin the premise: the read this publish makes returns the pre-edit copy,
     // and the cache is not older than it.
     let read_copy = app
+        .directory()
         .fetch_current_account_relay_list_status_for_account_id(
             &account.account_id_hex,
             vec![lagging_endpoint.clone()],
@@ -8440,6 +8525,7 @@ async fn connector_relay_list_edit_starts_from_the_newer_cached_list() {
     // What the lagging relay now holds is the newer list plus the edit, not the
     // pre-edit entries that same relay was still serving.
     let published = app
+        .directory()
         .fetch_current_account_relay_list_status_for_account_id(
             &account.account_id_hex,
             vec![lagging_endpoint.clone()],
@@ -8466,4 +8552,331 @@ async fn connector_relay_list_edit_starts_from_the_newer_cached_list() {
             .any(|relay| relay == &old_entry_url),
         "the pre-edit entries the lagging relay served must not come back"
     );
+}
+
+/// Hex secret for an identity that already exists elsewhere: a fixed scalar
+/// keeps the import path (`wn-agent import-identity`) deterministic.
+const IMPORTED_IDENTITY_SECRET_HEX: &str =
+    "1111111111111111111111111111111111111111111111111111111111111111";
+
+#[tokio::test]
+async fn connector_start_adopts_relay_lists_an_imported_identity_already_published() {
+    // The identity published its lists from another device. The import runs
+    // offline, so the agent home has no cached copy of either list.
+    let (_relay, relay_url) = mock_relay_url().await;
+    let (_read_relay, read_url) = mock_relay_url().await;
+    let (_write_relay, write_url) = mock_relay_url().await;
+    let (_inbox_relay, inbox_url) = mock_relay_url().await;
+    let relay_endpoint = crate::validation::endpoint(&relay_url);
+    let source = tempfile::tempdir().unwrap();
+    let source_account = AccountHome::open(source.path())
+        .import_account_idempotent("source", IMPORTED_IDENTITY_SECRET_HEX)
+        .unwrap();
+    let source_app = MarmotApp::with_relay(source.path(), relay_url.clone());
+    publish_nip65_and_inbox(
+        &source_app,
+        &source_account,
+        relay_endpoint.clone(),
+        crate::validation::endpoint(&read_url),
+        crate::validation::endpoint(&write_url),
+        crate::validation::endpoint(&inbox_url),
+    )
+    .await;
+    let published = source_app
+        .account_relay_list_status(&source_account.label)
+        .unwrap();
+    // A replacement published by the start below must land in a later second,
+    // or same-second ordering could hide it.
+    sleep(Duration::from_millis(1_100)).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let imported = crate::identity::import_existing_identity_secret(
+        dir.path(),
+        "agent",
+        IMPORTED_IDENTITY_SECRET_HEX,
+        None,
+    )
+    .unwrap();
+    assert_eq!(imported.account_id_hex, source_account.account_id_hex);
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+    assert!(
+        !connector
+            .app
+            .account_relay_list_status(&imported.label)
+            .unwrap()
+            .complete,
+        "the offline import must start without cached relay lists"
+    );
+
+    connector.start().await.unwrap();
+
+    // The relay still serves the lists the identity published, not a
+    // replacement naming only the connector's relay.
+    let on_relay = source_app
+        .directory()
+        .fetch_current_account_relay_list_status_for_account_id(
+            &source_account.account_id_hex,
+            vec![relay_endpoint],
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("published relay lists");
+    assert_eq!(on_relay.nip65.created_at, published.nip65.created_at);
+    assert_eq!(on_relay.inbox.created_at, published.inbox.created_at);
+    assert!(on_relay.nip65.read_relays.contains(&read_url));
+    assert!(on_relay.nip65.write_relays.contains(&write_url));
+    assert!(on_relay.inbox.relays.contains(&inbox_url));
+
+    // The agent home adopted them.
+    let adopted = connector
+        .app
+        .account_relay_list_status(&imported.label)
+        .unwrap();
+    assert!(adopted.complete);
+    assert_eq!(adopted.nip65.created_at, published.nip65.created_at);
+    assert!(adopted.inbox.relays.contains(&inbox_url));
+
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn connector_start_publishes_configured_relay_lists_once_their_absence_is_read() {
+    let (_relay, relay_url) = mock_relay_url().await;
+    let relay_endpoint = crate::validation::endpoint(&relay_url);
+    let dir = tempfile::tempdir().unwrap();
+    let imported = crate::identity::import_existing_identity_secret(
+        dir.path(),
+        "agent",
+        IMPORTED_IDENTITY_SECRET_HEX,
+        None,
+    )
+    .unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    // Every configured relay answered and none holds a list: absence is
+    // established, so the connector publishes its own relays.
+    connector.start().await.unwrap();
+
+    let reader = tempfile::tempdir().unwrap();
+    let published = MarmotApp::with_relay(reader.path(), relay_url.clone())
+        .directory()
+        .fetch_current_account_relay_list_status_for_account_id(
+            &imported.account_id_hex,
+            vec![relay_endpoint],
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("published relay lists");
+    assert_eq!(published.nip65.relays, vec![relay_url.clone()]);
+    assert_eq!(published.inbox.relays, vec![relay_url]);
+
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn connector_start_publishes_no_relay_list_when_a_configured_relay_cannot_answer() {
+    let (_relay, relay_url) = mock_relay_url().await;
+    // A loopback port nothing listens on: that relay cannot confirm absence.
+    let unreachable_url = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("ws://{}", listener.local_addr().unwrap())
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let imported = crate::identity::import_existing_identity_secret(
+        dir.path(),
+        "agent",
+        IMPORTED_IDENTITY_SECRET_HEX,
+        None,
+    )
+    .unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone(), unreachable_url],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    let error = connector.start().await.unwrap_err();
+    assert_eq!(error.code(), "relay_list_inconclusive");
+    assert!(error.retryable());
+
+    // The reachable relay received no list: an unconfirmed read never turns
+    // into a replacement.
+    let reader = tempfile::tempdir().unwrap();
+    let published = MarmotApp::with_relay(reader.path(), relay_url.clone())
+        .directory()
+        .fetch_current_account_relay_list_status_for_account_id(
+            &imported.account_id_hex,
+            vec![crate::validation::endpoint(&relay_url)],
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(published.is_none(), "{published:?}");
+    assert!(
+        !connector
+            .app
+            .account_relay_list_status(&imported.label)
+            .unwrap()
+            .complete
+    );
+
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn connector_start_without_relays_reports_missing_relay_lists() {
+    // An imported identity on a daemon run with no relays: nothing can read or
+    // publish its lists, so startup names that instead of `app_error`.
+    let dir = tempfile::tempdir().unwrap();
+    crate::identity::import_existing_identity_secret(
+        dir.path(),
+        "agent",
+        IMPORTED_IDENTITY_SECRET_HEX,
+        None,
+    )
+    .unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        Vec::new(),
+        false,
+        false,
+    ))
+    .unwrap();
+
+    let error = connector.start().await.unwrap_err();
+
+    assert_eq!(error.code(), "missing_relay_lists");
+    assert!(error.client_message().contains("--relay or MARMOT_RELAYS"));
+    connector.runtime.shutdown().await;
+}
+
+#[test]
+fn missing_relay_configuration_errors_share_one_code() {
+    for error in [
+        AppError::MissingRelayLists(vec![marmot_app::MissingRelayListKind::Inbox]),
+        AppError::MissingDefaultRelays,
+    ] {
+        let error = crate::ConnectorError::App(error);
+        assert_eq!(error.code(), "missing_relay_lists");
+        assert_eq!(error.privacy_safe_code(), "missing_relay_lists");
+        assert!(error.client_message().contains("--relay or MARMOT_RELAYS"));
+        assert!(!error.retryable());
+    }
+}
+
+#[tokio::test]
+async fn serve_socket_rejects_an_unusable_relay_url_before_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let mut config = test_config(
+        dir.path(),
+        socket.clone(),
+        vec!["ws://relay.example".to_owned()],
+        false,
+        false,
+    );
+    config.allow_loopback_relays = false;
+
+    let error = serve_socket(config).await.unwrap_err();
+
+    assert_eq!(error.code(), "invalid_relay_url");
+    assert!(!socket.exists());
+}
+
+#[tokio::test]
+async fn connector_restarts_keep_an_imported_read_only_relay_list() {
+    // A kind 10002 with only a read relay has no write route, so MDK counts it
+    // as missing. The first start caches it and stops; a restart must not then
+    // treat the cached read entry as a list and let the KeyPackage publish
+    // replace it with the daemon's relays.
+    let (_relay, relay_url) = mock_relay_url().await;
+    let (_read_relay, read_url) = mock_relay_url().await;
+    let (_inbox_relay, inbox_url) = mock_relay_url().await;
+    let relay_endpoint = crate::validation::endpoint(&relay_url);
+    let source = tempfile::tempdir().unwrap();
+    let source_account = AccountHome::open(source.path())
+        .import_account_idempotent("source", IMPORTED_IDENTITY_SECRET_HEX)
+        .unwrap();
+    let source_app = MarmotApp::with_relay(source.path(), relay_url.clone());
+    source_app
+        .publish_account_nip65_relay_set(
+            &source_account.label,
+            vec![crate::validation::endpoint(&read_url)],
+            Vec::new(),
+            vec![relay_endpoint.clone()],
+        )
+        .await
+        .unwrap();
+    source_app
+        .publish_account_relay_list_kind(
+            &source_account.label,
+            "inbox",
+            vec![crate::validation::endpoint(&inbox_url)],
+            vec![relay_endpoint.clone()],
+        )
+        .await
+        .unwrap();
+    let published = source_app
+        .account_relay_list_status(&source_account.label)
+        .unwrap();
+    assert_eq!(published.nip65.read_relays, vec![read_url.clone()]);
+    assert!(published.nip65.write_relays.is_empty());
+    sleep(Duration::from_millis(1_100)).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    crate::identity::import_existing_identity_secret(
+        dir.path(),
+        "agent",
+        IMPORTED_IDENTITY_SECRET_HEX,
+        None,
+    )
+    .unwrap();
+    for start in ["first", "restart"] {
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            dir.path().join("dev").join("wn-agent.sock"),
+            vec![relay_url.clone()],
+            false,
+            false,
+        ))
+        .unwrap();
+        let error = connector.start().await.unwrap_err();
+        assert_eq!(error.code(), "missing_relay_lists", "{start} start");
+        connector.runtime.shutdown_and_close().await.unwrap();
+    }
+
+    let on_relay = source_app
+        .directory()
+        .fetch_current_account_relay_list_status_for_account_id(
+            &source_account.account_id_hex,
+            vec![relay_endpoint],
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("published relay lists");
+    assert_eq!(on_relay.nip65.created_at, published.nip65.created_at);
+    assert_eq!(on_relay.nip65.read_relays, vec![read_url]);
+    assert!(on_relay.nip65.write_relays.is_empty());
+    assert_eq!(on_relay.inbox.created_at, published.inbox.created_at);
 }

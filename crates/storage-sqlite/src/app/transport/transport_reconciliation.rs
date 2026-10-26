@@ -121,20 +121,22 @@ fn compact_route_tx(tx: &Transaction<'_>, route_kind: i64, route_id: &[u8]) -> S
 }
 
 impl SqliteAppStorage {
-    /// Remember one transport event in the exact set advertised during NIP-77
-    /// reconciliation. The row is written only after the app confirms the
-    /// delivery was durably retained; resource-refused input must remain absent
+    /// Remember transport events in the exact set advertised during NIP-77
+    /// reconciliation in one transaction. Rows follow confirmed durable
+    /// retention; resource-refused input must remain absent
     /// so a later reconciliation fetches it again.
-    pub fn record_transport_reconciliation_item(
+    pub fn record_reconciliation_items<'a>(
         &self,
-        route: &TransportReconciliationRoute,
-        item: &TransportReconciliationItem,
+        items: impl Iterator<
+            Item = (
+                &'a TransportReconciliationRoute,
+                &'a TransportReconciliationItem,
+            ),
+        > + Clone,
     ) -> StorageResult<()> {
-        let created_at = i64::try_from(item.created_at).map_err(|_| {
-            StorageError::Serialization(
-                "transport reconciliation timestamp exceeds SQLite range".to_owned(),
-            )
-        })?;
+        if items.clone().next().is_none() {
+            return Ok(());
+        }
         let configured_floor =
             unix_now_secs()?.saturating_sub(TRANSPORT_RECONCILIATION_RETENTION_SECS);
         let configured_floor = i64::try_from(configured_floor).map_err(|_| {
@@ -142,26 +144,50 @@ impl SqliteAppStorage {
                 "transport reconciliation retention floor exceeds SQLite range".to_owned(),
             )
         })?;
-        let (route_kind, route_id) = route.storage_key();
         retry_on_busy(|| {
             let mut conn = self.connection.lock()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .storage()?;
-            let inventory_since =
-                route_state_floor_tx(&tx, route_kind, route_id, configured_floor)?;
-            if created_at >= inventory_since {
-                let inserted = tx
-                    .execute_cached(
-                        "INSERT OR IGNORE INTO transport_reconciliation_items (
-                         route_kind, route_id, event_id, created_at
-                     ) VALUES (?1, ?2, ?3, ?4)",
-                        params![route_kind, route_id, item.event_id.as_slice(), created_at],
+            let mut active_route: Option<&TransportReconciliationRoute> = None;
+            let mut inventory_since = 0;
+            let mut inserted = false;
+            for (route, item) in items.clone() {
+                let created_at = i64::try_from(item.created_at).map_err(|_| {
+                    StorageError::Serialization(
+                        "transport reconciliation timestamp exceeds SQLite range".to_owned(),
                     )
-                    .storage()?;
-                if inserted != 0 {
-                    compact_route_tx(&tx, route_kind, route_id)?;
+                })?;
+                let (route_kind, route_id) = route.storage_key();
+                if active_route != Some(route) {
+                    if let Some(previous) = active_route
+                        && inserted
+                    {
+                        let (kind, id) = previous.storage_key();
+                        compact_route_tx(&tx, kind, id)?;
+                    }
+                    inventory_since =
+                        route_state_floor_tx(&tx, route_kind, route_id, configured_floor)?;
+                    active_route = Some(route);
+                    inserted = false;
                 }
+                if created_at >= inventory_since {
+                    inserted |= tx
+                        .execute_cached(
+                            "INSERT OR IGNORE INTO transport_reconciliation_items (
+                             route_kind, route_id, event_id, created_at
+                         ) VALUES (?1, ?2, ?3, ?4)",
+                            params![route_kind, route_id, item.event_id.as_slice(), created_at],
+                        )
+                        .storage()?
+                        != 0;
+                }
+            }
+            if let Some(route) = active_route
+                && inserted
+            {
+                let (kind, id) = route.storage_key();
+                compact_route_tx(&tx, kind, id)?;
             }
             tx.commit().storage()?;
             Ok(())
@@ -583,7 +609,7 @@ mod tests {
                 event_id: message.id.as_slice().try_into().unwrap(),
                 created_at: now,
             };
-            app.record_transport_reconciliation_item(&route, &item)
+            app.record_reconciliation_items(std::iter::once((&route, &item)))
                 .unwrap();
             let before = app.recovery_revision_fence().unwrap();
             let retire = || match path {
@@ -645,7 +671,7 @@ mod tests {
             !app.retained_recovery_event(&route, &item.event_id, None, now)
                 .unwrap()
         );
-        app.record_transport_reconciliation_item(&route, &item)
+        app.record_reconciliation_items(std::iter::once((&route, &item)))
             .unwrap();
         assert!(
             app.retained_recovery_event(&route, &item.event_id, Some(now), now)
@@ -696,24 +722,21 @@ mod tests {
         };
 
         store
-            .record_transport_reconciliation_item(&group, &later)
-            .unwrap();
-        store
-            .record_transport_reconciliation_item(&group, &earlier)
-            .unwrap();
-        store
-            .record_transport_reconciliation_item(&group, &later)
-            .unwrap();
-        store
-            .record_transport_reconciliation_item(&inbox, &later)
-            .unwrap();
-        store
-            .record_transport_reconciliation_item(
-                &group,
-                &TransportReconciliationItem {
-                    event_id: later.event_id,
-                    created_at: now + 1,
-                },
+            .record_reconciliation_items(
+                [
+                    (&group, &later),
+                    (&group, &earlier),
+                    (&group, &later),
+                    (&inbox, &later),
+                    (
+                        &group,
+                        &TransportReconciliationItem {
+                            event_id: later.event_id,
+                            created_at: now + 1,
+                        },
+                    ),
+                ]
+                .into_iter(),
             )
             .unwrap();
 
@@ -737,7 +760,7 @@ mod tests {
             created_at: now - TRANSPORT_RECONCILIATION_RETENTION_SECS - 1,
         };
         store
-            .record_transport_reconciliation_item(&group, &stale)
+            .record_reconciliation_items(std::iter::once((&group, &stale)))
             .unwrap();
         assert_eq!(
             store
@@ -745,6 +768,31 @@ mod tests {
                 .unwrap()
                 .items,
             vec![earlier, later]
+        );
+    }
+
+    #[test]
+    fn batch_inventory_is_atomic() {
+        let store = SqliteAccountStorage::in_memory().unwrap().app_storage();
+        let route = TransportReconciliationRoute::Inbox;
+        let now = unix_now_secs().unwrap();
+        let retained = TransportReconciliationItem {
+            event_id: [1; 32],
+            created_at: now,
+        };
+        let invalid = TransportReconciliationItem {
+            event_id: [2; 32],
+            created_at: u64::MAX,
+        };
+        assert!(matches!(
+            store
+                .record_reconciliation_items([(&route, &retained), (&route, &invalid)].into_iter()),
+            Err(StorageError::Serialization(_))
+        ));
+        assert!(
+            !store
+                .retained_recovery_event(&route, &retained.event_id, None, now)
+                .unwrap()
         );
     }
 
@@ -848,9 +896,9 @@ mod tests {
             created_at: now,
         };
         let before = app.recovery_revision_fence().unwrap();
-        app.record_transport_reconciliation_item(&route, &item)
+        app.record_reconciliation_items(std::iter::once((&route, &item)))
             .unwrap();
-        app.record_transport_reconciliation_item(&route, &item)
+        app.record_reconciliation_items(std::iter::once((&route, &item)))
             .unwrap();
         assert_eq!(app.recovery_revision_fence().unwrap(), before);
         store

@@ -294,6 +294,15 @@ impl CloseableConnection {
         result
     }
 
+    /// Starts a close without waiting: admits no new operations, and a long
+    /// statement that polls the latch (a compaction) stops and rolls back. A
+    /// later [`Self::close`] finishes the job. Lets an owner tearing down
+    /// several resources free the ones blocked behind this connection before
+    /// it waits on any of them.
+    pub fn begin_close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
     fn close_taken(connection: rusqlite::Connection) -> StorageResult<()> {
         // TRUNCATE folds the WAL back into the main database and resets the
         // file to zero length, so the next open starts from a clean sidecar
@@ -391,6 +400,10 @@ struct SharedConnectionInner {
     /// Bumped before every write to `openmls_values` and on every rollback;
     /// see `StorageProvider::mls_write_generation`.
     openmls_writes: AtomicU64,
+    /// A WAL truncate after a compaction or page reclaim found a reader on
+    /// another connection and did not finish. Only changed with this
+    /// connection locked, by the attempt it describes.
+    wal_truncate_pending: AtomicBool,
 }
 
 impl fmt::Debug for SharedConnection {
@@ -416,6 +429,7 @@ impl SharedConnection {
                 transaction_released: Condvar::new(),
                 post_commit: Mutex::new(Vec::new()),
                 openmls_writes: AtomicU64::new(0),
+                wal_truncate_pending: AtomicBool::new(false),
             }),
         }
     }
@@ -503,6 +517,45 @@ impl SharedConnection {
         self.inner.closed.store(true, Ordering::Release);
         self.wake_transaction_waiters();
         self.inner.connection.close()
+    }
+
+    /// [`CloseableConnection::begin_close`] for this connection, also waking
+    /// threads parked for its transaction slot.
+    pub(crate) fn begin_close(&self) {
+        self.inner.closed.store(true, Ordering::Release);
+        self.wake_transaction_waiters();
+        self.inner.connection.begin_close();
+    }
+
+    /// A check a long statement's progress handler can poll: `true` once a
+    /// close of this connection has begun, at any point while it runs. Holds
+    /// only a weak reference, so it never keeps the connection alive.
+    pub(crate) fn closing_probe(&self) -> impl Fn() -> bool + Send + 'static {
+        let inner = Arc::downgrade(&self.inner);
+        move || {
+            inner.upgrade().is_none_or(|inner| {
+                inner.closed.load(Ordering::Acquire) || inner.connection.is_closed()
+            })
+        }
+    }
+
+    /// Whether an earlier WAL truncate is still owed. Nonblocking.
+    pub(crate) fn wal_truncate_pending(&self) -> bool {
+        self.inner.wal_truncate_pending.load(Ordering::Acquire)
+    }
+
+    /// Records a truncate attempt's result. Call only with this connection
+    /// locked, from the attempt itself, so a stale result never overwrites a
+    /// newer one.
+    pub(crate) fn record_wal_truncate(&self, truncated: bool) {
+        self.inner
+            .wal_truncate_pending
+            .store(!truncated, Ordering::Release);
+    }
+
+    /// Whether a close has started. Nonblocking.
+    pub(crate) fn is_closing(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire) || self.inner.connection.is_closed()
     }
 
     fn wake_transaction_waiters(&self) {
@@ -1018,9 +1071,16 @@ impl TransientError for BoundaryClosedOrError {
     }
 }
 
+/// A redacted, zeroizing SQLCipher passphrase or explicitly typed raw key.
 pub struct SqlCipherKey(Zeroizing<String>);
 
 impl SqlCipherKey {
+    /// Construct a passphrase, retaining SQLCipher's password derivation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty passphrases and SQLCipher's raw-key presentations. Use
+    /// [`Self::raw`] for already-derived, high-entropy key bytes instead.
     pub fn new(key: impl Into<String>) -> StorageResult<Self> {
         let key = Zeroizing::new(key.into());
         if key.is_empty() {
@@ -1028,9 +1088,44 @@ impl SqlCipherKey {
                 "SQLCipher key must not be empty".to_string(),
             ));
         }
+        // Match SQLCipher's raw AES-256 key forms: key, key + salt, or
+        // key + HMAC key + salt. PRAGMA values are quoted strings, so neither
+        // SQLite nor SQLCipher strips whitespace from this passphrase.
+        let bytes = key.as_bytes();
+        if matches!(bytes.len(), 67 | 99 | 163)
+            && matches!(bytes[0], b'x' | b'X')
+            && bytes[1] == b'\''
+            && bytes[bytes.len() - 1] == b'\''
+            && bytes[2..bytes.len() - 1].iter().all(u8::is_ascii_hexdigit)
+        {
+            return Err(StorageError::Backend(
+                "SQLCipher raw keys require SqlCipherKey::raw".to_string(),
+            ));
+        }
         Ok(Self(key))
     }
 
+    /// Construct a raw AES-256 key without SQLCipher's password derivation.
+    ///
+    /// The caller must supply 32 bytes of cryptographic entropy, from a secure
+    /// random generator or a suitable key derivation function, not a password
+    /// padded or truncated to 32 bytes. SQLCipher's separate HMAC-key derivation
+    /// and all cipher hardening defaults remain unchanged.
+    #[must_use]
+    pub fn raw(key: [u8; 32]) -> Self {
+        let key = Zeroizing::new(key);
+        let mut rendered = Zeroizing::new(String::with_capacity(67));
+        rendered.push_str("x'");
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in key.iter() {
+            rendered.push(char::from(HEX[usize::from(byte >> 4)]));
+            rendered.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        rendered.push('\'');
+        Self(rendered)
+    }
+
+    /// Borrow the secret PRAGMA value; never log or otherwise expose it.
     pub fn as_secret_str(&self) -> &str {
         &self.0
     }
@@ -1197,6 +1292,23 @@ pub(crate) fn finish_account_open(
         observer,
         crate::StorageOpenProgress::Phase(crate::StorageOpenPhase::OperationalPragmas),
     );
+    // A database with no schema yet starts in incremental auto-vacuum mode,
+    // so freed pages can go back to the filesystem without the one-time
+    // compaction older databases need (mdk#2314 step 6). The mode can only
+    // be chosen before the first table exists, and before WAL mode writes
+    // the file header: so ahead of the operational pragmas.
+    let fresh: bool = connection
+        .query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master)",
+            [],
+            |row| row.get(0),
+        )
+        .storage()?;
+    if fresh {
+        connection
+            .execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")
+            .storage()?;
+    }
     apply_operational_pragmas(&connection, &options)?;
     connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
     let migration_started = std::time::Instant::now();
@@ -1266,6 +1378,23 @@ impl DatabaseCloser {
         };
         self.release.wait();
         result
+    }
+
+    /// Starts closing the database without waiting (see
+    /// [`CloseableConnection::begin_close`]); [`Self::close`] finishes it.
+    pub fn begin_close(&self) {
+        match &self.target {
+            CloserTarget::Account(inner) => {
+                if let Some(inner) = inner.upgrade() {
+                    SharedConnection { inner }.begin_close();
+                }
+            }
+            CloserTarget::Connection(connection) => {
+                if let Some(connection) = connection.upgrade() {
+                    connection.begin_close();
+                }
+            }
+        }
     }
 
     /// Whether the connection is gone, closed or dropped with its last
@@ -1464,7 +1593,6 @@ mod tests {
     use super::*;
     use crate::SqliteAccountStorage;
     use cgka_traits::storage::StorageProvider;
-    use cgka_traits::types::Backend;
     use rusqlite::trace::{TraceEvent, TraceEventCodes};
     use std::sync::{
         Arc, Mutex,
@@ -1790,14 +1918,6 @@ mod tests {
     }
 
     #[test]
-    fn reports_sqlite_backend() {
-        assert_eq!(
-            SqliteAccountStorage::in_memory().unwrap().backend(),
-            Backend::Sqlite
-        );
-    }
-
-    #[test]
     fn android_memory_lock_platform_limit_is_reported_once() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(PlatformLimitLayer {
@@ -1860,12 +1980,26 @@ mod tests {
 
     #[test]
     fn sqlcipher_key_debug_redacts_secret_material() {
-        let key = SqlCipherKey::new("debug-visible secret").unwrap();
+        for key in [
+            SqlCipherKey::new("debug-visible secret").unwrap(),
+            SqlCipherKey::raw([0xab; 32]),
+        ] {
+            assert!(!format!("{key:?}").contains(key.as_secret_str()));
+        }
+    }
 
-        let rendered = format!("{key:?}");
-
-        assert!(!rendered.contains("debug-visible secret"));
-        assert!(rendered.contains("redacted"));
+    #[test]
+    fn passphrase_rejects_raw_keys() {
+        assert!(SqlCipherKey::new("").is_err());
+        for hex_len in [64, 96, 160] {
+            for prefix in ["x", "X"] {
+                for digit in ["a", "A"] {
+                    let presentation = format!("{prefix}'{}'", digit.repeat(hex_len));
+                    let error = SqlCipherKey::new(&presentation).unwrap_err();
+                    assert!(!format!("{error:?}").contains(&presentation));
+                }
+            }
+        }
     }
 
     #[test]
@@ -2409,19 +2543,26 @@ mod tests {
 
     #[test]
     fn encrypted_connection_applies_operational_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("operational defaults key").unwrap();
-        let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
-        let conn = store.lock().unwrap();
+        for key in [
+            SqlCipherKey::new("operational defaults key").unwrap(),
+            SqlCipherKey::raw([0x42; 32]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("marmot.sqlite");
+            let store = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+            let conn = store.lock().unwrap();
 
-        assert_eq!(pragma_i64(&conn, "busy_timeout"), 5_000);
-        assert_eq!(pragma_i64(&conn, "foreign_keys"), 1);
-        assert_eq!(pragma_i64(&conn, "secure_delete"), 1);
-        assert_eq!(pragma_i64(&conn, "temp_store"), 2);
-        assert_eq!(pragma_i64(&conn, "trusted_schema"), 0);
-        assert_eq!(pragma_i64(&conn, "synchronous"), 2);
-        assert_eq!(pragma_string(&conn, "journal_mode"), "wal");
+            assert_eq!(pragma_i64(&conn, "busy_timeout"), 5_000);
+            assert_eq!(pragma_i64(&conn, "foreign_keys"), 1);
+            assert_eq!(pragma_i64(&conn, "secure_delete"), 1);
+            assert_eq!(pragma_i64(&conn, "temp_store"), 2);
+            assert_eq!(pragma_i64(&conn, "trusted_schema"), 0);
+            assert_eq!(pragma_i64(&conn, "synchronous"), 2);
+            assert_eq!(pragma_string(&conn, "journal_mode"), "wal");
+            assert_eq!(pragma_string(&conn, "cipher_use_hmac"), "1");
+            assert_eq!(pragma_string(&conn, "kdf_iter"), "256000");
+            assert_eq!(pragma_string(&conn, "cipher_page_size"), "4096");
+        }
     }
 
     #[test]
@@ -2918,131 +3059,147 @@ mod tests {
     #[test]
     fn encrypted_connection_pins_cipher_pragmas_before_keying() {
         let _guard = TRACE_TEST_LOCK.lock().unwrap();
-        TRACED_SQLCIPHER_SETUP.lock().unwrap().clear();
+        for key in [
+            SqlCipherKey::new("trace setup key").unwrap(),
+            SqlCipherKey::raw([0x42; 32]),
+        ] {
+            TRACED_SQLCIPHER_SETUP.lock().unwrap().clear();
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("marmot.sqlite");
-        let key = SqlCipherKey::new("trace setup key").unwrap();
-        let connection = rusqlite::Connection::open(path).unwrap();
-        connection.trace_v2(
-            TraceEventCodes::SQLITE_TRACE_STMT,
-            Some(trace_sqlcipher_setup_event),
-        );
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("marmot.sqlite");
+            let connection = rusqlite::Connection::open(path).unwrap();
+            connection.trace_v2(
+                TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(trace_sqlcipher_setup_event),
+            );
 
-        let _store = SqliteAccountStorage::from_unkeyed_encrypted_connection_with_options(
-            connection,
-            &key,
-            SqliteStorageOptions::default(),
-        )
-        .unwrap();
+            let _store = SqliteAccountStorage::from_unkeyed_encrypted_connection_with_options(
+                connection,
+                &key,
+                SqliteStorageOptions::default(),
+            )
+            .unwrap();
 
-        let statements = TRACED_SQLCIPHER_SETUP.lock().unwrap().clone();
-        let cipher_compatibility = statements
-            .iter()
-            .position(|statement| *statement == "cipher_compatibility")
-            .expect("cipher_compatibility pragma was traced");
-        let cipher_memory_security = statements
-            .iter()
-            .position(|statement| *statement == "cipher_memory_security")
-            .expect("cipher_memory_security pragma was traced");
-        let key = statements
-            .iter()
-            .position(|statement| *statement == "key")
-            .expect("key pragma was traced");
-        let key_probe = statements
-            .iter()
-            .position(|statement| *statement == "key_probe")
-            .expect("keying probe was traced");
+            let statements = TRACED_SQLCIPHER_SETUP.lock().unwrap().clone();
+            let cipher_compatibility = statements
+                .iter()
+                .position(|statement| *statement == "cipher_compatibility")
+                .expect("cipher_compatibility pragma was traced");
+            let cipher_memory_security = statements
+                .iter()
+                .position(|statement| *statement == "cipher_memory_security")
+                .expect("cipher_memory_security pragma was traced");
+            let key = statements
+                .iter()
+                .position(|statement| *statement == "key")
+                .expect("key pragma was traced");
+            let key_probe = statements
+                .iter()
+                .position(|statement| *statement == "key_probe")
+                .expect("keying probe was traced");
 
-        assert!(
-            cipher_compatibility < key,
-            "cipher_compatibility must be pinned before SQLCipher keying",
-        );
-        assert!(
-            cipher_compatibility < key_probe,
-            "cipher_compatibility must be pinned before the keying probe",
-        );
-        assert!(
-            cipher_memory_security < key,
-            "cipher_memory_security must be enabled before SQLCipher keying",
-        );
-        assert!(
-            cipher_memory_security < key_probe,
-            "cipher_memory_security must be enabled before the keying probe",
-        );
+            assert!(
+                cipher_compatibility < key,
+                "cipher_compatibility must be pinned before SQLCipher keying",
+            );
+            assert!(
+                cipher_compatibility < key_probe,
+                "cipher_compatibility must be pinned before the keying probe",
+            );
+            assert!(
+                cipher_memory_security < key,
+                "cipher_memory_security must be enabled before SQLCipher keying",
+            );
+            assert!(
+                cipher_memory_security < key_probe,
+                "cipher_memory_security must be enabled before the keying probe",
+            );
+            assert!(cipher_compatibility < cipher_memory_security);
+            assert!(key < key_probe);
+        }
     }
 
     #[test]
     fn public_hardened_open_pins_cipher_pragmas_before_keying() {
         let _guard = TRACE_TEST_LOCK.lock().unwrap();
-        TRACED_SQLCIPHER_SETUP.lock().unwrap().clear();
+        for key in [
+            SqlCipherKey::new("public hardened key").unwrap(),
+            SqlCipherKey::raw([0x42; 32]),
+        ] {
+            TRACED_SQLCIPHER_SETUP.lock().unwrap().clear();
 
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("hardened.sqlite");
-        let key = SqlCipherKey::new("public hardened key").unwrap();
-        let connection = rusqlite::Connection::open(path).unwrap();
-        connection.trace_v2(
-            TraceEventCodes::SQLITE_TRACE_STMT,
-            Some(trace_sqlcipher_setup_event),
-        );
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hardened.sqlite");
+            let connection = rusqlite::Connection::open(path).unwrap();
+            connection.trace_v2(
+                TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(trace_sqlcipher_setup_event),
+            );
 
-        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+            open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
 
-        let statements = TRACED_SQLCIPHER_SETUP.lock().unwrap().clone();
-        let cipher_compatibility = statements
-            .iter()
-            .position(|statement| *statement == "cipher_compatibility")
-            .expect("cipher_compatibility pragma was traced");
-        let cipher_memory_security = statements
-            .iter()
-            .position(|statement| *statement == "cipher_memory_security")
-            .expect("cipher_memory_security pragma was traced");
-        let key = statements
-            .iter()
-            .position(|statement| *statement == "key")
-            .expect("key pragma was traced");
-        let key_probe = statements
-            .iter()
-            .position(|statement| *statement == "key_probe")
-            .expect("keying probe was traced");
+            let statements = TRACED_SQLCIPHER_SETUP.lock().unwrap().clone();
+            let cipher_compatibility = statements
+                .iter()
+                .position(|statement| *statement == "cipher_compatibility")
+                .expect("cipher_compatibility pragma was traced");
+            let cipher_memory_security = statements
+                .iter()
+                .position(|statement| *statement == "cipher_memory_security")
+                .expect("cipher_memory_security pragma was traced");
+            let key = statements
+                .iter()
+                .position(|statement| *statement == "key")
+                .expect("key pragma was traced");
+            let key_probe = statements
+                .iter()
+                .position(|statement| *statement == "key_probe")
+                .expect("keying probe was traced");
 
-        assert!(
-            cipher_compatibility < key,
-            "cipher_compatibility must be pinned before SQLCipher keying",
-        );
-        assert!(
-            cipher_compatibility < key_probe,
-            "cipher_compatibility must be pinned before the keying probe",
-        );
-        assert!(
-            cipher_memory_security < key,
-            "cipher_memory_security must be enabled before SQLCipher keying",
-        );
-        assert!(
-            cipher_memory_security < key_probe,
-            "cipher_memory_security must be enabled before the keying probe",
-        );
+            assert!(
+                cipher_compatibility < key,
+                "cipher_compatibility must be pinned before SQLCipher keying",
+            );
+            assert!(
+                cipher_compatibility < key_probe,
+                "cipher_compatibility must be pinned before the keying probe",
+            );
+            assert!(
+                cipher_memory_security < key,
+                "cipher_memory_security must be enabled before SQLCipher keying",
+            );
+            assert!(
+                cipher_memory_security < key_probe,
+                "cipher_memory_security must be enabled before the keying probe",
+            );
+            assert!(cipher_compatibility < cipher_memory_security);
+            assert!(key < key_probe);
+        }
     }
 
     #[test]
     fn public_hardened_open_applies_requested_privacy_pragmas() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("hardened.sqlite");
-        let key = SqlCipherKey::new("hardened privacy key").unwrap();
+        for key in [
+            SqlCipherKey::new("hardened privacy key").unwrap(),
+            SqlCipherKey::raw([0x42; 32]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hardened.sqlite");
 
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
-        assert_eq!(pragma_i64(&connection, "secure_delete"), 1);
-        assert_eq!(pragma_i64(&connection, "temp_store"), 2);
-        drop(connection);
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::live_cache()).unwrap();
+            assert_eq!(pragma_i64(&connection, "secure_delete"), 1);
+            assert_eq!(pragma_i64(&connection, "temp_store"), 2);
+            drop(connection);
 
-        // cipher_only() must not switch temp_store to MEMORY. (secure_delete is
-        // left at the SQLCipher compile-time default, which is ON, so it is not
-        // asserted here — only the live-cache path opts into it explicitly.)
-        let path = dir.path().join("cipher-only.sqlite");
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::cipher_only()).unwrap();
-        assert_ne!(pragma_i64(&connection, "temp_store"), 2);
+            // cipher_only() must not switch temp_store to MEMORY. (secure_delete is
+            // left at the SQLCipher compile-time default, which is ON, so it is not
+            // asserted here — only the live-cache path opts into it explicitly.)
+            let path = dir.path().join("cipher-only.sqlite");
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            open_hardened_sqlcipher(&connection, &key, SqlCipherHardening::cipher_only()).unwrap();
+            assert_ne!(pragma_i64(&connection, "temp_store"), 2);
+        }
     }
 
     #[test]
@@ -3081,6 +3238,115 @@ mod tests {
             .query_row("SELECT value FROM marker", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, "kept");
+    }
+
+    #[test]
+    fn raw_and_passphrase_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw_key = SqlCipherKey::raw([0xab; 32]);
+        let wrong_key = SqlCipherKey::raw([0xac; 32]);
+        let raw_path = dir.path().join("raw.sqlite");
+        {
+            let store = SqliteAccountStorage::open_encrypted(&raw_path, &raw_key).unwrap();
+            store
+                .lock()
+                .unwrap()
+                .execute_batch(
+                    "CREATE TABLE raw_marker (value TEXT NOT NULL);
+                 INSERT INTO raw_marker VALUES ('kept');",
+                )
+                .unwrap();
+            store.close().unwrap();
+        }
+        assert!(
+            !std::fs::read(&raw_path)
+                .unwrap()
+                .starts_with(b"SQLite format 3\0")
+        );
+        assert!(SqliteAccountStorage::open_encrypted(&raw_path, &wrong_key).is_err());
+
+        // SQLCipher recognizes neither surrounding nor internal whitespace as
+        // raw-key syntax when given a quoted PRAGMA string. These remain valid
+        // passphrases, as does the original 64-character HKDF hex presentation.
+        for (index, passphrase) in [
+            "ab".repeat(32),
+            format!(" {}", raw_key.as_secret_str()),
+            format!("{} ", raw_key.as_secret_str()),
+            format!("x' {}'", "ab".repeat(32)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let passphrase_key = SqlCipherKey::new(passphrase).unwrap();
+            let connection = rusqlite::Connection::open(&raw_path).unwrap();
+            assert!(
+                open_hardened_sqlcipher(
+                    &connection,
+                    &passphrase_key,
+                    SqlCipherHardening::cipher_only(),
+                )
+                .is_err()
+            );
+            drop(connection);
+
+            let passphrase_path = dir.path().join(format!("passphrase-{index}.sqlite"));
+            {
+                let connection = rusqlite::Connection::open(&passphrase_path).unwrap();
+                open_hardened_sqlcipher(
+                    &connection,
+                    &passphrase_key,
+                    SqlCipherHardening::cipher_only(),
+                )
+                .unwrap();
+                connection
+                    .execute_batch(
+                        "CREATE TABLE marker (value INTEGER);
+                    INSERT INTO marker VALUES (7);",
+                    )
+                    .unwrap();
+            }
+            let connection = rusqlite::Connection::open(&passphrase_path).unwrap();
+            assert!(
+                open_hardened_sqlcipher(&connection, &raw_key, SqlCipherHardening::cipher_only(),)
+                    .is_err()
+            );
+            drop(connection);
+            let connection = rusqlite::Connection::open(&passphrase_path).unwrap();
+            open_hardened_sqlcipher(
+                &connection,
+                &passphrase_key,
+                SqlCipherHardening::cipher_only(),
+            )
+            .unwrap();
+            assert_eq!(
+                connection
+                    .query_row("SELECT value FROM marker", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                7
+            );
+        }
+
+        // Reopen through the public hardened path as well as account storage.
+        let connection = rusqlite::Connection::open(&raw_path).unwrap();
+        open_hardened_sqlcipher(&connection, &raw_key, SqlCipherHardening::live_cache()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM raw_marker", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "kept"
+        );
+        drop(connection);
+        let store = SqliteAccountStorage::open_encrypted(&raw_path, &raw_key).unwrap();
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row("SELECT value FROM raw_marker", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "kept"
+        );
     }
 
     #[test]

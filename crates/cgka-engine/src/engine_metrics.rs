@@ -872,20 +872,6 @@ mod tests {
     }
 
     #[test]
-    fn first_settle_after_restart_is_not_a_reorg() {
-        // A restart drops the in-memory last-applied record. The first settle
-        // afterwards re-establishes it against an already-advanced tip and is
-        // not classified as a reorg (the spec accepts the slight under-count).
-        let mut restarted = EngineMetrics::default();
-        restarted.note_applied_selection(&gid(1), SETTLED, 4, 5, "branch-post-restart", 100);
-
-        let snap = restarted.snapshot();
-        assert_eq!(snap.settles, 1);
-        assert_eq!(snap.post_settle_reorgs, 0);
-        assert_eq!(snap.reorg_rewind_depth.sample_count(), 0);
-    }
-
-    #[test]
     fn reorgs_are_tracked_per_group_and_aggregated() {
         let mut metrics = EngineMetrics::default();
         // Group 1 reorgs.

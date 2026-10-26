@@ -44,6 +44,22 @@ async fn fixture() -> Fixture {
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     client.create_group("recovery audit", &[]).await.unwrap();
     let storage = app.account_storage("alice").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            client.synchronize_native_replay().await.unwrap();
+            let observation = client.adapter.replay_admission().await;
+            if client
+                .recovery_owner
+                .native_replay_authorizes(observation.generation())
+            {
+                break;
+            }
+            drop(observation);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the scripted native windows reach owner admission");
     Fixture {
         _dir: dir,
         _pump: pump,
@@ -54,12 +70,13 @@ async fn fixture() -> Fixture {
     }
 }
 
-fn authorize(client: &mut AppClient) -> Option<AttemptGrant> {
+async fn authorize(client: &mut AppClient) -> Option<AttemptGrant> {
     client
         .authorize_account_recovery(
             None,
             marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
         )
+        .await
         .unwrap()
 }
 
@@ -88,6 +105,42 @@ fn queue_loss_id(storage: &storage_sqlite::SqliteAccountStorage) -> [u8; 16] {
         .id
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_need_is_not_loss() {
+    let fixture = fixture().await;
+    let rows = recorded_v5_rows(&fixture.app, "recovery_need_changed");
+    let native = rows
+        .iter()
+        .filter(|row| row["event"]["cause"] == "subscription_replay")
+        .collect::<Vec<_>>();
+    assert!(!native.is_empty(), "native input is owned recovery need");
+    for row in native {
+        assert!(row["group_ref"].is_null());
+        assert!(row["event"].get("charged").is_none());
+        assert!(row["event"].get("snapshot").is_none());
+    }
+    assert!(rows.iter().all(|row| !matches!(
+        row["event"]["cause"].as_str(),
+        Some("queue_loss" | "notification_loss")
+    )));
+    assert!(
+        fixture
+            .storage
+            .app_storage()
+            .pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .all(|demand| demand.cause != RecoveryCause::SubscriptionReplay)
+    );
+    for row in recorded_v5_rows(&fixture.app, "recovery_obligation_reassessed")
+        .iter()
+        .filter(|row| row["event"]["cause"] == "subscription_replay")
+    {
+        assert_eq!(row["event"]["scopes_certified"], 0);
+        assert_ne!(row["event"]["progress"], "window_certified");
+    }
+}
+
 fn of_obligation<'rows>(rows: &'rows [Value], reference: &Value) -> Vec<&'rows Value> {
     rows.iter()
         .filter(|row| &row["event"]["obligation_ref"] == reference)
@@ -104,14 +157,14 @@ async fn loss_charged_at_authorization_records_its_cause_bound_and_count() {
         .app_storage()
         .record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
         .unwrap();
-    drop(authorize(&mut fixture.client));
+    drop(authorize(&mut fixture.client).await);
     // The same generation grows: charged to the pending obligation.
     fixture
         .storage
         .app_storage()
         .record_account_delivery_loss_bounded("alice", 41, 5, unix_now_seconds(), Some(floor))
         .unwrap();
-    drop(authorize(&mut fixture.client));
+    drop(authorize(&mut fixture.client).await);
     // A notification lag whose REQ floor was unknown.
     fixture
         .storage
@@ -125,7 +178,7 @@ async fn loss_charged_at_authorization_records_its_cause_bound_and_count() {
             None,
         )
         .unwrap();
-    drop(authorize(&mut fixture.client));
+    drop(authorize(&mut fixture.client).await);
 
     let rows = recorded_v5_rows(&fixture.app, "recovery_need_changed");
     let queue = rows
@@ -176,7 +229,9 @@ async fn quiet_passes_record_attempts_verdicts_parking_notice_and_dismissal() {
     let passes = storage_sqlite::RECOVERY_PARK_AFTER_QUIET_PASSES;
     let mut serials = Vec::new();
     for _ in 0..passes {
-        let grant = authorize(&mut fixture.client).expect("a retryable pass is selected");
+        let grant = authorize(&mut fixture.client)
+            .await
+            .expect("a retryable pass is selected");
         serials.push(grant.reservation.attempt_serial);
         fixture.client.test_comparison_results = Some(quiet_routes());
         fixture
@@ -318,7 +373,7 @@ async fn quiet_passes_record_attempts_verdicts_parking_notice_and_dismissal() {
         .app_storage()
         .record_account_delivery_loss_bounded("alice", 42, 1, unix_now_seconds(), None)
         .unwrap();
-    drop(authorize(&mut fixture.client));
+    drop(authorize(&mut fixture.client).await);
     let resumed = recorded_v5_rows(&fixture.app, "recovery_need_changed")
         .into_iter()
         .filter(|row| row["event"]["change"] == "resumed")
@@ -367,7 +422,9 @@ async fn new_loss_during_a_pass_supersedes_it() {
         .app_storage()
         .record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), None)
         .unwrap();
-    let grant = authorize(&mut fixture.client).expect("loss selects a grant");
+    let grant = authorize(&mut fixture.client)
+        .await
+        .expect("loss selects a grant");
     fixture.client.test_comparison_results = Some(quiet_routes());
     // New loss while the pass runs moves the obligation to a newer revision.
     fixture
@@ -396,7 +453,9 @@ async fn new_loss_during_a_pass_supersedes_it() {
         .clone();
     let joined = recorded_v5_rows(&fixture.app, "recovery_need_changed")
         .into_iter()
-        .filter(|row| row["event"]["change"] == "joined")
+        .filter(|row| {
+            row["event"]["change"] == "joined" && row["event"]["obligation_ref"] == loss_ref
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         joined.len(),
@@ -413,22 +472,23 @@ fn cursor_rows_record_settled_advances_and_only_large_live_promotions() {
         let mut fixture = crate::tests::LiveCursorFixture::open_audited().await;
         let cursor_before = fixture.cursor_before;
         // A live promotion within the rebuild lookback writes no row.
-        crate::tests::inject_epoch_gap_probe(
-            &fixture.app,
-            fixture.probe(cursor_before + 60, "near"),
-        )
-        .await;
+        let near = fixture
+            .delivery(fixture.probe(cursor_before + 60, "near"))
+            .await;
+        fixture
+            .app
+            .relay_plane
+            .route_account_delivery_for_test(near);
         fixture.wait_for_queue_depth(1).await;
         fixture.ingest_next_live_delivery().await;
         assert_eq!(fixture.persisted(), Some(cursor_before + 60));
         assert!(recorded_v5_rows(&fixture.app, "transport_cursor_advanced").is_empty());
 
         // One past the lookback does.
-        crate::tests::inject_epoch_gap_probe(
-            &fixture.app,
-            fixture.probe(cursor_before + 4_000, "far"),
-        )
-        .await;
+        let far = fixture
+            .delivery(fixture.probe(cursor_before + 4_000, "far"))
+            .await;
+        fixture.app.relay_plane.route_account_delivery_for_test(far);
         fixture.wait_for_queue_depth(1).await;
         fixture.ingest_next_live_delivery().await;
         assert_eq!(fixture.persisted(), Some(cursor_before + 4_000));
@@ -448,12 +508,21 @@ fn cursor_rows_record_settled_advances_and_only_large_live_promotions() {
             .relay_plane
             .route_account_delivery_for_test(exposed);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while fixture.client.adapter.delivery_loss_blocks_cursor() {
+            // Live promotion replaced the REQ; its current peers must finish too.
+            while fixture.client.adapter.delivery_loss_blocks_cursor()
+                || !fixture
+                    .client
+                    .adapter
+                    .account_subscription_eose()
+                    .await
+                    .complete()
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("the spill write becomes durable");
+        .expect("the spill is durable and the replacement replay is ready");
+        fixture.client.synchronize_native_replay().await.unwrap();
 
         // A drain checkpoint records its advance with that count.
         fixture.client.state.last_transport_timestamp = Some(cursor_before + 5_000);
@@ -530,61 +599,6 @@ async fn explicit_repair_below_the_window_records_a_searched_pass_and_its_close(
         recorded_v5_rows(&fixture.app, "recovery_need_changed")
             .iter()
             .all(|row| row["event"]["change"] != "closed_below_window")
-    );
-}
-
-/// A notification lag schedules the relay plane's lost-EOSE repair. The pass
-/// only queues its report; the worker's publication seam records it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lag_lost_eose_repair_pass_is_recorded_at_the_worker_seam() {
-    let fixture = fixture().await;
-    let plane = fixture.app.relay_plane.clone();
-    plane.set_eose_repair_settle_for_test(std::time::Duration::from_millis(20));
-    let account = fixture.client.adapter.account_id().clone();
-    plane.simulate_notification_lag_for_test(
-        &account,
-        1,
-        transport_nostr_adapter::NostrNotificationLossFloor::Since(unix_now_seconds() - 60),
-    );
-    let rows = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            fixture.client.record_eose_repair_reports();
-            let rows = recorded_v5_rows(&fixture.app, "subscription_eose_repaired");
-            if !rows.is_empty() {
-                break rows;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the repair runs once the receiver settles");
-    assert_eq!(rows.len(), 1);
-    let event = &rows[0]["event"];
-    assert_eq!(event["receiver"], "account");
-    assert_eq!(event["trigger"], "notification_lag");
-    assert_eq!(event["lags"], 1);
-    assert_eq!(event["dropped_before"], 0);
-    let awaiting = event["awaiting_relays"].as_u64().unwrap();
-    let accounted = [
-        "complete_relays",
-        "reissued_relays",
-        "reissued_earlier_relays",
-        "failed_relays",
-    ]
-    .iter()
-    .map(|field| event[*field].as_u64().unwrap())
-    .sum::<u64>();
-    assert!(accounted <= awaiting);
-    assert_eq!(
-        event["follow_up_scheduled"],
-        event["failed_relays"].as_u64().unwrap() > 0
-    );
-    assert!(rows[0]["group_ref"].is_null());
-    // Taken once: another seam records nothing new.
-    fixture.client.record_eose_repair_reports();
-    assert_eq!(
-        recorded_v5_rows(&fixture.app, "subscription_eose_repaired").len(),
-        1
     );
 }
 

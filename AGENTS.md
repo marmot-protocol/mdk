@@ -26,6 +26,7 @@ before adding behavior or bindings.
 | Storage traits and shared types | `crates/traits/AGENTS.md` |
 | Private file/dir/socket creation helpers | `crates/fs-private/AGENTS.md` |
 | Encrypted per-file media store (format, file lifecycle) | `crates/media-store/AGENTS.md` |
+| User directory (lookups, search, KeyPackage resolution, directory cache schema) | `crates/nostr-directory/AGENTS.md` |
 | SQLite storage | `crates/storage-sqlite/AGENTS.md` (`src/base/migrations/`, `src/protocol/openmls_storage/`, `src/protocol/storage/`, `src/protocol/storage/snapshots/` have their own) |
 | Nostr transport adapter | `crates/transport-nostr-adapter/AGENTS.md` |
 | Nostr relay plane (relay sessions, delivery, publish accounting, directory fetches) | `crates/transport-nostr/AGENTS.md` |
@@ -103,7 +104,8 @@ the pre-check passes, and own the queue result until the change merges.
   `docs/marmot-architecture/overview/multi-step-state-changes.md`.
 - Treat workspace and conformance-fixture version bumps as manual release operations. Never change the root workspace
   version, workspace package versions in `Cargo.lock`, or vector `conformance_version` values during feature, fix,
-  binding, or review-feedback work unless the user explicitly requests that version bump.
+  binding, or review-feedback work unless the user explicitly requests that version bump. The post-release move of
+  master to the next `X.Y.0-dev` is one of those release operations; see `release.md#development-versions`.
 - Keep binding READMEs and complete method references current with API changes; run `just binding-docs-gate`.
   Starting with 0.10.2, every release requires concise `docs/release/<version>.md` notes and a detailed
   `docs/integration/<version>.md` companion, indexed and linked both ways. Follow `release.md#release-documentation`:

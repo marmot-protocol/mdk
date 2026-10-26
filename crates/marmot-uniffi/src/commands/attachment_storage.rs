@@ -1,6 +1,6 @@
 use crate::conversions::{
-    AttachmentStorageUsageFfi, ChatStorageCursor, ChatStoragePageFfi, RetainedAttachmentsCursor,
-    RetainedAttachmentsPageFfi, group_id_from_hex,
+    AttachmentKeepMediaFfi, AttachmentStorageUsageFfi, ChatStorageCursor, ChatStoragePageFfi,
+    RetainedAttachmentsCursor, RetainedAttachmentsPageFfi, group_id_from_hex,
 };
 use crate::{Marmot, MarmotKitError};
 use std::sync::Arc;
@@ -96,6 +96,38 @@ impl Marmot {
             .remove_attachments_older_than(&account_ref, received_before, group.as_ref())
             .await?)
     }
+
+    /// The account's "Keep media" setting: `Forever` unless the user chose
+    /// a window. Needs no started runtime.
+    pub async fn attachment_keep_media(
+        &self,
+        account_ref: String,
+    ) -> Result<AttachmentKeepMediaFfi, MarmotKitError> {
+        Ok(self
+            .runtime
+            .attachment_keep_media(&account_ref)
+            .await?
+            .into())
+    }
+
+    /// Sets the account's "Keep media" setting, then removes every retained
+    /// attachment older than the new window, and every unfinished automatic
+    /// download past it, and returns how many it removed. Age is the later of
+    /// the message's received time and the user's last explicit download of
+    /// that attachment. They show as `CleanedBySetting` (download again
+    /// allowed), and media-store space is freed before this returns.
+    /// `Forever` removes nothing. While the runtime runs, the account worker
+    /// keeps applying the window as attachments age.
+    pub async fn set_attachment_keep_media(
+        &self,
+        account_ref: String,
+        keep: AttachmentKeepMediaFfi,
+    ) -> Result<u64, MarmotKitError> {
+        Ok(self
+            .runtime
+            .set_attachment_keep_media(&account_ref, keep.into())
+            .await?)
+    }
 }
 
 #[cfg(test)]
@@ -168,6 +200,20 @@ mod tests {
             kit.remove_chat_attachments("alice".into(), "not-hex".into())
                 .await
                 .is_err()
+        );
+        assert_eq!(
+            kit.attachment_keep_media("alice".into()).await.unwrap(),
+            AttachmentKeepMediaFfi::Forever
+        );
+        assert_eq!(
+            kit.set_attachment_keep_media("alice".into(), AttachmentKeepMediaFfi::ThirtyDays)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            kit.attachment_keep_media("alice".into()).await.unwrap(),
+            AttachmentKeepMediaFfi::ThirtyDays
         );
         kit.shutdown_and_close().await.unwrap();
     }

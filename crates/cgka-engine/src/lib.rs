@@ -90,7 +90,3 @@ pub use wire_format::{
     DEFAULT_MAX_PAST_EPOCHS, PURE_PLAINTEXT_WIRE_FORMAT_POLICY, WIRE_FORMAT_POLICY_REVIEW_REQUIRED,
     default_join_config, join_config,
 };
-
-// ── Compile-time witnesses ──────────────────────────────────────────────────
-
-const _: fn(Box<dyn cgka_traits::CgkaEngine + Send + Sync>) = |_| {};

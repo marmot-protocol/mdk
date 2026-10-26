@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - marmotkit-v*
+      # Nightly tags are created by nightly-releases.yml, which calls this workflow itself.
+      - "!marmotkit-v*-nightly.*"
   workflow_dispatch:
     inputs:
       source_sha:
@@ -15,12 +17,29 @@ on:
         required: false
         default: false
         type: boolean
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Full 40-character source SHA on master
+        required: true
+        type: string
+      build_only:
+        description: Build and validate workflow artifacts without staging a release
+        required: false
+        default: false
+        type: boolean
+      nightly_version:
+        description: Nightly version X.Y.Z-nightly.YYYYMMDD[.N]; stages a draft for nightly-releases.yml to publish
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: marmotkit-bindings-${{ inputs.source_sha || github.ref }}-${{ inputs.build_only && github.sha || 'publish' }}
+  # Nightlies get their own group: sharing a snapshot's group for the same SHA
+  # would deadlock against that snapshot's wait for the building nightly.
+  group: marmotkit-bindings-${{ inputs.nightly_version || inputs.source_sha || github.ref }}-${{ inputs.build_only && github.sha || 'publish' }}
   cancel-in-progress: false
 
 env:
@@ -33,8 +52,35 @@ env:
   PRODUCT_ANALYTICS_EXPORT: "1"
 
 jobs:
+  release-lane:
+    name: Wait for a building nightly
+    # A nightly yields to releases and snapshots before it builds; once it is
+    # building, releases and snapshots wait for it to leave the macOS runners.
+    # The job always runs, because a skipped ancestor would skip every build
+    # job below; nightly and build-only runs skip only its steps.
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: Check out workflow scripts
+        if: ${{ !inputs.nightly_version && !inputs.build_only }}
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Wait for a building nightly to finish
+        if: ${{ !inputs.nightly_version && !inputs.build_only }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/nightly_release.py wait-lane --nightly --timeout-minutes 180 --fail-on-timeout
+
   metadata:
     name: Resolve immutable release identity
+    needs: release-lane
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -46,6 +92,7 @@ jobs:
       macos_binary_name: ${{ steps.identity.outputs.macos_binary_name }}
       swift_name: ${{ steps.identity.outputs.swift_name }}
       is_snapshot: ${{ steps.identity.outputs.is_snapshot }}
+      is_nightly: ${{ steps.identity.outputs.is_nightly }}
 
     steps:
       - name: Check out requested source
@@ -62,12 +109,43 @@ jobs:
           REQUESTED_SHA: ${{ inputs.source_sha }}
           BUILDER_SHA: ${{ github.sha }}
           BUILD_ONLY: ${{ inputs.build_only }}
+          NIGHTLY_VERSION: ${{ inputs.nightly_version }}
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse 'HEAD^{commit}')"
           workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          is_nightly=false
+          NIGHTLY_VERSION="${NIGHTLY_VERSION:-}"
 
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+          # Called by nightly-releases.yml: the caller's event is schedule or
+          # workflow_dispatch, so check the nightly input before the event.
+          if [[ -n "$NIGHTLY_VERSION" ]]; then
+            if [[ "$BUILD_ONLY" != true && "$GITHUB_REF" != "refs/heads/master" ]]; then
+              echo "error: nightly publishing must run with the workflow from refs/heads/master" >&2
+              exit 1
+            fi
+            if [[ ! "$NIGHTLY_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-nightly\.[0-9]{8}(\.[1-9][0-9]{0,2})?$ ]]; then
+              echo "error: nightly version must look like 0.14.0-nightly.20261020" >&2
+              exit 1
+            fi
+            if [[ "${BASH_REMATCH[1]}-dev" != "$workspace_version" ]]; then
+              echo "error: nightly $NIGHTLY_VERSION does not match source workspace version $workspace_version" >&2
+              exit 1
+            fi
+            if [[ ! "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ || "$source_sha" != "$REQUESTED_SHA" ]]; then
+              echo "error: nightly source must be the requested full SHA, got $source_sha" >&2
+              exit 1
+            fi
+            git fetch --no-tags origin master
+            if ! git merge-base --is-ancestor "$source_sha" origin/master; then
+              echo "error: nightly SHA must be a commit reachable from origin/master" >&2
+              exit 1
+            fi
+            release_id="$NIGHTLY_VERSION"
+            release_tag="marmotkit-v$NIGHTLY_VERSION"
+            is_snapshot=false
+            is_nightly=true
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
             if [[ "$BUILD_ONLY" != true && "$GITHUB_REF" != "refs/heads/master" ]]; then
               echo "error: snapshot publishing must run with the workflow from refs/heads/master" >&2
               exit 1
@@ -113,6 +191,7 @@ jobs:
             echo "macos_binary_name=MarmotKitFFI-macos-$release_id.xcframework.zip"
             echo "swift_name=MarmotKit-$release_id.swift"
             echo "is_snapshot=$is_snapshot"
+            echo "is_nightly=$is_nightly"
           } >> "$GITHUB_OUTPUT"
 
   apple-build:
@@ -881,6 +960,7 @@ jobs:
           SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
           BUILDER_SHA: ${{ needs.metadata.outputs.builder_sha }}
           IS_SNAPSHOT: ${{ needs.metadata.outputs.is_snapshot }}
+          IS_NIGHTLY: ${{ needs.metadata.outputs.is_nightly }}
           BINARY_NAME: ${{ needs.metadata.outputs.binary_name }}
           MACOS_BINARY_NAME: ${{ needs.metadata.outputs.macos_binary_name }}
           SWIFT_NAME: ${{ needs.metadata.outputs.swift_name }}
@@ -924,6 +1004,15 @@ jobs:
           These checks validate local archives, not App Store export or upload. The Rust debug policy is unchanged.
           Assets on this release are immutable.
           EOF
+          if [[ "$IS_NIGHTLY" == "true" ]]; then
+            {
+              echo "Nightly build for testing only. Pin a formal \`marmotkit-v<version>\` release for anything you ship."
+              echo "Nightlies are deleted after 30 days, and going back to an older nightly is not supported."
+              echo
+              cat "$notes"
+            } > "$notes.nightly"
+            mv "$notes.nightly" "$notes"
+          fi
 
           if release_state="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
             if [[ "$release_state" == "true" ]]; then
@@ -935,14 +1024,17 @@ jobs:
             fi
           fi
 
-          if [[ "$IS_SNAPSHOT" == "true" ]] && \
+          if [[ "$IS_SNAPSHOT" == "true" || "$IS_NIGHTLY" == "true" ]] && \
              git ls-remote --exit-code --tags "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$tag" >/dev/null 2>&1; then
-            echo "error: immutable snapshot tag $tag already exists; refusing to move it" >&2
+            echo "error: immutable snapshot or nightly tag $tag already exists; refusing to move it" >&2
             exit 1
           fi
 
           assets=(dist/ios/* dist/macos/* dist/android/*)
-          if [[ "$IS_SNAPSHOT" == "false" ]]; then
+          if [[ "$IS_NIGHTLY" == "true" ]]; then
+            title="v$version - MarmotKit"
+            release_flags=(--prerelease --latest=false --target "$SOURCE_SHA")
+          elif [[ "$IS_SNAPSHOT" == "false" ]]; then
             title="v$version - MarmotKit"
             release_flags=(--latest=false)
           else
@@ -980,6 +1072,12 @@ jobs:
             }
           done
 
+          if [[ "$IS_NIGHTLY" == "true" ]]; then
+            # nightly-releases.yml publishes all three tracks together once each draft is verified.
+            echo "Staged verified draft $tag for the nightly publish job"
+            exit 0
+          fi
+
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
             -F draft=false -f make_latest=false >/dev/null
           # The workflow token cannot read repository-administration settings,
@@ -997,6 +1095,8 @@ jobs:
 
   validate-published-ios:
     name: Validate published iOS SwiftPM consumer
+    # Nightlies are still drafts here; their bytes passed the local consumer checks above.
+    if: success() && needs.metadata.outputs.is_nightly != 'true'
     runs-on: macos-latest
     needs:
       - metadata
@@ -1042,6 +1142,7 @@ jobs:
 
   validate-published-macos:
     name: Validate published macOS SwiftPM consumer
+    if: success() && needs.metadata.outputs.is_nightly != 'true'
     runs-on: macos-latest
     needs:
       - metadata

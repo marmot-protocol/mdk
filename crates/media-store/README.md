@@ -36,13 +36,15 @@ database, which this crate reaches through a catalog trait implemented by `stora
   writes: the rest of its wire file and its store file, less what is already checkpointed, never less than the store
   file. `DiskPolicy::send_need` is the rule for a send: its staged file, since the upload streams.
   `DiskPolicy::migration_need` is the rule for moving a legacy database body into the store: its store file.
+  `DiskPolicy::cache_need` is the same rule for caching an avatar or group image.
 - **The catalog traits**: `MediaCatalog` (store-wide rows), `PublishTarget` (one publication's commit),
   `CheckpointTarget` (one download checkpoint's row), `StageTarget` (one staged body's owner) and `PromoteTarget` (one
   promotion into a published message's slots), implemented on the account database by `storage-sqlite`. The `catalog-conformance` feature exports the suite every
   implementation must pass, and an in-memory catalog.
 
-Later steps of mdk#2314 add handoff leases and the evictable cache category, and move the rest of attachments onto
-the store.
+Retained attachments use the `Retained` category and are never deleted automatically. Avatars and group images use
+the `Cache` category (mdk#2314 step 9): they can always be fetched again, so the account's cache budget evicts them.
+The two categories never share a file.
 
 ## Using it
 

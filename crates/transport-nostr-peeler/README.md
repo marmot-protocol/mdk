@@ -39,6 +39,15 @@ Welcome peeling fails closed unless all of these hold:
 
 ## Boundary shape
 
+Inbound group events must be signature-verified before engine admission. The relay adapter uses SDK verification
+for SDK events and verifies events supplied through its public DTO boundary. Other callers must authenticate their
+source or call `to_verified_nostr_event` before ingesting a DTO; `to_transport_message` checks the hash and routing
+shape but does not verify signatures. A public `NostrTransportEvent` is not proof of authenticity.
+
+Group peeling checks the payload's event hash against both the event id and `TransportMessage.id`, enforces the
+strict routing tags, and decrypts the envelope without rebuilding an SDK event or verifying Schnorr signatures.
+Welcome peeling still decodes an SDK event for NIP-59, whose unwrap verifies the outer event and encrypted seal.
+
 Inbound:
 
 ```text

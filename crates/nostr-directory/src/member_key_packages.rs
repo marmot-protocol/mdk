@@ -1,0 +1,1052 @@
+//! Set-oriented group-member KeyPackage resolution.
+//!
+//! The create and invite paths know the whole requested roster before they
+//! mutate MLS state. Resolve that set as a set: canonicalize aliases, collapse
+//! duplicate account ids, reuse discovery routes, and fetch current KeyPackages
+//! from relays before every invitation. Cached packages are discovery hints, not
+//! evidence that a recipient still owns the private bundle. Unsupported batch
+//! queries fall back to bounded single-author relay requests.
+
+use crate::error::{DirectoryError, MissingKeyPackageReason};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use cgka_engine::key_package::key_package_metadata;
+use cgka_traits::TransportEndpoint;
+use cgka_traits::engine::KeyPackage;
+use cgka_traits::group::ProtocolProfile;
+use futures::{StreamExt, stream};
+use nostr_sdk::prelude::PublicKey;
+use transport_nostr_adapter::{
+    KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
+};
+
+use super::Directory;
+use super::observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, ObservedUnit};
+use super::resources::DirectoryResources;
+use crate::published_records::{
+    fresh_relay_list_status_from_records, merge_relay_list_status,
+    preferred_fresh_key_package_from_records,
+};
+use crate::{AccountRelayListStatus, FetchedKeyPackage};
+use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome};
+
+/// Maximum authors placed in one Nostr directory filter.
+pub(crate) const MEMBER_RESOLUTION_AUTHORS_PER_QUERY: usize = 32;
+/// Concurrent endpoint-group/chunk requests within one resolution pass.
+const MEMBER_RESOLUTION_RELAY_CONCURRENCY: usize = 4;
+/// Existing per-member fallback concurrency, retained for incompatible relays.
+const MEMBER_RESOLUTION_FALLBACK_CONCURRENCY: usize = 8;
+/// One complete set resolution is bounded even when several relay sets stall.
+// Relay-list discovery, normal reads, supplementary recovery and candidate-
+// scoped deletion proof share one deadline. No per-route or candidate retry
+// renews it; slow/incomplete coverage remains retryable rather than absence.
+const MEMBER_RESOLUTION_DEADLINE: Duration = Duration::from_secs(50);
+const KEY_PACKAGE_EVENTS_PER_AUTHOR: usize = 12;
+const RELAY_LIST_EVENTS_PER_AUTHOR: usize = 4;
+const MEMBER_PREWARM_CACHE_LIMIT: usize = 256;
+pub const MEMBER_PREWARM_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone)]
+struct MemberKeyPackagePrewarmEntry {
+    relay_lists: AccountRelayListStatus,
+    inserted_at: Instant,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn composition_prewarm_cache_is_bounded_and_expires_entries() {
+        let mut cache = MemberKeyPackagePrewarmCache::default();
+        for index in 0..=MEMBER_PREWARM_CACHE_LIMIT {
+            cache.insert(format!("{index:064x}"), AccountRelayListStatus::empty());
+        }
+        assert_eq!(cache.entries.len(), MEMBER_PREWARM_CACHE_LIMIT);
+        assert!(cache.get(&format!("{:064x}", 0)).is_none());
+
+        let newest = format!("{:064x}", MEMBER_PREWARM_CACHE_LIMIT);
+        cache.entries.get_mut(&newest).unwrap().inserted_at =
+            Instant::now() - MEMBER_PREWARM_CACHE_TTL - Duration::from_secs(1);
+        assert!(cache.get(&newest).is_none());
+        assert!(!cache.order.contains(&newest));
+    }
+}
+
+#[derive(Default)]
+pub struct MemberKeyPackagePrewarmCache {
+    entries: HashMap<String, MemberKeyPackagePrewarmEntry>,
+    order: VecDeque<String>,
+}
+
+impl MemberKeyPackagePrewarmCache {
+    /// When `account_id_hex`'s entry was cached.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inserted_at(&self, account_id_hex: &str) -> Option<Instant> {
+        self.entries
+            .get(account_id_hex)
+            .map(|entry| entry.inserted_at)
+    }
+
+    /// Backdate `account_id_hex`'s entry, to test expiry and reuse.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_inserted_at(&mut self, account_id_hex: &str, inserted_at: Instant) {
+        if let Some(entry) = self.entries.get_mut(account_id_hex) {
+            entry.inserted_at = inserted_at;
+        }
+    }
+
+    pub fn get(&mut self, account_id_hex: &str) -> Option<AccountRelayListStatus> {
+        self.remove_expired();
+        self.entries
+            .get(account_id_hex)
+            .map(|entry| entry.relay_lists.clone())
+    }
+
+    /// Insert freshly discovered routes, never a package-refresh result.
+    fn insert(&mut self, account_id_hex: String, relay_lists: AccountRelayListStatus) {
+        self.remove_expired();
+        self.order.retain(|existing| existing != &account_id_hex);
+        self.order.push_back(account_id_hex.clone());
+        self.entries.insert(
+            account_id_hex,
+            MemberKeyPackagePrewarmEntry {
+                relay_lists,
+                inserted_at: Instant::now(),
+            },
+        );
+        while self.entries.len() > MEMBER_PREWARM_CACHE_LIMIT {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn remove_expired(&mut self) {
+        let now = Instant::now();
+        self.entries.retain(|_, entry| {
+            now.saturating_duration_since(entry.inserted_at) <= MEMBER_PREWARM_CACHE_TTL
+        });
+        self.order
+            .retain(|account_id| self.entries.contains_key(account_id));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberResolutionPurpose {
+    Commit,
+    CommitFresh,
+    Prewarm,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemberKeyPackagePrewarmSummary {
+    /// Number of member references supplied by the host.
+    pub requested_members: u64,
+    /// Canonical account ids after aliases and duplicates are collapsed.
+    pub unique_members: u64,
+    /// Retained for API compatibility; always zero because packages must be
+    /// fetched from relays. Discovery routes may still be reused.
+    pub reused_members: u64,
+    /// Packages that required relay resolution during this call.
+    pub network_resolved_members: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemberKeyPackageResolutionStats {
+    pub(crate) requested_members: usize,
+    pub unique_members: usize,
+}
+
+impl From<MemberKeyPackageResolutionStats> for MemberKeyPackagePrewarmSummary {
+    fn from(stats: MemberKeyPackageResolutionStats) -> Self {
+        Self {
+            requested_members: stats.requested_members as u64,
+            unique_members: stats.unique_members as u64,
+            reused_members: 0,
+            network_resolved_members: stats.unique_members as u64,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MemberTarget {
+    account_id_hex: String,
+    relay_lists: AccountRelayListStatus,
+    cached_relay_lists: AccountRelayListStatus,
+    relay_records: Vec<transport_nostr::DirectoryRelayEventRecord>,
+}
+
+#[derive(Default)]
+struct RelayListResolution {
+    completed: HashSet<usize>,
+    errors: Vec<(usize, DirectoryError)>,
+}
+
+pub struct ResolvedMemberKeyPackages {
+    pub key_packages: Vec<KeyPackage>,
+    pub stats: MemberKeyPackageResolutionStats,
+}
+
+impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
+    /// Resolve a roster as one deterministic set.
+    ///
+    /// Account aliases are canonicalized and duplicate account ids collapse to
+    /// their first input position. Every package is fetched from relays; cached
+    /// packages are never a fallback if that lookup fails. On error, the error
+    /// belonging to the first unresolved canonical member is returned even if
+    /// later relay work completed earlier.
+    pub async fn resolve_member_key_packages(
+        &self,
+        member_refs: &[&str],
+    ) -> Result<Vec<KeyPackage>, DirectoryError> {
+        let member_refs = member_refs
+            .iter()
+            .map(|member_ref| (*member_ref).to_owned())
+            .collect::<Vec<_>>();
+        Ok(self
+            .resolve_member_key_packages_with_stats(member_refs)
+            .await?
+            .key_packages)
+    }
+
+    pub async fn resolve_compatible_member_key_packages(
+        &self,
+        member_refs: Vec<String>,
+        requirements: &cgka_engine::key_package::KeyPackageRequirements,
+        purpose: MemberResolutionPurpose,
+    ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
+        self.resolve_member_key_packages_for_purpose(member_refs, purpose, Some(requirements))
+            .await
+    }
+
+    /// Prewarm group composition without reserving or consuming any package.
+    /// Success reports relay/metadata readiness only; final Create/Invite
+    /// re-fetches packages and enforces the engine's membership policy.
+    ///
+    /// The roster must also resolve a safe Marmot inbox route for every member;
+    /// missing routes return [`DirectoryError::MissingMemberInboxRoute`]. Successfully
+    /// discovered routes remain cached even when another member fails readiness.
+    /// A malformed current slot publication suppresses older packages here too;
+    /// return an error rather than report readiness from superseded material.
+    /// Every call fetches packages for a fresh readiness signal; hosts should
+    /// debounce composition changes. A later create call can reuse discovery routes,
+    /// but fetches KeyPackages again because prewarmed material may have been
+    /// consumed in the meantime.
+    pub async fn prewarm_group_member_key_packages(
+        &self,
+        member_refs: &[&str],
+    ) -> Result<MemberKeyPackagePrewarmSummary, DirectoryError> {
+        let member_refs = member_refs
+            .iter()
+            .map(|member_ref| (*member_ref).to_owned())
+            .collect::<Vec<_>>();
+        self.resolve_member_key_packages_for_purpose(
+            member_refs,
+            MemberResolutionPurpose::Prewarm,
+            None,
+        )
+        .await
+        .map(|resolved| resolved.stats.into())
+    }
+
+    pub(crate) async fn resolve_member_key_packages_with_stats(
+        &self,
+        member_refs: Vec<String>,
+    ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
+        self.resolve_member_key_packages_for_purpose(
+            member_refs,
+            MemberResolutionPurpose::Commit,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn resolve_member_key_packages_for_purpose(
+        &self,
+        member_refs: Vec<String>,
+        purpose: MemberResolutionPurpose,
+        requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+    ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
+        let observation =
+            self.resources
+                .begin(ObservedFamily::KeyPackage, "lookup", ObservedUnit::Action);
+        let deadline = tokio::time::Instant::now() + MEMBER_RESOLUTION_DEADLINE;
+        let result = self
+            .resolve_member_key_packages_inner(&member_refs, purpose, requirements, deadline)
+            .await;
+        if let Some(observation) = observation {
+            observation.finish(match &result {
+                Ok(_) => "usable",
+                Err(DirectoryError::MissingKeyPackage { .. }) => "absent",
+                Err(DirectoryError::InvalidKeyPackageEvent(_)) => "invalid",
+                Err(_) => "unavailable",
+            });
+        }
+        result
+    }
+
+    /// Both network stages share `deadline`. A member whose lookup had not
+    /// finished when it passed reports `DirectoryLookupIncomplete`; members
+    /// already decided keep their outcome.
+    async fn resolve_member_key_packages_inner(
+        &self,
+        member_refs: &[String],
+        purpose: MemberResolutionPurpose,
+        requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+        deadline: tokio::time::Instant,
+    ) -> Result<ResolvedMemberKeyPackages, DirectoryError> {
+        let directory_observation = self
+            .resources
+            .begin(
+                ObservedFamily::Directory,
+                "key_package",
+                ObservedUnit::Attempt,
+            )
+            .map(DirectoryObservation::counts_only);
+        let mut seen = HashSet::new();
+        let mut targets = Vec::new();
+        for member_ref in member_refs {
+            let local = self.resources.account_id_for_label(member_ref).ok();
+            let account_id_hex = match local {
+                Some(account_id_hex) => account_id_hex,
+                None => PublicKey::parse(member_ref)
+                    .map_err(|_| DirectoryError::InvalidPublicKey)?
+                    .to_hex(),
+            };
+            if !seen.insert(account_id_hex.clone()) {
+                continue;
+            }
+            let relay_lists = self
+                .directory_entry(&account_id_hex)?
+                .map(|entry| entry.relay_lists)
+                .unwrap_or_else(AccountRelayListStatus::empty);
+            targets.push(MemberTarget {
+                account_id_hex,
+                relay_lists: relay_lists.clone(),
+                cached_relay_lists: relay_lists,
+                relay_records: Vec::new(),
+            });
+        }
+
+        let mut outcomes = (0..targets.len())
+            .map(|_| None)
+            .collect::<Vec<Option<Result<KeyPackage, DirectoryError>>>>();
+        // Even a valid, unexpired cached package may have been consumed on
+        // another device. Every purpose, including composition prewarm, must
+        // fetch current relay publications; only discovery routes are reused.
+        let mut reused_prewarmed_routes = HashSet::new();
+        for (index, target) in targets.iter_mut().enumerate() {
+            // Recovery deliberately refreshes routes as well as packages.
+            if purpose == MemberResolutionPurpose::CommitFresh {
+                continue;
+            }
+            let prefetched = self
+                .state
+                .member_key_package_prewarm_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&target.account_id_hex);
+            if let Some(relay_lists) = prefetched {
+                target.relay_lists =
+                    merge_relay_list_status(target.relay_lists.clone(), relay_lists);
+                target.cached_relay_lists = target.relay_lists.clone();
+                if !target.relay_lists.nip65.relays.is_empty()
+                    && !self
+                        .relay_plane
+                        .retain_safe_discovered_endpoints(
+                            target
+                                .relay_lists
+                                .inbox
+                                .relays
+                                .iter()
+                                .cloned()
+                                .map(TransportEndpoint)
+                                .collect(),
+                            "member prewarm inbox readiness",
+                        )
+                        .is_empty()
+                {
+                    reused_prewarmed_routes.insert(index);
+                }
+            }
+        }
+
+        // Durable projections have unknown observation age and need a bounded
+        // refresh. Process-local prewarm entries have an enforced TTL and were
+        // already resolved through the outbox path during composition.
+        let relay_list_unresolved = (0..targets.len())
+            .filter(|index| !reused_prewarmed_routes.contains(index))
+            .collect::<Vec<_>>();
+        // Unfinished relay lists cannot support any KeyPackage verdict.
+        let (relay_lists_completed, relay_lists_finished, finished) = match tokio::time::timeout_at(
+            deadline,
+            self.resolve_missing_relay_lists(&mut targets, &relay_list_unresolved),
+        )
+        .await
+        {
+            Ok(RelayListResolution { completed, errors }) => {
+                for (index, error) in errors {
+                    outcomes[index] = Some(Err(error));
+                }
+                let key_package_unresolved = (0..targets.len())
+                    .filter(|index| outcomes[*index].is_none())
+                    .collect::<Vec<_>>();
+                let finished = tokio::time::timeout_at(
+                    deadline,
+                    self.resolve_missing_key_packages(
+                        &targets,
+                        &key_package_unresolved,
+                        &mut outcomes,
+                        purpose,
+                        requirements,
+                    ),
+                )
+                .await
+                .is_ok();
+                (completed, true, finished)
+            }
+            Err(_) => (HashSet::new(), false, false),
+        };
+        if !finished {
+            for (target, outcome) in targets.iter().zip(&mut outcomes) {
+                outcome.get_or_insert_with(|| {
+                    Err(DirectoryError::DirectoryLookupIncomplete(
+                        target.account_id_hex.clone(),
+                    ))
+                });
+            }
+        }
+
+        if let Some(observation) = directory_observation {
+            for outcome in &outcomes {
+                let outcome = match outcome {
+                    Some(Ok(_)) => "success",
+                    Some(Err(DirectoryError::MissingKeyPackage { .. })) | None => "empty",
+                    Some(Err(_)) => "failure",
+                };
+                observation.directory_sample(outcome, "network", 1);
+            }
+        }
+        match purpose {
+            // A cancelled relay-list stage may hold a discovery-only snapshot.
+            MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh
+                if !relay_lists_finished => {}
+            MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh => {
+                for target in &targets {
+                    if !target.relay_lists.nip65.relays.is_empty()
+                        || !target.relay_lists.inbox.relays.is_empty()
+                        || target.relay_lists.nip65.created_at > 0
+                        || target.relay_lists.inbox.created_at > 0
+                    {
+                        self.remember_directory_relay_lists(
+                            &target.account_id_hex,
+                            &target.relay_lists,
+                        )?;
+                    }
+                }
+            }
+            MemberResolutionPurpose::Prewarm => {
+                let mut cache = self
+                    .state
+                    .member_key_package_prewarm_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for (index, target) in targets.iter().enumerate() {
+                    // Only completed discovery renews the route deadline.
+                    // A usable package can arrive after an incomplete metadata
+                    // hop retained an older durable inbox/outbox projection.
+                    if relay_lists_completed.contains(&index)
+                        && matches!(outcomes[index], Some(Ok(_)))
+                    {
+                        cache.insert(target.account_id_hex.clone(), target.relay_lists.clone());
+                    }
+                }
+            }
+        }
+
+        let mut key_packages = Vec::with_capacity(targets.len());
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            match outcome.unwrap_or_else(|| {
+                Err(DirectoryError::MissingKeyPackage {
+                    account: targets[index].account_id_hex.clone(),
+                    reason: MissingKeyPackageReason::NotFound,
+                })
+            }) {
+                Ok(key_package) => {
+                    let safe_inbox = self.relay_plane.retain_safe_discovered_endpoints(
+                        targets[index]
+                            .relay_lists
+                            .inbox
+                            .relays
+                            .iter()
+                            .cloned()
+                            .map(TransportEndpoint)
+                            .collect(),
+                        "member invite inbox readiness",
+                    );
+                    if safe_inbox.is_empty() {
+                        return Err(DirectoryError::MissingMemberInboxRoute(
+                            targets[index].account_id_hex.clone(),
+                        ));
+                    }
+                    key_packages.push(key_package);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(ResolvedMemberKeyPackages {
+            key_packages,
+            stats: MemberKeyPackageResolutionStats {
+                requested_members: member_refs.len(),
+                unique_members: targets.len(),
+            },
+        })
+    }
+
+    fn accept_fetched_key_package(
+        &self,
+        purpose: MemberResolutionPurpose,
+        fetched: FetchedKeyPackage,
+    ) -> Result<KeyPackage, DirectoryError> {
+        let key_package = self.validate_member_key_package_current(
+            &fetched.account_id_hex,
+            fetched.key_package.clone(),
+        )?;
+        match purpose {
+            MemberResolutionPurpose::Commit | MemberResolutionPurpose::CommitFresh => {
+                self.remember_directory_key_package(&fetched)?
+            }
+            MemberResolutionPurpose::Prewarm => {}
+        }
+        Ok(key_package)
+    }
+
+    fn validate_member_key_package_current(
+        &self,
+        account_id_hex: &str,
+        key_package: KeyPackage,
+    ) -> Result<KeyPackage, DirectoryError> {
+        let observation =
+            self.resources
+                .begin(ObservedFamily::KeyPackage, "lookup", ObservedUnit::Attempt);
+        let (result, outcome) = validate_current_member_key_package(account_id_hex, key_package);
+        if let Some(observation) = observation {
+            observation.count(outcome, ObservedUnit::Attempt, 1);
+            observation.discard();
+        }
+        result
+    }
+
+    fn relay_lists_from_records(
+        &self,
+        target: &MemberTarget,
+        records: Vec<transport_nostr::DirectoryRelayEventRecord>,
+        endpoints: &[TransportEndpoint],
+    ) -> AccountRelayListStatus {
+        let mut status = fresh_relay_list_status_from_records(
+            &target.account_id_hex,
+            records,
+            self.directory_freshness(),
+        )
+        .value;
+        if status.bootstrap_relays.is_empty() {
+            status.bootstrap_relays = endpoints
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect();
+        }
+        merge_relay_list_status(target.cached_relay_lists.clone(), status)
+    }
+
+    /// Run one metadata hop with identical batching, partial-record retention,
+    /// and bounded per-author fallback on both discovery and advertised relays.
+    /// Completion belongs to this hop only; callers reconcile hops separately.
+    async fn resolve_relay_list_hop(
+        &self,
+        targets: &mut [MemberTarget],
+        groups: Vec<(Vec<TransportEndpoint>, Vec<usize>)>,
+    ) -> HashSet<usize> {
+        let specs = groups
+            .into_iter()
+            .flat_map(|(endpoints, indices)| {
+                indices
+                    .chunks(MEMBER_RESOLUTION_AUTHORS_PER_QUERY)
+                    .map(|chunk| {
+                        let members = chunk
+                            .iter()
+                            .map(|index| (*index, targets[*index].account_id_hex.clone()))
+                            .collect::<Vec<_>>();
+                        (endpoints.clone(), members)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let directory = self.clone();
+        let work = specs.into_iter().map(move |(endpoints, members)| {
+            let directory = directory.clone();
+            async move {
+                let authors = members.iter().map(|(_, id)| id.clone()).collect::<Vec<_>>();
+                let queries = [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST]
+                    .into_iter()
+                    .map(|kind| {
+                        DirectoryEventQuery::new(
+                            kind,
+                            authors.clone(),
+                            authors.len() * RELAY_LIST_EVENTS_PER_AUTHOR,
+                        )
+                    })
+                    .collect();
+                let result = directory
+                    .relay_plane
+                    .fetch_directory_events_with_completion(endpoints.clone(), queries)
+                    .await;
+                let outcome = result.unwrap_or_default();
+                if members.len() == 1 || outcome.complete {
+                    return members
+                        .into_iter()
+                        .map(|(index, _)| (index, endpoints.clone(), outcome.clone()))
+                        .collect::<Vec<_>>();
+                }
+                // CLOSED and other incomplete outcomes need the same fallback
+                // as transport errors. Retain positive batch records even when
+                // the single-author retry also fails.
+                stream::iter(members.into_iter().map(|(index, account_id)| {
+                    let directory = directory.clone();
+                    let endpoints = endpoints.clone();
+                    let mut records = outcome
+                        .records
+                        .iter()
+                        .filter(|record| record.event.pubkey == account_id)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    async move {
+                        let queries = [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST]
+                            .into_iter()
+                            .map(|kind| {
+                                DirectoryEventQuery::new(
+                                    kind,
+                                    vec![account_id.clone()],
+                                    RELAY_LIST_EVENTS_PER_AUTHOR,
+                                )
+                            })
+                            .collect();
+                        let retry = directory
+                            .relay_plane
+                            .fetch_directory_events_with_completion(endpoints.clone(), queries)
+                            .await
+                            .unwrap_or_default();
+                        records.extend(retry.records);
+                        (
+                            index,
+                            endpoints,
+                            DirectoryFetchOutcome {
+                                records,
+                                complete: retry.complete,
+                            },
+                        )
+                    }
+                }))
+                .buffered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await
+            }
+        });
+        let results = stream::iter(work)
+            .buffered(MEMBER_RESOLUTION_RELAY_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        let mut completed = HashSet::new();
+        for (index, endpoints, outcome) in results.into_iter().flatten() {
+            let account_id = targets[index].account_id_hex.clone();
+            targets[index].relay_records.extend(
+                outcome
+                    .records
+                    .into_iter()
+                    .filter(|record| record.event.pubkey == account_id),
+            );
+            targets[index].relay_lists = self.relay_lists_from_records(
+                &targets[index],
+                targets[index].relay_records.clone(),
+                &endpoints,
+            );
+            if outcome.complete
+                && !fresh_relay_list_status_from_records(
+                    &account_id,
+                    targets[index].relay_records.clone(),
+                    self.directory_freshness(),
+                )
+                .rejected_future
+            {
+                completed.insert(index);
+            }
+        }
+        completed
+    }
+
+    async fn resolve_missing_relay_lists(
+        &self,
+        targets: &mut [MemberTarget],
+        unresolved: &[usize],
+    ) -> RelayListResolution {
+        let needs_discovery = unresolved.to_vec();
+        if needs_discovery.is_empty() {
+            return RelayListResolution::default();
+        }
+        let endpoints = self.directory_source_relays(&[]);
+        if endpoints.is_empty() {
+            return RelayListResolution::default();
+        }
+        let completed_discovery = self
+            .resolve_relay_list_hop(targets, vec![(endpoints.clone(), needs_discovery.clone())])
+            .await;
+        let incomplete_discovery = needs_discovery
+            .iter()
+            .copied()
+            .filter(|index| !completed_discovery.contains(index))
+            .collect::<HashSet<_>>();
+
+        // Group the same safe outbox sets before querying. This remains pure:
+        // only commit-purpose resolution persists the observed metadata.
+        let mut by_outboxes = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
+        for index in needs_discovery.iter().copied() {
+            let outbox_endpoints = self.relay_plane.retain_safe_discovered_endpoints(
+                targets[index]
+                    .relay_lists
+                    .nip65
+                    .relays
+                    .iter()
+                    .cloned()
+                    .map(TransportEndpoint)
+                    .collect(),
+                "member inbox outbox discovery",
+            );
+            let mut outbox_endpoints = outbox_endpoints
+                .into_iter()
+                .filter(|endpoint| {
+                    !completed_discovery.contains(&index) || !endpoints.contains(endpoint)
+                })
+                .collect::<Vec<_>>();
+            outbox_endpoints.sort();
+            if !outbox_endpoints.is_empty() {
+                by_outboxes.entry(outbox_endpoints).or_default().push(index);
+            }
+        }
+        let attempted_outbox = by_outboxes
+            .values()
+            .flatten()
+            .copied()
+            .collect::<HashSet<_>>();
+        let completed_outbox = self
+            .resolve_relay_list_hop(targets, by_outboxes.into_iter().collect())
+            .await;
+        let completed = completed_discovery
+            .iter()
+            .copied()
+            .filter(|index| !attempted_outbox.contains(index) || completed_outbox.contains(index))
+            .collect();
+        let errors = needs_discovery
+            .into_iter()
+            .filter(|index| {
+                let has_inbox = !self
+                    .relay_plane
+                    .retain_safe_discovered_endpoints(
+                        targets[*index]
+                            .relay_lists
+                            .inbox
+                            .relays
+                            .iter()
+                            .cloned()
+                            .map(TransportEndpoint)
+                            .collect(),
+                        "member invite inbox completion",
+                    )
+                    .is_empty();
+                !has_inbox
+                    && (incomplete_discovery.contains(index)
+                        || (attempted_outbox.contains(index) && !completed_outbox.contains(index)))
+            })
+            // The known list may be a stale cache or partial snapshot, so a
+            // retry can still find usable relays; claim no verdict. Completed
+            // lookups report MissingMemberInboxRoute.
+            .map(|index| {
+                let account = targets[index].account_id_hex.clone();
+                (index, DirectoryError::DirectoryLookupIncomplete(account))
+            })
+            .collect();
+        RelayListResolution { completed, errors }
+    }
+
+    async fn resolve_missing_key_packages(
+        &self,
+        targets: &[MemberTarget],
+        unresolved: &[usize],
+        outcomes: &mut [Option<Result<KeyPackage, DirectoryError>>],
+        purpose: MemberResolutionPurpose,
+        requirements: Option<&cgka_engine::key_package::KeyPackageRequirements>,
+    ) {
+        let defaults = self.directory_source_relays(&[]);
+        let mut by_endpoints = BTreeMap::<Vec<TransportEndpoint>, Vec<usize>>::new();
+        for index in unresolved.iter().copied() {
+            let mut endpoints = self.relay_plane.retain_safe_discovered_endpoints(
+                targets[index]
+                    .relay_lists
+                    .nip65
+                    .relays
+                    .iter()
+                    .cloned()
+                    .map(TransportEndpoint)
+                    .collect(),
+                "member KeyPackage batch fetch",
+            );
+            if endpoints.is_empty() {
+                endpoints.clone_from(&defaults);
+            }
+            endpoints.sort();
+            endpoints.dedup();
+            if endpoints.is_empty() {
+                outcomes[index] = Some(Err(DirectoryError::MissingRelayLists(vec![
+                    crate::MissingRelayListKind::Nip65,
+                ])));
+            } else {
+                by_endpoints.entry(endpoints).or_default().push(index);
+            }
+        }
+
+        let request_specs = by_endpoints
+            .into_iter()
+            .flat_map(|(endpoints, indices)| {
+                indices
+                    .chunks(MEMBER_RESOLUTION_AUTHORS_PER_QUERY)
+                    .map(|chunk| (endpoints.clone(), chunk.to_vec()))
+                    .collect::<Vec<_>>()
+            })
+            .map(|(endpoints, indices)| {
+                let authors = indices
+                    .iter()
+                    .map(|index| targets[*index].account_id_hex.clone())
+                    .collect::<Vec<_>>();
+                let query = DirectoryEventQuery::new(
+                    KIND_MARMOT_KEY_PACKAGE,
+                    authors.clone(),
+                    authors.len() * KEY_PACKAGE_EVENTS_PER_AUTHOR,
+                );
+                (indices, endpoints, query)
+            })
+            .collect::<Vec<_>>();
+        let directory = self.clone();
+        let requests = request_specs
+            .into_iter()
+            .map(move |(indices, endpoints, query)| {
+                let directory = directory.clone();
+                async move {
+                    let result = directory
+                        .relay_plane
+                        .fetch_directory_events(endpoints, vec![query])
+                        .await
+                        .map_err(|error| {
+                            DirectoryError::RelayDirectory(format!("fetch key packages: {error}"))
+                        });
+                    (indices, result)
+                }
+            });
+        // Record each outcome as it arrives: when the shared deadline cancels
+        // this stage, members already decided keep their outcome.
+        let mut batches =
+            stream::iter(requests).buffer_unordered(MEMBER_RESOLUTION_RELAY_CONCURRENCY);
+
+        let mut fallback = Vec::new();
+        let mut fallback_records = BTreeMap::new();
+        while let Some((indices, result)) = batches.next().await {
+            let Ok(records) = result else {
+                fallback.extend(indices);
+                continue;
+            };
+            let multiple_authors = indices.len() > 1;
+            let mut records_by_author = BTreeMap::<_, Vec<_>>::new();
+            for record in records {
+                records_by_author
+                    .entry(record.event.pubkey.clone())
+                    .or_default()
+                    .push(record);
+            }
+            for index in indices {
+                let account_id = &targets[index].account_id_hex;
+                let account_records = records_by_author.remove(account_id).unwrap_or_default();
+                let selected = preferred_fresh_key_package_from_records(
+                    account_id,
+                    &account_records,
+                    self.directory_freshness(),
+                    requirements,
+                    &self.config.key_package_client_preference,
+                )
+                .map(|selection| selection.value);
+                // Batch results prove no coverage; every absence or rejection
+                // is decided by the per-member recovery below.
+                match selected {
+                    Ok(Some(selected))
+                        if purpose == MemberResolutionPurpose::Prewarm
+                            || !multiple_authors
+                            || selected.priority == 2 =>
+                    {
+                        let mut fetched = selected.fetched;
+                        fetched.relay_lists = targets[index].relay_lists.clone();
+                        outcomes[index] = Some(self.accept_fetched_key_package(purpose, fetched));
+                    }
+                    // Bounded multi-author results can hide an older preferred
+                    // slot even when they contain a valid lower-priority one.
+                    // Relays may cap below our requested limit, so even a
+                    // short batch does not prove completeness. Prewarm only
+                    // needs existence, while commits seek the preferred slot.
+                    // A priority-2 winner already has the best tier in a
+                    // newest-first prefix. This is a bounded preference search,
+                    // not proof of relay completeness: neither path can detect
+                    // a newer publication omitted from a non-prefix response.
+                    // Keep observed slot replacements when combining the refetch.
+                    _ => {
+                        fallback.push(index);
+                        fallback_records.insert(index, account_records);
+                    }
+                }
+            }
+        }
+
+        fallback.sort_unstable();
+        fallback.dedup();
+        let fallback_specs = fallback
+            .into_iter()
+            .filter_map(|index| {
+                let target = targets[index].clone();
+                let mut endpoints = self.relay_plane.retain_safe_discovered_endpoints(
+                    target
+                        .relay_lists
+                        .nip65
+                        .relays
+                        .iter()
+                        .cloned()
+                        .map(TransportEndpoint)
+                        .collect(),
+                    "member KeyPackage fallback fetch",
+                );
+                if endpoints.is_empty() {
+                    endpoints.clone_from(&defaults);
+                }
+                (!endpoints.is_empty()).then_some((
+                    index,
+                    target,
+                    endpoints,
+                    fallback_records.remove(&index).unwrap_or_default(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let directory = self.clone();
+        let work =
+            fallback_specs
+                .into_iter()
+                .map(move |(index, target, endpoints, observed_records)| {
+                    let directory = directory.clone();
+                    async move {
+                        let query = DirectoryEventQuery::new(
+                            KIND_MARMOT_KEY_PACKAGE,
+                            vec![target.account_id_hex.clone()],
+                            KEY_PACKAGE_EVENTS_PER_AUTHOR,
+                        );
+                        let result = async {
+                            let (mut records, complete) = match directory
+                                .relay_plane
+                                .fetch_directory_events_with_completion(
+                                    endpoints.clone(),
+                                    vec![query],
+                                )
+                                .await
+                            {
+                                Ok(outcome) => (outcome.records, outcome.complete),
+                                Err(_) => (Vec::new(), false),
+                            };
+                            // This supplementary lookup must not discard a
+                            // valid package observed in this call's batch.
+                            // Never load a previously cached package here.
+                            records.extend(observed_records);
+                            let records = directory
+                                .recover_key_package_records(
+                                    super::key_package_recovery::KeyPackageRecoveryRequest {
+                                        account: &target.account_id_hex,
+                                        searched: &endpoints,
+                                        observed: records,
+                                        primary_complete: complete,
+                                        discovery: &directory.directory_source_relays(&[]),
+                                        requirements,
+                                        cached_target: None,
+                                    },
+                                )
+                                .await?;
+                            let mut fetched = preferred_fresh_key_package_from_records(
+                                &target.account_id_hex,
+                                &records.records,
+                                records.freshness,
+                                requirements,
+                                &self.config.key_package_client_preference,
+                            )?
+                            // Recovery returned, so lookup coverage is complete.
+                            .into_value_or_missing(&target.account_id_hex)?
+                            .fetched;
+                            fetched.relay_lists = target.relay_lists;
+                            Ok::<_, DirectoryError>(fetched)
+                        }
+                        .await;
+                        (index, result)
+                    }
+                });
+        let mut fallback_results =
+            stream::iter(work).buffer_unordered(MEMBER_RESOLUTION_FALLBACK_CONCURRENCY);
+        while let Some((index, result)) = fallback_results.next().await {
+            outcomes[index] =
+                Some(result.and_then(|fetched| self.accept_fetched_key_package(purpose, fetched)));
+        }
+    }
+}
+
+// The closed outcome accompanies the result without storing mutable flags in a closure.
+fn validate_current_member_key_package(
+    account_id_hex: &str,
+    key_package: KeyPackage,
+) -> (Result<KeyPackage, DirectoryError>, &'static str) {
+    let metadata = match key_package_metadata(&key_package) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return (
+                Err(DirectoryError::InvalidKeyPackageEvent(error.to_string())),
+                "invalid",
+            );
+        }
+    };
+    if metadata.protocol_profile != ProtocolProfile::Current
+        || metadata.credential_identity_hex != account_id_hex
+    {
+        return (
+            Err(DirectoryError::InvalidKeyPackageEvent(
+                "member KeyPackage identity or profile is invalid".to_owned(),
+            )),
+            "invalid",
+        );
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if now < metadata.not_before || now > metadata.not_after {
+        return (
+            Err(DirectoryError::InvalidKeyPackageEvent(
+                "member KeyPackage is outside its current lifetime".to_owned(),
+            )),
+            if now > metadata.not_after {
+                "expired"
+            } else {
+                "unavailable"
+            },
+        );
+    }
+    (Ok(key_package), "usable")
+}

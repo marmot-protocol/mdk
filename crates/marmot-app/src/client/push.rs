@@ -644,6 +644,7 @@ impl AppClient {
             .collect::<Vec<_>>();
         let server_inbox_relays = if record_relay_hints.is_empty() {
             self.app
+                .directory()
                 .directory_entry_for_account_id(server_pubkey_hex)?
                 .map(|entry| entry.relay_lists.inbox.relays)
                 .unwrap_or_default()

@@ -229,17 +229,17 @@ pub const CONSTANT_DECISIONS: [ConstantDecision; 39] = [
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),
-    // The lag-lost EOSE repair re-issues REQs unchanged, so it changes when
-    // relay history arrives, never which history.
-    decision(
-        "A15",
-        ConstantInfluence::InputAcquisition,
-        VersioningRule::OperationalNonInterference,
-    ),
     // The epoch-gap window fetch delivers more input and certifies nothing,
     // so it changes which history arrives, never what counts as covered.
     decision(
         "A16",
+        ConstantInfluence::InputAcquisition,
+        VersioningRule::OperationalNonInterference,
+    ),
+    // Source-local admission, finite active-unit leases and signed-safe wire
+    // bounds change input or explicit loss, not selection given equal input.
+    decision(
+        "A17",
         ConstantInfluence::InputAcquisition,
         VersioningRule::OperationalNonInterference,
     ),

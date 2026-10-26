@@ -197,9 +197,9 @@ async fn run_receive_selected_comparison(shutdown_while_held: bool) {
     .unwrap()
     .try_into()
     .unwrap();
-    // The old candidate is outside the ordinary reopened subscription's
-    // overlap. It causes a real request-local comparison without inventing a
-    // recovery demand or suppressing a production selector.
+    // The old candidate is outside the reopened subscription's seeded durable
+    // cursor overlap. It causes a real request-local comparison without
+    // inventing a recovery demand or suppressing a production selector.
     let candidate = EventBuilder::new(Kind::MlsGroupMessage, "comparison-only probe")
         .tags([Tag::custom("h", [hex::encode(route)])])
         .custom_created_at(SdkTimestamp::from_secs(crate::unix_now_seconds() - 3_600))
@@ -215,6 +215,13 @@ async fn run_receive_selected_comparison(shutdown_while_held: bool) {
     drop(app);
 
     let reopened_app = MarmotApp::with_relay_and_config(dir.path(), url, config);
+    // Both clients resume a trusted tail: the one-shot sender must not warm
+    // the shared SDK cache with the receiver's comparison-only candidate.
+    for label in [&alice.label, &bob.label] {
+        let mut seeded = reopened_app.load_state(label).unwrap();
+        seeded.last_transport_timestamp = Some(crate::unix_now_seconds());
+        reopened_app.save_state(&seeded).unwrap();
+    }
     let reopened = crate::MarmotAppRuntime::new(reopened_app.clone());
     let pool = reopened
         .shared_services()

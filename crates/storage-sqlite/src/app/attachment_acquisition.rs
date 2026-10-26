@@ -791,7 +791,14 @@ impl SqliteAppStorage {
     ) -> StorageResult<bool> {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            Ok(storage_usage::remove_slot(&conn, group, message, index)?.is_some())
+            Ok(storage_usage::remove_slot(
+                &conn,
+                group,
+                message,
+                index,
+                storage_usage::RemovalReason::ByYou,
+            )?
+            .is_some())
         })
     }
     /// User-authorized download-again only. Clearing suppression and requesting
@@ -1135,6 +1142,8 @@ mod legacy_migration;
 pub use legacy_migration::{
     AttachmentMigrationState, LegacyAttachmentBody, LegacyBodyPublication, LegacyBodyReader,
 };
+mod keep_media;
+pub use keep_media::AttachmentKeepMedia;
 mod storage_usage;
 pub use storage_usage::{
     ATTACHMENT_REMOVAL_BATCH, AttachmentRemoval, AttachmentStorageUsage, ChatAttachmentUsage,

@@ -878,7 +878,8 @@ async fn preview_sender_profile_commits_refresh_at_unchanged_selected_revision()
         .unwrap();
     let version = f.store.app_storage().chat_presentation_version().unwrap();
     f.app
-        .save_directory_entry(&UserDirectoryRecord {
+        .directory()
+        .save_directory_entry_for_test(&UserDirectoryRecord {
             account_id_hex: sender.clone(),
             npub: "fixture".into(),
             local_account: None,
@@ -1240,7 +1241,8 @@ async fn system_preview_resolves_subject_fallback_and_refreshes_profile_without_
     );
     let activity = sub.snapshot.rows[0].row.activity_sort_at;
     f.app
-        .save_directory_entry(&UserDirectoryRecord {
+        .directory()
+        .save_directory_entry_for_test(&UserDirectoryRecord {
             account_id_hex: subject.clone(),
             npub: "fixture".into(),
             local_account: None,

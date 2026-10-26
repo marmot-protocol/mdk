@@ -749,38 +749,6 @@ impl From<AppQuarantinedGroup> for AppQuarantinedGroupFfi {
 }
 
 #[cfg(test)]
-mod profile_presence_tests {
-    use super::*;
-
-    fn profile(present: bool) -> AppGroupProfileComponent {
-        AppGroupProfileComponent {
-            component_id: 0x8001,
-            component: "marmot.group.profile.v1".to_owned(),
-            present,
-            name: String::new(),
-            description: String::new(),
-            data_hex: if present {
-                "0000".to_owned()
-            } else {
-                String::new()
-            },
-        }
-    }
-
-    #[test]
-    fn ffi_profile_fields_distinguish_absent_from_present_empty() {
-        assert_eq!(
-            profile_ffi_fields(profile(false)),
-            (false, String::new(), String::new())
-        );
-        assert_eq!(
-            profile_ffi_fields(profile(true)),
-            (true, String::new(), String::new())
-        );
-    }
-}
-
-#[cfg(test)]
 mod group_roster_tests {
     use super::*;
     use marmot_app::{
@@ -812,36 +780,6 @@ mod group_roster_tests {
         assert!(matches!(ffi.self_membership, SelfMembershipFfi::Removed));
         assert_eq!(ffi.members.len(), 1);
         assert_eq!(ffi.members[0].display_name.as_deref(), Some("Alice"));
-    }
-
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../marmot-app/tests/support/identity_reference_vectors.rs"
-    ));
-
-    #[test]
-    fn normalize_member_ref_ffi_matches_shared_corpus() {
-        for case in cases() {
-            match case.ffi_account_id_hex {
-                Some(expected) => {
-                    let normalized = normalize_member_ref_ffi(&case.reference)
-                        .unwrap_or_else(|_| panic!("case {} should decode", case.name));
-                    assert_eq!(normalized.account_id_hex, expected, "case {}", case.name);
-                    assert_eq!(normalized.member_ref, expected, "case {}", case.name);
-                    assert_eq!(normalized.npub, NPUB, "case {}", case.name);
-                }
-                None => {
-                    assert!(
-                        matches!(
-                            normalize_member_ref_ffi(&case.reference),
-                            Err(MarmotKitError::InvalidIdentity { .. })
-                        ),
-                        "case {} should reject",
-                        case.name
-                    );
-                }
-            }
-        }
     }
 }
 

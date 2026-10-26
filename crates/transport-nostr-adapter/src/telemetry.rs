@@ -26,8 +26,8 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use cgka_traits::MessageId;
 use cgka_traits::TransportEndpoint;
 use cgka_traits::TransportEndpointRejectionCategory;
 use nostr::prelude::{RelayUrl, Url};
@@ -72,7 +72,8 @@ pub struct RelayIndex(pub u32);
 /// Device-local assignment of stable opaque indices to relay endpoints.
 #[derive(Clone, Debug, Default)]
 pub struct RelayIndexRegistry {
-    indices: HashMap<TransportEndpoint, RelayIndex>,
+    indices: HashMap<Arc<TransportEndpoint>, RelayIndex>,
+    endpoints: Vec<Arc<TransportEndpoint>>,
     next: u32,
 }
 
@@ -90,6 +91,8 @@ impl RelayIndexRegistry {
         }
         let index = RelayIndex(self.next);
         self.next += 1;
+        let key = Arc::new(key);
+        self.endpoints.push(Arc::clone(&key));
         self.indices.insert(key, index);
         index
     }
@@ -100,25 +103,19 @@ impl RelayIndexRegistry {
 
     /// Resolve an opaque index back to its relay endpoint, if one is assigned.
     ///
-    /// This is the only reverse mapping in the module. It exists solely for the
-    /// opt-in export label boundary; the adapter gates access behind
-    /// [`RelayExportConsent`], so callers cannot reach a populated registry
-    /// without one.
+    /// Account-bound recovery borrows this mapping locally. Diagnostic export
+    /// still requires [`RelayExportConsent`] at the adapter's export boundary.
     pub fn resolve(&self, index: RelayIndex) -> Option<&TransportEndpoint> {
-        self.indices
-            .iter()
-            .find_map(|(endpoint, candidate)| (*candidate == index).then_some(endpoint))
+        self.endpoints.get(index.0 as usize).map(Arc::as_ref)
     }
 
     /// Every assigned `(index, endpoint)` pair, ascending by index.
     pub fn resolutions(&self) -> Vec<(RelayIndex, TransportEndpoint)> {
-        let mut pairs: Vec<(RelayIndex, TransportEndpoint)> = self
-            .indices
+        self.endpoints
             .iter()
-            .map(|(endpoint, index)| (*index, endpoint.clone()))
-            .collect();
-        pairs.sort_by_key(|(index, _)| index.0);
-        pairs
+            .enumerate()
+            .map(|(index, endpoint)| (RelayIndex(index as u32), endpoint.as_ref().clone()))
+            .collect()
     }
 }
 
@@ -336,7 +333,7 @@ struct DeliveryTally {
 #[derive(Clone, Debug)]
 pub struct RelayDeliveryTelemetry {
     tracking_window_ms: u64,
-    pending: HashMap<MessageId, FirstSighting>,
+    pending: HashMap<[u8; 32], FirstSighting>,
     spread: DurationHistogram,
     per_relay: HashMap<RelayIndex, DeliveryTally>,
     observed: u64,
@@ -369,7 +366,7 @@ impl RelayDeliveryTelemetry {
     /// re-delivering a message is ignored; only the first sighting from each
     /// distinct relay contributes a spread sample. Pruning of the tracking
     /// window happens here so the table stays bounded without a timer.
-    pub fn record_sighting(&mut self, message_id: &MessageId, relay: RelayIndex, now_ms: u64) {
+    pub fn record_sighting(&mut self, message_id: &[u8; 32], relay: RelayIndex, now_ms: u64) {
         self.prune(now_ms);
 
         match self.pending.get_mut(message_id) {
@@ -379,7 +376,7 @@ impl RelayDeliveryTelemetry {
                 let mut relays = HashSet::new();
                 relays.insert(relay);
                 self.pending.insert(
-                    message_id.clone(),
+                    *message_id,
                     FirstSighting {
                         first_seen_ms: now_ms,
                         relays,
@@ -478,22 +475,6 @@ struct RelayProgress {
     started_ms: u64,
     first_event_seen: bool,
     eose_seen: bool,
-    /// A notification-lag repair re-issued this REQ on this relay, so no
-    /// later repair re-issues it again. A re-issue that went out nowhere is
-    /// released for a later repair.
-    eose_reissued: bool,
-}
-
-/// What a notification-lag repair may do on one relay of a REQ still
-/// awaiting EOSE, from [`RelaySyncTelemetry::claim_eose_repair`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EoseRepairClaim {
-    /// Check the relay client's EOSE record, and re-issue the REQ once when
-    /// it has none. The re-issue is claimed.
-    Reissue,
-    /// An earlier repair re-issued the REQ here: only check the relay
-    /// client's EOSE record, which costs no traffic.
-    Check,
 }
 
 /// Progress of one subscription across the relays it was issued to.
@@ -509,14 +490,13 @@ struct SubscriptionProgress {
 #[derive(Clone, Debug, Default)]
 struct StagedSubscriptionProgress {
     subscriptions: HashMap<String, SubscriptionProgress>,
-    first_event: Vec<(RelayIndex, u64)>,
-    eose: Vec<(RelayIndex, u64)>,
+    first_event: Vec<(String, RelayIndex, u64)>,
+    eose: Vec<(String, RelayIndex, u64)>,
     rollback_first_event: HashMap<(String, RelayIndex), u64>,
     rollback_eose: HashMap<(String, RelayIndex), u64>,
 }
 
-/// Local recorder for subscription sync timing and the initial-sync gate. It
-/// also records which relays a notification-lag repair re-issued a REQ to.
+/// Local recorder for subscription sync timing and the initial-sync gate.
 ///
 /// Diagnostic only; must never feed convergence or branch selection.
 #[derive(Clone, Debug, Default)]
@@ -579,25 +559,44 @@ impl RelaySyncTelemetry {
     /// Atomically promote staged progress and its aggregate samples after the
     /// relay subscription batch succeeds.
     pub fn commit_staged_subscription_starts(&mut self) {
-        let staged = std::mem::take(&mut self.staged);
-        self.subscriptions.extend(staged.subscriptions);
-        for (relay, elapsed_ms) in staged.first_event {
-            self.first_event
-                .entry(relay)
-                .or_default()
-                .record(elapsed_ms);
-        }
-        for (relay, elapsed_ms) in staged.eose {
-            self.eose.entry(relay).or_default().record(elapsed_ms);
-        }
+        self.settle_staged_subscription_starts(|_| true);
     }
 
     /// Discard progress from a failed subscription batch. Callbacks for an ID
     /// that was both staged and already committed are applied to the retained
     /// committed progress, because they may have come from its still-live REQ.
     pub fn rollback_staged_subscription_starts(&mut self) {
+        self.settle_staged_subscription_starts(|_| false);
+    }
+
+    /// Commit the staged progress of the ids `committed` accepts, as
+    /// [`Self::commit_staged_subscription_starts`] does, and roll back every
+    /// other staged id, as [`Self::rollback_staged_subscription_starts`] does.
+    pub fn settle_staged_subscription_starts(&mut self, committed: impl Fn(&str) -> bool) {
         let staged = std::mem::take(&mut self.staged);
+        self.subscriptions.extend(
+            staged
+                .subscriptions
+                .into_iter()
+                .filter(|(subscription_id, _)| committed(subscription_id)),
+        );
+        for (subscription_id, relay, elapsed_ms) in staged.first_event {
+            if committed(&subscription_id) {
+                self.first_event
+                    .entry(relay)
+                    .or_default()
+                    .record(elapsed_ms);
+            }
+        }
+        for (subscription_id, relay, elapsed_ms) in staged.eose {
+            if committed(&subscription_id) {
+                self.eose.entry(relay).or_default().record(elapsed_ms);
+            }
+        }
         for ((subscription_id, relay), now_ms) in staged.rollback_first_event {
+            if committed(&subscription_id) {
+                continue;
+            }
             if let Some(elapsed_ms) =
                 mark_first_event(&mut self.subscriptions, &subscription_id, relay, now_ms)
             {
@@ -608,6 +607,9 @@ impl RelaySyncTelemetry {
             }
         }
         for ((subscription_id, relay), now_ms) in staged.rollback_eose {
+            if committed(&subscription_id) {
+                continue;
+            }
             if let Some(elapsed_ms) =
                 mark_eose(&mut self.subscriptions, &subscription_id, relay, now_ms)
             {
@@ -634,7 +636,9 @@ impl RelaySyncTelemetry {
                 relay,
                 now_ms,
             ) {
-                self.staged.first_event.push((relay, elapsed_ms));
+                self.staged
+                    .first_event
+                    .push((subscription_id.to_string(), relay, elapsed_ms));
             }
             return;
         }
@@ -666,7 +670,9 @@ impl RelaySyncTelemetry {
                 relay,
                 now_ms,
             ) {
-                self.staged.eose.push((relay, elapsed_ms));
+                self.staged
+                    .eose
+                    .push((subscription_id.to_string(), relay, elapsed_ms));
             }
             return;
         }
@@ -736,44 +742,6 @@ impl RelaySyncTelemetry {
             .map(|progress| progress.eose_seen)
     }
 
-    /// Claim one relay of a committed subscription for a notification-lag
-    /// repair, when that relay has not reported EOSE for a REQ started at or
-    /// before `started_by_ms`. Every such repair may check the relay client's
-    /// EOSE record, but only the first may re-issue the REQ, so a replay that
-    /// lags again cannot loop. A new registration of the REQ starts over, and
-    /// a close forgets it.
-    pub(crate) fn claim_eose_repair(
-        &mut self,
-        subscription_id: &str,
-        relay: RelayIndex,
-        started_by_ms: u64,
-    ) -> Option<EoseRepairClaim> {
-        let progress = self
-            .subscriptions
-            .get_mut(subscription_id)
-            .and_then(|subscription| subscription.relays.get_mut(&relay))?;
-        if progress.eose_seen || progress.started_ms > started_by_ms {
-            return None;
-        }
-        if progress.eose_reissued {
-            return Some(EoseRepairClaim::Check);
-        }
-        progress.eose_reissued = true;
-        Some(EoseRepairClaim::Reissue)
-    }
-
-    /// Release a repair's re-issue on this relay for a later repair, when
-    /// nothing went out.
-    pub(crate) fn release_eose_reissue(&mut self, subscription_id: &str, relay: RelayIndex) {
-        if let Some(progress) = self
-            .subscriptions
-            .get_mut(subscription_id)
-            .and_then(|subscription| subscription.relays.get_mut(&relay))
-        {
-            progress.eose_reissued = false;
-        }
-    }
-
     /// Aggregate, privacy-safe snapshot of subscription sync timing.
     pub fn snapshot(&self) -> RelaySyncSnapshot {
         let tracked = self.subscriptions.len()
@@ -798,11 +766,11 @@ impl RelaySyncTelemetry {
                 .count();
 
         let mut first_event = self.first_event.clone();
-        for (relay, elapsed_ms) in &self.staged.first_event {
+        for (_, relay, elapsed_ms) in &self.staged.first_event {
             first_event.entry(*relay).or_default().record(*elapsed_ms);
         }
         let mut eose = self.eose.clone();
-        for (relay, elapsed_ms) in &self.staged.eose {
+        for (_, relay, elapsed_ms) in &self.staged.eose {
             eose.entry(*relay).or_default().record(*elapsed_ms);
         }
         let mut relays: Vec<RelayIndex> = first_event.keys().chain(eose.keys()).copied().collect();
@@ -869,7 +837,6 @@ fn subscription_progress(relays: &[RelayIndex], now_ms: u64) -> SubscriptionProg
                         started_ms: now_ms,
                         first_event_seen: false,
                         eose_seen: false,
-                        eose_reissued: false,
                     },
                 )
             })
@@ -980,8 +947,8 @@ pub struct RelayRefusalStats {
 mod tests {
     use super::*;
 
-    fn msg(byte: u8) -> MessageId {
-        MessageId::new(vec![byte; 32])
+    fn msg(byte: u8) -> [u8; 32] {
+        [byte; 32]
     }
 
     const A: RelayIndex = RelayIndex(0);
@@ -1066,22 +1033,6 @@ mod tests {
             registry.resolutions(),
             vec![(ia, canonical_a), (ib, canonical_b)]
         );
-    }
-
-    #[test]
-    fn relay_label_resolution_maps_indices_to_endpoints() {
-        let resolution = RelayLabelResolution::from_pairs([
-            (RelayIndex(0), TransportEndpoint("wss://a".into())),
-            (RelayIndex(1), TransportEndpoint("wss://b".into())),
-        ]);
-        assert_eq!(resolution.len(), 2);
-        assert!(!resolution.is_empty());
-        assert_eq!(
-            resolution.label_for(RelayIndex(1)),
-            Some(&TransportEndpoint("wss://b".into()))
-        );
-        assert_eq!(resolution.label_for(RelayIndex(2)), None);
-        assert!(RelayLabelResolution::default().is_empty());
     }
 
     #[test]
@@ -1290,46 +1241,6 @@ mod tests {
     }
 
     #[test]
-    fn lag_repair_claims_each_relay_awaiting_eose_until_released() {
-        use EoseRepairClaim::{Check, Reissue};
-        let mut telem = RelaySyncTelemetry::default();
-        telem.record_subscription_start("sub", &[A, B, C], 100);
-        telem.record_eose("sub", A, 110);
-
-        assert_eq!(telem.claim_eose_repair("sub", A, 200), None, "had EOSE");
-        assert_eq!(
-            telem.claim_eose_repair("sub", B, 99),
-            None,
-            "started after the lag"
-        );
-        assert_eq!(telem.claim_eose_repair("sub", B, 200), Some(Reissue));
-        assert_eq!(
-            telem.claim_eose_repair("sub", B, 300),
-            Some(Check),
-            "a later repair only checks"
-        );
-        assert_eq!(telem.claim_eose_repair("sub", RelayIndex(9), 200), None);
-        assert_eq!(telem.claim_eose_repair("unknown", A, 200), None);
-        // Claiming changes no gate: only the relay's own EOSE does.
-        assert_eq!(telem.subscription_endpoint_eose("sub", B), Some(false));
-
-        // A released re-issue lets a later repair re-issue again.
-        telem.release_eose_reissue("sub", B);
-        assert_eq!(telem.claim_eose_repair("sub", B, 300), Some(Reissue));
-        telem.record_eose("sub", B, 400);
-        assert_eq!(telem.claim_eose_repair("sub", B, 500), None);
-
-        // A fresh start of the same id is a new REQ, without any re-issue.
-        telem.record_subscription_start("sub", &[B], 500);
-        assert_eq!(telem.claim_eose_repair("sub", B, 500), Some(Reissue));
-        // Staged starts are not live yet and cannot be claimed.
-        telem.begin_staged_subscription_starts();
-        telem.stage_subscription_start("staged", &[A], 600);
-        assert_eq!(telem.claim_eose_repair("staged", A, 700), None);
-        telem.rollback_staged_subscription_starts();
-    }
-
-    #[test]
     fn committed_staged_reissue_keeps_synchronous_callback_progress() {
         let mut telem = RelaySyncTelemetry::default();
         telem.record_subscription_start("sub", &[A], 0);
@@ -1386,6 +1297,28 @@ mod tests {
         assert_eq!(snapshot.first_event.sum_ms, 110);
         assert_eq!(snapshot.eose.sample_count(), 1);
         assert_eq!(snapshot.eose.sum_ms, 120);
+    }
+
+    #[test]
+    fn settled_staged_starts_commit_and_roll_back_per_subscription() {
+        let mut telem = RelaySyncTelemetry::default();
+        let mut expected = telem.clone();
+        expected.record_subscription_start("kept", &[A], 100);
+        expected.record_first_event("kept", A, 110);
+        expected.record_eose("kept", A, 120);
+
+        telem.begin_staged_subscription_starts();
+        telem.stage_subscription_start("kept", &[A], 100);
+        telem.stage_subscription_start("dropped", &[B], 100);
+        telem.record_first_event("kept", A, 110);
+        telem.record_eose("kept", A, 120);
+        telem.record_first_event("dropped", B, 130);
+        telem.record_eose("dropped", B, 140);
+        telem.settle_staged_subscription_starts(|id| id == "kept");
+
+        assert_eq!(telem.snapshot(), expected.snapshot());
+        assert_eq!(telem.subscription_synced("kept"), Some(true));
+        assert_eq!(telem.subscription_synced("dropped"), None);
     }
 
     #[test]

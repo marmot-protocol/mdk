@@ -1,0 +1,228 @@
+name: Nightly Releases
+
+# Dated MarmotKit, Marmot C and WN Agent pre-releases from the newest master
+# commit whose merge-queue Required CI passed. See release.md#nightly-builds.
+
+on:
+  schedule:
+    # GitHub can start scheduled runs hours late; nothing below depends on the
+    # start time beyond naming the nightly after the run's UTC date.
+    - cron: "17 0 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Plan only. Report the source commit, version, skip decision and expired nightlies; build and change nothing
+        required: false
+        default: false
+        type: boolean
+      build_only:
+        description: Build and validate every track for the planned version without staging, publishing or deleting anything
+        required: false
+        default: false
+        type: boolean
+      force:
+        description: Build even if master's newest green commit is the previous nightly's source
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-releases
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      skip: ${{ steps.plan.outputs.skip }}
+      source_sha: ${{ steps.plan.outputs.source_sha }}
+      version: ${{ steps.plan.outputs.version }}
+
+    steps:
+      - name: Check out workflow
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Require master for publishing
+        if: github.event_name == 'workflow_dispatch' && !inputs.dry_run && !inputs.build_only
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/master" ]]; then
+            echo "error: publishing nightlies must run the workflow from refs/heads/master" >&2
+            exit 1
+          fi
+
+      - name: Select source commit and version
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force || inputs.build_only }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin master
+          args=(plan --master-ref origin/master)
+          if [[ "$FORCE" == "true" ]]; then
+            args+=(--force)
+          fi
+          python3 scripts/nightly_release.py "${args[@]}"
+
+  lane:
+    name: Wait for release lane
+    needs: plan
+    if: success() && needs.plan.outputs.skip != 'true' && !inputs.dry_run
+    runs-on: ubuntu-latest
+    # Releases and snapshots wait for a nightly only after this job succeeds.
+    timeout-minutes: 200
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      lane_free: ${{ steps.wait.outputs.lane_free }}
+
+    steps:
+      - name: Check out workflow
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Wait for releases and snapshots to finish
+        id: wait
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/nightly_release.py wait-lane --timeout-minutes 180
+
+  marmotkit:
+    name: MarmotKit
+    needs: [plan, lane]
+    if: success() && needs.lane.outputs.lane_free == 'true'
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/bindings.yaml
+    with:
+      source_sha: ${{ needs.plan.outputs.source_sha }}
+      build_only: ${{ inputs.build_only == true }}
+      nightly_version: ${{ needs.plan.outputs.version }}
+
+  marmotc:
+    name: Marmot C
+    needs: [plan, lane]
+    if: success() && needs.lane.outputs.lane_free == 'true'
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/c-bindings.yml
+    with:
+      source_sha: ${{ needs.plan.outputs.source_sha }}
+      build_only: ${{ inputs.build_only == true }}
+      nightly_version: ${{ needs.plan.outputs.version }}
+
+  wn-agent:
+    name: wn-agent
+    needs: [plan, lane]
+    if: success() && needs.lane.outputs.lane_free == 'true'
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/wn-agent-binaries.yml
+    with:
+      source_sha: ${{ needs.plan.outputs.source_sha }}
+      build_only: ${{ inputs.build_only == true }}
+      nightly_version: ${{ needs.plan.outputs.version }}
+
+  publish:
+    name: Publish nightly and latest.json
+    needs: [plan, marmotkit, marmotc, wn-agent]
+    # Runs only when all three tracks staged their drafts.
+    if: success() && !inputs.build_only && !inputs.dry_run
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out workflow
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Publish the three pre-releases and update nightly-meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+        run: python3 scripts/nightly_release.py publish --version "$VERSION" --source-sha "$SOURCE_SHA"
+
+  retention:
+    name: Expire nightlies older than 30 days
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out workflow
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Delete expired nightly releases and tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run || inputs.build_only }}
+          ON_MASTER: ${{ github.ref == 'refs/heads/master' }}
+        run: |
+          set -euo pipefail
+          args=(retention)
+          if [[ "$DRY_RUN" == "true" || "$ON_MASTER" != "true" ]]; then
+            args+=(--dry-run)
+          fi
+          python3 scripts/nightly_release.py "${args[@]}"
+
+  report:
+    name: Report scheduled failure
+    needs: [plan, lane, marmotkit, marmotc, wn-agent, publish, retention]
+    # Skipped nights (unchanged source, non-dev version, busy lane) exit 0, so only real
+    # failures get here. A job timeout cancels that job instead of failing it, so cancelled
+    # jobs count too, but a cancelled run does not. Dispatches file nothing: whoever started
+    # one is watching it.
+    if: github.event_name == 'schedule' && !cancelled() && (failure() || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+
+    steps:
+      - name: Open or update the nightly failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha || github.sha }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          title="Nightly release failed"
+          failed="$(jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled")
+            | if .value.result == "cancelled" then "\(.key) (cancelled)" else .key end] | join(", ")' <<<"$NEEDS")"
+          body="The scheduled nightly failed for ${SOURCE_SHA} (failed jobs: ${failed}). Run: ${RUN_URL}"
+          existing="$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number,title \
+            --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi

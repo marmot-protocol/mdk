@@ -1,8 +1,8 @@
 //! Closed vocabularies for the account-recovery owner rows
 //! (`recovery_need_changed`, `recovery_attempt_started`,
 //! `recovery_attempt_finished`, `recovery_obligation_reassessed`) and the
-//! transport-cursor row (`transport_cursor_advanced`) and the lag-lost EOSE
-//! repair row (`subscription_eose_repaired`). These kinds exist only
+//! transport-cursor row (`transport_cursor_advanced`) and historical wire-reissue row
+//! (`subscription_eose_repaired`). These kinds exist only
 //! in audit v5; a v4 recorder drops them (see `AuditEventKind::is_v5_only`).
 //!
 //! Each enum mirrors a name the recovery code already uses, so a reader can
@@ -35,6 +35,9 @@ pub enum RecoveryObligationCause {
     KnownEvent,
     /// Cold-start or incremental history over the retained window.
     IncrementalHistory,
+    /// Complete-range admission of an issued native subscription window.
+    /// This is not exhaustive history or acknowledgment of delivery loss.
+    SubscriptionReplay,
 }
 
 /// A meaningful change to recovery need. Unchanged scheduler evaluations
@@ -138,8 +141,9 @@ pub enum RecoveryScopeProgress {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryObligationVerdict {
-    /// Qualified completion: certified coverage and durable admission, or
-    /// the retained known event.
+    /// The obligation's own predicate completed: qualified history, a retained
+    /// known event, or limited native replay admission. Native admission does
+    /// not certify history or acknowledge delivery loss.
     Satisfied,
     /// Still pending; a later paced pass retries it.
     Deferred,
@@ -264,7 +268,7 @@ pub enum EoseRepairReceiver {
 pub enum EoseRepairTrigger {
     /// One or more notification lags, once the receiver settled.
     NotificationLag,
-    /// An earlier pass left relays unrepaired and scheduled this one.
+    /// An earlier pass left recovery pending and scheduled this one.
     FollowUp,
 }
 
@@ -324,6 +328,64 @@ mod tests {
             .filter(|line| line.contains("\"recovery_") || line.contains("\"transport_cursor"))
             .collect();
         (dir, lines)
+    }
+
+    #[test]
+    fn subscription_replay_uses_existing_owner_rows_and_sorted_causes() {
+        let mut native = started(1, 1, false);
+        if let AuditEventKind::RecoveryAttemptStarted { causes, .. } = &mut native {
+            *causes = vec![RecoveryObligationCause::SubscriptionReplay];
+        }
+        let mut mixed = native.clone();
+        if let AuditEventKind::RecoveryAttemptStarted { causes, .. } = &mut mixed {
+            *causes = vec![
+                RecoveryObligationCause::NotificationLoss,
+                RecoveryObligationCause::SubscriptionReplay,
+            ];
+        }
+        let mut unsorted = mixed.clone();
+        if let AuditEventKind::RecoveryAttemptStarted { causes, .. } = &mut unsorted {
+            causes.reverse();
+        }
+        let mut duplicate = native.clone();
+        if let AuditEventKind::RecoveryAttemptStarted { causes, .. } = &mut duplicate {
+            causes.push(RecoveryObligationCause::SubscriptionReplay);
+        }
+        let need = AuditEventKind::RecoveryNeedChanged {
+            cause: RecoveryObligationCause::SubscriptionReplay,
+            change: RecoveryNeedChange::Recorded,
+            obligation_id: "0a".repeat(16),
+            obligation_revision: 1,
+            bound: None,
+            floor_secs: None,
+            charged: None,
+        };
+        let mut charged_native = need.clone();
+        if let AuditEventKind::RecoveryNeedChanged { charged, .. } = &mut charged_native {
+            *charged = Some(1);
+        }
+        let (_dir, lines) = v5_lines(vec![
+            need,
+            native,
+            mixed,
+            unsorted,
+            duplicate,
+            charged_native,
+        ]);
+        assert_eq!(lines.len(), 3);
+        let schema: serde_json::Value = serde_json::from_str(v5::JSON_SCHEMA).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for line in lines {
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert!(validator.is_valid(&value));
+            let record = v5::Record::from_json(line.as_bytes()).unwrap();
+            assert_eq!(
+                v5::Record::from_json(&record.to_json().unwrap()).unwrap(),
+                record
+            );
+            assert!(!line.contains("wss://"));
+            assert!(!line.contains(&"0a".repeat(16)));
+        }
     }
 
     fn outcome(relay: &str, failure: RecoveryRelayFailure) -> RecoveryRelayOutcome {
@@ -440,6 +502,11 @@ mod tests {
         let path = dir.path().join("audit.jsonl");
         let recorder = JsonlRecorder::open_with_account_ref(&path, "e".repeat(32), None).unwrap();
         recorder.record(AuditRecord::new(None, started(1, 1, false)));
+        let mut native = started(1, 1, false);
+        if let AuditEventKind::RecoveryAttemptStarted { causes, .. } = &mut native {
+            *causes = vec![RecoveryObligationCause::SubscriptionReplay];
+        }
+        recorder.record(AuditRecord::new(None, native));
         recorder.record(AuditRecord::new(
             None,
             AuditEventKind::SyncDrain {
@@ -598,7 +665,8 @@ mod tests {
                 C::Maintenance,
                 C::ExplicitHistory,
                 C::KnownEvent,
-                C::IncrementalHistory
+                C::IncrementalHistory,
+                C::SubscriptionReplay
             ]),
             defined("Operational_recoveryObligationCause")
         );

@@ -131,13 +131,30 @@ impl MarmotAppRuntime {
             let mut remaining = max_bytes;
             let mut reads = Vec::with_capacity(references.len());
             let mut repaired = false;
+            let mut media = None;
             let outcome = (|| {
                 for reference in references {
-                    let result = storage.app_storage().read_avatar_bounded(
-                        &reference,
-                        crate::unix_now_seconds(),
-                        remaining,
-                    )?;
+                    let now = crate::unix_now_seconds();
+                    let mut result = storage
+                        .app_storage()
+                        .read_avatar_bounded(&reference, now, remaining)?;
+                    // A file-backed image is read from its cache file here, on
+                    // the blocking pool.
+                    if result.file.is_some() {
+                        if media.is_none() {
+                            media = Some(app.account_media_store(&account.label, &storage)?);
+                        }
+                        if let Some(media) = &media {
+                            crate::media::avatar_files::read_file_backed(
+                                &storage.app_storage(),
+                                media,
+                                &reference,
+                                &mut result,
+                                now,
+                                remaining,
+                            )?;
+                        }
+                    }
                     let deferred = result.image.is_none() && result.status.byte_count > remaining;
                     repaired |= result.repaired;
                     if let Some(image) = &result.image {

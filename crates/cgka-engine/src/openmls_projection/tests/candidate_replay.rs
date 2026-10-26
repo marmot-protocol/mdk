@@ -49,7 +49,7 @@ fn signing_key(seed: &[u8]) -> SigningKey {
         hasher.update(seed);
         hasher.update(counter.to_be_bytes());
         material.copy_from_slice(&hasher.finalize());
-        if let Ok(key) = SigningKey::from_bytes(&material) {
+        if let Ok(key) = SigningKey::from_slice(&material) {
             return key;
         }
     }

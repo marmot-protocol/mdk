@@ -222,6 +222,11 @@ enum MarmotStatus
    * cannot stage before uploading anything; retry once space is free.
    */
   MARMOT_STATUS_STORAGE_FULL = 106,
+  /**
+   * The current kind-3 contact list has at least 2,048 follows, more than
+   * MDK reads from one list; a follow or unfollow published nothing.
+   */
+  MARMOT_STATUS_FOLLOW_LIST_TOO_LARGE = 107,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -280,6 +285,7 @@ typedef enum MarmotAttachmentMigrationState {
   MARMOT_ATTACHMENT_MIGRATION_STATE_RUNNING,
   MARMOT_ATTACHMENT_MIGRATION_STATE_PAUSED,
   MARMOT_ATTACHMENT_MIGRATION_STATE_COMPLETE,
+  MARMOT_ATTACHMENT_MIGRATION_STATE_COMPACTING,
 } MarmotAttachmentMigrationState;
 
 typedef enum MarmotAvatarAvailability {
@@ -338,7 +344,40 @@ typedef enum MarmotOnboardingIssue {
   MARMOT_ONBOARDING_ISSUE_MULTI_DEVICE_UNSUPPORTED,
   MARMOT_ONBOARDING_ISSUE_OTHER_INSTALLATION_POSSIBLE,
   MARMOT_ONBOARDING_ISSUE_DISCOVERY_INCOMPLETE,
+  MARMOT_ONBOARDING_ISSUE_INSPECTION_COMPLETED,
 } MarmotOnboardingIssue;
+
+typedef enum MarmotOnboardingFindingContext {
+  MARMOT_ONBOARDING_FINDING_CONTEXT_UNKNOWN,
+  MARMOT_ONBOARDING_FINDING_CONTEXT_RECORD_DISCOVERY,
+  MARMOT_ONBOARDING_FINDING_CONTEXT_PUBLISHED_DECLARATION,
+  MARMOT_ONBOARDING_FINDING_CONTEXT_DECLARED_ROUTE,
+  MARMOT_ONBOARDING_FINDING_CONTEXT_REPAIR_APPROVAL,
+  MARMOT_ONBOARDING_FINDING_CONTEXT_REPAIR_PUBLICATION,
+} MarmotOnboardingFindingContext;
+
+typedef enum MarmotOnboardingCheckPurpose {
+  MARMOT_ONBOARDING_CHECK_PURPOSE_UNKNOWN,
+  MARMOT_ONBOARDING_CHECK_PURPOSE_RECORD_LOOKUP,
+  MARMOT_ONBOARDING_CHECK_PURPOSE_DECLARATION_VALIDATION,
+  MARMOT_ONBOARDING_CHECK_PURPOSE_DIRECTORY_QUERY,
+  MARMOT_ONBOARDING_CHECK_PURPOSE_SOURCE_FRESHNESS,
+  MARMOT_ONBOARDING_CHECK_PURPOSE_EVENT_PUBLICATION,
+} MarmotOnboardingCheckPurpose;
+
+typedef enum MarmotOnboardingCheckOutcome {
+  MARMOT_ONBOARDING_CHECK_OUTCOME_UNKNOWN,
+  MARMOT_ONBOARDING_CHECK_OUTCOME_SUCCESS,
+  MARMOT_ONBOARDING_CHECK_OUTCOME_FAILURE,
+} MarmotOnboardingCheckOutcome;
+
+typedef enum MarmotOnboardingRelayCapability {
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_NONE,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_READ,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_WRITE,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_READ_AND_WRITE,
+  MARMOT_ONBOARDING_RELAY_CAPABILITY_INBOX,
+} MarmotOnboardingRelayCapability;
 
 typedef enum MarmotOnboardingAction {
   MARMOT_ONBOARDING_ACTION_RETRY,
@@ -375,14 +414,6 @@ typedef enum MarmotOnboardingRelayTagDisposition {
   MARMOT_ONBOARDING_RELAY_TAG_DISPOSITION_REMOVED,
   MARMOT_ONBOARDING_RELAY_TAG_DISPOSITION_ADDED,
 } MarmotOnboardingRelayTagDisposition;
-
-typedef enum MarmotOnboardingRelayCapability {
-  MARMOT_ONBOARDING_RELAY_CAPABILITY_NONE,
-  MARMOT_ONBOARDING_RELAY_CAPABILITY_READ,
-  MARMOT_ONBOARDING_RELAY_CAPABILITY_WRITE,
-  MARMOT_ONBOARDING_RELAY_CAPABILITY_READ_AND_WRITE,
-  MARMOT_ONBOARDING_RELAY_CAPABILITY_INBOX,
-} MarmotOnboardingRelayCapability;
 
 typedef enum MarmotOnboardingDeviceDiscovery {
   MARMOT_ONBOARDING_DEVICE_DISCOVERY_NONE_FOUND,
@@ -829,7 +860,6 @@ typedef enum MarmotRetentionSweepStatus {
    * Expired messages are still unread; pruning waits.
    */
   MARMOT_RETENTION_SWEEP_STATUS_DEFERRED_UNREAD,
-  MARMOT_RETENTION_SWEEP_STATUS_DEFERRED_SCAN_EXHAUSTED,
   MARMOT_RETENTION_SWEEP_STATUS_FAILED,
 } MarmotRetentionSweepStatus;
 
@@ -1007,6 +1037,7 @@ typedef enum MarmotAttachmentTransferState {
   MARMOT_ATTACHMENT_TRANSFER_STATE_COMPLETED_UNRETAINED,
   MARMOT_ATTACHMENT_TRANSFER_STATE_RETRY_EXHAUSTED,
   MARMOT_ATTACHMENT_TRANSFER_STATE_STORAGE_BLOCKED,
+  MARMOT_ATTACHMENT_TRANSFER_STATE_CLEANED_BY_SETTING,
 } MarmotAttachmentTransferState;
 
 typedef enum MarmotChatListView {
@@ -1058,6 +1089,17 @@ typedef enum MarmotAttachmentHistoryChange {
   MARMOT_ATTACHMENT_HISTORY_CHANGE_ADDITIONS,
   MARMOT_ATTACHMENT_HISTORY_CHANGE_RESTART_REQUIRED,
 } MarmotAttachmentHistoryChange;
+
+/**
+ * How long retained attachments are kept on this device, per account
+ * ("Keep media"). Forever is the default.
+ */
+typedef enum MarmotAttachmentKeepMedia {
+  MARMOT_ATTACHMENT_KEEP_MEDIA_FOREVER,
+  MARMOT_ATTACHMENT_KEEP_MEDIA_ONE_YEAR,
+  MARMOT_ATTACHMENT_KEEP_MEDIA_SIX_MONTHS,
+  MARMOT_ATTACHMENT_KEEP_MEDIA_THIRTY_DAYS,
+} MarmotAttachmentKeepMedia;
 
 typedef enum MarmotChatListPageDirection {
   MARMOT_CHAT_LIST_PAGE_DIRECTION_FORWARD,
@@ -1492,7 +1534,9 @@ typedef struct MarmotSecretStore {
 
 /**
  * Borrowed construction options. Zero initialization selects public-only
- * endpoints, an advancing cursor, no client label, and the platform keychain.
+ * endpoints, an advancing cursor, no client label, and the platform keychain
+ * (under the deployment's keychain service). The deployment itself is a
+ * separate, required argument.
  * Use this struct only with the matching header/library version.
  */
 typedef struct MarmotClientOptions {
@@ -1747,6 +1791,7 @@ typedef struct MarmotAttachmentStorageUsage {
   uint64_t database_free_bytes;
   enum MarmotAttachmentMigrationState migration;
   uint64_t migration_bytes;
+  uint64_t cache_bytes;
 } MarmotAttachmentStorageUsage;
 
 /**
@@ -1971,6 +2016,17 @@ typedef struct MarmotSignOutOutcome {
 typedef struct MarmotOnboardingFinding {
   enum MarmotOnboardingIssue issue;
   char *endpoint;
+  enum MarmotOnboardingFindingContext context;
+  enum MarmotOnboardingCheckPurpose purpose;
+  enum MarmotOnboardingCheckOutcome outcome;
+  enum MarmotOnboardingRelayCapability declared_capability;
+  enum MarmotOnboardingAction *actions;
+  uintptr_t actions_len;
+  bool has_observed_revision;
+  /**
+   *Only meaningful when the matching `has_` flag is set.
+   */
+  uint64_t observed_revision;
 } MarmotOnboardingFinding;
 
 typedef struct MarmotOnboardingStepState {
@@ -4910,8 +4966,9 @@ typedef struct MarmotPublisherAck {
 } MarmotPublisherAck;
 
 /**
- * Borrowed broker options. NULL certificate with zero length selects
- * platform trust. `trust` is a `MarmotPublisherTrust` discriminant.
+ * Borrowed broker options. NULL certificate with zero length selects the
+ * bundled public-CA roots (not the OS trust store). `trust` is a
+ * `MarmotPublisherTrust` discriminant.
  */
 typedef struct MarmotPublisherOptions {
   const char *candidate;
@@ -5889,38 +5946,46 @@ extern "C" {
 #endif // __cplusplus
 
 /**
- * Create a client with an explicit relay policy and optional host secret store.
- * `store == NULL` selects the platform keychain. Loopback opt-in does not
+ * Create a client with an explicit relay policy, optional host secret store
+ * and the required deployment. `store == NULL` selects the platform keychain
+ * under the deployment's keychain service. Loopback opt-in does not
  * permit private/link-local relays or plaintext public endpoints.
  * Ownership of the store transfers only on success, as with
  * `marmot_client_new_with_secret_store`.
  *
  * # Safety
  * Strings and arrays must be valid for the call; `store` must be NULL or a
- * valid vtable; `out_client` must be writable. Pass a `MarmotRelayPolicy`
- * discriminant as `relay_policy`; unknown values are rejected.
+ * valid vtable; `deployment` as for marmot_client_new; `out_client` must be
+ * writable. Pass a `MarmotRelayPolicy` discriminant as `relay_policy`;
+ * unknown values are rejected.
  */
 MarmotStatus marmot_client_new_with_options(const char *root_path,
                                             const char *const *relay_urls,
                                             uintptr_t relay_urls_len,
                                             uint32_t relay_policy,
                                             const struct MarmotSecretStore *store,
+                                            const struct MarmotDeployment *deployment,
                                             struct MarmotClient **out_client);
 
 /**
  * Create a Marmot client rooted at `root_path`, connected to
- * `relay_urls` (`relay_urls_len` entries). On success writes the new
- * handle to `out_client`. Uses the platform keychain-backed account
- * store, matching the UniFFI constructor.
+ * `relay_urls` (`relay_urls_len` entries), with the required `deployment`
+ * (copied during the call). On success writes the new handle to
+ * `out_client`. Account secrets live in the platform keychain under the
+ * deployment's keychain service, matching the UniFFI constructor. Every
+ * constructor takes the deployment as its last argument before the output.
  *
  * # Safety
  * `root_path` must be a valid NUL-terminated UTF-8 string; `relay_urls`
  * must point to `relay_urls_len` valid strings (or be NULL with length
- * 0); `out_client` must be a valid pointer.
+ * 0); `deployment` must be a live handle from marmot_deployment_white_noise
+ * or marmot_deployment_neutral (NULL is MARMOT_STATUS_NULL_POINTER, checked
+ * before anything opens); `out_client` must be a valid pointer.
  */
 MarmotStatus marmot_client_new(const char *root_path,
                                const char *const *relay_urls,
                                uintptr_t relay_urls_len,
+                               const struct MarmotDeployment *deployment,
                                struct MarmotClient **out_client);
 
 /**
@@ -5944,6 +6009,7 @@ MarmotStatus marmot_client_new_with_cursor_persistence(const char *root_path,
                                                        const char *const *relay_urls,
                                                        uintptr_t relay_urls_len,
                                                        uint32_t cursor_persistence,
+                                                       const struct MarmotDeployment *deployment,
                                                        struct MarmotClient **out_client);
 
 /**
@@ -5966,23 +6032,27 @@ MarmotStatus marmot_client_new_with_cursor_persistence(const char *root_path,
  * # Safety
  * `root_path` must be a valid NUL-terminated UTF-8 string; `relay_urls`
  * must point to `relay_urls_len` valid strings (or be NULL with length
- * 0); `store` and `out_client` must be valid pointers.
+ * 0); `store` and `out_client` must be valid pointers; `deployment` as for
+ * marmot_client_new.
  */
 MarmotStatus marmot_client_new_with_secret_store(const char *root_path,
                                                  const char *const *relay_urls,
                                                  uintptr_t relay_urls_len,
                                                  const struct MarmotSecretStore *store,
+                                                 const struct MarmotDeployment *deployment,
                                                  struct MarmotClient **out_client);
 
 /**
  * Open with an optional public client name for newly prepared KeyPackages.
  * NULL or whitespace-only `client_name` omits the tag. Signed retries keep
- * their original tags. NULL `store` selects the platform keychain.
+ * their original tags. NULL `store` selects the platform keychain under the
+ * deployment's keychain service.
  * Store ownership transfers only on success, as with `marmot_client_new_with_secret_store`.
  *
  * # Safety
  * Same pointer contracts as `marmot_client_new_with_secret_store`, except
  * `store` may be NULL. `client_name` must be NULL or a valid UTF-8 C string.
+ * `deployment` as for marmot_client_new.
  * `cursor_persistence` must be a `MarmotCursorPersistence` discriminant.
  */
 MarmotStatus marmot_client_new_with_client_name(const char *root_path,
@@ -5991,42 +6061,30 @@ MarmotStatus marmot_client_new_with_client_name(const char *root_path,
                                                 const char *client_name,
                                                 uint32_t cursor_persistence,
                                                 const struct MarmotSecretStore *store,
+                                                const struct MarmotDeployment *deployment,
                                                 struct MarmotClient **out_client);
 
 /**
- * Create a client with combined relay, cursor, label and secret-storage options.
- * NULL options uses defaults. Store ownership transfers only on success, with
- * the same callback lifetime contract as marmot_client_new_with_secret_store.
+ * Create a client with combined relay, cursor, label and secret-storage
+ * options and the required deployment, which is copied during the call.
+ * NULL options uses defaults. With no secret store, the deployment's
+ * keychain service names the platform keychain. Store ownership transfers
+ * only on success, with the same callback lifetime contract as
+ * marmot_client_new_with_secret_store.
  *
  * # Safety
  * Same root, relay and output pointer contracts as marmot_client_new.
  * Non-NULL options must point to a readable MarmotClientOptions for this call;
  * its label and store pointers obey marmot_client_new_with_client_name's contract.
+ * deployment must be a live handle from marmot_deployment_white_noise or
+ * marmot_deployment_neutral; NULL is MARMOT_STATUS_NULL_POINTER.
  */
 MarmotStatus marmot_client_new_with_configuration(const char *root_path,
                                                   const char *const *relay_urls,
                                                   uintptr_t relay_urls_len,
                                                   const struct MarmotClientOptions *options,
+                                                  const struct MarmotDeployment *deployment,
                                                   struct MarmotClient **out_client);
-
-/**
- * Create a client with `marmot_client_new_with_configuration`'s options and
- * a deployment, copied during the call. NULL options uses defaults; a NULL
- * deployment selects marmot_deployment_white_noise() until the neutral
- * default lands. With no secret store, the deployment's keychain service
- * names the platform keychain.
- *
- * # Safety
- * Same contract as marmot_client_new_with_configuration; deployment must be
- * NULL or a live handle from marmot_deployment_white_noise or
- * marmot_deployment_neutral.
- */
-MarmotStatus marmot_client_new_with_deployment(const char *root_path,
-                                               const char *const *relay_urls,
-                                               uintptr_t relay_urls_len,
-                                               const struct MarmotClientOptions *options,
-                                               const struct MarmotDeployment *deployment,
-                                               struct MarmotClient **out_client);
 
 /**
  * Start the runtime (reconcile accounts, start workers, subscribe
@@ -6362,6 +6420,30 @@ MarmotStatus marmot_remove_attachments_older_than(const struct MarmotClient *cli
                                                   uint64_t received_before,
                                                   const char *group_id_hex,
                                                   uint64_t *out_removed);
+
+/**
+ * Writes the account's "Keep media" setting as a MarmotAttachmentKeepMedia
+ * discriminant. Blocking.
+ * # Safety
+ * Client and string must be live; out must be writable.
+ */
+MarmotStatus marmot_attachment_keep_media(const struct MarmotClient *client,
+                                          const char *account_ref,
+                                          uint32_t *out_keep);
+
+/**
+ * Sets the account's "Keep media" setting (a MarmotAttachmentKeepMedia
+ * discriminant), then removes every retained attachment already past the
+ * new window, writing how many it removed. They show as CleanedBySetting
+ * (download again allowed); media-store space is freed before this returns.
+ * Forever removes nothing. Blocking.
+ * # Safety
+ * Client and string must be live; out must be writable.
+ */
+MarmotStatus marmot_set_attachment_keep_media(const struct MarmotClient *client,
+                                              const char *account_ref,
+                                              uint32_t keep,
+                                              uint64_t *out_removed);
 
 /**
  * Read every effective sender/emoji pair for one visible message, off the UI thread.
@@ -8293,8 +8375,10 @@ MarmotStatus marmot_is_following(const struct MarmotClient *client,
                                  bool *out);
 
 /**
- * Follow `user_ref` and publish the updated list. Writes the new
- * follow set. Free with `marmot_string_list_free`.
+ * Follow `user_ref` and publish the updated list, keeping its other
+ * tags and content. Writes the new follow set. Returns
+ * `MARMOT_STATUS_FOLLOW_LIST_TOO_LARGE`, publishing nothing, when the
+ * list has 2,048 follows or more. Free with `marmot_string_list_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -8308,8 +8392,10 @@ MarmotStatus marmot_follow_user(const struct MarmotClient *client,
                                 struct MarmotStringList **out);
 
 /**
- * Unfollow `user_ref` and publish the updated list. Free with
- * `marmot_string_list_free`.
+ * Unfollow `user_ref` and publish the updated list, keeping its other
+ * tags and content. Returns `MARMOT_STATUS_FOLLOW_LIST_TOO_LARGE`,
+ * publishing nothing, when the list has 2,048 follows or more. Free
+ * with `marmot_string_list_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid
@@ -10097,9 +10183,9 @@ MarmotStatus marmot_startup_diagnostics_snapshot(const struct MarmotClient *clie
                                                  struct MarmotNativeStartupSnapshot **out);
 
 /**
- * White Noise's deployment as this build compiled it, the values every
- * constructor uses without a deployment until the neutral default lands.
- * Free with marmot_deployment_free.
+ * White Noise's deployment, the one White Noise's clients pass to every
+ * constructor. Free with marmot_deployment_free; a client constructed with
+ * it keeps its own copy.
  * # Safety
  * out must be writable.
  */
@@ -10107,10 +10193,9 @@ MarmotStatus marmot_deployment_white_noise(struct MarmotDeployment **out);
 
 /**
  * No deployment services: every list empty, every option unset, and the
- * neutral keychain service org.marmot-protocol.mdk. Until the neutral
- * default lands, an empty new-group media list or an unset group-image or
- * profile-image server still falls back to White Noise's. Free with
- * marmot_deployment_free.
+ * neutral keychain service org.marmot-protocol.mdk. With no media servers
+ * new groups are text-only; with no image servers group images can't load
+ * and profile images can't be uploaded. Free with marmot_deployment_free.
  * # Safety
  * out must be writable.
  */
@@ -11049,7 +11134,8 @@ void marmot_agent_stream_subscription_free(struct MarmotAgentStreamSubscription 
  * Watch a live agent text stream over the brokered QUIC channel. Pass
  * `stream_id_hex = NULL` to follow the latest stream in the group.
  * `server_cert_der` (+ `server_cert_der_len`) pins a self-signed broker
- * certificate; pass NULL with length 0 to use platform trust. The bytes
+ * certificate; pass NULL with length 0 to use the bundled public-CA roots
+ * (not the OS trust store). The bytes
  * are copied — the caller keeps ownership. `insecure_local` is
  * loopback-only for testing. Free with
  * `marmot_agent_stream_subscription_free`.

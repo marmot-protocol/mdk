@@ -80,6 +80,9 @@ https://github.com/marmot-protocol/mdk/releases/download/marmotkit-snapshot-<sha
 https://github.com/marmot-protocol/mdk/releases/download/marmotkit-snapshot-<sha>/PrivacyInfo-ios-snapshot-<sha>.xcprivacy.sha256
 ```
 
+A nightly `<X.Y.Z>-nightly.<YYYYMMDD>` uses the same names under the `marmotkit-v<X.Y.Z>-nightly.<YYYYMMDD>` tag; see
+[Nightlies](#nightlies).
+
 These URLs always contain an exact tag or snapshot identifier. Do not use a `latest` URL for SwiftPM artifacts.
 
 ### SwiftPM
@@ -225,6 +228,25 @@ payloads but do not change that existing consumer-facing API contract. `elf_vali
 without adding that report to `contents`. Exact-head candidate packages from the release-profile workflow include
 the same report beside `manifest.txt` and the build provenance. Publishing a new formal or snapshot artifact, and
 adopting it in an Android app, remains a separate release step.
+
+## Nightlies
+
+Each day's nightly publishes the iOS, macOS and Android assets above under a dated pre-release, for example
+`marmotkit-v0.14.0-nightly.20261020` with `MarmotKitFFI-0.14.0-nightly.20261020.xcframework.zip` and
+`marmotkit-android-0.14.0-nightly.20261020.zip`. The identifier works exactly like a formal version: keep the binary,
+Swift, privacy and Android inputs on one identifier and verify the same checksums. The manifests record the nightly as
+`release_identifier`, master's `X.Y.Z-dev` as the workspace version, and the exact source SHA.
+
+Use nightlies only for testing. Pin a formal `marmotkit-v<version>` release for anything you ship. Nightlies are deleted
+after 30 days, so a nightly pin stops resolving, and going back to an older nightly is not supported. To find the newest
+nightly, read `latest.json` on the `nightly-meta` branch:
+
+```text
+https://raw.githubusercontent.com/marmot-protocol/mdk/nightly-meta/latest.json
+```
+
+It lists every asset's URL and SHA-256 for MarmotKit, Marmot C and WN Agent. See
+[nightly builds](../../release.md#nightly-builds) for naming, publication and retention.
 
 ## Publishing
 

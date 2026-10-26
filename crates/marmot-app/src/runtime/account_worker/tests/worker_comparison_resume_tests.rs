@@ -6,7 +6,7 @@ use nostr_relay_builder::prelude::{
     BoxedFuture, Filter as RelayFilter, MemoryDatabase, MemoryDatabaseOptions, NostrDatabase,
     PolicyResult, QueryPolicy,
 };
-use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
+use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
 use std::net::SocketAddr;
 use std::sync::{
@@ -506,6 +506,317 @@ async fn run_held_comparison(
     );
 }
 
+#[derive(Clone, Copy)]
+enum JoinSummaryPath {
+    Settled,
+    Streamed,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovered_join_settles_routes() {
+    verify_join_routing(JoinSummaryPath::Settled).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovered_join_streams_routes() {
+    verify_join_routing(JoinSummaryPath::Streamed).await;
+}
+
+async fn verify_join_routing(path: JoinSummaryPath) {
+    use crate::client::{
+        CommittedSyncProgress, EpochBackfillRunOutcome, MAX_COMPARISON_ADMISSION_PER_TURN,
+    };
+    use crate::tests::{
+        ScriptedPushRelayClient, client_on_app_relay_plane, every_subscription,
+        remember_test_member_inbox, report_scripted_eose, scripted_eose_pump,
+    };
+    use transport_nostr_adapter::{NostrRelayEvent, NostrSubscription};
+
+    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let endpoint = "wss://relay.example";
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), endpoint).with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, endpoint);
+    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+    let mut receiver = client_on_app_relay_plane(&app, &bob.label).await;
+    // Startup's real KeyPackage lane does not activate Bob's inbox. His first
+    // Welcome therefore cannot arrive through ordinary local publication.
+    receiver.publish_setup_key_package().await.unwrap();
+    let mut sender = client_on_app_relay_plane(&app, &alice.label).await;
+    let welcome_count = match path {
+        JoinSummaryPath::Settled => 1,
+        JoinSummaryPath::Streamed => MAX_COMPARISON_ADMISSION_PER_TURN + 1,
+    };
+    let mut expected_groups = std::collections::HashSet::with_capacity(welcome_count);
+    for index in 0..welcome_count {
+        if index != 0 {
+            receiver.runtime.publish_fresh_key_package().await.unwrap();
+        }
+        let group = sender
+            .create_group("recovered join routing", &[&bob.account_id_hex])
+            .await
+            .unwrap();
+        expected_groups.insert(group);
+    }
+    let welcomes = relay
+        .attempted_events()
+        .into_iter()
+        .filter(|event| event.kind == transport_nostr_peeler::KIND_NIP59_GIFT_WRAP)
+        .collect::<Vec<_>>();
+    let group_hexes = expected_groups.iter().map(hex::encode).collect::<Vec<_>>();
+    assert!(
+        group_hexes
+            .iter()
+            .all(|group_hex| app.group(&bob.label, group_hex).unwrap().is_none())
+    );
+    receiver.prepare_transport().await.unwrap();
+    report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+    receiver.synchronize_native_replay().await.unwrap();
+    receiver.request_bounded_comparison().unwrap();
+    receiver
+        .recovery_owner
+        .test_advance_to_retry(&app.account_storage(&bob.label).unwrap());
+    receiver.test_comparison_results =
+        Some(crate::client::ScriptedComparisons::by_route(move |route| {
+            let events = if *route == storage_sqlite::TransportReconciliationRoute::Inbox {
+                welcomes
+                    .iter()
+                    .cloned()
+                    .map(|event| NostrRelayEvent {
+                        endpoint: cgka_traits::TransportEndpoint(endpoint.into()),
+                        subscription_id: None,
+                        event,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            Ok(Some((
+                transport_nostr_adapter::NostrReconciliationSummary {
+                    relays_succeeded: 1,
+                    remote_items: events.len(),
+                    received_items: events.len(),
+                    ..Default::default()
+                },
+                events,
+            )))
+        }));
+    let (events, mut consumer) = broadcast::channel(32);
+    let shared = RuntimeSharedServices::default();
+    relay.block_next_subscribe();
+    let group = {
+        let publish = |client: &AppClient, summary: &SyncSummary| {
+            publish_app_runtime_summary_with_v5(
+                client,
+                &events,
+                &bob.account_id_hex,
+                &bob.label,
+                summary,
+            );
+        };
+        let errors = |live_error, history_error| {
+            publish_join_errors(
+                live_error,
+                history_error,
+                &events,
+                &bob.account_id_hex,
+                &bob.label,
+            );
+        };
+        let progress = CommittedSyncProgress {
+            publish: &publish,
+            post_join_errors: &errors,
+        };
+        let reporting = async {
+            match path {
+                JoinSummaryPath::Settled => {
+                    run_pending_epoch_backfill_reporting_arm(
+                        &mut receiver,
+                        &events,
+                        &bob.account_id_hex,
+                        &bob.label,
+                        &shared,
+                        EpochBackfillExecutionSeam::ExplicitCatchUp,
+                    )
+                    .await
+                }
+                JoinSummaryPath::Streamed => {
+                    let grant = receiver
+                        .authorize_account_recovery(
+                            None,
+                            EpochBackfillExecutionSeam::ExplicitCatchUp,
+                        )
+                        .await
+                        .unwrap()
+                        .expect("the pending comparison owns a grant");
+                    let execution = receiver.begin_comparison_grant(&grant).await.unwrap();
+                    let credit = Arc::new(tokio::sync::Semaphore::new(1))
+                        .try_acquire_owned()
+                        .unwrap();
+                    let mut job = ComparisonNetworkJob::start(
+                        &receiver,
+                        &grant,
+                        credit,
+                        ComparisonNetworkJob::automatic_deadline(),
+                        None,
+                    )
+                    .unwrap();
+                    let (credit, network) = job.wait().await.unwrap();
+                    let outcome = receiver
+                        .admit_comparison_inline(Some(&progress), grant, execution, network)
+                        .await
+                        .unwrap();
+                    drop(credit);
+                    let (EpochBackfillRunOutcome::Completed(summary)
+                    | EpochBackfillRunOutcome::Incomplete(summary)) = outcome
+                    else {
+                        panic!("the streamed comparison must admit its fetched Welcomes");
+                    };
+                    assert!(
+                        summary.joined_groups.is_empty(),
+                        "settlement must not repeat published joins"
+                    );
+                    Ok(())
+                }
+            }
+        };
+        tokio::pin!(reporting);
+        let group = timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    event = consumer.recv() => {
+                        if let MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } = event.unwrap() {
+                            assert_eq!(account_id_hex, bob.account_id_hex);
+                            assert!(expected_groups.contains(&group_id));
+                            break group_id;
+                        }
+                    }
+                    result = &mut reporting => panic!("settlement returned before visible join followup: {result:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the recovered Welcome publishes GroupJoined before subscription I/O");
+        let group_hex = hex::encode(&group);
+        assert!(
+            app.group(&bob.label, &group_hex)
+                .unwrap()
+                .expect("GroupJoined has a durable public group projection")
+                .pending_confirmation
+        );
+        timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                biased;
+                result = &mut reporting => panic!("settlement skipped recovered join routing: {result:?}"),
+                () = relay.wait_for_blocked_subscribe() => {}
+            }
+        })
+        .await
+        .expect("the worker starts real group-subscription I/O before continuing");
+        if matches!(path, JoinSummaryPath::Streamed) {
+            assert!(
+                group_hexes
+                    .iter()
+                    .any(|group_hex| app.group(&bob.label, group_hex).unwrap().is_none()),
+                "subscription I/O must precede admission of the later Welcome turn"
+            );
+        }
+        relay.release_subscribe();
+        timeout(Duration::from_secs(5), &mut reporting)
+            .await
+            .expect("settlement continues after the subscription barrier releases")
+            .unwrap();
+        group
+    };
+    let bob_member = cgka_traits::MemberId::new(hex::decode(&bob.account_id_hex).unwrap());
+    let subscriptions = relay.accepted_subscriptions();
+    let joined = subscriptions.iter().filter(|subscription| {
+        subscription.account_id() == &bob_member && subscription.carries_group(&group)
+    });
+    assert!(joined.clone().any(|subscription| matches!(
+        subscription,
+        NostrSubscription::Group { .. } | NostrSubscription::GroupBatch { .. }
+    )));
+    // The visible join requests history; only the recovery owner may install
+    // that temporary subscription under its next grant.
+    report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+    receiver
+        .recovery_owner
+        .test_advance_to_retry(&app.account_storage(&bob.label).unwrap());
+    let grant = receiver
+        .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+        .await
+        .unwrap()
+        .expect("the recovered join leaves a grant-owned history boundary");
+    let backfill_armed = receiver.has_pending_epoch_backfill();
+    let backfill_result = receiver.run_recovery_grant_for_test(grant).await;
+    report_pending_epoch_backfill_result(
+        &mut receiver,
+        backfill_result,
+        backfill_armed,
+        None,
+        EpochBackfillReportContext {
+            events: &events,
+            account_id_hex: &bob.account_id_hex,
+            account_label: &bob.label,
+            shared: &shared,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(relay.accepted_subscriptions().iter().any(|subscription| {
+        subscription.account_id() == &bob_member
+            && subscription.carries_group(&group)
+            && matches!(
+                subscription,
+                NostrSubscription::GroupMaintenance { since: Some(_), .. }
+            )
+    }));
+    report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+    let summary = receiver.sync().await.unwrap();
+    publish_app_runtime_summary_with_v5(
+        &receiver,
+        &events,
+        &bob.account_id_hex,
+        &bob.label,
+        &summary,
+    );
+    start_post_join_history_after_visibility(
+        &mut receiver,
+        &summary,
+        &events,
+        &bob.account_id_hex,
+        &bob.label,
+    )
+    .await;
+    let mut observed_groups = std::collections::HashSet::from([group]);
+    while let Ok(event) = consumer.try_recv() {
+        if let MarmotAppEvent::GroupJoined {
+            account_id_hex,
+            group_id,
+            ..
+        } = event
+            && account_id_hex == bob.account_id_hex
+        {
+            assert!(
+                observed_groups.insert(group_id),
+                "settlement and repeated catch-up must not duplicate GroupJoined"
+            );
+        }
+    }
+    assert_eq!(observed_groups, expected_groups);
+    assert!(
+        group_hexes
+            .iter()
+            .all(|group_hex| app.group(&bob.label, group_hex).unwrap().is_some())
+    );
+}
+
 // Pauses the clock, which needs the current-thread runtime.
 #[tokio::test(flavor = "current_thread")]
 async fn comparison_credit_exhaustion_does_not_spend_reservation() {
@@ -573,7 +884,12 @@ async fn comparison_credit_exhaustion_does_not_spend_reservation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
-    let relay = MockRelay::run().await.unwrap();
+    let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+        events: true,
+        max_events: Some(64),
+    });
+    let relay = LocalRelay::new(RelayBuilder::default().database(database.clone()));
+    relay.run().await.unwrap();
     let url = relay.url().await.to_string();
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -584,6 +900,8 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         url.clone(),
         crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
+    app.set_audit_log_settings(AuditLogSettings { enabled: true })
+        .unwrap();
     crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &url);
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     let pool = runtime
@@ -627,10 +945,6 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         .unwrap()
         .shutdown()
         .await;
-    runtime
-        .send_message(&bob.label, &group, b"offworker admission target".to_vec())
-        .await
-        .unwrap();
     let mut client = app.client(&alice.label).await.unwrap();
     client.prepare_transport().await.unwrap();
     timeout(Duration::from_secs(10), async {
@@ -644,25 +958,66 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         timeout(Duration::from_millis(100), client.receive_next_delivery()).await,
         Ok(Ok(_))
     ) {}
-    let route: [u8; 32] = hex::decode(
-        app.group(&alice.label, &hex::encode(&group))
+    client.synchronize_native_replay().await.unwrap();
+    runtime
+        .accounts()
+        .workers
+        .lock()
+        .await
+        .remove(&bob.account_id_hex)
+        .unwrap()
+        .shutdown()
+        .await;
+    let mut sender = app.client(&bob.label).await.unwrap();
+    let expected = (0..9)
+        .map(|index| format!("offworker admission target {index}"))
+        .collect::<std::collections::BTreeSet<_>>();
+    // Save real encrypted MLS envelopes into relay history without notifying
+    // live subscriptions. Only the owned comparison result can supply them.
+    for text in &expected {
+        let inner = crate::messages::build_inner_event(
+            &AppMessageIntent::Chat {
+                content: text.clone(),
+            },
+            &bob.account_id_hex,
+            crate::unix_now_seconds(),
+        )
+        .unwrap();
+        let effects = sender
+            .runtime
+            .session_mut()
+            .send(cgka_traits::engine::SendIntent::AppMessage {
+                group_id: group.clone(),
+                payload: crate::messages::encode_inner_event(&inner).unwrap(),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap();
+        let Some(cgka_session::PublishWork::ApplicationMessage { msg, .. }) =
+            effects.publish.into_iter().next()
+        else {
+            panic!("a real MLS send produces its encrypted envelope");
+        };
+        let event = transport_nostr_peeler::NostrTransportEvent::from_transport_message(&msg)
             .unwrap()
-            .unwrap()
-            .nostr_routing
-            .nostr_group_id_hex,
-    )
-    .unwrap()
-    .try_into()
-    .unwrap();
-    let recovery_route = storage_sqlite::TransportReconciliationRoute::Group(route);
+            .to_verified_nostr_event()
+            .unwrap();
+        database
+            .save_event(&serde_json::from_str(event.as_json().as_str()).unwrap())
+            .await
+            .unwrap();
+    }
+    drop(sender);
     let storage = app.account_storage(&alice.label).unwrap();
     client.request_bounded_comparison().unwrap();
     client.recovery_owner.test_advance_to_retry(&storage);
     let grant = client
         .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
+        .await
         .unwrap()
         .unwrap();
-    let execution = client.begin_comparison_grant(&grant).await.unwrap();
+    let attempt_serial = grant.reservation.attempt_serial;
+    let mut execution = client.begin_comparison_grant(&grant).await.unwrap();
     let credit = recovery_credits::try_acquire_recovery_credit(&pool).unwrap();
     let mut job = ComparisonNetworkJob::start(
         &client,
@@ -676,37 +1031,140 @@ async fn comparison_offworker_valid_result_admitted_only_after_owner_join() {
         .await
         .unwrap()
         .unwrap();
-    let inventory = storage
-        .app_storage()
-        .transport_reconciliation_inventory(&recovery_route, crate::unix_now_seconds())
-        .unwrap();
-    let before = inventory
-        .items
-        .iter()
-        .map(|item| item.event_id)
-        .collect::<std::collections::HashSet<_>>();
     assert!(
         timeout(Duration::from_millis(100), client.receive_next_delivery())
             .await
             .is_err()
     );
+    let mut admission = client
+        .accept_comparison_network(&grant, &mut execution, network)
+        .await
+        .unwrap()
+        .unwrap();
+    let (events, mut consumer) = broadcast::channel(128);
+    assert!(
+        !client
+            .admit_comparison_turn(&grant, &mut execution, &mut admission)
+            .await
+            .unwrap(),
+        "nine actual ingests require more than one bounded worker turn"
+    );
+    let first = admission.take_committed_summary();
+    let durable_prefix = app
+        .messages(&alice.label)
+        .unwrap()
+        .into_iter()
+        .map(|message| message.plaintext)
+        .filter(|text| expected.contains(text))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(durable_prefix.len(), 4);
+    assert_eq!(
+        first
+            .messages
+            .iter()
+            .map(|message| message.plaintext.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        durable_prefix,
+        "only the checkpointed first four plaintexts are publishable"
+    );
+    publish_app_runtime_summary_with_v5(
+        &client,
+        &events,
+        &alice.account_id_hex,
+        &alice.label,
+        &first,
+    );
+    let mut received = std::collections::BTreeSet::new();
+    while let Ok(event) = consumer.try_recv() {
+        if let MarmotAppEvent::MessageReceived(update) = event {
+            assert!(received.insert(update.message.plaintext));
+        }
+    }
+    assert_eq!(
+        received.len(),
+        4,
+        "the permanent consumer sees the committed first turn before settlement"
+    );
+    assert_eq!(received, durable_prefix);
+    loop {
+        let complete = client
+            .admit_comparison_turn(&grant, &mut execution, &mut admission)
+            .await
+            .unwrap();
+        let prefix = admission.take_committed_summary();
+        publish_app_runtime_summary_with_v5(
+            &client,
+            &events,
+            &alice.account_id_hex,
+            &alice.label,
+            &prefix,
+        );
+        if complete {
+            break;
+        }
+    }
     let result = client
-        .admit_comparison_inline(grant, execution, network)
+        .finish_comparison_grant(grant, execution, Some(admission))
         .await
         .unwrap();
     drop(credit);
-    assert!(matches!(result, EpochBackfillRunOutcome::Incomplete(_)));
-    let after = storage
-        .app_storage()
-        .transport_reconciliation_inventory(&recovery_route, crate::unix_now_seconds())
-        .unwrap();
-    assert!(
-        after
-            .items
-            .iter()
-            .any(|item| !before.contains(&item.event_id)),
-        "one valid owned comparison event enters durable route inventory only after owner join"
+    let shared = RuntimeSharedServices::default();
+    report_pending_epoch_backfill_result(
+        &mut client,
+        Ok(result),
+        false,
+        None,
+        EpochBackfillReportContext {
+            events: &events,
+            account_id_hex: &alice.account_id_hex,
+            account_label: &alice.label,
+            shared: &shared,
+        },
+    )
+    .await
+    .unwrap();
+    while let Ok(event) = consumer.try_recv() {
+        if let MarmotAppEvent::MessageReceived(update) = event {
+            assert!(
+                received.insert(update.message.plaintext),
+                "settlement must not repeat an already published turn"
+            );
+        }
+    }
+    assert_eq!(received, expected);
+    assert_eq!(
+        app.messages(&alice.label)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.plaintext)
+            .filter(|text| expected.contains(text))
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected,
+        "every published plaintext has its permanent public projection"
+    );
+    let mut retained = None;
+    for file in app.audit_log_files().unwrap() {
+        let contents = std::fs::read_to_string(file.path).unwrap();
+        for line in contents.lines() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            if row["event"]["type"] != "recovery_attempt_finished"
+                || row["event"]["attempt_serial"] != attempt_serial
+            {
+                continue;
+            }
+            assert_eq!(
+                retained.replace(row["event"]["events_retained"].as_u64().unwrap()),
+                None,
+                "the pass has one terminal accounting row"
+            );
+        }
+    }
+    assert_eq!(
+        retained,
+        Some(expected.len() as u64),
+        "progressive publication must retain whole-pass admission accounting"
     );
     drop(client);
     runtime.shutdown_and_close().await.unwrap();
+    relay.shutdown();
 }

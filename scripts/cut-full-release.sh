@@ -148,6 +148,10 @@ fi
 
 if [ "$push" -eq 1 ] && [ "$dry_run" -eq 0 ]; then
     gh auth status -h github.com >/dev/null || die "gh is not authenticated for github.com"
+    # A building nightly holds the shared macOS runners; let it finish first.
+    GH_TOKEN="$(gh auth token -h github.com)" GITHUB_REPOSITORY="$repo" \
+        python3 scripts/nightly_release.py wait-lane --nightly --timeout-minutes 180 --fail-on-timeout ||
+        die "a nightly build is still using the release runners; retry after it finishes"
 fi
 
 mdk_tag="v$version"
@@ -158,7 +162,9 @@ marmotc_tag="marmotc-v$version"
 previous_tag() {
     local pattern="$1"
     local current="$2"
-    git tag -l "$pattern" --sort=-v:refname | awk -v current="$current" '$0 != current { print; exit }'
+    # Dated nightly pre-releases (<track>-vX.Y.Z-nightly.YYYYMMDD) are not release baselines.
+    git tag -l "$pattern" --sort=-v:refname |
+        awk -v current="$current" '$0 != current && $0 !~ /-nightly\./ { print; exit }'
 }
 
 previous_mdk_tag="$(previous_tag 'v[0-9]*' "$mdk_tag")"

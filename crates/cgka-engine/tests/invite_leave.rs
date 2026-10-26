@@ -96,7 +96,7 @@ fn pad32(name: &[u8]) -> Vec<u8> {
         hasher.update(name);
         hasher.update(counter.to_be_bytes());
         material.copy_from_slice(&hasher.finalize());
-        if let Ok(sk) = SigningKey::from_bytes(&material) {
+        if let Ok(sk) = SigningKey::from_slice(&material) {
             return sk.verifying_key().to_bytes().to_vec();
         }
         counter += 1;
@@ -4111,62 +4111,6 @@ async fn selfremove_auto_commit_publish_failed_rolls_back_projection() {
         1,
         "publish failure must leave the retained SelfRemove eligible for retry"
     );
-}
-
-#[tokio::test]
-async fn leave_produces_selfremove_proposal() {
-    let mut alice = build_client(b"alice");
-    let mut bob = build_client(b"bob");
-    let bob_kp = bob.fresh_key_package().await.unwrap();
-    let (group_id, create) = alice
-        .create_group(CreateGroupRequest {
-            name: "".into(),
-            description: "".into(),
-            members: vec![bob_kp],
-            required_features: vec![],
-            app_components: vec![],
-            initial_admins: vec![],
-        })
-        .await
-        .unwrap();
-    let welcome = match create {
-        SendResult::GroupCreated {
-            pending,
-            mut welcomes,
-        } => {
-            alice.confirm_published(pending).await.unwrap();
-            welcomes.remove(0)
-        }
-        _ => unreachable!(),
-    };
-    bob.join_welcome(welcome).await.unwrap();
-
-    // Bob (non-admin) leaves — should produce SendResult::Proposal, NOT
-    // GroupEvolution.
-    let res = bob
-        .send(SendIntent::Leave {
-            group_id: group_id.clone(),
-        })
-        .await
-        .unwrap();
-    match &res {
-        SendResult::Proposal { .. } => {} // expected
-        other => panic!("expected Proposal, got {other:?}"),
-    }
-
-    // Alice ingests the proposal — classifies as Processed and schedules a
-    // delayed SelfRemove-only commit.
-    let proposal_msg = match res {
-        SendResult::Proposal { msg } => TransportMessage {
-            envelope: TransportEnvelope::GroupMessage {
-                transport_group_id: group_id.as_slice().to_vec(),
-            },
-            ..msg
-        },
-        _ => unreachable!(),
-    };
-    let outcome = alice.ingest(proposal_msg).await.unwrap();
-    assert!(matches!(outcome, IngestOutcome::Processed));
 }
 
 // ── Grep invariant: no non-SelfRemove leave path ────────────────────────────

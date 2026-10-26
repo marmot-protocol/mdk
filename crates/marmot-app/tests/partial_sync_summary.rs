@@ -242,7 +242,7 @@ async fn failure_after_application_event_ack_replays_summary_exactly_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_with_failed_checkpoint_is_excluded_and_replays_exactly_once() {
+async fn native_prefix_survives_error() {
     let batch = pending_two_message_batch().await;
     let app_bob = open_store_with_boundary_failure(&batch.bob_dir, &batch.relay_url, 1);
     let mut bob = app_bob.client("bob").await.unwrap();
@@ -250,65 +250,37 @@ async fn batch_with_failed_checkpoint_is_excluded_and_replays_exactly_once() {
     let failure = bob
         .sync_with_partial_progress()
         .await
-        .expect_err("the accumulated batch checkpoint must fail");
+        .expect_err("the final drain checkpoint fails after native commits");
     assert_eq!(
         failure.partial_summary.messages.len(),
-        0,
-        "no delivery from an uncommitted batch is part of the completed prefix",
+        2,
+        "the failure must return both already-committed native outputs",
     );
-    assert!(
-        failure
-            .source
-            .to_string()
-            .contains("injected catch-up boundary save failure"),
-        "the fault must come from the accumulated-prefix checkpoint: {}",
-        failure.source
-    );
-    let failed_drain = app_bob
-        .audit_log_files()
-        .unwrap()
-        .into_iter()
-        .flat_map(|file| {
-            std::fs::read_to_string(file.path)
-                .unwrap()
-                .lines()
-                .map(|line| {
-                    marmot_forensics::v5::Record::from_json(line.as_bytes())
-                        .expect("real v5 sync row");
-                    serde_json::from_str::<serde_json::Value>(line).unwrap()
-                })
-                .collect::<Vec<_>>()
-        })
-        .rfind(|row| row["event"]["type"] == "sync_drain")
-        .expect("failed drain audit row");
     assert_eq!(
-        failed_drain["event"]["cursor_after_secs"], failed_drain["event"]["cursor_before_secs"],
-        "a failed projection checkpoint must not claim an uncommitted cursor",
+        app_bob
+            .messages("bob")
+            .unwrap()
+            .into_iter()
+            .map(|message| message.plaintext)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "committed before batch failure".to_owned(),
+            "still queued after batch failure".to_owned(),
+        ]),
     );
     drop(bob);
     drop(app_bob);
 
     let app_bob_recovered = open_store(&batch.bob_dir, &batch.relay_url, None);
     let mut bob_recovered = app_bob_recovered.client("bob").await.unwrap();
-    let recovered = bob_recovered.sync().await.unwrap();
-    assert_eq!(
-        recovered.messages.len(),
-        2,
-        "every durable engine output from the failed checkpoint must replay after reopen"
-    );
-    drop(bob_recovered);
-    drop(app_bob_recovered);
-
-    let app_bob_acknowledged = open_store(&batch.bob_dir, &batch.relay_url, None);
-    let mut bob_acknowledged = app_bob_acknowledged.client("bob").await.unwrap();
     assert!(
-        bob_acknowledged.sync().await.unwrap().messages.is_empty(),
-        "the replayed message must be acknowledged exactly once"
+        bob_recovered.sync().await.unwrap().messages.is_empty(),
+        "already-reported native outputs must not replay after reopen"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_checkpoint_retries_once_on_retained_client() {
+async fn native_prefix_reports_once() {
     let batch = pending_two_message_batch().await;
     let app_bob = open_store_with_boundary_failure(&batch.bob_dir, &batch.relay_url, 1);
     let mut bob = app_bob.client("bob").await.unwrap();
@@ -316,14 +288,14 @@ async fn failed_checkpoint_retries_once_on_retained_client() {
     let failure = bob
         .sync_with_partial_progress()
         .await
-        .expect_err("the accumulated batch checkpoint must fail");
-    assert!(failure.partial_summary.messages.is_empty());
+        .expect_err("the final drain checkpoint must fail");
+    assert_eq!(failure.partial_summary.messages.len(), 2);
 
     let recovered = bob
         .sync_with_partial_progress()
         .await
         .expect("the retained projection and outbox acknowledgements retry");
-    assert_eq!(recovered.messages.len(), 2);
+    assert!(recovered.messages.is_empty());
     assert!(
         bob.sync_with_partial_progress()
             .await

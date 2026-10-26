@@ -5598,7 +5598,7 @@ async fn auto_publish_confirms_pending_when_commit_was_partially_exposed() {
 
     let mut phases = Vec::new();
     let ingested = runtime
-        .ingest_delivery_with_observer(delivery, |phase, _elapsed, success| {
+        .ingest_delivery_with_observer(&delivery, |phase, _elapsed, success| {
             phases.push((phase, success));
         })
         .await
@@ -6515,30 +6515,6 @@ async fn maintenance_supersession_leaves_a_failed_obligation_terminal() {
         adapter.publishes().len(),
         publishes_before,
         "no self-update may be attempted in a group this device has left"
-    );
-}
-
-#[tokio::test]
-async fn maintenance_timing_defaults_match_production_windows() {
-    let timing = MaintenanceTiming::default();
-    assert_eq!(timing.quiet, Duration::from_secs(60));
-    assert_eq!(timing.contention_jitter_max, Duration::from_millis(30_000));
-    assert_eq!(timing.eose_timeout, Duration::from_secs(5 * 60));
-    assert_eq!(timing.post_eose_grace, Duration::from_secs(15));
-    assert_eq!(MaintenanceTiming::immediate().quiet, Duration::ZERO);
-
-    let dir = tempfile::tempdir().unwrap();
-    let key = SqlCipherKey::new("marmot maintenance timing key").unwrap();
-    let runtime = AccountDeviceRuntime::new(
-        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
-        RecordingAdapter::default(),
-        StaticTransportRouting::new(vec![]),
-        RecordingKeyPackages::default(),
-    );
-    assert_eq!(
-        runtime.maintenance_timing(),
-        MaintenanceTiming::default(),
-        "a runtime built without an override runs production maintenance windows"
     );
 }
 

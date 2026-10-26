@@ -287,6 +287,7 @@ pub(crate) fn obligation_cause(cause: RecoveryCause) -> RecoveryObligationCause 
         RecoveryCause::ExplicitHistory => RecoveryObligationCause::ExplicitHistory,
         RecoveryCause::KnownEvent => RecoveryObligationCause::KnownEvent,
         RecoveryCause::IncrementalHistory => RecoveryObligationCause::IncrementalHistory,
+        RecoveryCause::SubscriptionReplay => RecoveryObligationCause::SubscriptionReplay,
     }
 }
 
@@ -665,52 +666,13 @@ impl AppClient {
                     next_attempt,
                     progress: settled.progress,
                     scopes_total: count(obligation.scopes.len()),
-                    scopes_certified: settled.scopes_certified.min(count(obligation.scopes.len())),
+                    scopes_certified: if obligation.cause == RecoveryCause::SubscriptionReplay {
+                        0
+                    } else {
+                        settled.scopes_certified.min(count(obligation.scopes.len()))
+                    },
                     quiet_passes,
                     park_after_quiet_passes: storage_sqlite::RECOVERY_PARK_AFTER_QUIET_PASSES,
-                },
-            );
-        }
-    }
-
-    /// Record the relay plane's finished lag-lost EOSE repairs for this
-    /// account, one row per pass. The repair only queued its report, so it
-    /// never waited on audit. Without a v5 recorder this account still
-    /// discards its own reports, so a later enable does not replay stale
-    /// passes, but leaves shared-receiver reports for an account that can
-    /// record them.
-    pub(crate) fn record_eose_repair_reports(&self) {
-        let recording = self.audit_v5_enabled();
-        let reports = self
-            .relay_plane
-            .take_eose_repair_reports(self.adapter.account_id(), recording);
-        if reports.is_empty() || !recording {
-            return;
-        }
-        for report in reports {
-            let summary = report.summary;
-            self.runtime.session().record_audit_event(
-                None,
-                None,
-                AuditEventKind::SubscriptionEoseRepaired {
-                    receiver: if report.scope.is_some() {
-                        marmot_forensics::EoseRepairReceiver::Account
-                    } else {
-                        marmot_forensics::EoseRepairReceiver::Shared
-                    },
-                    trigger: if report.follow_up {
-                        marmot_forensics::EoseRepairTrigger::FollowUp
-                    } else {
-                        marmot_forensics::EoseRepairTrigger::NotificationLag
-                    },
-                    lags: report.lags,
-                    awaiting_relays: count(summary.awaiting_relays),
-                    complete_relays: count(summary.complete_relays),
-                    reissued_relays: count(summary.reissued_relays),
-                    reissued_earlier_relays: count(summary.reissued_earlier_relays),
-                    failed_relays: count(summary.failed_relays),
-                    follow_up_scheduled: report.follow_up_scheduled,
-                    dropped_before: report.dropped_before,
                 },
             );
         }

@@ -490,7 +490,6 @@ fn retention_sweep_status_name(status: RetentionSweepStatus) -> &'static str {
         RetentionSweepStatus::Pruned => "pruned",
         RetentionSweepStatus::DeferredClockSkew => "deferred_clock_skew",
         RetentionSweepStatus::DeferredUnread => "deferred_unread",
-        RetentionSweepStatus::DeferredScanExhausted => "deferred_scan_exhausted",
         RetentionSweepStatus::Failed => "failed",
     }
 }

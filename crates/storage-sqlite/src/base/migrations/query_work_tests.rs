@@ -353,13 +353,13 @@ fn replay_query_work() {
         measured(&store, "duplicate reconciliation", 120, || {
             store
                 .app_storage()
-                .record_transport_reconciliation_item(
+                .record_reconciliation_items(std::iter::once((
                     &crate::TransportReconciliationRoute::Inbox,
                     &crate::TransportReconciliationItem {
                         event_id: format!("{count:032x}").into_bytes().try_into().unwrap(),
                         created_at: now,
                     },
-                )
+                )))
                 .unwrap();
         });
         let retained: i64 = store

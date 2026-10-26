@@ -34,8 +34,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (timeline/group projection accessors, the `*_for_group` component reads, the
   kind-1210 group-system row synthesis, and the local-send projection helpers), `receipts.rs` (the synchronized
   transport receipt view, release-journal consumption, and seen-index maintenance), `push.rs` (push-token registration
-  and notification-trigger publishing), `retention.rs` (the engine-owned retention sweep policy, bounded timeline scan,
-  per-group outcome orchestration, and classifier tests), `history_notices.rs` ("history may be incomplete"
+  and notification-trigger publishing), `retention.rs` (the engine-owned retention sweep policy, the
+  storage-answered expiry/unread scan, per-group outcome orchestration, and decision tests), `history_notices.rs` ("history may be incomplete"
   notices, their worker-owned dismissal and the notice-change baseline; the public DTOs and opaque id codec live
   in the crate-root `src/history_notices.rs`), and `audit.rs` (audit-context construction, the local/observed
   `human_action` recorders, and the `ObservedHumanActionAudit` descriptor). Private items referenced across these files
@@ -69,13 +69,37 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
 - `runtime/attachment_storage.rs` is Manage storage (mdk#2314 step 5): usage and largest-first listings across both
   body layouts, and bulk removal that is exactly explicit `Remove`. Every removal path (bulk or `control_attachment`)
   unlinks the media files its transaction released through `unlink_released` before returning; never leave that to the
-  sweep.
+  sweep. The opt-in "Keep media" setting (mdk#2314 step 10) reuses that removal, recorded as cleaned by the setting:
+  its setter sweeps to completion before returning, and the worker's maintenance batch sweeps at start and hourly for
+  at most `KEEP_MEDIA_SWEEP_BUDGET`, before the legacy move. Automatic demand goes through
+  `request_automatic_acquisition` (which skips slots past the window); explicit requests never do.
 - `media/legacy_migration.rs` moves legacy database bodies into the media store (mdk#2314 step 6): one bounded batch per
   maintenance tick, started by the account worker on the blocking pool after readiness. Each body is admitted with
   `DiskPolicy::migration_need`, published, then its rows dropped; the smallest body that does not fit pauses the move
   (reported as `Paused { needed_bytes }`, never by deleting anything), and a body that fails its digest or is malformed
   as stored is dropped so its slot shows as unavailable with download-again allowed. The per-account
   `LegacyMigrationProgress` lives in `MarmotApp` and is dropped with the account's media store.
+- `media/avatar_files.rs` keeps avatar and group-image bodies in the media store's cache category (mdk#2314 step 9),
+  always on the blocking pool: a fetched image is admitted with `DiskPolicy::cache_need` and published with its
+  attempt settled in the same commit (no room retries the fetch later); reads take file-backed images from the store
+  and report a missing or corrupt file so every owner sharing it refetches; and the maintenance tick moves images
+  still held in the database into files after the attachment batch, smallest first. An identical ready file is
+  attached at no space cost (the move verifies it first, since its commit drops the database copy). When the next
+  image needs a new file the disk cannot take, or free space cannot be measured, the batch stops and the next tick
+  tries again; never delete an owner to make room.
+- `media/storage_compaction.rs` returns the account database's freed pages to the filesystem (mdk#2314 step 6) on the
+  blocking pool: the one-time compaction runs only through `compaction_gate` (a quarter of the file free, the reserve
+  plus two live copies free on the volume, and a live database of at most 64 MiB: the `VACUUM` copy is built in
+  memory, and its final write-back cannot be interrupted, so the cap bounds how long a close can wait for it; an
+  account over the cap with no legacy bodies left is logged once per process, as a power-of-two MiB bucket), at most once per worker ownership (a rolled-back one is retried, at most three times), never while a
+  migration batch runs. The maintenance task (never awaited) checks the gates every tick and only flags a due
+  compaction; the account worker awaits it from its maintenance tick only when flagged, so a tick with nothing due
+  costs the worker nothing and none of its synchronous storage calls park an async thread on the held connection, and
+  `Compacting` is served from a usage snapshot so hosts never wait on it. Afterwards `reclaim` runs after every
+  migration batch and bulk removal, settling any WAL truncate the storage records as owed; the first pass of each
+  worker ownership truncates once on an incremental database, since a truncate owed when a process ended is recorded
+  nowhere. `close_storage` calls `begin_close` on every database before closing media stores:
+  a sweep blocked behind a compacting connection holds its store's sweep lock until the VACUUM, which polls the close latch, stops.
 - `media/handoff.rs` owns handoff leases (mdk#2314 step 4): the only plaintext attachment files MDK writes, decrypted from a
   retained body (either layout) into `<account>/handoff/<lease>/<name>` for an OS surface that needs a real file.
   Register a lease before its directory exists, delete only on explicit release or by `wipe_stale` (worker start,
@@ -120,8 +144,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   the checkpoint commits, the notice publication seam and dismissal, and cursor commits after their save succeeds.
   Never add a row per scheduler evaluation, per live ingest, or on the router path; the router only counts
   placements. Rows are best effort: an audit-only read that fails skips the row, never the recovery step. The
-  relay plane's lag-lost EOSE repair only queues a bounded `EoseRepairReport`; the worker's
-  `publish_history_notice_changes` seam records it as `subscription_eose_repaired`. The same seam drains the
+  account owner's native input goal uses cause `subscription_replay` in those existing rows, without loss
+  charges or history certificates. `subscription_eose_repaired` remains historical decoding only. The publication seam drains the
   adapter's queued subscription refusals (`take_subscription_refusals`) into one `subscription_refused` row. Scenario
   tests live in
   `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
@@ -176,23 +200,30 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   migration marker or a missing verdict always re-runs the recovery probe, so the mdk#568 crash windows keep their
   self-heal. Key presentation and the passphrase KDF work factor follow the decision record in
   `docs/marmot-architecture/storage-format-v2.md`.
-- Keep the user-directory domain in the `src/directory/` module instead of regrowing `src/lib.rs`. It splits along these
-  seams: `records.rs` (the public `UserDirectory*`/`UserProfileMetadata`/`DirectoryKeyPackage` DTOs surfaced to
-  `marmot-uniffi`/`cli`, plus the stateless record helpers — cached <-> shared record conversion, recency selection,
-  Nostr profile/follow-list parsing, search-match ranking, and `profile_content_json` — which hold no `MarmotApp`
-  state), `methods.rs` (the split `impl MarmotApp` block: relay-list/profile/key-package/follow-list fetches, the
-  public `directory_*`/`*_user_directory` API, directory-cache lifecycle, and in-memory directory-record hydration),
-  `cache.rs` (the per-account SQLCipher directory cache, with its independent numbered migration runner in
-  `cache/migrations.rs`, frozen initial schema in `cache/v1.sql`, the public event preview table in `cache/v2.sql`, and populated/interrupted-upgrade
-  tests in `cache/assurance_tests.rs` using the historical `cache/fixtures/pre_ledger.sql` fixture), and `sync.rs` (the directory-subscription sync worker and
-  plan). `mod.rs` re-exports the DTOs so the `marmot_app::...` paths stay stable; private items referenced across these
-  files (and from `tests.rs`/sibling test modules) are widened to `pub(crate)`, never narrowed.
-- Keep stateless account relay-list and KeyPackage parsing/validation (relay-list status, KeyPackage tag/metadata
-  validation, fresh-vs-cached reconciliation, record merge, publish-endpoint selection) in
-  `src/key_package_records.rs`. They hold no `MarmotApp` state.
+- The user directory is the [`nostr-directory`](../nostr-directory/AGENTS.md) crate; `src/lib.rs` re-exports its
+  types at their `marmot_app::...` paths. This crate keeps the resources the directory reaches through traits:
+  `src/directory_resources.rs` implements `DirectoryResources` and `DirectoryObserver` over the per-account cache
+  lifecycle, label-based account resolution and product analytics, and builds the service with `directory()`;
+  `src/user_blocks.rs` implements `BlockListSink`; publishing the account's own profile and follow list is
+  `src/profile_publication.rs`. `directory()` builds a fresh service on each call with `DirectoryConfig` read from the
+  app's configuration; anything the directory keeps between calls lives in `directory_state`, never in `directory()`.
+- Callers reach the directory through `app.directory()`, whose methods return `DirectoryError`; `MarmotApp` has no
+  directory delegates. `From<DirectoryError> for AppError` in `src/error.rs` restores the variant, message and
+  `privacy_safe_kind` the directory reported before it had its own type, so app paths that return `AppError` convert
+  with `?`; `error::directory_error_tests` covers every variant. The CLI, agent connector and bindings convert
+  `DirectoryError` through `AppError` too, so their error codes don't depend on which layer failed.
+- Directory tests that need a real `MarmotApp` or runtime live in `src/directory_tests/`, one module per directory
+  file; tests that need only the directory live in `nostr-directory`. They reach directory internals through its
+  `test-support` feature (enabled here as a dev-dependency only): gated root re-exports and `_for_test` wrappers. The
+  account's own KeyPackage inventory, record merge and publish-endpoint selection stay in
+  `src/key_package_records.rs`, and the group-id helpers in `src/ids.rs`; both re-export only the directory helpers
+  the app's own code uses.
 - Keep the crate root focused on app construction, shared state, storage/projector wiring, account relay-list helpers,
-  the shared directory-record selection primitives (`DirectoryFreshness`, `DirectorySelection`, `sort_directory_records`)
-  reused by `key_package_records.rs`, and public re-exports.
+  and public re-exports.
+- Never publish an account relay list from the cache alone. `ensure_local_account_relay_lists`, which every KeyPackage
+  publish, setup publish and rotation runs first, leaves an open generated setup's lists to that setup (mdk#2359);
+  otherwise it adopts the published lists through `resolve_account_relay_list_status_for_account_id` and publishes only
+  a kind a complete read proved absent (mdk#2550).
 - Keep CLI/TUI presentation out of this crate.
 - Keep the Nostr user directory app-facing and pubkey-keyed. It may cache local-account links, profile metadata, follow
   lists, relay lists, and KeyPackages. Web-of-trust search may traverse the live follow graph, but traversal is bounded
@@ -212,9 +243,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   no inline executor. Runtime catch-ups (`SyncMode::Drain`) only drain the live queue and never run a job, so
   they cross a worker-owned job (mdk#2110); `sync()` drains, then runs one job in place; nothing
   re-subscribes to recover history, and only startup, a frozen wake or an unactivated client installs live
-  subscriptions. The job's one non-comparison fetch is the epoch-gap window (`fetch_epoch_gap_window`, mdk#2256): the
-  newest events of an epoch-gap group route from the relays that failed without answering its comparison. Never run it
-  while a compared relay still owes older history (#2086), keep only pages a relay ended itself, and admit the route's
+  subscriptions. Its epoch-gap window (`fetch_epoch_gap_window`, mdk#2256/#2257) pages backwards from relays that
+  failed without answering comparison, using raw counts/timestamps before SDK filtering and bounded advisory hints.
+  Admit only completed oldest pages; cuts and saturated seconds release no newer suffix. Held-only traversal never
+  resets pacing or durable parking, even after hint eviction or client reconstruction. Keep original comparison
+  stability and SQL fences. Never fetch ahead of older comparison backlog, and admit the route's
   comparison and window events together oldest first. Window events (`PendingSource::Window`) must not touch the
   route's certificate, replay cursor or admission verdict. Explicit full-history repair runs the job in place: one comparison pass over every route of its
   grant inside the repair budget. It never reports complete: history below the retained window is unsearched
@@ -240,23 +273,37 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   loss with the REQ floor its SDK context reported at the lag, and enqueue the generation's control record. Only an
   unexpected consumer exit closes the route and sends the worker through reconnect (mdk#2070). The worker persists
   notification loss before waiting for its control record.
-- A lag may also lose end-of-stored-events. Never mark EOSE complete at a lag: live cursor promotion
-  would advance the cursor while a relay was still sending history. The lag schedules the adapter's `reissue_subscriptions_awaiting_eose` for its
-  receiver's scope, marked at the lag, to run once the receiver has gone `NOTIFICATION_LAG_EOSE_REPAIR_SETTLE`
-  without another lag. A later lag postpones it. Re-issuing earlier restarts replays still arriving. A repair that
-  leaves relays unrepaired (`EoseReissueSummary::failed_relays`) schedules itself again the same way, for the same lag
-  mark.
+- AccountRecoveryOwner owns the SubscriptionReplay goal, original unresolved windows, retry and completion.
+  Synchronize borrowed source observations at lifecycle, grant, checkpoint and worker-watch seams. Preserve
+  unresolved floors across cancellation/reopen; an unfloored query must not become a recent tail. Capture only
+  current sources authorized by the frozen selected grant, through the existing credited comparison job.
+  Passive replay_admitted needs current-epoch full-range placement and no pending bytes/nondurable spill;
+  it spends no retry credit and never qualifies history, maintenance, known-event or real loss predicates.
+  Empty silence is not notification loss. No adapter/relay-plane quiet repair scheduler or alternate owner.
+- Register `ReplayIngress` before activation, seeding durable group spill rows before native source release.
+  Admit complete group batches through the owner's ordinary recovered-ingest path, sharing four actual
+  ingests per turn with comparison input, never through live/spill alternation. Select the oldest known
+  same-group frame across both sources; a pending native range fences that group, not independent groups.
+  Borrow each frame until ACK; cancellation or loan revocation leaves the frame
+  retained. Native batches keep holding the cursor, but acquired ranges spend no new network retry credit
+  while draining. Keep retained spill receipt settlement and independent-group turns.
 - Move `checkpointed_transport_timestamp` only through `AppClient::seal_transport_cursor`, never straight to
-  `state.last_transport_timestamp`. The seal runs under the lock the router places each delivery under, so it is the
-  commit's one decision point: it returns nothing while loss or a spill hand-off is pending, caps the commit at the
+  `state.last_transport_timestamp`. The seal holds adapter admission stable through the router's placement lock,
+  importing any discarded replay into the existing loss fence before deciding. It returns nothing while staged,
+  releasing or not-yet-placed replay, loss, or a spill hand-off is pending, and caps the commit at the
   lowest delivery a restart still fetches that is queued or taken and not yet released, and raises the restart floor
   before the save, so the router spills a delivery that arrives during the save and falls below it; before the
-  account's first settled floor that is every older delivery. A live ingest promotes with its own save only after every
-  account subscription reported EOSE and once the account has a settled floor, and leaves the floor raised. A drain
+  account's first settled floor that is every older delivery. A live ingest promotes with its own save only when
+  the owner's completed/explicitly retired native goal matches the guarded source generation and the account
+  has a settled floor, and leaves the floor raised. A drain
   checkpoint, settled loss or retired notice confirms what its seal reached with `settle_transport_cursor` once its save
   succeeds, which ends the spilling. Every failed save undoes its seal with `abandon_transport_cursor`. Keep every
   condition cursor safety relies on inside the seal: anything read before an `.await` or a save is stale by the time
   that save commits. See `docs/marmot-architecture/further-context/account-recovery.md` section 6.
+- With no durable transport cursor, activation requests retained history rather than inventing a recent-tail floor.
+  A trusted cursor keeps its configured rewind, bounded by unresolved original native windows. All-relay EOSE
+  remains separate from the owner's limited native admission; a silent peer alone must not prevent a seal once
+  available replay is placed and the matching native goal is completed or explicitly retired.
 - Every path that takes a delivery from the account queue calls `release_account_delivery` once its ingest returns
   `Ok`, or when it skips the delivery as already held, and before the save that follows. Never release on an ingest
   error: the key must keep capping the checkpoint that failure runs, because newest-first replay has usually remembered
@@ -322,7 +369,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `deployment.rs` (`MarmotDeployment`: the deployment services, with `neutral()` and the White Noise preset; the one
   place White Noise's values are defined), `error.rs`,
   `close_registry.rs` (terminal-close closures for runtime-owned handles outside the storage caches),
-  `ids.rs` (npub/nprofile/account-ref helpers), `drafts.rs` (encrypted per-account composer drafts),
+  `ids.rs` (group-id and admin-key helpers; it wraps the npub/nprofile/account-ref helpers in `nostr-directory`'s `ids.rs`), `drafts.rs` (encrypted per-account composer drafts),
   `chat_presentation.rs` + `chat_presentation/` (shared selected-chat presentation policy and maintenance),
   `conversation_presentation/` (C5 header, capability, and window selectors; they never subscribe, acknowledge
   reads, or fetch media), `local_submissions.rs` + `local_submissions/` (durable device-local send admission and host
@@ -332,8 +379,7 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `moderation_reports/tests.rs`), `history_notices.rs` (public notice DTOs and opaque id codec),
   `notifications.rs` (push platform, triggers, settings), `external_signer.rs` (`ExternalAccountSigner` and the
   internal `AccountSigner`), `nostr_secret.rs` (secret-key shape classification shared with CLI/UniFFI),
-  `nostr_verification.rs` (stateless public-event verification), `public_event_preview.rs` (verified previews of
-  `nostr:` references, stored in the directory cache; tests in `public_event_preview/tests.rs`), `profile_pseudonyms.rs` (cosmetic display names; not a
+  `nostr_verification.rs` (stateless public-event verification), `profile_pseudonyms.rs` (cosmetic display names; not a
   security primitive), `publisher_sequences.rs` (QUIC preview publisher lifecycle state), `agent_streams.rs` (agent
   stream watch DTOs and manager), `root_runtime_lease.rs` (cross-process exclusive root lease), `app_telemetry.rs` +
   `app_telemetry/` (aggregate app-performance telemetry; same privacy model as relay telemetry), `product_analytics/`
@@ -353,9 +399,6 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   job).
 - The shared relay plane is the [`transport-nostr`](../transport-nostr/AGENTS.md) crate; name its items as
   `transport_nostr::`.
-- `src/directory/`: also `cached_search.rs` (network-free cross-account search), `search.rs` (streaming web-of-trust
-  search), `open_ranking.rs` (bounded Vertex Open Ranking discovery), `member_key_packages.rs` (set-oriented roster
-  KeyPackage resolution for create/invite).
 - `src/sqlcipher/open_lock.rs`: in-process same-file open exclusion (the root lease covers cross-process).
 - Integration tests in `tests/` (with `tests/support/` and `tests/fixtures/`); media benchmarks in `benches/` (require
   `media-benchmarks`); `examples/usage_diagnostics_staging/`.
@@ -390,8 +433,7 @@ every thread its stack (`thread_stack_size`). Only a test that needs one thread 
 `#[tokio::test(start_paused = true)]` for a clock paused from the start (Tokio allows that only on the current-thread
 runtime), otherwise `flavor = "current_thread"`, `run_composed_app_runtime_test_on_one_thread`, or
 `Builder::new_current_thread()` with a `//` comment on the line above saying why.
-`async_suites_choose_their_tokio_flavor` rejects a bare `#[tokio::test]` and any of those one-thread pins without that
-comment. When a multi-thread test waits for an effect, wait for the state it expects rather than the next event: other
+When a multi-thread test waits for an effect, wait for the state it expects rather than the next event: other
 tasks run between your steps, and window subscriptions keep only the latest snapshot. `Notify::notify_waiters` reaches
 only waiters already registered, so a fixture signal either uses `notify_one`'s permit or the waiter `enable()`s its
 `notified()` before announcing it waits.

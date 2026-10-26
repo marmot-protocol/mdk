@@ -2391,6 +2391,7 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
             .complete
     );
     let directory_entry = app
+        .directory()
         .directory_entry_for_account_id(&created.account.account_id_hex)
         .unwrap()
         .expect("directory entry");
@@ -2436,6 +2437,7 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
     );
 
     let fetched = app
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
             vec![endpoint(&url)],
@@ -2447,12 +2449,13 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
         created.key_package_bytes.unwrap()
     );
     assert_eq!(
-        app.fetch_current_follow_list_for_account_id(
-            &created.account.account_id_hex,
-            vec![endpoint(&url)],
-        )
-        .await
-        .unwrap(),
+        app.directory()
+            .fetch_current_follow_list_for_account_id(
+                &created.account.account_id_hex,
+                vec![endpoint(&url)],
+            )
+            .await
+            .unwrap(),
         Some(Vec::new()),
         "a new identity should publish a kind-3 event with no p tags"
     );
@@ -2555,6 +2558,7 @@ async fn runtime_profile_publish_preserves_unknown_kind0_fields() {
     assert_eq!(updated.extra.get("bot"), Some(&serde_json::json!(false)));
 
     let fetched = app
+        .directory()
         .fetch_current_user_profile_for_account_id(
             &created.account.account_id_hex,
             vec![endpoint(&url)],
@@ -2614,6 +2618,7 @@ async fn fetch_and_refresh_profile_inherit_extra_field_bounds_from_shared_parser
 
     let publisher_hex = publisher.public_key().to_hex();
     let fetched = fetch_app
+        .directory()
         .fetch_current_user_profile_for_account_id(&publisher_hex, vec![endpoint(&url)])
         .await
         .unwrap()
@@ -2653,10 +2658,12 @@ async fn fetch_and_refresh_profile_inherit_extra_field_bounds_from_shared_parser
         .await
         .unwrap();
     fetch_app
+        .directory()
         .refresh_profile_for_account_id(&publisher_hex, vec![endpoint(&url)])
         .await
         .unwrap();
     let refreshed = fetch_app
+        .directory()
         .directory_entry_for_account_id(&publisher_hex)
         .unwrap()
         .expect("refresh cached the inbound profile")
@@ -2688,6 +2695,7 @@ async fn app_runtime_republish_key_package_resends_exact_current_event() {
     )
     .await;
     let first = app
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
             vec![endpoint(&url)],
@@ -2715,6 +2723,7 @@ async fn app_runtime_republish_key_package_resends_exact_current_event() {
         .unwrap()
         .expect("republish must keep lifecycle state");
     let relay_after_republish = app
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
             vec![endpoint(&url)],
@@ -2789,6 +2798,7 @@ async fn app_runtime_republish_key_package_resends_exact_current_event() {
         .unwrap()
         .expect("restart must retain lifecycle state");
     let relay_after_restart = restarted_app
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
             vec![endpoint(&url)],
@@ -2846,6 +2856,7 @@ async fn app_runtime_republish_key_package_resends_exact_current_event() {
         .unwrap()
         .expect("rotation must promote lifecycle state");
     let relay_after_rotation = restarted_app
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
             vec![endpoint(&url)],
@@ -2894,6 +2905,7 @@ async fn key_package_fetch_rejects_future_event_and_keeps_cached_package() {
     )
     .await;
     let cached = app
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
             vec![endpoint(&url)],
@@ -2912,6 +2924,7 @@ async fn key_package_fetch_rejects_future_event_and_keeps_cached_package() {
     .await;
 
     let fetched = app
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
             vec![endpoint(&url)],
@@ -2947,6 +2960,7 @@ async fn app_runtime_can_rotate_key_package_on_request() {
     )
     .await;
     let first = app
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
             vec![endpoint(&url)],
@@ -2959,6 +2973,7 @@ async fn app_runtime_can_rotate_key_package_on_request() {
         .await
         .unwrap();
     let rotated = app
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
             vec![endpoint(&url)],
@@ -2970,6 +2985,7 @@ async fn app_runtime_can_rotate_key_package_on_request() {
         .await
         .unwrap();
     let republished = app
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
             vec![endpoint(&url)],
@@ -3247,6 +3263,7 @@ async fn app_runtime_rotate_publishes_key_package_to_nip65_outbox_relays() {
     let bob = home.account("bob").unwrap().account_id_hex;
     let rotated_bytes = runtime.rotate_key_package("bob").await.unwrap();
     let fetched = app
+        .directory()
         .fetch_latest_key_package_for_account_id(&bob, vec![endpoint(&url)])
         .await
         .unwrap();
@@ -3307,6 +3324,7 @@ async fn app_runtime_ignores_invalid_legacy_json_cache_when_publishing() {
         .await
         .unwrap();
     let published = app
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
             vec![endpoint(&url)],
@@ -6922,6 +6940,7 @@ async fn directory_sync_worker_ingests_profile_metadata_events() {
     timeout(Duration::from_secs(5), async {
         loop {
             let name = app
+                .directory()
                 .directory_entry_for_account_id(&setup.account.account_id_hex)
                 .unwrap()
                 .and_then(|entry| entry.profile)
@@ -6971,6 +6990,7 @@ async fn directory_sync_worker_caches_follow_edges_without_promoting_follows() {
     timeout(Duration::from_secs(5), async {
         loop {
             let cached_follow = app
+                .directory()
                 .directory_entry_for_account_id(&setup.account.account_id_hex)
                 .unwrap()
                 .is_some_and(|entry| entry.follows.contains(&followed));
@@ -6984,7 +7004,8 @@ async fn directory_sync_worker_caches_follow_edges_without_promoting_follows() {
     .expect("follow edge cached on the account's own directory entry");
 
     assert!(
-        app.directory_entry_for_account_id(&followed)
+        app.directory()
+            .directory_entry_for_account_id(&followed)
             .unwrap()
             .is_none(),
         "ingested follows must not be promoted into known directory entries"
@@ -9507,6 +9528,152 @@ async fn retained_media_rehydrates_a_retired_current_epoch_before_the_group_adva
     assert_eq!(download.plaintext, retained_plaintext);
 }
 
+/// mdk#2425: the sweep and the unread projection must agree on the full read
+/// cursor. Two received messages in one wall-clock second are separated only
+/// by message id; classifying the sweep by time alone pruned the one above
+/// the marker even while the projection still counted it unread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sweep_keeps_unread_message_in_read_marker_wall_second() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let (_relay, app, _url) = mock_app(&dir).await;
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice
+        .create_group("read cursor retention", &["bob"])
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    bob.sync().await.unwrap();
+    alice
+        .update_message_retention(&group_id, 24 * 60 * 60)
+        .await
+        .unwrap();
+    sync_to_epoch(
+        &mut bob,
+        &group_id,
+        alice.group_mls_state(&group_id).unwrap().epoch,
+    )
+    .await;
+
+    let bob_timeline = |app: &MarmotApp| {
+        app.timeline_messages_with_query(
+            "bob",
+            TimelineMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap()
+        .messages
+    };
+
+    // Two chat messages inside one wall-clock second. Sends land away from a
+    // second boundary; retry if one slipped between the pair anyway.
+    let mut same_second_pair = None;
+    for _attempt in 0..10 {
+        loop {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            if (200..=700).contains(&(now_ms % 1_000)) {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        let first = alice
+            .send(&group_id, b"cursor pair first")
+            .await
+            .unwrap()
+            .message_ids;
+        let second = alice
+            .send(&group_id, b"cursor pair second")
+            .await
+            .unwrap()
+            .message_ids;
+        let first_id = first.into_iter().next().expect("send accepted");
+        let second_id = second.into_iter().next().expect("send accepted");
+        bob.sync().await.unwrap();
+        let messages = bob_timeline(&app);
+        let first_at = messages
+            .iter()
+            .find(|message| message.message_id_hex == first_id)
+            .map(|message| message.timeline_at);
+        let second_at = messages
+            .iter()
+            .find(|message| message.message_id_hex == second_id)
+            .map(|message| message.timeline_at);
+        if first_at.is_some() && first_at == second_at {
+            same_second_pair = Some((first_id, second_id));
+            break;
+        }
+    }
+    let (first_id, second_id) =
+        same_second_pair.expect("ten mid-second send attempts land a same-second pair");
+    let (read_id, unread_id) = if first_id < second_id {
+        (first_id, second_id)
+    } else {
+        (second_id, first_id)
+    };
+
+    app.mark_timeline_message_read("bob", &group_id_hex, &read_id)
+        .unwrap();
+    let bob_row = app
+        .chat_list("bob", false)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.group_id_hex == group_id_hex)
+        .expect("bob has the chat row");
+    assert_eq!(bob_row.unread_count, 1);
+    assert_eq!(
+        bob_row.first_unread_message_id_hex.as_deref(),
+        Some(unread_id.as_str())
+    );
+
+    let sweep_now_ms = (bob_timeline(&app)
+        .iter()
+        .find(|message| message.message_id_hex == unread_id)
+        .and_then(|message| message.retention_expires_at)
+        .expect("retention decision pins an expiry")
+        + 6)
+        * 1_000;
+    let report = bob.sweep_expired_retention(sweep_now_ms).unwrap();
+    let outcome = report
+        .groups
+        .iter()
+        .find(|outcome| outcome.group_id_hex == group_id_hex)
+        .expect("sweep reports the group");
+    assert_eq!(outcome.status, RetentionSweepStatus::DeferredUnread);
+    assert!(
+        bob_timeline(&app)
+            .iter()
+            .any(|message| message.message_id_hex == unread_id),
+        "the message the projection counts unread must survive the sweep"
+    );
+
+    app.mark_timeline_message_read("bob", &group_id_hex, &unread_id)
+        .unwrap();
+    let report = bob.sweep_expired_retention(sweep_now_ms).unwrap();
+    let outcome = report
+        .groups
+        .iter()
+        .find(|outcome| outcome.group_id_hex == group_id_hex)
+        .expect("sweep reports the group");
+    assert_eq!(outcome.status, RetentionSweepStatus::Pruned);
+    assert!(outcome.pruned_messages >= 2);
+    assert!(
+        !bob_timeline(&app)
+            .iter()
+            .any(|message| message.message_id_hex == unread_id),
+        "once read, the expired pair prunes"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() {
     let dir = tempfile::tempdir().unwrap();
@@ -9533,9 +9700,7 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
         .iter()
         .map(|endpoint| endpoint.base_url.as_str())
         .collect::<Vec<_>>();
-    // Host builds may compile in MARMOT_ENCRYPTED_MEDIA_BLOB_ENDPOINTS, which
-    // the default configuration lays over the White Noise servers, so expect
-    // whichever list the client actually embeds.
+    // The White Noise configuration signs its media servers into new groups.
     let expected_endpoints = marmot_app::MarmotAppConfig::white_noise()
         .deployment
         .new_group_media_endpoints;
@@ -9590,6 +9755,63 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
         // WHATWG normalization (group-encrypted-media-v1.md) serializes an empty
         // path as `/`, so the stored canonical endpoint URL carries the slash.
         "https://media.example/"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_neutral_deployment_creates_text_only_groups_and_refuses_group_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    home.create_account("bob").unwrap();
+
+    let (_relay, url) = mock_relay().await;
+    // The default deployment is neutral: no media or group-image servers, and
+    // nothing falls back to White Noise's.
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url,
+        MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+
+    let mut alice = app.client("alice").await.unwrap();
+    let group_id = alice.create_group("text only", &["bob"]).await.unwrap();
+    let group = app
+        .group("alice", &hex::encode(group_id.as_slice()))
+        .unwrap()
+        .unwrap();
+    assert!(
+        group.encrypted_media.data_hex.is_empty()
+            && group.encrypted_media.default_blob_endpoints.is_empty(),
+        "a neutral deployment must sign no encrypted-media component into a new group"
+    );
+    alice.send(&group_id, b"text still sends").await.unwrap();
+
+    let endpoint_error = alice
+        .replace_encrypted_media_blob_endpoints(
+            &group_id,
+            vec![marmot_app::AppBlobEndpoint {
+                locator_kind: "blossom-v1".to_owned(),
+                base_url: "https://media.example".to_owned(),
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        endpoint_error
+            .to_string()
+            .contains("no encrypted-media servers"),
+        "{endpoint_error}"
+    );
+    let image_error = alice
+        .update_group_image(&group_id, b"image bytes".to_vec(), "image/png")
+        .await
+        .unwrap_err();
+    assert!(
+        image_error.to_string().contains("no group-image server"),
+        "{image_error}"
     );
 }
 
@@ -9732,6 +9954,7 @@ async fn relay_app_publishes_account_relay_lists_for_setup() {
 
     let account_id = home.account("alice").unwrap().account_id_hex;
     let fetched = app
+        .directory()
         .fetch_account_relay_list_status_for_account_id(&account_id, vec![endpoint(&seed_url)])
         .await
         .unwrap();
@@ -9841,6 +10064,7 @@ async fn relay_list_fetch_only_uses_requested_bootstrap_relays_without_cache() {
 
     let account_id = home.account("alice").unwrap().account_id_hex;
     let missing_from_seed_b = app
+        .directory()
         .fetch_account_relay_list_status_for_account_id(&account_id, vec![endpoint(&seed_b_url)])
         .await
         .unwrap();
@@ -9991,12 +10215,14 @@ async fn relay_list_empty_fetch_keeps_cached_lists() {
 
     let account_id = home.account("alice").unwrap().account_id_hex;
     let fetched = app
+        .directory()
         .fetch_account_relay_list_status_for_account_id(&account_id, vec![endpoint(&seed_b_url)])
         .await
         .unwrap();
 
     assert_eq!(fetched, cached);
     let directory_entry = app
+        .directory()
         .directory_entry_for_account_id(&account_id)
         .unwrap()
         .expect("cached directory entry");
@@ -10167,6 +10393,7 @@ async fn remote_key_package_fetch_falls_back_when_published_outbox_is_retired() 
         MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     let fetched = consumer
+        .directory()
         .fetch_latest_key_package_for_account_id(
             &created.account.account_id_hex,
             vec![endpoint(&relay_url)],
@@ -10275,6 +10502,7 @@ async fn relay_list_all_read_fetch_clears_cached_write_targets() {
 
     let account_id = home.account("alice").unwrap().account_id_hex;
     let fetched = app
+        .directory()
         .fetch_account_relay_list_status_for_account_id(&account_id, vec![endpoint(&seed_url)])
         .await
         .unwrap();
@@ -10317,12 +10545,14 @@ async fn relay_list_fetch_rejects_future_events_and_keeps_cached_lists() {
 
     let account_id = home.account("alice").unwrap().account_id_hex;
     let fetched = app
+        .directory()
         .fetch_account_relay_list_status_for_account_id(&account_id, vec![endpoint(&seed_b_url)])
         .await
         .unwrap();
 
     assert_eq!(fetched, cached);
     let directory_entry = app
+        .directory()
         .directory_entry_for_account_id(&account_id)
         .unwrap()
         .expect("cached directory entry");
@@ -10354,6 +10584,7 @@ async fn relay_list_future_skew_is_configurable_at_app_instantiation() {
 
     let account_id = home.account("alice").unwrap().account_id_hex;
     let fetched = app
+        .directory()
         .fetch_account_relay_list_status_for_account_id(&account_id, vec![endpoint(&seed_url)])
         .await
         .unwrap();
@@ -10512,6 +10743,7 @@ async fn directory_cache_is_durable_app_state_not_json_user_files() {
 
     let reopened = MarmotApp::with_relay(dir.path(), seed_url);
     let cached = reopened
+        .directory()
         .directory_entry_for_account_id(&account_id)
         .unwrap()
         .expect("directory entry");
@@ -10583,6 +10815,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
         .unwrap();
 
     let alice_refresh = app
+        .directory()
         .refresh_user_directory_for_account_id(&alice_id, vec![endpoint(&seed_url)])
         .await
         .unwrap();
@@ -10590,6 +10823,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
     assert_eq!(alice_refresh.profile_count, 1);
 
     let bob_refresh = app
+        .directory()
         .refresh_user_directory_for_account_id(&bob_id, vec![endpoint(&seed_url)])
         .await
         .unwrap();
@@ -10597,6 +10831,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
     assert_eq!(bob_refresh.profile_count, 1);
 
     let alice_record = app
+        .directory()
         .directory_entry_for_account_id(&alice_id)
         .unwrap()
         .expect("alice directory record");
@@ -10606,6 +10841,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
     assert_eq!(alice_record.follows, vec![bob_id.clone()]);
 
     let bob_record = app
+        .directory()
         .directory_entry_for_account_id(&bob_id)
         .unwrap()
         .expect("bob directory record");
@@ -10615,6 +10851,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
     );
 
     let bob_results = app
+        .directory()
         .search_user_directory(UserDirectorySearch {
             searcher_account_id_hex: alice_id.clone(),
             query: "builder".into(),
@@ -10627,6 +10864,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
     assert_eq!(bob_results[0].radius, 1);
 
     let carol_too_close = app
+        .directory()
         .search_user_directory(UserDirectorySearch {
             searcher_account_id_hex: alice_id.clone(),
             query: "carol".into(),
@@ -10638,6 +10876,7 @@ async fn user_directory_refresh_precaches_follows_profiles_and_searches_by_radiu
     assert!(carol_too_close.is_empty());
 
     let carol_results = app
+        .directory()
         .search_user_directory(UserDirectorySearch {
             searcher_account_id_hex: alice_id,
             query: "carol".into(),
@@ -10680,7 +10919,8 @@ async fn user_directory_refresh_rejects_future_follow_and_profile_events() {
     app.publish_account_follow_list("alice", &[&bob_id], bootstrap)
         .await
         .unwrap();
-    app.refresh_user_directory_for_account_id(&alice_id, vec![endpoint(&seed_a_url)])
+    app.directory()
+        .refresh_user_directory_for_account_id(&alice_id, vec![endpoint(&seed_a_url)])
         .await
         .unwrap();
 
@@ -10696,6 +10936,7 @@ async fn user_directory_refresh_rejects_future_follow_and_profile_events() {
     publish_profile_at(&home, "bob", &seed_b_url, "Future Bob", future_created_at).await;
 
     let refresh = app
+        .directory()
         .refresh_user_directory_for_account_id(&alice_id, vec![endpoint(&seed_b_url)])
         .await
         .unwrap();
@@ -10703,11 +10944,13 @@ async fn user_directory_refresh_rejects_future_follow_and_profile_events() {
     assert_eq!(refresh.profile_count, 0);
 
     let alice_record = app
+        .directory()
         .directory_entry_for_account_id(&alice_id)
         .unwrap()
         .expect("alice directory record");
     assert_eq!(alice_record.follows, vec![bob_id.clone()]);
     let bob_record = app
+        .directory()
         .directory_entry_for_account_id(&bob_id)
         .unwrap()
         .expect("bob directory record");
@@ -10835,7 +11078,10 @@ async fn account_publishes_route_to_own_nip65_not_bootstrap() {
     let id = created.account.account_id_hex.clone();
     let label = created.account.label.clone();
 
-    let status = app.account_relay_list_status_for_account_id(&id).unwrap();
+    let status = app
+        .directory()
+        .account_relay_list_status_for_account_id(&id)
+        .unwrap();
     assert!(
         status.nip65.relays.iter().any(|r| r == &home_url),
         "nip65 should include the home relay, got {:?}",
@@ -10857,6 +11103,7 @@ async fn account_publishes_route_to_own_nip65_not_bootstrap() {
 
     // The bootstrap relay must NOT have the profile (outbox ignored it).
     let from_other = app
+        .directory()
         .fetch_current_user_profile_for_account_id(&id, vec![endpoint(&other_url)])
         .await
         .unwrap()
@@ -10869,6 +11116,7 @@ async fn account_publishes_route_to_own_nip65_not_bootstrap() {
 
     // The account's NIP-65 (home) relay SHOULD have it.
     let from_home = app
+        .directory()
         .fetch_current_user_profile_for_account_id(&id, vec![endpoint(&home_url)])
         .await
         .unwrap()
@@ -10888,6 +11136,7 @@ async fn assert_published_relay_lists(
     inbox: &str,
 ) {
     let status = app
+        .directory()
         .fetch_account_relay_list_status_for_account_id(account_id_hex, vec![endpoint(route)])
         .await
         .unwrap();
@@ -11013,6 +11262,7 @@ async fn account_owned_profile_publish_uses_the_selected_accounts_relay_configur
         .unwrap();
 
     let from_bob_relay = app
+        .directory()
         .fetch_current_user_profile_for_account_id(
             &bob.account.account_id_hex,
             vec![endpoint(&bob_relay_url)],
@@ -11023,6 +11273,7 @@ async fn account_owned_profile_publish_uses_the_selected_accounts_relay_configur
     assert_eq!(from_bob_relay.as_deref(), Some("BobAccountOwned"));
 
     let from_alice_relay = app
+        .directory()
         .fetch_current_user_profile_for_account_id(
             &bob.account.account_id_hex,
             vec![endpoint(&alice_relay_url)],
@@ -13306,11 +13557,13 @@ async fn resolved_inbox_route_survives_restart_and_delivers_exact_welcome() {
     })
     .await;
 
-    app.resolve_member_key_packages(&[carol_id.as_str()])
+    app.directory()
+        .resolve_member_key_packages(&[carol_id.as_str()])
         .await
         .expect("route and KeyPackage should resolve before restart");
     assert!(
-        app.directory_entry_for_account_id(&carol_id)
+        app.directory()
+            .directory_entry_for_account_id(&carol_id)
             .unwrap()
             .is_some_and(|entry| entry.relay_lists.inbox.relays.contains(&url))
     );
@@ -13324,7 +13577,8 @@ async fn resolved_inbox_route_survives_restart_and_delivers_exact_welcome() {
         MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     assert!(
-        app.directory_entry_for_account_id(&carol_id)
+        app.directory()
+            .directory_entry_for_account_id(&carol_id)
             .unwrap()
             .is_some_and(|entry| entry.relay_lists.inbox.relays.contains(&url)),
         "the resolved inbox route must survive process restart"
@@ -13469,11 +13723,13 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
     })
     .await;
 
-    app.resolve_member_key_packages(&[carol_id.as_str()])
+    app.directory()
+        .resolve_member_key_packages(&[carol_id.as_str()])
         .await
         .expect("KeyPackage and outbox-hosted inbox route should resolve before restart");
     assert!(
-        app.directory_entry_for_account_id(&carol_id)
+        app.directory()
+            .directory_entry_for_account_id(&carol_id)
             .unwrap()
             .is_some_and(|entry| entry.relay_lists.inbox.relays.contains(&inbox_url))
     );
@@ -13487,7 +13743,8 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
         MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
     );
     assert!(
-        app.directory_entry_for_account_id(&carol_id)
+        app.directory()
+            .directory_entry_for_account_id(&carol_id)
             .unwrap()
             .is_some_and(|entry| entry.relay_lists.inbox.relays.contains(&inbox_url)),
         "the outbox-resolved inbox route must survive process restart"
@@ -13655,17 +13912,20 @@ async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool
         .unwrap();
     assert!(
         sender
+            .directory()
             .directory_entry_for_account_id(&carol_id)
             .unwrap()
             .is_none_or(|entry| entry.relay_lists.inbox.relays.is_empty()),
         "sender must not inherit the receiver's already-resolved inbox cache"
     );
     sender
+        .directory()
         .resolve_member_key_packages(&[carol_id.as_str()])
         .await
         .unwrap();
     assert_eq!(
         sender
+            .directory()
             .directory_entry_for_account_id(&carol_id)
             .unwrap()
             .unwrap()
@@ -13689,6 +13949,7 @@ async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool
         MarmotApp::with_relay_and_config(receiver_dir.path(), discovery_url.clone(), config());
     assert_eq!(
         sender
+            .directory()
             .directory_entry_for_account_id(&carol_id)
             .unwrap()
             .unwrap()
@@ -14501,6 +14762,7 @@ async fn outbox_acceptance_closed_multi_author_queries_fall_back_per_member() {
     );
     let member_refs = member_ids.iter().map(String::as_str).collect::<Vec<_>>();
     let summary = reader
+        .directory()
         .prewarm_group_member_key_packages(&member_refs)
         .await
         .expect("CLOSED multi-author batches must fall back to routable single-author reads");
@@ -14589,7 +14851,8 @@ async fn onboarding_identity_only_is_durable_gated_and_never_publishes() {
             .running
     );
     assert!(
-        app.fetch_current_account_relay_list_status_for_account_id(&id, vec![endpoint(&url)], None)
+        app.directory()
+            .fetch_current_account_relay_list_status_for_account_id(&id, vec![endpoint(&url)], None)
             .await
             .unwrap()
             .is_none()
@@ -16700,3 +16963,6 @@ async fn offline_member_recovers_dismissal_label_after_admin_demotion() {
 
 #[path = "relay_runtime/attachment_retention.rs"]
 mod attachment_retention;
+
+#[path = "relay_runtime/offline_replay.rs"]
+mod offline_replay;

@@ -66,6 +66,8 @@ runtime. It complements the policy docs:
 | `reconciliation_relays_succeeded` / `reconciliation_relays_failed` | Endpoint results summed over those passes. | Aggregate count. |
 | `reconciliation_remote_items` / `reconciliation_received_items` | Event ids relays reported missing locally, and missing events downloaded. | Aggregate count. |
 | `reconciliation_order_unproven_passes` | Group passes that returned nothing because no time order covered the history they were missing: no relay answered the window probes, the delivery boundary was unknown or excluded everything fetched, or more history was set aside than the relays' comparisons name. A pass waiting one round for an unfinished window search does not count. Repeated, these are the passes that end in a "history may be incomplete" notice. | Aggregate count. |
+| `activations_full` / `activations_degraded` / `activations_failed` | Account activations by outcome: every REQ reached every relay; the activation succeeded while some relay owed a REQ (it was unreachable, so the relay client re-sends the REQ on its next connection) or refused one (it was connected and rejected the REQ while another relay took it; a refusal is not re-sent); or the activation failed and rolled back, because no relay took or owes one of its REQs or the relay client returned an error. | Aggregate count. |
+| `group_syncs_full` / `group_syncs_degraded` / `group_syncs_failed` | Group syncs that issued REQs, by the same outcomes. A failed sync is one whose REQ no relay took or owes, or that hit a relay-client error; it leaves the routes it already committed in place. Syncs that issue no REQs do not count. | Aggregate count. |
 
 Account-scoped publishes and the shared adapter's own `publish` share these counters. They are device-wide and unlabeled. Once every started call has resolved or been dropped, attempts equal successes + failures + cancellations; while calls are in flight, attempts is larger. A future that is never polled, or a request rejected before the client call (wrong account, unsafe endpoint, envelope mismatch, malformed payload), changes nothing. Local fanout runs only after the terminal count and cannot reclassify it.
 
@@ -274,7 +276,7 @@ Collected operations:
 | `group_invite_members` | `AccountManager::invite_members()`, from command dispatch through worker response, post-mutation catch-up, and audit-tracker scheduling. | Measures the public runtime invite envelope after any UniFFI admin preflight. |
 | `group_invite_key_package_lookup` | Invite path KeyPackage resolution for every requested member before routing refresh. | Captures fresh relay KeyPackage resolution, including discovery work when bounded route metadata cannot be reused. |
 | `group_invite_routing_refresh` | Invite path `AppClient::refresh_routing()` after KeyPackage lookup and before pre-send runtime sync. | Captures local route/projection refresh work that affects publish targets. |
-| `group_invite_pre_send_sync` | Invite path `AppClient::sync_runtime_groups()` immediately before engine send. | Separates pre-send relay/runtime sync from MLS commit and publish. |
+| `group_invite_pre_send_sync` | Invite path `AppClient::sync_runtime_groups()` immediately before engine send. | Separates pre-send relay/runtime sync from MLS commit and publish. A failure is recorded but does not stop the invite unless the account is inactive (mdk#2562). |
 | `group_invite_engine_publish` | Invite path `AccountDeviceRuntime::send_with_audit_context()` plus publish-failure check. | Covers MLS Add/Commit staging, commit publish, local publish confirmation, and Welcome publish. |
 | `group_invite_local_refresh` | Invite path local audit success, publish report cache, group refresh, retention pruning, state save, and projection queueing after publish. | Identifies local projection/storage work after the engine publish stage returns. |
 | `group_invite_notification_trigger` | Invite path best-effort notification-trigger publish. | The helper logs failures internally; the timing sample records the duration of the best-effort call. |
@@ -514,6 +516,8 @@ Unresolved relay indices are skipped rather than exported as opaque ids.
 | `relay_publish_cancellations` | none | Counter | Adapter `publish_cancellations` (caller dropped the call in flight) |
 | `relay_reconciliation_attempts` | none | Counter | Adapter `reconciliation_attempts` (inbox and group NIP-77 passes) |
 | `relay_reconciliation_order_unproven_passes` | none | Counter | Adapter `reconciliation_order_unproven_passes` (group passes held back without a proven order) |
+| `relay_account_activations_full` / `relay_account_activations_degraded` / `relay_account_activations_failed` | none | Counter | Adapter `activations_full` / `activations_degraded` / `activations_failed` |
+| `relay_group_syncs_full` / `relay_group_syncs_degraded` / `relay_group_syncs_failed` | none | Counter | Adapter `group_syncs_full` / `group_syncs_degraded` / `group_syncs_failed` |
 | `message_observed` | none | Counter | `RelayDeliverySpread.observed` |
 | `message_corroborated` | none | Counter | `RelayDeliverySpread.corroborated` |
 | `message_single_source` | none | Counter | `RelayDeliverySpread.single_source` |

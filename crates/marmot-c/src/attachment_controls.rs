@@ -18,7 +18,7 @@ impl From<MarmotAttachmentAcquisitionMode> for AttachmentAcquisitionModeFfi {
     }
 }
 c_enum! {MarmotAttachmentControl from AttachmentControlFfi {Cancel,Retry,Remove,}}
-c_enum! {MarmotAttachmentTransferState from AttachmentTransferStateFfi {Unavailable,NotRequested,Queued,Downloading,VerifyingCiphertext,Decrypting,VerifyingPlaintext,Ready,RetryScheduled,Failed,Cancelled,Paused,Removed,PolicyBlocked,PreviouslyAcquiredUnavailable,CompletedUnretained,RetryExhausted,StorageBlocked,}}
+c_enum! {MarmotAttachmentTransferState from AttachmentTransferStateFfi {Unavailable,NotRequested,Queued,Downloading,VerifyingCiphertext,Decrypting,VerifyingPlaintext,Ready,RetryScheduled,Failed,Cancelled,Paused,Removed,PolicyBlocked,PreviouslyAcquiredUnavailable,CompletedUnretained,RetryExhausted,StorageBlocked,CleanedBySetting,}}
 c_mirror! {MarmotAttachmentDownloadPolicy from AttachmentDownloadPolicyFfi, free marmot_attachment_download_policy_free {
  copy automatic: bool, copy retained_bytes: u64, copy disk_reserve: u64, copy transfer_limit: u64,
 }}
@@ -355,7 +355,20 @@ mod tests {
             MarmotAttachmentTransferState::from_c(17).unwrap(),
             MarmotAttachmentTransferState::StorageBlocked
         );
-        assert!(MarmotAttachmentTransferState::from_c(18).is_err());
+        assert!(MarmotAttachmentTransferState::from_c(19).is_err());
+    }
+    /// `CleanedBySetting` is appended after `StorageBlocked`.
+    #[test]
+    fn cleaned_by_setting_transfer_state_is_appended_to_the_abi() {
+        assert_eq!(
+            MarmotAttachmentTransferState::from(AttachmentTransferStateFfi::CleanedBySetting)
+                as u32,
+            18
+        );
+        assert_eq!(
+            MarmotAttachmentTransferState::from_c(18).unwrap(),
+            MarmotAttachmentTransferState::CleanedBySetting
+        );
     }
 }
 

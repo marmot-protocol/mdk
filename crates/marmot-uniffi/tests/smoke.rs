@@ -137,6 +137,7 @@ async fn empty_kit_lifecycle() {
     let kit: Arc<Marmot> = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -166,10 +167,19 @@ async fn root_lease_is_typed_busy_and_outlives_shutdown_until_handle_drop() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().to_string_lossy().into_owned();
     let relays = vec!["wss://relay.invalid.test".to_string()];
-    let first = Marmot::new(root.clone(), relays.clone()).expect("open first kit");
+    let first = Marmot::new(
+        root.clone(),
+        relays.clone(),
+        marmot_uniffi::marmot_deployment_white_noise(),
+    )
+    .expect("open first kit");
 
     assert!(matches!(
-        Marmot::new(root.clone(), relays.clone()),
+        Marmot::new(
+            root.clone(),
+            relays.clone(),
+            marmot_uniffi::marmot_deployment_white_noise()
+        ),
         Err(MarmotKitError::RuntimeBusy)
     ));
 
@@ -178,12 +188,17 @@ async fn root_lease_is_typed_busy_and_outlives_shutdown_until_handle_drop() {
     // lifetime rather than being released prematurely at shutdown return.
     first.shutdown().await;
     assert!(matches!(
-        Marmot::new(root.clone(), relays.clone()),
+        Marmot::new(
+            root.clone(),
+            relays.clone(),
+            marmot_uniffi::marmot_deployment_white_noise()
+        ),
         Err(MarmotKitError::RuntimeBusy)
     ));
 
     drop(first);
-    let reopened = Marmot::new(root, relays).expect("lease released after final handle drop");
+    let reopened = Marmot::new(root, relays, marmot_uniffi::marmot_deployment_white_noise())
+        .expect("lease released after final handle drop");
     drop(reopened);
 }
 
@@ -196,7 +211,12 @@ async fn shutdown_and_close_survives_a_call_dropped_before_its_task_runs() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().to_string_lossy().into_owned();
     let relays = vec!["wss://relay.invalid.test".to_string()];
-    let kit = Marmot::new(root.clone(), relays.clone()).expect("open kit");
+    let kit = Marmot::new(
+        root.clone(),
+        relays.clone(),
+        marmot_uniffi::marmot_deployment_white_noise(),
+    )
+    .expect("open kit");
 
     // On this current-thread runtime the spawned work cannot start before the drop.
     let mut call = Box::pin(kit.__ffi_shutdown_and_close());
@@ -210,7 +230,8 @@ async fn shutdown_and_close_survives_a_call_dropped_before_its_task_runs() {
     })
     .await
     .expect("terminal close runs after the call is dropped");
-    let reopened = Marmot::new(root, relays).expect("closing released the root lease");
+    let reopened = Marmot::new(root, relays, marmot_uniffi::marmot_deployment_white_noise())
+        .expect("closing released the root lease");
     drop(reopened);
 }
 
@@ -221,12 +242,16 @@ async fn remove_account_updates_list_accounts() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
-    let account = AccountHome::open_with_default_keychain(tmp.path())
-        .expect("open account home")
-        .create_nostr_account()
-        .expect("create local account");
+    let account = AccountHome::open_with_keychain(
+        tmp.path(),
+        marmot_uniffi::marmot_deployment_white_noise().keychain_service,
+    )
+    .expect("open account home")
+    .create_nostr_account()
+    .expect("create local account");
     assert_eq!(kit.list_accounts().expect("list accounts").len(), 1);
 
     kit.remove_account(account.label.clone())
@@ -256,6 +281,7 @@ async fn account_unread_summary_reports_local_accounts_without_session_load() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -266,10 +292,13 @@ async fn account_unread_summary_reports_local_accounts_without_session_load() {
             .is_empty()
     );
 
-    let account = AccountHome::open_with_default_keychain(tmp.path())
-        .expect("open account home")
-        .create_nostr_account()
-        .expect("create local account");
+    let account = AccountHome::open_with_keychain(
+        tmp.path(),
+        marmot_uniffi::marmot_deployment_white_noise().keychain_service,
+    )
+    .expect("open account home")
+    .create_nostr_account()
+    .expect("create local account");
 
     // The account is not running (no start()/reconcile()), yet it is reported
     // with a zero unread count read from its on-disk projection.
@@ -296,6 +325,7 @@ async fn login_existing_identity_returns_duplicate_identity_error() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -314,6 +344,7 @@ fn display_name_is_none_for_unknown_account() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -334,6 +365,7 @@ fn normalize_member_ref_accepts_profile_and_nostr_forms() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
     for case in cases() {
@@ -385,13 +417,17 @@ fn normalize_member_ref_accepts_profile_and_nostr_forms() {
 async fn create_group_rejects_malformed_member_as_invalid_identity() {
     install_mock_keyring();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let account = AccountHome::open_with_default_keychain(tmp.path())
-        .expect("open account home")
-        .create_nostr_account()
-        .expect("create local account");
+    let account = AccountHome::open_with_keychain(
+        tmp.path(),
+        marmot_uniffi::marmot_deployment_white_noise().keychain_service,
+    )
+    .expect("open account home")
+    .create_nostr_account()
+    .expect("create local account");
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
     kit.start().await.expect("start marmot kit");
@@ -420,6 +456,7 @@ async fn member_key_package_prewarm_binding_is_public_and_requires_a_known_accou
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -437,6 +474,7 @@ async fn delete_group_local_binding_is_public_and_validates_group_hex() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -454,6 +492,7 @@ async fn leave_group_binding_is_public_and_validates_group_hex() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -479,6 +518,7 @@ async fn group_image_binding_methods_are_public_and_validate_inputs() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -521,6 +561,7 @@ async fn profile_image_upload_binding_is_public_and_requires_a_known_account() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -543,6 +584,7 @@ async fn profile_image_download_binding_maps_invalid_url_to_typed_error() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -563,6 +605,7 @@ async fn media_binding_records_are_public_and_methods_validate_group_hex() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -667,6 +710,7 @@ async fn relay_list_binding_methods_are_public() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
     let relays = vec!["wss://relay.invalid.test".to_string()];
@@ -712,6 +756,7 @@ async fn notification_binding_methods_are_public_and_validate_missing_accounts()
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -768,6 +813,7 @@ async fn frozen_cursor_persistence_constructor_opens_and_collects() {
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
         CursorPersistenceFfi::Frozen,
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open frozen marmot kit");
     let collected = kit
@@ -785,6 +831,7 @@ async fn frozen_cursor_persistence_constructor_opens_and_collects() {
     let reopened = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("reopen marmot kit with the default Advance policy");
     assert!(!reopened.is_stopping());
@@ -797,6 +844,7 @@ async fn relay_telemetry_settings_binding_round_trips() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -836,6 +884,7 @@ async fn relay_telemetry_settings_binding_round_trips() {
     let reopened = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("reopen marmot kit");
     assert_eq!(
@@ -854,6 +903,7 @@ async fn audit_log_settings_binding_round_trips() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -871,6 +921,7 @@ async fn audit_log_settings_binding_round_trips() {
     let reopened = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("reopen marmot kit");
     let persisted = reopened
@@ -886,16 +937,23 @@ fn audit_log_binding_lists_local_jsonl_logs() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
-    let account = AccountHome::open_with_default_keychain(tmp.path())
-        .expect("open account home")
-        .create_nostr_account()
-        .expect("create local account");
-    let audit_path = AccountHome::open_with_default_keychain(tmp.path())
-        .expect("reopen account home")
-        .account_dir(&account.label)
-        .join("audit-binding.jsonl");
+    let account = AccountHome::open_with_keychain(
+        tmp.path(),
+        marmot_uniffi::marmot_deployment_white_noise().keychain_service,
+    )
+    .expect("open account home")
+    .create_nostr_account()
+    .expect("create local account");
+    let audit_path = AccountHome::open_with_keychain(
+        tmp.path(),
+        marmot_uniffi::marmot_deployment_white_noise().keychain_service,
+    )
+    .expect("reopen account home")
+    .account_dir(&account.label)
+    .join("audit-binding.jsonl");
     std::fs::write(&audit_path, b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n").expect("write audit log");
 
     let files = kit.audit_log_files().expect("list audit logs");
@@ -913,17 +971,24 @@ async fn audit_log_binding_posts_jsonl_file() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
-    let account = AccountHome::open_with_default_keychain(tmp.path())
-        .expect("open account home")
-        .create_nostr_account()
-        .expect("create local account");
+    let account = AccountHome::open_with_keychain(
+        tmp.path(),
+        marmot_uniffi::marmot_deployment_white_noise().keychain_service,
+    )
+    .expect("open account home")
+    .create_nostr_account()
+    .expect("create local account");
     let audit_body = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n";
-    let audit_path = AccountHome::open_with_default_keychain(tmp.path())
-        .expect("reopen account home")
-        .account_dir(&account.label)
-        .join("audit-binding-upload.jsonl");
+    let audit_path = AccountHome::open_with_keychain(
+        tmp.path(),
+        marmot_uniffi::marmot_deployment_white_noise().keychain_service,
+    )
+    .expect("reopen account home")
+    .account_dir(&account.label)
+    .join("audit-binding-upload.jsonl");
     std::fs::write(&audit_path, audit_body).expect("write audit log");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -964,17 +1029,24 @@ async fn audit_log_binding_posts_tracker_update() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
-    let account = AccountHome::open_with_default_keychain(tmp.path())
-        .expect("open account home")
-        .create_nostr_account()
-        .expect("create local account");
+    let account = AccountHome::open_with_keychain(
+        tmp.path(),
+        marmot_uniffi::marmot_deployment_white_noise().keychain_service,
+    )
+    .expect("open account home")
+    .create_nostr_account()
+    .expect("create local account");
     let audit_body = b"{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":1}\n{\"schema_version\":\"marmot-forensics-audit/v4\",\"wall_time_ms\":0,\"engine_id\":\"test-engine\",\"kind\":{\"type\":\"recorder_started\",\"recorder\":\"test\"},\"seq\":2}\n";
-    let audit_path = AccountHome::open_with_default_keychain(tmp.path())
-        .expect("reopen account home")
-        .account_dir(&account.label)
-        .join("audit-binding-tracker.jsonl");
+    let audit_path = AccountHome::open_with_keychain(
+        tmp.path(),
+        marmot_uniffi::marmot_deployment_white_noise().keychain_service,
+    )
+    .expect("reopen account home")
+    .account_dir(&account.label)
+    .join("audit-binding-tracker.jsonl");
     std::fs::write(&audit_path, audit_body).expect("write audit log");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1033,6 +1105,7 @@ async fn timeline_binding_methods_are_public_and_validate_inputs() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -1098,6 +1171,7 @@ async fn chat_list_binding_methods_are_public_and_validate_inputs() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -1160,6 +1234,7 @@ fn message_draft_binding_methods_are_public_and_validate_inputs() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
     let attachment = MessageDraftAttachmentFfi {
@@ -1203,6 +1278,7 @@ async fn message_history_binding_methods_validate_group_hex() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -1253,6 +1329,7 @@ async fn retry_group_convergence_binding_is_public_and_validates_inputs() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 
@@ -1281,6 +1358,7 @@ async fn retention_sweep_binding_is_public_and_requires_a_known_account() {
     let kit = Marmot::new(
         tmp.path().to_string_lossy().into_owned(),
         vec!["wss://relay.invalid.test".to_string()],
+        marmot_uniffi::marmot_deployment_white_noise(),
     )
     .expect("open marmot kit");
 

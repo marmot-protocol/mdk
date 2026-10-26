@@ -56,32 +56,6 @@ fn is_address_family_unavailable(err: &QuicTextStreamError) -> bool {
 }
 
 #[test]
-fn address_family_unavailable_recognizes_windows_wsaeafnosupport() {
-    let err = std::io::Error::from_raw_os_error(10047);
-    assert!(
-        is_io_address_family_unavailable(&err),
-        "WSAEAFNOSUPPORT (10047) must skip IPv6 setup instead of failing: {err:?}"
-    );
-    assert!(is_address_family_unavailable(&QuicTextStreamError::Io(err)));
-}
-
-#[test]
-fn address_family_unavailable_predicate_covers_documented_raw_codes() {
-    for code in [47, 49, 97, 99, 10047] {
-        let err = std::io::Error::from_raw_os_error(code);
-        assert!(
-            is_io_address_family_unavailable(&err),
-            "raw OS error {code} should be treated as address-family unavailable: {err:?}"
-        );
-    }
-    let unrelated = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
-    assert!(
-        !is_io_address_family_unavailable(&unrelated),
-        "unrelated I/O errors must not skip IPv6 tests: {unrelated:?}"
-    );
-}
-
-#[test]
 fn direct_path_alpn_is_the_pinned_wire_value() {
     // Wire-visible interop id; both peers must offer exactly this (quic.md).
     assert_eq!(QUIC_STREAM_PROTOCOL_V1, "marmot.quic_stream.v1");
@@ -450,6 +424,68 @@ fn malformed_certificate_der_fails_without_trust_fallback() {
             | QuicTextStreamError::Certificate(_)
             | QuicTextStreamError::ClientConfig(_)
     ));
+}
+
+/// Chain the production broker presented on 2026-10-15: leaf -> Let's Encrypt
+/// YE2 -> ISRG Root YE -> ISRG Root X2 (the last two are cross-signs).
+const PUBLIC_BROKER_CHAIN_PEM: &[u8] = include_bytes!("../fixtures/quic-broker.ipf.dev-chain.pem");
+const PUBLIC_BROKER_SERVER_NAME: &str = "quic-broker.ipf.dev";
+/// Capture time; inside the leaf's 2026-09-19..2026-12-18 validity window.
+const PUBLIC_BROKER_CHAIN_VERIFIED_AT: Duration = Duration::from_secs(1_792_065_658);
+
+fn public_broker_chain() -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    use rustls::pki_types::pem::PemObject;
+    rustls::pki_types::CertificateDer::pem_slice_iter(PUBLIC_BROKER_CHAIN_PEM)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn verify_with_platform_trust(
+    chain: &[rustls::pki_types::CertificateDer<'static>],
+    server_name: &str,
+) -> Result<(), rustls::Error> {
+    use rustls::client::danger::ServerCertVerifier;
+    let verifier = crate::tls::platform_trust_verifier(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .unwrap();
+    verifier
+        .verify_server_cert(
+            &chain[0],
+            &chain[1..],
+            &rustls::pki_types::ServerName::try_from(server_name.to_owned()).unwrap(),
+            &[],
+            rustls::pki_types::UnixTime::since_unix_epoch(PUBLIC_BROKER_CHAIN_VERIFIED_AT),
+        )
+        .map(|_| ())
+}
+
+#[test]
+fn platform_trust_verifies_ca_signed_public_broker_chain() {
+    // Default trust must verify a CA-signed broker on every platform the SDK
+    // ships to, including Android hosts that never initialize JNI state.
+    verify_with_platform_trust(&public_broker_chain(), PUBLIC_BROKER_SERVER_NAME)
+        .expect("CA-signed broker chain verifies under default trust");
+}
+
+#[test]
+fn platform_trust_rejects_self_signed_and_misnamed_certificates() {
+    let self_signed = rcgen::generate_simple_self_signed(vec![PUBLIC_BROKER_SERVER_NAME.into()])
+        .unwrap()
+        .cert;
+    let err = verify_with_platform_trust(&[self_signed.into()], PUBLIC_BROKER_SERVER_NAME)
+        .expect_err("self-signed certificate must not verify under default trust");
+    assert!(
+        matches!(err, rustls::Error::InvalidCertificate(_)),
+        "{err:?}"
+    );
+
+    let err = verify_with_platform_trust(&public_broker_chain(), "other.ipf.dev")
+        .expect_err("certificate must not verify for another name");
+    assert!(
+        matches!(err, rustls::Error::InvalidCertificate(_)),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]

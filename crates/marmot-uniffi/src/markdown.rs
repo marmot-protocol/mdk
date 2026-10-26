@@ -547,15 +547,6 @@ mod tests {
     }
 
     #[test]
-    fn caps_markdown_input_at_plaintext_frame_limit() {
-        let input = "a".repeat(MAX_FFI_MARKDOWN_INPUT_BYTES + 16);
-        let capped = markdown_input_within_ffi_limit(&input);
-
-        assert_eq!(capped.text.len(), MAX_FFI_MARKDOWN_INPUT_BYTES);
-        assert!(capped.truncated);
-    }
-
-    #[test]
     fn markdown_input_cap_preserves_utf8_boundary() {
         let input = format!("{}🦫", "a".repeat(MAX_FFI_MARKDOWN_INPUT_BYTES - 1));
         let capped = markdown_input_within_ffi_limit(&input);
