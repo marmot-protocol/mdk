@@ -791,18 +791,10 @@ const RETAINED_PROJECTION_STALL_WARNING_FAILURES: u32 = 4;
 /// engine's however the session and account layers wrapped it.
 fn unknown_group_id(error: &AppError) -> Option<GroupId> {
     use cgka_traits::error::EngineError;
-    let engine = match error {
-        AppError::UnknownGroup(group_id_hex) => {
-            return hex::decode(group_id_hex).ok().map(GroupId::new);
-        }
-        AppError::Account(marmot_account::AccountError::Engine(engine))
-        | AppError::Account(marmot_account::AccountError::Session(
-            cgka_session::SessionError::Engine(engine),
-        ))
-        | AppError::Session(cgka_session::SessionError::Engine(engine)) => engine,
-        _ => return None,
-    };
-    match engine {
+    if let AppError::UnknownGroup(group_id_hex) = error {
+        return hex::decode(group_id_hex).ok().map(GroupId::new);
+    }
+    match error.as_engine_error()? {
         EngineError::UnknownGroup(group_id) => Some(group_id.clone()),
         _ => None,
     }

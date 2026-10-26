@@ -3704,6 +3704,7 @@ dependencies = [
  "futures",
  "keyring-core",
  "libc",
+ "marmot-app",
  "marmot-uniffi",
  "nostr 0.45.5",
  "nostr-relay-builder",

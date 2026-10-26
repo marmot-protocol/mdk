@@ -33,7 +33,7 @@ use cgka_traits::maintenance::{
 };
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::{
-    EpochId, FanoutMlsState, FanoutPendingKind, GroupId, MemberId, MessageState,
+    EngineError, EpochId, FanoutMlsState, FanoutPendingKind, GroupId, MemberId, MessageState,
     OutboundApplicationMessage, OutboundFanout, OutboundFanoutOutcome, StorageError, Timestamp,
     TransportAccountActivation, TransportAdapter, TransportAdapterError, TransportDelivery,
     TransportEndpoint, TransportEndpointAckKind, TransportEndpointFailure,
@@ -2169,10 +2169,9 @@ where
                 tracing::warn!(
                     target: TRACE_TARGET,
                     method = "schedule_leaf_refreshes",
-                    error_kind = match &error {
-                        AccountError::Session(_) => "session",
-                        _ => "other",
-                    },
+                    error_kind = error
+                        .as_engine_error()
+                        .map_or("other", EngineError::privacy_safe_kind),
                     "leaf refresh scheduling skipped a group this tick"
                 );
             }
@@ -5354,7 +5353,7 @@ where
         // Test-only fault injection (`arm_finish_stage_failure`): behaves like
         // the durable fanout persist below failing with transient contention.
         if self.finish_stage_failure.as_ref() == Some(&message_id) {
-            return Err(AccountError::Session(SessionError::Storage(
+            return Err(AccountError::Session(SessionError::from(
                 StorageError::Busy("injected finish-stage failure".into()),
             )));
         }
@@ -5656,10 +5655,12 @@ where
 fn skips_group_this_tick<T>(result: Result<T, SessionError>) -> AccountResult<Option<T>> {
     match result {
         Ok(value) => Ok(Some(value)),
-        Err(SessionError::Engine(
-            cgka_traits::EngineError::GroupNotHydrated(_)
-            | cgka_traits::EngineError::UnknownGroup(_),
-        )) => {
+        Err(error)
+            if matches!(
+                error.as_engine_error(),
+                EngineError::GroupNotHydrated(_) | EngineError::UnknownGroup(_)
+            ) =>
+        {
             tracing::debug!(
                 target: TRACE_TARGET,
                 method = "run_due_maintenance",

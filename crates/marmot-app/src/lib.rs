@@ -103,6 +103,8 @@ mod drafts;
 mod local_submissions;
 pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
 mod error;
+#[cfg(any(test, feature = "test-support"))]
+pub mod error_kind_table;
 mod external_signer;
 mod groups;
 mod history_notices;
@@ -4678,8 +4680,7 @@ impl MarmotApp {
             session_config = session_config.recorder(recorder);
         }
         self.ensure_strict_cutover_replacement_intent_before_session_open(label)?;
-        let session =
-            AccountDeviceSession::open(session_config).map_err(external_signer_session_error)?;
+        let session = AccountDeviceSession::open(session_config)?;
 
         let publish_client =
             self.relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone());
@@ -7623,23 +7624,6 @@ pub(crate) fn external_signer_error(
         AppError::ExternalSignerRejected
     } else {
         AppError::Publish(format!("{context}: {error}"))
-    }
-}
-
-/// Recover a cancelled external-signer proof from a session-open failure.
-///
-/// The account-identity proof is signed synchronously through the external
-/// signer while the device session is opened (the engine builds it during
-/// `AccountDeviceSession::open`). That signing hook returns `String`, so a
-/// user-cancelled Amber prompt travels up as an opaque engine error carrying
-/// the `EXTERNAL_SIGNER_REJECTED` sentinel — recover the typed rejection here so
-/// callers see `AppError::ExternalSignerRejected` instead of a generic session
-/// error, matching `external_signer_error` on the other signer paths.
-pub(crate) fn external_signer_session_error(error: cgka_session::SessionError) -> AppError {
-    if error.to_string().contains(EXTERNAL_SIGNER_REJECTED) {
-        AppError::ExternalSignerRejected
-    } else {
-        AppError::from(error)
     }
 }
 

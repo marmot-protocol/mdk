@@ -1413,6 +1413,15 @@ fn build_group_system_projection(
 }
 
 fn read_marker_error_code(error: &AppError) -> &'static str {
+    // An engine failure gets one code whichever lower-stack layer carried it
+    // (mdk#2602).
+    if let Some(engine) = error.as_engine_error() {
+        return match engine {
+            cgka_traits::EngineError::Storage(_) => "read_marker_failed:storage",
+            cgka_traits::EngineError::UnknownGroup(_) => "read_marker_failed:unknown_group",
+            _ => "read_marker_failed:session",
+        };
+    }
     match error {
         AppError::InvalidAppComponent(_) => "read_marker_failed:invalid_app_component",
         AppError::ProductAnalytics(_) => "read_marker_failed:usage_diagnostics",
