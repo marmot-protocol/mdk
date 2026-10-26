@@ -43,8 +43,9 @@ pub use app::transport::user_blocks::{
 };
 
 pub use app::account_projection::{
-    AccountChatNotificationSettings, AccountDeliveryRecovery, AccountGroupPushToken,
-    AccountNotificationSettings, AccountPendingPushRegistrationRemoval, AccountPushRegistration,
+    AccountChatNotificationSettings, AccountDeliveryRecovery, AccountGroupPushGossipState,
+    AccountGroupPushToken, AccountGroupPushTokenTombstone, AccountNotificationSettings,
+    AccountPendingPushRegistrationRemoval, AccountPushRegistration, AccountPushTokenRemovalProof,
     AccountStoredPushRegistration, AppEventReplayCursor, DeleteLocalGroupDataResult,
     SelfMembership, StoredAccountGroup, StoredAccountGroupComponent, StoredAccountState,
     StoredAppMessageQuery, StoredAppMessageRecord, StoredEpochBackfillIntent,

@@ -9,6 +9,11 @@
   registration once for every joined group while native push is on, so
   members who joined before this release receive this device's token
   (mdk#2604).
+- Migration 0118 advances account storage to schema 118 (mdk#2611). It adds
+  `token_fingerprint` and `owner_sig` to push tombstones, which existing
+  tombstones leave NULL, and an empty `group_push_gossip_state` table.
+- `apply_group_push_token_tombstone` takes an `AccountGroupPushTokenTombstone`
+  instead of eight arguments, and stores its optional removal proof.
 
 ### Added
 
@@ -16,6 +21,13 @@
   registration for one joined group again, including a revision whose share
   already completed. It does nothing while native push is off or without a
   registration.
+- `group_push_token_tombstones` lists a group's tombstones. One with an
+  `AccountPushTokenRemovalProof` can be relayed as the owner's signed removal;
+  one without, written before migration 0118, stays local-only.
+- `group_push_gossip_state` and `record_group_push_gossip_join`, `_snapshot`
+  and `_announce` keep this device's per-group gossip state for its current
+  membership. Writes need a joined group; the row goes when the device leaves
+  or is removed, and with the group.
 
 ## 0.14.0 - 2026-10-23
 

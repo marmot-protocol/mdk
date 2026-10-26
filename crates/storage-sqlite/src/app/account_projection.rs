@@ -442,6 +442,51 @@ pub struct AccountGroupPushToken {
     pub updated_at_ms: i64,
 }
 
+/// A durable removal for one push record key. Its `(owner_ts, record_digest)`
+/// stamp suppresses any record with a lower stamp for the same key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountGroupPushTokenTombstone {
+    pub group_id_hex: String,
+    pub member_id_hex: String,
+    pub leaf_index: u32,
+    pub platform: u8,
+    pub server_pubkey_hex: String,
+    /// Owner-signed millisecond ordering stamp of the removal.
+    pub owner_ts: i64,
+    /// `SHA-256(SignedRecord)` hex of the removal: the ordering tie-breaker.
+    pub record_digest: String,
+    /// The rest of the owner-signed removal, so any member can relay the
+    /// tombstone unchanged in a kind 449. `None` for a tombstone written before
+    /// migration 0118, which kept no signature and stays local-only.
+    pub removal_proof: Option<AccountPushTokenRemovalProof>,
+    pub created_at_ms: i64,
+}
+
+/// The removal fields a tombstone needs beyond its key and stamp to rebuild
+/// the owner-signed removal entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountPushTokenRemovalProof {
+    pub token_fingerprint: String,
+    /// 128-hex BIP-340 signature by `member_id_hex` over the removal.
+    pub owner_sig: String,
+}
+
+/// This device's push-token gossip state in one group, for its current
+/// membership. The row goes when the device leaves or is removed, and with the
+/// group's projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountGroupPushGossipState {
+    pub group_id_hex: String,
+    /// When this device's join became final. `None` until recorded, and for a
+    /// group joined before migration 0118.
+    pub joined_at_ms: Option<i64>,
+    /// When the first snapshot arrived during this membership. `None` while
+    /// none has.
+    pub snapshot_received_at_ms: Option<i64>,
+    /// When this device last announced in the group. `None` if it never has.
+    pub last_announced_at_ms: Option<i64>,
+}
+
 struct RawStoredAccountGroup {
     group_id_hex: String,
     endpoint: String,
@@ -1743,6 +1788,12 @@ impl SqliteAppStorage {
                         params![group_id_hex],
                     )
                     .storage()?;
+                    // Gossip state covers one membership; a later join starts afresh.
+                    conn.execute_cached(
+                        "DELETE FROM group_push_gossip_state WHERE group_id_hex = ?1",
+                        params![group_id_hex],
+                    )
+                    .storage()?;
                 }
             }
             Ok(())
@@ -2903,65 +2954,188 @@ impl SqliteAppStorage {
     /// Apply an owner-verified removal: when its `(owner_ts, record_digest)` stamp
     /// is strictly greater than both the live record and any existing tombstone
     /// for the key, delete the live record and write/refresh the durable
-    /// tombstone. Returns whether the removal was applied.
-    #[allow(clippy::too_many_arguments)]
+    /// tombstone, including its removal proof. Returns whether the removal was
+    /// applied.
     pub fn apply_group_push_token_tombstone(
         &self,
-        group_id_hex: &str,
-        member_id_hex: &str,
-        leaf_index: u32,
-        platform: u8,
-        server_pubkey_hex: &str,
-        owner_ts: i64,
-        record_digest: &str,
-        created_at_ms: i64,
+        tombstone: &AccountGroupPushTokenTombstone,
     ) -> StorageResult<bool> {
         retry_on_busy(|| {
             let mut conn = self.lock()?;
             let tx = conn.transaction().storage()?;
-            let incoming = (owner_ts, record_digest);
+            let incoming = (tombstone.owner_ts, tombstone.record_digest.as_str());
             let key = PushTokenKey {
-                group_id_hex,
-                member_id_hex,
-                leaf_index,
-                platform,
-                server_pubkey_hex,
+                group_id_hex: &tombstone.group_id_hex,
+                member_id_hex: &tombstone.member_id_hex,
+                leaf_index: tombstone.leaf_index,
+                platform: tombstone.platform,
+                server_pubkey_hex: &tombstone.server_pubkey_hex,
             };
-            let tombstone = read_push_tombstone_stamp(&tx, key)?;
+            let existing = read_push_tombstone_stamp(&tx, key)?;
             let live = read_push_token_stamp(&tx, key)?;
             let strictly_newer = |stored: &Option<(i64, String)>| {
                 push_stamp_strictly_newer(incoming, stored.as_ref().map(|(t, d)| (*t, d.as_str())))
             };
-            if !strictly_newer(&tombstone) || !strictly_newer(&live) {
+            if !strictly_newer(&existing) || !strictly_newer(&live) {
                 return Ok(false);
             }
             delete_push_token(&tx, key)?;
+            let proof = tombstone.removal_proof.as_ref();
             tx.execute_cached(
                 "INSERT INTO group_push_token_tombstones (
                     group_id_hex, member_id_hex, leaf_index, platform, server_pubkey_hex,
-                    owner_ts, record_digest, created_at_ms
+                    owner_ts, record_digest, created_at_ms, token_fingerprint, owner_sig
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(group_id_hex, member_id_hex, leaf_index, platform, server_pubkey_hex)
                  DO UPDATE SET
                     owner_ts = excluded.owner_ts,
                     record_digest = excluded.record_digest,
-                    created_at_ms = excluded.created_at_ms",
+                    created_at_ms = excluded.created_at_ms,
+                    token_fingerprint = excluded.token_fingerprint,
+                    owner_sig = excluded.owner_sig",
                 params![
-                    group_id_hex,
-                    member_id_hex,
-                    u32_to_i64(leaf_index),
-                    i64::from(platform),
-                    server_pubkey_hex,
-                    owner_ts,
-                    record_digest,
-                    created_at_ms,
+                    &tombstone.group_id_hex,
+                    &tombstone.member_id_hex,
+                    u32_to_i64(tombstone.leaf_index),
+                    i64::from(tombstone.platform),
+                    &tombstone.server_pubkey_hex,
+                    tombstone.owner_ts,
+                    &tombstone.record_digest,
+                    tombstone.created_at_ms,
+                    proof.map(|proof| proof.token_fingerprint.as_str()),
+                    proof.map(|proof| proof.owner_sig.as_str()),
                 ],
             )
             .storage()?;
             tx.commit().storage()?;
             Ok(true)
         })
+    }
+
+    /// Every tombstone held for `group_id_hex`, in record-key order. A tombstone
+    /// without a `removal_proof` predates migration 0118 and must not be relayed.
+    pub fn group_push_token_tombstones(
+        &self,
+        group_id_hex: &str,
+    ) -> StorageResult<Vec<AccountGroupPushTokenTombstone>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare_cached(
+                "SELECT group_id_hex, member_id_hex, leaf_index, platform, server_pubkey_hex,
+                        owner_ts, record_digest, created_at_ms, token_fingerprint, owner_sig
+                 FROM group_push_token_tombstones
+                 WHERE group_id_hex = ?1
+                 ORDER BY member_id_hex, leaf_index, platform, server_pubkey_hex",
+            )
+            .storage()?;
+        statement
+            .query_map(params![group_id_hex], group_push_token_tombstone_from_row)
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()
+    }
+
+    /// This device's push gossip state in `group_id_hex`, if any is recorded.
+    pub fn group_push_gossip_state(
+        &self,
+        group_id_hex: &str,
+    ) -> StorageResult<Option<AccountGroupPushGossipState>> {
+        self.lock()?
+            .query_row_cached(
+                "SELECT group_id_hex, joined_at_ms, snapshot_received_at_ms, last_announced_at_ms
+                 FROM group_push_gossip_state
+                 WHERE group_id_hex = ?1",
+                params![group_id_hex],
+                |row| {
+                    Ok(AccountGroupPushGossipState {
+                        group_id_hex: row.get(0)?,
+                        joined_at_ms: row.get(1)?,
+                        snapshot_received_at_ms: row.get(2)?,
+                        last_announced_at_ms: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .storage()
+    }
+
+    /// Record when this device's join to `group_id_hex` became final. The
+    /// first recorded time stands for the rest of the membership. Returns
+    /// false, recording nothing, unless this device is a member of a projected
+    /// group.
+    pub fn record_group_push_gossip_join(
+        &self,
+        group_id_hex: &str,
+        joined_at_ms: i64,
+    ) -> StorageResult<bool> {
+        self.upsert_group_push_gossip_state(
+            "INSERT INTO group_push_gossip_state (group_id_hex, joined_at_ms)
+             SELECT group_id_hex, ?2 FROM account_groups
+             WHERE group_id_hex = ?1 AND self_membership = 'member'
+             ON CONFLICT(group_id_hex) DO UPDATE SET
+                joined_at_ms = COALESCE(group_push_gossip_state.joined_at_ms, excluded.joined_at_ms)",
+            group_id_hex,
+            joined_at_ms,
+        )
+    }
+
+    /// Record that a snapshot arrived in `group_id_hex`. The first arrival
+    /// stands for the rest of the membership, and may precede the join's
+    /// recorded finality. Returns false, recording nothing, unless this device
+    /// is a member of a projected group.
+    pub fn record_group_push_gossip_snapshot(
+        &self,
+        group_id_hex: &str,
+        received_at_ms: i64,
+    ) -> StorageResult<bool> {
+        self.upsert_group_push_gossip_state(
+            "INSERT INTO group_push_gossip_state (group_id_hex, snapshot_received_at_ms)
+             SELECT group_id_hex, ?2 FROM account_groups
+             WHERE group_id_hex = ?1 AND self_membership = 'member'
+             ON CONFLICT(group_id_hex) DO UPDATE SET
+                snapshot_received_at_ms = COALESCE(
+                    group_push_gossip_state.snapshot_received_at_ms,
+                    excluded.snapshot_received_at_ms
+                )",
+            group_id_hex,
+            received_at_ms,
+        )
+    }
+
+    /// Record that this device announced in `group_id_hex`. Keeps the latest
+    /// time. Returns false, recording nothing, unless this device is a member
+    /// of a projected group.
+    pub fn record_group_push_gossip_announce(
+        &self,
+        group_id_hex: &str,
+        announced_at_ms: i64,
+    ) -> StorageResult<bool> {
+        self.upsert_group_push_gossip_state(
+            "INSERT INTO group_push_gossip_state (group_id_hex, last_announced_at_ms)
+             SELECT group_id_hex, ?2 FROM account_groups
+             WHERE group_id_hex = ?1 AND self_membership = 'member'
+             ON CONFLICT(group_id_hex) DO UPDATE SET
+                last_announced_at_ms = MAX(
+                    COALESCE(group_push_gossip_state.last_announced_at_ms, excluded.last_announced_at_ms),
+                    excluded.last_announced_at_ms
+                )",
+            group_id_hex,
+            announced_at_ms,
+        )
+    }
+
+    fn upsert_group_push_gossip_state(
+        &self,
+        sql: &str,
+        group_id_hex: &str,
+        at_ms: i64,
+    ) -> StorageResult<bool> {
+        Ok(self
+            .lock()?
+            .execute_cached(sql, params![group_id_hex, at_ms])
+            .storage()?
+            > 0)
     }
 
     pub fn group_push_tokens(
@@ -3757,6 +3931,32 @@ fn group_push_token_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Accoun
         owner_sig: row.get(9)?,
         record_digest: row.get(10)?,
         updated_at_ms: row.get(11)?,
+    })
+}
+
+fn group_push_token_tombstone_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AccountGroupPushTokenTombstone> {
+    let token_fingerprint: Option<String> = row.get(8)?;
+    let owner_sig: Option<String> = row.get(9)?;
+    Ok(AccountGroupPushTokenTombstone {
+        group_id_hex: row.get(0)?,
+        member_id_hex: row.get(1)?,
+        leaf_index: i64_to_u32(row.get(2)?, 2)?,
+        platform: i64_to_u8(row.get(3)?, 3)?,
+        server_pubkey_hex: row.get(4)?,
+        owner_ts: row.get(5)?,
+        record_digest: row.get(6)?,
+        created_at_ms: row.get(7)?,
+        // The schema stores both or neither.
+        removal_proof: token_fingerprint
+            .zip(owner_sig)
+            .map(
+                |(token_fingerprint, owner_sig)| AccountPushTokenRemovalProof {
+                    token_fingerprint,
+                    owner_sig,
+                },
+            ),
     })
 }
 

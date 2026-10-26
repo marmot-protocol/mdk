@@ -505,6 +505,27 @@ pub(crate) struct PushTokenRemovalRecord {
     pub owner_sig: String,
 }
 
+/// A token record read back from storage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredGroupPushToken {
+    pub record: GroupPushTokenRecord,
+    /// `SHA-256(SignedRecord)` hex as stored for the record. `None` when the
+    /// stored digest is not the one the record's fields produce, or the fields
+    /// produce none.
+    pub record_digest: Option<String>,
+}
+
+/// A tombstone read back from storage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredPushTokenTombstone {
+    /// `SHA-256(SignedRecord)` hex of the removal, as stored.
+    pub record_digest: String,
+    /// The owner-signed removal, which any member may relay unchanged in a kind
+    /// 449. `None` for a tombstone written before migration 0118: it kept no
+    /// signature and stays local-only.
+    pub removal: Option<PushTokenRemovalRecord>,
+}
+
 pub fn parse_provider_token(platform: PushPlatform, raw_token: &str) -> Result<Vec<u8>, AppError> {
     let token = match platform {
         PushPlatform::Apns => parse_apns_hex_token(raw_token)?,
@@ -1156,15 +1177,7 @@ pub(crate) async fn local_token_removal_payload(
     record.sign_owner_with_signer(group_id_hex, signer).await?;
     let payload = PushTokenRemovalPayload {
         v: PUSH_VERSION.to_owned(),
-        removals: vec![PushTokenRemovalEntry {
-            member_id_hex: record.member_id_hex.clone(),
-            leaf_index: record.leaf_index,
-            platform: record.platform.as_str().to_owned(),
-            token_fingerprint: record.token_fingerprint.clone(),
-            server_pubkey_hex: record.server_pubkey_hex.clone(),
-            owner_ts: record.owner_ts,
-            owner_sig: record.owner_sig.clone(),
-        }],
+        removals: vec![PushTokenRemovalEntry::from_record(&record)],
     };
     Ok((payload, record))
 }
@@ -1338,6 +1351,18 @@ impl PushTokenGossipEntry {
 }
 
 impl PushTokenRemovalEntry {
+    fn from_record(record: &PushTokenRemovalRecord) -> Self {
+        Self {
+            member_id_hex: record.member_id_hex.clone(),
+            leaf_index: record.leaf_index,
+            platform: record.platform.as_str().to_owned(),
+            token_fingerprint: record.token_fingerprint.clone(),
+            server_pubkey_hex: record.server_pubkey_hex.clone(),
+            owner_ts: record.owner_ts,
+            owner_sig: record.owner_sig.clone(),
+        }
+    }
+
     fn into_record(self) -> Result<PushTokenRemovalRecord, AppError> {
         validate_account_hex(&self.member_id_hex, "member id")?;
         validate_account_hex(&self.server_pubkey_hex, "server pubkey")?;

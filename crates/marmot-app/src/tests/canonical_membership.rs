@@ -1020,16 +1020,17 @@ async fn termination_then_restoration_preserves_failed_sends_and_archive() {
         let mut withdrawn = peer_token.clone();
         withdrawn.leaf_index = 8;
         storage
-            .apply_group_push_token_tombstone(
-                &group_hex,
-                &peer,
-                8,
-                withdrawn.platform.platform_byte(),
-                &withdrawn.server_pubkey_hex,
-                withdrawn.owner_ts + 1,
-                "peer-withdrawal",
-                500,
-            )
+            .apply_group_push_token_tombstone(&storage_sqlite::AccountGroupPushTokenTombstone {
+                group_id_hex: group_hex.clone(),
+                member_id_hex: peer.clone(),
+                leaf_index: 8,
+                platform: withdrawn.platform.platform_byte(),
+                server_pubkey_hex: withdrawn.server_pubkey_hex.clone(),
+                owner_ts: withdrawn.owner_ts + 1,
+                record_digest: "peer-withdrawal".to_owned(),
+                removal_proof: None,
+                created_at_ms: 500,
+            })
             .unwrap();
 
         app.record_account_app_event(
