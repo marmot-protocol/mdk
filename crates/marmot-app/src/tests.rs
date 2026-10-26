@@ -1,3 +1,4 @@
+mod audit_ownership;
 #[cfg(feature = "test-policy-overrides")]
 mod canonical_membership;
 mod draft_lifecycle;

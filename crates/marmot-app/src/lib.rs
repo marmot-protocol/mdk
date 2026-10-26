@@ -1966,12 +1966,14 @@ impl MarmotApp {
         };
         let cursor_audit_placements = open.adapter.delivery_placement_counts();
         let recovery_loss_imports = open.recovery_loss_imports;
-        let audit_v5_enabled = open.runtime.session().audit_v5_enabled();
+        let audit = open.runtime.audit_recorder().clone();
+        let audit_v5_enabled = marmot_forensics::ForensicRecorder::records_v5(&audit);
         let mut client = AppClient {
             #[cfg(test)]
             test_recovery_selection_witness: None,
             audit_v5_probe: audit_v5_enabled.then(client::audit_v5_probe::WelcomeProbe::live),
             audit_v5_peel_slot: Some(open.audit_v5_peel_slot.clone()),
+            audit,
             #[cfg(test)]
             test_recovery_evidence: None,
             #[cfg(test)]

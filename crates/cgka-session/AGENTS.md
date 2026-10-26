@@ -23,6 +23,9 @@ key derivation, relay sync, or UI projection.
 - Every `SessionError` is an engine error. A storage failure the session meets itself converts to
   `EngineError::Storage`, so hosts classify it as they do the engine's own (mdk#2602). Callers ask
   `SessionError::as_engine_error`, not the variant.
+- Keep one audit recorder per account-device: `open` wraps the configured recorder in a `SharedRecorder`, builds the
+  engine with a clone, and writes the open-time `recorder_health` row through it. Do not add audit pass-through
+  methods; the runtime and the host record, rotate and finish through their own clones (mdk#2602, rule 5).
 - Prefer behavior tests over internal state assertions.
 
 ## Verification

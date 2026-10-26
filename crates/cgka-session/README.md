@@ -39,6 +39,9 @@ the default.
   identities, plus whether this device's own leaf is active. Pending roster projections do not replace those facts.
   Live termination and token cleanup use immutable engine effects captured at apply, rather than this reader.
 - Offers `promote_legacy_message_rows` for host-scheduled, bounded promotion of legacy stored rows after readiness.
+- Wraps the configured forensic recorder in the account-device's `SharedRecorder`, builds the engine with a clone,
+  and writes the open-time `recorder_health` row. `audit_recorder()` hands out the handle; the runtime and the host
+  record, rotate and finish the log through their own clones.
 
 It does **not** do account key derivation, recovery, or key rotation; relay sync, network publish, or transport
 adaptation; or UI projection and application databases. Those live above this crate (see

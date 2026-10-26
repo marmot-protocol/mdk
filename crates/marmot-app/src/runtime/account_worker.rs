@@ -7662,7 +7662,8 @@ fn record_runtime_publication(
     if publication.attempted == 0 || !client.audit_v5_enabled() {
         return;
     }
-    client.runtime.session().record_v5_event(
+    marmot_forensics::ForensicRecorder::record_v5_event(
+        &client.audit,
         None,
         marmot_forensics::v5::Event::RuntimePublicationOutcome(
             marmot_forensics::v5::RuntimePublicationOutcome {

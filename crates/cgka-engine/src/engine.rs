@@ -290,10 +290,13 @@ pub struct Engine<S: StorageProvider> {
     /// convergence or branch selection.
     pub(crate) engine_metrics: crate::engine_metrics::EngineMetrics,
 
-    /// Forensic audit-log recorder. Defaults to [`NoopRecorder`] when the
-    /// session is built without one. Engine call sites emit typed events
-    /// at every state-relevant decision point so a later analyzer can
-    /// reconstruct what each device saw and decided.
+    /// Forensic audit-log recorder, installed at build. Defaults to
+    /// [`NoopRecorder`] when the engine is built without one. Engine call
+    /// sites emit typed events at every state-relevant decision point so a
+    /// later analyzer can reconstruct what each device saw and decided. The
+    /// engine only records: the layer that built it owns the log's file,
+    /// rotation and end, through a shared handle it keeps (`cgka-session`
+    /// passes a clone of its `marmot_forensics::SharedRecorder`).
     pub(crate) recorder: Box<dyn ForensicRecorder>,
     pub(crate) audit_operation_counter: u64,
     /// Audit context for the in-flight local operation. The send and
@@ -2962,56 +2965,6 @@ impl<S: StorageProvider> Engine<S> {
         self.recorder.record(record);
     }
 
-    pub fn audit_external(
-        &self,
-        group_id: Option<&GroupId>,
-        context: Option<AuditEventContext>,
-        kind: AuditEventKind,
-    ) {
-        self.audit_with_context(group_id, context, kind);
-    }
-
-    pub fn audit_recorder_health(&self) {
-        let health = self.recorder.health_snapshot();
-        self.audit(AuditEventKind::RecorderHealth {
-            serialization_failures: health.serialization_failures,
-            write_failures: health.write_failures,
-            flush_failures: health.flush_failures,
-        });
-    }
-
-    /// Filesystem path the installed forensic recorder appends to, if it is
-    /// file-backed. `None` for the default [`NoopRecorder`].
-    pub fn audit_recorder_path(&self) -> Option<std::path::PathBuf> {
-        self.recorder.audit_log_path()
-    }
-
-    /// Native v5 evidence shares the recorder's source, session and sequence
-    /// with engine audit rows. V4 and disabled recorders ignore this call.
-    pub fn audit_v5_event(
-        &self,
-        group_ref: Option<marmot_forensics::v5::GroupRef>,
-        event: marmot_forensics::v5::Event,
-    ) {
-        self.recorder.record_v5_event(group_ref, event);
-    }
-
-    pub fn audit_v5_enabled(&self) -> bool {
-        self.recorder.records_v5()
-    }
-
-    /// Observe an explicit clean end to the installed v5 recorder. It does
-    /// not assert that preceding capture was complete or delivery succeeded.
-    pub fn finish_audit_v5_recording(&self, reason: marmot_forensics::v5::RecordingStopReason) {
-        self.recorder.finish_v5_recording(reason);
-    }
-
-    /// Rotate the installed forensic recorder: discard its current file and
-    /// begin a fresh one, then keep recording. No-op for non-file recorders.
-    pub fn rotate_audit_recorder(&self) -> std::io::Result<()> {
-        self.recorder.rotate()
-    }
-
     /// Override the deferred-peel retry budget (mdk#339). Rows that
     /// exceed it without ever peeling are resource-refused and released.
     /// Exposed so tests can exhaust the budget
@@ -3031,14 +2984,6 @@ impl<S: StorageProvider> Engine<S> {
     pub fn set_foreground_deferred_peel_budget(&mut self, budget_ms: u64, rows: usize) {
         self.foreground_deferred_peel_budget_ms = budget_ms.max(1);
         self.foreground_deferred_peel_rows = rows.max(1);
-    }
-
-    /// Replace the installed forensic recorder on a live engine. Dropping the
-    /// prior recorder flushes and closes any file it held. Used to start or
-    /// stop audit logging in place when the audit switch is toggled, without
-    /// rebuilding the engine. Pass [`NoopRecorder`] to stop recording.
-    pub fn set_recorder(&mut self, recorder: Box<dyn ForensicRecorder>) {
-        self.recorder = recorder;
     }
 
     pub(crate) fn next_audit_operation_id(&mut self) -> String {

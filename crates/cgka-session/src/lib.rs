@@ -34,7 +34,8 @@ use cgka_traits::{
     OutboundFanout, SecretBytes, TransportDelivery, TransportDeliveryPlane, TransportDeliverySource,
 };
 use marmot_forensics::{
-    AuditEventContext, AuditEventKind, AuditTransportContext, AuditTransportWire, ForensicRecorder,
+    AuditEventContext, AuditEventKind, AuditRecord, AuditTransportContext, AuditTransportWire,
+    ForensicRecorder, SharedRecorder,
 };
 use storage_sqlite::{
     MessageFormatPromotionProgress, SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions,
@@ -180,8 +181,9 @@ impl SessionConfig {
         self
     }
 
-    /// Install a forensic audit-log recorder. Without this call the engine
-    /// uses the no-op recorder.
+    /// Install a forensic audit-log recorder. The session wraps it in the
+    /// account-device's [`SharedRecorder`]. Without this call the handle
+    /// starts disabled.
     pub fn recorder(mut self, recorder: Box<dyn ForensicRecorder>) -> Self {
         self.recorder = Some(recorder);
         self
@@ -256,6 +258,9 @@ impl SessionConfig {
 pub struct AccountDeviceSession {
     engine: Engine<SqliteAccountStorage>,
     storage: SqliteAccountStorage,
+    /// The audit log's one recorder. The engine holds a clone from build, and
+    /// the runtime and the app take their own from [`Self::audit_recorder`].
+    audit: SharedRecorder,
     open_timings: SessionOpenTimings,
 }
 
@@ -444,9 +449,10 @@ impl AccountDeviceSession {
         if let Some((wall_clock, maintenance_random)) = config.maintenance_sources {
             builder = builder.maintenance_sources(wall_clock, maintenance_random);
         }
-        if let Some(recorder) = config.recorder {
-            builder = builder.recorder(recorder);
-        }
+        let audit = config
+            .recorder
+            .map_or_else(SharedRecorder::disabled, SharedRecorder::new);
+        builder = builder.recorder(Box::new(audit.clone()));
         let mut engine = builder.build()?;
         if config.protocol_profile == ProtocolProfile::Current {
             let retirement = engine.retire_non_current_key_packages()?;
@@ -470,7 +476,15 @@ impl AccountDeviceSession {
         engine
             .set_convergence_policy(config.convergence_policy)
             .map_err(|e| EngineError::Other(format!("convergence policy: {e}")))?;
-        engine.audit_recorder_health();
+        let health = audit.health_snapshot();
+        audit.record(AuditRecord::new(
+            None,
+            AuditEventKind::RecorderHealth {
+                serialization_failures: health.serialization_failures,
+                write_failures: health.write_failures,
+                flush_failures: health.flush_failures,
+            },
+        ));
         // In-memory count only: telemetry bookkeeping must neither re-list
         // storage on the open critical path nor add a failure mode after
         // hydration already succeeded.
@@ -494,6 +508,7 @@ impl AccountDeviceSession {
         Ok(Self {
             engine,
             storage: maintenance_storage,
+            audit,
             open_timings,
         })
     }
@@ -1516,55 +1531,11 @@ impl AccountDeviceSession {
             .map_err(|e| EngineError::Other(format!("convergence policy: {e}")))
     }
 
-    pub fn record_audit_event(
-        &self,
-        group_id: Option<&GroupId>,
-        context: Option<AuditEventContext>,
-        kind: AuditEventKind,
-    ) {
-        self.engine.audit_external(group_id, context, kind);
-    }
-
-    pub fn record_v5_event(
-        &self,
-        group_ref: Option<marmot_forensics::v5::GroupRef>,
-        event: marmot_forensics::v5::Event,
-    ) {
-        self.engine.audit_v5_event(group_ref, event);
-    }
-
-    pub fn audit_v5_enabled(&self) -> bool {
-        self.engine.audit_v5_enabled()
-    }
-
-    pub fn finish_audit_v5_recording(&self, reason: marmot_forensics::v5::RecordingStopReason) {
-        self.engine.finish_audit_v5_recording(reason);
-    }
-
-    pub fn record_audit_health(&self) {
-        self.engine.audit_recorder_health();
-    }
-
-    /// Path of the active forensic audit log, if a file-backed recorder is
-    /// installed on this session. `None` when audit logging is off (the
-    /// engine uses the no-op recorder).
-    pub fn audit_log_path(&self) -> Option<std::path::PathBuf> {
-        self.engine.audit_recorder_path()
-    }
-
-    /// Rotate the forensic audit log: discard the current file and begin a
-    /// fresh one, continuing to record from that point. No-op when no
-    /// file-backed recorder is installed.
-    pub fn rotate_audit_log(&self) -> std::io::Result<()> {
-        self.engine.rotate_audit_recorder()
-    }
-
-    /// Install or replace the forensic recorder on the live engine, e.g. when
-    /// the audit-logging switch is toggled. Pass a `NoopRecorder` to stop
-    /// recording; dropping the prior recorder flushes and closes any file it
-    /// held, so no session reopen is required.
-    pub fn set_audit_recorder(&mut self, recorder: Box<dyn ForensicRecorder>) {
-        self.engine.set_recorder(recorder);
+    /// The account-device's audit recorder. Engine rows and every row
+    /// recorded through a clone of this handle share one writer, recording
+    /// session and sequence.
+    pub fn audit_recorder(&self) -> &SharedRecorder {
+        &self.audit
     }
 
     fn collect_effects(&mut self, results: Vec<SendResult>) -> SessionEffects {

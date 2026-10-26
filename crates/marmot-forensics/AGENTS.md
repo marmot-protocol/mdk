@@ -6,6 +6,9 @@ Shared JSONL forensic audit schema for Marmot incident capture.
 
 - Own the append-only audit-log schema and the `ForensicRecorder` trait (with `JsonlRecorder` and `NoopRecorder`
   implementations) used by engine/runtime incident capture. Human overview: [`README.md`](README.md).
+- Keep `SharedRecorder` the one recorder per account-device: every owner records through a clone, so rows share one
+  writer, session and sequence. `swap` and `finish` drop the replaced recorder before returning, which closes its file;
+  never hand out the inner recorder, or a caller could keep a closed log's file open.
 - Keep this crate independent of engine, app, storage, transport SDK, and simulator crates.
 - Keep static snapshot dump analysis out of this repo; external tools should consume JSONL audit files.
 - Keep `JsonlRecorder` segment rotation transparent (mdk#1181). Sealing the active file at
@@ -46,7 +49,8 @@ Shared JSONL forensic audit schema for Marmot incident capture.
 ## Layout
 
 - `src/audit.rs` — v4 `AuditEvent`/`AuditEventKind` catalog, `JsonlRecorder`/`NoopRecorder`, segment rotation,
-  `AUDIT_LOG_SCHEMA_VERSION`, and `is_v5_only`. `src/audit/recovery.rs` — closed vocabularies for the v5-only
+  `AUDIT_LOG_SCHEMA_VERSION`, and `is_v5_only`. `src/audit/shared.rs` — `SharedRecorder`, the cloneable swappable
+  handle. `src/audit/recovery.rs` — closed vocabularies for the v5-only
   recovery-owner, transport-cursor, owned replay recovery and historical EOSE-repair rows. `src/audit/refusal.rs` — vocabularies for the v5-only
   `subscription_refused` row. `src/audit/tests.rs` — catalog/schema lockstep tests.
 - `src/v5/` — v5 record contract: `types.rs` (candidate DTOs), `validation.rs` (semantic validation behind `Record`),

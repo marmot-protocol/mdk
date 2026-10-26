@@ -44,7 +44,8 @@ use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 use marmot_forensics::v5 as audit_v5;
 use marmot_forensics::{
-    AuditEventContext, AuditEventKind, AuditTransportWire, MessageArtifactKind, PublishRelayFailure,
+    AuditEventContext, AuditEventKind, AuditRecord, AuditTransportWire, ForensicRecorder,
+    MessageArtifactKind, PublishRelayFailure, SharedRecorder,
 };
 use sha2::{Digest, Sha256};
 
@@ -426,6 +427,8 @@ impl Drop for PublicationProgressGuard {
 
 pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackagePublisher> {
     session: AccountDeviceSession,
+    /// This runtime's clone of the session's audit recorder.
+    audit: SharedRecorder,
     adapter: A,
     routing: R,
     key_packages: K,
@@ -464,6 +467,7 @@ where
 {
     pub fn new(session: AccountDeviceSession, adapter: A, routing: R, key_packages: K) -> Self {
         Self {
+            audit: session.audit_recorder().clone(),
             session,
             adapter,
             routing,
@@ -520,6 +524,26 @@ where
 
     pub fn session_mut(&mut self) -> &mut AccountDeviceSession {
         &mut self.session
+    }
+
+    /// The account-device's audit recorder. A host takes its own clone to
+    /// record, rotate and finish the log without going through this runtime.
+    pub fn audit_recorder(&self) -> &SharedRecorder {
+        &self.audit
+    }
+
+    fn record_audit_event(
+        &self,
+        group_id: Option<&GroupId>,
+        context: Option<AuditEventContext>,
+        kind: AuditEventKind,
+    ) {
+        let mut record = AuditRecord::new(
+            group_id.map(|group_id| hex::encode(group_id.as_slice())),
+            kind,
+        );
+        record.context = context;
+        self.audit.record(record);
     }
 
     /// Abandon a group locally without sending a leave or disband.
@@ -4275,7 +4299,7 @@ where
                 operation_id: Some(format!("publish-{msg_id_hex}")),
                 ..AuditEventContext::default()
             };
-            self.session.record_audit_event(
+            self.record_audit_event(
                 fanout.group_id.as_ref(),
                 Some(publish_context.clone()),
                 AuditEventKind::PublishAttempt {
@@ -4373,7 +4397,7 @@ where
                 .iter()
                 .filter(|target| target.state == TransportFanoutAttemptState::Accepted)
                 .count();
-            self.session.record_audit_event(
+            self.record_audit_event(
                 fanout.group_id.as_ref(),
                 Some(publish_context),
                 AuditEventKind::PublishOutcome {
@@ -4706,7 +4730,7 @@ where
             self.session.put_outbound_fanout(&fanout)?;
             // Every pass is audited, including secondary retries after the
             // first acknowledgement confirmed the pending MLS state (mdk#2255).
-            self.session.record_audit_event(
+            self.record_audit_event(
                 fanout.group_id(),
                 context.clone(),
                 AuditEventKind::PublishAttempt {
@@ -4850,7 +4874,7 @@ where
             // Record this artifact before confirmation releases any frozen
             // Welcome continuations, preserving transport chronology in the
             // returned effects while keeping the MLS edge atomic below.
-            self.session.record_audit_event(
+            self.record_audit_event(
                 fanout.group_id(),
                 context.clone(),
                 AuditEventKind::PublishOutcome {
@@ -5066,7 +5090,7 @@ where
         };
         let mut publish_context = context.unwrap_or_default();
         publish_context.operation_id = Some(format!("publish-{msg_id_hex}"));
-        let v5_welcome_identity = if self.session.audit_v5_enabled() {
+        let v5_welcome_identity = if self.audit.records_v5() {
             match &message.envelope {
                 TransportEnvelope::Welcome { recipient } => publish_context
                     .v5_welcome_refs
@@ -5107,7 +5131,7 @@ where
                     if let Some((op_id, outer_event_ref, recipient_ref, group_ref)) =
                         &v5_welcome_identity
                     {
-                        self.session.record_v5_event(
+                        self.audit.record_v5_event(
                             Some(group_ref.clone()),
                             audit_v5::Event::WelcomePublishNotStarted(
                                 audit_v5::WelcomePublishNotStarted {
@@ -5120,7 +5144,7 @@ where
                             ),
                         );
                     }
-                    self.session.record_audit_event(
+                    self.record_audit_event(
                         None,
                         Some(publish_context),
                         AuditEventKind::PublishFailure {
@@ -5151,7 +5175,7 @@ where
         let target_kind = publish_target_kind(&target).to_string();
         let relay_urls = publish_target_relay_urls(&target);
         let target_group_id = publish_target_group_id(&target);
-        self.session.record_audit_event(
+        self.record_audit_event(
             target_group_id.as_ref(),
             Some(publish_context.clone()),
             AuditEventKind::PublishAttempt {
@@ -5284,7 +5308,7 @@ where
             let targets_complete =
                 targets.len() == retry_endpoints.len() && targets.len() <= audit_v5::MAX_ENDPOINTS;
             targets.truncate(audit_v5::MAX_ENDPOINTS);
-            self.session.record_v5_event(
+            self.audit.record_v5_event(
                 Some(group_ref.clone()),
                 audit_v5::Event::WelcomePublishStarted(audit_v5::WelcomePublishStarted {
                     op_id: op_id.clone(),
@@ -5402,7 +5426,7 @@ where
                     required_acks,
                 );
                 if let Some(report) = &endpoint_report {
-                    self.session.record_audit_event(
+                    self.record_audit_event(
                         target_group_id.as_ref(),
                         Some(publish_context.clone()),
                         AuditEventKind::PublishOutcome {
@@ -5429,7 +5453,7 @@ where
                         },
                     );
                 }
-                self.session.record_audit_event(
+                self.record_audit_event(
                     target_group_id.as_ref(),
                     Some(publish_context),
                     AuditEventKind::PublishFailure {
@@ -5481,7 +5505,7 @@ where
         );
         let published = accepted_total >= required_acks.max(1);
         let accepted_by_any_endpoint = accepted_total > 0;
-        self.session.record_audit_event(
+        self.record_audit_event(
             target_group_id.as_ref(),
             Some(publish_context.clone()),
             AuditEventKind::PublishOutcome {
@@ -5512,7 +5536,7 @@ where
             },
         );
         if !published {
-            self.session.record_audit_event(
+            self.record_audit_event(
                 target_group_id.as_ref(),
                 Some(publish_context),
                 AuditEventKind::PublishFailure {
@@ -5620,7 +5644,7 @@ where
         } else {
             audit_v5::RetainedState::Pending
         };
-        self.session.record_v5_event(
+        self.audit.record_v5_event(
             Some(group_ref.clone()),
             audit_v5::Event::WelcomePublishFinished(audit_v5::WelcomePublishFinished {
                 attempt_id: attempt_id.clone(),

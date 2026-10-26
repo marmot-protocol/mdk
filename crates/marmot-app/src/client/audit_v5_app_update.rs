@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use cgka_traits::engine::GroupEvent;
+use marmot_forensics::ForensicRecorder as _;
 use marmot_forensics::v5::{
     AppUpdateCategory, AppUpdateCompute, AppUpdateFailureReason, AppUpdateFailureStage,
     AppUpdateInputScope, AppUpdateOutcome, AppUpdateTransaction, EngineMessageRef, Event,
@@ -75,7 +76,7 @@ impl AppClient {
             known_not_committed,
             failure_stage,
         } = observed;
-        self.runtime.session().record_v5_event(
+        self.audit.record_v5_event(
             None,
             Event::AppUpdateOutcome(AppUpdateOutcome {
                 operation_ref: None,
@@ -122,7 +123,7 @@ impl AppClient {
         if !self.audit_v5_enabled() {
             return;
         }
-        self.runtime.session().record_v5_event(
+        self.audit.record_v5_event(
             None,
             Event::AppUpdateOutcome(AppUpdateOutcome {
                 operation_ref: None,
@@ -149,7 +150,7 @@ impl AppClient {
         if !self.audit_v5_enabled() {
             return;
         }
-        self.runtime.session().record_v5_event(
+        self.audit.record_v5_event(
             None,
             Event::AppUpdateOutcome(AppUpdateOutcome {
                 operation_ref: None,

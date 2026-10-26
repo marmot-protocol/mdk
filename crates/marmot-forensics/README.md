@@ -10,6 +10,8 @@ forensic logging. Read this if you produce, validate, or analyze Marmot audit fi
   readable) and the Rust event kind catalog.
 - Provides privacy-safe `JsonlRecorder` and `NoopRecorder` implementations. There is no full-data mode: rows carry
   hashed or truncated identifiers, digests, lengths, counts, and typed outcomes only.
+- Provides `SharedRecorder`, the cloneable handle through which the engine, the account runtime and the app record
+  into one file and one sequence. Swapping or finishing it closes the old file for every clone.
 - Provides a local delivery boundary (`local_delivery`, Unix only) that prepares bounded batches of original, complete
   JSONL lines for a sender. It does no network I/O itself; `marmot-app` owns the upload path.
 - Stays independent of engine, storage, transport, and simulator crates.
