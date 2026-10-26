@@ -94,6 +94,9 @@ release and client adoption remain separate. See the [native handoff](../further
 Foreground push registration is idempotent when the provider token, platform, server, and relay hint are unchanged:
 it preserves the durable revision and completed or pending gossip work instead of broadcasting to every joined
 conversation again. Changes to those registration inputs still queue the new revision for all joined groups.
+A merged Commit that adds a member, or a Commit that branch selection re-adopts, queues the current revision for that
+group again, so a new member receives every existing member's token; migration 0117 queued every joined group once for
+installs that predate this (mdk#2604).
 Account workers process scheduled convergence one group per turn, retaining the other groups' deadlines and
 alternating queued commands with due recovery passes so neither queue starves the other. Each pass retries group
 subscriptions only when a refresh is pending; an unchanged group set needs no account-wide refresh. A running

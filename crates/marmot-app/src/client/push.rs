@@ -13,6 +13,27 @@ mod tests;
 
 const PUSH_PUBLISH_CONCURRENCY: usize = 4;
 
+/// The group a merged Commit may have grown: a member add, or a Commit that
+/// branch selection re-adopted after withdrawing it. Either way a member may
+/// now hold no record of this device's token.
+///
+/// The re-share is edge-triggered from these in-memory engine events. A crash
+/// or a failed queue write at a narrow moment loses it, and the new member
+/// then misses this token as before mdk#2604; token requests (mdk#2611) are
+/// what repair that. `MemberAdded` is per account, so a new device of an
+/// existing member never triggers it.
+pub(crate) fn member_add_group(event: &cgka_traits::engine::GroupEvent) -> Option<&GroupId> {
+    match event {
+        cgka_traits::engine::GroupEvent::GroupStateChanged {
+            group_id,
+            change: cgka_traits::engine::GroupStateChange::MemberAdded { .. },
+            ..
+        }
+        | cgka_traits::engine::GroupEvent::GroupStateRevalidated { group_id, .. } => Some(group_id),
+        _ => None,
+    }
+}
+
 impl AppClient {
     pub(crate) async fn upsert_and_share_push_registration(
         &mut self,
@@ -377,6 +398,78 @@ impl AppClient {
                 true
             }
         }
+    }
+
+    /// A merged Commit added a member, who cannot read this device's earlier
+    /// shares: queue the current registration for the group again. One queue
+    /// row per group absorbs every add in a batch.
+    pub(crate) fn queue_push_registration_share_after_member_added(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        if self
+            .runtime
+            .session()
+            .leave_in_progress(group_id)
+            .map_err(cgka_session::SessionError::from)?
+        {
+            return Ok(());
+        }
+        let queued = self.app.queue_current_push_registration_share_for_group(
+            &self.state.label,
+            &hex::encode(group_id.as_slice()),
+        )?;
+        if queued {
+            self.push_registration_share_queued = true;
+            tracing::debug!(
+                target: "marmot_app::notifications",
+                method = "queue_push_registration_share_after_member_added",
+                queued_groups = 1_u64,
+                "push token share queued for a member add",
+            );
+        }
+        Ok(())
+    }
+
+    /// Queue one share per group that `events` may have grown. A
+    /// group whose queue write fails is kept for the account worker to retry.
+    pub(crate) fn queue_push_registration_shares_for_member_adds(
+        &mut self,
+        events: &[cgka_traits::engine::GroupEvent],
+    ) {
+        for event in events {
+            if let Some(group_id) = member_add_group(event) {
+                self.pending_member_add_push_shares.insert(group_id.clone());
+            }
+        }
+        self.retry_pending_member_add_push_shares();
+    }
+
+    /// Queue the shares owed for member adds whose earlier queue write failed.
+    pub(crate) fn retry_pending_member_add_push_shares(&mut self) {
+        let groups: Vec<_> = self
+            .pending_member_add_push_shares
+            .iter()
+            .cloned()
+            .collect();
+        for group_id in groups {
+            match self.queue_push_registration_share_after_member_added(&group_id) {
+                Ok(()) => {
+                    self.pending_member_add_push_shares.remove(&group_id);
+                }
+                Err(error) => tracing::warn!(
+                    target: "marmot_app::notifications",
+                    method = "retry_pending_member_add_push_shares",
+                    error_kind = error.privacy_safe_kind(),
+                    "push token share after a member add was not queued"
+                ),
+            }
+        }
+    }
+
+    /// Whether a member add queued a share since the last call.
+    pub(crate) fn take_queued_push_registration_share(&mut self) -> bool {
+        std::mem::take(&mut self.push_registration_share_queued)
     }
 
     pub(crate) fn queue_current_push_registration_removal_for_group(

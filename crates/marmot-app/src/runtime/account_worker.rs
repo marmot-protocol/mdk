@@ -2100,6 +2100,11 @@ async fn run_app_runtime_account_worker(
             client.has_pending_runtime_group_subscription_refresh(),
             &command_tx,
         );
+        // A member add on any ingest or send path queued a share.
+        client.retry_pending_member_add_push_shares();
+        if client.take_queued_push_registration_share() {
+            scheduled_push_retry.observe_pending(true, &command_tx);
+        }
         schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
         let ready_command =
             ready_command_index(&pending, &media_http, comparison_recovery.is_some());

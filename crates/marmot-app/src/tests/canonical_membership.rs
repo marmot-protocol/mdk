@@ -4,7 +4,7 @@ use super::*;
 use crate::conversation_presentation::ConversationAuthority;
 use cgka_traits::engine::{GroupEvent, SendIntent};
 
-fn app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> MarmotApp {
+pub(super) fn app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> MarmotApp {
     MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://relay.example",
@@ -16,7 +16,11 @@ fn app_at(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> Marmo
 }
 
 /// Deliver actual signed publications through the app's normal inbound seam.
-async fn deliver_new(client: &mut AppClient, relay: &ScriptedPushRelayClient, cursor: &mut usize) {
+pub(super) async fn deliver_new(
+    client: &mut AppClient,
+    relay: &ScriptedPushRelayClient,
+    cursor: &mut usize,
+) {
     let events = relay.published_events.lock().unwrap().clone();
     let account = client
         .app
@@ -494,7 +498,7 @@ async fn late_competing_commit_cannot_restore_terminal_app_copy() {
 }
 
 /// Attach the real published KeyPackage event needed by the Welcome wrapper.
-async fn published_key_package(
+pub(super) async fn published_key_package(
     client: &mut AppClient,
     relay: &ScriptedPushRelayClient,
 ) -> cgka_traits::KeyPackage {
