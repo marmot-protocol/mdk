@@ -2147,7 +2147,7 @@ MarmotStatus marmot_flush_product_analytics(const struct MarmotClient *client);
 MarmotStatus marmot_group_members(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, struct MarmotAppGroupMemberRecordList **out);
 ```
 
-Membership roster for `group_id_hex`. Free with `marmot_app_group_member_record_list_free`.
+Membership roster for `group_id_hex`, one row per member account with its `device_count`. Free with `marmot_app_group_member_record_list_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotgroup_members) · [Header contract](include/marmot.h#L7051)
 
@@ -2157,7 +2157,7 @@ Membership roster for `group_id_hex`. Free with `marmot_app_group_member_record_
 MarmotStatus marmot_group_details(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, struct MarmotGroupDetails **out);
 ```
 
-Group plus enriched member rows for detail screens. Free with `marmot_group_details_free`.
+Group plus enriched member rows for detail screens, one per member account with its `device_count`. Free with `marmot_group_details_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotgroup_details) · [Header contract](include/marmot.h#L7066)
 
@@ -2247,7 +2247,7 @@ Read the local blocked-user list, newest first. Free with `marmot_blocked_user_l
 MarmotStatus marmot_group_member_ids_page(const struct MarmotClient *client, const char *account_ref, const char *const *group_ids_hex, uintptr_t group_ids_hex_len, struct MarmotAppGroupMemberIdsList **out);
 ```
 
-Member and admin ids for several groups in one read. Free with `marmot_app_group_member_ids_list_free`.
+Member account and admin ids for several groups in one read, each account once. Free with `marmot_app_group_member_ids_list_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotgroup_member_ids_page) · [Header contract](include/marmot.h#L8860)
 
@@ -2267,7 +2267,7 @@ Group details and management state in one read. Free with `marmot_group_conversa
 MarmotStatus marmot_group_roster(const struct MarmotClient *client, const char *account_ref, const char *group_id_hex, struct MarmotGroupRoster **out);
 ```
 
-The group's member roster at the current MLS epoch. Free with `marmot_group_roster_free`.
+The group's member roster at the current MLS epoch, one entry per member account with its `device_count`; `member_count` counts accounts. Free with `marmot_group_roster_free`.
 
 [Shared method and API guidance](../marmot-uniffi/API-REFERENCE.md#marmotgroup_roster) · [Header contract](include/marmot.h#L8891)
 

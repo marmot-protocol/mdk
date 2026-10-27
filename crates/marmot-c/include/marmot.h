@@ -2287,7 +2287,8 @@ typedef struct MarmotMemberRef {
 } MarmotMemberRef;
 
 /**
- * One member row of the group roster.
+ * One member account of the group roster. An account with several
+ * devices in the group is one row.
  */
 typedef struct MarmotAppGroupMemberRecord {
   char *member_id_hex;
@@ -2296,6 +2297,10 @@ typedef struct MarmotAppGroupMemberRecord {
    */
   char *account;
   bool local;
+  /**
+   * How many of this account's devices are in the group.
+   */
+  uint32_t device_count;
 } MarmotAppGroupMemberRecord;
 
 /**
@@ -2430,7 +2435,8 @@ typedef struct MarmotAppGroupRecord {
 } MarmotAppGroupRecord;
 
 /**
- * Enriched member row for group detail screens.
+ * Enriched member row for group detail screens. An account with
+ * several devices in the group is one row.
  */
 typedef struct MarmotGroupMemberDetails {
   char *member_id_hex;
@@ -2440,6 +2446,10 @@ typedef struct MarmotGroupMemberDetails {
   bool is_self;
   char *npub;
   char *display_name;
+  /**
+   * How many of this account's devices are in the group.
+   */
+  uint32_t device_count;
 } MarmotGroupMemberDetails;
 
 /**

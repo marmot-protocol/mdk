@@ -142,7 +142,7 @@ pub struct ExistingDirectConversation {
 /// Select the reusable direct conversation with `peer_account_id_hex`, if any.
 ///
 /// A row is a **direct** conversation when its group name is empty and the
-/// projected roster size is exactly two (`ChatConversationKind::Direct`).
+/// projected roster has exactly two member accounts (`ChatConversationKind::Direct`).
 /// It is **reusable** with that peer when all of the following hold:
 ///
 /// - `self_membership` is [`SelfMembership::Member`]
@@ -510,7 +510,7 @@ impl SqliteAppStorage {
     /// Direct-conversation candidates for a peer-keyed reuse lookup.
     ///
     /// Returns only rows whose durable projection is currently classified as
-    /// [`ChatConversationKind::Direct`] (empty group name and roster size 2)
+    /// [`ChatConversationKind::Direct`] (empty group name and two member accounts)
     /// and whose persisted member index contains `peer_account_id_hex`.
     /// Named chats, 3+ member chats, and Direct chats with a different peer
     /// are excluded in SQL so lookup work does not grow with those rows.
@@ -2815,6 +2815,8 @@ fn chat_list_row_from_row(row: &rusqlite::Row<'_>, now_ms: i64) -> rusqlite::Res
 }
 
 /// Classify a conversation from the same inputs used by chat-list projection.
+/// `member_count` counts member accounts, so a chat stays Direct however many
+/// devices either person has in it.
 pub fn conversation_kind(group_name: &str, member_count: Option<u64>) -> ChatConversationKind {
     if !group_name.trim().is_empty() {
         return ChatConversationKind::Group;

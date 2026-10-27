@@ -282,6 +282,13 @@ targets.
 chats. Clients render accept/decline UI from the group record: accept clears `pending_confirmation`; decline publishes a
 leave, clears the pending flag, and archives the local projection so normal chat lists hide it.
 
+**Members are accounts.** An account with several devices holds one MLS leaf per device in a group. Every member
+projection groups leaves by account: member records, rosters, member-id pages and conversation snapshots list each
+account once with its `device_count`, and `member_count`, admin counts and direct-chat detection count accounts. A chat
+between two accounts stays direct, and takes its title and avatar from the other account, whatever devices either
+person uses. Membership rows follow the engine's account-level changes: a second device joining, or one of several
+leaving, makes no row; an account's first device joining or last device leaving does.
+
 **Committed group activity.** Commands and maintenance retain native cleanup and commit activity before subscription
 work can suspend. Manual and scheduled convergence retain subscriber deltas through route refresh, checkpoints,
 notifications and invitation recovery. Quiet observations return repaired deltas once without republishing the accepted

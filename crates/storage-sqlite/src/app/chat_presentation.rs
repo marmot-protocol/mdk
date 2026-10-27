@@ -238,7 +238,7 @@ impl SqliteAppStorage {
             .with_deferred_read(|conn| presentation_input_tx(conn, group))
     }
 
-    /// Account orchestration supplies the complete authoritative two-member roster, including named groups.
+    /// Account orchestration supplies the complete authoritative two-account roster, including named groups.
     /// Other roster sizes/unknown membership clear peer evidence. Does not alter direct-chat reuse policy.
     pub fn set_chat_presentation_members(
         &self,

@@ -2417,12 +2417,11 @@ impl AppClient {
                 let group_record = self
                     .state_group_record(group_id)
                     .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))?;
-                let member_ids_hex = self
-                    .runtime
-                    .members(group_id)?
-                    .into_iter()
-                    .map(|member| hex::encode(member.id.as_slice()))
-                    .collect();
+                let member_ids_hex =
+                    crate::groups::member_accounts(&self.runtime.members(group_id)?)
+                        .into_iter()
+                        .map(|(member_id, _)| hex::encode(member_id.as_slice()))
+                        .collect();
                 Ok(crate::AppGroupMemberIds {
                     group_id_hex: hex::encode(group_id.as_slice()),
                     member_ids_hex,
@@ -2453,20 +2452,21 @@ impl AppClient {
         group_id: &GroupId,
         profiles: &HashMap<String, String>,
     ) -> Result<Vec<AppGroupMemberRecord>, AppError> {
-        Ok(self
-            .runtime
-            .members(group_id)?
-            .into_iter()
-            .map(|member| {
-                let member_id_hex = hex::encode(member.id.as_slice());
-                let account = profiles.get(&member_id_hex).cloned();
-                AppGroupMemberRecord {
-                    member_id_hex,
-                    local: account.is_some(),
-                    account,
-                }
-            })
-            .collect())
+        Ok(
+            crate::groups::member_accounts(&self.runtime.members(group_id)?)
+                .into_iter()
+                .map(|(member_id, device_count)| {
+                    let member_id_hex = hex::encode(member_id.as_slice());
+                    let account = profiles.get(&member_id_hex).cloned();
+                    AppGroupMemberRecord {
+                        member_id_hex,
+                        local: account.is_some(),
+                        account,
+                        device_count,
+                    }
+                })
+                .collect(),
+        )
     }
 
     pub fn group_mls_state(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
@@ -2544,7 +2544,7 @@ impl AppClient {
             protocol_profile: group.protocol_profile.into(),
             lifecycle_state,
             epoch: group.epoch.0,
-            member_count: group.members.len(),
+            member_count: crate::groups::member_account_count(&group.members),
             unrecoverable: group.unrecoverable,
             required_app_components: group
                 .required_capabilities
@@ -3698,9 +3698,9 @@ impl AppClient {
                     continue;
                 }
             };
-            let member_ids_hex = members
-                .iter()
-                .map(|member| hex::encode(member.id.as_slice()).to_ascii_lowercase())
+            let member_ids_hex = crate::groups::member_accounts(&members)
+                .into_iter()
+                .map(|(member_id, _)| hex::encode(member_id.as_slice()).to_ascii_lowercase())
                 .collect::<Vec<_>>();
             storage.fill_unindexed_direct_conversation_members(&group_id_hex, &member_ids_hex)?;
         }

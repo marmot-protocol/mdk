@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- Migration 0120 advances account storage to schema 120 (mdk#2628).
+  `account_groups.member_count` now counts member accounts, so an account
+  with several devices in a group counts once and a chat between two
+  accounts is `Direct`. The migration rewrites rows whose engine record lists
+  an account more than once; every other row already counted accounts.
 - Migration 0117 advances account storage to schema 117 on first open; older
   binaries reject the upgraded database. It queues the current push
   registration once for every joined group while native push is on, so

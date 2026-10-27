@@ -25,7 +25,8 @@ Read the documentation at the tag matching your binaries; `master` can describe 
   [live timeline updates](#live-timeline-updates), [durable avatar access](#durable-avatar-access)
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
   [group-system previews](#group-system-previews),
-  [device-local membership events](#device-local-membership-events), [group reporting](#group-reporting),
+  [device-local membership events](#device-local-membership-events), [members are accounts](#members-are-accounts),
+  [group reporting](#group-reporting),
   [moderation reports to the operator](#moderation-reports-to-the-operator),
   [history may be incomplete notices](#history-may-be-incomplete-notices)
 - Media: [file-backed media upload](#file-backed-media-upload),
@@ -887,6 +888,16 @@ notification effects before host delivery; these events create no system row.
 Use them to refresh presentation, and handle the new variants when regenerating
 Swift/Kotlin bindings. Retained-history engine rollback is separate from automatic
 terminal-copy recovery through the managed scheduler.
+
+## Members are accounts
+
+An account can have several devices in one group, each its own MLS leaf. Member
+rows, rosters, member-id pages and conversation snapshots list each account once,
+and `member_count`, admin counts, last-admin checks and direct-chat detection count
+accounts: a 1:1 chat stays a 1:1 whatever devices either person uses. A member row's
+`device_count` is how many of that account's devices are in the group; nothing else
+about another account's devices reaches the bindings. A group-system row marks only
+an account's first device joining or its last device leaving.
 
 ## Group-system previews
 

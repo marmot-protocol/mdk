@@ -1493,7 +1493,7 @@ fn probe_bounds_and_unknown_checkpoint_do_not_fabricate_success() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn baseline_marks_an_invalid_or_duplicate_member_identity_as_partial() {
+async fn baseline_marks_an_invalid_member_identity_as_partial_and_counts_accounts() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut scenario = Scenario::new().await;
         let group_id = scenario.create().await;
@@ -1510,15 +1510,17 @@ async fn baseline_marks_an_invalid_or_duplicate_member_identity_as_partial() {
         assert!(!row.members_complete);
         assert!(row.limitations.contains(&Limitation::MemberIdentityInvalid));
 
-        let mut duplicate = group;
-        duplicate.members[1].id = duplicate.members[0].id.clone();
-        capture.baseline(&duplicate, None, BaselineReason::Opened, None);
+        // A second leaf of one account is that account's other device, not
+        // an identity fault: the baseline lists and counts the account once.
+        let mut second_device = group;
+        second_device.members.push(second_device.members[0].clone());
+        capture.baseline(&second_device, None, BaselineReason::Opened, None);
         let Event::GroupBaseline(row) = &capture.rows[1].fields().event else {
             panic!("expected baseline");
         };
-        assert_eq!(row.capture, Capture::Partial);
-        assert!(!row.members_complete);
-        assert!(row.limitations.contains(&Limitation::MemberIdentityInvalid));
+        assert_eq!(row.members.len(), 2);
+        assert_eq!(row.member_count, Some(2));
+        assert!(!row.limitations.contains(&Limitation::MemberIdentityInvalid));
     })
     .await
     .expect("bounded baseline identity scenario");

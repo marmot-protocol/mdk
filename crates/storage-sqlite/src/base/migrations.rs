@@ -252,6 +252,8 @@ mod migration_0117_push_token_reshare_repair;
 mod migration_0118_push_token_gossip_state;
 #[path = "migrations/0119_push_snapshot_owed.rs"]
 mod migration_0119_push_snapshot_owed;
+#[path = "migrations/0120_member_count_accounts.rs"]
+mod migration_0120_member_count_accounts;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -986,6 +988,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0119_push_snapshot_owed",
         suspend_foreign_keys: &[],
         apply: migration_0119_push_snapshot_owed::apply,
+    },
+    Migration {
+        version: 120,
+        name: "0120_member_count_accounts",
+        suspend_foreign_keys: &[],
+        apply: migration_0120_member_count_accounts::apply,
     },
 ];
 
