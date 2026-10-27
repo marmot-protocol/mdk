@@ -1,7 +1,7 @@
 ---
 title: "Dial Safety"
 created: 2026-07-04
-updated: 2026-10-17
+updated: 2026-10-27
 tags: [marmot, overview, security, network, ssrf, transport]
 status: overview
 ---
@@ -65,9 +65,11 @@ redirects and system proxies, timeout budgets, retired-host rejection, and conte
 
 The explicit [SOCKS5 policy](../../../crates/marmot-app/README.md#socks5-routing) sends validated HTTP IP pins through
 a trusted proxy without proxy-side DNS. Relay hostnames use proxy-side DNS and retain the Nostr residual below.
-Runtime QUIC agent previews reject SOCKS5 mode rather than bypassing it. Crate-local `clippy.toml` files in
-`marmot-app`, `marmot-c`, and `transport-nostr-adapter` reject direct `nostr_sdk` and `reqwest` client constructors so
-new clients cannot skip the policy; `Client::default()` is a trait impl clippy cannot target, so review still covers it.
+Runtime QUIC agent previews reject SOCKS5 mode rather than bypassing it. Crate-local `clippy.toml` files reject direct
+client constructors so new clients cannot skip the policy: `marmot-app` and `nostr-directory` reject `nostr_sdk` and
+`reqwest` ones; `marmot-c`, `transport-nostr`, and `transport-nostr-adapter`, which have no `reqwest` dependency,
+reject `nostr_sdk` ones. `Client::default()` and `ClientBuilder::default()` are trait impls clippy cannot target, so
+review still covers them.
 
 The broker TLS client (`crates/transport-quic-broker/src/tls.rs`) keeps a resolved-address backstop
 (`InsecureLocalRequiresLoopback`): even if a caller mis-selects `InsecureLocal`, a non-loopback resolved address is
