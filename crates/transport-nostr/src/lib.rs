@@ -3471,6 +3471,18 @@ impl MarmotRelayPlaneAccountAdapter {
             .await
     }
 
+    /// Whether everything the post-join maintenance session delivered so far
+    /// has been ingested. See [`NostrTransportAdapter::subscription_placed`].
+    #[doc(hidden)]
+    pub async fn group_maintenance_placed(&self, subscription_id: &str) -> Option<bool> {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .subscription_placed(subscription_id)
+            .await
+    }
+
     /// Operational capability identity only; SDK presence proves neither
     /// endpoint availability nor exhaustive historical coverage.
     #[doc(hidden)]

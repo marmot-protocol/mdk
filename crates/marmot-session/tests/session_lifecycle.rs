@@ -1193,6 +1193,7 @@ fn group_account_records(
         last_own_leaf_rotation_at: Some(Timestamp(10)),
         next_periodic_rotation_at: Some(Timestamp(1_000)),
         leaf_refresh_due_at: None,
+        post_join_history: None,
     };
     let obligation = MaintenanceObligation {
         id: record_id("obligation", group_id),

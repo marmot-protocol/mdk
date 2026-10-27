@@ -2744,6 +2744,156 @@ async fn post_join_rotation_does_not_block_application_send_and_returns_disposit
     );
 }
 
+/// A Welcome join owes a history fetch named by its post-join obligation; a
+/// created group owes none. A commit neither ends the fetch nor is changed by
+/// it, and an unfetched fetch ends only once the deadline its installation
+/// set has passed.
+#[tokio::test]
+async fn a_post_join_history_fetch_outlives_commits_until_its_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("marmot post join history key").unwrap();
+    let mut alice = session(alice_database.clone(), &key, b"alice");
+    let alice_kp = alice.fresh_key_package().await.unwrap();
+    let alice_id = alice.self_id();
+    let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let created = bob
+        .create_group(CreateGroupRequest {
+            name: "post-join history".into(),
+            description: String::new(),
+            members: vec![alice_kp],
+            required_features: Vec::new(),
+            app_components: Vec::new(),
+            initial_admins: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let group_id = created.group_id.clone();
+    let welcome = match &created.effects.publish[0] {
+        PublishWork::GroupCreated { welcomes, pending } => {
+            bob.confirm_published(*pending).await.unwrap();
+            welcomes
+                .iter()
+                .find(|message| {
+                    matches!(
+                        &message.envelope,
+                        TransportEnvelope::Welcome { recipient } if recipient == &alice_id
+                    )
+                })
+                .unwrap()
+                .clone()
+        }
+        other => panic!("expected GroupCreated publish work, got {other:?}"),
+    };
+    assert_eq!(
+        bob.group_maintenance(&group_id)
+            .unwrap()
+            .and_then(|state| state.post_join_history),
+        None,
+        "a created group fetches no history"
+    );
+    alice.ingest(welcome).await.unwrap();
+    let obligation = alice.maintenance_obligations().unwrap().remove(0);
+    drop(alice);
+
+    let wall = Arc::new(TestWallClock::new(
+        obligation.created_at.0.saturating_add(1),
+    ));
+    let mut runtime = AccountDeviceRuntime::new(
+        session(alice_database, &key, b"alice"),
+        RecordingAdapter::default(),
+        StaticTransportRouting::new(vec![]).with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![TransportEndpoint("wss://group.example".into())],
+        ),
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(31)),
+    );
+    assert_eq!(
+        runtime.post_join_history_fetch(&group_id).unwrap(),
+        Some(cgka_traits::PostJoinHistoryFetch::new(
+            obligation.id.clone()
+        ))
+    );
+
+    // A commit before the fetch's subscription is installed.
+    runtime.note_valid_state_bearing_input(&group_id).unwrap();
+    let quiet = runtime.maintenance_status(&group_id).unwrap().obligations[0].clone();
+    assert_eq!(quiet.phase, cgka_traits::MaintenancePhase::Quiet);
+    assert_eq!(
+        runtime.start_post_join_history_fetch(&group_id).unwrap(),
+        Some(obligation.id.clone())
+    );
+    let deadline = runtime
+        .post_join_history_fetch(&group_id)
+        .unwrap()
+        .unwrap()
+        .deadline_at
+        .unwrap();
+    assert_eq!(
+        deadline.0,
+        wall.now()
+            .0
+            .saturating_add(MaintenanceTiming::default().eose_timeout.as_secs())
+    );
+    assert_eq!(
+        runtime
+            .settle_post_join_history_fetch(&group_id, &obligation.id, false)
+            .unwrap(),
+        None,
+        "an unfetched fetch goes on until its deadline"
+    );
+    assert_eq!(
+        runtime
+            .settle_post_join_history_fetch(&group_id, &MessageId::new(vec![1; 32]), true)
+            .unwrap(),
+        None,
+        "another copy's fetch cannot end this one"
+    );
+
+    wall.set(deadline.0);
+    let completion = runtime
+        .settle_post_join_history_fetch(&group_id, &obligation.id, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        completion,
+        cgka_traits::PostJoinHistoryFetchCompletion {
+            outcome: cgka_traits::PostJoinHistoryFetchOutcome::DeadlineExpired,
+            completed_at_ms: deadline.0.saturating_mul(1_000),
+        }
+    );
+    assert_eq!(
+        runtime.start_post_join_history_fetch(&group_id).unwrap(),
+        None,
+        "an ended fetch is not installed again"
+    );
+    assert_eq!(
+        runtime
+            .settle_post_join_history_fetch(&group_id, &obligation.id, true)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        runtime
+            .post_join_history_fetch(&group_id)
+            .unwrap()
+            .unwrap()
+            .completion,
+        Some(completion)
+    );
+    assert_eq!(
+        runtime.maintenance_status(&group_id).unwrap().obligations[0],
+        quiet,
+        "the fetch leaves the self-update obligation alone"
+    );
+}
+
 #[tokio::test]
 async fn create_group_publishes_welcome_and_confirms_pending_on_ack() {
     let dir = tempfile::tempdir().unwrap();

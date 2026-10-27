@@ -937,10 +937,14 @@ pub struct AppClient {
     /// retirement, for the retry path its callers depend on.
     #[cfg(test)]
     pub(crate) fail_next_terminal_recovery_retire: bool,
-    /// Temporary history subscriptions, floored at each copy's Welcome, installed
-    /// only while a post-join maintenance obligation waits for its first relay EOSE.
+    /// Temporary history subscriptions, floored at each copy's Welcome. One
+    /// lives while the group's post-join history fetch is owed, and while a
+    /// post-join maintenance obligation waits for its first relay EOSE.
     pub(crate) post_join_maintenance_subscriptions:
         HashMap<GroupId, (String, cgka_traits::TransportGroupSubscription)>,
+    /// The history fetch each live post-join session serves, by subscription
+    /// id. Pruned to the live sessions on every post-join pass.
+    pub(crate) post_join_history_sessions: HashMap<String, recovery::PostJoinHistorySession>,
     /// Per-group (in-memory) epoch at which the warm pass last confirmed the
     /// authoritative encrypted-media component is NOT required. A group's
     /// signed component can only change with a commit, and a commit always
@@ -1540,9 +1544,11 @@ impl AppClient {
 
     /// Request, poll, and retire temporary post-join full-history
     /// subscriptions. The recovery job installs a requested one under its
-    /// grant; this pass observes its first boundary. A restart reconstructs
-    /// this ephemeral map from durable CatchUp obligations; the EOSE deadline
-    /// itself remains persisted.
+    /// grant; this pass observes its first boundary. A group keeps its
+    /// subscription while its post-join history fetch is owed, which no commit
+    /// ends, and while a post-join obligation waits for its first EOSE. A
+    /// restart reconstructs this ephemeral map from owed fetches and durable
+    /// CatchUp obligations; the obligation's EOSE deadline remains persisted.
     pub(crate) async fn advance_post_join_maintenance_subscriptions(
         &mut self,
     ) -> Result<(), AppError> {
@@ -1573,11 +1579,12 @@ impl AppClient {
                     .maintenance_observations
                     .remove(&group_id);
             }
+            self.retain_live_post_join_history_sessions();
             return Ok(());
         }
         let storage = self.app.account_storage(&self.state.label)?;
         let app = storage.app_storage();
-        let active_jobs = storage
+        let mut active_jobs = storage
             .list_maintenance_obligations()?
             .into_iter()
             .filter(|job| {
@@ -1590,17 +1597,11 @@ impl AppClient {
                     )
             })
             .map(|job| {
-                serde_json::to_vec(&(job.id.as_slice(), job.semantic_rearm_count))
+                maintenance_recovery_job(&job.id, job.semantic_rearm_count)
                     .map(|key| (key, job.group_id.as_slice().to_vec()))
-                    .map_err(|_| {
-                        cgka_traits::storage::StorageError::Serialization(
-                            "invalid maintenance recovery identity".into(),
-                        )
-                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        app.retain_recovery_maintenance_jobs(&active_jobs)?;
-        let mut waiting = HashSet::new();
+        let mut waits = Vec::new();
 
         for group in self.state.groups.clone() {
             let group_id = match hex::decode(&group.group_id_hex) {
@@ -1618,18 +1619,28 @@ impl AppClient {
             // Only the group's obligations: the full status also decodes every
             // transport fanout in the account, which made this loop quadratic
             // in the number of groups (mdk#2110).
-            let obligations = match self.runtime.maintenance_obligations_for_group(&group_id) {
-                Ok(obligations) => obligations,
-                Err(_error) => {
-                    tracing::warn!(
-                        target: "marmot_app::maintenance",
-                        method = "advance_post_join_maintenance_subscriptions",
-                        error_kind = "maintenance_status_unavailable",
-                        "skipping unavailable post-join maintenance group"
-                    );
-                    continue;
-                }
+            let (Ok(obligations), Ok(fetch)) = (
+                self.runtime.maintenance_obligations_for_group(&group_id),
+                self.runtime.post_join_history_fetch(&group_id),
+            ) else {
+                tracing::warn!(
+                    target: "marmot_app::maintenance",
+                    method = "advance_post_join_maintenance_subscriptions",
+                    error_kind = "maintenance_status_unavailable",
+                    "skipping unavailable post-join maintenance group"
+                );
+                continue;
             };
+            // A copy this device has left, or that was disbanded, fetches
+            // nothing more.
+            let fetch = fetch
+                .filter(|fetch| fetch.completion.is_none())
+                .filter(|_| {
+                    !self
+                        .runtime
+                        .group_record(&group_id)
+                        .is_ok_and(|record| record.is_terminal())
+                });
             let prerequisite = obligations.iter().find(|obligation| {
                 obligation.trigger == cgka_traits::MaintenanceTrigger::PostJoin
                     && matches!(
@@ -1639,9 +1650,45 @@ impl AppClient {
                             | cgka_traits::MaintenancePhase::Grace
                     )
             });
-            let Some(prerequisite) = prerequisite else {
+            // An owed fetch keeps the recovery job of the obligation created
+            // with it, whatever phase commits have moved that obligation to,
+            // so its installed session stays checkpointable.
+            let fetch_job = fetch
+                .as_ref()
+                .map(|fetch| {
+                    let rearms = obligations
+                        .iter()
+                        .find(|obligation| obligation.id == fetch.obligation_id)
+                        .map_or(0, |obligation| obligation.semantic_rearm_count);
+                    maintenance_recovery_job(&fetch.obligation_id, rearms)
+                })
+                .transpose()?;
+            let job = match prerequisite {
+                Some(prerequisite) => Some(maintenance_recovery_job(
+                    &prerequisite.id,
+                    prerequisite.semantic_rearm_count,
+                )?),
+                None => fetch_job.clone(),
+            };
+            let Some(job) = job else {
                 continue;
             };
+            if let Some(fetch_job) = fetch_job {
+                active_jobs.push((fetch_job, group_id.as_slice().to_vec()));
+            }
+            waits.push(PostJoinWait {
+                group_id,
+                job,
+                fetch: fetch.map(|fetch| fetch.obligation_id),
+                obligation_waits: prerequisite.is_some(),
+            });
+        }
+        app.retain_recovery_maintenance_jobs(&active_jobs)?;
+        let mut waiting = HashSet::new();
+        let mut ended_jobs = Vec::new();
+
+        for wait in waits {
+            let group_id = wait.group_id;
             waiting.insert(group_id.clone());
 
             if let Some((subscription, _)) = self.post_join_maintenance_subscriptions.get(&group_id)
@@ -1656,29 +1703,66 @@ impl AppClient {
                     .maintenance_observations
                     .remove(&group_id);
             }
+            // A session installed for an earlier copy's fetch cannot end the
+            // fetch a replacement Welcome started: its REQ ran before that
+            // copy existed.
+            if let Some(fetch) = &wait.fetch
+                && let Some((subscription, _)) = self
+                    .post_join_maintenance_subscriptions
+                    .get(&group_id)
+                    .cloned()
+                && self
+                    .post_join_history_sessions
+                    .get(&subscription)
+                    .is_none_or(|session| session.fetch != *fetch)
+            {
+                if let Err(_error) = self
+                    .adapter
+                    .remove_group_maintenance_subscription(&subscription)
+                    .await
+                {
+                    tracing::warn!(
+                        target: "marmot_app::maintenance",
+                        method = "advance_post_join_maintenance_subscriptions",
+                        error_kind = "subscription_remove_failed",
+                        "could not remove superseded post-join maintenance subscription"
+                    );
+                    continue;
+                }
+                self.post_join_maintenance_subscriptions.remove(&group_id);
+                self.recovery_owner
+                    .maintenance_observations
+                    .remove(&group_id);
+            }
             if !self
                 .post_join_maintenance_subscriptions
                 .contains_key(&group_id)
             {
-                let job = serde_json::to_vec(&(
-                    prerequisite.id.as_slice(),
-                    prerequisite.semantic_rearm_count,
-                ))
-                .map_err(|_| {
-                    cgka_traits::storage::StorageError::Serialization(
-                        "invalid maintenance recovery identity".into(),
-                    )
-                })?;
                 let ticket = app.request_recovery(
                     storage_sqlite::RecoveryRequest::MaintenanceBoundary {
-                        job_id: &job,
+                        job_id: &wait.job,
                         group_id: group_id.as_slice(),
                     },
                     unix_now_seconds().saturating_mul(1000),
                 )?;
                 app.restore_recovery_maintenance_session(ticket)?;
             }
-            self.observe_post_join_recovery_boundary(&group_id).await?;
+            let boundary = self.observe_post_join_recovery_boundary(&group_id).await?;
+            if let Some(fetch) = &wait.fetch
+                && self
+                    .settle_post_join_history_fetch(&group_id, fetch, boundary)
+                    .await?
+                && !wait.obligation_waits
+            {
+                waiting.remove(&group_id);
+                ended_jobs.push(wait.job);
+            }
+        }
+        // A fetch that ended at its deadline leaves its boundary request
+        // unmet; nothing asks for it any more.
+        if !ended_jobs.is_empty() {
+            active_jobs.retain(|(job, _)| !ended_jobs.contains(job));
+            app.retain_recovery_maintenance_jobs(&active_jobs)?;
         }
 
         let stale = self
@@ -1710,6 +1794,7 @@ impl AppClient {
                 .maintenance_observations
                 .remove(&group_id);
         }
+        self.retain_live_post_join_history_sessions();
         Ok(())
     }
 
@@ -7470,6 +7555,29 @@ impl AppClient {
         self.clear_confirmed_welcome_intent(&storage.app_storage(), message_id_hex)?;
         Ok(send_summary_from_effects(&effects))
     }
+}
+
+/// A group the post-join pass keeps a history subscription for.
+struct PostJoinWait {
+    group_id: GroupId,
+    /// The recovery job its session is requested under.
+    job: Vec<u8>,
+    /// Its owed post-join history fetch.
+    fetch: Option<cgka_traits::MessageId>,
+    /// A post-join obligation still waits for its first EOSE.
+    obligation_waits: bool,
+}
+
+/// The recovery job identity of a post-join obligation's boundary session.
+fn maintenance_recovery_job(
+    obligation_id: &cgka_traits::MessageId,
+    semantic_rearm_count: u32,
+) -> Result<Vec<u8>, cgka_traits::storage::StorageError> {
+    serde_json::to_vec(&(obligation_id.as_slice(), semantic_rearm_count)).map_err(|_| {
+        cgka_traits::storage::StorageError::Serialization(
+            "invalid maintenance recovery identity".into(),
+        )
+    })
 }
 
 fn maintenance_run_summary_from_account(

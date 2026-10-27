@@ -283,7 +283,14 @@ every cause and every caller runs it:
 
 - A post-join maintenance grant installs only its own REQ when its job begins, under the
   grant's scope tokens, and completes on that REQ's end of stored events. Its scopes are
-  not compared.
+  not compared. The REQ serves two owners: the PostJoin self-update obligation, which
+  waits for the first end of stored events, and the copy's history fetch
+  (`GroupMaintenanceState::post_join_history`), which no commit or proposal ends. The
+  session stays installed while either is owed. The fetch ends as `Fetched` once the REQ's
+  boundary qualified and native ingress has placed everything it delivered, or as
+  `DeadlineExpired` when an installed session reaches no end of stored events within the
+  EOSE timeout of its installation. A restart installs an owed fetch again, and a
+  replacement Welcome starts a new one (mdk#2626).
 - Known-event demand compares its route and completes once that exact event is durably
   retained.
 - A startup or explicit-sync comparison request records its routes as incremental-history

@@ -27,7 +27,7 @@ use cgka_traits::error::EngineError;
 use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::maintenance::{
     GroupMaintenanceState, KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase,
-    MaintenanceTrigger, PeriodicMaintenancePolicy,
+    MaintenanceTrigger, PeriodicMaintenancePolicy, PostJoinHistoryFetch,
 };
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::storage::{StorageError, StorageProvider};
@@ -63,6 +63,17 @@ fn persist_new_group_maintenance<S: StorageProvider>(
         maintenance.periodic_maintenance_policy()?,
         PeriodicMaintenancePolicy::EnabledForNewGroups
     );
+    let post_join = post_join.map(|(welcome_id, sampled_jitter_ms)| {
+        let mut hasher = Sha256::new();
+        hasher.update(b"marmot-post-join-maintenance-v1");
+        hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
+        hasher.update(group_id.as_slice());
+        hasher.update(welcome_id.as_slice());
+        (
+            MessageId::new(hasher.finalize().to_vec()),
+            sampled_jitter_ms,
+        )
+    });
     maintenance.put_group_maintenance(&GroupMaintenanceState {
         group_id: group_id.clone(),
         enrolled_at: Some(enrolled_at),
@@ -70,14 +81,12 @@ fn persist_new_group_maintenance<S: StorageProvider>(
         last_own_leaf_rotation_at: post_join.is_none().then_some(enrolled_at),
         next_periodic_rotation_at: None,
         leaf_refresh_due_at: None,
+        // A joined copy owes its history fetch from the moment it exists.
+        post_join_history: post_join
+            .as_ref()
+            .map(|(obligation_id, _)| PostJoinHistoryFetch::new(obligation_id.clone())),
     })?;
-    if let Some((welcome_id, sampled_jitter_ms)) = post_join {
-        let mut hasher = Sha256::new();
-        hasher.update(b"marmot-post-join-maintenance-v1");
-        hasher.update((group_id.as_slice().len() as u64).to_be_bytes());
-        hasher.update(group_id.as_slice());
-        hasher.update(welcome_id.as_slice());
-        let obligation_id = MessageId::new(hasher.finalize().to_vec());
+    if let Some((obligation_id, sampled_jitter_ms)) = post_join {
         maintenance.put_maintenance_obligation(&MaintenanceObligation {
             id: obligation_id,
             group_id: group_id.clone(),

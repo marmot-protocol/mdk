@@ -112,6 +112,58 @@ pub struct GroupMaintenanceState {
     /// is current. Independent of periodic enrollment.
     #[serde(default)]
     pub leaf_refresh_due_at: Option<Timestamp>,
+    /// The temporary history fetch of a copy installed from a Welcome. A
+    /// replacement Welcome rewrites this whole state, so it starts a new fetch.
+    /// `None` for a created group and for copies joined before fetches were
+    /// recorded.
+    #[serde(default)]
+    pub post_join_history: Option<PostJoinHistoryFetch>,
+}
+
+/// A joined copy's fetch of the group messages its delivery endpoints hold from
+/// its Welcome on. It lasts until a relay reaches end-of-stored-events and this
+/// device has processed what the fetch delivered, or until its deadline,
+/// whatever commits arrive meanwhile. It is separate from the post-join
+/// self-update, whose obligation commits move to its quiet window.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostJoinHistoryFetch {
+    /// The post-join obligation created with this copy. Identifies the fetch,
+    /// so work for an earlier copy of the group cannot complete it.
+    pub obligation_id: MessageId,
+    /// When the fetch's current subscription stops waiting for
+    /// end-of-stored-events. Set at each installation: a restart or a lost
+    /// subscription resumes the fetch with a fresh one.
+    pub deadline_at: Option<Timestamp>,
+    /// `None` while the fetch is owed.
+    pub completion: Option<PostJoinHistoryFetchCompletion>,
+}
+
+impl PostJoinHistoryFetch {
+    pub fn new(obligation_id: MessageId) -> Self {
+        Self {
+            obligation_id,
+            deadline_at: None,
+            completion: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostJoinHistoryFetchCompletion {
+    pub outcome: PostJoinHistoryFetchOutcome,
+    /// Milliseconds since the Unix epoch.
+    pub completed_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostJoinHistoryFetchOutcome {
+    /// This device has fetched and processed the group messages its delivery
+    /// endpoints hold from its join epoch on.
+    Fetched,
+    /// No relay reached end-of-stored-events, or this device had not processed
+    /// what the fetch delivered, before the deadline. Messages may be missing.
+    DeadlineExpired,
 }
 
 /// Restart-safe semantic intent.  Wall-clock deadlines and sampled jitter are
