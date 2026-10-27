@@ -86,8 +86,10 @@ pub struct MarmotAppConfig {
     /// `None` leaves reporting unconfigured. An invalid value is rejected whole at first use
     /// and also leaves reporting unconfigured; see `MarmotApp::set_moderation_report_config`.
     pub moderation_report_config: Option<crate::ModerationReportConfig>,
-    /// Optional public client label for newly prepared KeyPackage events.
-    /// None leaves publications untagged; signed retries retain their original tags.
+    /// Optional public client label for newly prepared KeyPackage events, published
+    /// trimmed as the only value of one `client` tag. None, or a label that is blank
+    /// or longer than 64 bytes once trimmed, leaves publications untagged; signed
+    /// retries retain their original tags.
     pub key_package_client_name: Option<String>,
     /// Automatic acquisition defaults on with bounded resource limits.
     /// None disables automatic acquisition; frozen runtimes always disable it.

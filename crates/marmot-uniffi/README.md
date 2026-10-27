@@ -279,7 +279,8 @@ Kotlin exposes `Marmot.newWithClientName` with the same arguments; C exposes
 `MarmotAppConfig::with_key_package_client_name(Some("whitenoise".into()))`.
 Supply the name on every host runtime construction, including background and
 notification-extension entry points (which retain their frozen cursor policy).
-Absent or whitespace-only names omit the tag. New initial publications and normal
+Absent, whitespace-only and over-long names (more than 64 bytes of UTF-8 once
+trimmed) omit the tag; MDK never truncates one. New initial publications and normal
 rotations carry the configured label. Existing events are not republished, and
 already-signed pending publications retry with their original tags even if the
 configuration changes.
@@ -692,7 +693,9 @@ Invitation discovery temporarily ranks KeyPackages by the deployment's client pr
 `keyPackagePreferredClients` first, then untagged/other clients, then `keyPackageLastClients`.
 White Noise's deployment prefers `whitenoise` and ranks `amethyst` last; `marmotDeploymentNeutral()` sets no
 preference. Names are trimmed and matched case-insensitively, exactly (not by
-substring). These are advisory labels, never proof of a particular application.
+substring). A package with more than one `client` tag, or whose tag's first value is
+missing, empty or over 64 bytes, ranks as untagged; values after the name are ignored.
+These are advisory labels, never proof of a particular application.
 Only valid packages compatible with the proposed/existing group qualify. Within a
 tier, the existing recency order applies. A last-ranked client remains selectable when no
 higher-priority compatible package is available. A replacement in a publication

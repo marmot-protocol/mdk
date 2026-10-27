@@ -385,7 +385,8 @@ pub unsafe extern "C" fn marmot_client_new_with_secret_store(
 }
 
 /// Open with an optional public client name for newly prepared KeyPackages.
-/// NULL or whitespace-only `client_name` omits the tag. Signed retries keep
+/// NULL, whitespace-only or over-long (more than 64 bytes once trimmed)
+/// `client_name` omits the tag; it is never truncated. Signed retries keep
 /// their original tags. NULL `store` selects the platform keychain under the
 /// deployment's keychain service.
 /// Store ownership transfers only on success, as with `marmot_client_new_with_secret_store`.
@@ -467,7 +468,7 @@ pub struct MarmotClientOptions {
     pub relay_policy: u32,
     /// A MarmotCursorPersistence discriminant.
     pub cursor_persistence: u32,
-    /// Optional UTF-8 label; NULL or blank omits the public tag.
+    /// Optional UTF-8 label; NULL, blank or over 64 bytes omits the public tag.
     pub client_name: *const c_char,
     /// Optional callback store; NULL selects the platform keychain.
     pub store: *const MarmotSecretStore,

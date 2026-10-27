@@ -88,7 +88,8 @@ pub use acquisition::{
     NostrNotificationLossFloor, NostrNotificationLossScope,
 };
 pub use key_package::{
-    CLIENT_TAG, KIND_MARMOT_KEY_PACKAGE, NostrKeyPackagePublication, NostrKeyPackagePublisher,
+    CLIENT_NAME_MAX_BYTES, CLIENT_TAG, KIND_MARMOT_KEY_PACKAGE, NostrKeyPackagePublication,
+    NostrKeyPackagePublisher, is_valid_client_name, key_package_client_name,
 };
 pub use relay_list::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_NIP65_RELAY_LIST, NostrAccountRelayListKind,

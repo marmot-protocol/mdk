@@ -36,6 +36,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
     `local storage error`, an unknown engine group `unknown local group`, and
     any other engine failure `session error`. Account failures outside the
     engine still read `account error`.
+- `marmot_client_new_with_client_name` and `MarmotClientOptions.client_name`
+  leave out a name longer than 64 bytes once trimmed instead of publishing it;
+  the KeyPackage still publishes, untagged (mdk#2628).
 
 ## [0.14.0] - 2026-10-23
 

@@ -473,22 +473,12 @@ pub fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQuery> {
 /// Labels are self-asserted and do not authenticate an application; they only
 /// rank candidates after admission checks and never relax cryptographic gates.
 /// The ranking is the deployment's [`KeyPackageClientPreference`]; an event
-/// with no single, valued `client` tag ranks as unlabelled.
+/// that has no `client` tag under the shared reader's rule ranks as unlabelled.
 pub(crate) fn key_package_client_priority(
     event: &NostrTransportEvent,
     preference: &KeyPackageClientPreference,
 ) -> u8 {
-    let mut tags = event.tags.iter().filter(|tag| {
-        tag.first()
-            .is_some_and(|name| name == transport_nostr_adapter::CLIENT_TAG)
-    });
-    let Some(tag) = tags.next() else {
-        return preference.rank(None);
-    };
-    if tags.next().is_some() || tag.len() < 2 {
-        return preference.rank(None);
-    }
-    preference.rank(Some(&tag[1]))
+    preference.rank(transport_nostr_adapter::key_package_client_name(event))
 }
 
 /// Directory reads deliberately share the client ranking and slot-supersession

@@ -3836,9 +3836,9 @@ Construct with explicit advancing/frozen relay cursor behavior; new_with_configu
 pub fn new_with_client_name( root_path: String, relay_urls: Vec<String>, client_name: Option<String>, cursor_persistence: CursorPersistenceFfi, secret_store: Option<Arc<dyn SecretStore>>, deployment: MarmotDeploymentFfi, ) -> Result<Arc<Self>, MarmotKitError>
 ```
 
-Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels are omitted. Hosts must supply this on every foreground/background runtime construction.
+Open with an optional public client label for new KeyPackage publications. Existing constructors remain untagged. Whitespace-only labels, and labels longer than 64 bytes once trimmed, are omitted rather than truncated. Hosts must supply this on every foreground/background runtime construction.
 
-[Source](src/lib.rs#L405)
+[Source](src/lib.rs#L406)
 
 ### `Marmot::start`
 
@@ -3850,7 +3850,7 @@ pub async fn start(&self) -> Result<(), MarmotKitError>
 
 Bring the runtime to local readiness.
 
-[Source](src/lib.rs#L443)
+[Source](src/lib.rs#L444)
 
 ### `Marmot::shutdown`
 
@@ -3862,7 +3862,7 @@ pub async fn shutdown(&self)
 
 Tear the runtime down. Drops all subscriptions; long-lived `EventsSubscription` / `ChatsSubscription` / etc. instances on the host side will see their `next()` return `None` shortly after.
 
-[Source](src/lib.rs#L455)
+[Source](src/lib.rs#L456)
 
 ### `Marmot::shutdown_and_close`
 
@@ -3874,7 +3874,7 @@ pub async fn shutdown_and_close(&self) -> Result<(), MarmotKitError>
 
 Terminally stop work, close storage and release root ownership; reconstruct before further reads/work.
 
-[Source](src/lib.rs#L491)
+[Source](src/lib.rs#L492)
 
 ### `Marmot::storage_is_closed`
 
@@ -3886,7 +3886,7 @@ pub fn storage_is_closed(&self) -> bool
 
 True once `Marmot::shutdown_and_close` has closed the store. A host can check this to confirm it is safe to be suspended, or to notice it is holding a spent handle and needs a fresh one.
 
-[Source](src/lib.rs#L499)
+[Source](src/lib.rs#L500)
 
 ### `Marmot::is_stopping`
 
@@ -3898,7 +3898,7 @@ pub fn is_stopping(&self) -> bool
 
 True once shutdown has started. Host apps can use this to avoid launching more subscriptions or account work while they are moving to the background.
 
-[Source](src/lib.rs#L506)
+[Source](src/lib.rs#L507)
 
 </details>
 

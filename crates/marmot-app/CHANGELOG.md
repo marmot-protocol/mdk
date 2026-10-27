@@ -58,6 +58,21 @@
     read `account error`. The `error_code` logged when a read-marker update
     fails follows the same rule: `read_marker_failed:storage`,
     `read_marker_failed:unknown_group` or `read_marker_failed:session`.
+- KeyPackage `client` tags follow the Nostr binding's rule (mdk#2628). A
+  configured `key_package_client_name` is published, trimmed, only when it is
+  1 to 64 bytes. A longer one is left out rather than truncated, and the
+  KeyPackage still publishes. Every place MDK reads the tag, the directory's
+  client ranking and signed KeyPackage retries, now uses one reader,
+  `transport_nostr_adapter::key_package_client_name`: the name is the first
+  value and later values are ignored. More than one `client` tag, or a missing,
+  empty or over-long name, reads as no tag and never rejects the KeyPackage.
+  A signed retry whose stored tag that reader rejects is not resent, and
+  `NostrKeyPackagePublication` refuses an out-of-bounds `client_name`.
+  Known limitation: suppose a host configured a name over 64 bytes, and a
+  KeyPackage signed before this change has not reached any relay. That
+  KeyPackage keeps retrying without being sent until it expires (up to 84
+  days). Hosts that configure `whitenoise` or `White Noise Android` are
+  unaffected.
 
 ### Fixed
 
