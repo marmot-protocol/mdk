@@ -181,8 +181,8 @@ impl SessionConfig {
 
     /// Open with the cheap seed pass only (mdk#1161): every stored group is
     /// listed but gated `GroupNotHydrated` until the caller drives per-group
-    /// hydration ([`AccountDeviceSession::hydrate_next_groups`] /
-    /// [`AccountDeviceSession::ensure_group_hydrated`]) or a send/ingest
+    /// hydration (the runtime's `hydrate_next_groups` /
+    /// `ensure_group_hydrated`) or a send/ingest
     /// promotes a group on demand. Default is the eager open, which fully
     /// hydrates (or quarantines) every group before returning — embedders
     /// without a background pipeline should keep the default.
@@ -222,8 +222,8 @@ impl SessionConfig {
 
     /// Select the profile emitted by fresh KeyPackages and newly created
     /// groups. Defaults to current. Existing groups keep their persisted
-    /// profile. Passing legacy is rejected by [`AccountDeviceSession::open`];
-    /// only the explicitly named compatibility-fixture seam can open it.
+    /// profile. Passing legacy is rejected when the session opens; only the
+    /// explicitly named compatibility-fixture seam can open it.
     pub fn protocol_profile(mut self, protocol_profile: ProtocolProfile) -> Self {
         self.protocol_profile = protocol_profile;
         self.allow_legacy_compatibility_profile = false;
@@ -239,8 +239,8 @@ impl SessionConfig {
         self
     }
 
-    /// Options for the connection [`AccountDeviceSession::open`] opens. No
-    /// effect on a session built with [`Self::with_storage`].
+    /// Options for the connection the session opens. No effect on a session
+    /// built with [`Self::with_storage`].
     pub fn storage_options(mut self, options: SqliteStorageOptions) -> Self {
         self.storage_options = options;
         self
@@ -287,7 +287,10 @@ pub struct GroupAuthorityView<'a> {
 }
 
 impl GroupAuthorityView<'_> {
-    /// See [`AccountDeviceSession::with_group_authority_snapshot`].
+    /// Compose host-owned persisted reads with compact live authority using
+    /// the session's exact store and one deferred snapshot. The callback is
+    /// synchronous/read-only; it must not access a different account store or
+    /// use a startup/recovery copy of engine facts. No engine hydration runs.
     pub fn with_group_authority_snapshot<T, E>(
         &self,
         group_id: &GroupId,
@@ -315,7 +318,7 @@ pub struct HydrationProgress {
     pub remaining: usize,
 }
 
-/// Privacy-safe stage timings captured during [`AccountDeviceSession::open`].
+/// Privacy-safe stage timings captured while the session opens.
 ///
 /// Durations and aggregate counts only — no account, group, or key identifiers
 /// — so callers can feed them straight into fixed-bucket telemetry (mdk#1161).
