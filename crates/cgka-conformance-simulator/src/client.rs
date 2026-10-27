@@ -2450,6 +2450,43 @@ impl HarnessClient {
         }
     }
 
+    /// This client's leaf index in the default group.
+    pub fn own_leaf_index(&self) -> Result<u32, EngineError> {
+        let gid = self
+            .default_group
+            .clone()
+            .ok_or_else(Self::missing_default_group)?;
+        self.engine().own_leaf_index(&gid)
+    }
+
+    /// Stage a same-account Commit that removes `leaves`, other devices of
+    /// this client's account, by value. It goes through the engine's
+    /// test-only stand-in for the same-account Remove intent (mdk#2628 item
+    /// 2.1e).
+    pub(crate) async fn try_remove_own_account_leaves(
+        &mut self,
+        leaves: Vec<u32>,
+    ) -> Result<PendingStateRef, EngineError> {
+        let result = self.try_remove_own_account_leaves_inner(leaves).await;
+        self.release_unconsumed_scenario_input_on_err(result)
+    }
+
+    async fn try_remove_own_account_leaves_inner(
+        &mut self,
+        leaves: Vec<u32>,
+    ) -> Result<PendingStateRef, EngineError> {
+        let gid = self
+            .default_group
+            .clone()
+            .ok_or_else(Self::missing_default_group)?;
+        let result = self
+            .engine_mut()
+            .send_leaf_removals_for_tests(&gid, leaves)
+            .await?;
+        self.publish_group_evolution(result, &gid, "remove_own_account_devices")
+            .await
+    }
+
     pub fn admin_labels(&self) -> Vec<String> {
         let gid = self.default_group.clone().expect("group");
         self.engine()

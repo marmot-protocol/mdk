@@ -219,6 +219,8 @@ V3 adds:
   support for `marmot.group.account-devices.v1` (0x800d) and an admin's Commit that makes a group require it, so
   vectors can model mixed support. The `account_devices_state` expectation checks a client's exact state against the
   component's rules.
+- `remove_own_account_devices` — a same-account Commit in which a device removes other devices of its own account,
+  which needs no admin once a group requires 0x800d.
 - Real app-runtime stimuli: `interrupt_relay` (cuts live relay sockets for a real wall-time outage),
   `race_group_profiles` (2–8 clients release concurrent profile edits from a shared barrier), and `race_invite_profile`
   (an invite racing a rename, with an explicit rejoin offer). Adapters without the required capability refuse them

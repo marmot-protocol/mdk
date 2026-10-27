@@ -149,6 +149,7 @@ impl<S: StorageProvider> Engine<S> {
                         // from the wire bytes later (MLS refuses to process
                         // own commits), so this is the only durable source.
                         own_commit_stamp = Some(crate::openmls_projection::own_commit_stamp(
+                            &mls_group,
                             staged,
                             self.identity.self_id().clone(),
                         )?);

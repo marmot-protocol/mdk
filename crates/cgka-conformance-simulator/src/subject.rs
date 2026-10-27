@@ -233,6 +233,15 @@ pub struct SubjectRequireAccountDevices<'a> {
     pub pending: Option<&'a str>,
 }
 
+/// Stage a same-account Commit in which `client` removes the leaves of
+/// `devices`, other devices of its own account, by value.
+pub struct SubjectRemoveOwnAccountDevices<'a> {
+    pub action_id: &'a str,
+    pub client: &'a str,
+    pub devices: &'a [String],
+    pub pending: &'a str,
+}
+
 pub struct SubjectUpdateAdminPolicy<'a> {
     /// Stable input id for operations expected to produce protocol input.
     /// Expected validation failures leave this unset because no input should
@@ -367,6 +376,13 @@ pub trait ConvergenceSubject: Send {
     async fn require_account_devices(
         &mut self,
         _action: SubjectRequireAccountDevices<'_>,
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(SubjectCapability::AccountDevices))
+    }
+
+    async fn remove_own_account_devices(
+        &mut self,
+        _action: SubjectRemoveOwnAccountDevices<'_>,
     ) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(SubjectCapability::AccountDevices))
     }
@@ -750,6 +766,7 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
         step,
         ScenarioStep::RequireAccountDevices { .. }
             | ScenarioStep::ExpectRequireAccountDevicesError { .. }
+            | ScenarioStep::RemoveOwnAccountDevices { .. }
     ) {
         vec![
             SubjectCapability::AccountDevices,
@@ -818,7 +835,8 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             ScenarioStep::ExpectTickError { .. } => unreachable!("handled above"),
             ScenarioStep::SetAccountDevicesSupport { .. }
             | ScenarioStep::RequireAccountDevices { .. }
-            | ScenarioStep::ExpectRequireAccountDevicesError { .. } => {
+            | ScenarioStep::ExpectRequireAccountDevicesError { .. }
+            | ScenarioStep::RemoveOwnAccountDevices { .. } => {
                 unreachable!("handled above")
             }
             ScenarioStep::InGroup { .. } => unreachable!("handled above"),
@@ -1733,6 +1751,28 @@ impl ConvergenceSubject for EngineHarnessSubject {
             self.insert_pending(pending, action.client, pending_ref)?;
         }
         Ok(())
+    }
+
+    async fn remove_own_account_devices(
+        &mut self,
+        action: SubjectRemoveOwnAccountDevices<'_>,
+    ) -> Result<(), SubjectError> {
+        let leaves = action
+            .devices
+            .iter()
+            .map(|device| {
+                self.client(device)?
+                    .own_leaf_index()
+                    .map_err(subject_engine_error)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let client = self.client_mut(action.client)?;
+        client.name_next_scenario_input(action.action_id);
+        let pending_ref = client
+            .try_remove_own_account_leaves(leaves)
+            .await
+            .map_err(subject_engine_error)?;
+        self.insert_pending(action.pending, action.client, pending_ref)
     }
 
     async fn send_application(

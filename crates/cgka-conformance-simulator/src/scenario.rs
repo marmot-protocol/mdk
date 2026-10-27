@@ -11,10 +11,10 @@ use crate::{
     ScenarioAdminPolicyObservation, ScenarioErrorObservation, ScenarioOracleReport, ScenarioTrace,
     SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectFailureCategory,
     SubjectInviteMembers, SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome,
-    SubjectRemoveMembers, SubjectRequireAccountDevices, SubjectSelfUpdate, SubjectSendApplication,
-    SubjectUpdateAdminPolicy, SubjectUpdateGroupData, TraceExpectation, VectorFixture,
-    build_scenario_oracle_report, compare_trace_expectations, compile_scenario,
-    drive_subject_to_quiescence, preflight_compiled_scenario,
+    SubjectRemoveMembers, SubjectRemoveOwnAccountDevices, SubjectRequireAccountDevices,
+    SubjectSelfUpdate, SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
+    TraceExpectation, VectorFixture, build_scenario_oracle_report, compare_trace_expectations,
+    compile_scenario, drive_subject_to_quiescence, preflight_compiled_scenario,
 };
 use cgka_traits::group::ProtocolProfile;
 use serde::{Deserialize, Serialize};
@@ -132,6 +132,15 @@ pub enum ScenarioStep {
     ExpectRequireAccountDevicesError {
         client: String,
         error: String,
+    },
+    /// Stage a same-account Commit in which `client` removes the leaves of
+    /// `devices`, other devices of its own account, by value. It needs no
+    /// admin in a group that requires `marmot.group.account-devices.v1`.
+    /// Scenario IR v3 only.
+    RemoveOwnAccountDevices {
+        client: String,
+        devices: Vec<String>,
+        pending: String,
     },
     AcknowledgeOutbound {
         client: String,
@@ -291,6 +300,7 @@ impl ScenarioStep {
         "set_account_devices_support",
         "require_account_devices",
         "expect_require_account_devices_error",
+        "remove_own_account_devices",
         "acknowledge_outbound",
         "send_app_message",
         "leave",
@@ -363,6 +373,7 @@ impl ScenarioStep {
             ScenarioStep::ExpectRequireAccountDevicesError { .. } => {
                 "expect_require_account_devices_error"
             }
+            ScenarioStep::RemoveOwnAccountDevices { .. } => "remove_own_account_devices",
             ScenarioStep::AcknowledgeOutbound { .. } => "acknowledge_outbound",
             ScenarioStep::SendAppMessage { .. } => "send_app_message",
             ScenarioStep::Leave { .. } => "leave",
@@ -1010,6 +1021,21 @@ async fn execute_scenario_step(
                     );
                     failure
                 })?;
+        }
+        ScenarioStep::RemoveOwnAccountDevices {
+            client,
+            devices,
+            pending,
+        } => {
+            subject
+                .remove_own_account_devices(SubjectRemoveOwnAccountDevices {
+                    action_id,
+                    client,
+                    devices,
+                    pending,
+                })
+                .await
+                .map_err(|error| subject_step_error(step_index, error))?;
         }
         ScenarioStep::ExpectRequireAccountDevicesError { client, error } => {
             let client_label = client.clone();

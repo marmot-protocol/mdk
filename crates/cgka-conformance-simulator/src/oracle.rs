@@ -359,7 +359,7 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             ScenarioStep::InviteMembers { .. } => {
                 stimuli.insert(ScenarioStimulus::InviteMembers);
             }
-            ScenarioStep::RemoveMembers { .. } => {
+            ScenarioStep::RemoveMembers { .. } | ScenarioStep::RemoveOwnAccountDevices { .. } => {
                 stimuli.insert(ScenarioStimulus::RemoveMembers);
                 commits += 1;
             }

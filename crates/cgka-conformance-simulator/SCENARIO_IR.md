@@ -49,6 +49,10 @@ and lets the scenario continue. All three need the adapter's `account_devices` c
 actions are group-scoped and admin-gated like `update_admin_policy`. The `account_devices_state` vector expectation
 reads a client's latest `observe_exact` state: it checks whether that state requires 0x800d and, if it does, that every
 leaf advertises it, the GroupContext carries no data for it and no account holds more than 20 leaves.
+`remove_own_account_devices` sends a same-account Commit: `client` removes the current leaves of `devices`, other
+devices of its own account, by value, and records `pending`. In a group that requires 0x800d it needs no admin and has
+`ordinary` branch priority. It is group-scoped, needs the `account_devices` capability, and runs through the engine's
+test-only stand-in until the same-account Remove intent lands.
 
 ## Deterministic expansion
 

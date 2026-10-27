@@ -12,8 +12,9 @@ use crate::{
     ScenarioRelayV2, ScenarioTopologyV2, ScenarioTransportClass, SubjectCapability,
     SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectFailureCategory,
     SubjectInviteMembers, SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome,
-    SubjectProgressSnapshot, SubjectRemoveMembers, SubjectRequireAccountDevices, SubjectSelfUpdate,
-    SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
+    SubjectProgressSnapshot, SubjectRemoveMembers, SubjectRemoveOwnAccountDevices,
+    SubjectRequireAccountDevices, SubjectSelfUpdate, SubjectSendApplication,
+    SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
 };
 use async_trait::async_trait;
 use cgka_traits::group::ProtocolProfile;
@@ -647,6 +648,17 @@ impl ConvergenceSubject for RetainedRelaySubject {
             self.tag_new_outbound(&client, &before, &action_id, ScenarioTransportClass::Commit)?;
         }
         Ok(())
+    }
+
+    async fn remove_own_account_devices(
+        &mut self,
+        action: SubjectRemoveOwnAccountDevices<'_>,
+    ) -> Result<(), SubjectError> {
+        let client = action.client.to_owned();
+        let action_id = action.action_id.to_owned();
+        let before = self.unresolved_ids(&client)?;
+        self.engine.remove_own_account_devices(action).await?;
+        self.tag_new_outbound(&client, &before, &action_id, ScenarioTransportClass::Commit)
     }
 
     async fn send_application(
@@ -1353,6 +1365,37 @@ mod tests {
         )
         .await
         .expect("run account-devices vector over retained relays");
+
+        assert!(
+            report.expectation_failures.is_empty(),
+            "unexpected failures: {:#?}",
+            report.expectation_failures
+        );
+    }
+
+    #[tokio::test]
+    async fn own_device_removal_race_runs_over_retained_relays() {
+        let fixture: crate::VectorFixture = serde_json::from_str(include_str!(
+            "../vectors/account-devices-own-device-removal-loses-to-admin-remove.v1.json"
+        ))
+        .expect("vector parses");
+        let scenario = fixture.scenario;
+        let mut subject = RetainedRelaySubject::new(
+            &scenario.clients,
+            &scenario.topology,
+            ProtocolProfile::Current,
+            HarnessStorageMode::TempFileBackedSqlite,
+        )
+        .unwrap();
+
+        let report = run_scenario_report_with_subject(
+            &scenario,
+            None,
+            fixture.expected_outcomes,
+            &mut subject,
+        )
+        .await
+        .expect("run the own-device removal race over retained relays");
 
         assert!(
             report.expectation_failures.is_empty(),

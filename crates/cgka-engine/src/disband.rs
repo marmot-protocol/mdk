@@ -331,10 +331,10 @@ impl<S: StorageProvider> Engine<S> {
         let staged = mls_group
             .pending_commit()
             .ok_or_else(|| EngineError::Backend("disband produced no pending commit".into()))?;
-        crate::app_components::require_admin_for_staged_commit(
+        crate::commit_class::authorize_own_staged_commit(
             &mls_group,
             group_id,
-            Some(self.identity.self_id()),
+            self.identity.self_id(),
             staged,
         )?;
         crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
