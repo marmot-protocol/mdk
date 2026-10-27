@@ -52,7 +52,8 @@ The directory of other people's public Nostr data (step 3 of the 2026-10 archite
   `Directory::sync_worker()` gets or spawns it and `take_sync_worker()` hands it to shutdown.
 - Reach relays only through `transport-nostr`, and build every HTTP client by passing a fresh reqwest builder straight
   into `DirectoryConfig::http_builder`, the host's proxy-aware builder; `clippy.toml` rejects direct `nostr_sdk` and
-  `reqwest` client constructors. Allow that lint only at that hand-off (today, Open Ranking's client). See
+  `reqwest` client constructors. Allow that lint only at that hand-off (today, Open Ranking's client). Clippy cannot
+  target the `Client::default()` and `ClientBuilder::default()` trait impls, so review rejects those. See
   `docs/marmot-architecture/overview/dial-safety.md`.
 - Do not change cache SQL, migration ids, file names, TTLs, timeouts or bounds as part of a move. `cache/v1.sql` and
   `cache/v2.sql` are frozen; schema changes add a numbered migration.
