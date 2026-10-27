@@ -285,6 +285,92 @@ async fn invite_adds_every_device_of_the_account_in_one_commit() {
     assert_eq!(stored_member_count(&app, "alice", &group), Some(2));
 }
 
+/// Inviting an account again adds only its device outside the group: the
+/// selection also returns the fresh package of the device already in it,
+/// which the Commit leaves out rather than failing on its repeated leaf.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reinviting_an_account_adds_only_its_device_outside_the_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let laptop_dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice_id = home.create_account("alice").unwrap().account_id_hex;
+    let bob_id = home.create_account("bob").unwrap().account_id_hex;
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_at(&dir, relay.clone());
+    remember_test_member_inbox(&app, &bob_id, "wss://relay.example");
+    let (mut phones, _apps, _) = devices_with_key_packages(&app, &home, "bob", &[], &relay).await;
+    let phone = &mut phones[0];
+    let mut alice = app.client("alice").await.unwrap();
+    let group = alice.create_group("team", &[]).await.unwrap();
+    alice
+        .invite_members(&group, &[bob_id.as_str()])
+        .await
+        .unwrap();
+    let mut phone_cursor = 0;
+    deliver_new(phone, &relay, &mut phone_cursor).await;
+    phone.sync().await.unwrap();
+    phone.accept_group_invite(&group).unwrap();
+    let phone_refresh = published_key_package(phone, &relay).await;
+
+    second_device(&home, "bob", &laptop_dir);
+    let laptop_app = app_at(&laptop_dir, relay.clone());
+    let mut laptop = laptop_app.client("bob").await.unwrap();
+    let laptop_key_package = published_key_package(&mut laptop, &relay).await;
+    laptop.sync().await.unwrap();
+    let selected = alice
+        .app
+        .directory()
+        .resolve_compatible_member_key_packages(
+            vec![bob_id.clone()],
+            &alice
+                .runtime
+                .invite_key_package_requirements(&group)
+                .unwrap(),
+            nostr_directory::MemberResolutionPurpose::Commit,
+        )
+        .await
+        .unwrap()
+        .key_packages;
+    assert!(
+        selected
+            .iter()
+            .any(|package| package.source == phone_refresh.source),
+        "the selection offers the in-group device's fresh package"
+    );
+
+    let before = relay.published_events.lock().unwrap().len();
+    alice
+        .invite_members(&group, &[bob_id.as_str()])
+        .await
+        .unwrap();
+    let published = relay.published_events.lock().unwrap()[before..].to_vec();
+    assert_eq!(
+        published
+            .iter()
+            .filter(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+            .count(),
+        1,
+        "one Commit adds the device"
+    );
+    assert_eq!(
+        welcome_rumor_key_packages(&home, "bob", &published),
+        vec![hex::encode(
+            laptop_key_package.source.unwrap().event_id.as_slice()
+        )]
+    );
+
+    let mut laptop_cursor = 0;
+    deliver_new(&mut laptop, &relay, &mut laptop_cursor).await;
+    laptop.sync().await.unwrap();
+    laptop.accept_group_invite(&group).unwrap();
+    deliver_new(phone, &relay, &mut phone_cursor).await;
+    phone.sync().await.unwrap();
+    let two_devices = sorted(vec![(alice_id, 1), (bob_id, 2)]);
+    assert_eq!(member_view(&alice, &group), two_devices);
+    assert_eq!(member_view(phone, &group), two_devices);
+    assert_eq!(member_view(&laptop, &group), two_devices);
+}
+
 /// Creating a 1:1 with an account that has two devices adds both, leaves the
 /// creator's own other device out, and stays a 1:1 on every device.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

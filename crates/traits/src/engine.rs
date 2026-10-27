@@ -142,14 +142,17 @@ pub enum SendIntent {
         expected_epoch: Option<EpochId>,
     },
     /// Invite new members via their KeyPackages.
+    ///
+    /// A package from a device already in the group, or a second package
+    /// from one device, is skipped; an invite that adds no device fails.
     Invite {
         group_id: GroupId,
         key_packages: Vec<KeyPackage>,
         /// Admins granted in the same invite commit as the Adds.
         ///
-        /// Each id must be among the invited members. Empty keeps the
-        /// add-only commit. The current admin set is preserved and these
-        /// invitees are appended.
+        /// Each id must be an invited account with no device already in the
+        /// group. Empty keeps the add-only commit. The current admin set is
+        /// preserved and these invitees are appended.
         #[serde(default)]
         initial_admins: Vec<MemberId>,
     },

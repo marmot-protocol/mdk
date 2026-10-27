@@ -1304,6 +1304,73 @@ async fn invite_of_several_devices_projects_every_leaf_while_pending() {
     assert_eq!(alice.members(&group_id).unwrap().len(), 4);
 }
 
+/// An invite leaves out packages from devices already in the group, and a
+/// second package from one device, instead of failing the Commit on their
+/// repeated signature keys. An invite with nothing left to add still fails.
+#[tokio::test]
+async fn invite_adds_only_devices_not_already_in_the_group() {
+    let mut alice = build_client(b"alice");
+    let mut bob_phone = build_client(b"bob");
+    let mut bob_laptop = build_client(b"bob");
+    let (group_id, create_result) = alice
+        .create_group(CreateGroupRequest {
+            name: "test".into(),
+            description: "".into(),
+            members: vec![bob_phone.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = create_result else {
+        panic!("expected GroupCreated")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let epoch = alice.epoch(&group_id).unwrap();
+
+    let nothing_to_add = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![bob_phone.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await;
+    assert!(
+        matches!(nothing_to_add, Err(EngineError::Other(_))),
+        "got {nothing_to_add:?}"
+    );
+    assert_eq!(alice.epoch(&group_id).unwrap(), epoch);
+    assert_eq!(alice.members(&group_id).unwrap().len(), 2);
+
+    let laptop_key_package = bob_laptop.fresh_key_package().await.unwrap();
+    let invite_result = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![
+                bob_phone.fresh_key_package().await.unwrap(),
+                laptop_key_package.clone(),
+                bob_laptop.fresh_key_package().await.unwrap(),
+            ],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution {
+        mut welcomes,
+        pending,
+        ..
+    } = invite_result
+    else {
+        panic!("expected GroupEvolution")
+    };
+    assert_eq!(welcomes.len(), 1);
+    alice.confirm_published(pending).await.unwrap();
+    assert_eq!(alice.members(&group_id).unwrap().len(), 3);
+    bob_laptop.join_welcome(welcomes.remove(0)).await.unwrap();
+    assert_eq!(bob_laptop.members(&group_id).unwrap().len(), 3);
+}
+
 /// mdk#1298: inviting a member as admin is one GroupEvolution, one epoch
 /// bump, and the invitee is an admin after confirm — not invite then promote.
 #[tokio::test]

@@ -65,6 +65,8 @@ impl<R: DirectoryResources> Directory<R> {
             return Err(recovery_incomplete(account));
         }
         let freshness = self.directory_freshness();
+        // What the read found is used even when the read was incomplete:
+        // every device is sought, not guaranteed (mdk#2628, D12).
         if select_key_packages_from_records(account, &observed, freshness, requirements)
             .is_ok_and(|selection| !selection.value.is_empty())
         {

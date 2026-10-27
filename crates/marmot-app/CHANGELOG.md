@@ -78,7 +78,10 @@
   skipped. A lookup reads up to one relay page of 500 of an account's
   KeyPackages and 500 of its deletion requests; a relay that returns a full
   page of either leaves the lookup incomplete, since what lies past it may
-  change the selection.
+  change the selection. Every device is sought, not guaranteed: a device
+  whose KeyPackage no relay returns is left out, and inviting the account
+  again adds it. An invite adds only devices not already in the group, and
+  one that would add none still fails.
   KeyPackages not marked last-resort rank first, then the most
   recently published, then the lower KeyPackageRef; one device publishing in
   several slots counts once. One Commit adds the account, with one Welcome

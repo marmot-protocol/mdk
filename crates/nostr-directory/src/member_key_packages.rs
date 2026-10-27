@@ -196,7 +196,12 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
     ///
     /// Account aliases are canonicalized and duplicate account ids collapse to
     /// their first input position. Each account yields every KeyPackage
-    /// [`select_key_packages_from_records`] selects, best first. Every package
+    /// [`select_key_packages_from_records`] selects, best first, from what its
+    /// relays returned. Every device is sought, not guaranteed (mdk#2628,
+    /// D12): packages a read returned are selected even when the read was
+    /// incomplete, so a device whose package no relay returned is left out,
+    /// and inviting the account again adds it. A read that yields nothing
+    /// usable still fails the lookup rather than deciding on nothing. Every package
     /// is fetched from relays; cached packages are never a fallback if that
     /// lookup fails. On error, the error belonging to the first unresolved
     /// canonical member is returned even if later relay work completed earlier.
@@ -901,7 +906,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                 )
                 .map(|selection| selection.value);
                 // Batch results prove no coverage; every absence or rejection
-                // is decided by the per-member recovery below.
+                // is decided by the per-member recovery below. A single-author
+                // batch that selects is used as is (D12).
                 match selected {
                     Ok(selected)
                         if !selected.is_empty()
@@ -1002,7 +1008,9 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                                 records.freshness,
                                 requirements,
                             )?
-                            // Recovery returned, so lookup coverage is complete.
+                            // Recovery returned: an empty selection is a
+                            // complete negative, while a non-empty one may
+                            // still leave out a device (D12).
                             .into_value_or_missing(&target.account_id_hex)
                         }
                         .await;
