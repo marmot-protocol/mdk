@@ -27,3 +27,7 @@ dev/data/
 
 # opencode tool artifacts
 .opencode/
+
+# Nix build outputs
+/result
+/result-*
