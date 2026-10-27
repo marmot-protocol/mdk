@@ -40,11 +40,15 @@
 //! compiler checks whatever is left.
 //! - Paths are matched by name. A name brought in through a glob from outside the set is seen
 //!   only at the glob (`crate::*`).
-//! - A field access counts only when the scan can tell its receiver is the moving type: `self`,
-//!   a parameter or `let` with a written type, a `let` initialised from a call to a function or
-//!   method this crate defines, a field of a struct this crate defines, or a chain of those.
-//!   Struct literals and patterns count by their path. Other receivers, such as `match` and
-//!   `if let` bindings, closure parameters without a type and iterator items, are not counted.
+//! - A field access counts only when the scan can tell its receiver is the moving type. It
+//!   follows `self`, written types, calls to functions and methods this crate defines, fields of
+//!   structs it defines, and the std adapters in [`TRANSPARENT_METHODS`]. A name bound by a
+//!   `let`, `match`, `if let`, `while let` or `for` pattern, or as a parameter of a closure passed
+//!   to a std adapter, takes the type of the value it matches, within its scope. Generics are
+//!   read loosely: an `Option<Pinned>` or a `Vec<Pinned>` holds a `Pinned`. Struct literals and
+//!   patterns count by their path. Receivers the scan can't type are not counted: values only a
+//!   trait method, a generic function or a macro produces, and the parameters of a closure
+//!   passed to this crate's own functions.
 //!
 //! The walk and the test-only rules follow `storage-sqlite`'s boundary test and the directory's
 //! crossing check (#2501).
@@ -83,22 +87,45 @@ const FORBIDDEN_CRATES: &[&str] = &[
 const HUB_TYPES: &[&str] = &["MarmotApp", "MarmotAppRuntime"];
 const APP_ERROR: &str = "AppError";
 
-/// Methods whose result the scan treats as their receiver's type, for the few std and
-/// `Result`/`Option` adapters that sit between a binding and the value it holds.
+/// Methods whose result the scan treats as their receiver's type, for the std, `Option`,
+/// `Result` and iterator adapters that sit between a binding and the value it holds. The scan
+/// reads generics loosely: an `Option<Pinned>`, or an iterator over a `Vec<Pinned>`, holds a
+/// `Pinned`.
 const TRANSPARENT_METHODS: &[&str] = &[
     "as_mut",
     "as_ref",
     "borrow",
     "borrow_mut",
     "clone",
+    "cloned",
+    "copied",
     "expect",
+    "filter",
+    "first",
+    "flatten",
+    "get",
+    "get_mut",
+    "into_iter",
+    "iter",
+    "iter_mut",
+    "last",
     "lock",
     "map_err",
+    "next",
+    "pop",
     "read",
+    "remove",
+    "rev",
+    "take",
     "unwrap",
     "unwrap_or_else",
+    "values",
+    "values_mut",
     "write",
 ];
+
+/// Adapters whose closure takes an accumulator before the item.
+const FOLDS: &[&str] = &["fold", "rfold", "scan", "try_fold", "try_rfold"];
 
 const LIST: &str = include_str!("observability_crossings.txt");
 const LIST_PATH: &str = "src/observability_crossings.txt";
@@ -306,6 +333,68 @@ fn the_scan_sees_each_field_reach() {
             "fn f(app: crate::MarmotApp) { assert!(app.analytics.rejected); }",
         ),
         (
+            "reach/matches.rs",
+            r#"
+            fn f(maybe: Option<crate::Pinned>) -> String {
+                match maybe { Some(pin) => pin.url, None => String::new() }
+            }
+            "#,
+        ),
+        (
+            "reach/if_let.rs",
+            r#"
+            fn f(maybe: Option<crate::Permit>, ready: bool) -> String {
+                if ready && let Some(permit) = &maybe { permit.id.clone() } else { String::new() }
+            }
+            "#,
+        ),
+        (
+            "reach/while_let.rs",
+            r#"
+            fn f(mut pending: Vec<crate::Permit>) -> usize {
+                let mut n = 0;
+                while let Some(permit) = pending.pop() { n += permit.id.len(); }
+                n
+            }
+            "#,
+        ),
+        (
+            "reach/let_else.rs",
+            r#"
+            fn f(result: Result<crate::telemetry::Counter, ()>) -> u64 {
+                let Ok(counter) = result else { return 0 };
+                counter.0
+            }
+            "#,
+        ),
+        (
+            "reach/destructured.rs",
+            r#"
+            fn f(app: crate::MarmotApp) -> bool {
+                let crate::MarmotApp { analytics, .. } = app;
+                analytics.rejected
+            }
+            "#,
+        ),
+        (
+            "reach/for_loops.rs",
+            r#"
+            fn f(collectors: &[crate::Collector]) -> usize {
+                let mut n = 0;
+                for collector in collectors.iter() { if collector.rejected { n += 1; } }
+                n
+            }
+            "#,
+        ),
+        (
+            "reach/closures.rs",
+            r#"
+            fn f(pins: Vec<crate::Pinned>) -> Vec<String> {
+                pins.into_iter().map(|pin| pin.url).collect()
+            }
+            "#,
+        ),
+        (
             "reach/tests.rs",
             r#"
             #[cfg(test)]
@@ -318,12 +407,19 @@ fn the_scan_sees_each_field_reach() {
         [
             "production reach/calls.rs field telemetry::Pinned.url",
             "production reach/chains.rs field telemetry::Collector.rejected",
+            "production reach/closures.rs field telemetry::Pinned.url",
+            "production reach/destructured.rs field telemetry::Collector.rejected",
+            "production reach/for_loops.rs field telemetry::Collector.rejected",
+            "production reach/if_let.rs field telemetry::Permit.id",
+            "production reach/let_else.rs field telemetry::Counter.0",
             "production reach/literals.rs field telemetry::Pinned.url",
             "production reach/macros.rs field telemetry::Collector.rejected",
+            "production reach/matches.rs field telemetry::Pinned.url",
             "production reach/methods.rs field telemetry::State.persisted",
             "production reach/params.rs field telemetry::Permit.id",
             "production reach/patterns.rs field telemetry::Collector.rejected",
             "production reach/tuples.rs field telemetry::Counter.0",
+            "production reach/while_let.rs field telemetry::Permit.id",
             "production telemetry.rs crate::MarmotApp",
             "production telemetry.rs field telemetry::Collector.clock",
             "production telemetry.rs impl MarmotApp",
@@ -333,7 +429,8 @@ fn the_scan_sees_each_field_reach() {
 }
 
 /// A field access counts only when the receiver is shown to be the moving type, so a field of
-/// the same name on another type, or on a receiver the scan can't type, is not listed.
+/// the same name on another type, or on a receiver the scan can't type, is not listed. A name is
+/// typed by its innermost binding in scope.
 #[test]
 fn field_reaches_need_the_receivers_type() {
     let files = fixture(&[
@@ -345,9 +442,14 @@ fn field_reaches_need_the_receivers_type() {
             pub struct Proxy { pub url: String }
             fn other_type(proxy: Proxy) -> String { proxy.url }
             fn unknown_call() -> String { let pin = make(); pin.url }
-            fn match_binding(maybe: Option<Pinned>) -> String {
+            fn out_of_scope(maybe: Option<Pinned>) -> String {
                 let pin = Proxy { url: String::new() };
-                match maybe { Some(pin) => pin.url, None => pin.url }
+                if let Some(pin) = maybe { drop(pin); }
+                match maybe { Some(_) => pin.url, None => pin.url }
+            }
+            fn shadowed(pin: Pinned) -> String { let pin = Proxy { url: pin.public.to_string() }; pin.url }
+            fn accumulator(pins: Vec<Pinned>, start: Proxy) -> Proxy {
+                pins.iter().fold(start, |acc, _| { drop(acc.url); acc })
             }
             fn public_field(pin: Pinned) -> u8 { pin.public }
             fn both_types(pair: Result<Proxy, Pinned>) -> String { pair.unwrap().url }
@@ -375,14 +477,33 @@ fn an_added_crossing_fails_the_check() {
         fn added() -> u64 { crate::observability_crossing_probe() }
     });
     let rel = file.rel.clone();
+    // And a reach into a restricted field from `lib.rs`, through a `match` binding.
+    let (field, owners) = Index::build(&files, MOVING_SET)
+        .doors
+        .into_iter()
+        .next()
+        .expect("the set has no restricted field");
+    let owner = owners.first().unwrap();
+    let lib = files
+        .iter_mut()
+        .find(|file| file.module.is_empty())
+        .unwrap();
+    lib.ast.items.push(
+        syn::parse_str(&format!(
+            "fn added_reach(maybe: Option<{owner}>) {{ \
+                match maybe {{ Some(value) => drop(value.{field}), None => {{}} }} \
+            }}"
+        ))
+        .unwrap(),
+    );
     let index = Index::build(&files, MOVING_SET);
     let message = compare(&scan(&files, &index), &parse_list(LIST)).unwrap_err();
-    assert!(
-        message.contains(&format!(
-            "production {rel} crate::observability_crossing_probe"
-        )),
-        "{message}"
-    );
+    for added in [
+        format!("production {rel} crate::observability_crossing_probe"),
+        format!("production lib.rs field {}.{field}", display_type(owner)),
+    ] {
+        assert!(message.contains(&added), "{added} not in: {message}");
+    }
 }
 
 #[test]
@@ -1199,64 +1320,13 @@ impl<'ast> Visit<'ast> for TypeNames<'_> {
     }
 }
 
-/// How a function binds a name: with a written type, from an initialiser, or by a pattern the
-/// scan does not type.
-enum Binding<'a> {
-    Typed(&'a syn::Type),
-    Init(&'a syn::Expr),
-    Unknown,
-}
-
-/// The names one function binds, closures included; nested items keep their own.
+/// The names one block, arm, closure or function binds, with the types the scan can tell each
+/// holds (`None` when it can't).
 #[derive(Default)]
-struct Bindings<'a> {
-    names: BTreeMap<String, Vec<Binding<'a>>>,
-}
-
-impl<'a> Bindings<'a> {
-    fn of(sig: &'a syn::Signature, block: &'a syn::Block) -> Self {
-        let mut bindings = Bindings::default();
-        for input in &sig.inputs {
-            bindings.visit_fn_arg(input);
-        }
-        bindings.visit_block(block);
-        bindings
-    }
-
-    fn add(&mut self, name: &syn::Ident, binding: Binding<'a>) {
-        self.names
-            .entry(name.to_string())
-            .or_default()
-            .push(binding);
-    }
-}
-
-impl<'a> Visit<'a> for Bindings<'a> {
-    fn visit_item(&mut self, _: &'a syn::Item) {}
-
-    fn visit_local(&mut self, local: &'a syn::Local) {
-        match (&local.pat, &local.init) {
-            (syn::Pat::Ident(p), Some(init)) if p.subpat.is_none() => {
-                self.add(&p.ident, Binding::Init(&init.expr));
-            }
-            (pat, _) => self.visit_pat(pat),
-        }
-        if let Some(init) = &local.init {
-            self.visit_local_init(init);
-        }
-    }
-
-    fn visit_pat_type(&mut self, pat: &'a syn::PatType) {
-        match &*pat.pat {
-            syn::Pat::Ident(p) if p.subpat.is_none() => self.add(&p.ident, Binding::Typed(&pat.ty)),
-            other => self.visit_pat(other),
-        }
-    }
-
-    fn visit_pat_ident(&mut self, pat: &'a syn::PatIdent) {
-        self.add(&pat.ident, Binding::Unknown);
-        visit::visit_pat_ident(self, pat);
-    }
+struct Scope {
+    names: BTreeMap<String, Option<BTreeSet<String>>>,
+    /// A function's own scope: names outside it are not in scope.
+    item: bool,
 }
 
 /// Every crossing, as `<production|test> <file> <target>` lines.
@@ -1270,7 +1340,7 @@ fn scan(files: &[SourceFile], index: &Index) -> BTreeSet<String> {
             test: file.test,
             hub_impl: false,
             self_ty: None,
-            bindings: Vec::new(),
+            scopes: Vec::new(),
             found: BTreeSet::new(),
         };
         for item in &file.ast.items {
@@ -1370,8 +1440,8 @@ struct Scan<'a> {
     /// Inside an impl block of `MarmotApp` or `MarmotAppRuntime`.
     hub_impl: bool,
     self_ty: Option<String>,
-    /// The enclosing functions' bindings, innermost last.
-    bindings: Vec<Bindings<'a>>,
+    /// The scopes around the code being scanned, innermost last.
+    scopes: Vec<Scope>,
     /// `(test, target)`.
     found: BTreeSet<(bool, String)>,
 }
@@ -1496,21 +1566,18 @@ impl<'a> Scan<'a> {
     }
 
     /// The types an expression's value names, when the scan can tell.
-    fn types_of(&self, expr: &syn::Expr, depth: usize) -> Option<BTreeSet<String>> {
-        if depth > 8 {
-            return None;
-        }
+    fn types_of(&self, expr: &syn::Expr) -> Option<BTreeSet<String>> {
         match expr {
             syn::Expr::Path(p) if p.qself.is_none() => {
                 let ident = p.path.get_ident()?.to_string();
-                self.name_types(&ident, depth)
+                self.name_types(&ident)
             }
             syn::Expr::Field(f) => {
-                let base = self.types_of(&f.base, depth + 1)?;
+                let base = self.types_of(&f.base)?;
                 self.index.field_types(&base, &member_name(&f.member))
             }
             syn::Expr::MethodCall(call) => {
-                let receiver = self.types_of(&call.receiver, depth + 1)?;
+                let receiver = self.types_of(&call.receiver)?;
                 let method = call.method.to_string();
                 self.index.method_returns(&receiver, &method).or_else(|| {
                     TRANSPARENT_METHODS
@@ -1524,47 +1591,140 @@ impl<'a> Scan<'a> {
                 };
                 self.call_returns(&func.path)
             }
-            syn::Expr::Await(e) => self.types_of(&e.base, depth + 1),
-            syn::Expr::Try(e) => self.types_of(&e.expr, depth + 1),
-            syn::Expr::Paren(e) => self.types_of(&e.expr, depth + 1),
-            syn::Expr::Group(e) => self.types_of(&e.expr, depth + 1),
-            syn::Expr::Reference(e) => self.types_of(&e.expr, depth + 1),
-            syn::Expr::Unary(e) if matches!(e.op, syn::UnOp::Deref(_)) => {
-                self.types_of(&e.expr, depth + 1)
-            }
+            syn::Expr::Await(e) => self.types_of(&e.base),
+            syn::Expr::Try(e) => self.types_of(&e.expr),
+            syn::Expr::Paren(e) => self.types_of(&e.expr),
+            syn::Expr::Group(e) => self.types_of(&e.expr),
+            syn::Expr::Reference(e) => self.types_of(&e.expr),
+            syn::Expr::Index(e) => self.types_of(&e.expr),
+            syn::Expr::Unary(e) if matches!(e.op, syn::UnOp::Deref(_)) => self.types_of(&e.expr),
             syn::Expr::Struct(s) => Some(BTreeSet::from([self.resolve(&s.path)])),
-            syn::Expr::Cast(c) => Some(self.index.type_keys(
-                &self.file.rel,
-                &self.module,
-                &c.ty,
-                self.self_ty.as_deref(),
-            )),
+            syn::Expr::Cast(c) => Some(self.type_keys(&c.ty)),
             _ => None,
         }
     }
 
-    /// The types a name holds: `self`, or every binding of it in the enclosing function agrees.
-    fn name_types(&self, name: &str, depth: usize) -> Option<BTreeSet<String>> {
+    /// The types a name holds: `self`, or the innermost binding of it in the enclosing function.
+    fn name_types(&self, name: &str) -> Option<BTreeSet<String>> {
         if name == "self" {
             return self.self_ty.clone().map(|ty| BTreeSet::from([ty]));
         }
-        let bindings = self.bindings.last()?.names.get(name)?;
-        let mut agreed: Option<BTreeSet<String>> = None;
-        for binding in bindings {
-            let types = match binding {
-                Binding::Typed(ty) => {
-                    self.index
-                        .type_keys(&self.file.rel, &self.module, ty, self.self_ty.as_deref())
-                }
-                Binding::Init(expr) => self.types_of(expr, depth + 1)?,
-                Binding::Unknown => return None,
-            };
-            agreed = Some(match agreed {
-                None => types,
-                Some(agreed) => agreed.intersection(&types).cloned().collect(),
-            });
+        for scope in self.scopes.iter().rev() {
+            if let Some(types) = scope.names.get(name) {
+                return types.clone();
+            }
+            if scope.item {
+                break;
+            }
         }
-        agreed
+        None
+    }
+
+    fn type_keys(&self, ty: &syn::Type) -> BTreeSet<String> {
+        self.index
+            .type_keys(&self.file.rel, &self.module, ty, self.self_ty.as_deref())
+    }
+
+    /// Binds the names a pattern introduces in the innermost scope, typing each from the value
+    /// it matches: a written type as written, a struct pattern's field by its declared type, and
+    /// anything else (tuples, references, `Some`, `Ok`) as the whole value, the way the scan reads
+    /// generics.
+    fn bind(&mut self, pat: &syn::Pat, types: Option<BTreeSet<String>>) {
+        match pat {
+            syn::Pat::Ident(p) => {
+                if let Some((_, sub)) = &p.subpat {
+                    self.bind(sub, types.clone());
+                }
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.names.insert(p.ident.to_string(), types);
+                }
+            }
+            syn::Pat::Type(p) => {
+                let types = self.type_keys(&p.ty);
+                self.bind(&p.pat, Some(types));
+            }
+            syn::Pat::Reference(p) => self.bind(&p.pat, types),
+            syn::Pat::Paren(p) => self.bind(&p.pat, types),
+            syn::Pat::Or(p) => {
+                for case in &p.cases {
+                    self.bind(case, types.clone());
+                }
+            }
+            syn::Pat::Tuple(p) => {
+                for elem in &p.elems {
+                    self.bind(elem, types.clone());
+                }
+            }
+            syn::Pat::Slice(p) => {
+                for elem in &p.elems {
+                    self.bind(elem, types.clone());
+                }
+            }
+            syn::Pat::TupleStruct(p) => {
+                let owner = BTreeSet::from([self.resolve(&p.path)]);
+                // Positions after `..` are not known.
+                let mut known = true;
+                for (position, elem) in p.elems.iter().enumerate() {
+                    known &= !matches!(elem, syn::Pat::Rest(_));
+                    let elem_types = if known {
+                        self.index
+                            .field_types(&owner, &position.to_string())
+                            .or_else(|| types.clone())
+                    } else {
+                        None
+                    };
+                    self.bind(elem, elem_types);
+                }
+            }
+            syn::Pat::Struct(p) => {
+                let owner = BTreeSet::from([self.resolve(&p.path)]);
+                for field in &p.fields {
+                    let declared = self.index.field_types(&owner, &member_name(&field.member));
+                    self.bind(&field.pat, declared.or_else(|| types.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Visits code in a scope of its own.
+    fn scoped(&mut self, item: bool, visit: impl FnOnce(&mut Self)) {
+        self.scopes.push(Scope {
+            item,
+            ..Scope::default()
+        });
+        visit(self);
+        self.scopes.pop();
+    }
+
+    /// Visits a function in its own scope, with its parameters bound.
+    fn function(&mut self, sig: &syn::Signature, visit: impl FnOnce(&mut Self)) {
+        self.scoped(true, |scan| {
+            for input in &sig.inputs {
+                if let syn::FnArg::Typed(param) = input {
+                    let types = scan.type_keys(&param.ty);
+                    scan.bind(&param.pat, Some(types));
+                }
+            }
+            visit(scan);
+        });
+    }
+
+    /// Visits a closure. A parameter without a written type holds `items`, the types of the
+    /// value the closure's method was called on, except a fold's accumulator.
+    fn closure(
+        &mut self,
+        closure: &'a syn::ExprClosure,
+        items: Option<BTreeSet<String>>,
+        fold: bool,
+    ) {
+        self.scoped(false, |scan| {
+            for (position, input) in closure.inputs.iter().enumerate() {
+                let items = (!(fold && position == 0)).then(|| items.clone()).flatten();
+                scan.bind(input, items);
+            }
+            visit::visit_expr_closure(scan, closure);
+        });
     }
 
     /// What a call to this path returns: `Type::f` and `Self::f` by the type's methods, a free
@@ -1592,7 +1752,7 @@ impl<'a> Scan<'a> {
         let TokenTree::Ident(first) = &trees[start] else {
             return;
         };
-        let Some(mut types) = self.name_types(&first.to_string(), 0) else {
+        let Some(mut types) = self.name_types(&first.to_string()) else {
             return;
         };
         let mut i = start + 1;
@@ -1678,12 +1838,6 @@ impl<'a> Scan<'a> {
             }
         }
     }
-
-    fn with_bindings(&mut self, bindings: Bindings<'a>, visit: impl FnOnce(&mut Self)) {
-        self.bindings.push(bindings);
-        visit(self);
-        self.bindings.pop();
-    }
 }
 
 fn member_name(member: &syn::Member) -> String {
@@ -1712,8 +1866,7 @@ impl<'a> Visit<'a> for Scan<'a> {
             }
             syn::Item::Use(item_use) => self.use_tree(&item_use.tree, &mut Vec::new()),
             syn::Item::Fn(function) => {
-                let bindings = Bindings::of(&function.sig, &function.block);
-                self.with_bindings(bindings, |scan| visit::visit_item(scan, item));
+                self.function(&function.sig, |scan| visit::visit_item(scan, item));
             }
             _ => visit::visit_item(self, item),
         }
@@ -1755,8 +1908,7 @@ impl<'a> Visit<'a> for Scan<'a> {
         let outer = self.test;
         self.test |= starts_test_only(item.to_token_stream());
         if let syn::ImplItem::Fn(method) = item {
-            let bindings = Bindings::of(&method.sig, &method.block);
-            self.with_bindings(bindings, |scan| visit::visit_impl_item(scan, item));
+            self.function(&method.sig, |scan| visit::visit_impl_item(scan, item));
         } else {
             visit::visit_impl_item(self, item);
         }
@@ -1767,9 +1919,8 @@ impl<'a> Visit<'a> for Scan<'a> {
         let outer = self.test;
         self.test |= starts_test_only(item.to_token_stream());
         match item {
-            syn::TraitItem::Fn(method) if method.default.is_some() => {
-                let bindings = Bindings::of(&method.sig, method.default.as_ref().unwrap());
-                self.with_bindings(bindings, |scan| visit::visit_trait_item(scan, item));
+            syn::TraitItem::Fn(method) => {
+                self.function(&method.sig, |scan| visit::visit_trait_item(scan, item));
             }
             _ => visit::visit_trait_item(self, item),
         }
@@ -1781,6 +1932,94 @@ impl<'a> Visit<'a> for Scan<'a> {
         self.test |= starts_test_only(stmt.to_token_stream());
         visit::visit_stmt(self, stmt);
         self.test = outer;
+    }
+
+    fn visit_block(&mut self, block: &'a syn::Block) {
+        self.scoped(false, |scan| visit::visit_block(scan, block));
+    }
+
+    fn visit_local(&mut self, local: &'a syn::Local) {
+        // The initialiser, and a let-else's `else`, see only the names bound before the `let`.
+        if let Some(init) = &local.init {
+            self.visit_local_init(init);
+        }
+        let types = local
+            .init
+            .as_ref()
+            .and_then(|init| self.types_of(&init.expr));
+        self.visit_pat(&local.pat);
+        self.bind(&local.pat, types);
+    }
+
+    fn visit_expr_let(&mut self, expr: &'a syn::ExprLet) {
+        self.visit_expr(&expr.expr);
+        let types = self.types_of(&expr.expr);
+        self.visit_pat(&expr.pat);
+        self.bind(&expr.pat, types);
+    }
+
+    fn visit_expr_if(&mut self, expr: &'a syn::ExprIf) {
+        // An `if let` binds for the rest of its condition and its then-branch.
+        self.scoped(false, |scan| {
+            scan.visit_expr(&expr.cond);
+            scan.visit_block(&expr.then_branch);
+        });
+        if let Some((_, else_branch)) = &expr.else_branch {
+            self.visit_expr(else_branch);
+        }
+    }
+
+    fn visit_expr_while(&mut self, expr: &'a syn::ExprWhile) {
+        self.scoped(false, |scan| {
+            scan.visit_expr(&expr.cond);
+            scan.visit_block(&expr.body);
+        });
+    }
+
+    fn visit_expr_match(&mut self, expr: &'a syn::ExprMatch) {
+        self.visit_expr(&expr.expr);
+        let types = self.types_of(&expr.expr);
+        for arm in &expr.arms {
+            self.scoped(false, |scan| {
+                scan.bind(&arm.pat, types.clone());
+                scan.visit_arm(arm);
+            });
+        }
+    }
+
+    fn visit_expr_for_loop(&mut self, expr: &'a syn::ExprForLoop) {
+        self.visit_expr(&expr.expr);
+        let types = self.types_of(&expr.expr);
+        self.scoped(false, |scan| {
+            scan.visit_pat(&expr.pat);
+            scan.bind(&expr.pat, types);
+            scan.visit_block(&expr.body);
+        });
+    }
+
+    fn visit_expr_closure(&mut self, closure: &'a syn::ExprClosure) {
+        self.closure(closure, None, false);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'a syn::ExprMethodCall) {
+        self.visit_expr(&call.receiver);
+        if let Some(turbofish) = &call.turbofish {
+            self.visit_angle_bracketed_generic_arguments(turbofish);
+        }
+        // A closure passed to a std adapter (`map`, `any`, `retain`) takes the receiver's items.
+        // One passed to this crate's own method takes what that method's bounds say, which the
+        // scan does not read.
+        let method = call.method.to_string();
+        let items = self
+            .types_of(&call.receiver)
+            .filter(|receiver| self.index.method_returns(receiver, &method).is_none());
+        let fold = FOLDS.contains(&method.as_str());
+        for arg in &call.args {
+            match arg {
+                syn::Expr::Closure(closure) => self.closure(closure, items.clone(), fold),
+                _ => self.visit_expr(arg),
+            }
+        }
     }
 
     fn visit_field(&mut self, field: &'a syn::Field) {
@@ -1819,7 +2058,7 @@ impl<'a> Visit<'a> for Scan<'a> {
 
     fn visit_expr_field(&mut self, field: &'a syn::ExprField) {
         if self.stays()
-            && let Some(types) = self.types_of(&field.base, 0)
+            && let Some(types) = self.types_of(&field.base)
         {
             self.reach(&types, &member_name(&field.member));
         }
