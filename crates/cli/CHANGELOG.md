@@ -18,6 +18,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   `diagnostic_status`. `--json` prints the same checks with stable ids. The output names no paths, account ids,
   public keys, relay URLs or tokens, and the command exits nonzero when a check fails. A passing doctor does not show
   that messages are delivered.
+- The conformance simulator models `marmot.group.account-devices.v1` (0x800d) support per client (mdk#2628). Scenario
+  IR v3 gains `set_account_devices_support`, `require_account_devices` and `expect_require_account_devices_error`, and
+  vectors gain an `account_devices_state` expectation that checks the component's state rules on a client's exact
+  state. Four vectors cover activation, activation refused while a member lacks support, and activation racing an
+  invite of a member without support, with each side winning once.
 
 ### Changed
 

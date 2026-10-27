@@ -19,6 +19,7 @@ pub enum ScenarioStimulus {
     SelfUpdate,
     GroupDataUpdate,
     AdminPolicyUpdate,
+    AccountDevicesActivation,
     PublishConfirm,
     PublishFail,
     AppMessage,
@@ -377,6 +378,13 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             ScenarioStep::ExpectUpdateAdminPolicyError { .. } => {
                 stimuli.insert(ScenarioStimulus::AdminPolicyUpdate);
             }
+            ScenarioStep::RequireAccountDevices { .. } => {
+                stimuli.insert(ScenarioStimulus::AccountDevicesActivation);
+                commits += 1;
+            }
+            ScenarioStep::ExpectRequireAccountDevicesError { .. } => {
+                stimuli.insert(ScenarioStimulus::AccountDevicesActivation);
+            }
             ScenarioStep::AcknowledgeOutbound { outcome, .. } => {
                 stimuli.insert(match outcome {
                     crate::SubjectOutboundOutcome::Accepted => ScenarioStimulus::PublishConfirm,
@@ -424,7 +432,7 @@ pub fn scenario_stimuli(spec: &ScenarioSpec) -> Vec<ScenarioStimulus> {
             ScenarioStep::InterruptRelay { .. } => {
                 stimuli.insert(ScenarioStimulus::OfflineReconnect);
             }
-            ScenarioStep::RestartClient { .. } => {
+            ScenarioStep::RestartClient { .. } | ScenarioStep::SetAccountDevicesSupport { .. } => {
                 stimuli.insert(ScenarioStimulus::Restart);
             }
             ScenarioStep::SetClientOffline { .. } | ScenarioStep::ReconnectClient { .. } => {
@@ -727,7 +735,7 @@ fn expectation_behaviors(expectation: &TraceExpectation) -> BTreeSet<OracleBehav
                 behaviors.insert(OracleBehavior::DeliveredPayload);
             }
         }
-        TraceExpectation::GroupProfile { .. } => {
+        TraceExpectation::GroupProfile { .. } | TraceExpectation::AccountDevicesState { .. } => {
             behaviors.insert(OracleBehavior::ClientState);
         }
         TraceExpectation::ClientsConverged { member_count, .. } => {
@@ -839,6 +847,12 @@ fn recommended_behaviors(stimulus: ScenarioStimulus) -> Vec<OracleBehavior> {
             OracleBehavior::PendingConfirmed,
             OracleBehavior::ExpectedError,
             OracleBehavior::AdminPolicyObserved,
+            OracleBehavior::ClientConvergence,
+        ],
+        ScenarioStimulus::AccountDevicesActivation => vec![
+            OracleBehavior::PendingConfirmed,
+            OracleBehavior::ExpectedError,
+            OracleBehavior::EpochChanged,
             OracleBehavior::ClientConvergence,
         ],
         ScenarioStimulus::PublishConfirm => vec![OracleBehavior::PendingConfirmed],

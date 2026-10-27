@@ -215,6 +215,10 @@ V3 adds:
   profile fields.
 - `expect_tick_error` — records a normalized, expected transport refusal and continues, so the same input can be
   replayed after a later prerequisite state transition.
+- `set_account_devices_support`, `require_account_devices` and `expect_require_account_devices_error` — per-client
+  support for `marmot.group.account-devices.v1` (0x800d) and an admin's Commit that makes a group require it, so
+  vectors can model mixed support. The `account_devices_state` expectation checks a client's exact state against the
+  component's rules.
 - Real app-runtime stimuli: `interrupt_relay` (cuts live relay sockets for a real wall-time outage),
   `race_group_profiles` (2–8 clients release concurrent profile edits from a shared barrier), and `race_invite_profile`
   (an invite racing a rename, with an explicit rejoin offer). Adapters without the required capability refuse them

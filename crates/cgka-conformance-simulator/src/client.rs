@@ -20,8 +20,9 @@ use cgka_engine::engine_metrics::{EngineMetricsSnapshot, HistogramSnapshot};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{ConvergenceClock, Engine, EngineBuilder};
 use cgka_traits::app_components::{
-    AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
-    default_group_components, encode_nostr_routing_v1,
+    ACCOUNT_DEVICES_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
+    GROUP_ADMIN_POLICY_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+    default_group_components, encode_components_list, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 #[cfg(test)]
@@ -80,6 +81,8 @@ pub struct HarnessClient {
     disable_app_witnesses_for_tests: bool,
     replay_probe_budget_override: Option<u64>,
     deferred_peel_limits_override: Option<(usize, usize, usize)>,
+    /// Whether this client's build advertises `marmot.group.account-devices.v1`.
+    account_devices_supported: bool,
     completed_replay_probe_count: u64,
     completed_engine_metrics: EngineMetricsSnapshot,
     virtual_time_tick_enabled: bool,
@@ -646,7 +649,7 @@ mod tests {
                     keys: client.signer.clone(),
                 }))
                 .protocol_profile(ProtocolProfile::Current)
-                .supported_app_components(harness_supported_app_components())
+                .supported_app_components(harness_supported_app_components(false))
                 .peeler(Box::new(OpaquePeeler(
                     NostrMlsPeeler::new().with_welcome_signer(client.signer.clone()),
                 )))
@@ -1023,6 +1026,7 @@ pub struct ClientBuilder {
     disable_app_witnesses_for_tests: bool,
     replay_probe_budget_override: Option<u64>,
     deferred_peel_limits_override: Option<(usize, usize, usize)>,
+    account_devices_supported: bool,
     #[cfg(test)]
     welcome_wrap_refusal: Option<Arc<AtomicBool>>,
 }
@@ -1176,6 +1180,7 @@ impl ClientBuilder {
             disable_app_witnesses_for_tests: false,
             replay_probe_budget_override: None,
             deferred_peel_limits_override: None,
+            account_devices_supported: false,
             #[cfg(test)]
             welcome_wrap_refusal: None,
         }
@@ -1219,6 +1224,13 @@ impl ClientBuilder {
 
     pub fn convergence_clock(mut self, clock: Arc<dyn ConvergenceClock>) -> Self {
         self.convergence_clock = Some(clock);
+        self
+    }
+
+    /// Advertise `marmot.group.account-devices.v1` (0x800d), which production
+    /// builds do not advertise yet.
+    pub fn account_devices_supported(mut self, supported: bool) -> Self {
+        self.account_devices_supported = supported;
         self
     }
 
@@ -1274,6 +1286,7 @@ impl ClientBuilder {
                 disable_app_witnesses_for_tests: self.disable_app_witnesses_for_tests,
                 replay_probe_budget_override: self.replay_probe_budget_override,
                 deferred_peel_limits_override: self.deferred_peel_limits_override,
+                account_devices_supported: self.account_devices_supported,
                 #[cfg(test)]
                 welcome_wrap_refusal: self.welcome_wrap_refusal.as_ref(),
             },
@@ -1294,6 +1307,7 @@ impl ClientBuilder {
             disable_app_witnesses_for_tests: self.disable_app_witnesses_for_tests,
             replay_probe_budget_override: self.replay_probe_budget_override,
             deferred_peel_limits_override: self.deferred_peel_limits_override,
+            account_devices_supported: self.account_devices_supported,
             completed_replay_probe_count: 0,
             completed_engine_metrics: EngineMetricsSnapshot::default(),
             virtual_time_tick_enabled: false,
@@ -1326,6 +1340,7 @@ struct HarnessEngineOptions<'a> {
     disable_app_witnesses_for_tests: bool,
     replay_probe_budget_override: Option<u64>,
     deferred_peel_limits_override: Option<(usize, usize, usize)>,
+    account_devices_supported: bool,
     #[cfg(test)]
     welcome_wrap_refusal: Option<&'a Arc<AtomicBool>>,
 }
@@ -1366,9 +1381,14 @@ fn build_harness_engine(
         }))
         .protocol_profile(protocol_profile)
         .feature_registry(registry.clone())
-        .supported_app_components(harness_supported_app_components())
+        .supported_app_components(harness_supported_app_components(
+            options.account_devices_supported,
+        ))
         .peeler(peeler)
         .recorder(Box::new(CapturingRecorder::new(audit_capture.clone())));
+    if options.account_devices_supported {
+        builder = builder.allow_account_devices_advertising_for_tests();
+    }
     #[cfg(debug_assertions)]
     if protocol_profile == ProtocolProfile::Legacy {
         builder = builder.legacy_compatibility_profile();
@@ -1420,9 +1440,12 @@ fn deterministic_nostr_keys(seed: &[u8]) -> nostr::prelude::Keys {
     }
 }
 
-fn harness_supported_app_components() -> Vec<u16> {
+fn harness_supported_app_components(account_devices_supported: bool) -> Vec<u16> {
     let mut components = default_group_components();
     components.insert(NOSTR_ROUTING_COMPONENT_ID);
+    if account_devices_supported {
+        components.insert(ACCOUNT_DEVICES_COMPONENT_ID);
+    }
     components.into_iter().collect()
 }
 
@@ -1754,6 +1777,7 @@ impl HarnessClient {
                 disable_app_witnesses_for_tests: self.disable_app_witnesses_for_tests,
                 replay_probe_budget_override: self.replay_probe_budget_override,
                 deferred_peel_limits_override: self.deferred_peel_limits_override,
+                account_devices_supported: self.account_devices_supported,
                 #[cfg(test)]
                 welcome_wrap_refusal: self.welcome_wrap_refusal.as_ref(),
             },
@@ -2361,6 +2385,66 @@ impl HarnessClient {
             }
             other => Err(EngineError::Backend(format!(
                 "expected GroupEvolution from update_admin_policy, got {}",
+                send_result_kind(&other)
+            ))),
+        }
+    }
+
+    /// Switch the build this client runs to one that does or does not
+    /// advertise `marmot.group.account-devices.v1`. It takes effect when the
+    /// engine is next built, so callers restart the client.
+    pub fn set_account_devices_supported(&mut self, supported: bool) {
+        self.account_devices_supported = supported;
+    }
+
+    /// Stage the Commit that adds `marmot.group.account-devices.v1` to the
+    /// default group's required app components.
+    pub async fn try_require_account_devices(&mut self) -> Result<PendingStateRef, EngineError> {
+        let result = self.require_account_devices_inner().await;
+        self.release_unconsumed_scenario_input_on_err(result)
+    }
+
+    async fn require_account_devices_inner(&mut self) -> Result<PendingStateRef, EngineError> {
+        let gid = self
+            .default_group
+            .clone()
+            .ok_or_else(Self::missing_default_group)?;
+        let mut required = self
+            .engine()
+            .group_record(&gid)?
+            .required_capabilities
+            .app_components;
+        required.insert(ACCOUNT_DEVICES_COMPONENT_ID);
+        let res = self
+            .engine_mut()
+            .send(SendIntent::UpdateAppComponents {
+                group_id: gid.clone(),
+                updates: vec![AppComponentData {
+                    component_id: APP_COMPONENTS_COMPONENT_ID,
+                    data: encode_components_list(&required.ids),
+                }],
+            })
+            .await?;
+        match res {
+            SendResult::GroupEvolution {
+                msg,
+                welcomes,
+                pending,
+            } => {
+                if !welcomes.is_empty() {
+                    return Err(EngineError::Backend(
+                        "account-devices activation should not create welcomes".into(),
+                    ));
+                }
+                let routed = route(msg, &gid);
+                self.remember_pending_publication(pending, std::iter::once(routed.id.clone()));
+                self.remember_pending_confirmation(pending, std::iter::once(routed.id.clone()));
+                self.publish_commit_scenario_input(&routed, pending).await;
+                self.bus.send(self.bus_id, routed);
+                Ok(pending)
+            }
+            other => Err(EngineError::Backend(format!(
+                "expected GroupEvolution from account-devices activation, got {}",
                 send_result_kind(&other)
             ))),
         }

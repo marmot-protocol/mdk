@@ -63,6 +63,8 @@ pub enum SubjectCapability {
     RetainedRelayHistory,
     RetainedRelayControl,
     RetainedRelayConfiguration,
+    /// Per-client `marmot.group.account-devices.v1` support and activation.
+    AccountDevices,
 }
 
 impl SubjectCapability {
@@ -95,6 +97,7 @@ impl SubjectCapability {
             Self::RetainedRelayHistory => "retained_relay_history",
             Self::RetainedRelayControl => "retained_relay_control",
             Self::RetainedRelayConfiguration => "retained_relay_configuration",
+            Self::AccountDevices => "account_devices",
         }
     }
 
@@ -220,6 +223,16 @@ pub struct SubjectUpdateGroupData<'a> {
     pub pending: &'a str,
 }
 
+/// Stage the Commit that makes the group require
+/// `marmot.group.account-devices.v1`.
+#[derive(Clone, Copy, Debug)]
+pub struct SubjectRequireAccountDevices<'a> {
+    /// Unset for an expected refusal, which produces no protocol input.
+    pub action_id: Option<&'a str>,
+    pub client: &'a str,
+    pub pending: Option<&'a str>,
+}
+
 pub struct SubjectUpdateAdminPolicy<'a> {
     /// Stable input id for operations expected to produce protocol input.
     /// Expected validation failures leave this unset because no input should
@@ -339,6 +352,23 @@ pub trait ConvergenceSubject: Send {
         _action: SubjectUpdateAdminPolicy<'_>,
     ) -> Result<(), SubjectError> {
         Err(SubjectError::unsupported(SubjectCapability::GroupMutation))
+    }
+
+    /// Restart `client` on a build that does or does not advertise
+    /// `marmot.group.account-devices.v1`.
+    fn set_account_devices_support(
+        &mut self,
+        _client: &str,
+        _supported: bool,
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(SubjectCapability::AccountDevices))
+    }
+
+    async fn require_account_devices(
+        &mut self,
+        _action: SubjectRequireAccountDevices<'_>,
+    ) -> Result<(), SubjectError> {
+        Err(SubjectError::unsupported(SubjectCapability::AccountDevices))
     }
 
     async fn send_application(
@@ -711,6 +741,20 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             capabilities.push(SubjectCapability::OutboundPublication);
         }
         capabilities
+    } else if matches!(step, ScenarioStep::SetAccountDevicesSupport { .. }) {
+        vec![
+            SubjectCapability::AccountDevices,
+            SubjectCapability::CrashReopen,
+        ]
+    } else if matches!(
+        step,
+        ScenarioStep::RequireAccountDevices { .. }
+            | ScenarioStep::ExpectRequireAccountDevicesError { .. }
+    ) {
+        vec![
+            SubjectCapability::AccountDevices,
+            SubjectCapability::GroupMutation,
+        ]
     } else if matches!(step, ScenarioStep::ExpectTickError { .. }) {
         vec![
             SubjectCapability::TransportDelivery,
@@ -772,6 +816,11 @@ pub fn required_capabilities(step: &ScenarioStep) -> Vec<SubjectCapability> {
             ScenarioStep::Assert { .. } => unreachable!("handled above"),
             ScenarioStep::AwaitQuiescence { .. } => unreachable!("handled above"),
             ScenarioStep::ExpectTickError { .. } => unreachable!("handled above"),
+            ScenarioStep::SetAccountDevicesSupport { .. }
+            | ScenarioStep::RequireAccountDevices { .. }
+            | ScenarioStep::ExpectRequireAccountDevicesError { .. } => {
+                unreachable!("handled above")
+            }
             ScenarioStep::InGroup { .. } => unreachable!("handled above"),
         }]
     }
@@ -1026,6 +1075,7 @@ impl EngineHarnessSubject {
             SubjectCapability::AssertionEvaluation,
             SubjectCapability::ClientStateAssertion,
             SubjectCapability::MultiGroup,
+            SubjectCapability::AccountDevices,
         ]);
         Ok(Self {
             descriptor: SubjectDescriptor {
@@ -1649,6 +1699,34 @@ impl ConvergenceSubject for EngineHarnessSubject {
         }
         let pending_ref = client
             .update_admin_policy(admin_ids)
+            .await
+            .map_err(subject_engine_error)?;
+        if let Some(pending) = action.pending {
+            self.insert_pending(pending, action.client, pending_ref)?;
+        }
+        Ok(())
+    }
+
+    fn set_account_devices_support(
+        &mut self,
+        client: &str,
+        supported: bool,
+    ) -> Result<(), SubjectError> {
+        self.client_mut(client)?
+            .set_account_devices_supported(supported);
+        ConvergenceSubject::restart(self, client)
+    }
+
+    async fn require_account_devices(
+        &mut self,
+        action: SubjectRequireAccountDevices<'_>,
+    ) -> Result<(), SubjectError> {
+        let client = self.client_mut(action.client)?;
+        if let Some(action_id) = action.action_id {
+            client.name_next_scenario_input(action_id);
+        }
+        let pending_ref = client
+            .try_require_account_devices()
             .await
             .map_err(subject_engine_error)?;
         if let Some(pending) = action.pending {
