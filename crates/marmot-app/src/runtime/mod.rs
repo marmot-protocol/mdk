@@ -4139,7 +4139,8 @@ impl MarmotAppRuntime {
     ///   persist a remote-deletion retry queue.
     /// - The KeyPackage step runs **before** the worker teardown, inside the
     ///   account worker, so it is ordered with KeyPackage maintenance and the
-    ///   worker publishes nothing into the slot after it.
+    ///   worker publishes nothing into the slot after it. An account already
+    ///   signed out has no worker; its session opens for the step alone.
     /// - The account ref stays valid after this returns (unlike a wipe).
     /// - Every account that can sign — local or external-signer — can sign
     ///   out. Only tracked-only (npub) accounts are rejected.

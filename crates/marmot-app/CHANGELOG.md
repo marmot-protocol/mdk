@@ -113,9 +113,10 @@
 - Sign-out and wipe delete only this device's KeyPackage slot (mdk#1697,
   mdk#2628). They used to delete every KeyPackage event of the account found
   on its relays, which took the account's other devices' KeyPackages with
-  them. The account worker now sends one kind 5 naming the slot (an `a` tag
+  them. The device now sends one kind 5 naming the slot (an `a` tag
   `30443:<account>:<slot>` and a `k` tag `30443`) to the relays the slot was
-  published to, and publishes nothing into it afterwards. `key_packages_deleted`
+  published to, and publishes nothing into it afterwards; wiping an account
+  that is already signed out sends it too. `key_packages_deleted`
   on `SignOutOutcome` and `WipeOutcome` is `1` when a relay accepted the
   deletion, otherwise `0`. A deletion no relay accepted is reported in
   `key_package_failures` and leaves the slot as it was. A device that runs

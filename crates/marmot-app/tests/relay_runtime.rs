@@ -12275,6 +12275,70 @@ async fn app_runtime_sign_out_skips_key_package_deletion_when_disabled() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wiping_a_signed_out_account_deletes_its_key_package_slot() {
+    // A signed-out account runs no worker; wiping it still deletes the slot
+    // it left published before its private material goes.
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        },
+    )
+    .await;
+    let account_id = created.account.account_id_hex;
+    let slot = runtime
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .stable_slot_id;
+    runtime
+        .sign_out(
+            &account_id,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        relay_events_of(&url, &account_id, Kind::Custom(30443))
+            .await
+            .iter()
+            .filter_map(slot_of)
+            .collect::<Vec<_>>(),
+        vec![slot.clone()]
+    );
+
+    let outcome = runtime.sign_out_and_wipe(&account_id).await.unwrap();
+
+    assert_eq!(outcome.key_packages_deleted, 1);
+    assert!(outcome.key_package_failures.is_empty());
+    assert!(outcome.local_cleanup.completed);
+    let deletions = relay_events_of(&url, &account_id, Kind::EventDeletion).await;
+    assert_eq!(deletions.len(), 1);
+    assert_eq!(
+        event_tags(&deletions[0]),
+        vec![
+            vec!["a".to_owned(), format!("30443:{account_id}:{slot}")],
+            vec!["k".to_owned(), "30443".to_owned()],
+        ]
+    );
+    assert!(
+        relay_events_of(&url, &account_id, Kind::Custom(30443))
+            .await
+            .is_empty()
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_runtime_sign_out_rejects_unknown_account() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, _url) = mock_app(&dir).await;
