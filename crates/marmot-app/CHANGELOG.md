@@ -133,6 +133,11 @@
 - `marmot_app::product_analytics::configure_product_analytics_from_environment`
   no longer resolves (mdk#2627). Hosts call the same function as
   `marmot_app::configure_product_analytics_from_environment`, as before.
+- Collector clients (relay-telemetry export, product analytics, the audit
+  upload and `AuditOtlpSender`) take the process SOCKS5 policy from the first
+  `MarmotApp` the process builds (mdk#2627). Before one exists they build no
+  HTTP client, so an `AuditOtlpSender::send` made that early returns
+  `Unknown` without dialing. Every send through a runtime is unchanged.
 
 ### Fixed
 

@@ -4,16 +4,48 @@
 use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
+    sync::OnceLock,
     time::Duration,
 };
 
 use cgka_traits::app_components::{is_loopback_ip, reject_non_public_ip};
 use url::{Host, Url};
 
-use crate::config::{endpoint_host_is_loopback, parse_relay_telemetry_endpoint};
+use crate::export_config::{endpoint_host_is_loopback, parse_relay_telemetry_endpoint};
 
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Applies the process network proxy policy to an HTTP client builder.
+pub(crate) type HttpClientBuilder =
+    fn(reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder, &'static str>;
+
+/// The process SOCKS5 policy every collector client is built through. `marmot-app` hands in
+/// its one builder when it builds a `MarmotApp`. Until then no collector client is built, so
+/// nothing dials.
+static HTTP_BUILDER: OnceLock<HttpClientBuilder> = OnceLock::new();
+
+/// Hands in the process proxy policy. Only the first call takes effect.
+pub(crate) fn hand_in_http_builder(builder: HttpClientBuilder) {
+    let _ = HTTP_BUILDER.set(builder);
+}
+
+#[cfg(not(test))]
+fn http_builder() -> Option<HttpClientBuilder> {
+    HTTP_BUILDER.get().copied()
+}
+
+/// Unit tests build collectors without a `MarmotApp`, so they fall back to the builder it hands
+/// in.
+#[cfg(test)]
+fn http_builder() -> Option<HttpClientBuilder> {
+    Some(
+        HTTP_BUILDER
+            .get()
+            .copied()
+            .unwrap_or(crate::network_proxy::http_builder),
+    )
+}
 
 /// Context-free failure from collector resolution or client construction.
 ///
@@ -48,7 +80,8 @@ impl PinnedCollector {
         &self,
         builder: reqwest::ClientBuilder,
     ) -> Result<reqwest::Client, CollectorRequestError> {
-        crate::network_proxy::http_builder(builder)
+        let http_builder = http_builder().ok_or(CollectorRequestError)?;
+        http_builder(builder)
             .map_err(|_| CollectorRequestError)?
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)

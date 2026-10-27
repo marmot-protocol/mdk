@@ -91,6 +91,7 @@ mod chat_presentation;
 mod client;
 mod config;
 mod deployment;
+mod export_config;
 pub use deployment::{
     KeyPackageClientPreference, MarmotDeployment, NEUTRAL_KEYCHAIN_SERVICE_NAME,
     OpenRankingProvider,
@@ -227,9 +228,7 @@ pub use client::AppClient;
 pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
     AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
-    AuditLogUploadSource, CursorPersistence, MarmotAppConfig, MarmotServiceEndpoints,
-    RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
-    RelayTelemetrySettings,
+    CursorPersistence, MarmotAppConfig, MarmotServiceEndpoints, RelayTelemetrySettings,
 };
 pub use drafts::{
     ChatListDraftVersion, MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary,
@@ -238,6 +237,10 @@ pub use drafts::{
 };
 pub use error::{
     AccountCatchUpFailure, AppError, FullHistoryRepairIncompleteReason, MissingKeyPackageReason,
+};
+pub use export_config::{
+    AuditLogUploadSource, RelayTelemetryExportConfig, RelayTelemetryResource,
+    RelayTelemetryRuntimeConfig,
 };
 pub use groups::{
     AppAgentTextStreamComponent, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandFailureReason,
@@ -1479,7 +1482,7 @@ impl MarmotApp {
         Ok(self
             .relay_telemetry_settings()?
             .export_config_with_runtime_and_endpoints(
-                config::RelayTelemetryRuntimeConfig::default(),
+                export_config::RelayTelemetryRuntimeConfig::default(),
                 self.service_endpoints(),
             ))
     }
@@ -1588,6 +1591,7 @@ impl MarmotApp {
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,
         );
+        collector_host_safety::hand_in_http_builder(network_proxy::http_builder);
         let product_analytics = ProductAnalytics::default();
         product_analytics.silence(
             config.usage_diagnostics_silent
@@ -1685,6 +1689,7 @@ impl MarmotApp {
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,
         );
+        collector_host_safety::hand_in_http_builder(network_proxy::http_builder);
         let product_analytics = ProductAnalytics::default();
         product_analytics.silence(
             config.usage_diagnostics_silent

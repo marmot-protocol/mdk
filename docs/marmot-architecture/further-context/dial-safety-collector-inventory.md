@@ -1,7 +1,7 @@
 ---
 title: "Dial Safety Collector Inventory"
 created: 2026-09-15
-updated: 2026-10-09
+updated: 2026-10-27
 tags: [marmot, security, network, ssrf, collector, audit]
 status: current-implementation
 ---
@@ -18,7 +18,7 @@ workspace HTTP client has been audited.
 `crates/marmot-app/src/collector_host_safety.rs` is the default-build chokepoint for
 OTLP export, product analytics, and forensic audit-log POST uploads.
 
-- Parse the configured URL with `config::parse_relay_telemetry_endpoint` before DNS.
+- Parse the configured URL with `export_config::parse_relay_telemetry_endpoint` before DNS.
   Reject missing hosts, unusable ports, userinfo, fragments, unsupported schemes, and
   nonlocal HTTP.
 - Preserve the configured hostname, port, path, and query. Never rewrite the URL to a
