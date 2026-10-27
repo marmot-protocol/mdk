@@ -705,6 +705,10 @@ pub(crate) enum AccountWorkerCommand {
         registration: PushRegistration,
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
+    GroupPushDebugInfo {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<crate::GroupPushDebugInfo, AppError>>,
+    },
     RetryPushRegistration {
         respond: oneshot::Sender<bool>,
     },
@@ -772,6 +776,7 @@ impl AccountWorkerCommand {
                 | Self::GroupRecoveryStatus { .. }
                 | Self::HistoryNotices { .. }
                 | Self::GroupCommitDelivery { .. }
+                | Self::GroupPushDebugInfo { .. }
         )
     }
 
@@ -4029,6 +4034,10 @@ async fn handle_startup_hydration_command(
         AccountWorkerCommand::GroupRoster { group_id, respond } => {
             let _ = respond.send(group_roster_after_hydration(client, &group_id));
         }
+        AccountWorkerCommand::GroupPushDebugInfo { group_id, respond } => {
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
+            let _ = respond.send(client.group_push_debug_info(&group_id));
+        }
         AccountWorkerCommand::QuarantinedGroups { respond } => {
             let _ = respond.send(Ok(client.quarantined_groups()));
         }
@@ -6416,6 +6425,14 @@ fn account_worker_command_future<'a>(
             respond,
         } => Box::pin(async move {
             let result = client.remove_push_registration(registration).await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::GroupPushDebugInfo { group_id, respond } => Box::pin(async move {
+            // See the Members arm: on-demand promotion for pipeline-abort
+            // leftovers.
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
+            let result = client.group_push_debug_info(&group_id);
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),

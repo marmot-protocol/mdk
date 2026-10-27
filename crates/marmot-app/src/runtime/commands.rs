@@ -1655,19 +1655,13 @@ impl AccountManager {
         let command = self.worker_commands(&account.account_id_hex).await?;
         let (respond, response) = oneshot::channel();
         command
-            .send(AccountWorkerCommand::Members {
+            .send(AccountWorkerCommand::GroupPushDebugInfo {
                 group_id: group_id.clone(),
                 respond,
             })
             .await
             .map_err(|_| AppError::TransportClosed)?;
-        let members = account_worker_response(response)
-            .await?
-            .into_iter()
-            .map(|member| member.member_id_hex)
-            .collect::<Vec<_>>();
-        self.app
-            .group_push_debug_info(&account.label, &hex::encode(group_id.as_slice()), &members)
+        account_worker_response(response).await
     }
 
     pub(crate) async fn send_app_event(

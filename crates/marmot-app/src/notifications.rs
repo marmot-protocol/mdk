@@ -350,6 +350,8 @@ pub struct LocalPushRegistrationDebug {
     pub shareable: bool,
     pub local_notifications_enabled: bool,
     pub native_push_enabled: bool,
+    /// This device's own leaf in the group, or `None` while it holds no
+    /// active leaf (for example after its removal).
     pub local_leaf_index: Option<u32>,
     pub local_token_cached: bool,
 }
@@ -362,7 +364,9 @@ pub struct GroupPushTokenDebugEntry {
     pub token_fingerprint: String,
     pub server_pubkey_hex: String,
     pub has_relay_hint: bool,
+    /// The record's member holds at least one leaf in the group's current tree.
     pub active_leaf: bool,
+    /// The member still holds the record's leaf. Only these records are active.
     pub member_matches_active_leaf: bool,
     pub is_local_member: bool,
     pub updated_at_ms: i64,
@@ -371,7 +375,10 @@ pub struct GroupPushTokenDebugEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupPushDebugInfo {
     pub total_token_count: u32,
+    /// Records whose member still holds the record's leaf.
     pub active_token_count: u32,
+    /// Records whose member no longer holds the record's leaf: it is blank or
+    /// another member's.
     pub stale_token_count: u32,
     pub missing_relay_hint_count: u32,
     pub last_token_list_updated_at_ms: Option<i64>,
@@ -2243,19 +2250,26 @@ pub(crate) fn dedupe_notification_updates(
     out
 }
 
+/// Check each stored token record against the group's canonical
+/// `(member_id_hex, leaf_index)` roster, the one push-token leaf
+/// reconciliation uses. `local_leaf_index` is this device's own leaf; a
+/// member's sibling leaves share its member id, so it is not derived here.
 pub(crate) fn group_debug_info(
     settings: NotificationSettings,
     registration: Option<StoredPushRegistration>,
     tokens: Vec<GroupPushTokenRecord>,
     local_account_id_hex: &str,
-    active_members: &[String],
+    member_leaves: &[(String, u32)],
+    local_leaf_index: Option<u32>,
 ) -> GroupPushDebugInfo {
-    let active_by_member = active_members
+    let active_leaves = member_leaves
         .iter()
-        .enumerate()
-        .map(|(index, member)| (member.clone(), index as u32))
-        .collect::<BTreeMap<_, _>>();
-    let local_leaf_index = active_by_member.get(local_account_id_hex).copied();
+        .map(|(member, leaf_index)| (member.as_str(), *leaf_index))
+        .collect::<HashSet<_>>();
+    let active_members = member_leaves
+        .iter()
+        .map(|(member, _)| member.as_str())
+        .collect::<HashSet<_>>();
     let local_token_cached = registration.is_some();
     let mut latest = None;
     let mut active_count = 0_u32;
@@ -2268,11 +2282,10 @@ pub(crate) fn group_debug_info(
         if token.relay_hint.is_none() {
             missing_relay_hint_count += 1;
         }
-        let active_leaf = active_by_member.contains_key(&token.member_id_hex);
-        let member_matches_active_leaf = active_by_member
-            .get(&token.member_id_hex)
-            .is_some_and(|leaf_index| *leaf_index == token.leaf_index);
-        if active_leaf && member_matches_active_leaf {
+        let active_leaf = active_members.contains(token.member_id_hex.as_str());
+        let member_matches_active_leaf =
+            active_leaves.contains(&(token.member_id_hex.as_str(), token.leaf_index));
+        if member_matches_active_leaf {
             active_count += 1;
         }
         entries.push(GroupPushTokenDebugEntry {

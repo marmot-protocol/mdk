@@ -68,6 +68,15 @@
   group again, once per group however many members the batch adds, and a
   member that was offline shares after catching up. Storage migration 0117
   repairs existing groups once.
+- Push debug info checks each token record against the group's real leaves
+  (mdk#2622). It took a member's position in member order as its leaf, so
+  after a removal blanked a leaf, or for a member with sibling device leaves,
+  active records counted as stale and `local_leaf_index` reported a position.
+  A record is now active when its member still holds its leaf, and
+  `local_leaf_index` is the device's own leaf. Notification triggers never
+  read this view. `MarmotApp::group_push_debug_info` is now crate-private;
+  hosts read the view through `MarmotAppRuntime::group_push_debug_info` or the
+  bindings, whose fields keep their shape.
 
 - The OpenMLS RustCrypto provider moves to the elliptic-curve 0.14 crates
   (crypto-bigint 0.7.6) and HPKE 0.8, fixing RUSTSEC-2026-0387. MDK's single

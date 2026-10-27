@@ -187,6 +187,125 @@ fn token_records_by_server_excludes_local_sibling_leaves() {
     assert_eq!(selected_leaves(&grouped), vec![(bob, 1)]);
 }
 
+fn debug_info_for(
+    tokens: Vec<GroupPushTokenRecord>,
+    local: &str,
+    member_leaves: &[(&String, u32)],
+    local_leaf_index: Option<u32>,
+) -> GroupPushDebugInfo {
+    let member_leaves = member_leaves
+        .iter()
+        .map(|(member, leaf_index)| ((*member).clone(), *leaf_index))
+        .collect::<Vec<_>>();
+    group_debug_info(
+        NotificationSettings {
+            account_ref: "local".to_owned(),
+            account_id_hex: local.to_owned(),
+            local_notifications_enabled: true,
+            native_push_enabled: true,
+        },
+        None,
+        tokens,
+        local,
+        &member_leaves,
+        local_leaf_index,
+    )
+}
+
+/// `(member, leaf, active_leaf, member_matches_active_leaf)` per entry.
+fn debug_leaf_states(info: &GroupPushDebugInfo) -> Vec<(String, u32, bool, bool)> {
+    let mut states = info
+        .tokens
+        .iter()
+        .map(|entry| {
+            (
+                entry.member_id_hex.clone(),
+                entry.leaf_index,
+                entry.active_leaf,
+                entry.member_matches_active_leaf,
+            )
+        })
+        .collect::<Vec<_>>();
+    states.sort();
+    states
+}
+
+#[test]
+fn group_debug_info_matches_records_past_a_blank_leaf() {
+    let alice = "aa".repeat(32);
+    let bob = "bb".repeat(32);
+    let carol = "cc".repeat(32);
+    // Bob's removal blanked leaf 1, so Carol is second in member order but
+    // still holds leaf 2.
+    let info = debug_info_for(
+        vec![
+            device_token_record(&alice, 0, b"alice", 1),
+            device_token_record(&bob, 1, b"bob", 1),
+            device_token_record(&carol, 2, b"carol", 1),
+        ],
+        &carol,
+        &[(&alice, 0), (&carol, 2)],
+        Some(2),
+    );
+    assert_eq!(
+        debug_leaf_states(&info),
+        vec![
+            (alice, 0, true, true),
+            (bob, 1, false, false),
+            (carol, 2, true, true),
+        ]
+    );
+    assert_eq!(
+        (
+            info.total_token_count,
+            info.active_token_count,
+            info.stale_token_count
+        ),
+        (3, 2, 1)
+    );
+    assert_eq!(info.local_registration.local_leaf_index, Some(2));
+}
+
+#[test]
+fn group_debug_info_counts_each_sibling_leaf_and_old_leaves_as_stale() {
+    let local = "dd".repeat(32);
+    let bob = "bb".repeat(32);
+    // Bob's devices hold leaves 1 and 3; his record on leaf 2 is from a device
+    // that left. Leaf 2 now holds the local device's sibling.
+    let info = debug_info_for(
+        vec![
+            device_token_record(&bob, 1, b"bob-phone", 1),
+            device_token_record(&bob, 2, b"bob-old-phone", 1),
+            device_token_record(&bob, 3, b"bob-tablet", 1),
+            device_token_record(&bob, 5, b"bob-older-phone", 1),
+            device_token_record(&local, 4, b"local-tablet", 1),
+        ],
+        &local,
+        &[(&local, 0), (&bob, 1), (&local, 2), (&bob, 3), (&local, 4)],
+        Some(4),
+    );
+    assert_eq!(
+        debug_leaf_states(&info),
+        vec![
+            (bob.clone(), 1, true, true),
+            (bob.clone(), 2, true, false),
+            (bob.clone(), 3, true, true),
+            (bob, 5, true, false),
+            (local, 4, true, true),
+        ]
+    );
+    assert_eq!(
+        (
+            info.total_token_count,
+            info.active_token_count,
+            info.stale_token_count
+        ),
+        (5, 3, 2)
+    );
+    // The local account holds three leaves; the device's own is reported.
+    assert_eq!(info.local_registration.local_leaf_index, Some(4));
+}
+
 #[test]
 fn apns_token_encryption_uses_platform_byte_0x01() {
     let secret = server_secret();
