@@ -19,7 +19,8 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
 `marmot_session::Item` path. Source is split into focused modules:
 
 - `session.rs` — `SessionConfig`, `AccountDeviceSession`, `SessionEffects` / `PublishWork`, `SessionError`, and the
-  engine items the session's API exposes, re-exported under their engine names.
+  engine items the session's API exposes, re-exported under their engine names. The module is private, and the root
+  re-exports `AccountDeviceSession` and `IngestEffects` only under `test-support`.
 - `error.rs` — `AccountError` and the `AccountResult` alias.
   `AccountError::as_engine_error` finds the engine error whether the runtime met it directly or through the session;
   ask it instead of matching `Engine(..)` or `Session(..)`.
@@ -73,6 +74,11 @@ the session's `tests/session_lifecycle.rs`, `tests/nostr_stack.rs` and `tests/no
 - Treat `KeyPackagePublisher` as provisional. The likely production direction is to move KeyPackage publication into the
   transport adapter family rather than keeping it as a separate app-core-owned publisher.
 - Keep `AccountDeviceSession` as the owner of engine state.
+- Keep the session private (mdk#2602). The root re-exports `AccountDeviceSession`, and any session type that only the
+  session's own API hands out, only under `test-support`; a session type the runtime's public API, the facade or
+  `marmot-app`'s production build names stays public. A session method the normal build never calls is deleted, unless
+  tests call it through the re-export: then it keeps `#[cfg_attr(not(feature = "test-support"), allow(dead_code))]`
+  on the method itself.
 - Keep `AccountDeviceRuntime` the only production way to the session (mdk#2602). Hosts open it with
   `AccountDeviceRuntime::open`, which opens the session before it builds the host's transport. A session method a host
   needs becomes a runtime forward with the session's exact signature: same return type, error type and generics.

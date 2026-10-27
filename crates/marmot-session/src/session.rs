@@ -552,16 +552,6 @@ impl AccountDeviceSession {
         })
     }
 
-    /// Forward the host's post-commit storage wakeup to the actual engine
-    /// connection. Projection policy and subscription ownership stay in the host.
-    #[doc(hidden)]
-    pub fn set_message_draft_commit_observer(
-        &self,
-        observer: storage_sqlite::MessageDraftCommitObserver,
-    ) {
-        self.storage.set_message_draft_commit_observer(observer);
-    }
-
     /// Stage timings captured by [`Self::open`]; durations and aggregate
     /// counts only, safe for fixed-bucket telemetry.
     pub fn open_timings(&self) -> &SessionOpenTimings {
@@ -575,6 +565,7 @@ impl AccountDeviceSession {
     /// of [`Self::open`]: migration 47 preserves legacy rows so a large
     /// account's payload decoding does not extend the account-open critical
     /// path. The result contains aggregate counts only.
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub fn promote_legacy_message_rows(
         &self,
         limit: usize,
@@ -582,6 +573,7 @@ impl AccountDeviceSession {
         Ok(self.storage.promote_legacy_message_rows(limit)?)
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
         tracing::debug!(
             target: TRACE_TARGET,
@@ -606,29 +598,6 @@ impl AccountDeviceSession {
         key_package: &KeyPackage,
     ) -> Result<cgka_engine::KeyPackageMetadata, EngineError> {
         cgka_engine::key_package_metadata(key_package)
-    }
-
-    /// Delete a previously generated KeyPackage bundle from storage.
-    ///
-    /// Used by the account orchestration layer to prune the private bundle
-    /// persisted by `fresh_key_package` when publication fails, so a retrying
-    /// app does not accumulate orphaned private key material (mdk#160).
-    pub async fn delete_key_package(
-        &mut self,
-        key_package: &KeyPackage,
-    ) -> Result<(), EngineError> {
-        tracing::debug!(
-            target: TRACE_TARGET,
-            method = "delete_key_package",
-            "deleting key package bundle"
-        );
-        self.engine.delete_key_package(key_package).await?;
-        tracing::debug!(
-            target: TRACE_TARGET,
-            method = "delete_key_package",
-            "key package bundle deleted"
-        );
-        Ok(())
     }
 
     pub fn key_package_lifecycle(&self) -> SessionResult<Option<KeyPackageLifecycleState>> {
@@ -700,6 +669,7 @@ impl AccountDeviceSession {
             .list_maintenance_obligations_for_group(group_id)?)
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub fn delete_maintenance_obligation(&self, id: &MessageId) -> SessionResult<()> {
         Ok(self.storage.delete_maintenance_obligation(id)?)
     }
@@ -1041,15 +1011,6 @@ impl AccountDeviceSession {
         Ok(CreateGroupEffects { group_id, effects })
     }
 
-    pub async fn create_group_with_audit_context(
-        &mut self,
-        req: CreateGroupRequest,
-        context: AuditEventContext,
-    ) -> SessionResult<CreateGroupEffects> {
-        self.create_group_with_optional_app_components_and_audit_context(req, Vec::new(), context)
-            .await
-    }
-
     pub async fn create_group_with_optional_app_components_and_audit_context(
         &mut self,
         req: CreateGroupRequest,
@@ -1140,6 +1101,7 @@ impl AccountDeviceSession {
         Ok(self.collect_effects(vec![result]))
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn ingest(&mut self, msg: TransportMessage) -> SessionResult<IngestEffects> {
         tracing::debug!(
             target: TRACE_TARGET,
@@ -1440,6 +1402,7 @@ impl AccountDeviceSession {
         self.collect_effects(vec![])
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub fn epoch(&self, group_id: &GroupId) -> Result<EpochId, EngineError> {
         self.engine.epoch(group_id)
     }
@@ -1566,6 +1529,7 @@ impl AccountDeviceSession {
         self.engine.self_id()
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub fn set_convergence_policy(
         &mut self,
         policy: CanonicalizationPolicy,

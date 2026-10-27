@@ -1,7 +1,8 @@
 # AGENTS.md - crates/marmot-session/tests
 
-Session integration tests exercise the public `AccountDeviceSession` boundary. Keep helper code in `support/` and do
-not reach into engine, storage, adapter, or peeler internals. File coverage is summarized in
+Session integration tests exercise the `AccountDeviceSession` boundary, which the `test-support` feature re-exports
+(this crate enables it for its own tests as a dev-dependency). Keep helper code in `support/` and do not reach into
+engine, storage, adapter, or peeler internals. File coverage is summarized in
 [`../README.md#tests`](../README.md#tests).
 
 ## Runtime tests

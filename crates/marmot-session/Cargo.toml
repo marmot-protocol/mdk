@@ -8,9 +8,10 @@ publish.workspace = true
 [features]
 default = []
 test-policy-overrides = ["cgka-engine/test-policy-overrides"]
-# The session accessors and `AccountDeviceRuntime::new`, for tests that drive
-# the session directly to set up scenarios. Production opens the runtime with
-# `AccountDeviceRuntime::open` and reaches the session only through it.
+# The session type, its accessors and `AccountDeviceRuntime::new`, for tests
+# that drive the session directly to set up scenarios. Production opens the
+# runtime with `AccountDeviceRuntime::open` and reaches the session only
+# through it.
 # Enable only as a dev-dependency.
 test-support = []
 
