@@ -368,6 +368,7 @@ async fn restart_treats_own_account_intents_like_invites_and_removals() {
     let kp = new_sibling_key_package(&mut m.bob, b"bob").await;
     let staged = m.bob.engine.send(add_own_devices(&gid, vec![kp])).await;
     assert!(matches!(staged, Ok(SendResult::GroupEvolution { .. })));
+    assert_eq!(m.bob.engine.members(&gid).unwrap().len(), 5);
     let mut bob = restart(m.bob, b"bob");
     let events = bob.engine.drain_events();
     assert!(
@@ -387,8 +388,10 @@ async fn restart_treats_own_account_intents_like_invites_and_removals() {
         .send(remove_own_devices(&gid, vec![sibling]))
         .await;
     assert!(matches!(staged, Ok(SendResult::GroupEvolution { .. })));
+    assert_eq!(bob.engine.members(&gid).unwrap().len(), 3);
     let bob = restart(bob, b"bob");
     assert!(load_group(&bob, &gid).pending_commit().is_some());
+    assert_eq!(bob.engine.members(&gid).unwrap().len(), 3);
 }
 
 /// Drop `device`'s engine and open a new one on the same storage, hydrating
