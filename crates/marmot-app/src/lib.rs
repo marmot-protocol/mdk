@@ -127,6 +127,8 @@ pub use moderation_reports::{
 mod nostr_secret;
 mod nostr_verification;
 mod notifications;
+#[cfg(test)]
+mod observability_crossings_tests;
 mod profile_publication;
 mod projection;
 mod publisher_sequences;
