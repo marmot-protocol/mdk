@@ -493,9 +493,7 @@ impl Default for RuntimeSharedServices {
             attachment_cancellations: watch::channel(()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
-            observer: crate::observer::Observer::standalone(
-                crate::sqlcipher::sqlcipher_migration_probe_counters,
-            ),
+            observer: crate::observer::Observer::default(),
             product_worker: Arc::new(StdMutex::new(None)),
             diagnostics_executor: Arc::new(StdMutex::new(None)),
             agent_streams: AgentStreamWatchManager::default(),
@@ -592,10 +590,7 @@ impl RuntimeSharedServices {
             attachment_cancellations: watch::channel(()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: app.relay_plane.clone(),
-            observer: crate::observer::Observer::sharing(
-                &app.product_analytics,
-                crate::sqlcipher::sqlcipher_migration_probe_counters,
-            ),
+            observer: crate::observer::Observer::sharing(&app.product_analytics),
             product_worker: Arc::new(StdMutex::new(None)),
             diagnostics_executor: Arc::new(StdMutex::new(None)),
             agent_streams: AgentStreamWatchManager::default(),

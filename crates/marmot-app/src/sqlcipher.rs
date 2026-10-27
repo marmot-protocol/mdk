@@ -78,6 +78,13 @@ pub(crate) fn sqlcipher_migration_probe_counters() -> (u64, u64) {
     )
 }
 
+/// Counts one probe run or skip. The app-performance recorder gets the reader first, so no
+/// snapshot misses a count.
+fn count_sqlcipher_migration_probe(counter: &AtomicU64) {
+    crate::app_telemetry::hand_in_sqlcipher_probe_counters(sqlcipher_migration_probe_counters);
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
 struct SqlcipherV2VerdictCache {
     by_path: HashMap<PathBuf, [u8; SQLCIPHER_SALT_LEN]>,
     insertion_order: VecDeque<PathBuf>,
@@ -237,7 +244,7 @@ impl MarmotApp {
             if !sqlcipher_raw_marker_path(db_path).exists()
                 && sqlcipher_v2_verdict_cached(db_path, &salt)
             {
-                SQLCIPHER_MIGRATION_PROBE_SKIPS.fetch_add(1, Ordering::Relaxed);
+                count_sqlcipher_migration_probe(&SQLCIPHER_MIGRATION_PROBE_SKIPS);
             } else {
                 if !probe_raw_sqlcipher(db_path, &raw_key)? {
                     let passphrase = SqlCipherKey::new(hex::encode(&material))?;
@@ -328,7 +335,7 @@ impl MarmotApp {
                     && !sqlcipher_raw_marker_path(db_path).exists()
                     && sqlcipher_v2_verdict_cached(db_path, &salt)
                 {
-                    SQLCIPHER_MIGRATION_PROBE_SKIPS.fetch_add(1, Ordering::Relaxed);
+                    count_sqlcipher_migration_probe(&SQLCIPHER_MIGRATION_PROBE_SKIPS);
                 } else {
                     let observation = self.product_analytics.begin(
                         crate::ProductFamily::Storage,
@@ -595,7 +602,7 @@ fn probe_raw_sqlcipher(db_path: &Path, key: &SqlCipherKey) -> Result<bool, AppEr
     check_raw_sqlcipher_marker(db_path)?;
     fs_private::ensure_private_db_files(db_path)?;
     let conn = Connection::open(db_path)?;
-    SQLCIPHER_MIGRATION_PROBE_RUNS.fetch_add(1, Ordering::Relaxed);
+    count_sqlcipher_migration_probe(&SQLCIPHER_MIGRATION_PROBE_RUNS);
     #[cfg(test)]
     record_probe_attempt_for_test(db_path);
     Ok(open_hardened_sqlcipher(&conn, key, SqlCipherHardening::cipher_only()).is_ok())
@@ -1141,6 +1148,20 @@ mod tests {
              INSERT INTO marker (value) VALUES ('kept');",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_counted_probe_reaches_every_performance_snapshot() {
+        // The counters are process-global atomics shared with every test in this process, so
+        // compare a fresh recorder's snapshots around one count instead of exact values.
+        let skips = || {
+            crate::AppPerformanceTelemetry::default()
+                .snapshot()
+                .sqlcipher_migration_probe_skips
+        };
+        let before = skips();
+        count_sqlcipher_migration_probe(&SQLCIPHER_MIGRATION_PROBE_SKIPS);
+        assert!(skips() > before);
     }
 
     #[test]

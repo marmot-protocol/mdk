@@ -9,7 +9,7 @@ pub(crate) mod runtime;
 pub use runtime::{RuntimePerformanceOperation, RuntimePerformanceSnapshot};
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -491,13 +491,20 @@ pub struct AppPerformanceSnapshot {
     pub host_foreground_local_ready: AppPerformanceOperationSnapshot,
 }
 
+/// Reads the process-wide SQLCipher migration probe `(runs, skips)` that every snapshot carries.
+/// `marmot-app` hands it in before it counts the first probe, so a snapshot taken before then
+/// reports the zero the counters still hold.
+static SQLCIPHER_PROBE_COUNTERS: OnceLock<fn() -> (u64, u64)> = OnceLock::new();
+
+/// Hands in the SQLCipher migration probe reader. Only the first call takes effect.
+pub(crate) fn hand_in_sqlcipher_probe_counters(read: fn() -> (u64, u64)) {
+    let _ = SQLCIPHER_PROBE_COUNTERS.set(read);
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AppPerformanceTelemetry {
     runtime: runtime::RuntimeTelemetry,
     product: Option<crate::ProductAnalytics>,
-    /// Reads the process-wide SQLCipher migration probe `(runs, skips)` for snapshots. The runtime
-    /// hands it in; a recorder without one reports zero.
-    sqlcipher_probe_counters: Option<fn() -> (u64, u64)>,
     inner: Arc<Mutex<AppPerformanceTelemetryInner>>,
 }
 
@@ -690,12 +697,6 @@ impl AppPerformanceTelemetry {
         Self {
             product: Some(product),
             ..Self::default()
-        }
-    }
-    pub(crate) fn with_sqlcipher_probe_counters(self, read: fn() -> (u64, u64)) -> Self {
-        Self {
-            sqlcipher_probe_counters: Some(read),
-            ..self
         }
     }
     fn record_product(
@@ -1220,7 +1221,7 @@ impl AppPerformanceTelemetry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (sqlcipher_migration_probe_runs, sqlcipher_migration_probe_skips) =
-            self.sqlcipher_probe_counters.map_or((0, 0), |read| read());
+            SQLCIPHER_PROBE_COUNTERS.get().map_or((0, 0), |read| read());
         AppPerformanceSnapshot {
             runtime_operations: self.runtime.snapshot(),
             app_start: inner.app_start.snapshot(),
@@ -1815,8 +1816,7 @@ mod tests {
         // The counters are process-global atomics shared with every test in
         // this process, so bracket the snapshot between two direct reads
         // instead of asserting exact values.
-        let telemetry = AppPerformanceTelemetry::default()
-            .with_sqlcipher_probe_counters(crate::sqlcipher::sqlcipher_migration_probe_counters);
+        let telemetry = AppPerformanceTelemetry::default();
         let before = crate::sqlcipher::sqlcipher_migration_probe_counters();
         let snapshot = telemetry.snapshot();
         let after = crate::sqlcipher::sqlcipher_migration_probe_counters();

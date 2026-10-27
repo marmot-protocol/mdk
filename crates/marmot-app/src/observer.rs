@@ -12,10 +12,7 @@
 
 use crate::{AppPerformanceTelemetry, ProductAnalytics};
 
-/// Every constructor takes the reader for the process-wide SQLCipher migration probe
-/// `(runs, skips)`, which the performance recorder's snapshots carry, so no handle `marmot-app`
-/// builds reports zero for them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Observer {
     product: ProductAnalytics,
     performance: AppPerformanceTelemetry,
@@ -23,24 +20,10 @@ pub(crate) struct Observer {
 
 impl Observer {
     /// A runtime's handle: the app's collector, shared, and a performance recorder of its own.
-    pub(crate) fn sharing(
-        product: &ProductAnalytics,
-        sqlcipher_probe_counters: fn() -> (u64, u64),
-    ) -> Self {
+    pub(crate) fn sharing(product: &ProductAnalytics) -> Self {
         Self {
             product: product.clone(),
-            performance: AppPerformanceTelemetry::with_product_analytics(product.clone())
-                .with_sqlcipher_probe_counters(sqlcipher_probe_counters),
-        }
-    }
-
-    /// A handle for shared services no app built: a collector of its own, which its performance
-    /// recorder does not forward to.
-    pub(crate) fn standalone(sqlcipher_probe_counters: fn() -> (u64, u64)) -> Self {
-        Self {
-            product: ProductAnalytics::default(),
-            performance: AppPerformanceTelemetry::default()
-                .with_sqlcipher_probe_counters(sqlcipher_probe_counters),
+            performance: AppPerformanceTelemetry::with_product_analytics(product.clone()),
         }
     }
 
@@ -52,25 +35,5 @@ impl Observer {
     /// This handle's performance recorder.
     pub(crate) fn performance(&self) -> &AppPerformanceTelemetry {
         &self.performance
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_handle_snapshots_the_probe_counters_it_is_handed() {
-        let probe = |snapshot: crate::AppPerformanceSnapshot| {
-            (
-                snapshot.sqlcipher_migration_probe_runs,
-                snapshot.sqlcipher_migration_probe_skips,
-            )
-        };
-        let shared = Observer::sharing(&ProductAnalytics::default(), || (3, 5));
-        assert_eq!(probe(shared.performance().snapshot()), (3, 5));
-        let standalone = Observer::standalone(|| (7, 11));
-        assert_eq!(probe(standalone.performance().snapshot()), (7, 11));
-        assert_eq!(probe(AppPerformanceTelemetry::default().snapshot()), (0, 0));
     }
 }
