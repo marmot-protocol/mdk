@@ -35,7 +35,6 @@ pub(crate) const TABLE_OWNERS: &[(&str, Side)] = &[
     ("cgka_leave_requests", Side::Protocol),
     ("cgka_maintenance_obligations", Side::Protocol),
     ("cgka_maintenance_settings", Side::Protocol),
-    ("cgka_member_capabilities", Side::Protocol),
     ("cgka_member_validation_cache", Side::Protocol),
     ("cgka_messages", Side::Protocol),
     ("cgka_outbound_fanout", Side::Protocol),

@@ -109,11 +109,10 @@ mod tests {
     use crate::base::test_support::{
         TestGroupState, gid, mid, sample_group, sample_message, sample_queued_intent,
     };
-    use cgka_traits::capabilities::{Capability, GroupCapabilities};
     use cgka_traits::engine::GroupEvent;
     use cgka_traits::storage::{
-        CapabilityStorage, GroupStateCheckpointRef, GroupStorage, MemberValidationCacheStorage,
-        MessageStorage, OutboundIntentStorage, StorageError, StorageProvider,
+        GroupStateCheckpointRef, GroupStorage, MemberValidationCacheStorage, MessageStorage,
+        OutboundIntentStorage, StorageError, StorageProvider,
     };
     use cgka_traits::types::{EpochId, MemberId};
     use openmls_traits::storage::StorageProvider as OpenMlsStorageProvider;
@@ -263,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rollback_restores_group_messages_queue_caps_and_openmls_group_state() {
+    fn snapshot_rollback_restores_group_messages_queue_and_openmls_group_state() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let g0 = sample_group(gid(1), 0, 1);
         store.put_group(&g0).unwrap();
@@ -272,11 +271,6 @@ mod tests {
             .unwrap();
         store
             .put_queued_outbound_intent(&sample_queued_intent(mid(10), g0.id.clone()))
-            .unwrap();
-        let mut caps = GroupCapabilities::default();
-        caps.insert(Capability::Proposal(10));
-        store
-            .save_member_capabilities(&g0.id, &g0.members[0], caps.clone())
             .unwrap();
         let mls_group_id = openmls::group::GroupId::from_slice(g0.id.as_slice());
         store
@@ -328,12 +322,6 @@ mod tests {
         let queued = store.list_queued_outbound_intents(&g0.id).unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].id, mid(10));
-        assert_eq!(
-            store
-                .member_capabilities(&g0.id, &g0.members[0].id)
-                .unwrap(),
-            Some(caps)
-        );
         let state: Option<TestGroupState> = store.mls_storage().group_state(&mls_group_id).unwrap();
         assert_eq!(state, Some(TestGroupState(b"epoch-0".to_vec())));
     }
@@ -586,7 +574,7 @@ mod tests {
                 "record": serde_json::to_value(&anchor_message).unwrap(),
             }],
             "queued_outbound": [],
-            "member_caps": [],
+            "member_caps": [retired_member_caps_row()],
             "convergence_policy": null,
             "validated_tree_marker": null,
             "openmls_values": [],
@@ -641,11 +629,6 @@ mod tests {
             .mls_storage()
             .write_group_state(&mls_group_id, &TestGroupState(b"branch-a".to_vec()))
             .unwrap();
-        let mut branch_a_caps = GroupCapabilities::default();
-        branch_a_caps.insert(Capability::Proposal(10));
-        store
-            .save_member_capabilities(&g1.id, &g1.members[0], branch_a_caps.clone())
-            .unwrap();
         store
             .put_validated_tree_marker(&g1.id, b"branch-a-marker")
             .unwrap();
@@ -682,11 +665,6 @@ mod tests {
             .mls_storage()
             .write_group_state(&mls_group_id, &TestGroupState(b"branch-b".to_vec()))
             .unwrap();
-        let mut branch_b_caps = GroupCapabilities::default();
-        branch_b_caps.insert(Capability::Extension(11));
-        store
-            .save_member_capabilities(&g2.id, &g2.members[0], branch_b_caps)
-            .unwrap();
         store
             .put_validated_tree_marker(&g2.id, b"branch-b-marker")
             .unwrap();
@@ -698,12 +676,6 @@ mod tests {
         assert_eq!(store.get_group(&g1.id).unwrap(), g1);
         let state: Option<TestGroupState> = store.mls_storage().group_state(&mls_group_id).unwrap();
         assert_eq!(state, Some(TestGroupState(b"branch-a".to_vec())));
-        assert_eq!(
-            store
-                .member_capabilities(&g1.id, &g1.members[0].id)
-                .unwrap(),
-            Some(branch_a_caps)
-        );
         assert_eq!(
             store.validated_tree_marker(&g1.id).unwrap(),
             Some(b"branch-a-marker".to_vec())
@@ -743,18 +715,31 @@ mod tests {
         );
     }
 
+    /// A row of the retired member-capability cache, as blobs written before
+    /// its removal carry it.
+    fn retired_member_caps_row() -> serde_json::Value {
+        serde_json::json!({
+            "member_id": [7, 7, 7, 7],
+            "capabilities": {"proposals": [10], "extensions": [], "app_components": {"ids": []}},
+        })
+    }
+
+    fn legacy_json_checkpoint(group: &cgka_traits::group::Group) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "group": serde_json::to_value(group).unwrap(),
+            "member_caps": [retired_member_caps_row()],
+            "validated_tree_marker": null,
+            "openmls_values": [],
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn legacy_json_group_state_checkpoint_remains_restorable() {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let anchor = sample_group(gid(1), 1, 1);
         store.put_group(&anchor).unwrap();
-        let legacy = crate::serialize(&super::rows::GroupStateCheckpoint {
-            group: anchor.clone(),
-            member_caps: Vec::new(),
-            validated_tree_marker: None,
-            openmls_values: Vec::new(),
-        })
-        .unwrap();
+        let legacy = legacy_json_checkpoint(&anchor);
         store
             .lock()
             .unwrap()
@@ -781,13 +766,7 @@ mod tests {
         let store = SqliteAccountStorage::in_memory().unwrap();
         let anchor = sample_group(gid(1), 1, 1);
         store.put_group(&anchor).unwrap();
-        let legacy = crate::serialize(&super::rows::GroupStateCheckpoint {
-            group: anchor.clone(),
-            member_caps: Vec::new(),
-            validated_tree_marker: None,
-            openmls_values: Vec::new(),
-        })
-        .unwrap();
+        let legacy = legacy_json_checkpoint(&anchor);
         store
             .lock()
             .unwrap()

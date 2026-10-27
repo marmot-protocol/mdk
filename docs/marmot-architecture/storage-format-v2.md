@@ -1,7 +1,7 @@
 ---
 title: "Storage Format v2"
 created: 2026-08-13
-updated: 2026-10-22
+updated: 2026-10-27
 tags: [marmot, storage, sqlite, migration, encoding]
 status: current
 ---
@@ -247,7 +247,8 @@ so that path justified a binary format.
 
 Snapshot and group-state checkpoint v2 start with `MDKS` and network-order
 `uint16` version `2`. A full rollback snapshot then contains length-delimited
-group JSON, normalized message rows, queued outbound rows, member capabilities,
+group JSON, normalized message rows, queued outbound rows, a retired
+member-capability list (written empty since migration 0121, skipped on read),
 optional convergence-policy and validation bytes, and raw OpenMLS key/value
 rows. A state-scoped snapshot intentionally marks the message and queue fields
 absent, so restoring it leaves the live message ledger, pending application

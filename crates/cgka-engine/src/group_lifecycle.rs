@@ -546,11 +546,11 @@ impl<S: StorageProvider> Engine<S> {
         //    must exist before `record_sent_message` writes welcome records.
         //
         //    The MLS group is still at epoch 0 pre-merge, but the `members`
-        //    field surfaced via the `CgkaEngine::members` API and walked by
-        //    `feature_status` needs to reflect "who the user thinks is in the
-        //    group" — which includes invitees they just added. On
-        //    `publish_failed` we re-derive from the (still-unmerged) MLS
-        //    state, which naturally rolls the projection back.
+        //    field surfaced via the `CgkaEngine::members` API needs to
+        //    reflect "who the user thinks is in the group" — which includes
+        //    invitees they just added. On `publish_failed` we re-derive from
+        //    the (still-unmerged) MLS state, which naturally rolls the
+        //    projection back.
         let projected_members = projected_members_with_pending(&mls_group, &parsed_kps)?;
         let group_record = Group {
             id: group_id.clone(),
@@ -643,12 +643,12 @@ impl<S: StorageProvider> Engine<S> {
                 self.storage
                     .with_transaction(|storage| -> Result<EpochId, EngineError> {
                         if mls_group.pending_commit().is_some() {
-                            // The capability cache validates every added leaf
-                            // against the persisted group's protocol profile.
-                            // Seed the projected record inside this same
-                            // transaction before inspecting the staged Add;
-                            // it is overwritten with the canonical epoch and
-                            // roster after the merge below.
+                            // The added-leaf check reads the persisted
+                            // group's protocol profile. Seed the projected
+                            // record inside this same transaction before
+                            // inspecting the staged Add; it is overwritten
+                            // with the canonical epoch and roster after the
+                            // merge below.
                             storage.put_group(&group_record)?;
                             {
                                 let staged = mls_group.pending_commit().ok_or_else(|| {
@@ -656,7 +656,7 @@ impl<S: StorageProvider> Engine<S> {
                                         "founding add lost its pending commit".into(),
                                     )
                                 })?;
-                                crate::capability_manager::cache_from_staged_commit(
+                                crate::capability_manager::check_added_leaf_profiles(
                                     storage, &group_id, staged,
                                 )?;
                             }
@@ -698,14 +698,12 @@ impl<S: StorageProvider> Engine<S> {
                                 deferred_peel: None,
                             })?;
                         }
-                        crate::capability_manager::cache_from_key_packages(
+                        crate::capability_manager::check_key_package_profiles(
                             storage,
                             &group_id,
                             &parsed_kps,
                         )?;
-                        crate::capability_manager::cache_self_capabilities(
-                            storage,
-                            &group_id,
+                        crate::capability_manager::check_own_leaf(
                             &mls_group,
                             self.identity.self_id(),
                             self.ciphersuite,
@@ -773,10 +771,12 @@ impl<S: StorageProvider> Engine<S> {
             return Ok((group_id, SendResult::FoundingGroupCreated { welcomes }));
         }
 
-        crate::capability_manager::cache_from_key_packages(&self.storage, &group_id, &parsed_kps)?;
-        crate::capability_manager::cache_self_capabilities(
+        crate::capability_manager::check_key_package_profiles(
             &self.storage,
             &group_id,
+            &parsed_kps,
+        )?;
+        crate::capability_manager::check_own_leaf(
             &mls_group,
             self.identity.self_id(),
             self.ciphersuite,
@@ -1477,9 +1477,7 @@ impl<S: StorageProvider> Engine<S> {
                         },
                     )?;
             }
-            crate::capability_manager::cache_self_capabilities(
-                storage,
-                &group_id,
+            crate::capability_manager::check_own_leaf(
                 &mls_group,
                 self.identity.self_id(),
                 self.ciphersuite,
@@ -1868,10 +1866,11 @@ pub(crate) fn welcome_metadata_for_key_package(
 
 /// Build the projected post-merge member list: existing MLS members + each
 /// invitee whose KeyPackage is being added by the staged commit. Used by
-/// the send paths so `members()` and `feature_status` reflect the user's
-/// intended state during `PendingPublish`. On rollback, the engine simply
-/// calls `marmot_members(&mls_group)` against the still-unmerged group to
-/// discard the projection.
+/// the send paths so `members()` reflects the user's intended state during
+/// `PendingPublish`; `feature_status` counts the same added leaves from the
+/// pending commit. On rollback, the engine simply calls
+/// `marmot_members(&mls_group)` against the still-unmerged group to discard
+/// the projection.
 pub(crate) fn projected_members_with_pending(
     group: &MlsGroup,
     invitees: &[openmls::prelude::KeyPackage],

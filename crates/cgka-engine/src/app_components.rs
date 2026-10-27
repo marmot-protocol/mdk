@@ -1382,7 +1382,9 @@ pub(crate) fn ratchet_tree_nodes(
         .map_err(|error| EngineError::Backend(format!("decode ratchet tree: {error}")))
 }
 
-fn ratchet_tree_leaves(tree: openmls::treesync::RatchetTree) -> Result<Vec<LeafNode>, EngineError> {
+pub(crate) fn ratchet_tree_leaves(
+    tree: openmls::treesync::RatchetTree,
+) -> Result<Vec<LeafNode>, EngineError> {
     Ok(ratchet_tree_nodes(tree)?
         .into_iter()
         .filter_map(|node| match node {
@@ -1400,8 +1402,8 @@ pub(crate) fn lifecycle_support_blockers(group: &MlsGroup) -> Result<Vec<MemberI
 
 /// Deduplicated account identifiers for current leaves that do not advertise
 /// `component_id`. An empty result means the group is eligible to require it.
-/// The tree walk is leaf-precise, so sibling devices cannot be hidden by the
-/// account-keyed capability cache.
+/// The tree walk is leaf-precise, so one device's support never stands in for
+/// a sibling's.
 pub(crate) fn app_component_support_blockers(
     group: &MlsGroup,
     component_id: AppComponentId,

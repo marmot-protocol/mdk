@@ -54,7 +54,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
   - **Owns:** Invite, MIP-03 SelfRemove auto-commit, auto-publish confirm/fail
 
 - **File:** `capabilities.rs`
-  - **Owns:** `feature_status`, capability cache, capability matrix
+  - **Owns:** `feature_status` and `upgradeable_capabilities` read from every leaf (several devices per account
+    included), KeyPackage-based `constructable_capabilities`, capability matrix
 
 - **File:** `leaf_advertisement.rs`
   - **Owns:** Own-leaf re-advertisement on self-update (peer acceptance), and staleness reported only while a refresh
@@ -105,8 +106,8 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     `PendingCommit`, clears it, and surfaces `GroupEvent::PendingCommitRecovered` (mdk#150)
 
 - **File:** `record_write_atomicity.rs`
-  - **Owns:** Group-projection atomicity under injected record/cache write failures (mdk#333, mdk#794), one test per
-    seam that projects the record plus inbound capability-cache coverage. No torn record or capability cache,
+  - **Owns:** Group-projection atomicity under injected record write failures (mdk#333, mdk#794), one test per
+    seam that projects the record. No torn record,
     orphaned pending publish, leaked snapshot, stale stored proposal, or epoch split between the record and the epoch
     manager; the group stays usable, and an apply the fault abandoned hands its still-retained winning commit back to
     stored convergence so it is eventually applied. Also owns the snapshot-guard durability pair: a guard whose

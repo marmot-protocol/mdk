@@ -4,6 +4,15 @@
 
 ### Breaking changes
 
+- Migration 0121 advances account storage to schema 121 (mdk#2628). It drops
+  `cgka_member_capabilities`, the engine's per-account capability cache: with
+  several devices per account, one device's capabilities stood in for all of
+  them, so a capability could be offered as an upgrade while a device lacked
+  it. The engine now reads each current leaf's capabilities from the MLS tree,
+  and every member computes the same answer, a Welcome joiner included.
+  `CapabilityStorage` loses `save_member_capabilities` and
+  `member_capabilities`. Snapshots and checkpoints keep their v2 layout: the
+  retired list is written empty, and rows in older snapshots are skipped.
 - Migration 0120 advances account storage to schema 120 (mdk#2628).
   `account_groups.member_count` now counts member accounts, so an account
   with several devices in a group counts once and a chat between two
