@@ -49,8 +49,7 @@ use crate::{
     AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
     AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
     ChatListRow, ChatNotificationSettings, ChatPinState, ExistingDirectConversation,
-    GroupInviteDeclineResult, GroupPushDebugInfo, KeyPackageDeletionResult,
-    KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane,
+    GroupInviteDeclineResult, GroupPushDebugInfo, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane,
     MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
     MediaUploadResult, MessageDraft, MessageDraftAttachment, MessageDraftSummary,
     NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
@@ -1057,9 +1056,10 @@ pub struct WipeOutcome {
     pub groups_left: u32,
     /// Per-group leave failures. Best-effort: the wipe does not abort on these.
     pub group_leave_failures: Vec<GroupLeaveFailure>,
-    /// Number of relay-published KeyPackage events successfully deleted.
+    /// `1` when relays accepted the deletion of this device's KeyPackage slot,
+    /// otherwise `0`. Other devices' slots are never deleted.
     pub key_packages_deleted: u32,
-    /// Per-relay KeyPackage deletion failures. Best-effort.
+    /// KeyPackage slot deletion failures. Best-effort.
     pub key_package_failures: Vec<RelayFailure>,
     /// Whether the local cleanup stage (MLS DB, media cache, SQL account row,
     /// secret-store nsec, ephemeral relay/subscription state) completed.
@@ -1076,11 +1076,11 @@ pub struct GroupLeaveFailure {
     pub reason: String,
 }
 
-/// A failed relay-side operation (currently KeyPackage deletion) during the
-/// wipe. `event_id_hex` identifies the KeyPackage event the deletion targeted
-/// (empty when the failure happened during discovery, before any specific
-/// event was known) and `reason` is a privacy-safe summary — it MUST NOT
-/// contain relay URLs, pubkeys, payloads, or key material.
+/// A failed relay-side operation (currently KeyPackage deletion) during sign-out
+/// or the wipe. `event_id_hex` identifies the KeyPackage event the deletion
+/// targeted, and is empty when it targeted this device's whole slot. `reason`
+/// is a privacy-safe summary — it MUST NOT contain relay URLs, pubkeys,
+/// payloads, or key material.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayFailure {
     pub event_id_hex: String,
@@ -1112,10 +1112,10 @@ pub struct LocalCleanupReport {
 /// (mdk#477, parent mdk-android#347).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignOutOptions {
-    /// Publish kind:5 deletions for every relay-published KeyPackage of this
-    /// account so strangers cannot pull a stale KeyPackage and gift-wrap a
-    /// Welcome into a group while the account is signed out. Defaults to
-    /// `true`; the app exposes it as a toggle in the sign-out sheet.
+    /// Ask the relays to delete this device's KeyPackage slot, so inviters stop
+    /// selecting a device that is signed out. Other devices of the account
+    /// keep theirs. Defaults to `true`; the app exposes it as a toggle in the
+    /// sign-out sheet.
     pub delete_key_packages: bool,
 }
 
@@ -1139,12 +1139,12 @@ impl Default for SignOutOptions {
 /// sheet.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignOutOutcome {
-    /// Number of relay-published KeyPackage events successfully deleted. Always
-    /// `0` when `delete_key_packages` was `false`.
+    /// `1` when relays accepted the deletion of this device's KeyPackage slot,
+    /// otherwise `0`. Always `0` when `delete_key_packages` was `false`.
     pub key_packages_deleted: u32,
-    /// Per-relay KeyPackage deletion (or discovery) failures. Best-effort: a
-    /// failure here never blocks local cleanup. No durable remote-deletion
-    /// retry is implied by this outcome.
+    /// KeyPackage slot deletion failures. Best-effort: a failure here never
+    /// blocks local cleanup. No durable remote-deletion retry is implied by
+    /// this outcome.
     pub key_package_failures: Vec<RelayFailure>,
     /// Result of the always-run local teardown (worker shutdown, subscription
     /// deactivation, in-memory cache eviction). Unlike a wipe this never
@@ -1223,27 +1223,6 @@ fn transport_publish_endpoint_failures_app_reason(
         }
     }
     Some(unique.join("; "))
-}
-
-fn relay_failures_from_key_package_deletion_results(
-    results: Vec<KeyPackageDeletionResult>,
-) -> (u32, Vec<RelayFailure>) {
-    let mut deleted = 0;
-    let mut failures = Vec::new();
-    for result in results {
-        match result.result {
-            Ok(accepted) if accepted > 0 => deleted += 1,
-            Ok(_) => failures.push(RelayFailure {
-                event_id_hex: result.event_id_hex,
-                reason: "relay publish failed".to_owned(),
-            }),
-            Err(error) => failures.push(RelayFailure {
-                event_id_hex: result.event_id_hex,
-                reason: wipe_failure_reason(&error),
-            }),
-        }
-    }
-    (deleted, failures)
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -4105,58 +4084,30 @@ impl MarmotAppRuntime {
             .await
     }
 
-    async fn delete_relay_key_packages(
+    /// Delete this device's KeyPackage slot, and only it, for a sign-out
+    /// (`foundation/key-packages.md`, "Stopping publication"). Counts it as
+    /// deleted only when a relay accepted the request.
+    async fn withdraw_own_key_package_slot(
         &self,
-        account_label: &str,
-        events: Vec<AccountKeyPackageRelayEvent>,
-    ) -> (u32, Vec<RelayFailure>) {
-        let mut seen = std::collections::HashSet::new();
-        let targets = events
-            .into_iter()
-            .filter(|event| seen.insert(event.key_package_event_id.clone()))
-            .map(|event| KeyPackageDeletionTarget {
-                event_id_hex: event.key_package_event_id,
-                source_relays: event
-                    .source_relays
-                    .into_iter()
-                    .map(TransportEndpoint)
-                    .collect(),
-            })
-            .collect::<Vec<_>>();
-        if targets.is_empty() {
-            return (0, Vec::new());
+        account_ref: &str,
+        deleted: &mut u32,
+        failures: &mut Vec<RelayFailure>,
+    ) {
+        match self.accounts.withdraw_key_package_slot(account_ref).await {
+            Ok(0) => {}
+            Ok(_) => *deleted += 1,
+            Err(err) => failures.push(RelayFailure {
+                event_id_hex: String::new(),
+                reason: format!(
+                    "key package slot deletion failed: {}",
+                    wipe_failure_reason(&err)
+                ),
+            }),
         }
-        let event_ids = targets
-            .iter()
-            .map(|target| target.event_id_hex.clone())
-            .collect::<Vec<_>>();
-        let results = match self
-            .accounts
-            .app
-            .delete_key_package_events(account_label, targets)
-            .await
-        {
-            Ok(results) => results,
-            Err(error) => {
-                let reason = wipe_failure_reason(&error);
-                return (
-                    0,
-                    event_ids
-                        .into_iter()
-                        .map(|event_id_hex| RelayFailure {
-                            event_id_hex,
-                            reason: reason.clone(),
-                        })
-                        .collect(),
-                );
-            }
-        };
-
-        relay_failures_from_key_package_deletion_results(results)
     }
 
     /// Non-destructive sign-out: deactivate the account on this device and
-    /// (optionally) clean up its relay-published KeyPackages, while keeping all
+    /// (optionally) delete this device's KeyPackage slot, while keeping all
     /// local state so the same identity can be signed back in later.
     ///
     /// This is the reversible counterpart to [`sign_out_and_wipe`]. It
@@ -4173,25 +4124,22 @@ impl MarmotAppRuntime {
     ///    the SQL account record, and the secret-store nsec all stay on disk.
     ///    The account remains a live record in the picker and can be
     ///    re-activated with its groups, message history, and drafts intact.
-    /// 2. **KeyPackage hygiene (when `delete_key_packages`).** Enumerate every
-    ///    relay-published KeyPackage for this account and publish a kind:5
-    ///    deletion to each one's source relays, mirroring the
-    ///    [`delete_key_package`](Self::delete_key_package) path. This stops
-    ///    strangers from pulling a stale KeyPackage and gift-wrapping a Welcome
-    ///    into a new group while the account is signed out.
+    /// 2. **KeyPackage hygiene (when `delete_key_packages`).** Ask the relays
+    ///    to delete this device's KeyPackage slot, and only it
+    ///    (`foundation/key-packages.md`, "Stopping publication"), so inviters
+    ///    stop selecting a device that is signed out. The account's other
+    ///    devices keep their slots. Signing back in republishes.
     ///
     /// # Invariants
     /// - The MLS state DB is never touched — that is the "sign back in and
     ///   resume" contract.
-    /// - KeyPackage cleanup is best-effort and per-relay: a failure is recorded
-    ///   in [`SignOutOutcome::key_package_failures`] and never blocks the local
-    ///   teardown. The runtime does not persist a remote-deletion retry queue.
-    /// - A discovery failure (could not enumerate KeyPackages) is recorded as a
-    ///   single failure with an empty `event_id_hex`, not silently treated as
-    ///   "no KeyPackages".
-    /// - The KeyPackage step runs **before** the worker teardown so it can use
-    ///   the account's live state; neither step depends on a running worker for
-    ///   the publish itself.
+    /// - KeyPackage cleanup is best-effort: a deletion no relay accepted is
+    ///   recorded in [`SignOutOutcome::key_package_failures`], never counted as
+    ///   deleted, and never blocks the local teardown. The runtime does not
+    ///   persist a remote-deletion retry queue.
+    /// - The KeyPackage step runs **before** the worker teardown, inside the
+    ///   account worker, so it is ordered with KeyPackage maintenance and the
+    ///   worker publishes nothing into the slot after it.
     /// - The account ref stays valid after this returns (unlike a wipe).
     /// - Every account that can sign — local or external-signer — can sign
     ///   out. Only tracked-only (npub) accounts are rejected.
@@ -4233,30 +4181,17 @@ impl MarmotAppRuntime {
 
         let mut outcome = SignOutOutcome::default();
 
-        // Step 1 (KeyPackage hygiene): delete every relay-published KeyPackage
-        // before tearing the worker down, while the account is still fully
-        // live. Discovery itself is network-bound; a discovery failure is
-        // recorded as a single failure (no event id) and must not abort the
-        // sign-out. This mirrors stage 2 of `sign_out_and_wipe`.
+        // Step 1 (KeyPackage hygiene): delete this device's slot before
+        // tearing the worker down; the worker does it, and publishes nothing
+        // after. A failure must not abort the sign-out. This mirrors stage 2
+        // of `sign_out_and_wipe`.
         if options.delete_key_packages {
-            match self
-                .account_key_package_relay_events(account_ref, Vec::new())
-                .await
-            {
-                Ok(events) => {
-                    let (deleted, failures) =
-                        self.delete_relay_key_packages(&account.label, events).await;
-                    outcome.key_packages_deleted += deleted;
-                    outcome.key_package_failures.extend(failures);
-                }
-                Err(err) => outcome.key_package_failures.push(RelayFailure {
-                    event_id_hex: String::new(),
-                    reason: format!(
-                        "key package discovery failed: {}",
-                        wipe_failure_reason(&err)
-                    ),
-                }),
-            }
+            self.withdraw_own_key_package_slot(
+                account_ref,
+                &mut outcome.key_packages_deleted,
+                &mut outcome.key_package_failures,
+            )
+            .await;
         }
 
         // Step 2 (local teardown): shut the worker down (deactivating its
@@ -4295,8 +4230,9 @@ impl MarmotAppRuntime {
     ///    pending invite is a real committed membership this device must leave
     ///    (the decline path leaves such groups too). Group-enumeration failures
     ///    are surfaced as a recorded failure rather than silently dropped.
-    /// 2. Best-effort delete of every relay-published KeyPackage event, always
-    ///    (no toggle), mirroring the `delete_key_package` path.
+    /// 2. Best-effort deletion of this device's KeyPackage slot, always (no
+    ///    toggle): one kind 5 naming only that slot, so the account's other
+    ///    devices keep theirs.
     /// 3. Local cleanup (stages 3-5 of the spec): tear down the managed worker
     ///    and in-memory caches, then remove the account directory. In mdk
     ///    `remove_account` first **atomically renames** the live account
@@ -4388,27 +4324,14 @@ impl MarmotAppRuntime {
             }
         }
 
-        // Stage 2: delete every relay-published KeyPackage. Discovery itself is
-        // network-bound; a discovery failure is recorded as a single failure
-        // (no event id) and must not abort the wipe.
-        match self
-            .account_key_package_relay_events(account_ref, Vec::new())
-            .await
-        {
-            Ok(events) => {
-                let (deleted, failures) =
-                    self.delete_relay_key_packages(&account.label, events).await;
-                outcome.key_packages_deleted += deleted;
-                outcome.key_package_failures.extend(failures);
-            }
-            Err(err) => outcome.key_package_failures.push(RelayFailure {
-                event_id_hex: String::new(),
-                reason: format!(
-                    "key package discovery failed: {}",
-                    wipe_failure_reason(&err)
-                ),
-            }),
-        }
+        // Stage 2: delete this device's KeyPackage slot while its private
+        // material still exists. A failure must not abort the wipe.
+        self.withdraw_own_key_package_slot(
+            account_ref,
+            &mut outcome.key_packages_deleted,
+            &mut outcome.key_package_failures,
+        )
+        .await;
 
         // Stages 3-5: local cleanup. `remove_account` shuts the worker down,
         // drops in-memory caches, and removes the account directory (MLS DB,
@@ -8621,25 +8544,7 @@ impl AccountManager {
             None => {
                 let account = match account_home.resumable_generated_account_setup()? {
                     Some(account) => account,
-                    None => {
-                        let account = account_home.create_nostr_account_for_setup()?;
-                        // This identity did not exist before this process and
-                        // therefore cannot have a legacy kind-30443 event to
-                        // retire. Persist that proof before its first session
-                        // open so startup never pays a guaranteed-empty relay
-                        // scan (mdk#1436).
-                        if let Err(error) = self
-                            .app
-                            .mark_key_package_cutover_scan_complete(&account.label)
-                        {
-                            let _ = self
-                                .app
-                                .remove_account_key_package_artifacts(&account.label);
-                            let _ = account_home.remove_account(&account.label);
-                            return Err(error);
-                        }
-                        account
-                    }
+                    None => account_home.create_nostr_account_for_setup()?,
                 };
                 Ok((account, None))
             }

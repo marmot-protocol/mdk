@@ -16,6 +16,18 @@ pub struct KeyPackagePublication {
     pub endpoints: Vec<TransportEndpoint>,
 }
 
+/// A request to stop serving this device's slot at sign-out
+/// (`foundation/key-packages.md`, "Stopping publication").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyPackageSlotWithdrawal {
+    pub account_id: MemberId,
+    /// This device's slot, the only one the request may name.
+    pub slot_id: String,
+    /// Every publication in the slot up to this time is withdrawn.
+    pub created_at: Timestamp,
+    pub endpoints: Vec<TransportEndpoint>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KeyPackagePublishReceipt {
     pub accepted: Vec<TransportEndpoint>,
@@ -100,6 +112,17 @@ pub trait KeyPackagePublisher: Send + Sync {
         publication: &KeyPackagePublication,
         artifact: &SignedPublicationArtifact,
     ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError>;
+
+    /// Ask the transport to stop serving `withdrawal.slot_id` and nothing
+    /// else. The receipt lists the endpoints that accepted the request.
+    async fn withdraw_key_package_slot(
+        &self,
+        _withdrawal: &KeyPackageSlotWithdrawal,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        Err(KeyPackagePublishError::unexposed(
+            "this publisher cannot withdraw a KeyPackage slot",
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -130,6 +153,16 @@ impl KeyPackagePublisher for NoopKeyPackagePublisher {
     ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
         Ok(KeyPackagePublishReceipt {
             accepted: publication.endpoints.clone(),
+            failed: Vec::new(),
+        })
+    }
+
+    async fn withdraw_key_package_slot(
+        &self,
+        withdrawal: &KeyPackageSlotWithdrawal,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        Ok(KeyPackagePublishReceipt {
+            accepted: withdrawal.endpoints.clone(),
             failed: Vec::new(),
         })
     }

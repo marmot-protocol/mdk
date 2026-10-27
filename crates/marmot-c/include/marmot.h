@@ -1972,7 +1972,8 @@ typedef struct MarmotGroupLeaveFailure {
 } MarmotGroupLeaveFailure;
 
 /**
- * Per-relay KeyPackage deletion (or discovery) failure.
+ * KeyPackage slot deletion failure. `event_id_hex` is empty when the
+ * deletion targeted the whole slot.
  */
 typedef struct MarmotRelayFailure {
   char *event_id_hex;
@@ -2001,7 +2002,8 @@ typedef struct MarmotWipeOutcome {
   struct MarmotGroupLeaveFailure *group_leave_failures;
   uintptr_t group_leave_failures_len;
   /**
-   * Relay-published KeyPackage events successfully deleted.
+   * `1` when a relay accepted the deletion of this device's
+   * KeyPackage slot, otherwise `0`.
    */
   uint32_t key_packages_deleted;
   struct MarmotRelayFailure *key_package_failures;
@@ -2014,8 +2016,9 @@ typedef struct MarmotWipeOutcome {
  */
 typedef struct MarmotSignOutOutcome {
   /**
-   * Relay-published KeyPackage events successfully deleted. `0`
-   * when KeyPackage deletion was not requested.
+   * `1` when a relay accepted the deletion of this device's
+   * KeyPackage slot, otherwise `0` (always `0` when deletion was not
+   * requested).
    */
   uint32_t key_packages_deleted;
   struct MarmotRelayFailure *key_package_failures;
@@ -6601,8 +6604,8 @@ MarmotStatus marmot_sign_out_and_wipe(const struct MarmotClient *client,
 /**
  * Non-destructive sign-out: deactivate the account on this device,
  * keeping local state so it can sign back in later. When
- * `delete_key_packages` is true, relay-published KeyPackages get
- * NIP-09 deletions. Free with `marmot_sign_out_outcome_free`.
+ * `delete_key_packages` is true, this device's KeyPackage slot gets a
+ * NIP-09 deletion. Free with `marmot_sign_out_outcome_free`.
  *
  * # Safety
  * `client` must be a live handle; string arguments must be valid

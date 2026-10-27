@@ -18,7 +18,7 @@ mod time;
 pub use error::{AccountError, AccountResult};
 pub use key_package::{
     KeyPackagePublication, KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
-    NoopKeyPackagePublisher,
+    KeyPackageSlotWithdrawal, NoopKeyPackagePublisher,
 };
 pub use routing::{StaticTransportRouting, TransportRoutingError, TransportRoutingPolicy};
 pub use runtime::{

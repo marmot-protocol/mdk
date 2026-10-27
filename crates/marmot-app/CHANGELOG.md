@@ -110,6 +110,20 @@
   per build (`KeyPackageLifecycleState::unusable_artifact_replaced_by`).
   `NostrKeyPackagePublication::matches_prepared_event` is the check the Nostr
   publishers use.
+- Sign-out and wipe delete only this device's KeyPackage slot (mdk#1697,
+  mdk#2628). They used to delete every KeyPackage event of the account found
+  on its relays, which took the account's other devices' KeyPackages with
+  them. The account worker now sends one kind 5 naming the slot (an `a` tag
+  `30443:<account>:<slot>` and a `k` tag `30443`) to the relays the slot was
+  published to, and publishes nothing into it afterwards. `key_packages_deleted`
+  on `SignOutOutcome` and `WipeOutcome` is `1` when a relay accepted the
+  deletion, otherwise `0`. A deletion no relay accepted is reported in
+  `key_package_failures` and leaves the slot as it was. A device that runs
+  again republishes into its slot (`KeyPackageLifecycleState::slot_withdrawn_at`
+  records the withdrawal). Account open no longer scans the relays for the
+  account's KeyPackages in other slots to delete. `KeyPackagePublisher::withdraw_key_package_slot`
+  with `KeyPackageSlotWithdrawal` sends the request, and
+  `transport_nostr_adapter::key_package_slot_deletion_event` builds it.
 - A device joins a group only through the Welcome delivery that names one of
   its own KeyPackages (mdk#2628). Welcomes are gift-wrapped to the account, so
   each device of an account receives the delivery for every device an inviter

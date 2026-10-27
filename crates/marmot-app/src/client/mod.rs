@@ -1842,6 +1842,17 @@ impl AppClient {
         Ok(self.runtime.publish_fresh_key_package().await?)
     }
 
+    /// Ask the relays to stop serving this device's KeyPackage slot before it
+    /// signs out; other devices' slots are never named. Returns how many
+    /// relays accepted, or 0 when this device never published into the slot.
+    /// Afterwards this client publishes no KeyPackage.
+    pub async fn withdraw_key_package_slot(&mut self) -> Result<usize, AppError> {
+        // Current kind 10002 write relays; the runtime adds every relay the
+        // slot was published to.
+        self.refresh_routing()?;
+        Ok(self.runtime.withdraw_key_package_slot().await?)
+    }
+
     /// Fetch current relay KeyPackages for the composition roster without
     /// reserving or consuming them. Group creation fetches again before the
     /// MLS mutation; cached packages only inform discovery.

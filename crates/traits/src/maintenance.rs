@@ -460,6 +460,13 @@ pub struct KeyPackageLifecycleState {
     /// still replace one an earlier build signed.
     #[serde(default)]
     pub unusable_artifact_replaced_by: Option<String>,
+    /// When this device asked its relays to delete its slot at sign-out
+    /// (`foundation/key-packages.md`, "Stopping publication"). Relays drop
+    /// every publication in the slot up to this time, so the next one must be
+    /// newer and is due as soon as the device runs again. Confirmed
+    /// publication of that newer one clears it.
+    #[serde(default)]
+    pub slot_withdrawn_at: Option<Timestamp>,
 }
 
 impl KeyPackageLifecycleState {
@@ -486,6 +493,7 @@ impl KeyPackageLifecycleState {
             retained_private_material: Vec::new(),
             pending_replacement: None,
             unusable_artifact_replaced_by: None,
+            slot_withdrawn_at: None,
         }
     }
 

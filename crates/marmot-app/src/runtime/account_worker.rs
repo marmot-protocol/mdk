@@ -654,6 +654,11 @@ pub(crate) enum AccountWorkerCommand {
     RotateKeyPackage {
         respond: oneshot::Sender<Result<usize, AppError>>,
     },
+    /// Delete this device's KeyPackage slot before sign-out tears the worker
+    /// down. Answers with the number of relays that accepted.
+    WithdrawKeyPackageSlot {
+        respond: oneshot::Sender<Result<usize, AppError>>,
+    },
     KeyPackageMaintenanceStatus {
         respond: oneshot::Sender<Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError>>,
     },
@@ -6297,6 +6302,11 @@ fn account_worker_command_future<'a>(
                 Ok(key_package.bytes().len())
             }
             .await;
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::WithdrawKeyPackageSlot { respond } => Box::pin(async move {
+            let result = client.withdraw_key_package_slot().await;
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),

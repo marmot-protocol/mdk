@@ -141,6 +141,11 @@ Each device keeps one KeyPackage in its own slot and replaces it in place
   earlier build signed with a client name over 64 bytes) as `artifact_unusable`. The runtime then replaces it with a
   freshly signed KeyPackage in the same slot instead of retrying it until it expires. Each build does this at most
   once, so a publisher that refuses its own artifacts cannot make it generate a KeyPackage per attempt.
+- **Stopping publication.** At sign-out, `withdraw_key_package_slot` asks the slot's relays to delete it, naming only
+  this device's slot, so the account's other devices keep theirs. The runtime records the withdrawal before sending it
+  and publishes nothing more into the slot. A request no relay accepts is undone and returned as an error. The next
+  runtime for the account republishes into the slot with a newer timestamp; a replacement prepared before the
+  withdrawal is never published after it.
 
 ## KeyPackage generator upgrades
 

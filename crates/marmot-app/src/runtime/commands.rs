@@ -2118,6 +2118,16 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    pub async fn withdraw_key_package_slot(&self, account_ref: &str) -> Result<usize, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::WithdrawKeyPackageSlot { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn key_package_maintenance_status(
         &self,
         account_ref: &str,

@@ -370,8 +370,30 @@ async fn superseded_key_package_event_remains_deletable() {
     );
 }
 
+/// The kind 5 requests the relay saw, as tag lists.
+fn kind5_tags(relay: &ScriptedPushRelayClient) -> Vec<(u64, Vec<Vec<String>>)> {
+    relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == 5)
+        .map(|event| (event.created_at, event.tags.clone()))
+        .collect()
+}
+
+fn slot_deletion_tags(account: &AccountSummary, slot_id: &str) -> Vec<Vec<String>> {
+    vec![
+        vec![
+            "a".to_owned(),
+            format!("30443:{}:{slot_id}", account.account_id_hex),
+        ],
+        vec!["k".to_owned(), "30443".to_owned()],
+    ]
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bulk_key_package_cleanup_includes_superseded_events() {
+async fn sign_out_deletes_this_devices_slot_with_every_version_in_it() {
     let directory = tempfile::tempdir().unwrap();
     let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -395,20 +417,25 @@ async fn bulk_key_package_cleanup_includes_superseded_events() {
         .await
         .unwrap();
     let account = created.account;
-    let (older, newer, _other) = same_slot_events(&app, &account).await;
-    seed_fetcher(
-        &fetcher,
-        &account,
-        vec![older.clone(), newer.clone()],
-        &[DIRECTORY],
-    );
-    write_key_package_cache(&app, &account, SLOT, "local-only-ref", "");
-
-    let history = runtime
-        .account_key_package_relay_events(&account.account_id_hex, vec![endpoint(DIRECTORY)])
+    // Other devices' publications of this account, in their own slots.
+    let (older, newer, other) = same_slot_events(&app, &account).await;
+    seed_fetcher(&fetcher, &account, vec![older, newer, other], &[DIRECTORY]);
+    // Two publications in this device's slot: a superseded one and the
+    // current one.
+    for _ in 0..2 {
+        runtime
+            .rotate_key_package(&account.account_id_hex)
+            .await
+            .unwrap();
+    }
+    let lifecycle = runtime
+        .key_package_maintenance_status(&account.account_id_hex)
         .await
+        .unwrap()
         .unwrap();
-    assert_eq!(history.len(), 2);
+    let own_slot = lifecycle.stable_slot_id.clone();
+    assert!(own_slot != SLOT && own_slot != OTHER_SLOT);
+    assert!(!lifecycle.retained_private_material.is_empty());
 
     let outcome = runtime
         .sign_out(
@@ -419,18 +446,19 @@ async fn bulk_key_package_cleanup_includes_superseded_events() {
         )
         .await
         .unwrap();
-    let deleted = kind5_targets(&relay);
-    assert_eq!(
-        deleted.iter().cloned().collect::<BTreeSet<_>>(),
-        BTreeSet::from([older.id.clone(), newer.id.clone()])
-    );
-    assert_eq!(deleted.len(), 2);
-    assert!(outcome.key_packages_deleted >= 2);
-    assert!(!deleted.iter().any(|id| id.is_empty()));
+    // One request names the slot and nothing else; relays drop every
+    // version in it up to its time, the superseded one included.
+    let deletions = kind5_tags(&relay);
+    assert_eq!(deletions.len(), 1);
+    let (deleted_at, tags) = &deletions[0];
+    assert_eq!(tags, &slot_deletion_tags(&account, &own_slot));
+    assert!(*deleted_at >= lifecycle.authored_event_created_at.unwrap().0);
+    assert_eq!(outcome.key_packages_deleted, 1);
+    assert!(outcome.key_package_failures.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wipe_bulk_cleanup_includes_superseded_events() {
+async fn wipe_deletes_no_key_package_this_device_did_not_publish() {
     let directory = tempfile::tempdir().unwrap();
     let fetcher = Arc::new(MemberResolutionDirectoryFetcher::default());
     let relay = Arc::new(ScriptedPushRelayClient::default());
@@ -454,24 +482,29 @@ async fn wipe_bulk_cleanup_includes_superseded_events() {
         .await
         .unwrap();
     let account = created.account;
-    let (older, newer, _other) = same_slot_events(&app, &account).await;
-    seed_fetcher(
-        &fetcher,
-        &account,
-        vec![older.clone(), newer.clone()],
-        &[DIRECTORY],
-    );
+    // Other devices' publications of this account, in their own slots.
+    let (older, newer, other) = same_slot_events(&app, &account).await;
+    seed_fetcher(&fetcher, &account, vec![older, newer, other], &[DIRECTORY]);
+    runtime
+        .rotate_key_package(&account.account_id_hex)
+        .await
+        .unwrap();
+    let own_slot = runtime
+        .key_package_maintenance_status(&account.account_id_hex)
+        .await
+        .unwrap()
+        .unwrap()
+        .stable_slot_id;
+    assert!(own_slot != SLOT && own_slot != OTHER_SLOT);
 
     let outcome = runtime
         .sign_out_and_wipe(&account.account_id_hex)
         .await
         .unwrap();
-    let deleted = kind5_targets(&relay);
-    assert_eq!(
-        deleted.iter().cloned().collect::<BTreeSet<_>>(),
-        BTreeSet::from([older.id.clone(), newer.id.clone()])
-    );
-    assert!(outcome.key_packages_deleted >= 2);
+    let deletions = kind5_tags(&relay);
+    assert_eq!(deletions.len(), 1);
+    assert_eq!(deletions[0].1, slot_deletion_tags(&account, &own_slot));
+    assert_eq!(outcome.key_packages_deleted, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

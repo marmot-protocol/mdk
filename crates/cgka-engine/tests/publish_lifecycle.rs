@@ -1853,6 +1853,7 @@ fn key_package_bundle_and_lifecycle_intent_roll_back_together() {
         retained_private_material: Vec::new(),
         pending_replacement: None,
         unusable_artifact_replaced_by: None,
+        slot_withdrawn_at: None,
     };
 
     lifecycle_fault.arm(1);

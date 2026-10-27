@@ -47,7 +47,9 @@ use marmot_forensics::{
 use sha2::{Digest, Sha256};
 
 use crate::error::{AccountError, AccountResult};
-use crate::key_package::{KeyPackagePublication, KeyPackagePublisher, NoopKeyPackagePublisher};
+use crate::key_package::{
+    KeyPackagePublication, KeyPackagePublisher, KeyPackageSlotWithdrawal, NoopKeyPackagePublisher,
+};
 use crate::routing::{
     StaticTransportRouting, TransportRoutingPolicy, publish_target_group_id, publish_target_kind,
     publish_target_relay_urls,
@@ -451,6 +453,9 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     maintenance_random: Arc<dyn MaintenanceRandom>,
     maintenance_timing: MaintenanceTiming,
     maintenance_paused: bool,
+    /// This runtime withdrew the device's slot for sign-out, so it publishes
+    /// nothing more. The next runtime for the account republishes.
+    key_package_slot_withdrawn: bool,
     maintenance_activity: std::sync::Mutex<MaintenanceActivity>,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
     /// Monotonic time each group's own-leaf currency was last read from the
@@ -523,6 +528,7 @@ where
             maintenance_random: Arc::new(OsMaintenanceRandom),
             maintenance_timing: MaintenanceTiming::default(),
             maintenance_paused: false,
+            key_package_slot_withdrawn: false,
             maintenance_activity: std::sync::Mutex::new(MaintenanceActivity::default()),
             maintenance_quiet_monotonic: HashMap::new(),
             component_migration_checked_at: HashMap::new(),
@@ -927,6 +933,7 @@ where
     /// When no usable current package or signed artifact exists, this falls back to
     /// [`Self::publish_fresh_key_package`].
     pub async fn republish_key_package(&mut self) -> AccountResult<KeyPackage> {
+        self.ensure_key_package_slot_not_withdrawn()?;
         let Some(mut lifecycle) = self.session.key_package_lifecycle()? else {
             tracing::debug!(
                 target: TRACE_TARGET,
@@ -1116,6 +1123,7 @@ where
             endpoint_count = endpoints.len(),
             "preparing fresh key package for later publication"
         );
+        self.ensure_key_package_slot_not_withdrawn()?;
         let now = self.wall_clock.now();
         let mut lifecycle = match self.session.key_package_lifecycle()? {
             Some(state) => state,
@@ -1147,6 +1155,7 @@ where
                     retained_private_material: Vec::new(),
                     pending_replacement: None,
                     unusable_artifact_replaced_by: None,
+                    slot_withdrawn_at: None,
                 }
             }
         };
@@ -1161,8 +1170,13 @@ where
             || lifecycle
                 .pending_replacement
                 .as_ref()
-                .is_none_or(|pending| pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION)
+                .is_none_or(|pending| {
+                    pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
+                        || withdrawn_with_slot(&lifecycle, pending.authored_created_at)
+                })
         {
+            // Newer than every publication in the slot, and than its
+            // withdrawal: relays drop anything up to that.
             let created_at = Timestamp(
                 lifecycle
                     .authored_event_created_at
@@ -1173,6 +1187,7 @@ where
                             .as_ref()
                             .map(|pending| pending.authored_created_at),
                     )
+                    .chain(lifecycle.slot_withdrawn_at)
                     .max()
                     .map(|previous| previous.0.saturating_add(1))
                     .unwrap_or(now.0)
@@ -1413,6 +1428,9 @@ where
         lifecycle.current_not_after = Some(replacement.not_after);
         lifecycle.authored_event_id = Some(artifact.id.clone());
         lifecycle.authored_event_created_at = Some(artifact.created_at);
+        if !withdrawn_with_slot(&lifecycle, artifact.created_at) {
+            lifecycle.slot_withdrawn_at = None;
+        }
         lifecycle.authored_signed_event = Some(artifact);
         lifecycle.publication_targets = replacement.targets;
         lifecycle.refresh_at = Some(replacement.refresh_at);
@@ -1470,12 +1488,16 @@ where
     }
 
     pub fn key_package_network_maintenance_due(&self) -> AccountResult<bool> {
+        if self.key_package_slot_withdrawn {
+            return Ok(false);
+        }
         let now = self.wall_clock.now();
         Ok(match self.session.key_package_lifecycle()? {
             None => true,
             Some(lifecycle) => match lifecycle.pending_replacement.as_ref() {
                 Some(pending) => {
                     pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION
+                        || withdrawn_with_slot(&lifecycle, pending.authored_created_at)
                         || pending.signed_event.is_none()
                         || pending
                             .targets
@@ -1492,8 +1514,9 @@ where
 
     /// Whether the current KeyPackage is due for replacement for any reason
     /// other than a Welcome consuming it: there is none, its weekly refresh
-    /// is due, the generator policy changed, or the capabilities this client
-    /// supports changed (`foundation/key-packages.md`, "Refreshing a slot").
+    /// is due, the generator policy changed, the capabilities this client
+    /// supports changed (`foundation/key-packages.md`, "Refreshing a slot"),
+    /// or the slot was withdrawn at sign-out.
     fn current_key_package_replacement_due(
         &self,
         lifecycle: &KeyPackageLifecycleState,
@@ -1503,6 +1526,7 @@ where
             return true;
         };
         key_package_refresh_due(lifecycle, now)
+            || lifecycle.slot_withdrawn_at.is_some()
             || !lifecycle.upgrade_rotation_recorded
             || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION
             || !self.advertises_current_capabilities(current)
@@ -1518,11 +1542,16 @@ where
     }
 
     pub fn key_package_has_pending_fanout(&self) -> AccountResult<bool> {
+        if self.key_package_slot_withdrawn {
+            return Ok(false);
+        }
+        // A withdrawn slot's publication is deleted; its replacement is due.
         Ok(self
             .session
             .key_package_lifecycle()?
             .is_some_and(|lifecycle| {
-                lifecycle.generation_revision >= KEY_PACKAGE_GENERATION_REVISION
+                lifecycle.slot_withdrawn_at.is_none()
+                    && lifecycle.generation_revision >= KEY_PACKAGE_GENERATION_REVISION
                     && lifecycle.authored_signed_event.is_some()
                     && lifecycle.publication_targets.iter().any(|target| {
                         matches!(
@@ -1534,11 +1563,109 @@ where
             }))
     }
 
+    /// Ask the relays to stop serving this device's slot before it signs out
+    /// (`foundation/key-packages.md`, "Stopping publication"). The request
+    /// names this device's slot and nothing else. The withdrawal is recorded
+    /// before the request goes out, so the next runtime for the account
+    /// republishes, and is undone when no endpoint accepts the request.
+    ///
+    /// Returns how many endpoints accepted it, or 0 when this device never
+    /// published into the slot. Afterwards this runtime publishes no
+    /// KeyPackage.
+    pub async fn withdraw_key_package_slot(&mut self) -> AccountResult<usize> {
+        let Some(previous) = self.session.key_package_lifecycle()? else {
+            return Ok(0);
+        };
+        let pending = previous.pending_replacement.as_ref();
+        let published = previous.authored_event_id.is_some()
+            || pending.is_some_and(|pending| pending.signed_event.is_some());
+        if !published || previous.stable_slot_id.is_empty() {
+            return Ok(0);
+        }
+        // The deletion covers every publication in the slot up to its time.
+        let created_at = previous
+            .authored_event_created_at
+            .into_iter()
+            .chain(pending.map(|pending| pending.authored_created_at))
+            .fold(self.wall_clock.now(), Timestamp::max);
+        let mut endpoints = self.routing.key_package_endpoints().to_vec();
+        for target in previous
+            .publication_targets
+            .iter()
+            .chain(pending.into_iter().flat_map(|pending| &pending.targets))
+        {
+            if !endpoints.contains(&target.endpoint) {
+                endpoints.push(target.endpoint.clone());
+            }
+        }
+        if endpoints.is_empty() {
+            return Err(crate::key_package::KeyPackagePublishError::unexposed(
+                "no KeyPackage publication endpoints are configured",
+            )
+            .into());
+        }
+
+        let mut withdrawn = previous.clone();
+        withdrawn.slot_withdrawn_at = Some(created_at);
+        self.session.put_key_package_lifecycle(&withdrawn)?;
+        self.key_package_slot_withdrawn = true;
+        let withdrawal = KeyPackageSlotWithdrawal {
+            account_id: self.session.self_id().clone(),
+            slot_id: previous.stable_slot_id.clone(),
+            created_at,
+            endpoints,
+        };
+        let endpoint_count = withdrawal.endpoints.len();
+        let error = match self
+            .key_packages
+            .withdraw_key_package_slot(&withdrawal)
+            .await
+        {
+            Ok(receipt) if !receipt.accepted.is_empty() => {
+                tracing::info!(
+                    target: TRACE_TARGET,
+                    method = "withdraw_key_package_slot",
+                    endpoint_count,
+                    accepted_count = receipt.accepted.len(),
+                    "withdrew this device's key package slot"
+                );
+                return Ok(receipt.accepted.len());
+            }
+            Ok(_) => crate::key_package::KeyPackagePublishError::unexposed(
+                "no KeyPackage relay accepted the slot withdrawal",
+            ),
+            Err(error) => error,
+        };
+        // Nothing confirms the withdrawal, so the slot stays as it was.
+        self.session.put_key_package_lifecycle(&previous)?;
+        self.key_package_slot_withdrawn = false;
+        tracing::warn!(
+            target: TRACE_TARGET,
+            method = "withdraw_key_package_slot",
+            endpoint_count,
+            "no endpoint accepted the key package slot withdrawal"
+        );
+        Err(error.into())
+    }
+
+    fn ensure_key_package_slot_not_withdrawn(&self) -> AccountResult<()> {
+        if self.key_package_slot_withdrawn {
+            return Err(crate::key_package::KeyPackagePublishError::unexposed(
+                "this device's KeyPackage slot was withdrawn for sign-out",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     async fn retry_key_package_fanout(&mut self) -> AccountResult<()> {
         let Some(mut lifecycle) = self.session.key_package_lifecycle()? else {
             return Ok(());
         };
-        if lifecycle.pending_replacement.is_some() {
+        if lifecycle.pending_replacement.is_some()
+            || lifecycle.slot_withdrawn_at.is_some()
+            || self.key_package_slot_withdrawn
+        {
             return Ok(());
         }
         let Some(artifact) = lifecycle.authored_signed_event.clone() else {
@@ -2068,9 +2195,13 @@ where
             .session
             .key_package_lifecycle()?
             .is_some_and(|lifecycle| {
-                lifecycle.pending_replacement.is_some_and(|pending| {
-                    pending.generation_revision >= KEY_PACKAGE_GENERATION_REVISION
-                })
+                lifecycle
+                    .pending_replacement
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.generation_revision >= KEY_PACKAGE_GENERATION_REVISION
+                            && !withdrawn_with_slot(&lifecycle, pending.authored_created_at)
+                    })
             });
         if key_package_due && (!self.maintenance_paused || key_package_prepared) {
             let started = self.monotonic_clock.elapsed();
@@ -6328,6 +6459,14 @@ fn may_replace_unusable_artifact(lifecycle: &KeyPackageLifecycleState) -> bool {
 /// [`KEY_PACKAGE_REFRESH_MAX_SECS`] after publication. The second bound also
 /// covers a record whose `refresh_at` was scheduled under the earlier 84-day
 /// lifetime.
+/// Whether a publication authored at `created_at` went with the slot's
+/// withdrawal: relays drop every publication in the slot up to that time.
+fn withdrawn_with_slot(lifecycle: &KeyPackageLifecycleState, created_at: Timestamp) -> bool {
+    lifecycle
+        .slot_withdrawn_at
+        .is_some_and(|withdrawn_at| created_at <= withdrawn_at)
+}
+
 fn key_package_refresh_due(lifecycle: &KeyPackageLifecycleState, now: Timestamp) -> bool {
     lifecycle.refresh_at.is_some_and(|deadline| deadline <= now)
         || lifecycle
@@ -6341,7 +6480,9 @@ fn current_key_package_republish_blocker(
     lifecycle: &KeyPackageLifecycleState,
     now: Timestamp,
 ) -> Option<&'static str> {
-    if lifecycle.current_key_package.is_none() {
+    if lifecycle.slot_withdrawn_at.is_some() {
+        Some("slot_withdrawn")
+    } else if lifecycle.current_key_package.is_none() {
         Some("missing_current_key_package")
     } else if lifecycle.current_key_package_ref.is_none() {
         Some("missing_current_key_package_ref")
