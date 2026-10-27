@@ -43,9 +43,12 @@
   installs the group and survives a restart. Every other announce owed is
   stored before it is sent, so one the outbox drops, or one deferred until
   the catch-up has run, is still sent after a restart; a published announce
-  built since settles it, and a new Welcome drops it. Only a published
-  announce counts: one left in the outbox counts once the outbox publishes
-  it, and no other is sent in that group meanwhile. Incoming announces are
+  built since settles it, and a new Welcome drops it. When the join window
+  or the device's stored records cannot be read, or the announce a new or
+  changed record owes cannot be recorded, nothing is sent in that group: the
+  share stays pending and its retry decides again. Only a published announce
+  counts: one left in the outbox counts once the outbox publishes it, and no
+  other is sent in that group meanwhile. Incoming announces are
   applied as before, as a self-update or a request.
 
   Known limits, each costing at most a stale or repeated announce:

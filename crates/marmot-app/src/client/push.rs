@@ -12,6 +12,7 @@ mod announce;
 #[cfg(test)]
 mod tests;
 
+use announce::PushShareForm;
 pub(crate) use announce::{AcceptedPushAnnounce, PushAnnounceTiming, PushFetchClock};
 
 const PUSH_PUBLISH_CONCURRENCY: usize = 4;
@@ -303,11 +304,21 @@ impl AppClient {
                         continue;
                     }
                 };
-                let announce = self.shares_in_announce(&group_id, &record);
-                let content = if announce.is_some() {
-                    self.build_push_announce(&group_id, std::slice::from_ref(&record))
-                } else {
-                    serde_json::to_string(&payload).map_err(AppError::from)
+                let form = self.push_share_form(&group_id, &record);
+                let content = match form {
+                    PushShareForm::Defer => {
+                        tracing::debug!(
+                            target: "marmot_app::notifications",
+                            method = "share_push_registration",
+                            skipped_groups = 1_u64,
+                            "push token update waits until its owed announce is recorded",
+                        );
+                        continue;
+                    }
+                    PushShareForm::Announce { .. } => {
+                        self.build_push_announce(&group_id, std::slice::from_ref(&record))
+                    }
+                    PushShareForm::Plain => serde_json::to_string(&payload).map_err(AppError::from),
                 };
                 let content = match content {
                     Ok(content) => content,
@@ -329,7 +340,7 @@ impl AppClient {
                         if summary.accept_disposition
                             == cgka_traits::SendAcceptDisposition::Published =>
                     {
-                        if let Some(settles_owed) = announce {
+                        if let PushShareForm::Announce { settles_owed } = form {
                             self.record_push_announce(&group_id, Some(settles_owed));
                         }
                         if let Err(err) = self.app.upsert_group_push_token(&account.label, &record)
@@ -350,7 +361,7 @@ impl AppClient {
                         )?;
                     }
                     Ok((event, _summary)) => {
-                        if let Some(settles_owed) = announce {
+                        if let PushShareForm::Announce { settles_owed } = form {
                             self.note_push_announce_left_in_outbox(
                                 &group_id,
                                 event.id,

@@ -756,3 +756,37 @@ async fn a_change_shared_before_the_catch_up_is_announced_after_a_restart() {
     assert_eq!(token_leaves(&sent[0]), vec![alice.leaf(&fx.group)]);
     assert_eq!(gossip_state(&alice, &group_hex).announce_owed_at_ms, None);
 }
+
+/// A change whose owed announce cannot be recorded is not shared at all: no
+/// plain self-update goes out and the share stays pending, so once storage
+/// recovers its retry shares the change in an announce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_whose_announce_debt_cannot_be_recorded_waits_for_its_retry() {
+    let mut fx = Fixture::new().await;
+    let group_hex = fx.group_hex();
+    let before = gossip_state(&fx.alice, &group_hex);
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    fx.alice.register("alice-token-2", &fx.server);
+    fx.alice.client.test_fail_push_announce_owed_write = true;
+    let from = gossip_sent(&fx.alice);
+    assert_eq!(fx.alice.share().await.succeeded_groups, 0);
+    assert!(sent_updates(&fx.alice, from).is_empty(), "nothing is sent");
+    assert_eq!(gossip_state(&fx.alice, &group_hex), before);
+    assert!(
+        fx.alice.client.has_pending_push_registration_work(),
+        "the share stays pending"
+    );
+    assert!(retry(&mut fx.alice).await, "the retry still waits");
+    assert!(sent_updates(&fx.alice, from).is_empty());
+
+    fx.alice.client.test_fail_push_announce_owed_write = false;
+    assert!(!retry(&mut fx.alice).await);
+    let sent = sent_updates(&fx.alice, from);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(have(&sent[0]), Some(held(&fx.alice, &group_hex)));
+    assert_eq!(token_leaves(&sent[0]), vec![fx.alice.leaf(&fx.group)]);
+    let state = gossip_state(&fx.alice, &group_hex);
+    assert!(state.last_announced_at_ms > before.last_announced_at_ms);
+    assert_eq!(state.announce_owed_at_ms, None);
+    assert!(!fx.alice.client.has_pending_push_registration_work());
+}

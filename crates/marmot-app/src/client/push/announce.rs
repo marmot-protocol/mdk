@@ -153,6 +153,19 @@ impl PushAnnounceTiming {
     }
 }
 
+/// How a device shares its push record in a group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PushShareForm {
+    /// A plain self-update, with no `have`.
+    Plain,
+    /// An announce. Once published, it settles the owed announce stored as
+    /// `settles_owed`, unless another was owed since.
+    Announce { settles_owed: i64 },
+    /// Not now: what the choice needs could not be read, or the announce owed
+    /// could not be recorded. The share stays pending for its retry.
+    Defer,
+}
+
 /// An announce the runtime accepted into a group's outbox without publishing
 /// it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,21 +183,21 @@ fn millis(duration: Duration) -> i64 {
 }
 
 impl AppClient {
-    /// Whether this device shares `record` in `group_id` in an announce, and
-    /// if so the owed announce it settles once published. The record must be new or
-    /// changed and the join window there over or never opened; then the group
-    /// is owed an announce, recorded before anything is sent. It goes in this
-    /// share unless an announce of this device's waits in the group's outbox
-    /// or the device has not been able to fetch for the settle time; then the
-    /// share is a plain self-update, which is always valid, and the announce
-    /// owed is sent once it can be. Inside the window, when re-sharing a
-    /// record members may have, and when the debt cannot be recorded, the
-    /// share is a plain self-update too.
-    pub(super) fn shares_in_announce(
-        &mut self,
+    /// How this device shares `record` in `group_id`. A new or changed record
+    /// after the join window, or with none opened, owes the group an
+    /// announce, recorded before anything is sent. It goes in this share
+    /// unless an announce of this device's waits in the group's outbox or the
+    /// device has not been able to fetch for the settle time; then the share
+    /// is a plain self-update, which is always valid, and the announce owed
+    /// is sent once it can be. Inside the window, and when re-sharing a record
+    /// members may have, the share is a plain self-update too. When what the
+    /// decision needs cannot be read, or the debt cannot be recorded, the
+    /// share waits, so its retry decides again.
+    pub(super) fn push_share_form(
+        &self,
         group_id: &GroupId,
         record: &notifications::GroupPushTokenRecord,
-    ) -> Option<i64> {
+    ) -> PushShareForm {
         let state = match self
             .app
             .group_push_gossip_state(&self.state.label, &record.group_id_hex)
@@ -193,58 +206,67 @@ impl AppClient {
             Err(error) => {
                 tracing::warn!(
                     target: "marmot_app::notifications",
-                    method = "shares_in_announce",
+                    method = "push_share_form",
                     error_kind = error.privacy_safe_kind(),
                     "push join window read failed",
                 );
-                if self.is_new_own_push_record(record) != Some(false) {
-                    self.record_push_announce_owed(group_id, notifications::unix_now_ms());
-                }
-                return None;
+                return PushShareForm::Defer;
             }
         };
         if self.push_announce_timing.join_window(state.as_ref()) == PushJoinWindow::Open {
-            return None;
+            return PushShareForm::Plain;
         }
         match self.is_new_own_push_record(record) {
             Some(true) => {}
-            Some(false) => return None,
-            None => {
-                self.record_push_announce_owed(group_id, notifications::unix_now_ms());
-                return None;
-            }
+            Some(false) => return PushShareForm::Plain,
+            None => return PushShareForm::Defer,
         }
-        let owed = self.record_push_announce_owed(group_id, notifications::unix_now_ms())?;
+        let Ok(owed) = self.record_push_announce_owed(group_id, notifications::unix_now_ms())
+        else {
+            return PushShareForm::Defer;
+        };
+        // No debt without a projected membership; the send decides the rest.
+        let Some(settles_owed) = owed else {
+            return PushShareForm::Plain;
+        };
         if self.announce_left_in_outbox(group_id, state.as_ref())
             || !self
                 .push_fetch_clock
                 .settled(self.push_announce_timing.catch_up_settle)
         {
-            return None;
+            return PushShareForm::Plain;
         }
-        Some(owed)
+        PushShareForm::Announce { settles_owed }
     }
 
     /// Record that this device owes `group_id` an announce as of
-    /// `owed_at_ms`. Returns the value stored, or `None` when nothing was
-    /// recorded.
-    fn record_push_announce_owed(&self, group_id: &GroupId, owed_at_ms: i64) -> Option<i64> {
-        match self.app.record_group_push_announce_owed(
-            &self.state.label,
-            &hex::encode(group_id.as_slice()),
-            owed_at_ms,
-        ) {
-            Ok(owed) => owed,
-            Err(error) => {
+    /// `owed_at_ms`. Returns the value stored, or `None` without a projected
+    /// membership to record it for.
+    fn record_push_announce_owed(
+        &self,
+        group_id: &GroupId,
+        owed_at_ms: i64,
+    ) -> Result<Option<i64>, AppError> {
+        #[cfg(test)]
+        if self.test_fail_push_announce_owed_write {
+            return Err(AppError::BlockingTask(
+                "injected owed push announce write failure".to_owned(),
+            ));
+        }
+        self.app
+            .record_group_push_announce_owed(
+                &self.state.label,
+                &hex::encode(group_id.as_slice()),
+                owed_at_ms,
+            )
+            .inspect_err(|error| {
                 tracing::warn!(
                     target: "marmot_app::notifications",
                     method = "record_push_announce_owed",
                     error_kind = error.privacy_safe_kind(),
                     "owed push announce was not recorded",
                 );
-                None
-            }
-        }
+            })
     }
 
     /// Count the time since the last look during which this device could
@@ -383,7 +405,10 @@ impl AppClient {
             .push_announce_timing
             .periodic_due(state.as_ref(), now_ms)
             && !self.announce_left_in_outbox(group_id, state.as_ref())
-            && self.record_push_announce_owed(group_id, now_ms).is_some()
+            && matches!(
+                self.record_push_announce_owed(group_id, now_ms),
+                Ok(Some(_))
+            )
         {
             self.push_registration_share_queued = true;
         }

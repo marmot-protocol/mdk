@@ -925,6 +925,9 @@ pub struct AppClient {
     /// EOSE. `None` reads the relays.
     #[cfg(test)]
     pub(crate) test_push_device_can_fetch: Option<bool>,
+    /// Tests fail every write of an owed push announce.
+    #[cfg(test)]
+    pub(crate) test_fail_push_announce_owed_write: bool,
     /// Welcomes queued for re-delivery during the most recent create/invite.
     /// The runtime account worker drains this after the command and broadcasts a
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable

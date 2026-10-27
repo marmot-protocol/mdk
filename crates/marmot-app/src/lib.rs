@@ -2058,6 +2058,8 @@ impl MarmotApp {
             test_sent_push_gossip: Vec::new(),
             #[cfg(test)]
             test_push_device_can_fetch: None,
+            #[cfg(test)]
+            test_fail_push_announce_owed_write: false,
             pending_welcome_delivery_events: Vec::new(),
             pending_superseded_change_events: Vec::new(),
             maintenance_failed_backlog: 0,
