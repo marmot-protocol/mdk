@@ -1241,11 +1241,12 @@ impl<S: StorageProvider> Engine<S> {
             };
             let (local_state_is_stale, repaired_unrecoverable) = match discarded.as_ref() {
                 Some(group) => {
-                    let self_is_recorded_member = group
-                        .members
-                        .iter()
-                        .any(|member| &member.id == self.identity.self_id());
-                    if self_is_recorded_member && !group.unrecoverable {
+                    // A sibling device's leaf keeps this account on the roster
+                    // after this device's removal, so the roster alone never
+                    // makes the discarded copy an active member.
+                    let copy_is_member =
+                        crate::identity::local_copy_is_member(group, self.identity.self_id());
+                    if copy_is_member && !group.unrecoverable {
                         // A fork can have advanced beyond the replacement epoch.
                         // Epoch ordering never grants consent: every distinct fully
                         // validated Welcome only offers explicit branch replacement.
@@ -1267,7 +1268,7 @@ impl<S: StorageProvider> Engine<S> {
                             confirmation_token = Some(token);
                         }
                     }
-                    if consent.is_some() && (!self_is_recorded_member || group.unrecoverable) {
+                    if consent.is_some() && (!copy_is_member || group.unrecoverable) {
                         return Err(rejoin_confirmation_required());
                     }
                     // Unrecoverable is the explicit exception: a fully

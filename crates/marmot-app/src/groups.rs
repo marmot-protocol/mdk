@@ -2316,9 +2316,30 @@ pub(crate) fn observe_event(
                     GroupConfirmationProjection::Preserve,
                 );
             }
-            summary.events.push(event.clone());
+            summary.events.push(host_group_event(event));
             None
         }
+    }
+}
+
+/// The copy of an engine event that hosts receive. A departure's removed leaves
+/// are device destinations MDK consumes itself, so no leaf index reaches a host.
+/// Hosts still learn which accounts left, and `LocalGroupCopyTerminated` tells
+/// them when this device's own leaf was removed.
+pub(crate) fn host_group_event(event: &GroupEvent) -> GroupEvent {
+    match event {
+        GroupEvent::GroupMemberLeavesRemoved {
+            group_id,
+            epoch,
+            departed_members,
+            ..
+        } => GroupEvent::GroupMemberLeavesRemoved {
+            group_id: group_id.clone(),
+            epoch: *epoch,
+            leaves: Vec::new(),
+            departed_members: departed_members.clone(),
+        },
+        event => event.clone(),
     }
 }
 

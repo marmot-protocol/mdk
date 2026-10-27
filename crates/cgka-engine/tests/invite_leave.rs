@@ -757,6 +757,399 @@ async fn sibling_device_membership_preserves_activity_targets() {
     }
 }
 
+fn current_device_on(label: &[u8], storage: SqliteAccountStorage) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(storage)
+        .identity(pad32(label))
+        .account_identity_proof_signer(proof_signer(label))
+        .feature_registry(selfremove_registry())
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap()
+}
+
+/// A group in which bob's account holds two leaves: `bob` and `bob_sibling`
+/// are distinct devices of that account. Carol is a co-admin whose storage
+/// authors the single-leaf Remove MDK has no intent for.
+struct TwoDeviceAccountGroup {
+    alice: Engine<SqliteAccountStorage>,
+    bob: Engine<SqliteAccountStorage>,
+    bob_sibling: Engine<SqliteAccountStorage>,
+    bob_sibling_storage: SqliteAccountStorage,
+    carol: Engine<SqliteAccountStorage>,
+    carol_storage: SqliteAccountStorage,
+    group_id: GroupId,
+}
+
+async fn two_device_account_group() -> TwoDeviceAccountGroup {
+    let mut alice = current_device_on(b"alice", SqliteAccountStorage::in_memory().unwrap());
+    let mut bob = current_device_on(b"bob", SqliteAccountStorage::in_memory().unwrap());
+    let bob_sibling_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut bob_sibling = current_device_on(b"bob", bob_sibling_storage.clone());
+    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut carol = current_device_on(b"carol", carol_storage.clone());
+    // One invitee per Welcome: the mock peeler names a Welcome by its bytes.
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "two-device account".into(),
+            description: "".into(),
+            members: vec![carol.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![carol.self_id()],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { mut welcomes } = created else {
+        panic!("current-profile founding group")
+    };
+    carol.join_welcome(welcomes.remove(0)).await.unwrap();
+
+    let mut joined = vec![&mut carol];
+    for device in [&mut bob, &mut bob_sibling] {
+        let SendResult::GroupEvolution {
+            msg,
+            pending,
+            mut welcomes,
+        } = alice
+            .send(SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages: vec![device.fresh_key_package().await.unwrap()],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("device invitation")
+        };
+        alice.confirm_published(pending).await.unwrap();
+        device.join_welcome(welcomes.remove(0)).await.unwrap();
+        for member in &mut joined {
+            member
+                .ingest(route_group_commit(msg.clone(), &group_id))
+                .await
+                .unwrap();
+            converge_buffered_commit(member, &group_id);
+        }
+        joined.push(device);
+    }
+    drop(joined);
+    for device in [&mut alice, &mut bob, &mut bob_sibling, &mut carol] {
+        assert_eq!(device.members(&group_id).unwrap().len(), 4);
+        device.drain_events();
+    }
+    TwoDeviceAccountGroup {
+        alice,
+        bob,
+        bob_sibling,
+        bob_sibling_storage,
+        carol,
+        carol_storage,
+        group_id,
+    }
+}
+
+/// Raw OpenMLS Remove of exactly `leaves`, which may be part of an account.
+fn raw_remove_leaves_commit(
+    storage: &SqliteAccountStorage,
+    sender: &MemberId,
+    group_id: &GroupId,
+    leaves: &[u32],
+) -> TransportMessage {
+    let (mut mls_group, signer) = load_group_and_signer(storage, sender, group_id);
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let leaves: Vec<_> = leaves
+        .iter()
+        .copied()
+        .map(openmls::prelude::LeafNodeIndex::new)
+        .collect();
+    let (commit, _welcome, _group_info) = mls_group
+        .remove_members(&provider, &signer, &leaves)
+        .expect("raw OpenMLS leaf remove commit");
+    let payload = commit
+        .tls_serialize_detached()
+        .expect("serialize raw remove commit");
+    TransportMessage {
+        id: hash_id(&payload),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("raw-openmls-leaf-remove".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    }
+}
+
+/// Carol removes only `bob_sibling`'s leaf; alice, bob and the removed device apply it.
+async fn remove_sibling_leaf(fixture: &mut TwoDeviceAccountGroup) -> u32 {
+    let group_id = fixture.group_id.clone();
+    let sibling_leaf = fixture.bob_sibling.own_leaf_index(&group_id).unwrap();
+    assert_ne!(sibling_leaf, fixture.bob.own_leaf_index(&group_id).unwrap());
+    let commit = raw_remove_leaves_commit(
+        &fixture.carol_storage,
+        &fixture.carol.self_id(),
+        &group_id,
+        &[sibling_leaf],
+    );
+    for device in [
+        &mut fixture.alice,
+        &mut fixture.bob,
+        &mut fixture.bob_sibling,
+    ] {
+        device.ingest(commit.clone()).await.unwrap();
+        converge_buffered_commit(device, &group_id);
+    }
+    sibling_leaf
+}
+
+fn realized_removal(engine: &mut Engine<SqliteAccountStorage>, group_id: &GroupId) {
+    use cgka_traits::engine::GroupEvent;
+
+    assert!(engine.group_record(group_id).unwrap().removed);
+    let events = engine.drain_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::LocalGroupCopyTerminated {
+                voluntary: false,
+                ..
+            }
+        )),
+        "the removed device terminates its copy: {events:?}"
+    );
+    assert!(!engine.group_authority(group_id).unwrap().facts.is_member);
+}
+
+/// An admin's Remove of one of an account's two leaves is a device removal:
+/// that device realizes it, its sibling stays a member and reports no
+/// departure, and other members still see the account.
+#[tokio::test]
+async fn removing_one_device_leaf_terminates_only_that_device() {
+    use cgka_traits::engine::GroupEvent;
+
+    let mut fixture = two_device_account_group().await;
+    let sibling_leaf = remove_sibling_leaf(&mut fixture).await;
+    let TwoDeviceAccountGroup {
+        mut alice,
+        mut bob,
+        mut bob_sibling,
+        group_id,
+        ..
+    } = fixture;
+    let bob_id = bob.self_id();
+
+    realized_removal(&mut bob_sibling, &group_id);
+
+    let bob_events = bob.drain_events();
+    assert!(
+        !emits_departure_of(&bob_events, &bob_id),
+        "a device removal is not an account departure: {bob_events:?}"
+    );
+    assert!(
+        !bob_events
+            .iter()
+            .any(|event| matches!(event, GroupEvent::LocalGroupCopyTerminated { .. })),
+        "the sibling's removal leaves this copy alone: {bob_events:?}"
+    );
+    let facts = bob.group_authority(&group_id).unwrap().facts;
+    assert!(facts.is_member && !facts.removed);
+    assert!(
+        bob.canonical_group_membership(&group_id)
+            .unwrap()
+            .local_leaf_active
+    );
+
+    let alice_events = alice.drain_events();
+    assert!(!emits_departure_of(&alice_events, &bob_id));
+    assert!(
+        alice_events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupMemberLeavesRemoved { leaves, departed_members, .. }
+                if leaves.iter().map(|leaf| leaf.leaf_index).eq([sibling_leaf])
+                    && departed_members.is_empty()
+        )),
+        "one device destination left, no account did: {alice_events:?}"
+    );
+    for engine in [&alice, &bob] {
+        let members = engine.members(&group_id).unwrap();
+        assert_eq!(members.len(), 3);
+        assert!(members.iter().any(|member| member.id == bob_id));
+    }
+
+    // The surviving device keeps sending to the group.
+    let routed = post_eviction_app_message(&mut bob, &group_id, b"still here").await;
+    alice.ingest(routed).await.unwrap();
+    assert!(alice.drain_events().iter().any(|event| matches!(
+        event,
+        GroupEvent::MessageReceived { sender, .. } if sender == &bob_id
+    )));
+}
+
+/// A removed device whose account still has a leaf joins a re-add Welcome
+/// directly: its discarded copy has no active leaf, so the Welcome is not a
+/// rival branch needing the recipient's confirmation.
+#[tokio::test]
+async fn removed_device_rejoins_without_confirmation_while_its_sibling_stays() {
+    let mut fixture = two_device_account_group().await;
+    remove_sibling_leaf(&mut fixture).await;
+    let TwoDeviceAccountGroup {
+        mut alice,
+        mut bob_sibling,
+        group_id,
+        ..
+    } = fixture;
+    realized_removal(&mut bob_sibling, &group_id);
+
+    let SendResult::GroupEvolution {
+        pending,
+        mut welcomes,
+        ..
+    } = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![bob_sibling.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("re-add the removed device")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    assert_eq!(
+        bob_sibling.join_welcome(welcomes.remove(0)).await.unwrap(),
+        group_id
+    );
+    assert!(!bob_sibling.group_record(&group_id).unwrap().removed);
+    assert!(
+        bob_sibling
+            .group_authority(&group_id)
+            .unwrap()
+            .facts
+            .is_member
+    );
+}
+
+/// A removed device's copy keeps no leave request through its account's
+/// surviving leaf: once its removal is realized, reopening drops the request.
+/// Before realization (the silent-eviction window) the request stays, as it
+/// does for an account with one device, so realization can still attribute
+/// the departure as a leave.
+#[tokio::test]
+async fn removed_device_copy_drops_its_leave_request_through_its_sibling_leaf() {
+    let mut fixture = two_device_account_group().await;
+    remove_sibling_leaf(&mut fixture).await;
+    let TwoDeviceAccountGroup {
+        bob,
+        mut bob_sibling,
+        bob_sibling_storage,
+        group_id,
+        ..
+    } = fixture;
+    realized_removal(&mut bob_sibling, &group_id);
+    drop(bob_sibling);
+    let realized = bob_sibling_storage.get_group(&group_id).unwrap();
+    assert!(
+        realized
+            .members
+            .iter()
+            .any(|member| member.id == bob.self_id()),
+        "the sibling's leaf keeps the account on the removed copy's roster"
+    );
+
+    let reopen_with_leave_request = |removed: bool| {
+        let mut record = realized.clone();
+        record.removed = removed;
+        bob_sibling_storage.put_group(&record).unwrap();
+        bob_sibling_storage
+            .put_leave_request(&cgka_traits::storage::LeaveRequest {
+                group_id: group_id.clone(),
+                requested_at_ms: 1,
+                last_proposed_epoch: None,
+            })
+            .unwrap();
+        current_device_on(b"bob", bob_sibling_storage.clone())
+            .hydrate_all_stored_groups()
+            .unwrap();
+        bob_sibling_storage.leave_request(&group_id).unwrap()
+    };
+    assert!(
+        reopen_with_leave_request(false).is_some(),
+        "realization still owes the silent-eviction copy its leave"
+    );
+    assert!(
+        reopen_with_leave_request(true).is_none(),
+        "a realized removal drops a leave request this device can never send"
+    );
+}
+
+/// Removing an account removes every one of its leaves in one Commit, and
+/// each of its devices realizes the removal.
+#[tokio::test]
+async fn removing_an_account_removes_every_device_leaf_in_one_commit() {
+    use cgka_traits::engine::GroupEvent;
+
+    let TwoDeviceAccountGroup {
+        mut alice,
+        mut bob,
+        mut bob_sibling,
+        mut carol,
+        group_id,
+        ..
+    } = two_device_account_group().await;
+    let bob_id = bob.self_id();
+    let mut bob_leaves = vec![
+        bob.own_leaf_index(&group_id).unwrap(),
+        bob_sibling.own_leaf_index(&group_id).unwrap(),
+    ];
+    bob_leaves.sort_unstable();
+
+    let SendResult::GroupEvolution { msg, pending, .. } = alice
+        .send(SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![bob_id.clone()],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("remove the account")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let account_removal = |events: &[GroupEvent]| {
+        events.iter().any(|event| matches!(
+            event,
+            GroupEvent::GroupMemberLeavesRemoved { leaves, departed_members, .. }
+                if {
+                    let mut removed: Vec<_> = leaves.iter().map(|leaf| leaf.leaf_index).collect();
+                    removed.sort_unstable();
+                    removed == bob_leaves && departed_members == &vec![bob_id.clone()]
+                }
+        )) && emits_removed_of(events, &bob_id)
+    };
+    let alice_events = alice.drain_events();
+    assert!(account_removal(&alice_events), "{alice_events:?}");
+    assert!(
+        !alice
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .any(|member| member.id == bob_id)
+    );
+
+    let routed = route_group_commit(msg, &group_id);
+    carol.ingest(routed.clone()).await.unwrap();
+    converge_buffered_commit(&mut carol, &group_id);
+    let carol_events = carol.drain_events();
+    assert!(account_removal(&carol_events), "{carol_events:?}");
+    for device in [&mut bob, &mut bob_sibling] {
+        device.ingest(routed.clone()).await.unwrap();
+        converge_buffered_commit(device, &group_id);
+        realized_removal(device, &group_id);
+    }
+}
+
 #[tokio::test]
 async fn invite_adds_third_member_and_advances_epoch() {
     let mut alice = build_client(b"alice");

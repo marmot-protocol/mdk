@@ -42,6 +42,8 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- `groups management` offers no member actions on a device that was removed while another device of its account stays
+  in the group (mdk#2628). It used to read that account's roster entry as this device.
 - `wn-agent` no longer replaces an imported identity's published relay lists on its first start (mdk#2550). With no
   cached copy of the account's kind 10002 or 10050 list, it published a new list naming only its own relays. It now
   reads the published lists from its relays and adopts them. It publishes a list only when every relay answered and

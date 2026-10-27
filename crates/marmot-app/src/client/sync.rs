@@ -820,7 +820,7 @@ fn defer_event_projection(
         cgka_traits::engine::GroupEvent::MessageReceived { .. }
             | cgka_traits::engine::GroupEvent::GroupJoined { .. }
     ) {
-        summary.events.push(event.clone());
+        summary.events.push(crate::groups::host_group_event(event));
     }
     true
 }

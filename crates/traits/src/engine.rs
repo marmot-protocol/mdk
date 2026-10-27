@@ -586,6 +586,9 @@ pub enum GroupEvent {
     GroupMemberLeavesRemoved {
         group_id: GroupId,
         epoch: EpochId,
+        /// Removed device destinations, for MDK's own push-token cleanup.
+        /// `marmot-app` empties this list before hosts receive the event, so
+        /// no leaf index reaches a host.
         leaves: Vec<GroupMemberLeaf>,
         /// Accounts with no surviving leaf. Only these lose their tombstones.
         departed_members: Vec<MemberId>,
