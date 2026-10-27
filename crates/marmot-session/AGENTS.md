@@ -32,8 +32,9 @@ It must not own MLS internals, transport event parsing, SQLCipher key derivation
   `SystemMonotonicClock`, `OsMaintenanceRandom`). Persist wall-clock values and sampled jitter; use monotonic time only
   for in-process windows and timeouts.
 
-Tests: `tests/runtime.rs` plus `tests/runtime/` (frozen fanout, KeyPackage generator upgrade, component migration), and
-the session's `tests/session_lifecycle.rs`, `tests/nostr_stack.rs` and `tests/nostr_stack_chaos.rs`.
+Tests: `tests/runtime.rs` plus `tests/runtime/` (frozen fanout, KeyPackage generator upgrade, component migration,
+multi-device Welcome delivery), and the session's `tests/session_lifecycle.rs`, `tests/nostr_stack.rs` and
+`tests/nostr_stack_chaos.rs`.
 
 ## Rules
 

@@ -119,6 +119,37 @@ pub(crate) fn welcome_content_dedup_id(
     }
 }
 
+/// Receiving flow step 2 (`protocol-core/joining.md`): a delivery joins only
+/// when it names a KeyPackage this device published. `first_held` is the first
+/// Welcome secret, in OpenMLS order, for which this device holds a private
+/// bundle; the result is the reference the join consumes.
+///
+/// A delivery naming one of [`KeyPackageLifecycleState::held_publications`] is
+/// this device's join, and a missing bundle fails it as before. One naming any
+/// other KeyPackage, such as a sibling device's, is not addressed to this
+/// device. The exception is a Welcome that only opens with a bundle whose
+/// publication this device never recorded: KeyPackages kept from before ids
+/// were recorded must still join after an upgrade, and a sibling's delivery
+/// can reach one only when it carries the same Welcome as this device's own.
+/// A transport that names no KeyPackage leaves the decision to the MLS match.
+pub(crate) fn welcome_key_package_of_this_device(
+    lifecycle: Option<&KeyPackageLifecycleState>,
+    claimed: Option<&MessageId>,
+    first_held: Option<Vec<u8>>,
+) -> Result<Vec<u8>, EngineError> {
+    let held = || {
+        lifecycle
+            .into_iter()
+            .flat_map(KeyPackageLifecycleState::held_publications)
+    };
+    match claimed {
+        Some(claimed) if !held().any(|(id, _)| id == claimed) => first_held
+            .filter(|reference| !held().any(|(_, held_ref)| held_ref == reference.as_slice()))
+            .ok_or(EngineError::WelcomeNotAddressedToThisDevice),
+        _ => first_held.ok_or(EngineError::MissingWelcomeKeyPackage),
+    }
+}
+
 pub(crate) fn terminal_welcome_error(error: &EngineError) -> bool {
     matches!(
         error,
@@ -1044,10 +1075,12 @@ impl<S: StorageProvider> Engine<S> {
         consent: Option<(&GroupId, &[u8])>,
     ) -> Result<GroupId, EngineError> {
         let welcome_id = welcome_msg.id.clone();
-        let (welcome_bytes, welcome_created_at) = match peeled.content {
-            cgka_traits::ingest::PeeledContent::Welcome { bytes, created_at } => {
-                (bytes, created_at)
-            }
+        let (welcome_bytes, welcome_created_at, key_package_claim) = match peeled.content {
+            cgka_traits::ingest::PeeledContent::Welcome {
+                bytes,
+                created_at,
+                key_package_event_id,
+            } => (bytes, created_at, key_package_event_id),
             _ => {
                 return Err(EngineError::Peeler(
                     cgka_traits::error::PeelerError::Malformed(
@@ -1112,7 +1145,9 @@ impl<S: StorageProvider> Engine<S> {
             // Match in the same order OpenMLS uses: the first Welcome
             // KeyPackageRef for which this account-device has a private
             // bundle. Transport tags are deliberately outside this
-            // selection. Point-query per candidate ref — the same lookup
+            // selection; the delivery's KeyPackage claim only decides
+            // below whether it is addressed to this device. Point-query
+            // per candidate ref — the same lookup
             // `ProcessedWelcome::new_from_welcome` performs internally —
             // rather than enumerating, JSON-decoding, and re-hashing
             // every stored bundle on each join.
@@ -1128,8 +1163,33 @@ impl<S: StorageProvider> Engine<S> {
                     break;
                 }
             }
-            let consumed_key_package_ref =
-                consumed_key_package_ref.ok_or(EngineError::MissingWelcomeKeyPackage)?;
+            // Before anything is decrypted, so a delivery for another
+            // device consumes nothing and never reaches the rejoin offers.
+            let lifecycle = match (&key_package_claim, storage.maintenance_storage()) {
+                (Some(_), Some(maintenance)) => maintenance.key_package_lifecycle()?,
+                _ => None,
+            };
+            let consumed_key_package_ref = match welcome_key_package_of_this_device(
+                lifecycle.as_ref(),
+                key_package_claim.as_ref(),
+                consumed_key_package_ref.clone(),
+            ) {
+                // An offer this device already holds passed this check when
+                // it arrived, or was stored before deliveries were checked,
+                // when the MLS match alone decided. Such an offer may wrap
+                // this device's own Welcome in another device's delivery,
+                // and this device's own copy has usually passed the transport
+                // cursor, so the MLS match decides it still.
+                Err(EngineError::WelcomeNotAddressedToThisDevice)
+                    if storage
+                        .list_welcomes()?
+                        .iter()
+                        .any(|offer| offer.message_id == welcome_id) =>
+                {
+                    consumed_key_package_ref.ok_or(EngineError::MissingWelcomeKeyPackage)?
+                }
+                decided => decided?,
+            };
             let processed = openmls::group::ProcessedWelcome::new_from_welcome(
                 &provider,
                 &join_config,
@@ -2079,5 +2139,43 @@ mod tests {
         let error = classify_openmls_welcome_error(WelcomeError::<&str>::NoMatchingKeyPackage);
         assert!(matches!(error, EngineError::MissingWelcomeKeyPackage));
         assert!(terminal_welcome_error(&error));
+    }
+
+    #[test]
+    fn a_welcome_joins_only_through_a_key_package_this_device_published() {
+        let id = |byte| MessageId::new(vec![byte; 32]);
+        let mut lifecycle = KeyPackageLifecycleState::slot_only("slot".into());
+        lifecycle.current_key_package_ref = Some(vec![1]);
+        lifecycle.authored_event_id = Some(id(1));
+        let decide = |claimed: Option<MessageId>, first_held: Option<Vec<u8>>| {
+            welcome_key_package_of_this_device(Some(&lifecycle), claimed.as_ref(), first_held)
+        };
+
+        // This device's own delivery joins, or fails as it always has.
+        assert_eq!(decide(Some(id(1)), Some(vec![1])).unwrap(), vec![1]);
+        assert!(matches!(
+            decide(Some(id(1)), None),
+            Err(EngineError::MissingWelcomeKeyPackage)
+        ));
+        // A sibling's or unknown delivery is not this device's, even when
+        // the shared Welcome also opens with this device's KeyPackage.
+        for first_held in [None, Some(vec![1])] {
+            assert!(matches!(
+                decide(Some(id(2)), first_held),
+                Err(EngineError::WelcomeNotAddressedToThisDevice)
+            ));
+        }
+        // A bundle with no recorded publication predates the ids.
+        assert_eq!(decide(Some(id(2)), Some(vec![9])).unwrap(), vec![9]);
+        assert_eq!(
+            welcome_key_package_of_this_device(None, Some(&id(2)), Some(vec![9])).unwrap(),
+            vec![9]
+        );
+        // Without a claim, the MLS match decides alone.
+        assert_eq!(decide(None, Some(vec![1])).unwrap(), vec![1]);
+        assert!(matches!(
+            decide(None, None),
+            Err(EngineError::MissingWelcomeKeyPackage)
+        ));
     }
 }

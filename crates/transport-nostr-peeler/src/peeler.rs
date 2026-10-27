@@ -15,7 +15,7 @@ use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::{GroupMessageMetadata, TransportPeeler};
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
-use cgka_traits::types::{GroupId, MemberId};
+use cgka_traits::types::{GroupId, MemberId, MessageId};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use nostr::prelude::{
@@ -261,6 +261,7 @@ impl NostrMlsPeeler {
                 content: PeeledContent::Welcome {
                     created_at: Some(cgka_traits::Timestamp(unwrapped.rumor.created_at.as_secs())),
                     bytes: welcome_bytes,
+                    key_package_event_id: Some(MessageId::new(key_package_event_id.to_vec())),
                 },
                 origin: msg.clone(),
             },
@@ -1160,6 +1161,9 @@ mod tests {
             PeeledContent::Welcome {
                 created_at: Some(cgka_traits::Timestamp(unwrapped.rumor.created_at.as_secs())),
                 bytes: b"mls welcome bytes".to_vec(),
+                // The engine decides from the `e` claim whether the delivery
+                // is addressed to this device, so it travels with the bytes.
+                key_package_event_id: Some(sample_welcome_metadata().key_package_event_id),
             }
         );
     }
