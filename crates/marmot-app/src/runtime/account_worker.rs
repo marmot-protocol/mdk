@@ -1537,7 +1537,7 @@ async fn run_app_runtime_account_worker(
                                         send_message_on_worker(
                                             &mut client, enqueued_at, queued, group_id, payload, respond,
                                             &events, &account_id_hex, &account_label, &shared,
-                                            shared.product_analytics.permit(),
+                                            shared.observer.product().permit(),
                                         ).await;
                                         publish_client_pending_applied_summary(
                                             &mut client, &events, &account_id_hex, &account_label,
@@ -1750,7 +1750,7 @@ async fn run_app_runtime_account_worker(
     let (media_http_tx, mut media_http_rx) = mpsc::unbounded_channel();
     let (media_http_worker_lifetime, _) = watch::channel(());
     let media_http = MediaHttpContext {
-        product: shared.product_analytics.clone(),
+        product: shared.observer.product().clone(),
         tx: media_http_tx,
         permits: Arc::new(Semaphore::new(MEDIA_HTTP_IN_FLIGHT_LIMIT)),
         prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
@@ -1843,7 +1843,7 @@ async fn run_app_runtime_account_worker(
     schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
 
     let mut reconnect_backoff = AccountWorkerReconnectBackoff::default();
-    let product_backlog = shared.product_analytics.backlog_source();
+    let product_backlog = shared.observer.product().backlog_source();
     let mut maintenance_tick = interval(Duration::from_secs(15));
     maintenance_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut legacy_message_promotion = LegacyMessagePromotionSchedule::new();
@@ -2433,7 +2433,7 @@ async fn run_app_runtime_account_worker(
                                         // complete and let that job settle the
                                         // still-durable recovery debt.
                                         let backfill_armed = client.has_pending_epoch_backfill();
-                                        let observation = backfill_armed.then(|| shared.product_analytics.begin(
+                                        let observation = backfill_armed.then(|| shared.observer.product().begin(
                                             crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
                                         )).flatten();
                                         let backfill_result = if comparison_recovery.is_some() {
@@ -2996,7 +2996,7 @@ async fn run_app_runtime_account_worker(
                     &mut attachment_admission,
                 );
                 if client.key_package_maintenance_requires_catch_up() {
-                    let observation = shared.product_analytics.begin(
+                    let observation = shared.observer.product().begin(
                         crate::ProductFamily::Maintenance, "catch_up", crate::ProductUnit::Attempt,
                     );
                     let catch_up = timeout(
@@ -3078,7 +3078,7 @@ async fn run_app_runtime_account_worker(
                     &command_tx,
                 );
                 let backfill_armed = client.has_pending_epoch_backfill();
-                let observation = backfill_armed.then(|| shared.product_analytics.begin(
+                let observation = backfill_armed.then(|| shared.observer.product().begin(
                     crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
                 )).flatten();
                 let backfill_result = match start_pending_recovery_job(
@@ -3255,7 +3255,7 @@ async fn start_receive_recovery(
     let backfill_armed = client.has_pending_epoch_backfill();
     let observation = backfill_armed
         .then(|| {
-            context.shared.product_analytics.begin(
+            context.shared.observer.product().begin(
                 crate::ProductFamily::Recovery,
                 "backfill",
                 crate::ProductUnit::Attempt,
@@ -3322,7 +3322,7 @@ async fn finish_periodic_maintenance_after_recovery(
             account_error_message("post-join maintenance subscription failed", &err),
         );
     }
-    let backlog_permit = shared.product_analytics.permit();
+    let backlog_permit = shared.observer.product().permit();
     match client.run_due_maintenance().await {
         Ok(summary) => {
             if let Some(permit) = &backlog_permit {
@@ -4750,7 +4750,7 @@ fn respond_diagnosed<T>(
     result: Result<T, AppError>,
 ) -> Result<(), Result<T, AppError>> {
     if let Err(error) = &result {
-        shared.product_analytics.storage_failure(permit, error);
+        shared.observer.product().storage_failure(permit, error);
     }
     respond.send(result)
 }
@@ -4803,7 +4803,7 @@ fn account_worker_command_future<'a>(
         media_http,
         scheduled_convergence,
     } = context;
-    let storage_permit = shared.product_analytics.permit();
+    let storage_permit = shared.observer.product().permit();
     match command {
         AccountWorkerCommand::ConnectivityRestored { respond } => Box::pin(async move {
             let result = client.note_connectivity_restored().map(|_| ());
@@ -7426,7 +7426,7 @@ async fn run_pending_epoch_backfill_reporting_arm(
     let backfill_armed = client.has_pending_epoch_backfill();
     let observation = backfill_armed
         .then(|| {
-            shared.product_analytics.begin(
+            shared.observer.product().begin(
                 crate::ProductFamily::Recovery,
                 "backfill",
                 crate::ProductUnit::Attempt,

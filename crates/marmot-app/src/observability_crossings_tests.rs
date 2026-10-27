@@ -67,6 +67,7 @@ const MOVING_SET: &[&str] = &[
     "app_telemetry",
     "audit_otlp_sender",
     "collector_host_safety",
+    "observer",
     "product_analytics",
     "relay_telemetry_export",
 ];

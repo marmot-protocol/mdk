@@ -376,11 +376,12 @@ pub struct RuntimeSharedServices {
     attachment_updates: watch::Sender<()>,
     attachment_cancellations: watch::Sender<()>,
     attachment_permissions: attachment_permission::Permissions,
-    product_analytics: crate::ProductAnalytics,
+    /// The recording handle: the app's product collector, shared, and this runtime's own
+    /// performance recorder.
+    observer: crate::observer::Observer,
     product_worker: Arc<StdMutex<Option<JoinHandle<()>>>>,
     diagnostics_executor: Arc<StdMutex<Option<tokio::runtime::Handle>>>,
     relay_plane: MarmotRelayPlane,
-    app_performance_telemetry: AppPerformanceTelemetry,
     agent_streams: AgentStreamWatchManager,
     lifecycle: RuntimeLifecycle,
     relay_telemetry_exporter: Arc<StdMutex<Option<JoinHandle<()>>>>,
@@ -492,8 +493,7 @@ impl Default for RuntimeSharedServices {
             attachment_cancellations: watch::channel(()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
-            app_performance_telemetry: AppPerformanceTelemetry::default(),
-            product_analytics: crate::ProductAnalytics::default(),
+            observer: crate::observer::Observer::default(),
             product_worker: Arc::new(StdMutex::new(None)),
             diagnostics_executor: Arc::new(StdMutex::new(None)),
             agent_streams: AgentStreamWatchManager::default(),
@@ -590,10 +590,7 @@ impl RuntimeSharedServices {
             attachment_cancellations: watch::channel(()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: app.relay_plane.clone(),
-            app_performance_telemetry: AppPerformanceTelemetry::with_product_analytics(
-                app.product_analytics.clone(),
-            ),
-            product_analytics: app.product_analytics.clone(),
+            observer: crate::observer::Observer::sharing(&app.product_analytics),
             product_worker: Arc::new(StdMutex::new(None)),
             diagnostics_executor: Arc::new(StdMutex::new(None)),
             agent_streams: AgentStreamWatchManager::default(),
@@ -621,7 +618,7 @@ impl RuntimeSharedServices {
     }
 
     pub fn app_performance_telemetry(&self) -> AppPerformanceTelemetry {
-        self.app_performance_telemetry.clone()
+        self.observer.performance().clone()
     }
 
     pub fn agent_streams(&self) -> AgentStreamWatchManager {
@@ -724,7 +721,7 @@ impl RuntimeSharedServices {
         self.stop_relay_telemetry_exporter();
         #[cfg(feature = "otlp-export")]
         {
-            let Some(permit) = self.product_analytics.permit() else {
+            let Some(permit) = self.observer.product().permit() else {
                 return;
             };
             let Some(executor) = self.diagnostics_executor() else {
@@ -734,7 +731,7 @@ impl RuntimeSharedServices {
                 crate::RelayTelemetryExporter::new(&self.relay_plane, config, permit)
             {
                 let shutdown = self.lifecycle.subscribe_shutdown();
-                let app_performance_telemetry = self.app_performance_telemetry.clone();
+                let app_performance_telemetry = self.observer.performance().clone();
                 let handle = executor
                     .spawn(exporter.run_with_app_performance(shutdown, app_performance_telemetry));
                 *self
@@ -1732,7 +1729,7 @@ impl MarmotAppRuntime {
             self.shared.lifecycle().ensure_running()?;
             let app = self.accounts.app.clone();
             blocking_app_task(move || app.warm_directory_storage()).await?;
-            self.shared.product_analytics.telemetry_origin(
+            self.shared.observer.product().telemetry_origin(
                 self.shared
                     .relay_telemetry_runtime_config()
                     .otlp_endpoint
@@ -1843,7 +1840,7 @@ impl MarmotAppRuntime {
     /// projection path as ordinary catch-up. It is intended for user- or
     /// diagnostics-directed repair; normal startup remains cursor-based.
     pub async fn repair_full_history(&self, account_ref: &str) -> Result<(), AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observation = self.shared.observer.product().begin(
             crate::ProductFamily::Sync,
             "full_history",
             crate::ProductUnit::Action,
@@ -1864,7 +1861,7 @@ impl MarmotAppRuntime {
         max_wait_ms: u32,
         _source: NotificationWakeSource,
     ) -> BackgroundNotificationCollection {
-        let observation = self.shared.product_analytics.begin(
+        let observation = self.shared.observer.product().begin(
             crate::ProductFamily::Notification,
             "schedule",
             crate::ProductUnit::Attempt,
@@ -3011,12 +3008,13 @@ impl MarmotAppRuntime {
     }
 
     pub fn usage_diagnostics_status(&self) -> crate::UsageDiagnosticsStatus {
-        let mut status = self.shared.product_analytics.status();
-        status.telemetry = if self.shared.product_analytics.permit().is_none() {
+        let mut status = self.shared.observer.product().status();
+        status.telemetry = if self.shared.observer.product().permit().is_none() {
             crate::DiagnosticsExporterStatus::Disabled
         } else if self
             .shared
-            .product_analytics
+            .observer
+            .product()
             .telemetry_rejected
             .load(std::sync::atomic::Ordering::Acquire)
         {
@@ -3052,7 +3050,7 @@ impl MarmotAppRuntime {
         if let Some(old) = worker.take() {
             old.abort();
         }
-        if self.shared.lifecycle().is_running() && self.shared.product_analytics.permit().is_some()
+        if self.shared.lifecycle().is_running() && self.shared.observer.product().permit().is_some()
         {
             let Some(executor) = self.shared.diagnostics_executor() else {
                 return;
@@ -3060,7 +3058,8 @@ impl MarmotAppRuntime {
             *worker = Some(
                 executor.spawn(
                     self.shared
-                        .product_analytics
+                        .observer
+                        .product()
                         .clone()
                         .run(self.shared.relay_plane().clone()),
                 ),
@@ -3109,7 +3108,7 @@ impl MarmotAppRuntime {
             .and_then(|v| url::Url::parse(v).ok())
             .map(|v| v.origin().ascii_serialization())
             .unwrap_or_default();
-        self.shared.product_analytics.configure(config, origin)?;
+        self.shared.observer.product().configure(config, origin)?;
         if self.shared.lifecycle().is_running() {
             self.accounts.app.restore_usage_diagnostics()?;
         }
@@ -3125,7 +3124,10 @@ impl MarmotAppRuntime {
         if self.is_stopping() {
             return None;
         }
-        self.shared.product_analytics.begin(family, operation, unit)
+        self.shared
+            .observer
+            .product()
+            .begin(family, operation, unit)
     }
 
     pub fn record_product_event(
@@ -3135,7 +3137,7 @@ impl MarmotAppRuntime {
         if self.is_stopping() {
             return Ok(crate::ProductRecordResult::IgnoredDisabled);
         }
-        Ok(self.shared.product_analytics.record(event)?)
+        Ok(self.shared.observer.product().record(event)?)
     }
 
     /// Record an app-defined timing through the consent-gated product exporter.
@@ -3172,17 +3174,17 @@ impl MarmotAppRuntime {
             return;
         }
         let background = activity == crate::ProductAnalyticsActivity::Background;
-        self.shared.product_analytics.activity(activity);
+        self.shared.observer.product().activity(activity);
         if background {
-            self.shared.product_analytics.flush().await;
+            self.shared.observer.product().flush().await;
         }
     }
     pub async fn flush_product_analytics(&self) {
         if self.is_stopping() {
             return;
         }
-        self.shared.product_analytics.seal_partial();
-        self.shared.product_analytics.flush().await;
+        self.shared.observer.product().seal_partial();
+        self.shared.observer.product().flush().await;
     }
 
     pub fn relay_telemetry_settings(&self) -> Result<RelayTelemetrySettings, AppError> {
@@ -3251,7 +3253,7 @@ impl MarmotAppRuntime {
             .map_err(AppError::InvalidRelayTelemetrySettings)?;
         self.shared
             .set_relay_telemetry_runtime_config(config.clone());
-        self.shared.product_analytics.telemetry_origin(
+        self.shared.observer.product().telemetry_origin(
             config.otlp_endpoint.as_deref().or(self
                 .shared
                 .service_endpoints
@@ -3262,7 +3264,8 @@ impl MarmotAppRuntime {
             self.accounts.app.restore_usage_diagnostics()?;
         }
         self.shared
-            .product_analytics
+            .observer
+            .product()
             .telemetry_rejected
             .store(false, std::sync::atomic::Ordering::Release);
         self.refresh_diagnostics_exporters()?;
@@ -3374,7 +3377,7 @@ impl MarmotAppRuntime {
         account_ref: &str,
         enabled: bool,
     ) -> Result<NotificationSettings, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observation = self.shared.observer.product().begin(
             crate::ProductFamily::Notification,
             if enabled {
                 "local_enable"
@@ -3406,7 +3409,7 @@ impl MarmotAppRuntime {
         group_id_hex: &str,
         muted_until_ms: Option<i64>,
     ) -> Result<ChatNotificationSettings, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observation = self.shared.observer.product().begin(
             crate::ProductFamily::Notification,
             "mute",
             crate::ProductUnit::Action,
@@ -3448,7 +3451,7 @@ impl MarmotAppRuntime {
         account_ref: &str,
         group_id_hex: &str,
     ) -> Result<ChatNotificationSettings, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observation = self.shared.observer.product().begin(
             crate::ProductFamily::Notification,
             "unmute",
             crate::ProductUnit::Action,
@@ -3489,7 +3492,7 @@ impl MarmotAppRuntime {
         account_ref: &str,
         enabled: bool,
     ) -> Result<NotificationSettings, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observation = self.shared.observer.product().begin(
             crate::ProductFamily::Notification,
             if enabled {
                 "native_enable"
@@ -4087,7 +4090,7 @@ impl MarmotAppRuntime {
         event_id_hex: &str,
         relays: Vec<TransportEndpoint>,
     ) -> Result<usize, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observation = self.shared.observer.product().begin(
             crate::ProductFamily::KeyPackage,
             "retire",
             crate::ProductUnit::Action,
@@ -4209,7 +4212,7 @@ impl MarmotAppRuntime {
         account_ref: &str,
         options: SignOutOptions,
     ) -> Result<SignOutOutcome, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observation = self.shared.observer.product().begin(
             crate::ProductFamily::Account,
             "logout",
             crate::ProductUnit::Action,
@@ -4737,7 +4740,7 @@ impl MarmotAppRuntime {
         account_ref: &str,
         user_account_id_hex: &str,
     ) -> Result<Vec<String>, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observation = self.shared.observer.product().begin(
             crate::ProductFamily::Directory,
             "follow",
             crate::ProductUnit::Action,
@@ -4767,7 +4770,7 @@ impl MarmotAppRuntime {
         account_ref: &str,
         user_account_id_hex: &str,
     ) -> Result<Vec<String>, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observation = self.shared.observer.product().begin(
             crate::ProductFamily::Directory,
             "unfollow",
             crate::ProductUnit::Action,
@@ -5637,7 +5640,7 @@ impl MarmotAppRuntime {
         schedule_background: bool,
         initial_profile: Option<UserProfileMetadata>,
     ) -> Result<AccountSetupResult, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observation = self.shared.observer.product().begin(
             crate::ProductFamily::Account,
             "local_ready",
             crate::ProductUnit::Attempt,
@@ -6106,16 +6109,16 @@ impl MarmotAppRuntime {
                 APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT.saturating_sub(started_at.elapsed()),
             )
             .await;
-        self.shared.product_analytics.observe(
+        self.shared.observer.product().observe(
             crate::ProductFamily::Runtime,
             "shutdown",
             "success",
             crate::ProductUnit::Attempt,
             Some(started_at.elapsed()),
         );
-        self.shared.product_analytics.seal_partial();
-        self.shared.product_analytics.flush().await;
-        self.shared.product_analytics.revoke_memory();
+        self.shared.observer.product().seal_partial();
+        self.shared.observer.product().flush().await;
+        self.shared.observer.product().revoke_memory();
         self.restart_product_worker();
         tracing::debug!(
             target: "marmot_app::runtime",
@@ -6190,7 +6193,7 @@ impl MarmotAppRuntime {
         // clones after its deadline, but terminal storage closure makes those
         // clones inert and releases the suspension-sensitive root lease.
         let app = self.accounts.app.clone();
-        let close_observation = self.shared.product_analytics.begin(
+        let close_observation = self.shared.observer.product().begin(
             crate::ProductFamily::Storage,
             "close",
             crate::ProductUnit::Attempt,
@@ -6207,9 +6210,9 @@ impl MarmotAppRuntime {
             });
         }
 
-        self.shared.product_analytics.seal_partial();
-        self.shared.product_analytics.flush().await;
-        self.shared.product_analytics.revoke_memory();
+        self.shared.observer.product().seal_partial();
+        self.shared.observer.product().flush().await;
+        self.shared.observer.product().revoke_memory();
         self.restart_product_worker();
         let graceful_wait = self.shutdown_grace_wait();
         if timeout(graceful_wait, self.shutdown()).await.is_err() {
@@ -6855,7 +6858,7 @@ impl AccountManager {
 
     /// Explicitly re-activate a reversibly signed-out local account.
     pub async fn sign_in_account(&self, account_ref: &str) -> Result<ManagedAccount, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observation = self.shared.observer.product().begin(
             crate::ProductFamily::Account,
             "login",
             crate::ProductUnit::Action,
@@ -7648,7 +7651,7 @@ impl AccountManager {
         &self,
         request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observation = self.shared.observer.product().begin(
             crate::ProductFamily::Account,
             if request.import_nsec.is_some() {
                 "import"
@@ -7909,7 +7912,7 @@ impl AccountManager {
     where
         S: crate::ExternalAccountSigner + 'static,
     {
-        let observation = self.shared.product_analytics.begin(
+        let observation = self.shared.observer.product().begin(
             crate::ProductFamily::Account,
             "external_signer",
             crate::ProductUnit::Attempt,

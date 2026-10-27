@@ -76,6 +76,7 @@ mod user_blocks;
 pub use runtime::RuntimeBlockListSubscription;
 pub use user_blocks::{BlockListSnapshot, BlockedUser};
 mod agent_streams;
+mod app_outcome;
 mod app_telemetry;
 mod collector_host_safety;
 mod network_proxy;
@@ -129,6 +130,7 @@ mod nostr_verification;
 mod notifications;
 #[cfg(test)]
 mod observability_crossings_tests;
+mod observer;
 mod profile_publication;
 mod projection;
 mod publisher_sequences;

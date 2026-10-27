@@ -24,6 +24,7 @@ pub use builtins::approved_host_product_schemas;
 pub use catalogue::*;
 #[cfg(feature = "product-analytics-export")]
 mod delivery;
+pub(crate) mod observed;
 #[cfg(test)]
 mod tests;
 
@@ -1087,12 +1088,8 @@ impl ProductAnalytics {
         }
         self.accumulate(&mut s, ProductFamily::Sync.as_str(), props);
         if let Some(failure) = failure {
-            let operation = match failure.error_class {
-                crate::SyncErrorClass::StorageBusy => Some("busy"),
-                crate::SyncErrorClass::StorageCorruption => Some("corruption"),
-                crate::SyncErrorClass::StorageCapacity => Some("capacity"),
-                _ => None,
-            };
+            let operation = StorageFailureKind::from_sync_class(failure.error_class)
+                .map(StorageFailureKind::as_str);
             if let Some(operation) = operation {
                 self.accumulate(
                     &mut s,
@@ -1638,26 +1635,52 @@ impl Drop for ProductObservation {
         }
     }
 }
+/// A storage failure the collector counts, by the class of the error behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StorageFailureKind {
+    Busy,
+    Corruption,
+    Capacity,
+}
+impl StorageFailureKind {
+    /// The counted kind of a sync error class; other classes are not storage failures.
+    pub(crate) const fn from_sync_class(class: crate::SyncErrorClass) -> Option<Self> {
+        match class {
+            crate::SyncErrorClass::StorageBusy => Some(Self::Busy),
+            crate::SyncErrorClass::StorageCorruption => Some(Self::Corruption),
+            crate::SyncErrorClass::StorageCapacity => Some(Self::Capacity),
+            _ => None,
+        }
+    }
+    /// The storage operation it is counted under.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Corruption => "corruption",
+            Self::Capacity => "capacity",
+        }
+    }
+}
 impl ProductAnalytics {
-    /// Called only at a canonical failing command boundary, with its admission generation.
-    pub(crate) fn storage_failure(&self, permit: Option<&DiagnosticsPermit>, error: &AppError) {
+    /// Called only at a canonical failing command boundary, with its admission generation and
+    /// the storage failure its error counts as, if any. `marmot-app` converts its errors
+    /// (`app_outcome`); a forwarded sync failure counts as none, since the sync completion
+    /// observation already owns it.
+    pub(crate) fn storage_failure(
+        &self,
+        permit: Option<&DiagnosticsPermit>,
+        failure: impl Into<Option<StorageFailureKind>>,
+    ) {
         let Some(permit) = permit else {
             return;
         };
-        // A forwarded sync failure is already owned by the sync completion observation.
-        if matches!(error, AppError::AccountCatchUp(_)) {
+        let Some(failure) = failure.into() else {
             return;
-        }
-        let operation = match error.sync_error_class() {
-            crate::app_telemetry::SyncErrorClass::StorageBusy => "busy",
-            crate::app_telemetry::SyncErrorClass::StorageCorruption => "corruption",
-            crate::app_telemetry::SyncErrorClass::StorageCapacity => "capacity",
-            _ => return,
         };
         self.observe_count(
             permit,
             ProductFamily::Storage,
-            operation,
+            failure.as_str(),
             "failure",
             ProductUnit::Attempt,
             1,

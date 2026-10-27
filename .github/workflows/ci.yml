@@ -595,6 +595,7 @@ jobs:
         run: |
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib product_analytics:: --locked
           cargo test -p marmot-app --features otlp-export,product-analytics-export --lib backend_maintenance_collects --locked
+          cargo test -p marmot-app --features otlp-export,product-analytics-export --lib runtimes_from_one_app_share --locked
           cargo test -p marmot-app --features otlp-export,product-analytics-export --test relay_telemetry_otlp --locked
           cargo test -p marmot-c --features otlp-export,product-analytics-export,alloc-audit product_analytics --locked
           cargo test -p agent-connector --features otlp-export,product-analytics-export usage_diagnostics:: --locked
