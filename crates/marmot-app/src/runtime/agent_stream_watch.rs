@@ -41,7 +41,7 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
         options: AgentStreamWatchOptions,
     ) -> Result<RuntimeAgentStreamWatch, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observation = self.shared.observer.product().begin(
             crate::ProductFamily::Stream,
             "watch",
             crate::ProductUnit::Action,
@@ -114,7 +114,7 @@ impl MarmotAppRuntime {
         let mut runtime_events = self.subscribe();
         let invalidation_group_id = group_id.clone();
         let invalidation_start_id = start_message_id_hex.clone();
-        let product = self.shared.product_analytics.clone();
+        let product = self.shared.observer.product().clone();
         let mut block_changes = self.accounts.app.block_list_updates.subscribe();
         let policy_account = self.accounts.resolve(account_ref)?;
         let policy_storage = self.accounts.app.account_storage(&policy_account.label)?;

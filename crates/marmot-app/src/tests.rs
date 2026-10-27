@@ -23099,6 +23099,111 @@ async fn dev_maintenance_timing_reaches_the_account_runtime_only_in_test_policy_
     );
 }
 
+/// Two runtimes built from one app share its collector side: consent, and the product events
+/// either records. Each keeps its own performance recorder and snapshot (#2627).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtimes_from_one_app_share_consent_and_product_events_but_not_performance() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let first = app.runtime();
+    let second = app.runtime();
+    first
+        .set_product_analytics_runtime_config(ProductAnalyticsRuntimeConfig {
+            events_endpoint: Some("https://analytics.example/api/v0/events".into()),
+            app_key: Some("A-SH-test".into()),
+            operator: "test".into(),
+            allow_loopback: false,
+            registry: vec![],
+            metadata: ProductAnalyticsMetadata {
+                app_version: "1.0".into(),
+                os_family: "linux".into(),
+                os_major_version: "6".into(),
+                device_class: "desktop".into(),
+                host_surface: "native".into(),
+                environment: "staging".into(),
+                is_debug: true,
+            },
+        })
+        .unwrap();
+
+    first.set_usage_diagnostics_consent(true).unwrap();
+    assert_eq!(
+        second.usage_diagnostics_status().consent,
+        UsageDiagnosticsDecision::Granted
+    );
+
+    let frame_draw = |runtime: &MarmotAppRuntime| {
+        runtime
+            .app_performance_snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| snapshot.operation == RuntimePerformanceOperation::HostFrameDraw)
+            .unwrap()
+            .started
+    };
+    first.record_host_performance(
+        HostPerformanceOperation::FrameDraw,
+        Duration::from_millis(3),
+        HostPerformanceOutcome::Success,
+    );
+    assert_eq!((frame_draw(&first), frame_draw(&second)), (1, 0));
+
+    #[cfg(feature = "product-analytics-export")]
+    {
+        let first_sync =
+            first.begin_product_operation(ProductFamily::Sync, "full_history", ProductUnit::Action);
+        first_sync.unwrap().finish("success");
+        let second_schedule = second.begin_product_operation(
+            ProductFamily::Notification,
+            "schedule",
+            ProductUnit::Attempt,
+        );
+        second_schedule.unwrap().finish("failure");
+        // A runtime's performance recorder forwards readiness to the shared collector. The
+        // collector drops a sample longer than consent has been granted, so this one is empty.
+        second.record_host_performance(
+            HostPerformanceOperation::ForegroundLocalReady,
+            Duration::ZERO,
+            HostPerformanceOutcome::Success,
+        );
+        // Sealing also adds the window's coverage row, which carries no outcome.
+        let mut recorded: Vec<_> = app
+            .product_analytics
+            .test_payloads()
+            .iter()
+            .filter_map(|row| {
+                let props = &row["props"];
+                Some((
+                    row["eventName"].as_str()?.to_owned(),
+                    props["operation"].as_str()?.to_owned(),
+                    props["outcome"].as_str()?.to_owned(),
+                ))
+            })
+            .collect();
+        recorded.sort();
+        let expected = [
+            ("mdk_notification_summary", "schedule", "failure"),
+            ("mdk_runtime_summary", "readiness", "success"),
+            ("mdk_sync_summary", "full_history", "success"),
+        ]
+        .map(|(event, operation, outcome)| (event.into(), operation.into(), outcome.into()));
+        assert_eq!(recorded, expected);
+    }
+
+    second.set_usage_diagnostics_consent(false).unwrap();
+    assert_eq!(
+        first.usage_diagnostics_status().consent,
+        UsageDiagnosticsDecision::Declined
+    );
+    assert!(
+        first
+            .begin_product_operation(ProductFamily::Sync, "full_history", ProductUnit::Action)
+            .is_none()
+    );
+    first.shutdown().await;
+    second.shutdown().await;
+}
+
 #[cfg(feature = "product-analytics-export")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backend_maintenance_collects_without_host_tracking_and_frozen_stays_silent() {
