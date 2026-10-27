@@ -478,9 +478,18 @@ pub struct AccountPushTokenRemovalProof {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountGroupPushGossipState {
     pub group_id_hex: String,
+    /// When a Welcome installed this device's copy of the group, which opened
+    /// its join window there. Set from then until the device announces once
+    /// the window ends. `None` for a group this device created, for one
+    /// joined before migration 0122, and once the window has closed.
+    pub joining_since_ms: Option<i64>,
     /// When this device's join became final. `None` until recorded, and for a
     /// group joined before migration 0118.
     pub joined_at_ms: Option<i64>,
+    /// Time counted toward the join window since the join completed: time
+    /// during which this device could fetch the group's messages. Zero until
+    /// the join completes and for a group with no window.
+    pub join_window_counted_ms: i64,
     /// When this device last announced in the group. `None` if it never has.
     pub last_announced_at_ms: Option<i64>,
     /// The device owes the group a push snapshot once its merged epoch passes
@@ -1233,15 +1242,17 @@ impl SqliteAppStorage {
                 .iter()
                 .filter(|group| !locally_deleted_group_ids.contains(&group.group_id_hex))
             {
-                let group_was_new = !conn
+                // The stored row's Welcome, or `None` when the group has no row.
+                let stored_welcome = conn
                     .query_row_cached(
-                        "SELECT EXISTS(
-                            SELECT 1 FROM account_groups WHERE group_id_hex = ?1
-                         )",
+                        "SELECT via_welcome_message_id_hex FROM account_groups
+                         WHERE group_id_hex = ?1",
                         params![&group.group_id_hex],
-                        |row| row.get::<_, bool>(0),
+                        |row| row.get::<_, Option<String>>(0),
                     )
+                    .optional()
                     .storage()?;
+                let group_was_new = stored_welcome.is_none();
                 let nostr_routing_last_epoch =
                     i64::try_from(group.nostr_routing_last_epoch).unwrap_or(i64::MAX);
                 let prior_nostr_routes_json = serde_json::to_string(&group.prior_nostr_routes)
@@ -1337,6 +1348,24 @@ impl SqliteAppStorage {
                         conn.execute_cached("UPDATE push_registration SET last_shared_at_ms = NULL", [])
                             .storage()?;
                     }
+                }
+                // A Welcome that installs or replaces this device's copy opens
+                // its push join window in the group, with the group's row. A
+                // group this device created has no window.
+                if group.via_welcome_message_id_hex.is_some()
+                    && stored_welcome.as_ref() != Some(&group.via_welcome_message_id_hex)
+                {
+                    conn.execute_cached(
+                        "INSERT INTO group_push_gossip_state (group_id_hex, joining_since_ms)
+                         SELECT group_id_hex, ?2 FROM account_groups
+                         WHERE group_id_hex = ?1 AND self_membership = 'member'
+                         ON CONFLICT(group_id_hex) DO UPDATE SET
+                            joining_since_ms = excluded.joining_since_ms,
+                            joined_at_ms = NULL,
+                            join_window_counted_ms = 0",
+                        params![&group.group_id_hex, unix_now_ms()],
+                    )
+                    .storage()?;
                 }
 
                 delete_stale_group_components(&conn, &group.group_id_hex, &group.components)?;
@@ -3070,7 +3099,8 @@ impl SqliteAppStorage {
     ) -> StorageResult<Option<AccountGroupPushGossipState>> {
         self.lock()?
             .query_row_cached(
-                "SELECT group_id_hex, joined_at_ms, last_announced_at_ms, snapshot_owed_after_epoch
+                "SELECT group_id_hex, joined_at_ms, last_announced_at_ms, snapshot_owed_after_epoch,
+                        joining_since_ms, join_window_counted_ms
                  FROM group_push_gossip_state
                  WHERE group_id_hex = ?1",
                 params![group_id_hex],
@@ -3085,9 +3115,32 @@ impl SqliteAppStorage {
         let conn = self.lock()?;
         let mut statement = conn
             .prepare_cached(
-                "SELECT group_id_hex, joined_at_ms, last_announced_at_ms, snapshot_owed_after_epoch
+                "SELECT group_id_hex, joined_at_ms, last_announced_at_ms, snapshot_owed_after_epoch,
+                        joining_since_ms, join_window_counted_ms
                  FROM group_push_gossip_state
                  WHERE snapshot_owed_after_epoch IS NOT NULL
+                 ORDER BY group_id_hex",
+            )
+            .storage()?;
+        statement
+            .query_map([], group_push_gossip_state_from_row)
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()
+    }
+
+    /// Every group whose push join window this device has open, or whose
+    /// window ended without an announce yet, in group id order.
+    pub fn joining_group_push_gossip_states(
+        &self,
+    ) -> StorageResult<Vec<AccountGroupPushGossipState>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare_cached(
+                "SELECT group_id_hex, joined_at_ms, last_announced_at_ms, snapshot_owed_after_epoch,
+                        joining_since_ms, join_window_counted_ms
+                 FROM group_push_gossip_state
+                 WHERE joining_since_ms IS NOT NULL
                  ORDER BY group_id_hex",
             )
             .storage()?;
@@ -3145,9 +3198,9 @@ impl SqliteAppStorage {
     }
 
     /// Record when this device's join to `group_id_hex` became final. The
-    /// first recorded time stands for the rest of the membership. Returns
-    /// false, recording nothing, unless this device is a member of a projected
-    /// group.
+    /// first recorded time stands until a later Welcome installs the group
+    /// again. Returns false, recording nothing, unless this device is a member
+    /// of a projected group.
     pub fn record_group_push_gossip_join(
         &self,
         group_id_hex: &str,
@@ -3164,9 +3217,24 @@ impl SqliteAppStorage {
         )
     }
 
-    /// Record that this device announced in `group_id_hex`. Keeps the latest
-    /// time. Returns false, recording nothing, unless this device is a member
-    /// of a projected group.
+    /// Count `counted_ms` toward every open join window whose join has
+    /// completed: time during which this device could fetch its groups'
+    /// messages. Returns how many windows it counted toward.
+    pub fn count_push_join_window_time(&self, counted_ms: i64) -> StorageResult<usize> {
+        self.lock()?
+            .execute_cached(
+                "UPDATE group_push_gossip_state
+                 SET join_window_counted_ms = join_window_counted_ms + ?1
+                 WHERE joining_since_ms IS NOT NULL AND joined_at_ms IS NOT NULL",
+                params![counted_ms],
+            )
+            .storage()
+    }
+
+    /// Record that this device announced in `group_id_hex`, which it does
+    /// only once its join window there has ended, so the window closes. Keeps
+    /// the latest time. Returns false, recording nothing, unless this device
+    /// is a member of a projected group.
     pub fn record_group_push_gossip_announce(
         &self,
         group_id_hex: &str,
@@ -3180,7 +3248,8 @@ impl SqliteAppStorage {
                 last_announced_at_ms = MAX(
                     COALESCE(group_push_gossip_state.last_announced_at_ms, excluded.last_announced_at_ms),
                     excluded.last_announced_at_ms
-                )",
+                ),
+                joining_since_ms = NULL",
             group_id_hex,
             announced_at_ms,
         )
@@ -4143,7 +4212,9 @@ fn group_push_gossip_state_from_row(
     let snapshot_owed_after_epoch: Option<i64> = row.get(3)?;
     Ok(AccountGroupPushGossipState {
         group_id_hex: row.get(0)?,
+        joining_since_ms: row.get(4)?,
         joined_at_ms: row.get(1)?,
+        join_window_counted_ms: row.get(5)?,
         last_announced_at_ms: row.get(2)?,
         snapshot_owed_after_epoch: snapshot_owed_after_epoch
             .map(|epoch| {

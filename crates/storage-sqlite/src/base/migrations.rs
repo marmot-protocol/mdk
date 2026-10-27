@@ -256,6 +256,8 @@ mod migration_0119_push_snapshot_owed;
 mod migration_0120_member_count_accounts;
 #[path = "migrations/0121_drop_member_capabilities.rs"]
 mod migration_0121_drop_member_capabilities;
+#[path = "migrations/0122_push_join_window.rs"]
+mod migration_0122_push_join_window;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1002,6 +1004,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0121_drop_member_capabilities",
         suspend_foreign_keys: &[],
         apply: migration_0121_drop_member_capabilities::apply,
+    },
+    Migration {
+        version: 122,
+        name: "0122_push_join_window",
+        suspend_foreign_keys: &[],
+        apply: migration_0122_push_join_window::apply,
     },
 ];
 

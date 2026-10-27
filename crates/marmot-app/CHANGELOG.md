@@ -17,6 +17,43 @@
   entries. A device that holds neither sends nothing. The owed snapshot is
   recorded before the invite's Commit is staged or queued, so a restart still
   sends it once the Commit merges, and a Commit that rolls back owes none.
+- Devices now send push announces (mdk#2611): a kind 447 whose `have` names,
+  by the first 8 bytes of each record digest, every token record and tombstone
+  the device holds in the group, so members can later send it what it lacks.
+  An announce carries the device's own current records, or `tokens: []`, and
+  `have` lists as many as fit 4,096 elements and the 64 KiB message size, own
+  records first. Records whose stored digest does not verify are left out.
+  A device announces:
+  - once its join window in a group ends, when two minutes during which it
+    could fetch have passed since its join completed (the group stable and
+    its post-join history fetch ended), whether or not a snapshot came;
+  - instead of a plain self-update when it shares a new or changed record of
+    its own after the window, which a group's creator never has; and
+  - with the next group message it sends there once seven days have passed
+    since its last announce, or when it has never announced there.
+
+  A device can fetch while a relay is connected and its client's catch-up has
+  run: every endpoint of the account's live subscriptions has served its
+  stored history, or, five minutes after the client opened, any subscription
+  has been served by one. No announce goes out until the client has watched
+  the device able to fetch for 15 seconds; a record changed before then is
+  shared in a plain self-update and announced after. Inside the window, and
+  when re-sharing an unchanged record after a member add, a device shares in
+  plain self-updates, with no `have`. The window opens when a Welcome
+  installs the group and survives a restart. Only a published announce
+  counts: one left in the outbox counts once the outbox publishes it, no
+  other is sent in that group meanwhile, and one the outbox drops is owed
+  again. Incoming announces are applied as before, as a self-update or a
+  request.
+
+  Known limits, each costing at most a stale or repeated announce:
+  - whether a device can fetch is judged for the whole account, not per
+    group, so a group whose relays are unreachable still counts window time;
+  - after the five-minute timeout, the catch-up counts as run once any
+    subscription was served, so an announce may name less than a slow relay
+    would have brought;
+  - an announce held in the outbox when the client restarts is owed again,
+    so the outbox may publish it as well as its replacement.
 
 ### Changed
 

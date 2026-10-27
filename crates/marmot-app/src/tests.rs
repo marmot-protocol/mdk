@@ -14,6 +14,8 @@ mod message_journeys;
 mod multi_device_members;
 mod publication_progress;
 #[cfg(feature = "test-policy-overrides")]
+mod push_announce;
+#[cfg(feature = "test-policy-overrides")]
 mod push_snapshot;
 #[cfg(feature = "test-policy-overrides")]
 mod push_token_reshare;

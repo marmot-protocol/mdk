@@ -3073,6 +3073,13 @@ async fn run_app_runtime_account_worker(
                         }
                     }
                 }
+                // A join window ends once T has been counted since its join
+                // completed, which only time passing shows; the tick counts
+                // it and notices joins that completed.
+                client.advance_push_join_windows().await;
+                if client.has_due_push_announce() {
+                    scheduled_push_retry.observe_pending(true, &command_tx);
+                }
                 scheduled_runtime_group_subscription_refresh.observe_pending(
                     client.has_pending_runtime_group_subscription_refresh(),
                     &command_tx,
@@ -6736,17 +6743,22 @@ fn push_registration_retry_delay(attempt: u32) -> Duration {
 }
 
 /// Arm the push retry for the work a worker turn left: a member add on any
-/// ingest or send path that queued a share or owed a snapshot, or an owed
-/// snapshot that its group's state no longer holds back. What holds one back
-/// (hydration, a queued invite, a disband, a block) changes only through
-/// account work, so checking after every turn notices it without polling.
+/// ingest or send path that queued a share or owed a snapshot, a sent message
+/// that owes the periodic announce, or an owed snapshot or announce that its
+/// group's state no longer holds back. What holds one back (hydration, a
+/// queued invite, a disband, a block) changes only through account work, so
+/// checking after every turn notices it without polling. A join window
+/// ending is noticed by the maintenance tick.
 fn schedule_push_work_after_turn(
     client: &mut AppClient,
     scheduled: &mut ScheduledPushRegistrationRetry,
     commands: &mpsc::Sender<AccountWorkerCommand>,
 ) {
     client.retry_pending_member_add_push_shares();
-    if client.take_queued_push_registration_share() || client.has_due_push_snapshot() {
+    if client.take_queued_push_registration_share()
+        || client.has_due_push_snapshot()
+        || client.has_due_push_announce()
+    {
         scheduled.observe_pending(true, commands);
     }
 }
@@ -10390,6 +10402,52 @@ mod tests {
         schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
         tokio::task::yield_now().await;
         assert!(!client.has_due_push_snapshot());
+    }
+
+    /// A group message sent where this device has never announced owes the
+    /// periodic announce once the device can fetch, and the turn that sent it
+    /// arms the push retry that sends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sent_message_owing_the_periodic_announce_arms_the_push_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app =
+            MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+        let mut client = app.client(&account.label).await.unwrap();
+        let group = client.create_group("periodic announce", &[]).await.unwrap();
+        let group_hex = hex::encode(group.as_slice());
+        // The scripted relay sends no EOSE.
+        client.test_push_device_can_fetch = Some(true);
+        client.push_announce_timing.catch_up_settle = Duration::ZERO;
+        client.advance_push_join_windows().await;
+        let (commands, mut received) = mpsc::channel(2);
+        let mut scheduled = ScheduledPushRegistrationRetry::new();
+        schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
+        assert!(!scheduled.is_armed(), "nothing is owed before a send");
+
+        client.send(&group, b"first message").await.unwrap();
+        schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
+        assert!(scheduled.is_armed());
+        let AccountWorkerCommand::RetryPushRegistration { respond } =
+            received.recv().await.unwrap()
+        else {
+            panic!("an owed announce must enqueue a push retry")
+        };
+        let pending = client
+            .retry_pending_push_registration_shares_best_effort()
+            .await;
+        assert!(!pending);
+        let _ = respond.send(pending);
+        assert!(
+            app.group_push_gossip_state(&account.label, &group_hex)
+                .unwrap()
+                .and_then(|state| state.last_announced_at_ms)
+                .is_some()
+        );
+        assert!(!client.has_due_push_announce());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

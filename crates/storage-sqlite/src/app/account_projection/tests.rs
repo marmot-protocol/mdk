@@ -4218,7 +4218,9 @@ fn push_gossip_state_tracks_the_current_membership() {
     assert!(app.record_group_push_gossip_announce("aa", 40).unwrap());
     let recorded = Some(AccountGroupPushGossipState {
         group_id_hex: "aa".to_owned(),
+        joining_since_ms: None,
         joined_at_ms: Some(10),
+        join_window_counted_ms: 0,
         last_announced_at_ms: Some(50),
         snapshot_owed_after_epoch: None,
     });
@@ -4249,6 +4251,91 @@ fn push_gossip_state_tracks_the_current_membership() {
     assert_eq!(state("aa"), None);
     save(Vec::new());
     assert_eq!(state("bb"), None);
+}
+
+/// A Welcome opens this device's push join window with the group's row; a
+/// created group has none, a replay keeps the window, time counts toward it
+/// only once its join completed, a new Welcome reopens it and drops the
+/// earlier join and its counted time, and the announce at its end closes it.
+#[test]
+fn a_welcome_opens_the_push_join_window_until_the_announce() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let save = |groups: Vec<StoredAccountGroup>| {
+        app.save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups,
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    };
+    let welcomed = |id: &str, welcome: &str| {
+        let mut group = group(id, "welcomed");
+        group.via_welcome_message_id_hex = Some(welcome.to_owned());
+        group
+    };
+    let state = |group: &str| app.group_push_gossip_state(group).unwrap();
+    let joining = || {
+        app.joining_group_push_gossip_states()
+            .unwrap()
+            .into_iter()
+            .map(|state| state.group_id_hex)
+            .collect::<Vec<_>>()
+    };
+
+    save(vec![group("aa", "created"), welcomed("bb", "w1")]);
+    assert_eq!(state("aa"), None, "a created group has no window");
+    let opened = state("bb").unwrap().joining_since_ms.unwrap();
+    assert_eq!(state("bb").unwrap().joined_at_ms, None);
+    assert_eq!(joining(), vec!["bb".to_owned()]);
+
+    // Time counts only toward a window whose join has completed.
+    assert_eq!(app.count_push_join_window_time(5).unwrap(), 0);
+    assert_eq!(state("bb").unwrap().join_window_counted_ms, 0);
+
+    // Saving the same Welcome again keeps the window, its join time and the
+    // time counted toward it.
+    assert!(app.record_group_push_gossip_join("bb", 10).unwrap());
+    assert_eq!(app.count_push_join_window_time(5).unwrap(), 1);
+    assert_eq!(app.count_push_join_window_time(7).unwrap(), 1);
+    save(vec![group("aa", "created"), welcomed("bb", "w1")]);
+    assert_eq!(state("bb").unwrap().joining_since_ms, Some(opened));
+    assert_eq!(state("bb").unwrap().joined_at_ms, Some(10));
+    assert_eq!(state("bb").unwrap().join_window_counted_ms, 12);
+
+    // The announce closes the window, and time no longer counts toward it; a
+    // new Welcome opens a fresh one and drops the earlier join and its
+    // counted time, keeping the announce time.
+    assert!(app.record_group_push_gossip_announce("bb", 20).unwrap());
+    assert_eq!(state("bb").unwrap().joining_since_ms, None);
+    assert_eq!(joining(), Vec::<String>::new());
+    assert_eq!(app.count_push_join_window_time(5).unwrap(), 0);
+    save(vec![group("aa", "created"), welcomed("bb", "w2")]);
+    let reopened = state("bb").unwrap();
+    assert!(reopened.joining_since_ms.is_some());
+    assert_eq!(reopened.joined_at_ms, None);
+    assert_eq!(reopened.join_window_counted_ms, 0);
+    assert_eq!(reopened.last_announced_at_ms, Some(20));
+
+    // A Welcome saved while this device is not a member opens nothing.
+    save(vec![
+        group("aa", "created"),
+        welcomed("bb", "w2"),
+        group("cc", "gone"),
+    ]);
+    app.set_group_self_membership("cc", SelfMembership::Removed)
+        .unwrap();
+    save(vec![
+        group("aa", "created"),
+        welcomed("bb", "w2"),
+        welcomed("cc", "w3"),
+    ]);
+    assert_eq!(state("cc"), None);
 }
 
 /// An owed push snapshot needs a joined group, keeps the latest owed epoch,

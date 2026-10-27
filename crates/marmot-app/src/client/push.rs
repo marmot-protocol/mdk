@@ -8,8 +8,11 @@ use crate::notifications;
 
 use super::AppClient;
 
+mod announce;
 #[cfg(test)]
 mod tests;
+
+pub(crate) use announce::{AcceptedPushAnnounce, PushAnnounceTiming, PushFetchClock};
 
 const PUSH_PUBLISH_CONCURRENCY: usize = 4;
 
@@ -63,9 +66,10 @@ pub(crate) struct RecordedPushSnapshot {
     recorded: u64,
 }
 
-/// What one owed push snapshot needs now.
-enum PushSnapshotState {
-    /// The adding Commit has merged; send it.
+/// What one owed push snapshot or announce needs now.
+enum PushGossipGate {
+    /// Send it: the group can take messages, and a snapshot's adding Commit
+    /// has merged.
     Due,
     /// The Commit has not merged, or the group cannot take messages yet.
     NotYet,
@@ -299,13 +303,19 @@ impl AppClient {
                         continue;
                     }
                 };
-                let content = match serde_json::to_string(&payload) {
+                let announce = self.shares_in_announce(&group_id, &record);
+                let content = if announce {
+                    self.build_push_announce(&group_id, std::slice::from_ref(&record))
+                } else {
+                    serde_json::to_string(&payload).map_err(AppError::from)
+                };
+                let content = match content {
                     Ok(content) => content,
                     Err(err) => {
                         tracing::warn!(
                             target: "marmot_app::notifications",
                             method = "share_push_registration",
-                            error_kind = AppError::from(err).privacy_safe_kind(),
+                            error_kind = err.privacy_safe_kind(),
                             "push token gossip serialization failed",
                         );
                         continue;
@@ -319,6 +329,9 @@ impl AppClient {
                         if summary.accept_disposition
                             == cgka_traits::SendAcceptDisposition::Published =>
                     {
+                        if announce {
+                            self.record_push_announce(&group_id);
+                        }
                         if let Err(err) = self.app.upsert_group_push_token(&account.label, &record)
                         {
                             tracing::warn!(
@@ -336,7 +349,10 @@ impl AppClient {
                             registration.registration.updated_at_ms,
                         )?;
                     }
-                    Ok((_event, _summary)) => {
+                    Ok((event, _summary)) => {
+                        if announce {
+                            self.note_push_announce_left_in_outbox(&group_id, event.id);
+                        }
                         tracing::debug!(
                             target: "marmot_app::notifications",
                             method = "share_push_registration",
@@ -397,7 +413,9 @@ impl AppClient {
     pub(crate) async fn retry_pending_push_registration_shares_best_effort(&mut self) -> bool {
         let snapshots_pending = self.send_owed_push_snapshots().await;
         let shares_pending = self.retry_pending_push_registration_shares().await;
-        snapshots_pending || shares_pending
+        // After the shares: one sent after a join window ends is the announce.
+        let announces_pending = self.send_due_push_announces().await;
+        snapshots_pending || shares_pending || announces_pending
     }
 
     async fn retry_pending_push_registration_shares(&mut self) -> bool {
@@ -432,7 +450,7 @@ impl AppClient {
             .app
             .has_pending_push_registration_work(&self.state.label)
         {
-            Ok(pending) => pending || self.has_due_push_snapshot(),
+            Ok(pending) => pending || self.has_due_push_snapshot() || self.has_due_push_announce(),
             Err(err) => {
                 tracing::warn!(
                     target: "marmot_app::notifications",
@@ -614,8 +632,8 @@ impl AppClient {
         match self.app.owed_group_push_snapshots(&self.state.label) {
             Ok(owed) => owed.into_iter().any(|(group_id_hex, after_epoch)| {
                 !matches!(
-                    self.push_snapshot_state(&group_id_hex, after_epoch),
-                    PushSnapshotState::NotYet
+                    self.push_gossip_gate(&group_id_hex, Some(after_epoch)),
+                    PushGossipGate::NotYet
                 )
             }),
             Err(error) => {
@@ -630,26 +648,30 @@ impl AppClient {
         }
     }
 
-    /// Leaving the group, or losing membership, deletes its owed snapshot with
-    /// the rest of its gossip state, so a row here belongs to a group this
-    /// device is still in, though perhaps not hydrated yet.
-    fn push_snapshot_state(&self, group_id_hex: &str, after_epoch: u64) -> PushSnapshotState {
+    /// Whether `group_id_hex` can take push gossip now, and for an owed
+    /// snapshot, whether the group's merged epoch has passed `after_epoch`.
+    ///
+    /// Leaving the group, or losing membership, deletes its owed snapshot and
+    /// join window with the rest of its gossip state, so a row here belongs to
+    /// a group this device is still in, though perhaps not hydrated yet.
+    fn push_gossip_gate(&self, group_id_hex: &str, after_epoch: Option<u64>) -> PushGossipGate {
         let Ok(group_id) = hex::decode(group_id_hex).map(GroupId::new) else {
-            return PushSnapshotState::Void;
+            return PushGossipGate::Void;
         };
         match self.runtime.epoch_state(&group_id) {
-            Some(cgka_traits::EpochState::Disbanded(_)) => return PushSnapshotState::Void,
-            Some(cgka_traits::EpochState::Stable { epoch }) if epoch.0 > after_epoch => {}
+            Some(cgka_traits::EpochState::Disbanded(_)) => return PushGossipGate::Void,
+            Some(cgka_traits::EpochState::Stable { epoch })
+                if after_epoch.is_none_or(|after_epoch| epoch.0 > after_epoch) => {}
             // Not hydrated or quarantined, still resolving a publish, or
             // recovering.
-            _ => return PushSnapshotState::NotYet,
+            _ => return PushGossipGate::NotYet,
         }
         if self
             .runtime
             .group_record(&group_id)
             .is_ok_and(|group| group.is_terminal())
         {
-            return PushSnapshotState::Void;
+            return PushGossipGate::Void;
         }
         // A queued invite, or one convergence superseded that waits for fresh
         // KeyPackages, has not added its members yet, and a disband or block
@@ -678,9 +700,9 @@ impl AppClient {
                 })
                 .unwrap_or(true);
         if waiting {
-            PushSnapshotState::NotYet
+            PushGossipGate::NotYet
         } else {
-            PushSnapshotState::Due
+            PushGossipGate::Due
         }
     }
 
@@ -707,10 +729,10 @@ impl AppClient {
         };
         let mut pending = false;
         for (group_id_hex, after_epoch) in owed {
-            let settle = match self.push_snapshot_state(&group_id_hex, after_epoch) {
-                PushSnapshotState::NotYet => continue,
-                PushSnapshotState::Void => true,
-                PushSnapshotState::Due => match self.send_push_snapshot(&group_id_hex).await {
+            let settle = match self.push_gossip_gate(&group_id_hex, Some(after_epoch)) {
+                PushGossipGate::NotYet => continue,
+                PushGossipGate::Void => true,
+                PushGossipGate::Due => match self.send_push_snapshot(&group_id_hex).await {
                     Ok(()) => true,
                     // The group's state changed since it was checked; the
                     // next check settles or sends the snapshot.

@@ -83,7 +83,10 @@ mod sync;
 mod upload_cleanup_tests;
 
 use epoch_stall::EpochStallDetector;
+pub(crate) use push::PushFetchClock;
 use push::notification_trigger_for_intent;
+#[cfg(all(test, feature = "test-policy-overrides"))]
+pub(crate) use push::{AcceptedPushAnnounce, PushAnnounceTiming};
 #[cfg(test)]
 pub(crate) use sync::ScriptedComparisons;
 #[cfg(test)]
@@ -810,6 +813,20 @@ pub struct AppClient {
     /// epoch that Commit started from, whose owed push snapshot failed to
     /// record; the account worker retries them.
     pub(super) pending_own_add_push_snapshots: HashMap<GroupId, u64>,
+    /// How long this device's push join windows last, and how often it
+    /// announces in a group it sends to.
+    pub(super) push_announce_timing: push::PushAnnounceTiming,
+    /// The time during which this device could fetch, as this client has
+    /// seen it; only that time counts toward a push join window.
+    pub(super) push_fetch_clock: push::PushFetchClock,
+    /// Groups owed a push announce that waits for its turn: a sent group
+    /// message found the periodic one due, or a changed record was shared
+    /// before this client's catch-up had run. The account worker sends it.
+    pub(super) pending_push_announces: std::collections::HashSet<GroupId>,
+    /// Groups where the runtime accepted a push announce into the outbox
+    /// without publishing it. This client sends no other there until the
+    /// outbox publishes or drops it, or a Welcome opens a new window.
+    pub(super) accepted_push_announces: HashMap<GroupId, push::AcceptedPushAnnounce>,
     /// App-visible outputs ingested during a sync whose account-projection
     /// checkpoint failed. A retained client keeps the matching projected state
     /// and outbox acknowledgements, then returns this summary after its next
@@ -905,6 +922,13 @@ pub struct AppClient {
     /// Unit-test fault injection that fails every drained-batch checkpoint.
     #[cfg(test)]
     pub(crate) fail_drained_effect_checkpoints: bool,
+    /// Push gossip events this client sent and the runtime accepted, in order.
+    #[cfg(test)]
+    pub(crate) test_sent_push_gossip: Vec<(GroupId, MarmotInnerEvent)>,
+    /// Whether this device can fetch, for tests whose scripted relay sends no
+    /// EOSE. `None` reads the relays.
+    #[cfg(test)]
+    pub(crate) test_push_device_can_fetch: Option<bool>,
     /// Welcomes queued for re-delivery during the most recent create/invite.
     /// The runtime account worker drains this after the command and broadcasts a
     /// `WelcomeDeliveryPending` event so callers learn a member is unjoinable
@@ -3418,6 +3442,8 @@ impl AppClient {
         self.pending_push_leaf_reconciliations.remove(group_id);
         self.pending_member_add_push_shares.remove(group_id);
         self.pending_own_add_push_snapshots.remove(group_id);
+        self.pending_push_announces.remove(group_id);
+        self.accepted_push_announces.remove(group_id);
         self.app.presentation_signals.wake();
         // Deletion already committed. A failed transport refresh must not make
         // the caller believe the group still exists; ordinary maintenance retries.
@@ -4901,6 +4927,14 @@ impl AppClient {
             )
             .await;
             self.remember_message_notification_sent(group_id, &app_event_id);
+        }
+        if should_project_locally {
+            self.note_push_announce_after_send(group_id);
+        }
+        #[cfg(test)]
+        if !should_project_locally {
+            self.test_sent_push_gossip
+                .push((group_id.clone(), event.clone()));
         }
         Ok((
             event,

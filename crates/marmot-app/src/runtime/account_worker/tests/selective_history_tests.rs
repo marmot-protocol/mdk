@@ -200,6 +200,14 @@ async fn late_commit_700_recovers() {
     })
     .await
     .expect("Alice joins the real MLS group");
+    // A recent announce keeps Bob's send from owing a push announce, so his
+    // text is the group's last event.
+    app.record_group_push_gossip_announce(
+        &bob.label,
+        &hex::encode(&group),
+        crate::notifications::unix_now_ms(),
+    )
+    .unwrap();
     let old_text = "x".repeat(4_096);
     runtime
         .send_message(&bob.label, &group, old_text.clone().into_bytes())
