@@ -1650,18 +1650,13 @@ impl AppClient {
                             | cgka_traits::MaintenancePhase::Grace
                     )
             });
-            // An owed fetch keeps the recovery job of the obligation created
-            // with it, whatever phase commits have moved that obligation to,
-            // so its installed session stays checkpointable.
+            // An owed fetch keeps the recovery job its obligation had in
+            // CatchUp, whatever commits, or a superseded self-update's re-arm,
+            // have done to that obligation since, so its installed session
+            // stays checkpointable. Only a Quiet obligation is ever re-armed.
             let fetch_job = fetch
                 .as_ref()
-                .map(|fetch| {
-                    let rearms = obligations
-                        .iter()
-                        .find(|obligation| obligation.id == fetch.obligation_id)
-                        .map_or(0, |obligation| obligation.semantic_rearm_count);
-                    maintenance_recovery_job(&fetch.obligation_id, rearms)
-                })
+                .map(|fetch| maintenance_recovery_job(&fetch.obligation_id, 0))
                 .transpose()?;
             let job = match prerequisite {
                 Some(prerequisite) => Some(maintenance_recovery_job(

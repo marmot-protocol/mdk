@@ -2843,14 +2843,14 @@ async fn a_post_join_history_fetch_outlives_commits_until_its_deadline() {
     );
     assert_eq!(
         runtime
-            .settle_post_join_history_fetch(&group_id, &obligation.id, false)
+            .expire_post_join_history_fetch(&group_id, &obligation.id)
             .unwrap(),
         None,
         "an unfetched fetch goes on until its deadline"
     );
     assert_eq!(
         runtime
-            .settle_post_join_history_fetch(&group_id, &MessageId::new(vec![1; 32]), true)
+            .finish_post_join_history_fetch(&group_id, &MessageId::new(vec![1; 32]))
             .unwrap(),
         None,
         "another copy's fetch cannot end this one"
@@ -2858,7 +2858,7 @@ async fn a_post_join_history_fetch_outlives_commits_until_its_deadline() {
 
     wall.set(deadline.0);
     let completion = runtime
-        .settle_post_join_history_fetch(&group_id, &obligation.id, false)
+        .expire_post_join_history_fetch(&group_id, &obligation.id)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -2875,7 +2875,7 @@ async fn a_post_join_history_fetch_outlives_commits_until_its_deadline() {
     );
     assert_eq!(
         runtime
-            .settle_post_join_history_fetch(&group_id, &obligation.id, true)
+            .finish_post_join_history_fetch(&group_id, &obligation.id)
             .unwrap(),
         None
     );

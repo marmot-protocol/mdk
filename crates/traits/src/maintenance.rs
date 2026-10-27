@@ -121,16 +121,16 @@ pub struct GroupMaintenanceState {
 }
 
 /// A joined copy's fetch of the group messages its delivery endpoints hold from
-/// its Welcome on. It lasts until a relay reaches end-of-stored-events and this
-/// device has processed what the fetch delivered, or until its deadline,
-/// whatever commits arrive meanwhile. It is separate from the post-join
-/// self-update, whose obligation commits move to its quiet window.
+/// its Welcome on. Once a relay reaches end-of-stored-events it lasts until this
+/// device has processed what the fetch delivered; until then it lasts until its
+/// deadline. Commits end neither: the post-join self-update, whose obligation
+/// commits move to its quiet window, is separate.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostJoinHistoryFetch {
     /// The post-join obligation created with this copy. Identifies the fetch,
     /// so work for an earlier copy of the group cannot complete it.
     pub obligation_id: MessageId,
-    /// When the fetch's current subscription stops waiting for
+    /// When the fetch's current subscription stops waiting for its first
     /// end-of-stored-events. Set at each installation: a restart or a lost
     /// subscription resumes the fetch with a fresh one.
     pub deadline_at: Option<Timestamp>,
@@ -161,8 +161,8 @@ pub enum PostJoinHistoryFetchOutcome {
     /// This device has fetched and processed the group messages its delivery
     /// endpoints hold from its join epoch on.
     Fetched,
-    /// No relay reached end-of-stored-events, or this device had not processed
-    /// what the fetch delivered, before the deadline. Messages may be missing.
+    /// No relay reached end-of-stored-events before the deadline. Messages may
+    /// be missing.
     DeadlineExpired,
 }
 
