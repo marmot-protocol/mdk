@@ -11,12 +11,14 @@ use super::Directory;
 use super::resources::DirectoryResources;
 use crate::DirectoryFreshness;
 use crate::published_records::{
-    KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, key_package_queries,
-    select_key_packages_from_records, without_revoked_slot_winners,
+    KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, key_package_deletion_page_full,
+    key_package_queries, select_key_packages_from_records, without_revoked_slot_winners,
 };
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord};
 
 const RECOVERY_ENDPOINT_LIMIT: usize = 8;
+/// How many revoked candidates recovery replaces before it reports the lookup
+/// incomplete. Proving a candidate undeleted spends none of it.
 const RECOVERY_CANDIDATE_LIMIT: usize = 12;
 
 pub(super) struct RecoveredKeyPackageRecords {
@@ -57,6 +59,11 @@ impl<R: DirectoryResources> Directory<R> {
             cached_target,
             wanted,
         } = request;
+        // Recovery reads more deletion requests only for candidates it
+        // proves; it cannot prove what a full page left unread elsewhere.
+        if key_package_deletion_page_full(account, &observed) {
+            return Err(recovery_incomplete(account));
+        }
         let freshness = self.directory_freshness();
         if select_key_packages_from_records(account, &observed, freshness, requirements)
             .is_ok_and(|selection| !selection.value.is_empty())
@@ -107,14 +114,23 @@ impl<R: DirectoryResources> Directory<R> {
             }
         }
         let routes = distinct_recovery_routes(searched.iter().chain(&supplementary));
-        let mut deletions = Vec::new();
+        // Deletion requests read with the KeyPackages count from the start; a
+        // later scoped read that misses one never revives what it covers.
+        let mut deletions = observed
+            .iter()
+            .filter(|record| record.event.kind == 5)
+            .cloned()
+            .collect::<Vec<_>>();
         // Event ids whose deletion lookup completed without a match.
         let mut proven = BTreeSet::new();
         // The selection being proven. It is redrawn only after a revocation:
         // time passing during a deletion read must never swap in a different
         // candidate.
         let mut targets = None;
-        for round in 0..=RECOVERY_CANDIDATE_LIMIT {
+        let mut revocations = 0;
+        // Every pass proves a candidate not proven before or revokes one, so
+        // the selection's size and the revocation limit bound the loop.
+        loop {
             let current = match &mut targets {
                 Some(current) => current,
                 None => {
@@ -171,17 +187,8 @@ impl<R: DirectoryResources> Directory<R> {
                     account, observed, &deletions, freshness, &proven,
                 ));
             };
-            if !package_coverage || routes.is_empty() {
+            if !package_coverage || routes.is_empty() || revocations == RECOVERY_CANDIDATE_LIMIT {
                 return Err(recovery_incomplete(account));
-            }
-            if round == RECOVERY_CANDIDATE_LIMIT {
-                // Out of rounds: the candidates already proven still stand.
-                if proven.is_empty() {
-                    return Err(recovery_incomplete(account));
-                }
-                return Ok(proven_records(
-                    account, observed, &deletions, freshness, &proven,
-                ));
             }
             let queries = vec![
                 DirectoryEventQuery::deletion_reference(
@@ -223,6 +230,7 @@ impl<R: DirectoryResources> Directory<R> {
                 }
             }
             if revoked {
+                revocations += 1;
                 targets = None;
                 continue;
             }
@@ -231,7 +239,6 @@ impl<R: DirectoryResources> Directory<R> {
             }
             proven.insert(target.event_id);
         }
-        Err(recovery_incomplete(account))
     }
 }
 

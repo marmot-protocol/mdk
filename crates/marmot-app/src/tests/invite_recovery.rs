@@ -357,6 +357,114 @@ async fn invite_recovery_ignores_many_unrelated_deletions() {
     );
 }
 
+fn signed_by_account(
+    app: &MarmotApp,
+    account: &AccountSummary,
+    event: NostrTransportEvent,
+) -> NostrTransportEvent {
+    let signed = EventBuilder::new(Kind::from(event.kind as u16), event.content)
+        .tags(event.tags.into_iter().map(|tag| Tag::parse(tag).unwrap()))
+        .custom_created_at(NostrTimestamp::from_secs(event.created_at))
+        .finalize(
+            &app.account_home()
+                .load_signing_keys(&account.label)
+                .unwrap(),
+        )
+        .unwrap();
+    NostrTransportEvent::from_nostr_event(&signed).unwrap()
+}
+
+/// A deletion request read with the KeyPackages counts even when the scoped
+/// deletion reads that follow come back empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_recovery_keeps_deletions_read_with_the_key_packages() {
+    for membership in [true, false] {
+        let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
+        let account = &accounts[0];
+        let published = package(&fetcher, account);
+        let deletion = signed_by_account(
+            &app,
+            account,
+            NostrTransportEvent::new_unsigned_at(
+                account.account_id_hex.clone(),
+                5,
+                vec![
+                    vec!["e".into(), published.id.clone()],
+                    vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+                ],
+                String::new(),
+                published.created_at,
+            ),
+        );
+        fetcher
+            .events_by_endpoint
+            .lock()
+            .unwrap()
+            .get_mut(DISCOVERY)
+            .unwrap()
+            .push(deletion);
+        fetcher
+            .empty_deletion_proofs
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let missing = if membership {
+            matches!(
+                app.directory()
+                    .resolve_member_key_packages(&[&account.account_id_hex])
+                    .await,
+                Err(DirectoryError::MissingKeyPackage { .. })
+            )
+        } else {
+            matches!(
+                app.directory()
+                    .fetch_latest_key_package_for_account_id(&account.account_id_hex, vec![])
+                    .await,
+                Err(DirectoryError::MissingKeyPackage { .. })
+            )
+        };
+        assert!(missing, "membership: {membership}");
+    }
+}
+
+/// Recovery proves every device it selects, more than its revocation budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_recovery_proves_every_device_found_only_in_discovery() {
+    let (_directory, app, accounts, fetcher) = discovery_fixture(1).await;
+    let account = &accounts[0];
+    let now = unix_now_seconds();
+    let devices = (0..15)
+        .map(|index| {
+            let mut event = member_resolution_key_package_event(
+                account,
+                package_expiring_at(&app, account, now + 3_000, true),
+            );
+            event.tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = format!("device-{index}");
+            event.created_at = now - index;
+            signed_by_account(&app, account, event)
+        })
+        .collect::<Vec<_>>();
+    {
+        let mut routes = fetcher.events_by_endpoint.lock().unwrap();
+        let discovery = routes.get_mut(DISCOVERY).unwrap();
+        discovery.retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+        discovery.extend(devices.iter().cloned());
+    }
+    let packages = app
+        .directory()
+        .resolve_member_key_packages(&[&account.account_id_hex])
+        .await
+        .unwrap();
+    assert_eq!(
+        packages
+            .iter()
+            .map(|package| hex::encode(package.source.as_ref().unwrap().event_id.as_slice()))
+            .collect::<Vec<_>>(),
+        devices
+            .iter()
+            .map(|event| event.id.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invite_recovery_ignores_wrong_author_and_unsigned_deletions() {
     let (_directory, app, accounts, fetcher) = discovery_fixture(2).await;

@@ -75,7 +75,9 @@
   KeyPackage published in the last 30 days, at most 20, or the single best one
   when none is that recent. A publication slot contributes at most one, and a
   KeyPackage a deletion request covers, by slot address or event id, is
-  skipped. KeyPackages not marked last-resort rank first, then the most
+  skipped. A relay that returns a full page of 500 deletion requests leaves
+  the lookup incomplete, since an unread one may cover a selected slot.
+  KeyPackages not marked last-resort rank first, then the most
   recently published, then the lower KeyPackageRef; one device publishing in
   several slots counts once. One Commit adds the account, with one Welcome
   rumor per KeyPackage, and the creator's own other devices stay out of a new

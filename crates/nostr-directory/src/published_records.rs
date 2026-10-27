@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use transport_nostr_adapter::parse_nip65_relay_set;
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
+    RELAY_REPLAY_PAGE_LIMIT,
 };
 use transport_nostr_peeler::NostrTransportEvent;
 
@@ -495,9 +496,15 @@ pub const MAX_KEY_PACKAGES_PER_ACCOUNT: usize = 20;
 pub const KEY_PACKAGE_FRESHNESS: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// KeyPackage events read per author. Twice the per-account limit, so slots
 /// that turn out invalid, deleted or incompatible leave room for the rest.
+/// Relays keep one event per slot, so this is the newest 40 live slots; an
+/// older slot past them, even one that is not last-resort, is not seen. A read
+/// that fills the limit is reported incomplete, so it never proves absence.
 pub(crate) const KEY_PACKAGE_EVENTS_PER_AUTHOR: usize = 2 * MAX_KEY_PACKAGES_PER_ACCOUNT;
-/// KeyPackage deletion requests read per author alongside its KeyPackages.
-pub(crate) const KEY_PACKAGE_DELETIONS_PER_AUTHOR: usize = KEY_PACKAGE_EVENTS_PER_AUTHOR;
+/// KeyPackage deletion requests read alongside the KeyPackages: one relay
+/// page. Deletion requests are small, and few accounts publish many, so a
+/// page that comes back full fails the lookup instead of selecting a slot an
+/// unread request may cover ([`key_package_deletion_page_full`]).
+pub(crate) const KEY_PACKAGE_DELETIONS_READ: usize = RELAY_REPLAY_PAGE_LIMIT;
 
 /// The KeyPackage events and the deletion requests read alongside them.
 pub(crate) fn key_package_queries(authors: Vec<String>) -> Vec<DirectoryEventQuery> {
@@ -508,11 +515,29 @@ pub(crate) fn key_package_queries(authors: Vec<String>) -> Vec<DirectoryEventQue
             authors.clone(),
             count * KEY_PACKAGE_EVENTS_PER_AUTHOR,
         ),
-        DirectoryEventQuery::key_package_deletions(
-            authors,
-            count * KEY_PACKAGE_DELETIONS_PER_AUTHOR,
-        ),
+        DirectoryEventQuery::key_package_deletions(authors, KEY_PACKAGE_DELETIONS_READ),
     ]
+}
+
+/// Whether some relay returned a full page of `account`'s deletion requests.
+/// Older requests past the page were not read, and one of them may cover a
+/// slot that still selects.
+pub(crate) fn key_package_deletion_page_full(account: &str, records: &[RelayEventRecord]) -> bool {
+    let mut per_endpoint = std::collections::BTreeMap::<_, BTreeSet<_>>::new();
+    for record in records
+        .iter()
+        .filter(|record| record.event.kind == 5 && record.event.pubkey == account)
+    {
+        for endpoint in &record.endpoints {
+            per_endpoint
+                .entry(endpoint.as_str())
+                .or_default()
+                .insert(record.event.id.as_str());
+        }
+    }
+    per_endpoint
+        .values()
+        .any(|ids| ids.len() >= KEY_PACKAGE_DELETIONS_READ)
 }
 
 /// One account's selected KeyPackages, best first. `legacy_slots` only

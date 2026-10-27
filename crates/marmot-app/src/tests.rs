@@ -577,6 +577,8 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
     failing_endpoint: std::sync::Mutex<Option<String>>,
     failing_endpoint_kind: std::sync::Mutex<Option<u64>>,
     fetch_gate_kind: std::sync::Mutex<Option<u64>>,
+    /// Answer every deletion proof with nothing, as a relay that lost them.
+    pub(crate) empty_deletion_proofs: std::sync::atomic::AtomicBool,
     fetch_gate: std::sync::Mutex<
         Option<(
             std::sync::Arc<tokio::sync::Notify>,
@@ -706,6 +708,16 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
                 .any(|endpoint| endpoint.0 == stalled)
         }) {
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if self
+            .empty_deletion_proofs
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && request
+                .queries
+                .iter()
+                .all(|query| targets_kind(query, Some(5)))
+        {
+            return Ok(Vec::new());
         }
         let single_author_only = self.key_packages_only_in_single_author.lock().unwrap();
         let multi_author_only = self.key_packages_only_in_multi_author.lock().unwrap();

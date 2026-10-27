@@ -2392,11 +2392,12 @@ impl AppClient {
         if !optional_app_components.is_empty() {
             changed_fields.push("image");
         }
+        // The people added, not their devices' KeyPackages.
         let mut audit_context = Self::local_human_action_context(
             "create_group",
             changed_fields,
             touched_components,
-            Some(members.len() as u64),
+            Some(resolved.stats.unique_members as u64),
         );
 
         request.members = members;

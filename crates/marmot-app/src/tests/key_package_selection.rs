@@ -271,6 +271,55 @@ async fn deletion_by_slot_address_or_event_id_skips_a_slot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_page_of_deletion_requests_fails_the_lookup() {
+    // Account 0 alone, then beside another account, whose batch defers the
+    // decision to the single-author read and recovery.
+    for count in [1, 2] {
+        let (_dir, app, accounts, fetcher) = member_resolution_fixture(count, false).await;
+        let account = &accounts[0];
+        let now = unix_now_seconds();
+        let mut deletions = (0..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT)
+            .map(|index| {
+                signed_deletion(
+                    &app,
+                    account,
+                    vec![
+                        slot_address(account, &format!("retired-{index}")),
+                        vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+                    ],
+                    now - 100,
+                )
+            })
+            .collect::<Vec<_>>();
+        let last = deletions.pop().unwrap();
+        fetcher.events.lock().unwrap().extend(deletions);
+        let refs = accounts
+            .iter()
+            .map(|account| account.account_id_hex.as_str())
+            .collect::<Vec<_>>();
+        // One short of a page proves the read held every request.
+        assert_eq!(
+            app.directory()
+                .resolve_member_key_packages(&refs)
+                .await
+                .unwrap()
+                .len(),
+            count
+        );
+        fetcher.events.lock().unwrap().push(last);
+        let error = app
+            .directory()
+            .resolve_member_key_packages(&refs)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, DirectoryError::DirectoryLookupIncomplete(id) if *id == account.account_id_hex),
+            "an unread deletion request may cover the selected slot: {error:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn last_resort_packages_rank_after_the_rest() {
     let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
     let account = &accounts[0];
