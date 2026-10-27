@@ -32,6 +32,13 @@
   session methods that nothing called are gone:
   `set_message_draft_commit_observer`, `delete_key_package` and
   `create_group_with_audit_context`.
+- The lower stack's log events carry the module that emits them (mdk#2602).
+  Session events move from the `cgka_session::session` target to
+  `marmot_session::session`, and the account-device runtime's from
+  `marmot_account::runtime` to `marmot_session::runtime`. A log filter that
+  named an old target or the `marmot_account` crate must name the new target
+  to keep these events. Account-home events keep `marmot_account::home`, and
+  every event keeps its fields, level, message and `method`.
 - What an error reports depends on what it is, not on which lower-stack
   layers wrapped it (mdk#2602). Three answers change:
   - A storage failure that the account session reported itself is now the

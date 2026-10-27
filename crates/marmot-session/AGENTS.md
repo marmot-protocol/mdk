@@ -106,7 +106,13 @@ the session's `tests/session_lifecycle.rs`, `tests/nostr_stack.rs` and `tests/no
 - Roll back pending work when publication fails before any external exposure is possible. Once publication intent is
   durable and a relay may have accepted work, retain the journaled state and retry the exact or replaceable publication
   instead.
+
+### Logs
+
 - Do not log account ids, group ids, relay URLs, message ids, pubkeys, payloads, ciphertext, plaintext, or key material.
+- Give every event explicit `target` and `method` fields (`docs/marmot-architecture/overview/observability.md`). Each
+  target is `marmot_session::<module>`, the module that emits the event: `marmot_session::session` or
+  `marmot_session::runtime` today.
 
 ## Verification
 

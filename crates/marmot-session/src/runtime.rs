@@ -62,7 +62,7 @@ use crate::time::{
     WallClock,
 };
 
-const TRACE_TARGET: &str = "marmot_account::runtime";
+const TRACE_TARGET: &str = "marmot_session::runtime";
 const WELCOME_PUBLISH_CONCURRENCY: usize = 8;
 const KEY_PACKAGE_MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
 const KEY_PACKAGE_REFRESH_MIN_LEAD_SECS: u64 = 14 * 24 * 60 * 60;
