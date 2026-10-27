@@ -339,9 +339,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `advance_post_join_maintenance_subscriptions` keeps a group's session while its fetch is owed, whatever phase commits
   moved the obligation to, and ends the fetch only through `settle_post_join_history_fetch`: `Fetched` needs the
   session's qualified boundary, open native ingress and the adapter's placement verdict for that subscription, and
-  the deadline expires only a session whose boundary has not qualified. Its recovery job is keyed by the fetch alone,
-  so a re-armed obligation cannot delete its session's demand. A session installed for another fetch id (an earlier
-  copy) never ends the current one. The fetch never moves the obligation, so self-update timing stays the
+  the deadline expires only a session whose boundary has not qualified. While a fetch is owed, its session is
+  requested and retained under the fetch's job alone; an early-phase obligation (a re-armed one, or an earlier copy's
+  after a replacement Welcome) keeps the session alive but never picks its job. A session installed for another fetch
+  id (an earlier copy), or whose demand is gone before its boundary qualified, never ends the current one. The fetch never moves the obligation, so self-update timing stays the
   obligation's own.
 - Keep `MarmotAppRuntime::shutdown_and_close` the one terminal teardown for hosts whose process can be suspended: it
   closes admission, closes every SQLite database and releases the root runtime lease first, then gives graceful worker

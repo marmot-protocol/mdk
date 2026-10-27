@@ -5321,6 +5321,8 @@ mod tests {
 
     /// A replacement Welcome starts a new fetch. The session installed for the
     /// earlier copy ran before that copy existed, so its EOSE cannot end it.
+    /// The earlier copy's obligation stays in `CatchUp`, yet the new session is
+    /// the new fetch's, so a commit before its EOSE does not orphan it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_replacement_welcome_starts_a_new_post_join_history_fetch() {
         use cgka_traits::storage::MaintenanceStorage;
@@ -5331,8 +5333,9 @@ mod tests {
         install_post_join_session(&mut client).await;
         let (first_session, _) = client.post_join_maintenance_subscriptions[&group].clone();
 
-        // The Welcome join rewrites the group's maintenance state.
-        storage.delete_maintenance_obligation(&first).unwrap();
+        // The Welcome join rewrites the group's maintenance state and adds its
+        // own obligation. The earlier copy's stays live until maintenance sees
+        // that its leaf has rotated.
         let second = owe_post_join_history_fetch(&storage, &group, 65);
         crate::tests::report_scripted_eose(
             &app.relay_plane,
@@ -5357,6 +5360,82 @@ mod tests {
         );
 
         install_post_join_session(&mut client).await;
+        client
+            .runtime
+            .note_valid_state_bearing_input(&group)
+            .unwrap();
+        for obligation in [&first, &second] {
+            assert_eq!(
+                storage
+                    .maintenance_obligation(obligation)
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                cgka_traits::MaintenancePhase::Quiet
+            );
+        }
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        let fetched = client
+            .runtime
+            .post_join_history_fetch(&group)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.obligation_id, second);
+        assert_eq!(
+            fetched.completion.map(|completion| completion.outcome),
+            Some(cgka_traits::PostJoinHistoryFetchOutcome::Fetched)
+        );
+    }
+
+    /// A grant selected for the earlier copy's demand can install its session
+    /// after a replacement Welcome. That demand is the earlier fetch's, so the
+    /// next pass deletes it; the session is requested again under the new
+    /// fetch's own demand, whose EOSE ends the fetch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_granted_before_a_replacement_welcome_is_requested_again() {
+        let (_directory, app, relay, _pump, mut client, group) =
+            post_join_fetch_fixture("stale grant").await;
+        let storage = app.account_storage("alice").unwrap();
+        owe_post_join_history_fetch(&storage, &group, 66);
+        client.recovery_owner.test_advance_to_retry(&storage);
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        let grant = client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let second = owe_post_join_history_fetch(&storage, &group, 67);
+        client.run_recovery_grant_for_test(grant).await.unwrap();
+        let (stale_session, _) = client.post_join_maintenance_subscriptions[&group].clone();
+        client
+            .runtime
+            .note_valid_state_bearing_input(&group)
+            .unwrap();
+
+        install_post_join_session(&mut client).await;
+        assert_ne!(
+            client.post_join_maintenance_subscriptions[&group].0,
+            stale_session
+        );
         crate::tests::report_scripted_eose(
             &app.relay_plane,
             &relay,

@@ -1602,6 +1602,7 @@ impl AppClient {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut waits = Vec::new();
+        let mut fetch_jobs = HashMap::new();
 
         for group in self.state.groups.clone() {
             let group_id = match hex::decode(&group.group_id_hex) {
@@ -1650,26 +1651,25 @@ impl AppClient {
                             | cgka_traits::MaintenancePhase::Grace
                     )
             });
-            // An owed fetch keeps the recovery job its obligation had in
-            // CatchUp, whatever commits, or a superseded self-update's re-arm,
-            // have done to that obligation since, so its installed session
-            // stays checkpointable. Only a Quiet obligation is ever re-armed.
+            // An owed fetch owns its session's recovery job: the one its
+            // obligation had in CatchUp, whatever commits, or a superseded
+            // self-update's re-arm, have done to that obligation since. Only a
+            // Quiet obligation is ever re-armed. An early-phase obligation,
+            // even an earlier copy's after a replacement Welcome, keeps the
+            // session alive but never picks its job.
             let fetch_job = fetch
                 .as_ref()
                 .map(|fetch| maintenance_recovery_job(&fetch.obligation_id, 0))
                 .transpose()?;
-            let job = match prerequisite {
-                Some(prerequisite) => Some(maintenance_recovery_job(
-                    &prerequisite.id,
-                    prerequisite.semantic_rearm_count,
-                )?),
-                None => fetch_job.clone(),
-            };
-            let Some(job) = job else {
-                continue;
+            let job = match (&fetch_job, prerequisite) {
+                (Some(fetch_job), _) => fetch_job.clone(),
+                (None, Some(prerequisite)) => {
+                    maintenance_recovery_job(&prerequisite.id, prerequisite.semantic_rearm_count)?
+                }
+                (None, None) => continue,
             };
             if let Some(fetch_job) = fetch_job {
-                active_jobs.push((fetch_job, group_id.as_slice().to_vec()));
+                fetch_jobs.insert(group_id.as_slice().to_vec(), fetch_job);
             }
             waits.push(PostJoinWait {
                 group_id,
@@ -1678,7 +1678,15 @@ impl AppClient {
                 obligation_waits: prerequisite.is_some(),
             });
         }
+        // A group with an owed fetch keeps only the fetch's demand.
+        active_jobs.retain(|(_, group)| !fetch_jobs.contains_key(group));
+        active_jobs.extend(fetch_jobs.into_iter().map(|(group, job)| (job, group)));
         app.retain_recovery_maintenance_jobs(&active_jobs)?;
+        let live_demands = if self.post_join_history_sessions.is_empty() {
+            Vec::new()
+        } else {
+            app.recovery_revision_fence()?.obligations
+        };
         let mut waiting = HashSet::new();
         let mut ended_jobs = Vec::new();
 
@@ -1700,7 +1708,16 @@ impl AppClient {
             }
             // A session installed for an earlier copy's fetch cannot end the
             // fetch a replacement Welcome started: its REQ ran before that
-            // copy existed.
+            // copy existed. Nor can one whose demand is gone before its
+            // boundary qualified, as when a grant selected before that Welcome
+            // installed it under the earlier job: no checkpoint qualifies it.
+            let demand_live = self
+                .recovery_owner
+                .maintenance_observations
+                .get(&group_id)
+                .is_some_and(|observation| {
+                    live_demands.iter().any(|(id, _)| *id == observation.id)
+                });
             if let Some(fetch) = &wait.fetch
                 && let Some((subscription, _)) = self
                     .post_join_maintenance_subscriptions
@@ -1709,7 +1726,9 @@ impl AppClient {
                 && self
                     .post_join_history_sessions
                     .get(&subscription)
-                    .is_none_or(|session| session.fetch != *fetch)
+                    .is_none_or(|session| {
+                        session.fetch != *fetch || (!session.boundary && !demand_live)
+                    })
             {
                 if let Err(_error) = self
                     .adapter
