@@ -109,10 +109,20 @@ pub const ACCOUNT_IDENTITY_PROOF_COMPONENT_ID: AppComponentId = 0x8009;
 // not assign.
 pub const GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID: AppComponentId = 0x800b;
 pub const GROUP_LIFECYCLE_COMPONENT_ID: AppComponentId = 0x800c;
+/// `marmot.group.account-devices.v1`: lets a member add and remove leaves of
+/// its own account without admin authority once a group requires it. It has
+/// no data at any location; its id appears only in `app_components` support
+/// and required lists.
+pub const ACCOUNT_DEVICES_COMPONENT_ID: AppComponentId = 0x800d;
+
+/// `max_leaves_per_account` of `marmot.group.account-devices.v1`: while a
+/// group requires the component, no account holds more current leaves than
+/// this. Fixed for the component id; a different cap needs a new id.
+pub const MAX_LEAVES_PER_ACCOUNT: usize = 20;
 
 /// First component id applications may allocate for themselves.
 ///
-/// The protocol registry allocates upward from `0x8001` and is at `0x800c`
+/// The protocol registry allocates upward from `0x8001` and is at `0x800d`
 /// today, so "any private-use id the registry has not taken yet" is not a
 /// safe rule for applications: an id chosen that way can be assigned by a
 /// later registry entry, stranding state already committed in live groups.
@@ -152,6 +162,7 @@ pub const PROTOCOL_OWNED_APP_COMPONENT_IDS: &[AppComponentId] = &[
     ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
     GROUP_LIFECYCLE_COMPONENT_ID,
+    ACCOUNT_DEVICES_COMPONENT_ID,
 ];
 
 /// Lookup key for the encrypted-media secret in the
@@ -175,6 +186,7 @@ pub const GROUP_ENCRYPTED_MEDIA_COMPONENT: &str = GROUP_ENCRYPTED_MEDIA_V1_COMPO
 pub const ACCOUNT_IDENTITY_PROOF_COMPONENT: &str = "marmot.member.account-identity-proof.v2";
 pub const GROUP_ENCRYPTED_MEDIA_V2_COMPONENT: &str = "marmot.group.encrypted-media.v2";
 pub const GROUP_LIFECYCLE_COMPONENT: &str = "marmot.group.lifecycle.v1";
+pub const ACCOUNT_DEVICES_COMPONENT: &str = "marmot.group.account-devices.v1";
 pub const ENCRYPTED_MEDIA_FORMAT_V1: &str = "encrypted-media-v1";
 pub const ENCRYPTED_MEDIA_FORMAT_V2: &str = "encrypted-media-v2";
 pub const BLOSSOM_LOCATOR_KIND_V1: &str = "blossom-v1";

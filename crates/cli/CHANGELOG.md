@@ -24,6 +24,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 - `groups members`, `groups show` and `groups management` list each member account once, even when it has several
   devices in the group, and each `members` entry gains `device_count` (mdk#2628). Member counts, admin counts and the
   last-admin check count accounts, and a chat between two accounts stays direct whatever devices either person uses.
+- MDK now enforces `marmot.group.account-devices.v1` (0x800d) in groups that require it (mdk#2628). In such a group
+  nothing carries data for it (GroupContext, leaves, added KeyPackages) and no AppDataUpdate targets it, every leaf
+  supports it, no account holds more than 20 leaves, and the group never stops requiring it. A Commit or standalone
+  proposal that breaks a rule is rejected. MDK does not advertise 0x800d yet, so it cannot be in such a group; groups
+  that don't require it behave as before, and data under 0x800d there is still unknown data. The engine builder now
+  refuses to advertise a protocol component id the engine does not implement, such as SafeAAD (0x0002) and 0x800d.
 - JSON error codes now depend on what an error is, not on which MDK layers wrapped it (mdk#2602). Two codes change.
   A storage failure from the account session or the engine now always reports `engine_error`. Before, some paths
   reported `command_failed`. An external-signer rejection now reports `command_failed`, with

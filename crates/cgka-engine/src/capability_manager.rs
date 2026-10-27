@@ -26,7 +26,9 @@
 
 use crate::capabilities::{capabilities_of_key_package, capabilities_of_leaf};
 use crate::engine::Engine;
-use cgka_traits::capabilities::{Feature, FeatureStatus, GroupCapabilities, RequirementLevel};
+use cgka_traits::capabilities::{
+    Capability, Feature, FeatureStatus, GroupCapabilities, RequirementLevel,
+};
 use cgka_traits::error::EngineError;
 use cgka_traits::group::Member as MarmotMember;
 use cgka_traits::storage::StorageProvider;
@@ -331,6 +333,16 @@ impl<S: StorageProvider> Engine<S> {
                 continue;
             }
             if already_required.contains(&cap) {
+                continue;
+            }
+            // Requiring account-devices is an explicit admin decision that a
+            // group can never undo (account-devices-v1.md, "Activation in an
+            // existing group"), so an upgrade never adds it by itself.
+            if cap
+                == Capability::AppComponent(
+                    cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID,
+                )
+            {
                 continue;
             }
             // Check every member supports.
