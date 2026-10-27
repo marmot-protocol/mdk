@@ -113,6 +113,9 @@
   left from `departed_members` and `GroupStateChanged`, and that this device
   was removed from `LocalGroupCopyTerminated`. MarmotKit and the C ABI
   already left the leaves out.
+- `marmot_app::product_analytics::configure_product_analytics_from_environment`
+  no longer resolves (mdk#2627). Hosts call the same function as
+  `marmot_app::configure_product_analytics_from_environment`, as before.
 
 ### Fixed
 
