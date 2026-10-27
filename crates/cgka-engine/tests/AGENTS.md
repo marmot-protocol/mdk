@@ -153,9 +153,11 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `account_devices.rs`
   - **Owns:** The `marmot.group.account-devices.v1` (0x800d) rules in groups that require it: no data, support, the
-    per-account leaf limit, never un-require. Each rule is checked by the committer, by replay of a raw OpenMLS commit,
-    and at ingest for standalone proposals; before activation, and on the legacy profile, 0x800d data stays unknown
-    data. Needs `test-policy-overrides` or `test-conformance-snapshot`.
+    per-account leaf limit, never un-require, and Welcome acceptance. Each rule is checked by the committer, by replay
+    of a raw OpenMLS commit, at ingest for standalone proposals, and by the joiner of a raw OpenMLS Welcome, which
+    applies the state rules and the GroupInfo rule and accepts a Welcome from its own account; before activation, and
+    on the legacy profile, 0x800d data stays unknown data and only an admin's Welcome joins. Needs
+    `test-policy-overrides` or `test-conformance-snapshot`.
 
 - **File:** `epoch_sealed_transport.rs`
   - **Owns:** Engine behavior under production transport visibility via `support::epoch_sealed_peeler` — the sealing

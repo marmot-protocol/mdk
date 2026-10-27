@@ -1,19 +1,22 @@
 //! `marmot.group.account-devices.v1` (0x800d) resulting-state rules
-//! (account-devices-v1.md; mdk#2628 item 2.1b).
+//! (account-devices-v1.md; mdk#2628 items 2.1b and 2.1d).
 //!
 //! Covers, for a group whose GroupContext `app_components` list requires
 //! 0x800d:
-//! - No data: no 0x800d entry in the GroupContext, in any leaf, or in an added
-//!   KeyPackage, and no AppDataUpdate for it.
+//! - No data: no 0x800d entry in the GroupContext, in any leaf, in an added
+//!   KeyPackage, or in a Welcome's GroupInfo, and no AppDataUpdate for it.
 //! - Support: every leaf advertises 0x800d.
 //! - Leaf limit: at most `MAX_LEAVES_PER_ACCOUNT` leaves per account.
 //! - Never un-require: no Commit or standalone proposal drops 0x800d from the
 //!   required list.
+//! - Welcome acceptance: a device joins through a Welcome from a device of its
+//!   own account, as through an admin's.
 //!
 //! Each rule is shown from the committer's side (the engine refuses to send)
 //! and the receiver's side (a commit crafted with raw OpenMLS is dropped by
-//! replay, and a crafted standalone proposal is rejected at ingest). Before a
-//! group requires 0x800d, its data is accepted like any unknown component's.
+//! replay, a crafted standalone proposal is rejected at ingest, and a joiner
+//! refuses a crafted Welcome). Before a group requires 0x800d, its data is
+//! accepted like any unknown component's, and only an admin's Welcome joins.
 //! The builder only lets these tests advertise 0x800d through the test-only
 //! escape hatch, so the file needs one of the test features.
 #![cfg(any(
@@ -34,11 +37,15 @@ use cgka_traits::app_components::{
     default_group_components, encode_components_list,
 };
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
-use cgka_traits::engine::{CgkaEngine, CreateGroupRequest, KeyPackage, SendIntent, SendResult};
+use cgka_traits::engine::{
+    CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
+};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
-use cgka_traits::ingest::{IngestOutcome, PeeledContent, PeeledMessage, ProposalRejectionCategory};
+use cgka_traits::ingest::{
+    IngestOutcome, InputRejectionCategory, PeeledContent, PeeledMessage, ProposalRejectionCategory,
+};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{AccountDeviceSignerStorage, StorageProvider};
 use cgka_traits::transport::{
@@ -46,12 +53,14 @@ use cgka_traits::transport::{
 };
 use cgka_traits::types::{GroupId, MemberId, MessageId};
 use openmls::component::ComponentData;
-use openmls::extensions::{AppDataDictionaryExtension, Extension, ExtensionValidator, Extensions};
+use openmls::extensions::{
+    AppDataDictionary, AppDataDictionaryExtension, Extension, ExtensionValidator, Extensions,
+};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateOperation, AppDataUpdateProposal, Proposal};
 use openmls::prelude::{
-    CredentialWithKey, KeyPackage as MlsKeyPackage, LeafNode, LeafNodeParameters, MlsMessageBodyIn,
-    MlsMessageIn, MlsMessageOut, ProtocolVersion,
+    CommitMessageBundle, CredentialWithKey, KeyPackage as MlsKeyPackage, LeafNode,
+    LeafNodeParameters, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProtocolVersion,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::{OpenMlsRustCrypto, RustCrypto};
@@ -551,6 +560,56 @@ fn crafted_commit(
     app_data: Vec<AppDataUpdateProposal>,
     leaf_extensions: Option<Extensions<LeafNode>>,
 ) -> TransportMessage {
+    let bundle = crafted_bundle(sender, gid, &adds, app_data, leaf_extensions, vec![]);
+    group_transport(bundle.into_commit(), gid, "crafted-commit")
+}
+
+/// The Welcome of a Commit `sender` builds as [`crafted_commit`] does, for
+/// `recipient`'s account. `group_info_extensions` go into its GroupInfo
+/// beside the ratchet tree. The Commit itself reaches nobody.
+fn crafted_welcome(
+    sender: &Device,
+    gid: &GroupId,
+    adds: &[KeyPackage],
+    app_data: Vec<AppDataUpdateProposal>,
+    group_info_extensions: Vec<Extension>,
+    recipient: &Device,
+) -> TransportMessage {
+    let bundle = crafted_bundle(sender, gid, adds, app_data, None, group_info_extensions);
+    let payload = bundle
+        .into_welcome_msg()
+        .expect("a Commit that adds members has a Welcome")
+        .tls_serialize_detached()
+        .unwrap();
+    TransportMessage {
+        id: hash_id(&payload),
+        payload,
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("crafted-welcome".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: recipient.engine.self_id(),
+        },
+    }
+}
+
+/// A GroupInfo `app_data_dictionary` with an entry under 0x800d.
+fn group_info_account_devices_entry() -> Vec<Extension> {
+    let mut dictionary = AppDataDictionary::default();
+    dictionary.insert(ACCOUNT_DEVICES_COMPONENT_ID, vec![1]);
+    vec![Extension::AppDataDictionary(
+        AppDataDictionaryExtension::new(dictionary),
+    )]
+}
+
+fn crafted_bundle(
+    sender: &Device,
+    gid: &GroupId,
+    adds: &[KeyPackage],
+    app_data: Vec<AppDataUpdateProposal>,
+    leaf_extensions: Option<Extensions<LeafNode>>,
+    group_info_extensions: Vec<Extension>,
+) -> CommitMessageBundle {
     let crypto = RustCrypto::default();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, sender.storage.mls_storage());
@@ -571,6 +630,11 @@ fn crafted_commit(
         );
     }
     let mut builder = builder.load_psks(provider.storage()).unwrap();
+    if !group_info_extensions.is_empty() {
+        builder = builder
+            .create_group_info_with_extensions(group_info_extensions)
+            .unwrap();
+    }
     let mut updater = builder.app_data_dictionary_updater();
     for proposal in builder.app_data_update_proposals() {
         match proposal.operation() {
@@ -598,7 +662,7 @@ fn crafted_commit(
         .expect("raw OpenMLS stages the commit");
     // Leave the sender's engine as it was, so it can still commit.
     group.clear_pending_commit(provider.storage()).unwrap();
-    group_transport(bundle.into_commit(), gid, "crafted-commit")
+    bundle
 }
 
 fn required_list_update(ids: &AppComponentSet) -> AppDataUpdateProposal {
@@ -1157,6 +1221,14 @@ async fn legacy_groups_are_not_subject_to_the_rules() {
     .await;
     assert_accepted(&mut bob, &require_with_data, &gid).await;
     assert!(requires_account_devices(&alice.engine, &gid));
+    // Only an admin adds here, even another device of the author's account.
+    let mut bob_laptop = legacy_device(b"bob");
+    let bob_laptop_kp = bob_laptop.engine.fresh_key_package().await.unwrap();
+    let welcome = crafted_welcome(&bob, &gid, &[bob_laptop_kp], vec![], vec![], &bob_laptop);
+    assert_eq!(
+        join_outcome(&mut bob_laptop, &welcome).await,
+        refused(InputRejectionCategory::AuthorizationFailed)
+    );
     let removes_entry = crafted_commit(
         &alice,
         &gid,
@@ -1168,4 +1240,223 @@ async fn legacy_groups_are_not_subject_to_the_rules() {
     let ids = without_account_devices(required(&alice.engine, &gid));
     let unrequire = send_commit(&mut alice, update_required(&gid, &ids), &gid).await;
     assert_accepted(&mut bob, &unrequire, &gid).await;
+}
+
+// ── Welcome acceptance ──────────────────────────────────────────────────────
+
+async fn join_outcome(joiner: &mut Device, welcome: &TransportMessage) -> IngestOutcome {
+    joiner.engine.ingest(welcome.clone()).await.unwrap()
+}
+
+fn refused(category: InputRejectionCategory) -> IngestOutcome {
+    IngestOutcome::Ignored { category }
+}
+
+/// `joiner` joins `gid` through `welcome`, and names `author` as its author.
+async fn assert_joins(
+    joiner: &mut Device,
+    welcome: &TransportMessage,
+    gid: &GroupId,
+    author: &Device,
+) {
+    assert_eq!(
+        join_outcome(joiner, welcome).await,
+        IngestOutcome::Processed
+    );
+    let welcomers: Vec<_> = joiner
+        .engine
+        .drain_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            GroupEvent::GroupJoined {
+                group_id, welcomer, ..
+            } if &group_id == gid => welcomer,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(welcomers, vec![author.engine.self_id()]);
+}
+
+fn is_admin(device: &Device, gid: &GroupId) -> bool {
+    let id = device.engine.self_id();
+    device
+        .engine
+        .admin_pubkeys(gid)
+        .unwrap()
+        .iter()
+        .any(|admin| admin.as_slice() == id.as_slice())
+}
+
+/// Bob's group, requiring 0x800d when `require` is set, with Alice's phone as
+/// a member who is not an admin, and Alice's laptop, which has not joined.
+async fn alice_and_a_new_device(require: bool) -> (Device, Device, Device, GroupId) {
+    let mut bob = device(b"bob", true);
+    let mut phone = device(b"alice", true);
+    let laptop = device(b"alice", true);
+    let phone_kp = phone.engine.fresh_key_package().await.unwrap();
+    let gid = found_group(&mut bob, vec![phone_kp], require, &mut [&mut phone]).await;
+    assert!(!is_admin(&phone, &gid));
+    (bob, phone, laptop, gid)
+}
+
+#[tokio::test]
+async fn a_device_joins_through_its_own_accounts_welcome_once_required() {
+    let (bob, phone, mut laptop, gid) = alice_and_a_new_device(true).await;
+    let laptop_kp = laptop.engine.fresh_key_package().await.unwrap();
+    let welcome = crafted_welcome(&phone, &gid, &[laptop_kp], vec![], vec![], &laptop);
+
+    assert_joins(&mut laptop, &welcome, &gid, &phone).await;
+    assert!(requires_account_devices(&laptop.engine, &gid));
+    let leaves_of = |account: &Device| {
+        let id = account.engine.self_id();
+        laptop
+            .engine
+            .members(&gid)
+            .unwrap()
+            .iter()
+            .filter(|member| member.id == id)
+            .count()
+    };
+    assert_eq!((leaves_of(&phone), leaves_of(&bob)), (2, 1));
+}
+
+#[tokio::test]
+async fn an_own_account_welcome_is_refused_before_account_devices_is_required() {
+    let (_bob, phone, mut laptop, gid) = alice_and_a_new_device(false).await;
+    let laptop_kp = laptop.engine.fresh_key_package().await.unwrap();
+    let welcome = crafted_welcome(&phone, &gid, &[laptop_kp], vec![], vec![], &laptop);
+
+    assert_eq!(
+        join_outcome(&mut laptop, &welcome).await,
+        refused(InputRejectionCategory::AuthorizationFailed)
+    );
+    assert!(laptop.engine.epoch(&gid).is_err());
+}
+
+#[tokio::test]
+async fn another_accounts_non_admin_cannot_add_even_once_required() {
+    let mut bob = device(b"bob", true);
+    let mut phone = device(b"alice", true);
+    let mut carol = device(b"carol", true);
+    let phone_kp = phone.engine.fresh_key_package().await.unwrap();
+    let carol_kp = carol.engine.fresh_key_package().await.unwrap();
+    let gid = found_group(
+        &mut bob,
+        vec![phone_kp, carol_kp],
+        true,
+        &mut [&mut phone, &mut carol],
+    )
+    .await;
+
+    // Carol is no admin, and neither joiner is of her account, even the one
+    // whose account is already a member.
+    let mut laptop = device(b"alice", true);
+    let mut dave = device(b"dave", true);
+    for joiner in [&mut laptop, &mut dave] {
+        let kp = joiner.engine.fresh_key_package().await.unwrap();
+        let welcome = crafted_welcome(&carol, &gid, &[kp], vec![], vec![], joiner);
+        assert_eq!(
+            join_outcome(joiner, &welcome).await,
+            refused(InputRejectionCategory::AuthorizationFailed)
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_group_info_with_account_devices_data_is_refused_once_required() {
+    let (bob, phone, mut laptop, gid) = alice_and_a_new_device(true).await;
+    let mut dave = device(b"dave", true);
+    let dave_kp = dave.engine.fresh_key_package().await.unwrap();
+    let laptop_kp = laptop.engine.fresh_key_package().await.unwrap();
+
+    // An admin's Welcome and a same-account Welcome alike. Without the entry,
+    // the same Add joins.
+    for (author, joiner, kp) in [(&bob, &mut dave, dave_kp), (&phone, &mut laptop, laptop_kp)] {
+        let welcome = crafted_welcome(
+            author,
+            &gid,
+            std::slice::from_ref(&kp),
+            vec![],
+            group_info_account_devices_entry(),
+            joiner,
+        );
+        assert_eq!(
+            join_outcome(joiner, &welcome).await,
+            refused(InputRejectionCategory::InvalidEncoding)
+        );
+        let welcome = crafted_welcome(author, &gid, &[kp], vec![], vec![], joiner);
+        assert_joins(joiner, &welcome, &gid, author).await;
+    }
+}
+
+#[tokio::test]
+async fn a_group_info_with_account_devices_data_is_unknown_data_before_activation() {
+    let (bob, _phone, _laptop, gid) = alice_and_a_new_device(false).await;
+    let mut dave = device(b"dave", true);
+    let dave_kp = dave.engine.fresh_key_package().await.unwrap();
+    let welcome = crafted_welcome(
+        &bob,
+        &gid,
+        &[dave_kp],
+        vec![],
+        group_info_account_devices_entry(),
+        &dave,
+    );
+    assert_joins(&mut dave, &welcome, &gid, &bob).await;
+}
+
+/// The state rules the members apply to every Commit apply to the state a
+/// Welcome joins, whoever authored it.
+#[tokio::test]
+async fn a_joined_state_breaking_the_rules_is_refused() {
+    let mut alice = device(b"alice", true);
+    let mut carol = device(b"carol", true);
+    let mut dave = device(b"dave", true);
+    let carol_kp = carol.engine.fresh_key_package().await.unwrap();
+    let dave_kp = dave.engine.fresh_key_package().await.unwrap();
+    let bob_kp = device(b"bob", true)
+        .engine
+        .fresh_key_package()
+        .await
+        .unwrap();
+    let founders: Vec<_> = [carol_kp, bob_kp.clone()]
+        .into_iter()
+        .chain((1..MAX_LEAVES_PER_ACCOUNT).map(|_| sibling_key_package(&bob_kp, b"bob")))
+        .collect();
+    let gid = found_group(&mut alice, founders, true, &mut [&mut carol]).await;
+    let unsupported = device(b"erin", false)
+        .engine
+        .fresh_key_package()
+        .await
+        .unwrap();
+    let mut frank = device(b"frank", true);
+    let leaf_data = key_package_with_account_devices_data(&mut frank, true, false).await;
+
+    for (rule, extra, app_data) in [
+        (
+            "leaf limit",
+            vec![sibling_key_package(&bob_kp, b"bob")],
+            vec![],
+        ),
+        ("support", vec![unsupported], vec![]),
+        ("no leaf data", vec![leaf_data], vec![]),
+        (
+            "no GroupContext data",
+            vec![],
+            vec![AppDataUpdateProposal::update(
+                ACCOUNT_DEVICES_COMPONENT_ID,
+                vec![1],
+            )],
+        ),
+    ] {
+        let adds: Vec<_> = extra.into_iter().chain([dave_kp.clone()]).collect();
+        let welcome = crafted_welcome(&alice, &gid, &adds, app_data, vec![], &dave);
+        assert_eq!(
+            join_outcome(&mut dave, &welcome).await,
+            refused(InputRejectionCategory::InvalidEncoding),
+            "{rule}"
+        );
+    }
+    let welcome = crafted_welcome(&alice, &gid, &[dave_kp], vec![], vec![], &dave);
+    assert_joins(&mut dave, &welcome, &gid, &alice).await;
 }

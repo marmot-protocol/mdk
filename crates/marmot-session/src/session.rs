@@ -104,6 +104,8 @@ pub struct SessionConfig {
     recorder: Option<Box<dyn ForensicRecorder>>,
     maintenance_sources: Option<(Arc<dyn WallClock>, Arc<dyn MaintenanceRandom>)>,
     defer_group_hydration: bool,
+    #[cfg(feature = "test-policy-overrides")]
+    allow_account_devices_advertising: bool,
 }
 
 /// Where [`AccountDeviceSession::open`] gets its database connection.
@@ -176,6 +178,8 @@ impl SessionConfig {
             recorder: None,
             maintenance_sources: None,
             defer_group_hydration: false,
+            #[cfg(feature = "test-policy-overrides")]
+            allow_account_devices_advertising: false,
         }
     }
 
@@ -217,6 +221,15 @@ impl SessionConfig {
         components: impl IntoIterator<Item = AppComponentId>,
     ) -> Self {
         self.supported_app_components = AppComponentSet::new(components);
+        self
+    }
+
+    /// Let [`Self::supported_app_components`] include
+    /// `marmot.group.account-devices.v1`, which the engine enforces but does
+    /// not advertise yet (mdk#2628, item 2.2). Test builds only.
+    #[cfg(feature = "test-policy-overrides")]
+    pub fn allow_account_devices_advertising_for_tests(mut self) -> Self {
+        self.allow_account_devices_advertising = true;
         self
     }
 
@@ -485,6 +498,12 @@ impl AccountDeviceSession {
                 )
                 .into());
             }
+            builder
+        };
+        #[cfg(feature = "test-policy-overrides")]
+        let builder = if config.allow_account_devices_advertising {
+            builder.allow_account_devices_advertising_for_tests()
+        } else {
             builder
         };
         let mut builder = builder.peeler(config.peeler);
