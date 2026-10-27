@@ -88,8 +88,11 @@
   rumor per KeyPackage, and the roster lists each added device while that
   Commit awaits publication. Reissuing a lost invite leaves out a device that
   has not yet replaced the KeyPackage the lost invite consumed, while another
-  device of its account can still join. The creator's own other devices stay out of a new
-  group. `ResolvedMemberKeyPackages::key_packages` lists each account's
+  device of its account can still join. A lost invite that cannot re-add every
+  device it added, including a new device of an account already in the group,
+  is reported as a conflict that needs a new invite, never as applied. The
+  creator's own other devices stay out of a new group.
+  `ResolvedMemberKeyPackages::key_packages` lists each account's
   KeyPackages best first. Directory lookup returns the best of the same
   selection. Within one slot, a tie on `created_at` now goes to the lower
   event id, as NIP-01 says, where it went to the higher. Create and invite now

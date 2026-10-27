@@ -250,6 +250,10 @@ impl AppClient {
                 }
                 Err(error) => return Err(error.into()),
             };
+            // Only accounts with no device on the canonical roster are looked
+            // up again. A lost device of an account still in the group, or one
+            // left out below, is reported by the engine as needing a new
+            // invite (mdk#2628, D13).
             let mut members = Vec::new();
             for package in key_packages {
                 let metadata = self
@@ -344,7 +348,8 @@ impl AppClient {
 
 /// The lost invite consumed its packages, and the engine refuses to reissue
 /// one. A device that has not replaced its consumed package sits the reissue
-/// out while another device of its account can join. An account left with
+/// out while another device of its account can join, and the engine reports
+/// that device as needing a new invite. An account left with
 /// only consumed packages keeps them, so the reissue waits for a replacement
 /// as it does for a single-device account.
 fn without_consumed_packages<T>(packages: Vec<(String, bool, T)>) -> Vec<T> {
