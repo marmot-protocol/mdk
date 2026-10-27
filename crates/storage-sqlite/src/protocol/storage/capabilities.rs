@@ -1,11 +1,7 @@
 use crate::base::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, deserialize, serialize};
-use cgka_traits::capabilities::{
-    Capability, CapabilityRequirement, Feature, GroupCapabilities, RequirementLevel,
-};
-use cgka_traits::group::Member;
+use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::storage::{CapabilityStorage, StorageResult};
-use cgka_traits::types::{GroupId, MemberId};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -88,58 +84,16 @@ impl CapabilityStorage for SqliteAccountStorage {
             .map(|record| deserialize::<CapabilityRequirementRow>(&record).map(Into::into))
             .transpose()
     }
-
-    fn save_member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member: &Member,
-        capabilities: GroupCapabilities,
-    ) -> StorageResult<()> {
-        self.lock()?
-            .execute_cached(
-                "INSERT OR REPLACE INTO cgka_member_capabilities
-                    (group_id, member_id, capabilities)
-                 VALUES (?1, ?2, ?3)",
-                params![
-                    group_id.as_slice(),
-                    member.id.as_slice(),
-                    serialize(&capabilities)?
-                ],
-            )
-            .storage()?;
-        Ok(())
-    }
-
-    fn member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member_id: &MemberId,
-    ) -> StorageResult<Option<GroupCapabilities>> {
-        let record: Option<Vec<u8>> = self
-            .lock()?
-            .query_row_cached(
-                "SELECT capabilities FROM cgka_member_capabilities
-                 WHERE group_id = ?1 AND member_id = ?2",
-                params![group_id.as_slice(), member_id.as_slice()],
-                |row| row.get(0),
-            )
-            .optional()
-            .storage()?;
-        record.map(|record| deserialize(&record)).transpose()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::SqliteAccountStorage;
-    use crate::base::test_support::{gid, member_id, sample_group};
-    use cgka_traits::storage::GroupStorage;
 
     #[test]
-    fn feature_registry_and_member_capabilities_roundtrip() {
+    fn feature_registry_roundtrip() {
         let store = SqliteAccountStorage::in_memory().unwrap();
-        store.put_group(&sample_group(gid(1), 0, 1)).unwrap();
         let feature = Feature("self-remove");
         let requirement = CapabilityRequirement {
             requires: Capability::Proposal(10),
@@ -152,24 +106,6 @@ mod tests {
         assert_eq!(
             store.feature_requirement(&feature).unwrap(),
             Some(requirement)
-        );
-
-        let member = Member {
-            id: member_id(1),
-            credential: vec![],
-        };
-        let mut caps = GroupCapabilities::default();
-        caps.insert(Capability::Proposal(10));
-        store
-            .save_member_capabilities(&gid(1), &member, caps.clone())
-            .unwrap();
-        assert_eq!(
-            store.member_capabilities(&gid(1), &member.id).unwrap(),
-            Some(caps)
-        );
-        assert_eq!(
-            store.member_capabilities(&gid(2), &member.id).unwrap(),
-            None
         );
     }
 

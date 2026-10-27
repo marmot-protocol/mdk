@@ -1,7 +1,6 @@
 use super::format as snapshot_format;
 use super::rows::{
-    GroupStateCheckpoint, MemberCapabilitiesSnapshot, OpenMlsValueSnapshot, OrderedMessage,
-    OrderedQueuedOutbound, Snapshot,
+    GroupStateCheckpoint, OpenMlsValueSnapshot, OrderedMessage, OrderedQueuedOutbound, Snapshot,
 };
 #[cfg(feature = "test-conformance-replay")]
 use super::rows::{REPLAY_SNAPSHOT_VERSION, ReplaySnapshot};
@@ -15,7 +14,7 @@ use crate::{
     base::connection::retry_on_busy, deserialize,
 };
 use cgka_traits::storage::{StorageError, StorageResult};
-use cgka_traits::types::{GroupId, MemberId};
+use cgka_traits::types::GroupId;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
@@ -154,7 +153,6 @@ fn capture_snapshot(
         ),
         SnapshotScope::GroupState => (None, None),
     };
-    let member_caps = member_capabilities(conn, group_id)?;
     let convergence_policy = convergence_policy(conn, group_id)?;
     let validated_tree_marker = validated_tree_marker(conn, group_id)?;
     let openmls_values = openmls_values(conn, &mls_group_key)?;
@@ -163,7 +161,6 @@ fn capture_snapshot(
         group,
         messages,
         queued_outbound,
-        member_caps,
         convergence_policy,
         validated_tree_marker,
         openmls_values,
@@ -187,7 +184,6 @@ pub(super) fn capture_group_state(
 
     Ok(GroupStateCheckpoint {
         group: deserialize(&group_blob)?,
-        member_caps: member_capabilities(conn, group_id)?,
         validated_tree_marker: validated_tree_marker(conn, group_id)?,
         openmls_values: openmls_values(conn, &mls_group_key)?,
     })
@@ -248,34 +244,6 @@ fn queued_outbound(
             Ok(OrderedQueuedOutbound {
                 insert_order,
                 record: deserialize(&record)?,
-            })
-        })
-        .collect()
-}
-
-fn member_capabilities(
-    tx: &rusqlite::Connection,
-    group_id: &GroupId,
-) -> StorageResult<Vec<MemberCapabilitiesSnapshot>> {
-    let mut stmt = tx
-        .prepare_cached(
-            "SELECT member_id, capabilities FROM cgka_member_capabilities
-             WHERE group_id = ?1
-             ORDER BY member_id",
-        )
-        .storage()?;
-    let rows = stmt
-        .query_map(params![group_id.as_slice()], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })
-        .storage()?
-        .collect::<Result<Vec<_>, _>>()
-        .storage()?;
-    rows.into_iter()
-        .map(|(member_id, capabilities)| {
-            Ok(MemberCapabilitiesSnapshot {
-                member_id: MemberId::new(member_id),
-                capabilities: deserialize(&capabilities)?,
             })
         })
         .collect()

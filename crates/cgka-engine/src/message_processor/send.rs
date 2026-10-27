@@ -383,15 +383,18 @@ impl<S: StorageProvider> Engine<S> {
             welcomes.push(wrapped);
         }
 
-        // Cache invitees' capabilities NOW so `feature_status` reflects the
-        // pending invite immediately. Update the Marmot record with the
-        // projected post-merge member list — `members()` and
-        // `feature_status` walk this list, and users expect the API to
+        // Update the Marmot record with the projected post-merge member
+        // list — `members()` walks this list (and `feature_status` counts the
+        // pending commit's added leaves), and users expect the API to
         // reflect "what I just asked for" while the publish is pending.
         // Epoch stays at the pre-merge value; that updates on confirm.
         // On `publish_failed`, the engine re-derives from the (still-
         // unmerged) MLS state, which naturally drops the projection.
-        crate::capability_manager::cache_from_key_packages(&self.storage, &group_id, &parsed_kps)?;
+        crate::capability_manager::check_key_package_profiles(
+            &self.storage,
+            &group_id,
+            &parsed_kps,
+        )?;
         let mut group_record = existing;
         group_record.members =
             crate::group_lifecycle::projected_members_with_pending(&mls_group, &parsed_kps)?;

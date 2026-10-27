@@ -29,7 +29,8 @@ MIP-03 admin rules, and returns typed outcomes for every ingest path.
   without polluting convergence replay.
 - Resolves same-epoch forks deterministically through stored-message distributed convergence.
 - Retains a small, configurable OpenMLS past-epoch window for delayed application messages.
-- Maintains a per-leaf capability cache so `feature_status` lookups do not walk the ratchet tree.
+- Answers `feature_status` and `upgradeable_capabilities` from every current leaf of the ratchet tree, so each device
+  of an account counts on its own.
 - Stages SelfRemove-only commits for eligible remaining members, keeps durable local leave requests gated, and
   re-proposes stale SelfRemove proposals for newer epochs.
 

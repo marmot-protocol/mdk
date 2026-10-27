@@ -3373,12 +3373,9 @@ fn update_group_record_from_replay<S: StorageProvider>(
     {
         group.required_capabilities = required_capabilities_from_group(&mls_group);
         crate::group_lifecycle::mirror_app_components_into_record(&mls_group, &mut group);
-        crate::capability_manager::cache_own_capabilities_from_group(storage, group_id, &mls_group)
-            .map_err(|e| {
-                OpenMlsProjectionError::Replay(format!(
-                    "refresh post-replay self capabilities: {e}"
-                ))
-            })?;
+        crate::capability_manager::check_own_leaf_of_group(&mls_group).map_err(|e| {
+            OpenMlsProjectionError::Replay(format!("check post-replay own leaf: {e}"))
+        })?;
     }
 
     storage
@@ -4190,15 +4187,11 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     .map(|proposal| tls_hex(proposal.proposal_reference_ref()))
                     .collect::<Result<Vec<_>, _>>()?;
                 consumed_proposal_refs.sort();
-                // Mirror direct ingest: the staged commit is the only public
-                // source for newly added members' KeyPackage capabilities.
-                // The outer canonicalization transaction rolls these writes
-                // back with the merge, record, and dispositions.
-                crate::capability_manager::cache_from_staged_commit(storage, group_id, &staged)
+                // Mirror direct ingest: check each added leaf's proof profile
+                // before the merge consumes the staged commit.
+                crate::capability_manager::check_added_leaf_profiles(storage, group_id, &staged)
                     .map_err(|e| {
-                        OpenMlsProjectionError::Replay(format!(
-                            "cache replayed Add capabilities: {e}"
-                        ))
+                        OpenMlsProjectionError::Replay(format!("check replayed Add leaves: {e}"))
                     })?;
                 let activity_before = retain_replayed_anchors
                     .map(|_| group_activity::GroupActivitySnapshot::capture(&mls_group));

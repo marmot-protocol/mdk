@@ -6,7 +6,7 @@ use cgka_traits::engine::{
     SendResult,
 };
 use cgka_traits::error::{EngineError, PeelerError};
-use cgka_traits::group::{Group, Member};
+use cgka_traits::group::Group;
 use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::message::{MessageRecord, MessageState};
@@ -744,22 +744,6 @@ impl CapabilityStorage for FlakyGroupRecordStorage {
         feature: &Feature,
     ) -> StorageResult<Option<CapabilityRequirement>> {
         self.inner.feature_requirement(feature)
-    }
-    fn save_member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member: &Member,
-        capabilities: GroupCapabilities,
-    ) -> StorageResult<()> {
-        self.inner
-            .save_member_capabilities(group_id, member, capabilities)
-    }
-    fn member_capabilities(
-        &self,
-        group_id: &GroupId,
-        member_id: &MemberId,
-    ) -> StorageResult<Option<GroupCapabilities>> {
-        self.inner.member_capabilities(group_id, member_id)
     }
 }
 
