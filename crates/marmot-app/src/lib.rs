@@ -49,8 +49,9 @@ use cgka_traits::{
 use marmot_account::{AccountHome, AccountHomeError, AccountSetupKind, AccountSummary};
 use marmot_session::{
     AccountDeviceRuntime, CanonicalizationPolicy, FeatureRegistry, KeyPackagePublication,
-    KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher, SessionConfig,
-    TransportRoutingError, TransportRoutingPolicy, key_package_metadata,
+    KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
+    KeyPackageSlotWithdrawal, SessionConfig, TransportRoutingError, TransportRoutingPolicy,
+    key_package_metadata,
 };
 use nostr_sdk::prelude::{
     EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag, Timestamp as NostrTimestamp,
@@ -428,7 +429,6 @@ const DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER: &str = "direct-conversation-m
 pub(crate) use storage_sqlite::LOCAL_PUBLISH_FAILED_REASON;
 const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
 const SHARED_DB_FILE: &str = "shared.sqlite3";
-const KEY_PACKAGE_CUTOVER_RELAY_SCAN_LIMIT: usize = 1_024;
 const SESSION_DB_FILE: &str = "session.sqlite";
 const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
@@ -2125,10 +2125,6 @@ impl MarmotApp {
         client
             .app
             .retire_cached_non_current_key_package(&client.state.label)
-            .await;
-        client
-            .app
-            .retire_relay_non_current_key_packages(&client.state.label)
             .await;
         if client
             .app
@@ -5256,120 +5252,6 @@ impl MarmotApp {
         true
     }
 
-    /// Scan the account's authoritative KeyPackage relays and best-effort
-    /// delete every still-discoverable legacy event. This runs on each account
-    /// open, so a crash or partial relay outage simply leaves work for the next
-    /// restart. Local private bundles have already been retired synchronously.
-    async fn retire_relay_non_current_key_packages(&self, label: &str) -> bool {
-        if self.key_package_cutover_scan_complete(label)
-            && !self.key_package_cutover_replacement_pending(label)
-        {
-            return false;
-        }
-        let account = match self.account_home().account(label) {
-            Ok(account) => account,
-            Err(error) => {
-                tracing::warn!(
-                    target: "marmot_app::key_packages",
-                    method = "retire_relay_non_current_key_packages",
-                    error_kind = AppError::from(error).privacy_safe_kind(),
-                    "could not resolve account for relay key package retirement"
-                );
-                return false;
-            }
-        };
-        let relay_lists = match self
-            .directory()
-            .account_relay_list_status_for_account_id(&account.account_id_hex)
-        {
-            Ok(relay_lists) => relay_lists,
-            Err(error) => {
-                tracing::warn!(
-                    target: "marmot_app::key_packages",
-                    method = "retire_relay_non_current_key_packages",
-                    error_kind = error.privacy_safe_kind(),
-                    "could not resolve relays for key package retirement"
-                );
-                return false;
-            }
-        };
-        let source_relays = relay_lists
-            .nip65
-            .relays
-            .iter()
-            .cloned()
-            .map(TransportEndpoint)
-            .collect::<Vec<_>>();
-        if source_relays.is_empty() {
-            return false;
-        }
-        let records = match self
-            .directory()
-            .fetch_key_package_events_for_account_id_with_limit(
-                &account.account_id_hex,
-                &source_relays,
-                KEY_PACKAGE_CUTOVER_RELAY_SCAN_LIMIT,
-            )
-            .await
-        {
-            Ok(records) => records,
-            Err(error) => {
-                tracing::warn!(
-                    target: "marmot_app::key_packages",
-                    method = "retire_relay_non_current_key_packages",
-                    error_kind = error.privacy_safe_kind(),
-                    "deferred relay key package retirement scan"
-                );
-                return false;
-            }
-        };
-
-        let mut non_current_event_count = 0usize;
-        let mut accepted_delete_count = 0usize;
-        let mut delete_failure_count = 0usize;
-        for record in records {
-            let event_id = record.event.id.clone();
-            let endpoints = record.endpoints.clone();
-            let is_current = key_package_from_record(record)
-                .ok()
-                .and_then(|fetched| key_package_metadata(&fetched.key_package).ok())
-                .is_some_and(|metadata| {
-                    self.key_package_metadata_matches_current_support(&metadata)
-                });
-            if is_current {
-                continue;
-            }
-            if !self.mark_key_package_cutover_replacement_pending(label) {
-                delete_failure_count += 1;
-                continue;
-            }
-            non_current_event_count += 1;
-            match self
-                .delete_key_package_event(label, &event_id, endpoints)
-                .await
-            {
-                Ok(accepted) => accepted_delete_count += accepted,
-                Err(_) => delete_failure_count += 1,
-            }
-        }
-        if delete_failure_count == 0 {
-            // The marker helper emits its own privacy-safe warning. It is not
-            // a relay deletion failure, so do not fold it into this counter.
-            let _ = self.mark_key_package_cutover_scan_complete(label);
-        }
-        if non_current_event_count > 0 {
-            tracing::info!(
-                target: "marmot_app::key_packages",
-                method = "retire_relay_non_current_key_packages",
-                non_current_event_count,
-                accepted_delete_count,
-                delete_failure_count,
-                "completed relay key package retirement scan"
-            );
-        }
-        non_current_event_count > 0
-    }
-
     fn key_package_cutover_replacement_pending_path(&self, label: &str) -> PathBuf {
         self.key_package_cache_dir()
             .join(KEY_PACKAGE_DIR)
@@ -5442,34 +5324,6 @@ impl MarmotApp {
             }
         }
         Ok(())
-    }
-
-    fn key_package_cutover_scan_complete(&self, label: &str) -> bool {
-        self.key_package_cutover_scan_complete_path(label).exists()
-    }
-
-    fn mark_key_package_cutover_scan_complete(&self, label: &str) -> Result<(), AppError> {
-        let path = self.key_package_cutover_scan_complete_path(label);
-        let result = path
-            .parent()
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "cutover marker has no parent directory",
-                )
-            })
-            .and_then(fs_private::create_dir_all_private)
-            .and_then(|()| fs_private::write_private(&path, b"complete\n"))
-            .map_err(AppError::from);
-        if let Err(error) = &result {
-            tracing::warn!(
-                target: "marmot_app::key_packages",
-                method = "mark_key_package_cutover_scan_complete",
-                error_kind = error.privacy_safe_kind(),
-                "could not persist completed key package relay scan"
-            );
-        }
-        result
     }
 
     pub fn local_key_package_records(
@@ -8314,6 +8168,61 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
             }
         }
 
+        Ok(KeyPackagePublishReceipt { accepted, failed })
+    }
+
+    async fn withdraw_key_package_slot(
+        &self,
+        withdrawal: &KeyPackageSlotWithdrawal,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        let event = transport_nostr_adapter::key_package_slot_deletion_event(
+            &withdrawal.account_id,
+            &withdrawal.slot_id,
+            withdrawal.created_at.0,
+        );
+        // One request per relay, each checked on its own: an unusable endpoint
+        // must not stop the deletion at the others, and one relay's
+        // acknowledgement must not cancel the send to the rest.
+        let mut failed = Vec::new();
+        let mut requests: Vec<NostrEventPublishRequest> = Vec::new();
+        for endpoint in &withdrawal.endpoints {
+            match self
+                .app
+                .relay_plane
+                .sanitize_relay_endpoints(vec![endpoint.clone()], "key package slot withdrawal")
+            {
+                Ok(endpoints) => {
+                    if !requests
+                        .iter()
+                        .any(|request| request.endpoints == endpoints)
+                    {
+                        requests.push(NostrEventPublishRequest {
+                            endpoints,
+                            event: event.clone(),
+                            required_acks: 1,
+                        });
+                    }
+                }
+                Err(_) => failed.push(endpoint.clone()),
+            }
+        }
+        let relay_client = self.app.relay_client_for_account_id(
+            &hex::encode(withdrawal.account_id.as_slice()),
+            self.signer.as_nostr_signer(),
+        );
+        let mut outcomes = relay_client
+            .publish_events_for_account(&withdrawal.account_id, &requests)
+            .await
+            .into_iter();
+        let mut accepted = Vec::new();
+        for request in requests {
+            match outcomes.next() {
+                Some(Ok(outcome)) if !outcome.accepted.is_empty() => {
+                    accepted.extend(outcome.accepted.into_iter().map(|receipt| receipt.endpoint))
+                }
+                _ => failed.extend(request.endpoints),
+            }
+        }
         Ok(KeyPackagePublishReceipt { accepted, failed })
     }
 }

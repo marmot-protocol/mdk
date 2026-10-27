@@ -2431,16 +2431,6 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
         1,
         "setup must open the worker-owned session exactly once"
     );
-    assert!(
-        dir.path()
-            .join("key-packages")
-            .join(format!(
-                "{}.capability-refresh-v1-relay-scan-complete",
-                created.account.label
-            ))
-            .exists(),
-        "a generated account must persist the guaranteed-empty cutover scan marker before opening"
-    );
 
     let fetched = app
         .directory()
@@ -11457,7 +11447,7 @@ async fn app_runtime_sign_out_and_wipe_removes_account_and_deletes_key_package()
     let account_id = created.account.account_id_hex.clone();
 
     // The initial KeyPackage was published to the relay during setup, so the
-    // wipe's stage-2 discovery should find and delete at least one.
+    // wipe's stage 2 deletes this device's slot.
     let before = runtime
         .account_key_packages(&account_id, vec![endpoint(&url)])
         .await
@@ -11474,8 +11464,8 @@ async fn app_runtime_sign_out_and_wipe_removes_account_and_deletes_key_package()
     assert!(outcome.group_leave_failures.is_empty());
     // The published key package is deleted with no per-relay failures.
     assert!(
-        outcome.key_packages_deleted >= 1,
-        "expected at least one relay key package deleted, got {}",
+        outcome.key_packages_deleted == 1,
+        "expected this device's key package slot deleted, got {}",
         outcome.key_packages_deleted
     );
     assert!(
@@ -11740,11 +11730,11 @@ async fn app_runtime_sign_out_and_wipe_removes_external_signer_account() {
     // No groups joined, so nothing to leave and no leave failures.
     assert_eq!(outcome.groups_left, 0);
     assert!(outcome.group_leave_failures.is_empty());
-    // Stage 2 signs the kind:5 deletions through the registered external
+    // Stage 2 signs the kind:5 deletion through the registered external
     // signer, so the relay cleanup is as complete as it is for a local account.
     assert!(
-        outcome.key_packages_deleted >= 1,
-        "expected at least one relay key package deleted, got {}",
+        outcome.key_packages_deleted == 1,
+        "expected this device's key package slot deleted, got {}",
         outcome.key_packages_deleted
     );
     assert!(
@@ -11906,6 +11896,154 @@ async fn app_runtime_sign_out_keeps_external_signer_registration() {
     runtime.shutdown().await;
 }
 
+/// The events `author` has of `kind` on the relay at `url`.
+async fn relay_events_of(url: &str, author: &str, kind: Kind) -> Vec<nostr::prelude::Event> {
+    let client = NostrSdkClient::builder().build();
+    client.add_relay(url).await.unwrap();
+    client.connect().await;
+    let events = client
+        .fetch_events(nostr_sdk::prelude::ReqTarget::manual(vec![(
+            nostr_sdk::prelude::RelayUrl::parse(url).unwrap(),
+            vec![
+                nostr::prelude::Filter::new()
+                    .author(nostr::prelude::PublicKey::parse(author).unwrap())
+                    .kind(kind),
+            ],
+        )]))
+        .timeout(Duration::from_secs(3))
+        .await
+        .unwrap();
+    client.shutdown().await;
+    events.into_iter().collect()
+}
+
+fn event_tags(event: &nostr::prelude::Event) -> Vec<Vec<String>> {
+    event
+        .tags
+        .iter()
+        .map(|tag| tag.as_slice().to_vec())
+        .collect()
+}
+
+fn slot_of(event: &nostr::prelude::Event) -> Option<String> {
+    event_tags(event)
+        .into_iter()
+        .find(|tag| tag.first().is_some_and(|name| name == "d"))
+        .and_then(|tag| tag.get(1).cloned())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signing_out_one_device_deletes_only_its_own_key_package_slot() {
+    // mdk#1697: each device of an account publishes into its own slot, and
+    // signing one out deletes that slot and nothing else
+    // (`foundation/key-packages.md`, "Stopping publication").
+    let (_relay, url) = mock_relay().await;
+    let config = || MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let dir_inviter = tempfile::tempdir().unwrap();
+    let device_a = MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
+        dir_a.path(),
+        url.clone(),
+        config(),
+    ));
+    let app_b = MarmotApp::with_relay_and_config(dir_b.path(), url.clone(), config());
+    let device_b = MarmotAppRuntime::new(app_b.clone());
+    let inviter = MarmotApp::with_relay_and_config(dir_inviter.path(), url.clone(), config());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        discovery_relays: vec![endpoint(&url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let created = create_network_ready_identity(&device_a, setup.relay_options_only()).await;
+    let account_id = created.account.account_id_hex.clone();
+    let nsec = AccountHome::open(dir_a.path())
+        .reveal_nsec(&created.account.label)
+        .unwrap();
+    device_b
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(nsec.to_string())),
+            ..setup
+        })
+        .await
+        .unwrap();
+    let slot_a = device_a
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .stable_slot_id;
+    let lifecycle_b = device_b
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(slot_a, lifecycle_b.stable_slot_id);
+    let mut slots = relay_events_of(&url, &account_id, Kind::Custom(30443))
+        .await
+        .iter()
+        .filter_map(slot_of)
+        .collect::<Vec<_>>();
+    slots.sort();
+    let mut expected = vec![slot_a.clone(), lifecycle_b.stable_slot_id.clone()];
+    expected.sort();
+    assert_eq!(slots, expected);
+
+    let outcome = device_a
+        .sign_out(&account_id, SignOutOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(outcome.key_packages_deleted, 1);
+    assert!(outcome.key_package_failures.is_empty());
+
+    // One kind 5 naming A's slot, with exactly one `a` and one `k` tag.
+    let deletions = relay_events_of(&url, &account_id, Kind::EventDeletion).await;
+    assert_eq!(deletions.len(), 1);
+    assert_eq!(
+        event_tags(&deletions[0]),
+        vec![
+            vec!["a".to_owned(), format!("30443:{account_id}:{slot_a}")],
+            vec!["k".to_owned(), "30443".to_owned()],
+        ]
+    );
+    // B's KeyPackage stays on the relay, and an inviter still selects it.
+    let remaining = relay_events_of(&url, &account_id, Kind::Custom(30443)).await;
+    assert_eq!(
+        remaining.iter().filter_map(slot_of).collect::<Vec<_>>(),
+        vec![lifecycle_b.stable_slot_id.clone()]
+    );
+    assert_eq!(
+        inviter
+            .directory()
+            .resolve_member_key_packages(&[account_id.as_str()])
+            .await
+            .unwrap(),
+        vec![lifecycle_b.current_key_package.clone().unwrap()]
+    );
+
+    // Signing A back in republishes its slot and deletes nothing more.
+    device_a.sign_in_account(&account_id).await.unwrap();
+    device_a.publish_key_package(&account_id).await.unwrap();
+    let mut slots = relay_events_of(&url, &account_id, Kind::Custom(30443))
+        .await
+        .iter()
+        .filter_map(slot_of)
+        .collect::<Vec<_>>();
+    slots.sort();
+    assert_eq!(slots, expected);
+    assert_eq!(
+        relay_events_of(&url, &account_id, Kind::EventDeletion)
+            .await
+            .len(),
+        1
+    );
+    device_a.shutdown_and_close().await.unwrap();
+    device_b.shutdown_and_close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_runtime_sign_out_deletes_key_packages_but_keeps_local_state() {
     // mdk#477: a non-destructive sign-out must clean up the relay
@@ -11929,8 +12067,8 @@ async fn app_runtime_sign_out_deletes_key_packages_but_keeps_local_state() {
     .await;
     let account_id = created.account.account_id_hex.clone();
 
-    // Setup published a KeyPackage to the relay, so the sign-out should find
-    // and delete at least one.
+    // Setup published a KeyPackage to the relay, so the sign-out deletes this
+    // device's slot.
     let before = runtime
         .account_key_packages(&account_id, vec![endpoint(&url)])
         .await
@@ -11947,8 +12085,8 @@ async fn app_runtime_sign_out_deletes_key_packages_but_keeps_local_state() {
 
     // The published key package is deleted with no per-relay failures.
     assert!(
-        outcome.key_packages_deleted >= 1,
-        "expected at least one relay key package deleted, got {}",
+        outcome.key_packages_deleted == 1,
+        "expected this device's key package slot deleted, got {}",
         outcome.key_packages_deleted
     );
     assert!(
@@ -12037,6 +12175,11 @@ async fn app_runtime_sign_out_reports_deletion_failure_and_keeps_local_state() {
     )
     .await;
     let account_id = created.account.account_id_hex;
+    let before = runtime
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap();
 
     let outcome = runtime
         .sign_out(&account_id, SignOutOptions::default())
@@ -12051,6 +12194,15 @@ async fn app_runtime_sign_out_reports_deletion_failure_and_keeps_local_state() {
         runtime.accounts().resolve(&account_id).is_ok(),
         "best-effort remote failure must keep the local account"
     );
+    // No relay accepted the deletion, so the slot is recorded as it was.
+    runtime.sign_in_account(&account_id).await.unwrap();
+    let after = runtime
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.slot_withdrawn_at, None);
+    assert_eq!(after.authored_event_id, before.authored_event_id);
     runtime.shutdown().await;
 }
 
@@ -12123,6 +12275,70 @@ async fn app_runtime_sign_out_skips_key_package_deletion_when_disabled() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wiping_a_signed_out_account_deletes_its_key_package_slot() {
+    // A signed-out account runs no worker; wiping it still deletes the slot
+    // it left published before its private material goes.
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        },
+    )
+    .await;
+    let account_id = created.account.account_id_hex;
+    let slot = runtime
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .stable_slot_id;
+    runtime
+        .sign_out(
+            &account_id,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        relay_events_of(&url, &account_id, Kind::Custom(30443))
+            .await
+            .iter()
+            .filter_map(slot_of)
+            .collect::<Vec<_>>(),
+        vec![slot.clone()]
+    );
+
+    let outcome = runtime.sign_out_and_wipe(&account_id).await.unwrap();
+
+    assert_eq!(outcome.key_packages_deleted, 1);
+    assert!(outcome.key_package_failures.is_empty());
+    assert!(outcome.local_cleanup.completed);
+    let deletions = relay_events_of(&url, &account_id, Kind::EventDeletion).await;
+    assert_eq!(deletions.len(), 1);
+    assert_eq!(
+        event_tags(&deletions[0]),
+        vec![
+            vec!["a".to_owned(), format!("30443:{account_id}:{slot}")],
+            vec!["k".to_owned(), "30443".to_owned()],
+        ]
+    );
+    assert!(
+        relay_events_of(&url, &account_id, Kind::Custom(30443))
+            .await
+            .is_empty()
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_runtime_sign_out_rejects_unknown_account() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, _url) = mock_app(&dir).await;
@@ -12186,8 +12402,8 @@ async fn app_runtime_sign_out_succeeds_for_external_signer_account() {
         .unwrap();
 
     assert!(
-        outcome.key_packages_deleted >= 1,
-        "expected at least one relay key package deleted, got {}",
+        outcome.key_packages_deleted == 1,
+        "expected this device's key package slot deleted, got {}",
         outcome.key_packages_deleted
     );
     assert!(

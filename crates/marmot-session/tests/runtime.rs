@@ -36,10 +36,11 @@ use cgka_traits::{
 };
 use marmot_session::{
     AccountDeviceRuntime, AccountDeviceSession, AccountError, KeyPackagePublication,
-    KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher, MaintenanceRandom,
-    MaintenanceTiming, MonotonicClock, NoopKeyPackagePublisher, PendingResolution, PublishWork,
-    PublishedApplicationMessage, SessionConfig, SessionError, StaticTransportRouting,
-    TransportRoutingError, TransportRoutingPolicy, WallClock,
+    KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
+    KeyPackageSlotWithdrawal, MaintenanceRandom, MaintenanceTiming, MonotonicClock,
+    NoopKeyPackagePublisher, PendingResolution, PublishWork, PublishedApplicationMessage,
+    SessionConfig, SessionError, StaticTransportRouting, TransportRoutingError,
+    TransportRoutingPolicy, WallClock,
 };
 use nostr::prelude::FinalizeEvent;
 use storage_sqlite::{SqlCipherKey, SqliteAccountStorage};
@@ -729,6 +730,7 @@ include!("runtime/key_package_generation_upgrade.rs");
 include!("runtime/component_migration.rs");
 include!("runtime/multi_device_welcome.rs");
 include!("runtime/key_package_slot.rs");
+include!("runtime/key_package_slot_withdrawal.rs");
 
 #[derive(Clone, Default)]
 struct RecordingKeyPackages {
