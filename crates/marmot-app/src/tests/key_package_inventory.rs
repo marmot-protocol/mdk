@@ -1191,3 +1191,61 @@ async fn local_read_rejects_terminal_close_without_reopening() {
         "unexpected close error: {error:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slot_withdrawal_reaches_every_usable_relay_on_its_own() {
+    use marmot_session::{KeyPackagePublisher, KeyPackageSlotWithdrawal};
+
+    let directory = tempfile::tempdir().unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    // One relay's acknowledgement cancels the rest of a shared request.
+    relay.accept_first_endpoint_only();
+    let app =
+        MarmotApp::with_relay(directory.path(), DIRECTORY).with_test_relay_client(relay.clone());
+    let account = app.account_home().create_account("alice").unwrap();
+    let publisher = crate::AppKeyPackagePublisher {
+        app: app.clone(),
+        account_label: account.label.clone(),
+        signer: app.account_signer_for_summary(&account).unwrap(),
+    };
+    let usable = ["wss://a.example", "wss://b.example", "wss://c.example"];
+    let unusable = endpoint("not a relay");
+    let withdrawal = KeyPackageSlotWithdrawal {
+        account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+        slot_id: SLOT.to_owned(),
+        created_at: cgka_traits::Timestamp(1_700_000_000),
+        endpoints: vec![
+            endpoint(usable[0]),
+            unusable.clone(),
+            endpoint(usable[1]),
+            endpoint(usable[2]),
+            endpoint(usable[0]),
+        ],
+    };
+
+    let receipt = publisher
+        .withdraw_key_package_slot(&withdrawal)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        receipt.accepted,
+        usable.iter().map(|url| endpoint(url)).collect::<Vec<_>>()
+    );
+    assert_eq!(receipt.failed, vec![unusable]);
+    // Each usable relay got its own request for the same deletion.
+    assert_eq!(
+        relay.attempted_routes(),
+        usable
+            .iter()
+            .map(|url| (5, vec![endpoint(url)]))
+            .collect::<Vec<_>>()
+    );
+    let deletions = kind5_tags(&relay);
+    assert_eq!(deletions.len(), 3);
+    assert!(
+        deletions
+            .iter()
+            .all(|(_, tags)| *tags == slot_deletion_tags(&account, SLOT))
+    );
+}

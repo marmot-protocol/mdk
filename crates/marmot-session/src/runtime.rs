@@ -1610,6 +1610,7 @@ where
         let mut withdrawn = previous.clone();
         withdrawn.slot_withdrawn_at = Some(created_at);
         self.session.put_key_package_lifecycle(&withdrawn)?;
+        let was_withdrawn = self.key_package_slot_withdrawn;
         self.key_package_slot_withdrawn = true;
         let withdrawal = KeyPackageSlotWithdrawal {
             account_id: self.session.self_id().clone(),
@@ -1638,9 +1639,10 @@ where
             ),
             Err(error) => error,
         };
-        // Nothing confirms the withdrawal, so the slot stays as it was.
+        // Nothing confirms this withdrawal, so the slot stays as it was,
+        // including an earlier withdrawal by this runtime.
         self.session.put_key_package_lifecycle(&previous)?;
-        self.key_package_slot_withdrawn = false;
+        self.key_package_slot_withdrawn = was_withdrawn;
         tracing::warn!(
             target: TRACE_TARGET,
             method = "withdraw_key_package_slot",

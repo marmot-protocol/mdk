@@ -156,6 +156,37 @@ async fn a_withdrawal_no_relay_accepts_leaves_the_slot_as_it_was() {
 }
 
 #[tokio::test]
+async fn a_refused_second_withdrawal_keeps_the_first_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("kp slot second withdrawal refused").unwrap();
+    let wall = Arc::new(TestWallClock::new(unix_now()));
+    let publisher = WithdrawingKeyPackages::default();
+    let mut runtime = slot_runtime(
+        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[KEY_ENDPOINT],
+    );
+    runtime.publish_fresh_key_package().await.unwrap();
+    let published = slot_lifecycle(&runtime);
+    runtime.withdraw_key_package_slot().await.unwrap();
+    let withdrawn = slot_lifecycle(&runtime);
+
+    publisher.refuse.store(true, Ordering::Relaxed);
+    runtime.withdraw_key_package_slot().await.unwrap_err();
+    assert_eq!(slot_lifecycle(&runtime), withdrawn);
+
+    // The first withdrawal still stands: this runtime publishes nothing.
+    wall.set(published.refresh_at.unwrap().0);
+    assert!(!runtime.key_package_network_maintenance_due().unwrap());
+    runtime.run_due_maintenance().await.unwrap();
+    runtime.publish_fresh_key_package().await.unwrap_err();
+    runtime.republish_key_package().await.unwrap_err();
+    assert_eq!(publisher.publications.publications().len(), 1);
+}
+
+#[tokio::test]
 async fn a_restart_while_withdrawing_the_slot_republishes_it() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("alice.sqlite");

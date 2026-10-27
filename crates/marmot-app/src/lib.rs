@@ -8052,42 +8052,55 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         &self,
         withdrawal: &KeyPackageSlotWithdrawal,
     ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
-        let endpoints = self
-            .app
-            .relay_plane
-            .sanitize_relay_endpoints(withdrawal.endpoints.clone(), "key package slot withdrawal")
-            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
-        let request = NostrEventPublishRequest {
-            endpoints,
-            event: transport_nostr_adapter::key_package_slot_deletion_event(
-                &withdrawal.account_id,
-                &withdrawal.slot_id,
-                withdrawal.created_at.0,
-            ),
-            required_acks: 1,
-        };
+        let event = transport_nostr_adapter::key_package_slot_deletion_event(
+            &withdrawal.account_id,
+            &withdrawal.slot_id,
+            withdrawal.created_at.0,
+        );
+        // One request per relay, each checked on its own: an unusable endpoint
+        // must not stop the deletion at the others, and one relay's
+        // acknowledgement must not cancel the send to the rest.
+        let mut failed = Vec::new();
+        let mut requests: Vec<NostrEventPublishRequest> = Vec::new();
+        for endpoint in &withdrawal.endpoints {
+            match self
+                .app
+                .relay_plane
+                .sanitize_relay_endpoints(vec![endpoint.clone()], "key package slot withdrawal")
+            {
+                Ok(endpoints) => {
+                    if !requests
+                        .iter()
+                        .any(|request| request.endpoints == endpoints)
+                    {
+                        requests.push(NostrEventPublishRequest {
+                            endpoints,
+                            event: event.clone(),
+                            required_acks: 1,
+                        });
+                    }
+                }
+                Err(_) => failed.push(endpoint.clone()),
+            }
+        }
         let relay_client = self.app.relay_client_for_account_id(
             &hex::encode(withdrawal.account_id.as_slice()),
             self.signer.as_nostr_signer(),
         );
-        let outcome = relay_client
-            .publish_events_for_account(&withdrawal.account_id, std::slice::from_ref(&request))
+        let mut outcomes = relay_client
+            .publish_events_for_account(&withdrawal.account_id, &requests)
             .await
-            .pop()
-            .ok_or_else(|| KeyPackagePublishError::exposed("slot withdrawal was not attempted"))?
-            .map_err(|error| KeyPackagePublishError::exposed(error.to_string()))?;
-        Ok(KeyPackagePublishReceipt {
-            accepted: outcome
-                .accepted
-                .into_iter()
-                .map(|receipt| receipt.endpoint)
-                .collect(),
-            failed: outcome
-                .failed
-                .into_iter()
-                .map(|failure| failure.endpoint)
-                .collect(),
-        })
+            .into_iter();
+        let mut accepted = Vec::new();
+        for request in requests {
+            match outcomes.next() {
+                Some(Ok(outcome)) if !outcome.accepted.is_empty() => {
+                    accepted.extend(outcome.accepted.into_iter().map(|receipt| receipt.endpoint))
+                }
+                _ => failed.extend(request.endpoints),
+            }
+        }
+        Ok(KeyPackagePublishReceipt { accepted, failed })
     }
 }
 
