@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use transport_nostr::retired_relay_hosts;
 
-use crate::{collector_host_safety, config};
+use crate::{collector_host_safety, export_config};
 
 const AUDIT_LOG_CONTENT_TYPE: &str = "application/x-ndjson";
 // The whole-file Goggles endpoint accepts the historical v4 contract only.
@@ -298,9 +298,9 @@ pub(crate) fn validate_audit_upload_endpoint(
             "forensic upload endpoint is empty".to_owned(),
         ));
     }
-    let Some(url) = config::parse_relay_telemetry_endpoint(endpoint) else {
+    let Some(url) = export_config::parse_relay_telemetry_endpoint(endpoint) else {
         return Err(AuditUploadError::AuditLogUpload(
-            if config::endpoint_transport_allowed(endpoint) {
+            if export_config::endpoint_transport_allowed(endpoint) {
                 "forensic upload endpoint is invalid".to_owned()
             } else {
                 "forensic upload endpoint must be https, or loopback http for local testing"
@@ -313,7 +313,7 @@ pub(crate) fn validate_audit_upload_endpoint(
             "forensic upload endpoint is not allowed".to_owned(),
         ));
     }
-    if !config::endpoint_host_is_loopback(endpoint)
+    if !export_config::endpoint_host_is_loopback(endpoint)
         && authorization_bearer_token.is_none_or(|token| token.trim().is_empty())
     {
         return Err(AuditUploadError::AuditLogUpload(

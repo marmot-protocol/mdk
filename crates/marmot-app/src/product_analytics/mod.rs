@@ -242,10 +242,11 @@ impl ProductAnalyticsRuntimeConfig {
             }
         }
         if let Some(endpoint) = &self.events_endpoint {
-            let url =
-                crate::config::parse_relay_telemetry_endpoint(endpoint).ok_or_else(invalid)?;
+            let url = crate::export_config::parse_relay_telemetry_endpoint(endpoint)
+                .ok_or_else(invalid)?;
             if url.query().is_some()
-                || (crate::config::endpoint_host_is_loopback(endpoint) && !self.allow_loopback)
+                || (crate::export_config::endpoint_host_is_loopback(endpoint)
+                    && !self.allow_loopback)
             {
                 return Err(invalid());
             }
@@ -1403,7 +1404,7 @@ impl ProductAnalytics {
             .await;
         }
     }
-    pub(crate) async fn run(self, relay_plane: crate::MarmotRelayPlane) {
+    pub(crate) async fn run(self, relay_plane: transport_nostr::MarmotRelayPlane) {
         let Some(permit) = self.permit() else {
             return;
         };

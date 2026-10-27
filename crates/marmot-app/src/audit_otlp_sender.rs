@@ -12,7 +12,7 @@ use marmot_forensics::local_delivery::{DeliveryBatch, ReceiverResult};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
-use crate::{audit_upload::audit_upload_host_is_retired, collector_host_safety, config};
+use crate::{audit_upload::audit_upload_host_is_retired, collector_host_safety, export_config};
 
 const MAX_RECORDS: usize = 96;
 const MAX_BODY_BYTES: usize = 65_535;
@@ -124,15 +124,15 @@ impl AuditOtlpSender {
         bearer_token: String,
         allow_loopback: bool,
     ) -> Result<Self, AuditOtlpSenderConfigError> {
-        let url =
-            config::parse_relay_telemetry_endpoint(&endpoint).ok_or(AuditOtlpSenderConfigError)?;
+        let url = export_config::parse_relay_telemetry_endpoint(&endpoint)
+            .ok_or(AuditOtlpSenderConfigError)?;
         let host = url.host_str().ok_or(AuditOtlpSenderConfigError)?;
         if destination.is_empty()
             || destination.len() > 256
             || url.path() != "/v1/logs"
             || url.query().is_some()
             || audit_upload_host_is_retired(host)
-            || (config::endpoint_host_is_loopback(&endpoint) && !allow_loopback)
+            || (export_config::endpoint_host_is_loopback(&endpoint) && !allow_loopback)
             || bearer_token.is_empty()
             || !bearer_token.is_ascii()
             || bearer_token.bytes().any(|byte| byte.is_ascii_control())

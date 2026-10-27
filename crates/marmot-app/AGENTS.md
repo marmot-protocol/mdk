@@ -380,7 +380,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   points carry only a `relay` label. Keep the OTLP wire encoding and HTTP push behind
   the `otlp-export` feature; keep the privacy-critical mapping (`build_export_batch`) and the opt-in gate in the default
   build. Keep per-attempt collector DNS validation and pinning in `collector_host_safety.rs`: validate
-  every address, pin reqwest, disable redirects/system proxies, and retain TLS verification. Explicit SOCKS5 routing
+  every address, pin reqwest, disable redirects/system proxies, and retain TLS verification. It builds every collector
+  client through the `http_builder` that both `MarmotApp` constructors hand in (`hand_in_http_builder`); before that
+  it builds none, so nothing dials. Endpoint parsers and the exporters' resolved config live in `export_config.rs`;
+  `config.rs` keeps the settings that resolve against `MarmotServiceEndpoints`. Explicit SOCKS5 routing
   must send the validated IP rather than delegate HTTP DNS to the proxy. Build every relay client with
   `network_proxy::nostr_builder()` (in `transport-nostr`, its own `nostr_builder()`, which calls the same adapter
   builder; that crate's `clippy.toml` holds the same ban) and every HTTP client through `network_proxy::http_builder()`; `clippy.toml` rejects
