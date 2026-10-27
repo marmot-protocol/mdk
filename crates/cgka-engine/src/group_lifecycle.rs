@@ -1884,12 +1884,12 @@ pub(crate) fn welcome_metadata_for_key_package(
 }
 
 /// Build the projected post-merge member list: existing MLS members + each
-/// invitee whose KeyPackage is being added by the staged commit. Used by
-/// the send paths so `members()` reflects the user's intended state during
-/// `PendingPublish`; `feature_status` counts the same added leaves from the
-/// pending commit. On rollback, the engine simply calls
-/// `marmot_members(&mls_group)` against the still-unmerged group to discard
-/// the projection.
+/// invitee leaf the staged commit adds, one per KeyPackage, so an account's
+/// several devices each keep their entry. Used by the send paths so
+/// `members()` reflects the user's intended state during `PendingPublish`;
+/// `feature_status` counts the same added leaves from the pending commit. On
+/// rollback, the engine simply calls `marmot_members(&mls_group)` against the
+/// still-unmerged group to discard the projection.
 pub(crate) fn projected_members_with_pending(
     group: &MlsGroup,
     invitees: &[openmls::prelude::KeyPackage],
@@ -1897,11 +1897,9 @@ pub(crate) fn projected_members_with_pending(
     let mut out = marmot_members(group);
     for kp in invitees {
         let id = crate::identity::validated_member_id_of_leaf(kp.leaf_node())?;
-        if !out.iter().any(|m| m.id == id) {
-            out.push(Member {
-                id,
-                credential: kp.leaf_node().signature_key().as_slice().to_vec(),
-            });
+        let credential = kp.leaf_node().signature_key().as_slice().to_vec();
+        if !out.iter().any(|m| m.id == id && m.credential == credential) {
+            out.push(Member { id, credential });
         }
     }
     Ok(out)

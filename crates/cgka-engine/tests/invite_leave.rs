@@ -1243,6 +1243,67 @@ async fn invite_adds_third_member_and_advances_epoch() {
     assert_eq!(carol.members(&group_id).unwrap().len(), 3);
 }
 
+/// Inviting several devices of one account projects one roster entry per added
+/// leaf while the Commit awaits publication, the same roster as after confirm.
+#[tokio::test]
+async fn invite_of_several_devices_projects_every_leaf_while_pending() {
+    let mut alice = build_client(b"alice");
+    let mut bob = build_client(b"bob");
+    let mut carol_phone = build_client(b"carol");
+    let mut carol_laptop = build_client(b"carol");
+    let (group_id, create_result) = alice
+        .create_group(CreateGroupRequest {
+            name: "test".into(),
+            description: "".into(),
+            members: vec![bob.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, .. } = create_result else {
+        panic!("expected GroupCreated")
+    };
+    alice.confirm_published(pending).await.unwrap();
+
+    let invite_result = alice
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![
+                carol_phone.fresh_key_package().await.unwrap(),
+                carol_laptop.fresh_key_package().await.unwrap(),
+            ],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution {
+        welcomes, pending, ..
+    } = invite_result
+    else {
+        panic!("expected GroupEvolution")
+    };
+    assert_eq!(welcomes.len(), 2);
+    let carol = MemberId::new(pad32(b"carol"));
+    let carol_leaves = |engine: &Engine<SqliteAccountStorage>| {
+        engine
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .filter(|member| member.id == carol)
+            .map(|member| member.credential.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let pending_leaves = carol_leaves(&alice);
+    assert_eq!(pending_leaves.len(), 2);
+    assert_eq!(alice.members(&group_id).unwrap().len(), 4);
+
+    alice.confirm_published(pending).await.unwrap();
+    assert_eq!(carol_leaves(&alice), pending_leaves);
+    assert_eq!(alice.members(&group_id).unwrap().len(), 4);
+}
+
 /// mdk#1298: inviting a member as admin is one GroupEvolution, one epoch
 /// bump, and the invitee is an admin after confirm — not invite then promote.
 #[tokio::test]

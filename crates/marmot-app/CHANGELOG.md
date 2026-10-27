@@ -80,7 +80,8 @@
   KeyPackages not marked last-resort rank first, then the most
   recently published, then the lower KeyPackageRef; one device publishing in
   several slots counts once. One Commit adds the account, with one Welcome
-  rumor per KeyPackage, and the creator's own other devices stay out of a new
+  rumor per KeyPackage, and the roster lists each added device while that
+  Commit awaits publication. The creator's own other devices stay out of a new
   group. `ResolvedMemberKeyPackages::key_packages` lists each account's
   KeyPackages best first. Directory lookup returns the best of the same
   selection. Within one slot, a tie on `created_at` now goes to the lower
