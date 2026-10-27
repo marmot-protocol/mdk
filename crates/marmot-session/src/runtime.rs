@@ -6630,6 +6630,8 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
         intent,
         SendIntent::Invite { .. }
             | SendIntent::RemoveMembers { .. }
+            | SendIntent::AddOwnAccountDevices { .. }
+            | SendIntent::RemoveOwnAccountDevices { .. }
             | SendIntent::SelfUpdate { .. }
             | SendIntent::UpdateAppComponents { .. }
             | SendIntent::UpdateGroupData { .. }

@@ -16,7 +16,7 @@ use cgka_traits::message::OwnApplicationConvergenceStamp;
 use cgka_traits::peeler::GroupMessageMetadata;
 use cgka_traits::storage::{LeaveRequest, StorageError, StorageProvider};
 use cgka_traits::transport::{EncryptedPayload, TransportMessage};
-use cgka_traits::types::{EpochId, GroupId, MemberId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use openmls::group::MlsGroup;
 use openmls::messages::proposals::{AppDataUpdateProposal, Proposal};
 use openmls::prelude::{BasicCredential, MlsMessageOut};
@@ -114,6 +114,20 @@ impl<S: StorageProvider> Engine<S> {
             }
             SendIntent::RemoveMembers { group_id, members } => {
                 self.do_send_remove_members(group_id, members).await
+            }
+            SendIntent::AddOwnAccountDevices {
+                group_id,
+                key_packages,
+            } => {
+                self.do_send_add_own_account_devices(group_id, key_packages)
+                    .await
+            }
+            SendIntent::RemoveOwnAccountDevices {
+                group_id,
+                leaf_signature_keys,
+            } => {
+                self.do_send_remove_own_account_devices(group_id, leaf_signature_keys)
+                    .await
             }
             SendIntent::Leave { group_id } => self.do_send_leave(group_id).await,
             SendIntent::SelfUpdate { group_id } => self.do_send_self_update(group_id).await,
@@ -356,38 +370,17 @@ impl<S: StorageProvider> Engine<S> {
             pre_commit_epoch,
         )?;
 
-        let mut welcomes = Vec::with_capacity(parsed_kps.len());
-        let welcome_relays = crate::group_lifecycle::welcome_relays_for_group(&mls_group)?;
-        for (source_kp, parsed_kp) in key_packages.iter().zip(parsed_kps.iter()) {
-            let recipient = {
-                let bc = BasicCredential::try_from(parsed_kp.leaf_node().credential().clone())
-                    .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
-                MemberId::new(bc.identity().to_vec())
-            };
-            let payload = EncryptedPayload {
-                ciphertext: welcome_bytes.clone(),
-                aad: vec![],
-            };
-            let wrapped = if let Some(metadata) =
-                crate::group_lifecycle::welcome_metadata_for_key_package(
-                    source_kp,
-                    welcome_relays.as_deref(),
-                )? {
-                self.peeler
-                    .wrap_welcome_with_metadata(&payload, &recipient, &metadata)
-                    .await
-            } else {
-                self.peeler.wrap_welcome(&payload, &recipient).await
-            }
-            .map_err(EngineError::Peeler)?;
-            self.record_staged_invite_welcome(
-                &wrapped,
-                &commit_msg.id,
+        let welcomes = self
+            .wrap_staged_welcomes(
+                &mls_group,
                 &group_id,
+                &commit_msg.id,
                 pre_commit_epoch,
-            )?;
-            welcomes.push(wrapped);
-        }
+                &welcome_bytes,
+                &key_packages,
+                &parsed_kps,
+            )
+            .await?;
 
         // Update the Marmot record with the projected post-merge member
         // list — `members()` walks this list (and `feature_status` counts the
@@ -445,6 +438,51 @@ impl<S: StorageProvider> Engine<S> {
             welcomes,
             pending: pending_ref,
         })
+    }
+
+    /// Wrap a staged Commit's Welcome once per added KeyPackage, addressed to
+    /// that KeyPackage's account and naming its publication, and record each
+    /// as staged delivery work of `commit_id`. Invites and same-account Adds
+    /// deliver their Welcomes this way (joining.md, "Delivery").
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn wrap_staged_welcomes(
+        &mut self,
+        mls_group: &MlsGroup,
+        group_id: &GroupId,
+        commit_id: &MessageId,
+        source_epoch: EpochId,
+        welcome_bytes: &[u8],
+        key_packages: &[cgka_traits::engine::KeyPackage],
+        parsed_kps: &[openmls::prelude::KeyPackage],
+    ) -> Result<Vec<TransportMessage>, EngineError> {
+        let mut welcomes = Vec::with_capacity(parsed_kps.len());
+        let welcome_relays = crate::group_lifecycle::welcome_relays_for_group(mls_group)?;
+        for (source_kp, parsed_kp) in key_packages.iter().zip(parsed_kps.iter()) {
+            let recipient = {
+                let bc = BasicCredential::try_from(parsed_kp.leaf_node().credential().clone())
+                    .map_err(|e| EngineError::Backend(format!("credential: {e:?}")))?;
+                MemberId::new(bc.identity().to_vec())
+            };
+            let payload = EncryptedPayload {
+                ciphertext: welcome_bytes.to_vec(),
+                aad: vec![],
+            };
+            let wrapped = if let Some(metadata) =
+                crate::group_lifecycle::welcome_metadata_for_key_package(
+                    source_kp,
+                    welcome_relays.as_deref(),
+                )? {
+                self.peeler
+                    .wrap_welcome_with_metadata(&payload, &recipient, &metadata)
+                    .await
+            } else {
+                self.peeler.wrap_welcome(&payload, &recipient).await
+            }
+            .map_err(EngineError::Peeler)?;
+            self.record_staged_invite_welcome(&wrapped, commit_id, group_id, source_epoch)?;
+            welcomes.push(wrapped);
+        }
+        Ok(welcomes)
     }
 
     async fn do_send_remove_members(
@@ -674,139 +712,6 @@ impl<S: StorageProvider> Engine<S> {
                 )),
             ),
         );
-        self.track_pending_origin_commit(pending_ref, commit_msg.id.clone());
-        pending_commit_guard.disarm();
-
-        Ok(SendResult::GroupEvolution {
-            msg: commit_msg,
-            welcomes: vec![],
-            pending: pending_ref,
-        })
-    }
-
-    /// Test-only stand-in for the same-account Remove intent of mdk#2628 item
-    /// 2.1e: a Commit that removes `leaves` by value, built without the
-    /// OpenMLS proposal store, that passes this device's own checks and the
-    /// ordinary publish lifecycle (`confirm_published` stamps it). It never
-    /// changes the group record's members, which `confirm_published` mirrors
-    /// from the merged state.
-    #[cfg(any(
-        feature = "test-policy-overrides",
-        feature = "test-conformance-snapshot"
-    ))]
-    pub async fn send_leaf_removals_for_tests(
-        &mut self,
-        group_id: &GroupId,
-        leaves: Vec<u32>,
-    ) -> Result<SendResult, EngineError> {
-        self.ensure_hydrated(group_id)?;
-        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
-        let mut mls_group = MlsGroup::load(
-            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
-            &openmls::group::GroupId::from_slice(group_id.as_slice()),
-        )
-        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
-        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
-        if let Some(state) = self.epoch_manager.state(group_id)
-            && !matches!(state, EpochState::Stable { .. })
-        {
-            return Err(EngineError::InvalidTransition(
-                cgka_traits::engine_state::InvalidTransition {
-                    from: state.name(),
-                    to: "RemoveLeaves",
-                    reason: "remove leaves requires Stable",
-                },
-            ));
-        }
-        let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
-        let pending_commit_guard =
-            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
-        let pre_commit_ctx =
-            crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
-        let commit_out = mls_group
-            .commit_builder()
-            .consume_proposal_store(false)
-            .propose_removals(leaves.into_iter().map(openmls::prelude::LeafNodeIndex::new))
-            .load_psks(
-                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
-                    &provider,
-                ),
-            )
-            .map_err(|e| EngineError::Backend(format!("remove_leaves load_psks: {e:?}")))?
-            .build(
-                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::rand(&provider),
-                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(
-                    &provider,
-                ),
-                &self.identity.signer,
-                |_| true,
-            )
-            .map_err(|e| EngineError::Backend(format!("remove_leaves build: {e:?}")))?
-            .stage_commit(&provider)
-            .map_err(|e| EngineError::Backend(format!("remove_leaves stage: {e:?}")))?
-            .into_commit();
-        let staged_commit = mls_group
-            .pending_commit()
-            .ok_or_else(|| EngineError::Backend("remove produced no pending commit".into()))?;
-        crate::commit_class::authorize_own_staged_commit(
-            &mls_group,
-            group_id,
-            self.identity.self_id(),
-            staged_commit,
-        )?;
-        crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
-            &mls_group,
-            group_id,
-            staged_commit,
-        )?;
-        crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
-            staged_commit,
-            &mls_group,
-            self.identity.self_id(),
-            self.ciphersuite,
-        )?;
-        crate::app_components::validate_current_profile_invariants_for_staged_commit(
-            &mls_group,
-            staged_commit,
-            mls_group.own_leaf_index(),
-        )?;
-
-        let commit_bytes = commit_out
-            .tls_serialize_detached()
-            .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
-        let commit_msg = self
-            .peeler
-            .wrap_group_message(
-                &EncryptedPayload {
-                    ciphertext: commit_bytes.clone(),
-                    aad: vec![],
-                },
-                &pre_commit_ctx,
-            )
-            .await
-            .map_err(EngineError::Peeler)?;
-        let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
-        self.record_sent_openmls_message(
-            &commit_msg,
-            commit_bytes.as_slice(),
-            group_id,
-            pre_commit_epoch,
-        )?;
-
-        let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
-        let pending_ref = self.epoch_manager.next_pending_ref();
-        let staged =
-            cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
-        self.invalidate_deferred_peel_candidate_cache(group_id);
-        self.epoch_manager.begin_pending(
-            group_id.clone(),
-            pre_commit_epoch,
-            new_epoch,
-            staged,
-            pending_ref,
-            crate::epoch_manager::PendingKind::GroupEvolution,
-            self.current_audit_context.clone(),
-        )?;
         self.track_pending_origin_commit(pending_ref, commit_msg.id.clone());
         pending_commit_guard.disarm();
 

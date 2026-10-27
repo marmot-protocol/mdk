@@ -1757,19 +1757,19 @@ impl ConvergenceSubject for EngineHarnessSubject {
         &mut self,
         action: SubjectRemoveOwnAccountDevices<'_>,
     ) -> Result<(), SubjectError> {
-        let leaves = action
+        let keys = action
             .devices
             .iter()
             .map(|device| {
                 self.client(device)?
-                    .own_leaf_index()
+                    .own_leaf_signature_key()
                     .map_err(subject_engine_error)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let client = self.client_mut(action.client)?;
         client.name_next_scenario_input(action.action_id);
         let pending_ref = client
-            .try_remove_own_account_leaves(leaves)
+            .try_remove_own_account_devices(keys)
             .await
             .map_err(subject_engine_error)?;
         self.insert_pending(action.pending, action.client, pending_ref)

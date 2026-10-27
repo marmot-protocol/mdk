@@ -52,10 +52,55 @@ fn nostr_routing() -> AppComponentData {
     }
 }
 
+/// Static routing a test extends once it knows a group's id.
+#[derive(Clone)]
+struct SharedRouting(Arc<Mutex<StaticTransportRouting>>);
+
+impl SharedRouting {
+    // Only the account-devices tests, behind `test-policy-overrides`, add
+    // routes.
+    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+    fn update(&self, extend: impl FnOnce(StaticTransportRouting) -> StaticTransportRouting) {
+        let mut routing = self.0.lock().unwrap();
+        *routing = extend(routing.clone());
+    }
+}
+
+impl TransportRoutingPolicy for SharedRouting {
+    fn local_inbox_endpoints(&self) -> Vec<TransportEndpoint> {
+        TransportRoutingPolicy::local_inbox_endpoints(&*self.0.lock().unwrap())
+    }
+
+    fn key_package_endpoints(&self) -> Vec<TransportEndpoint> {
+        TransportRoutingPolicy::key_package_endpoints(&*self.0.lock().unwrap())
+    }
+
+    fn group_subscriptions(&self) -> Vec<cgka_traits::TransportGroupSubscription> {
+        TransportRoutingPolicy::group_subscriptions(&*self.0.lock().unwrap())
+    }
+
+    fn publish_target(
+        &self,
+        message: &TransportMessage,
+    ) -> Result<TransportPublishTarget, TransportRoutingError> {
+        TransportRoutingPolicy::publish_target(&*self.0.lock().unwrap(), message)
+    }
+
+    fn required_acks(&self, target: &TransportPublishTarget) -> usize {
+        TransportRoutingPolicy::required_acks(&*self.0.lock().unwrap(), target)
+    }
+}
+
 /// One device of an account, with its own database and a published
 /// KeyPackage.
 struct Device {
-    runtime: AccountDeviceRuntime<RecordingAdapter, StaticTransportRouting, RecordingKeyPackages>,
+    runtime: AccountDeviceRuntime<RecordingAdapter, SharedRouting, RecordingKeyPackages>,
+    /// What the runtime publishes, and where. Only the account-devices
+    /// tests, behind `test-policy-overrides`, read them.
+    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+    adapter: RecordingAdapter,
+    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+    routing: SharedRouting,
     /// The device's current KeyPackage as an inviter fetches it, carrying the
     /// id of its publication for the inviter to name in the rumor.
     key_package: cgka_traits::engine::KeyPackage,
@@ -75,14 +120,20 @@ impl Device {
         session: AccountDeviceSession,
         key_package: cgka_traits::engine::KeyPackage,
     ) -> Self {
+        let adapter = RecordingAdapter::default();
+        let routing = SharedRouting(Arc::new(Mutex::new(
+            StaticTransportRouting::new(vec![])
+                .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
+        )));
         Self {
             runtime: AccountDeviceRuntime::new(
                 session,
-                RecordingAdapter::default(),
-                StaticTransportRouting::new(vec![])
-                    .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
+                adapter.clone(),
+                routing.clone(),
                 RecordingKeyPackages::default(),
             ),
+            adapter,
+            routing,
             key_package,
         }
     }
@@ -92,6 +143,7 @@ impl Device {
         let Self {
             runtime,
             key_package,
+            ..
         } = self;
         drop(runtime);
         Self::with_session(nostr_device_session(path, key, account), key_package)
@@ -954,32 +1006,54 @@ mod same_account_welcome {
     #[tokio::test]
     async fn a_device_joins_through_its_siblings_welcome_once_required() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut phone, phone_storage, mut laptop, group_id) =
-            phone_in_bobs_group(&dir, true).await;
+        let (mut phone, _, mut laptop, group_id) = phone_in_bobs_group(&dir, true).await;
         let (phone_before, laptop_before) = (phone.lifecycle(), laptop.lifecycle());
         let phone_epoch = phone.runtime.session().epoch(&group_id).unwrap();
 
-        // The phone delivers the Welcome as any inviter does: one rumor,
-        // gift-wrapped to the account and naming the laptop's KeyPackage.
-        let welcome = same_account_add(&phone, &phone_storage, &group_id, &laptop.key_package);
-        let to_laptop = rewrapped(
-            b"alice",
-            b"alice",
-            welcome,
-            publication_id(&laptop.key_package),
-        )
-        .await;
-
-        // The committing phone receives the rumor too, and leaves it alone.
-        let results = phone.ingest_all(&[&to_laptop]).await;
-        assert_eq!(outcomes(&results), vec![not_addressed()]);
-        assert_eq!(phone.lifecycle(), phone_before);
+        // The phone, not an admin, adds the laptop through the runtime and
+        // publishes the Welcome as any inviter does: one rumor, gift-wrapped
+        // to the account and naming the laptop's KeyPackage.
+        let alice = phone.runtime.self_id();
+        phone.routing.update(|routing| {
+            routing
+                .with_group_route(
+                    group_id.clone(),
+                    vec![0x5a; 32],
+                    vec![TransportEndpoint("wss://group.example".into())],
+                )
+                .with_inbox_route(alice, vec![TransportEndpoint("wss://inbox.example".into())])
+        });
+        let effects = phone
+            .runtime
+            .send(SendIntent::AddOwnAccountDevices {
+                group_id: group_id.clone(),
+                key_packages: vec![laptop.key_package.clone()],
+            })
+            .await
+            .unwrap();
+        assert!(effects.failures.is_empty(), "{:?}", effects.failures);
         assert_eq!(
-            phone.runtime.session().epoch(&group_id).unwrap(),
-            phone_epoch
+            phone.runtime.session().epoch(&group_id).unwrap().0,
+            phone_epoch.0 + 1
         );
+        let welcomes: Vec<_> = phone
+            .adapter
+            .publishes()
+            .into_iter()
+            .map(|publish| publish.message)
+            .filter(|message| matches!(message.envelope, TransportEnvelope::Welcome { .. }))
+            .collect();
+        let [to_laptop] = &rumors_for(&welcomes, b"alice", &[&laptop.key_package]).await[..] else {
+            unreachable!()
+        };
 
-        let results = laptop.ingest_all(&[&to_laptop]).await;
+        // The committing phone receives the rumor back from its account's
+        // inbox, knows it as its own, and leaves it alone.
+        let results = phone.ingest_all(&[to_laptop]).await;
+        assert_eq!(outcomes(&results), vec![duplicate()]);
+        assert_eq!(phone.lifecycle(), phone_before);
+
+        let results = laptop.ingest_all(&[to_laptop]).await;
         assert_eq!(joins(&results), vec![(group_id.clone(), to_laptop.id.clone())]);
         let welcomers: Vec<_> = results
             .iter()

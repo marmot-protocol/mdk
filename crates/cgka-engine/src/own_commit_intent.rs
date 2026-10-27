@@ -42,7 +42,8 @@ pub const MAX_OWN_COMMIT_REISSUE_ATTEMPTS: u32 = 2;
 impl<S: StorageProvider> Engine<S> {
     /// The kind and authoring baseline to retain for an intent that is about
     /// to stage a group evolution, or `None` for intents that never need
-    /// re-issue (application messages, leaves, self-updates, disband).
+    /// re-issue (application messages, leaves, self-updates, same-account
+    /// Adds and Removes, disband).
     pub(crate) fn own_commit_recording(
         &self,
         intent: &SendIntent,
@@ -84,6 +85,8 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::AppMessage { .. }
             | SendIntent::Leave { .. }
             | SendIntent::SelfUpdate { .. }
+            | SendIntent::AddOwnAccountDevices { .. }
+            | SendIntent::RemoveOwnAccountDevices { .. }
             | SendIntent::EnableDisbanding { .. }
             | SendIntent::Disband { .. } => None,
         })

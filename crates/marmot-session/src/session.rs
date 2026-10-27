@@ -1686,6 +1686,8 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::AppMessage { .. } => "app_message",
         SendIntent::Invite { .. } => "invite",
         SendIntent::RemoveMembers { .. } => "remove_members",
+        SendIntent::AddOwnAccountDevices { .. } => "add_own_account_devices",
+        SendIntent::RemoveOwnAccountDevices { .. } => "remove_own_account_devices",
         SendIntent::Leave { .. } => "leave",
         SendIntent::SelfUpdate { .. } => "self_update",
         SendIntent::UpdateAppComponents { .. } => "update_app_components",

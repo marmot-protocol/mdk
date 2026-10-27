@@ -82,6 +82,9 @@ use tls_codec::{Deserialize as _, Serialize as _};
 mod support;
 use support::proof_signer;
 
+#[path = "account_devices/send_intents.rs"]
+mod send_intents;
+
 const ACCOUNT_DEVICES: Feature = Feature("account-devices");
 
 fn pad32(name: &[u8]) -> Vec<u8> {
@@ -395,6 +398,20 @@ fn assert_refused(result: Result<SendResult, EngineError>, reason: &str) {
     assert!(
         error.to_string().contains(reason),
         "expected {reason:?}, got: {error}"
+    );
+}
+
+/// The refusal of a same-account intent in a group that does not require
+/// account-devices.
+#[track_caller]
+fn assert_not_required(result: Result<SendResult, EngineError>) {
+    assert!(
+        matches!(
+            &result,
+            Err(EngineError::InvalidTransition(transition))
+                if transition.from == "AccountDevicesNotRequired"
+        ),
+        "expected the account-devices requirement refusal, got {result:?}"
     );
 }
 
@@ -1607,6 +1624,31 @@ fn leaf(device: &Device, gid: &GroupId) -> u32 {
     load_group(device, gid).own_leaf_index().u32()
 }
 
+/// The signature key of `device`'s leaf, which names it in a same-account
+/// Remove.
+fn signature_key(device: &Device, gid: &GroupId) -> Vec<u8> {
+    load_group(device, gid)
+        .own_leaf_node()
+        .expect("a current member")
+        .signature_key()
+        .as_slice()
+        .to_vec()
+}
+
+fn add_own_devices(gid: &GroupId, key_packages: Vec<KeyPackage>) -> SendIntent {
+    SendIntent::AddOwnAccountDevices {
+        group_id: gid.clone(),
+        key_packages,
+    }
+}
+
+fn remove_own_devices(gid: &GroupId, leaf_signature_keys: Vec<Vec<u8>>) -> SendIntent {
+    SendIntent::RemoveOwnAccountDevices {
+        group_id: gid.clone(),
+        leaf_signature_keys,
+    }
+}
+
 /// A KeyPackage of a new device of `device`'s account.
 async fn new_sibling_key_package(device: &mut Device, account: &[u8]) -> KeyPackage {
     sibling_key_package(&device.engine.fresh_key_package().await.unwrap(), account)
@@ -1675,17 +1717,13 @@ async fn a_non_admin_commits_its_own_accounts_adds_and_removes() {
 
     // A Remove of bob's other device, through the committer's own send path.
     let mut m = members(true).await;
-    let SendResult::GroupEvolution { msg, pending, .. } = m
-        .bob
-        .engine
-        .send_leaf_removals_for_tests(&m.gid, vec![leaf(&m.bob_sibling, &m.gid)])
-        .await
-        .unwrap()
-    else {
-        panic!("expected GroupEvolution")
-    };
-    m.bob.engine.confirm_published(pending).await.unwrap();
-    let remove = route_to_group(&msg, &m.gid);
+    let sibling = signature_key(&m.bob_sibling, &m.gid);
+    let remove = send_commit(
+        &mut m.bob,
+        remove_own_devices(&m.gid, vec![sibling]),
+        &m.gid,
+    )
+    .await;
     assert_eq!(
         stamped_priority(&m.bob, &remove),
         CommitOrderingPriority::Ordinary
@@ -1777,29 +1815,21 @@ async fn a_non_admin_cannot_commit_anything_beside_its_own_accounts_leaves() {
     }
 
     // The committer's send path refuses another account's leaf, alone or
-    // beside a same-account Remove.
-    for leaves in [
-        vec![carol_leaf],
-        vec![leaf(&m.bob_sibling, &gid), carol_leaf],
+    // beside a same-account Remove, and its own leaf, which leaves through
+    // Leave. OpenMLS also refuses to stage a Commit that removes its
+    // committer (and rejects one on receipt), so that one is never classified.
+    let carol_key = signature_key(&m.carol, &gid);
+    let sibling_key = signature_key(&m.bob_sibling, &gid);
+    for (keys, reason) in [
+        (vec![carol_key.clone()], "belongs to another account"),
+        (vec![sibling_key, carol_key], "belongs to another account"),
+        (vec![signature_key(&m.bob, &gid)], "use SendIntent::Leave"),
     ] {
-        assert!(matches!(
-            m.bob
-                .engine
-                .send_leaf_removals_for_tests(&gid, leaves)
-                .await,
-            Err(EngineError::NotGroupAdmin { .. })
-        ));
+        assert_refused(
+            m.bob.engine.send(remove_own_devices(&gid, keys)).await,
+            reason,
+        );
     }
-
-    // The committer's own leaf: OpenMLS refuses to stage a Commit that removes
-    // its committer (and rejects one on receipt), so it is never classified.
-    assert!(
-        m.bob
-            .engine
-            .send_leaf_removals_for_tests(&gid, vec![leaf(&m.bob, &gid)])
-            .await
-            .is_err()
-    );
 
     // An Add of bob's device carried by reference: alice, an admin, proposes
     // it and bob commits her proposal. A same-account Add is by value only, so
@@ -1879,13 +1909,15 @@ async fn without_account_devices_own_account_commits_need_an_admin() {
             Some(ProposalRejectionCategory::AuthorizationFailed)
         );
     }
-    assert!(matches!(
+    assert_not_required(
         m.bob
             .engine
-            .send_leaf_removals_for_tests(&gid, vec![leaf(&m.bob_sibling, &gid)])
+            .send(remove_own_devices(
+                &gid,
+                vec![signature_key(&m.bob_sibling, &gid)],
+            ))
             .await,
-        Err(EngineError::NotGroupAdmin { .. })
-    ));
+    );
 
     // An admin adding its own device keeps today's `privileged` class.
     let alice_kp = new_sibling_key_package(&mut m.alice, b"alice").await;
@@ -2024,17 +2056,8 @@ async fn the_stamp_and_replay_give_every_class_the_same_priority() {
     .await;
 
     // Same-account, by a non-admin: bob removes his other device.
-    let SendResult::GroupEvolution { msg, pending, .. } = m
-        .bob
-        .engine
-        .send_leaf_removals_for_tests(&gid, vec![leaf(&m.bob_sibling, &gid)])
-        .await
-        .unwrap()
-    else {
-        panic!("expected GroupEvolution")
-    };
-    m.bob.engine.confirm_published(pending).await.unwrap();
-    let commit = route_to_group(&msg, &gid);
+    let sibling = signature_key(&m.bob_sibling, &gid);
+    let commit = send_commit(&mut m.bob, remove_own_devices(&gid, vec![sibling]), &gid).await;
     assert_priorities(
         &m.bob,
         &commit,
@@ -2241,19 +2264,19 @@ fn traced_priority_of(
 async fn sibling_devices_removing_each_other_are_settled_by_digest() {
     let mut m = members(true).await;
     let gid = m.gid.clone();
-    let bob_leaf = leaf(&m.bob, &gid);
-    let sibling_leaf = leaf(&m.bob_sibling, &gid);
+    let bob_key = signature_key(&m.bob, &gid);
+    let sibling_key = signature_key(&m.bob_sibling, &gid);
     let removes_sibling = m
         .bob
         .engine
-        .send_leaf_removals_for_tests(&gid, vec![sibling_leaf])
+        .send(remove_own_devices(&gid, vec![sibling_key]))
         .await
         .unwrap();
     let removes_sibling = publish(&mut m.bob, removes_sibling, &gid).await;
     let removes_bob = m
         .bob_sibling
         .engine
-        .send_leaf_removals_for_tests(&gid, vec![bob_leaf])
+        .send(remove_own_devices(&gid, vec![bob_key]))
         .await
         .unwrap();
     let removes_bob = publish(&mut m.bob_sibling, removes_bob, &gid).await;
