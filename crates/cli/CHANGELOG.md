@@ -40,6 +40,14 @@ versioning through the workspace version in the root `Cargo.toml`.
   state rules to the group it joins, as members do to every Commit, and rejects a Welcome whose GroupInfo carries data
   under 0x800d. In any other group only an admin's Welcome joins, as before. Nothing sends such a Welcome yet, and MDK
   does not advertise 0x800d, so nothing changes in practice.
+- In a group that requires `marmot.group.account-devices.v1` (0x800d), a device may now commit adds and removes of its
+  own account's devices without being an admin (mdk#2628). The Commit must carry them by value and nothing else, and a
+  Commit that also touches another account, carries a proposal by reference or changes group state still needs an
+  admin. Such a Commit has ordinary branch priority whoever commits it, so an admin's Remove beats an admin's add of
+  their own device. One classifier now decides authorization and priority at replay, on every send path and in the
+  publish stamp. Groups that don't require 0x800d behave exactly as before; MDK does not advertise 0x800d yet.
+  Scenario IR v3 gains `remove_own_account_devices`, and a vector races two devices of one account: an admin's
+  Remove of another member beats the other device's same-account Remove on every client.
 - JSON error codes now depend on what an error is, not on which MDK layers wrapped it (mdk#2602). Two codes change.
   A storage failure from the account session or the engine now always reports `engine_error`. Before, some paths
   reported `command_failed`. An external-signer rejection now reports `command_failed`, with

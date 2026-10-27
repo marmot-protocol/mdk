@@ -15,7 +15,6 @@ use cgka_traits::app_components::{
     decode_group_profile_v1, decode_nostr_routing_v1, decode_quic_varint, encode_component_vectors,
     encode_components_list, encode_group_lifecycle_v1, encode_group_profile_v1,
 };
-use cgka_traits::engine::CommitOrderingPriority;
 use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::ingest::ProposalRejectionCategory;
@@ -313,14 +312,18 @@ pub(crate) fn require_admin(
     })
 }
 
+/// Require an active admin committer for an admin-required Commit. `class` is
+/// the Commit's [`crate::commit_class::CommitClass`] in `mls_group`, its
+/// candidate parent state.
 pub(crate) fn require_admin_for_staged_commit(
     mls_group: &MlsGroup,
     group_id: &GroupId,
     sender: Option<&MemberId>,
     staged: &StagedCommit,
+    class: crate::commit_class::CommitClass,
 ) -> Result<(), EngineError> {
     reject_admin_self_remove_proposals(mls_group, group_id, staged)?;
-    if !staged_commit_requires_admin(staged) {
+    if !class.requires_admin() {
         return Ok(());
     }
     let Some(sender) = sender else {
@@ -483,19 +486,20 @@ pub(crate) fn authorize_standalone_proposal(
     mls_group: &MlsGroup,
     proposal: &QueuedProposal,
 ) -> Result<(), StandaloneProposalRejection> {
-    authorize_proposal(mls_group, proposal, true)
+    authorize_proposal(mls_group, proposal, None)
 }
 
-/// `standalone` is true when admitting a proposal on its own, false when
-/// re-authorizing the proposals a Commit carries. A Commit's AppDataUpdate
-/// batch and its resulting state are validated as a whole elsewhere, so the
-/// checks that need only the proposal and its source state run here for
-/// standalone proposals alone.
+/// `commit` is `None` when admitting a proposal on its own, and the class of
+/// the Commit when re-authorizing the proposals that Commit carries. A
+/// Commit's AppDataUpdate batch and its resulting state are validated as a
+/// whole elsewhere, so the checks that need only the proposal and its source
+/// state run here for standalone proposals alone.
 fn authorize_proposal(
     mls_group: &MlsGroup,
     proposal: &QueuedProposal,
-    standalone: bool,
+    commit: Option<crate::commit_class::CommitClass>,
 ) -> Result<(), StandaloneProposalRejection> {
+    let standalone = commit.is_none();
     let Sender::Member(sender_index) = proposal.sender() else {
         return Err(StandaloneProposalRejection::authorization(
             "proposal_sender_not_member",
@@ -594,7 +598,11 @@ fn authorize_proposal(
             }
         }
         Proposal::Add(_) | Proposal::Remove(_) => {
-            if !sender_is_admin {
+            // account-devices-v1.md, "Authorization": in a same-account
+            // Commit every proposal is the committer's own by-value Add or
+            // Remove of its account's leaves, which needs no admin. Such
+            // operations have no standalone authority.
+            if !sender_is_admin && commit != Some(crate::commit_class::CommitClass::SameAccount) {
                 return Err(StandaloneProposalRejection::authorization(
                     "membership_proposal_sender_not_admin",
                 ));
@@ -627,14 +635,16 @@ fn authorize_proposal(
 }
 
 /// Re-run proposal-sender authorization for every proposal carried by a
-/// staged Commit. By-reference proposals keep their original authenticated
-/// sender; by-value proposals are attributed to the committer by MLS.
+/// staged Commit of class `class`. By-reference proposals keep their original
+/// authenticated sender; by-value proposals are attributed to the committer by
+/// MLS.
 pub(crate) fn authorize_staged_commit_proposals(
     mls_group: &MlsGroup,
     staged: &StagedCommit,
+    class: crate::commit_class::CommitClass,
 ) -> Result<(), StandaloneProposalRejection> {
     for proposal in staged.queued_proposals() {
-        authorize_proposal(mls_group, proposal, false)?;
+        authorize_proposal(mls_group, proposal, Some(class))?;
     }
     validate_app_data_update_batch(
         mls_group,
@@ -701,7 +711,7 @@ fn validate_group_context_extension_proposal(
     Ok(required_components)
 }
 
-fn credential_account_pubkey(cred: openmls::prelude::Credential) -> Option<[u8; 32]> {
+pub(crate) fn credential_account_pubkey(cred: openmls::prelude::Credential) -> Option<[u8; 32]> {
     let basic = BasicCredential::try_from(cred).ok()?;
     <[u8; 32]>::try_from(basic.identity()).ok()
 }
@@ -742,8 +752,10 @@ pub(crate) fn validate_admin_leaf_coupling_for_staged_commit(
     // ANOTHER member's leaf requires an authenticated admin sender
     // (`require_admin_for_staged_commit`, enforced before this check on the
     // send, ingest, and convergence-replay paths), which fail-closes when the
-    // admin set is empty; the only leaf-removing shape a non-admin may commit
-    // is SelfRemove-only, which cannot de-leaf a member of an empty admin set.
+    // admin set is empty; the leaf-removing shapes a non-admin may commit are
+    // SelfRemove-only and same-account (`crate::commit_class`), which remove
+    // only the committer's own account's leaves, so neither can de-leaf
+    // another member.
     if resulting_admins.is_empty() {
         return Ok(());
     }
@@ -1671,77 +1683,6 @@ fn reject_admin_self_remove_proposals(
         }
     }
     Ok(())
-}
-
-/// Does this staged commit require the sender to be a group admin?
-///
-/// `spec/protocol-core/group-messaging.md:46-53` defines an *allowlist* of the
-/// only two commit shapes a non-admin may produce:
-///
-/// - **(a) self-update**: a Commit that updates only the sender's own LeafNode,
-///   i.e. an inline update path with no by-reference proposals; and
-/// - **(b) SelfRemove-only**: a Commit whose by-reference proposals are all
-///   `SelfRemove` (at least one), and nothing else.
-///
-/// The two shapes must not be combined with each other or with any other
-/// proposal type. Every other commit shape — including `PreSharedKey`,
-/// `ReInit`, `ExternalInit`, `GroupContextExtensions`, `AppDataUpdate`,
-/// `AppEphemeral`, `Custom`, by-reference `Add`/`Remove`/`Update`, illegal
-/// combinations, and the empty/no-op commit — requires admin.
-///
-/// This is the inverse of the allowlist: it returns `true` (admin required)
-/// unless the commit is exactly one of the two allowed non-admin shapes.
-///
-/// `pub` so engine integration tests can classify real OpenMLS staged commits
-/// directly; there is no production caller outside this crate.
-pub fn staged_commit_requires_admin(staged: &StagedCommit) -> bool {
-    !is_allowed_non_admin_commit(staged)
-}
-
-/// Authorization-aware branch ordering class for same-epoch fork recovery.
-pub(crate) fn commit_ordering_priority_for_staged(staged: &StagedCommit) -> CommitOrderingPriority {
-    if staged_commit_requires_admin(staged) {
-        CommitOrderingPriority::Privileged
-    } else {
-        CommitOrderingPriority::Ordinary
-    }
-}
-
-/// Returns `true` iff `staged` is exactly one of the two commit shapes a
-/// non-admin member is permitted to commit. Fail-closed: any unrecognized or
-/// combined shape returns `false`.
-///
-/// Both allowed shapes carry the committer's own update-path leaf node — MLS
-/// requires a fresh path on a Remove/SelfRemove commit, and a self-update *is*
-/// a path. So the update path is never a disqualifier; classification is driven
-/// entirely by the set of by-reference proposals.
-fn is_allowed_non_admin_commit(staged: &StagedCommit) -> bool {
-    let mut proposal_count = 0usize;
-    let mut self_remove_count = 0usize;
-    for queued in staged.queued_proposals() {
-        proposal_count += 1;
-        match queued.proposal() {
-            Proposal::SelfRemove => self_remove_count += 1,
-            // Any non-SelfRemove by-reference proposal (Add, Remove, Update,
-            // PreSharedKey, ReInit, ExternalInit, GroupContextExtensions,
-            // AppDataUpdate, AppEphemeral, Custom) disqualifies both allowed
-            // shapes.
-            _ => return false,
-        }
-    }
-
-    // Shape (a): self-update only — the committer's update path with no
-    // by-reference proposals (updates only the sender's own LeafNode).
-    let is_self_update_only = proposal_count == 0 && staged.update_path_leaf_node().is_some();
-
-    // Shape (b): SelfRemove-only — at least one SelfRemove proposal and every
-    // by-reference proposal is a SelfRemove. The committer's update path is
-    // expected and allowed; it re-keys the committer's own leaf for PCS.
-    let is_self_remove_only = self_remove_count > 0 && self_remove_count == proposal_count;
-
-    // The two shapes are mutually exclusive by proposal count; `^` also rejects
-    // the empty/no-op commit (neither shape).
-    is_self_update_only ^ is_self_remove_only
 }
 
 pub(crate) fn admin_pubkey_from_member_id(id: &MemberId) -> Result<[u8; 32], EngineError> {

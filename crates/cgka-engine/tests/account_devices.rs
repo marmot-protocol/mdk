@@ -1,5 +1,5 @@
 //! `marmot.group.account-devices.v1` (0x800d) resulting-state rules
-//! (account-devices-v1.md; mdk#2628 items 2.1b and 2.1d).
+//! (account-devices-v1.md; mdk#2628 items 2.1b, 2.1c and 2.1d).
 //!
 //! Covers, for a group whose GroupContext `app_components` list requires
 //! 0x800d:
@@ -11,6 +11,10 @@
 //!   required list.
 //! - Welcome acceptance: a device joins through a Welcome from a device of its
 //!   own account, as through an admin's.
+//! - Same-account Commits (mdk#2628 item 2.1c): a non-admin may add and remove
+//!   leaves of its own account, by value and with nothing else in the Commit.
+//!   One classifier decides authority and branch priority; a same-account
+//!   Commit is `ordinary` whoever commits it.
 //!
 //! Each rule is shown from the committer's side (the engine refuses to send)
 //! and the receiver's side (a commit crafted with raw OpenMLS is dropped by
@@ -26,19 +30,23 @@
 
 use async_trait::async_trait;
 use cgka_engine::account_identity_proof::account_identity_proof_component;
-use cgka_engine::canonicalization::DroppedMessageReason;
+use cgka_engine::canonicalization::{CanonicalizationResult, DroppedMessageReason};
+use cgka_engine::commit_class::{CommitAuthorityError, CommitClass, authorize_staged_commit};
+use cgka_engine::convergence::BranchSelectionTrace;
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::provider::EngineOpenMlsProvider;
 use cgka_engine::{DEFAULT_CIPHERSUITE, Engine, EngineBuilder};
 use cgka_traits::EngineError;
 use cgka_traits::app_components::{
     ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID,
-    AppComponentData, AppComponentSet, MAX_LEAVES_PER_ACCOUNT, SAFE_AAD_COMPONENT_ID,
-    default_group_components, encode_components_list,
+    AppComponentData, AppComponentSet, GROUP_PROFILE_COMPONENT_ID, GroupProfileV1,
+    MAX_LEAVES_PER_ACCOUNT, SAFE_AAD_COMPONENT_ID, default_group_components,
+    encode_components_list, encode_group_profile_v1,
 };
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
-    CgkaEngine, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent, SendResult,
+    CgkaEngine, CommitOrderingPriority, CreateGroupRequest, GroupEvent, KeyPackage, SendIntent,
+    SendResult,
 };
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
@@ -46,8 +54,9 @@ use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{
     IngestOutcome, InputRejectionCategory, PeeledContent, PeeledMessage, ProposalRejectionCategory,
 };
+use cgka_traits::message::StoredMessagePayload;
 use cgka_traits::peeler::TransportPeeler;
-use cgka_traits::storage::{AccountDeviceSignerStorage, StorageProvider};
+use cgka_traits::storage::{AccountDeviceSignerStorage, MessageStorage, StorageProvider};
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
 };
@@ -62,6 +71,7 @@ use openmls::prelude::{
     CommitMessageBundle, CredentialWithKey, KeyPackage as MlsKeyPackage, LeafNode,
     LeafNodeParameters, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProtocolVersion,
 };
+use openmls::prelude::{LeafNodeIndex, ProcessedMessageContent};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::{OpenMlsRustCrypto, RustCrypto};
 use openmls_traits::OpenMlsProvider as _;
@@ -247,6 +257,17 @@ async fn found_group(
     require: bool,
     joiners: &mut [&mut Device],
 ) -> GroupId {
+    found_group_with_admins(alice, members, require, vec![], joiners).await
+}
+
+/// [`found_group`] with `initial_admins` besides `alice`.
+async fn found_group_with_admins(
+    alice: &mut Device,
+    members: Vec<KeyPackage>,
+    require: bool,
+    initial_admins: Vec<MemberId>,
+    joiners: &mut [&mut Device],
+) -> GroupId {
     let (gid, created) = alice
         .engine
         .create_group(CreateGroupRequest {
@@ -259,7 +280,7 @@ async fn found_group(
                 vec![]
             },
             app_components: vec![],
-            initial_admins: vec![],
+            initial_admins,
         })
         .await
         .unwrap();
@@ -314,7 +335,11 @@ async fn activate(alice: &mut Device, gid: &GroupId, members: &mut [&mut Device]
     assert!(requires_account_devices(&alice.engine, gid));
 }
 
-async fn assert_accepted(receiver: &mut Device, commit: &TransportMessage, gid: &GroupId) {
+async fn assert_accepted(
+    receiver: &mut Device,
+    commit: &TransportMessage,
+    gid: &GroupId,
+) -> CanonicalizationResult {
     let before = receiver.engine.epoch(gid).unwrap().0;
     receiver.engine.ingest(commit.clone()).await.unwrap();
     let result = receiver
@@ -328,15 +353,17 @@ async fn assert_accepted(receiver: &mut Device, commit: &TransportMessage, gid: 
         result.dropped_messages
     );
     assert_eq!(receiver.engine.epoch(gid).unwrap().0, before + 1);
+    result
 }
 
 /// Replay drops `commit` as invalid against its candidate parent, so it never
 /// becomes an edge: the receiver stays at its epoch and keeps the parent open.
+/// Returns the rejection category replay reported.
 async fn assert_rejected_on_replay(
     receiver: &mut Device,
     commit: &TransportMessage,
     gid: &GroupId,
-) {
+) -> Option<ProposalRejectionCategory> {
     let before = receiver.engine.epoch(gid).unwrap().0;
     let required_before = required(&receiver.engine, gid);
     receiver
@@ -350,16 +377,17 @@ async fn assert_rejected_on_replay(
         .expect("invalid commit receives a terminal disposition");
     assert!(result.accepted_commits.is_empty(), "{result:?}");
     let commit_id = hex::encode(hash_id(&commit.payload).as_slice());
-    assert!(
-        result.dropped_messages.iter().any(|dropped| {
+    let dropped = result
+        .dropped_messages
+        .iter()
+        .find(|dropped| {
             dropped.message_id == commit_id
                 && dropped.reason == DroppedMessageReason::InvalidAgainstCandidateState
-        }),
-        "dropped: {:?}",
-        result.dropped_messages
-    );
+        })
+        .unwrap_or_else(|| panic!("dropped: {:?}", result.dropped_messages));
     assert_eq!(receiver.engine.epoch(gid).unwrap().0, before);
     assert_eq!(required(&receiver.engine, gid), required_before);
+    dropped.rejection_category
 }
 
 fn assert_refused(result: Result<SendResult, EngineError>, reason: &str) {
@@ -550,18 +578,34 @@ fn sibling_key_package(template: &KeyPackage, account: &[u8]) -> KeyPackage {
     KeyPackage::new(bytes).with_protocol_profile(ProtocolProfile::Current)
 }
 
-/// A Commit `sender` builds with raw OpenMLS, bypassing the engine's checks:
-/// it adds `adds`, carries `app_data` by value, and replaces the sender's leaf
-/// with `leaf_extensions` when given.
-fn crafted_commit(
+/// The parts of a Commit [`craft`] builds with raw OpenMLS.
+#[derive(Default)]
+struct Parts {
+    adds: Vec<KeyPackage>,
+    removes: Vec<u32>,
+    app_data: Vec<AppDataUpdateProposal>,
+    /// A replacement for the committer's leaf, carried in its update path.
+    leaf_extensions: Option<Extensions<LeafNode>>,
+    /// Proposal messages the committer stores and commits by reference.
+    by_reference: Vec<TransportMessage>,
+    /// Extensions for the Welcome's GroupInfo, beside the ratchet tree.
+    group_info_extensions: Vec<Extension>,
+}
+
+/// A Commit `sender` builds with raw OpenMLS, bypassing the engine's send
+/// paths, with the committer's verdict on it: the check every send path runs
+/// before it publishes, against the same parent. The sender's group is left as
+/// it was, so it can still commit.
+fn craft(
     sender: &Device,
     gid: &GroupId,
-    adds: Vec<KeyPackage>,
-    app_data: Vec<AppDataUpdateProposal>,
-    leaf_extensions: Option<Extensions<LeafNode>>,
-) -> TransportMessage {
-    let bundle = crafted_bundle(sender, gid, &adds, app_data, leaf_extensions, vec![]);
-    group_transport(bundle.into_commit(), gid, "crafted-commit")
+    parts: Parts,
+) -> (Result<CommitClass, CommitAuthorityError>, TransportMessage) {
+    let (verdict, bundle) = craft_bundle(sender, gid, parts);
+    (
+        verdict,
+        group_transport(bundle.into_commit(), gid, "crafted-commit"),
+    )
 }
 
 /// The Welcome of a Commit `sender` builds as [`crafted_commit`] does, for
@@ -575,7 +619,16 @@ fn crafted_welcome(
     group_info_extensions: Vec<Extension>,
     recipient: &Device,
 ) -> TransportMessage {
-    let bundle = crafted_bundle(sender, gid, adds, app_data, None, group_info_extensions);
+    let (_, bundle) = craft_bundle(
+        sender,
+        gid,
+        Parts {
+            adds: adds.to_vec(),
+            app_data,
+            group_info_extensions,
+            ..Parts::default()
+        },
+    );
     let payload = bundle
         .into_welcome_msg()
         .expect("a Commit that adds members has a Welcome")
@@ -602,27 +655,47 @@ fn group_info_account_devices_entry() -> Vec<Extension> {
     )]
 }
 
-fn crafted_bundle(
+/// The Commit [`craft`] builds, with its Welcome when it adds members.
+fn craft_bundle(
     sender: &Device,
     gid: &GroupId,
-    adds: &[KeyPackage],
-    app_data: Vec<AppDataUpdateProposal>,
-    leaf_extensions: Option<Extensions<LeafNode>>,
-    group_info_extensions: Vec<Extension>,
-) -> CommitMessageBundle {
+    parts: Parts,
+) -> (
+    Result<CommitClass, CommitAuthorityError>,
+    CommitMessageBundle,
+) {
     let crypto = RustCrypto::default();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, sender.storage.mls_storage());
     let mut group = load_group(sender, gid);
+    for message in &parts.by_reference {
+        let message = MlsMessageIn::tls_deserialize_exact(message.payload.as_slice())
+            .unwrap()
+            .try_into_protocol_message()
+            .unwrap();
+        let ProcessedMessageContent::ProposalMessage(queued) = group
+            .process_message(&provider, message)
+            .expect("the committer processes the proposal")
+            .into_content()
+        else {
+            panic!("expected a proposal")
+        };
+        group
+            .store_pending_proposal(provider.storage(), *queued)
+            .unwrap();
+    }
     let mut builder = group
         .commit_builder()
-        .propose_adds(adds.iter().map(parse_key_package))
+        .consume_proposal_store(!parts.by_reference.is_empty())
+        .propose_adds(parts.adds.iter().map(parse_key_package))
+        .propose_removals(parts.removes.into_iter().map(LeafNodeIndex::new))
         .add_proposals(
-            app_data
+            parts
+                .app_data
                 .into_iter()
                 .map(|proposal| Proposal::AppDataUpdate(Box::new(proposal))),
         );
-    if let Some(extensions) = leaf_extensions {
+    if let Some(extensions) = parts.leaf_extensions {
         builder = builder.force_self_update(true).leaf_node_parameters(
             LeafNodeParameters::builder()
                 .with_extensions(extensions)
@@ -630,9 +703,9 @@ fn crafted_bundle(
         );
     }
     let mut builder = builder.load_psks(provider.storage()).unwrap();
-    if !group_info_extensions.is_empty() {
+    if !parts.group_info_extensions.is_empty() {
         builder = builder
-            .create_group_info_with_extensions(group_info_extensions)
+            .create_group_info_with_extensions(parts.group_info_extensions)
             .unwrap();
     }
     let mut updater = builder.app_data_dictionary_updater();
@@ -660,9 +733,39 @@ fn crafted_bundle(
         .expect("raw OpenMLS builds the commit")
         .stage_commit(&provider)
         .expect("raw OpenMLS stages the commit");
-    // Leave the sender's engine as it was, so it can still commit.
+    let verdict = authorize_staged_commit(
+        &group,
+        gid,
+        Some(group.own_leaf_index()),
+        Some(&sender.engine.self_id()),
+        group.pending_commit().unwrap(),
+    );
     group.clear_pending_commit(provider.storage()).unwrap();
-    bundle
+    group.clear_pending_proposals(provider.storage()).unwrap();
+    (verdict, bundle)
+}
+
+/// A Commit `sender` builds with raw OpenMLS, bypassing the engine's checks:
+/// it adds `adds`, carries `app_data` by value, and replaces the sender's leaf
+/// with `leaf_extensions` when given.
+fn crafted_commit(
+    sender: &Device,
+    gid: &GroupId,
+    adds: Vec<KeyPackage>,
+    app_data: Vec<AppDataUpdateProposal>,
+    leaf_extensions: Option<Extensions<LeafNode>>,
+) -> TransportMessage {
+    craft(
+        sender,
+        gid,
+        Parts {
+            adds,
+            app_data,
+            leaf_extensions,
+            ..Parts::default()
+        },
+    )
+    .1
 }
 
 fn required_list_update(ids: &AppComponentSet) -> AppDataUpdateProposal {
@@ -1459,4 +1562,717 @@ async fn a_joined_state_breaking_the_rules_is_refused() {
     }
     let welcome = crafted_welcome(&alice, &gid, &[dave_kp], vec![], vec![], &dave);
     assert_joins(&mut dave, &welcome, &gid, &alice).await;
+}
+
+// ── Same-account Commits ────────────────────────────────────────────────────
+
+/// alice founds the group and is its only admin; bob joins on two devices and
+/// carol on one. Every device advertises 0x800d; the group requires it when
+/// `require` is set.
+struct Members {
+    alice: Device,
+    bob: Device,
+    bob_sibling: Device,
+    carol: Device,
+    gid: GroupId,
+}
+
+async fn members(require: bool) -> Members {
+    let mut alice = device(b"alice", true);
+    let mut bob = device(b"bob", true);
+    let mut bob_sibling = device(b"bob", true);
+    let mut carol = device(b"carol", true);
+    let key_packages = vec![
+        bob.engine.fresh_key_package().await.unwrap(),
+        bob_sibling.engine.fresh_key_package().await.unwrap(),
+        carol.engine.fresh_key_package().await.unwrap(),
+    ];
+    let gid = found_group(
+        &mut alice,
+        key_packages,
+        require,
+        &mut [&mut bob, &mut bob_sibling, &mut carol],
+    )
+    .await;
+    Members {
+        alice,
+        bob,
+        bob_sibling,
+        carol,
+        gid,
+    }
+}
+
+fn leaf(device: &Device, gid: &GroupId) -> u32 {
+    load_group(device, gid).own_leaf_index().u32()
+}
+
+/// A KeyPackage of a new device of `device`'s account.
+async fn new_sibling_key_package(device: &mut Device, account: &[u8]) -> KeyPackage {
+    sibling_key_package(&device.engine.fresh_key_package().await.unwrap(), account)
+}
+
+/// The priority `device`'s publish stamped on its own commit.
+fn stamped_priority(device: &Device, commit: &TransportMessage) -> CommitOrderingPriority {
+    let record = device.storage.get_message(&commit.id).unwrap();
+    StoredMessagePayload::decode(&record.payload)
+        .unwrap()
+        .own_commit_stamp()
+        .expect("an own commit carries its stamp")
+        .priority
+}
+
+/// The priority a pass gave the branch whose tip is `commit`.
+fn traced_priority(
+    result: &CanonicalizationResult,
+    commit: &TransportMessage,
+) -> CommitOrderingPriority {
+    let digest: [u8; 32] = Sha256::digest(&commit.payload).into();
+    result
+        .selection_trace
+        .as_ref()
+        .expect("the pass selected among candidates")
+        .candidates
+        .iter()
+        .find(|candidate| candidate.tip_digest == digest)
+        .expect("the commit is a branch tip")
+        .tip_priority
+}
+
+fn assert_refused_for_authorization(verdict: Result<CommitClass, CommitAuthorityError>) {
+    assert!(
+        matches!(
+            verdict,
+            Err(CommitAuthorityError::Proposal(
+                ProposalRejectionCategory::AuthorizationFailed
+            ))
+        ),
+        "the committer refuses it as authorization_failed, got {verdict:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_non_admin_commits_its_own_accounts_adds_and_removes() {
+    // An Add of a new bob device.
+    let mut m = members(true).await;
+    let kp = new_sibling_key_package(&mut m.bob, b"bob").await;
+    let (verdict, add) = craft(
+        &m.bob,
+        &m.gid,
+        Parts {
+            adds: vec![kp],
+            ..Parts::default()
+        },
+    );
+    assert_eq!(verdict.unwrap(), CommitClass::SameAccount);
+    for receiver in [&mut m.alice, &mut m.bob_sibling, &mut m.carol] {
+        let result = assert_accepted(receiver, &add, &m.gid).await;
+        assert_eq!(
+            traced_priority(&result, &add),
+            CommitOrderingPriority::Ordinary
+        );
+    }
+
+    // A Remove of bob's other device, through the committer's own send path.
+    let mut m = members(true).await;
+    let SendResult::GroupEvolution { msg, pending, .. } = m
+        .bob
+        .engine
+        .send_leaf_removals_for_tests(&m.gid, vec![leaf(&m.bob_sibling, &m.gid)])
+        .await
+        .unwrap()
+    else {
+        panic!("expected GroupEvolution")
+    };
+    m.bob.engine.confirm_published(pending).await.unwrap();
+    let remove = route_to_group(&msg, &m.gid);
+    assert_eq!(
+        stamped_priority(&m.bob, &remove),
+        CommitOrderingPriority::Ordinary
+    );
+    for receiver in [&mut m.alice, &mut m.carol] {
+        let result = assert_accepted(receiver, &remove, &m.gid).await;
+        assert_eq!(
+            traced_priority(&result, &remove),
+            CommitOrderingPriority::Ordinary
+        );
+    }
+    assert_accepted(&mut m.bob_sibling, &remove, &m.gid).await;
+    assert!(m.bob_sibling.engine.group_record(&m.gid).unwrap().removed);
+
+    // Both in one Commit.
+    let mut m = members(true).await;
+    let kp = new_sibling_key_package(&mut m.bob, b"bob").await;
+    let (verdict, both) = craft(
+        &m.bob,
+        &m.gid,
+        Parts {
+            adds: vec![kp],
+            removes: vec![leaf(&m.bob_sibling, &m.gid)],
+            ..Parts::default()
+        },
+    );
+    assert_eq!(verdict.unwrap(), CommitClass::SameAccount);
+    assert_accepted(&mut m.carol, &both, &m.gid).await;
+    assert_accepted(&mut m.alice, &both, &m.gid).await;
+}
+
+/// Every Commit outside the same-account shape needs an admin. The committer
+/// refuses each one before publishing, and replay rejects it, leaving the
+/// receiver at the parent.
+#[tokio::test]
+async fn a_non_admin_cannot_commit_anything_beside_its_own_accounts_leaves() {
+    let mut m = members(true).await;
+    let gid = m.gid.clone();
+    let bob_kp = new_sibling_key_package(&mut m.bob, b"bob").await;
+    let dave_kp = device(b"dave", true)
+        .engine
+        .fresh_key_package()
+        .await
+        .unwrap();
+    let carol_leaf = leaf(&m.carol, &gid);
+    let profile = AppDataUpdateProposal::update(
+        GROUP_PROFILE_COMPONENT_ID,
+        encode_group_profile_v1(&GroupProfileV1 {
+            name: "renamed".into(),
+            description: String::new(),
+        })
+        .unwrap(),
+    );
+
+    for parts in [
+        // An Add whose KeyPackage belongs to another account.
+        Parts {
+            adds: vec![dave_kp.clone()],
+            ..Parts::default()
+        },
+        // A Remove of another account's leaf.
+        Parts {
+            removes: vec![carol_leaf],
+            ..Parts::default()
+        },
+        // Same-account operations mixed with another account's.
+        Parts {
+            adds: vec![bob_kp.clone(), dave_kp.clone()],
+            ..Parts::default()
+        },
+        Parts {
+            adds: vec![bob_kp.clone()],
+            removes: vec![carol_leaf],
+            ..Parts::default()
+        },
+        // Same-account operations mixed with a group change.
+        Parts {
+            adds: vec![bob_kp.clone()],
+            app_data: vec![profile.clone()],
+            ..Parts::default()
+        },
+    ] {
+        let (verdict, commit) = craft(&m.bob, &gid, parts);
+        assert_refused_for_authorization(verdict);
+        assert_eq!(
+            assert_rejected_on_replay(&mut m.carol, &commit, &gid).await,
+            Some(ProposalRejectionCategory::AuthorizationFailed)
+        );
+    }
+
+    // The committer's send path refuses another account's leaf, alone or
+    // beside a same-account Remove.
+    for leaves in [
+        vec![carol_leaf],
+        vec![leaf(&m.bob_sibling, &gid), carol_leaf],
+    ] {
+        assert!(matches!(
+            m.bob
+                .engine
+                .send_leaf_removals_for_tests(&gid, leaves)
+                .await,
+            Err(EngineError::NotGroupAdmin { .. })
+        ));
+    }
+
+    // The committer's own leaf: OpenMLS refuses to stage a Commit that removes
+    // its committer (and rejects one on receipt), so it is never classified.
+    assert!(
+        m.bob
+            .engine
+            .send_leaf_removals_for_tests(&gid, vec![leaf(&m.bob, &gid)])
+            .await
+            .is_err()
+    );
+
+    // An Add of bob's device carried by reference: alice, an admin, proposes
+    // it and bob commits her proposal. A same-account Add is by value only, so
+    // the Commit is admin-required. Each proposal is authorized on its own, so
+    // the refusal is the committer check, which replay reports without a
+    // category in every group, as before this class existed (mdk#2647).
+    let proposal = standalone_add(&m.alice, &gid, &bob_kp);
+    let outcome = m.carol.engine.ingest(proposal.clone()).await.unwrap();
+    assert!(
+        !matches!(outcome, IngestOutcome::Rejected { .. }),
+        "an admin's Add proposal is admitted: {outcome:?}"
+    );
+    let (verdict, by_reference) = craft(
+        &m.bob,
+        &gid,
+        Parts {
+            by_reference: vec![proposal],
+            ..Parts::default()
+        },
+    );
+    assert!(
+        matches!(verdict, Err(CommitAuthorityError::NotAdmin)),
+        "{verdict:?}"
+    );
+    assert_eq!(
+        assert_rejected_on_replay(&mut m.carol, &by_reference, &gid).await,
+        None
+    );
+
+    // Every rejected Commit left the parent open: bob's same-account Add of
+    // the same KeyPackage, by value, is accepted.
+    let (verdict, add) = craft(
+        &m.bob,
+        &gid,
+        Parts {
+            adds: vec![bob_kp],
+            ..Parts::default()
+        },
+    );
+    assert_eq!(verdict.unwrap(), CommitClass::SameAccount);
+    assert_accepted(&mut m.carol, &add, &gid).await;
+}
+
+/// Without the requirement, a Commit of one's own account's leaves needs an
+/// admin as before, and an admin's is `privileged`. The Commit that turns the
+/// requirement on authorizes nothing either.
+#[tokio::test]
+async fn without_account_devices_own_account_commits_need_an_admin() {
+    let mut m = members(false).await;
+    let gid = m.gid.clone();
+    let bob_kp = new_sibling_key_package(&mut m.bob, b"bob").await;
+    let activation = required_list_update(&with_account_devices(required(&m.bob.engine, &gid)));
+
+    for parts in [
+        Parts {
+            adds: vec![bob_kp.clone()],
+            ..Parts::default()
+        },
+        Parts {
+            removes: vec![leaf(&m.bob_sibling, &gid)],
+            ..Parts::default()
+        },
+        Parts {
+            adds: vec![bob_kp.clone()],
+            app_data: vec![activation.clone()],
+            ..Parts::default()
+        },
+        Parts {
+            app_data: vec![activation],
+            ..Parts::default()
+        },
+    ] {
+        let (verdict, commit) = craft(&m.bob, &gid, parts);
+        assert_refused_for_authorization(verdict);
+        assert_eq!(
+            assert_rejected_on_replay(&mut m.carol, &commit, &gid).await,
+            Some(ProposalRejectionCategory::AuthorizationFailed)
+        );
+    }
+    assert!(matches!(
+        m.bob
+            .engine
+            .send_leaf_removals_for_tests(&gid, vec![leaf(&m.bob_sibling, &gid)])
+            .await,
+        Err(EngineError::NotGroupAdmin { .. })
+    ));
+
+    // An admin adding its own device keeps today's `privileged` class.
+    let alice_kp = new_sibling_key_package(&mut m.alice, b"alice").await;
+    let invite = send_commit(
+        &mut m.alice,
+        SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![alice_kp],
+            initial_admins: vec![],
+        },
+        &gid,
+    )
+    .await;
+    assert_eq!(
+        stamped_priority(&m.alice, &invite),
+        CommitOrderingPriority::Privileged
+    );
+    let result = assert_accepted(&mut m.carol, &invite, &gid).await;
+    assert_eq!(
+        traced_priority(&result, &invite),
+        CommitOrderingPriority::Privileged
+    );
+}
+
+/// For every class, the priority the committer stamps at publish equals the
+/// one each receiver's replay derives from the same parent.
+#[tokio::test]
+async fn the_stamp_and_replay_give_every_class_the_same_priority() {
+    let mut m = members(true).await;
+    let gid = m.gid.clone();
+
+    // Self-update.
+    let commit = send_commit(
+        &mut m.carol,
+        SendIntent::SelfUpdate {
+            group_id: gid.clone(),
+        },
+        &gid,
+    )
+    .await;
+    assert_priorities(
+        &m.carol,
+        &commit,
+        &mut [&mut m.alice, &mut m.bob, &mut m.bob_sibling],
+        &gid,
+        CommitOrderingPriority::Ordinary,
+    )
+    .await;
+
+    // Same-account, by an admin: alice invites a device of her own.
+    let alice_kp = new_sibling_key_package(&mut m.alice, b"alice").await;
+    let commit = send_commit(
+        &mut m.alice,
+        SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![alice_kp],
+            initial_admins: vec![],
+        },
+        &gid,
+    )
+    .await;
+    assert_priorities(
+        &m.alice,
+        &commit,
+        &mut [&mut m.bob, &mut m.bob_sibling, &mut m.carol],
+        &gid,
+        CommitOrderingPriority::Ordinary,
+    )
+    .await;
+
+    // Admin-required: alice invites dave.
+    let dave_kp = device(b"dave", true)
+        .engine
+        .fresh_key_package()
+        .await
+        .unwrap();
+    let commit = send_commit(
+        &mut m.alice,
+        SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![dave_kp],
+            initial_admins: vec![],
+        },
+        &gid,
+    )
+    .await;
+    assert_priorities(
+        &m.alice,
+        &commit,
+        &mut [&mut m.bob, &mut m.bob_sibling, &mut m.carol],
+        &gid,
+        CommitOrderingPriority::Privileged,
+    )
+    .await;
+
+    // SelfRemove-only: alice commits carol's Leave.
+    let SendResult::Proposal { msg } = m
+        .carol
+        .engine
+        .send(SendIntent::Leave {
+            group_id: gid.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a SelfRemove proposal")
+    };
+    let leave = route_to_group(&msg, &gid);
+    m.alice.engine.ingest(leave.clone()).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+    assert!(
+        m.alice
+            .engine
+            .advance_convergence(&gid)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut publications = m.alice.engine.drain_auto_publish();
+    assert_eq!(publications.len(), 1);
+    let publication = publications.remove(0);
+    m.alice
+        .engine
+        .confirm_published(publication.pending)
+        .await
+        .unwrap();
+    let commit = route_to_group(&publication.msg, &gid);
+    m.bob.engine.ingest(leave).await.unwrap();
+    assert_priorities(
+        &m.alice,
+        &commit,
+        &mut [&mut m.bob],
+        &gid,
+        CommitOrderingPriority::Ordinary,
+    )
+    .await;
+
+    // Same-account, by a non-admin: bob removes his other device.
+    let SendResult::GroupEvolution { msg, pending, .. } = m
+        .bob
+        .engine
+        .send_leaf_removals_for_tests(&gid, vec![leaf(&m.bob_sibling, &gid)])
+        .await
+        .unwrap()
+    else {
+        panic!("expected GroupEvolution")
+    };
+    m.bob.engine.confirm_published(pending).await.unwrap();
+    let commit = route_to_group(&msg, &gid);
+    assert_priorities(
+        &m.bob,
+        &commit,
+        &mut [&mut m.alice],
+        &gid,
+        CommitOrderingPriority::Ordinary,
+    )
+    .await;
+}
+
+async fn assert_priorities(
+    committer: &Device,
+    commit: &TransportMessage,
+    receivers: &mut [&mut Device],
+    gid: &GroupId,
+    expected: CommitOrderingPriority,
+) {
+    assert_eq!(stamped_priority(committer, commit), expected);
+    for receiver in receivers.iter_mut() {
+        let result = assert_accepted(receiver, commit, gid).await;
+        assert_eq!(traced_priority(&result, commit), expected);
+    }
+}
+
+/// An Add proposal of `kp` by `sender`, built with raw OpenMLS. The sender's
+/// own proposal store is left empty.
+fn standalone_add(sender: &Device, gid: &GroupId, kp: &KeyPackage) -> TransportMessage {
+    let crypto = RustCrypto::default();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, sender.storage.mls_storage());
+    let mut group = load_group(sender, gid);
+    let (message, _) = group
+        .propose_add_member(&provider, &device_signer(sender), &parse_key_package(kp))
+        .expect("raw OpenMLS builds the proposal");
+    group.clear_pending_proposals(provider.storage()).unwrap();
+    group_transport(message, gid, "standalone-add")
+}
+
+// ── Branch priority ─────────────────────────────────────────────────────────
+
+/// Deliver every commit in `commits` (each with the index of its sender) to
+/// every other device, converge each device once, and return each device's
+/// branch-selection trace. Every device must select the same branch from the
+/// same candidates, scored the same way.
+async fn race(
+    devices: &mut [&mut Device],
+    commits: &[(usize, TransportMessage)],
+    gid: &GroupId,
+) -> BranchSelectionTrace {
+    let mut traces = Vec::new();
+    for (index, device) in devices.iter_mut().enumerate() {
+        for (sender, commit) in commits {
+            if *sender != index {
+                device.engine.ingest(commit.clone()).await.unwrap();
+            }
+        }
+        let result = device
+            .engine
+            .converge_stored_openmls_messages_at(gid, 1_000_000)
+            .unwrap();
+        traces.push(result.selection_trace.expect("the pass selected a branch"));
+    }
+    let scores = |trace: &BranchSelectionTrace| {
+        let mut scores: Vec<_> = trace
+            .candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.branch_id.clone(),
+                    candidate.tip_priority,
+                    candidate.tip_committer.clone(),
+                    candidate.tip_digest,
+                )
+            })
+            .collect();
+        scores.sort();
+        scores
+    };
+    let first = traces.remove(0);
+    assert_eq!(first.candidates.len(), commits.len());
+    for trace in &traces {
+        assert_eq!(trace.selected_branch_id, first.selected_branch_id);
+        assert_eq!(scores(trace), scores(&first));
+    }
+    first
+}
+
+fn decisive_rule(trace: &BranchSelectionTrace) -> &'static str {
+    trace
+        .rule_trace
+        .iter()
+        .find(|rule| rule.decisive)
+        .expect("a rule decided the race")
+        .rule_name
+}
+
+fn selected_tip(trace: &BranchSelectionTrace) -> [u8; 32] {
+    trace
+        .candidates
+        .iter()
+        .find(|candidate| Some(&candidate.branch_id) == trace.selected_branch_id.as_ref())
+        .expect("a selected branch")
+        .tip_digest
+}
+
+async fn publish(device: &mut Device, result: SendResult, gid: &GroupId) -> TransportMessage {
+    let SendResult::GroupEvolution { msg, pending, .. } = result else {
+        panic!("expected GroupEvolution")
+    };
+    device.engine.confirm_published(pending).await.unwrap();
+    route_to_group(&msg, gid)
+}
+
+/// Two admins race from one parent: one adds a device of its own account
+/// (`ordinary`), the other removes a member (`privileged`). The Remove wins on
+/// every client, including the adder, whose account sorts first and would
+/// otherwise win the committer comparison.
+#[tokio::test]
+async fn an_admins_remove_beats_an_admins_same_account_add() {
+    let mut first = device(b"alice", true);
+    let mut second = device(b"bob", true);
+    let mut carol = device(b"carol", true);
+    let mut dave = device(b"dave", true);
+    let key_packages = vec![
+        second.engine.fresh_key_package().await.unwrap(),
+        carol.engine.fresh_key_package().await.unwrap(),
+        dave.engine.fresh_key_package().await.unwrap(),
+    ];
+    let second_id = second.engine.self_id();
+    let gid = found_group_with_admins(
+        &mut first,
+        key_packages,
+        true,
+        vec![second_id],
+        &mut [&mut second, &mut carol, &mut dave],
+    )
+    .await;
+    let (mut adder, adder_account, mut remover) =
+        if first.engine.self_id().as_slice() < second.engine.self_id().as_slice() {
+            (first, b"alice".as_slice(), second)
+        } else {
+            (second, b"bob".as_slice(), first)
+        };
+
+    let kp = new_sibling_key_package(&mut adder, adder_account).await;
+    let add = adder
+        .engine
+        .send(SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let add = publish(&mut adder, add, &gid).await;
+    let remove = remover
+        .engine
+        .send(SendIntent::RemoveMembers {
+            group_id: gid.clone(),
+            members: vec![dave.engine.self_id()],
+        })
+        .await
+        .unwrap();
+    let remove = publish(&mut remover, remove, &gid).await;
+
+    let trace = race(
+        &mut [&mut adder, &mut remover, &mut carol],
+        &[(0, add.clone()), (1, remove.clone())],
+        &gid,
+    )
+    .await;
+    assert_eq!(
+        selected_tip(&trace),
+        <[u8; 32]>::from(Sha256::digest(&remove.payload))
+    );
+    assert_eq!(decisive_rule(&trace), "tip_priority");
+    assert_eq!(
+        traced_priority_of(&trace, &add),
+        CommitOrderingPriority::Ordinary
+    );
+    assert_eq!(
+        traced_priority_of(&trace, &remove),
+        CommitOrderingPriority::Privileged
+    );
+}
+
+fn traced_priority_of(
+    trace: &BranchSelectionTrace,
+    commit: &TransportMessage,
+) -> CommitOrderingPriority {
+    let digest: [u8; 32] = Sha256::digest(&commit.payload).into();
+    trace
+        .candidates
+        .iter()
+        .find(|candidate| candidate.tip_digest == digest)
+        .expect("the commit is a branch tip")
+        .tip_priority
+}
+
+/// Two devices of one account remove each other from one parent. Both
+/// Commits are `ordinary` from the same account, so the digest decides, the
+/// same way on every client, both committers included.
+#[tokio::test]
+async fn sibling_devices_removing_each_other_are_settled_by_digest() {
+    let mut m = members(true).await;
+    let gid = m.gid.clone();
+    let bob_leaf = leaf(&m.bob, &gid);
+    let sibling_leaf = leaf(&m.bob_sibling, &gid);
+    let removes_sibling = m
+        .bob
+        .engine
+        .send_leaf_removals_for_tests(&gid, vec![sibling_leaf])
+        .await
+        .unwrap();
+    let removes_sibling = publish(&mut m.bob, removes_sibling, &gid).await;
+    let removes_bob = m
+        .bob_sibling
+        .engine
+        .send_leaf_removals_for_tests(&gid, vec![bob_leaf])
+        .await
+        .unwrap();
+    let removes_bob = publish(&mut m.bob_sibling, removes_bob, &gid).await;
+
+    let trace = race(
+        &mut [&mut m.bob, &mut m.bob_sibling, &mut m.alice, &mut m.carol],
+        &[(0, removes_sibling.clone()), (1, removes_bob.clone())],
+        &gid,
+    )
+    .await;
+    assert_eq!(decisive_rule(&trace), "tip_digest");
+    for candidate in &trace.candidates {
+        assert_eq!(candidate.tip_priority, CommitOrderingPriority::Ordinary);
+        assert_eq!(candidate.tip_committer, m.bob.engine.self_id().as_slice());
+    }
+    let lower = [&removes_sibling, &removes_bob]
+        .map(|commit| <[u8; 32]>::from(Sha256::digest(&commit.payload)))
+        .into_iter()
+        .min()
+        .unwrap();
+    assert_eq!(selected_tip(&trace), lower);
 }

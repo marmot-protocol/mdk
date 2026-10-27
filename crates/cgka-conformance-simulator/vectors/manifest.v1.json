@@ -187,6 +187,19 @@
       "next": "Assert the losing inviter's superseded-intent event portably."
     },
     {
+      "id": "account-devices-own-device-removal-loses-to-admin-remove/v1",
+      "kind": "scenario_vector",
+      "status": "portable",
+      "artifact": "account-devices-own-device-removal-loses-to-admin-remove.v1.json",
+      "coverage": [
+        "two devices of one account racing from one parent",
+        "same-account Remove committed without the proposal store",
+        "admin-required Commit beats a same-account Commit by priority class",
+        "converged state requires 0x800d and satisfies its rules"
+      ],
+      "next": "Add the sibling mutual-removal race once vectors can assert a digest-decided winner."
+    },
+    {
       "id": "cross-route-own-commit-recovery/v1",
       "kind": "scenario_vector",
       "status": "portable",

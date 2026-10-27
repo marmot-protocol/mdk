@@ -207,6 +207,12 @@ impl<S: StorageProvider> Engine<S> {
             let staged_commit = mls_group
                 .pending_commit()
                 .ok_or_else(|| EngineError::Backend("upgrade produced no pending commit".into()))?;
+            crate::commit_class::authorize_own_staged_commit(
+                &mls_group,
+                group_id,
+                self.identity.self_id(),
+                staged_commit,
+            )?;
             crate::app_components::validate_app_component_integrity_for_staged_commit(
                 &mls_group,
                 group_id,

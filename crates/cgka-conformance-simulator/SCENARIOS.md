@@ -143,6 +143,19 @@ These are the scenarios another implementation should be able to load from JSON 
   pending work. As in `concurrent-invite-fork-recovery/v1`, Carol's Welcome belongs to the losing branch and Carol is
   not run.
 
+### `account-devices-own-device-removal-loses-to-admin-remove/v1`
+
+- File: `vectors/account-devices-own-device-removal-loses-to-admin-remove.v1.json`
+- Setup: Alice's phone and laptop and Bob are in a group that requires 0x800d, with Alice an admin. From the same
+  parent, the phone removes Bob, a Commit that needs an admin, while the laptop removes the phone, a same-account
+  Commit (`remove_own_account_devices`).
+- Pressure: two devices of one account race. Both Commits share a committer, so only their priority classes separate
+  them: the Remove of Bob is `privileged` and the same-account Remove is `ordinary`, whoever commits it.
+- Expected: both of Alice's devices select the Remove of Bob with a settled `tip_priority` decision and reach the same
+  exact state at epoch 3 with two leaves, a state that requires 0x800d and satisfies its rules, and no pending work.
+  Bob is removed and not observed. A rule that gave the same-account Commit the admin class would leave the digest to
+  decide.
+
 ### `cross-route-own-commit-recovery/v1`
 
 - File: `vectors/cross-route-own-commit-recovery.v1.json`

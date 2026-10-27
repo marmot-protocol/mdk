@@ -525,11 +525,18 @@ impl PrevalidatedOwnCommits {
 ///
 /// Checkpoint identity and resulting epoch authentication are filled in by the
 /// confirm path after the commit is merged.
+///
+/// `parent` is the group the commit is staged on, still at the commit's
+/// source epoch: the same candidate parent state every receiver classifies the
+/// commit against on replay, so the stamped priority equals theirs.
 pub(crate) fn own_commit_stamp(
+    parent: &MlsGroup,
     staged: &openmls::group::StagedCommit,
     committer: MemberId,
 ) -> Result<cgka_traits::message::OwnCommitConvergenceStamp, cgka_traits::error::EngineError> {
-    let priority = crate::app_components::commit_ordering_priority_for_staged(staged);
+    let priority =
+        crate::commit_class::classify_staged_commit(parent, staged, Some(parent.own_leaf_index()))?
+            .priority();
     let mut consumed_proposal_refs = staged
         .queued_proposals()
         .map(|proposal| tls_hex(proposal.proposal_reference_ref()))
@@ -4058,33 +4065,45 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         rejection_category: None,
                     });
                 }
-                if let Err(rejection) =
-                    crate::app_components::authorize_staged_commit_proposals(&mls_group, &staged)
-                {
-                    return Err(OpenMlsProjectionError::InvalidCommit {
-                        message_id,
-                        reason: crate::app_components::proposal_rejection_category_tag(
-                            rejection.category,
-                        )
-                        .to_string(),
-                        rejection_category: Some(rejection.category),
-                    });
-                }
-                if let Err(err) = crate::app_components::require_admin_for_staged_commit(
+                // One class decides this Commit's authority and its branch
+                // priority, from the same parent state the committer stamped
+                // it against.
+                let class = match crate::commit_class::authorize_staged_commit(
                     &mls_group,
                     group_id,
+                    sender_leaf_index,
                     sender_id.as_ref(),
                     &staged,
                 ) {
-                    return match err {
-                        cgka_traits::error::EngineError::NotGroupAdmin { .. } => {
-                            Err(OpenMlsProjectionError::UnauthorizedCommit { message_id })
-                        }
-                        other => Err(OpenMlsProjectionError::Replay(format!(
+                    Ok(class) => class,
+                    Err(crate::commit_class::CommitAuthorityError::ParentState(err)) => {
+                        return Err(OpenMlsProjectionError::InvalidCommit {
+                            message_id,
+                            reason: format!("commit class: {err}"),
+                            rejection_category: Some(
+                                cgka_traits::ingest::ProposalRejectionCategory::InvalidEncoding,
+                            ),
+                        });
+                    }
+                    Err(crate::commit_class::CommitAuthorityError::Proposal(category)) => {
+                        return Err(OpenMlsProjectionError::InvalidCommit {
+                            message_id,
+                            reason: crate::app_components::proposal_rejection_category_tag(
+                                category,
+                            )
+                            .to_string(),
+                            rejection_category: Some(category),
+                        });
+                    }
+                    Err(crate::commit_class::CommitAuthorityError::NotAdmin) => {
+                        return Err(OpenMlsProjectionError::UnauthorizedCommit { message_id });
+                    }
+                    Err(crate::commit_class::CommitAuthorityError::Other(other)) => {
+                        return Err(OpenMlsProjectionError::Replay(format!(
                             "admin check: {other:?}"
-                        ))),
-                    };
-                }
+                        )));
+                    }
+                };
                 if let Err(err) =
                     crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
                         &mls_group, group_id, &staged,
@@ -4120,7 +4139,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 let sender = sender_id
                     .as_ref()
                     .expect("authenticated sender checked above");
-                let priority = crate::app_components::commit_ordering_priority_for_staged(&staged);
+                let priority = class.priority();
                 let committer = sender.as_slice().to_vec();
                 // foundation/identity.md: deferred commits replayed during
                 // convergence are an inbound credential ingress too. Reject

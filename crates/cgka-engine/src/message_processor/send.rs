@@ -300,6 +300,12 @@ impl<S: StorageProvider> Engine<S> {
         let staged_commit = mls_group
             .pending_commit()
             .ok_or_else(|| EngineError::Backend("invite produced no pending commit".into()))?;
+        crate::commit_class::authorize_own_staged_commit(
+            &mls_group,
+            &group_id,
+            self.identity.self_id(),
+            staged_commit,
+        )?;
         crate::app_components::validate_current_profile_invariants_for_staged_commit(
             &mls_group,
             staged_commit,
@@ -584,6 +590,12 @@ impl<S: StorageProvider> Engine<S> {
         let staged_commit = mls_group
             .pending_commit()
             .ok_or_else(|| EngineError::Backend("remove produced no pending commit".into()))?;
+        crate::commit_class::authorize_own_staged_commit(
+            &mls_group,
+            &group_id,
+            self.identity.self_id(),
+            staged_commit,
+        )?;
         crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
             &mls_group,
             &group_id,
@@ -662,6 +674,139 @@ impl<S: StorageProvider> Engine<S> {
                 )),
             ),
         );
+        self.track_pending_origin_commit(pending_ref, commit_msg.id.clone());
+        pending_commit_guard.disarm();
+
+        Ok(SendResult::GroupEvolution {
+            msg: commit_msg,
+            welcomes: vec![],
+            pending: pending_ref,
+        })
+    }
+
+    /// Test-only stand-in for the same-account Remove intent of mdk#2628 item
+    /// 2.1e: a Commit that removes `leaves` by value, built without the
+    /// OpenMLS proposal store, that passes this device's own checks and the
+    /// ordinary publish lifecycle (`confirm_published` stamps it). It never
+    /// changes the group record's members, which `confirm_published` mirrors
+    /// from the merged state.
+    #[cfg(any(
+        feature = "test-policy-overrides",
+        feature = "test-conformance-snapshot"
+    ))]
+    pub async fn send_leaf_removals_for_tests(
+        &mut self,
+        group_id: &GroupId,
+        leaves: Vec<u32>,
+    ) -> Result<SendResult, EngineError> {
+        self.ensure_hydrated(group_id)?;
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let mut mls_group = MlsGroup::load(
+            <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(&provider),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .map_err(|e| EngineError::Backend(format!("load: {e:?}")))?
+        .ok_or_else(|| EngineError::UnknownGroup(group_id.clone()))?;
+        if let Some(state) = self.epoch_manager.state(group_id)
+            && !matches!(state, EpochState::Stable { .. })
+        {
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: state.name(),
+                    to: "RemoveLeaves",
+                    reason: "remove leaves requires Stable",
+                },
+            ));
+        }
+        let pre_commit_epoch = EpochId(mls_group.epoch().as_u64());
+        let pending_commit_guard =
+            PendingCommitCleanupGuard::arm(&self.storage, &provider, group_id.clone());
+        let pre_commit_ctx =
+            crate::group_lifecycle::build_group_context_snapshot(&mls_group, &provider)?;
+        let commit_out = mls_group
+            .commit_builder()
+            .consume_proposal_store(false)
+            .propose_removals(leaves.into_iter().map(openmls::prelude::LeafNodeIndex::new))
+            .load_psks(
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::storage(
+                    &provider,
+                ),
+            )
+            .map_err(|e| EngineError::Backend(format!("remove_leaves load_psks: {e:?}")))?
+            .build(
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::rand(&provider),
+                <EngineOpenMlsProvider<'_, S> as openmls_traits::OpenMlsProvider>::crypto(
+                    &provider,
+                ),
+                &self.identity.signer,
+                |_| true,
+            )
+            .map_err(|e| EngineError::Backend(format!("remove_leaves build: {e:?}")))?
+            .stage_commit(&provider)
+            .map_err(|e| EngineError::Backend(format!("remove_leaves stage: {e:?}")))?
+            .into_commit();
+        let staged_commit = mls_group
+            .pending_commit()
+            .ok_or_else(|| EngineError::Backend("remove produced no pending commit".into()))?;
+        crate::commit_class::authorize_own_staged_commit(
+            &mls_group,
+            group_id,
+            self.identity.self_id(),
+            staged_commit,
+        )?;
+        crate::app_components::validate_admin_leaf_coupling_for_staged_commit(
+            &mls_group,
+            group_id,
+            staged_commit,
+        )?;
+        crate::account_identity_proof::validate_staged_commit_account_identity_proofs(
+            staged_commit,
+            &mls_group,
+            self.identity.self_id(),
+            self.ciphersuite,
+        )?;
+        crate::app_components::validate_current_profile_invariants_for_staged_commit(
+            &mls_group,
+            staged_commit,
+            mls_group.own_leaf_index(),
+        )?;
+
+        let commit_bytes = commit_out
+            .tls_serialize_detached()
+            .map_err(|e| EngineError::Serialize(format!("{e:?}")))?;
+        let commit_msg = self
+            .peeler
+            .wrap_group_message(
+                &EncryptedPayload {
+                    ciphertext: commit_bytes.clone(),
+                    aad: vec![],
+                },
+                &pre_commit_ctx,
+            )
+            .await
+            .map_err(EngineError::Peeler)?;
+        let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
+        self.record_sent_openmls_message(
+            &commit_msg,
+            commit_bytes.as_slice(),
+            group_id,
+            pre_commit_epoch,
+        )?;
+
+        let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
+        let pending_ref = self.epoch_manager.next_pending_ref();
+        let staged =
+            cgka_traits::engine_state::StagedCommitHandle::from_bytes(group_id.as_slice().to_vec());
+        self.invalidate_deferred_peel_candidate_cache(group_id);
+        self.epoch_manager.begin_pending(
+            group_id.clone(),
+            pre_commit_epoch,
+            new_epoch,
+            staged,
+            pending_ref,
+            crate::epoch_manager::PendingKind::GroupEvolution,
+            self.current_audit_context.clone(),
+        )?;
         self.track_pending_origin_commit(pending_ref, commit_msg.id.clone());
         pending_commit_guard.disarm();
 
