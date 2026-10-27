@@ -13,8 +13,8 @@ use cgka_traits::error::EngineError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::storage::StorageProvider;
 use openmls::prelude::{
-    KeyPackage as MlsKeyPackage, KeyPackageBundle, KeyPackageVerifyError, MlsMessageBodyIn,
-    MlsMessageIn, MlsMessageOut, ProtocolVersion,
+    KeyPackage as MlsKeyPackage, KeyPackageBundle, KeyPackageVerifyError, Lifetime,
+    MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProtocolVersion,
 };
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::OpenMlsProvider as _;
@@ -43,6 +43,12 @@ mod validation_crypto {
             .map_err(|e| EngineError::Backend(format!("key_package ref: {e:?}")))
     }
 }
+
+/// How long a KeyPackage this device publishes stays valid. OpenMLS starts the
+/// `Lifetime` an hour early for clock skew, so the range is 30 days plus one
+/// hour, the publishing target in `foundation/key-packages.md` ("Refreshing a
+/// slot"). Receivers still accept ranges up to the 84-day validity limit.
+const KEY_PACKAGE_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyPackageMetadata {
@@ -363,6 +369,42 @@ impl<S: StorageProvider> Engine<S> {
         durably_owned_key_packages(&self.storage, self.new_protocol_profile)
     }
 
+    /// Whether `key_package` advertises what a KeyPackage built now would:
+    /// the same profile, ciphersuite, MLS extensions and proposals, and app
+    /// components. When the set this client supports changes, its published
+    /// KeyPackage is due for replacement (`foundation/key-packages.md`,
+    /// "Capability advertising").
+    pub fn key_package_advertises_current_capabilities(
+        &self,
+        key_package: &KeyPackage,
+    ) -> Result<bool, EngineError> {
+        let metadata = key_package_metadata(key_package)?;
+        let caps = leaf_capabilities(&self.registry, self.ciphersuite, self.new_protocol_profile);
+        let advertised = crate::capabilities::advertised_capabilities_from_caps(&caps);
+        let app_components = crate::app_components::app_components_of_leaf_extensions(
+            &self
+                .identity
+                .leaf_extensions(&self.supported_app_components)?,
+        )?;
+        Ok(metadata.protocol_profile == self.new_protocol_profile
+            && metadata.ciphersuite == u16::from(self.ciphersuite)
+            && metadata
+                .mls_extensions
+                .iter()
+                .copied()
+                .eq(advertised.extensions)
+            && metadata
+                .mls_proposals
+                .iter()
+                .copied()
+                .eq(advertised.proposals)
+            && metadata
+                .app_components
+                .iter()
+                .copied()
+                .eq(app_components.ids))
+    }
+
     /// Build + persist a fresh KeyPackage using the supplied storage view.
     ///
     /// Maintenance uses this inside `StorageProvider::with_transaction` so the
@@ -375,6 +417,7 @@ impl<S: StorageProvider> Engine<S> {
         let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
 
         let bundle = MlsKeyPackage::builder()
+            .key_package_lifetime(Lifetime::new(KEY_PACKAGE_LIFETIME_SECS))
             .leaf_node_capabilities(caps)
             .leaf_node_extensions(leaf_extensions)
             .mark_as_last_resort()

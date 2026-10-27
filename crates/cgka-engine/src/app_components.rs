@@ -84,7 +84,14 @@ pub(crate) fn leaf_app_components_extension(
 }
 
 pub(crate) fn app_components_of_leaf(leaf: &LeafNode) -> Result<AppComponentSet, EngineError> {
-    let Some(ext) = leaf.extensions().app_data_dictionary() else {
+    app_components_of_leaf_extensions(leaf.extensions())
+}
+
+/// The app component ids a LeafNode with `extensions` advertises.
+pub(crate) fn app_components_of_leaf_extensions(
+    extensions: &Extensions<LeafNode>,
+) -> Result<AppComponentSet, EngineError> {
+    let Some(ext) = extensions.app_data_dictionary() else {
         return Ok(AppComponentSet::default());
     };
     let Some(bytes) = ext.dictionary().get(&APP_COMPONENTS_COMPONENT_ID) else {

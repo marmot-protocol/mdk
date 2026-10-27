@@ -153,6 +153,24 @@ impl NostrKeyPackagePublication {
             created_at,
         ))
     }
+
+    /// Whether a prepared, signed `event` is exactly the event this
+    /// publication describes at the event's own `created_at`: same author,
+    /// kind, tags and content. Only such an event is ever sent, so one that
+    /// does not match, for example because an earlier build signed it under
+    /// rules this one no longer accepts, can never be published.
+    pub fn matches_prepared_event(
+        &self,
+        event: &NostrTransportEvent,
+    ) -> Result<bool, TransportAdapterError> {
+        let expected = self.to_event_at(event.created_at)?;
+        Ok(event.sig.is_some()
+            && event.pubkey == expected.pubkey
+            && event.kind == expected.kind
+            && event.tags == expected.tags
+            && event.content == expected.content
+            && event.created_at == expected.created_at)
+    }
 }
 
 #[derive(Clone)]
@@ -197,14 +215,7 @@ impl NostrKeyPackagePublisher {
         publication: &NostrKeyPackagePublication,
         event: &NostrTransportEvent,
     ) -> Result<NostrPublishOutcome, TransportAdapterError> {
-        let expected = publication.to_event_at(event.created_at)?;
-        if event.sig.is_none()
-            || event.pubkey != expected.pubkey
-            || event.kind != expected.kind
-            || event.tags != expected.tags
-            || event.content != expected.content
-            || event.created_at != expected.created_at
-        {
+        if !publication.matches_prepared_event(event)? {
             return Err(TransportAdapterError::Publish(
                 "prepared KeyPackage event does not match publication".into(),
             ));

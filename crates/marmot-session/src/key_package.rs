@@ -29,11 +29,17 @@ pub struct KeyPackagePublishReceipt {
 /// its private bundle remain durable in either case until acknowledgement or
 /// MLS lifetime expiry; this bit only distinguishes safe regeneration before
 /// exposure from an ambiguous publication that must retry identical bytes.
+///
+/// `artifact_unusable` means the publisher will never send these signed
+/// bytes, for example because they were signed by an earlier build under rules
+/// this one no longer accepts. Retrying them cannot succeed, so the runtime
+/// replaces the KeyPackage with a freshly signed one instead (mdk#2628, D8).
 #[derive(Debug, thiserror::Error)]
 #[error("key package publication failed: {message}")]
 pub struct KeyPackagePublishError {
     pub message: String,
     pub externally_exposed: bool,
+    pub artifact_unusable: bool,
 }
 
 impl KeyPackagePublishError {
@@ -42,6 +48,7 @@ impl KeyPackagePublishError {
         Self {
             message: message.into(),
             externally_exposed: false,
+            artifact_unusable: false,
         }
     }
 
@@ -51,6 +58,17 @@ impl KeyPackagePublishError {
         Self {
             message: message.into(),
             externally_exposed: true,
+            artifact_unusable: false,
+        }
+    }
+
+    /// The publisher refused the signed artifact before sending it and will
+    /// refuse it on every retry.
+    pub fn unusable_artifact(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            externally_exposed: false,
+            artifact_unusable: true,
         }
     }
 }

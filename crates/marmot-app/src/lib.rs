@@ -8131,8 +8131,9 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         // A retry belongs to its durable signed artifact, not the current host
         // config. An artifact whose tag the shared reader rejects no longer
         // matches its publication, so it is never resent. One signed before
-        // names were bounded with a name over 64 bytes therefore retries
-        // until it expires; re-signing it belongs to mdk#2628 item 1.2 (D8).
+        // names were bounded with a name over 64 bytes is such an artifact:
+        // it is reported unusable, and the runtime replaces it with a freshly
+        // signed KeyPackage (mdk#2628, D8).
         nostr_publication.client_name =
             transport_nostr_adapter::key_package_client_name(&event).map(str::to_owned);
         if event.id != hex::encode(artifact.id.as_slice())
@@ -8140,6 +8141,14 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         {
             return Err(KeyPackagePublishError::unexposed(
                 "persisted KeyPackage event identity does not match lifecycle record",
+            ));
+        }
+        if !nostr_publication
+            .matches_prepared_event(&event)
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?
+        {
+            return Err(KeyPackagePublishError::unusable_artifact(
+                "persisted KeyPackage event no longer matches its publication",
             ));
         }
         let relay_client = self.app.relay_client_for_account_id(

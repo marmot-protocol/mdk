@@ -940,6 +940,7 @@ mod tests {
             replaced_at: Timestamp(1),
             consumed: false,
             authored_event_id: None,
+            awaiting_confirmed_replacement: false,
         }];
 
         assert_eq!(

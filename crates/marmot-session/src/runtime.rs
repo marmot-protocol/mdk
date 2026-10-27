@@ -66,8 +66,16 @@ use crate::time::{
 const TRACE_TARGET: &str = "marmot_session::runtime";
 const WELCOME_PUBLISH_CONCURRENCY: usize = 8;
 const KEY_PACKAGE_MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
-const KEY_PACKAGE_REFRESH_MIN_LEAD_SECS: u64 = 14 * 24 * 60 * 60;
-const KEY_PACKAGE_REFRESH_MAX_LEAD_SECS: u64 = 21 * 24 * 60 * 60;
+/// A device republishes its KeyPackage slot at least weekly while it runs, so
+/// an inviter can tell a device that still exists from one that was
+/// uninstalled (`foundation/key-packages.md`, "Refreshing a slot"). Each
+/// refresh falls due a sampled interval after publication, which spreads
+/// devices that published together across a day.
+const KEY_PACKAGE_REFRESH_MIN_SECS: u64 = 6 * 24 * 60 * 60;
+const KEY_PACKAGE_REFRESH_MAX_SECS: u64 = 7 * 24 * 60 * 60;
+/// `last_failure_code` of a pending replacement whose signed bytes the
+/// publisher refused as unusable.
+const KEY_PACKAGE_ARTIFACT_UNUSABLE: &str = "artifact_unusable";
 const MAINTENANCE_EOSE_TIMEOUT_SECS: u64 = 5 * 60;
 const MAINTENANCE_POST_EOSE_GRACE_SECS: u64 = 15;
 const MAINTENANCE_QUIET_SECS: u64 = 60;
@@ -935,7 +943,15 @@ where
             .into());
         }
         let now = self.wall_clock.now();
-        if let Some(fallback_reason) = current_key_package_republish_blocker(&lifecycle, now) {
+        let fallback_reason =
+            current_key_package_republish_blocker(&lifecycle, now).or_else(|| {
+                lifecycle
+                    .current_key_package
+                    .as_ref()
+                    .is_some_and(|current| !self.advertises_current_capabilities(current))
+                    .then_some("advertised_capabilities_changed")
+            });
+        if let Some(fallback_reason) = fallback_reason {
             tracing::debug!(
                 target: TRACE_TARGET,
                 method = "republish_key_package",
@@ -1026,6 +1042,10 @@ where
                 self.session.put_key_package_lifecycle(&lifecycle)?;
                 Ok(key_package)
             }
+            Err(error) if error.artifact_unusable => {
+                self.replace_unusable_current_artifact(&mut lifecycle)?;
+                self.publish_fresh_key_package().await
+            }
             Err(error) => {
                 note_key_package_attempt(
                     &mut lifecycle.publication_targets,
@@ -1045,6 +1065,24 @@ where
         }
     }
 
+    /// The publisher refused the current signed event as unusable, so it is
+    /// never resent. Make the current KeyPackage due for replacement now; the
+    /// replacement is a freshly signed event in the same slot (D8).
+    fn replace_unusable_current_artifact(
+        &mut self,
+        lifecycle: &mut KeyPackageLifecycleState,
+    ) -> AccountResult<()> {
+        tracing::info!(
+            target: TRACE_TARGET,
+            method = "replace_unusable_current_artifact",
+            "replacing a current key package the publisher can no longer send"
+        );
+        lifecycle.refresh_at = Some(self.wall_clock.now());
+        lifecycle.phase = cgka_traits::MaintenancePhase::Retry;
+        self.session.put_key_package_lifecycle(lifecycle)?;
+        Ok(())
+    }
+
     /// Stage the exact next KeyPackage and authored publication bytes without
     /// performing any network I/O.
     ///
@@ -1055,6 +1093,17 @@ where
     pub async fn prepare_fresh_key_package(
         &mut self,
         endpoints: Vec<TransportEndpoint>,
+    ) -> AccountResult<KeyPackage> {
+        self.prepare_key_package_replacement(endpoints, false).await
+    }
+
+    /// [`Self::prepare_fresh_key_package`]. With `supersede_pending`, a
+    /// pending replacement is superseded by a newly generated one even when
+    /// its generator revision is current.
+    async fn prepare_key_package_replacement(
+        &mut self,
+        endpoints: Vec<TransportEndpoint>,
+        supersede_pending: bool,
     ) -> AccountResult<KeyPackage> {
         tracing::debug!(
             target: TRACE_TARGET,
@@ -1102,10 +1151,11 @@ where
             .into());
         }
 
-        if lifecycle
-            .pending_replacement
-            .as_ref()
-            .is_none_or(|pending| pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION)
+        if supersede_pending
+            || lifecycle
+                .pending_replacement
+                .as_ref()
+                .is_none_or(|pending| pending.generation_revision < KEY_PACKAGE_GENERATION_REVISION)
         {
             let created_at = Timestamp(
                 lifecycle
@@ -1127,14 +1177,13 @@ where
                 self.session.put_key_package_lifecycle(&lifecycle)?;
                 return Err(AccountError::ClockSkewBlocked);
             }
-            let lead = self.maintenance_random.sample_inclusive(
-                KEY_PACKAGE_REFRESH_MIN_LEAD_SECS,
-                KEY_PACKAGE_REFRESH_MAX_LEAD_SECS,
-            );
+            let refresh_after = self
+                .maintenance_random
+                .sample_inclusive(KEY_PACKAGE_REFRESH_MIN_SECS, KEY_PACKAGE_REFRESH_MAX_SECS);
             self.session.stage_key_package_replacement(
                 &mut lifecycle,
                 created_at,
-                lead,
+                refresh_after,
                 endpoints
                     .into_iter()
                     .map(|endpoint| TransportFanoutTarget {
@@ -1194,63 +1243,86 @@ where
             "publishing fresh key package"
         );
         let endpoints = self.routing.key_package_endpoints().to_vec();
-        self.prepare_fresh_key_package(endpoints).await?;
-        let mut lifecycle = self
-            .session
-            .key_package_lifecycle()?
-            .expect("prepared lifecycle is durable");
-        // Promotion clears the marker, so move an old record's marker first.
-        lifecycle.migrate_legacy_consumption_marker();
+        let mut supersede_pending = false;
+        let (mut lifecycle, artifact, publication, receipt) = loop {
+            self.prepare_key_package_replacement(endpoints.clone(), supersede_pending)
+                .await?;
+            let mut lifecycle = self
+                .session
+                .key_package_lifecycle()?
+                .expect("prepared lifecycle is durable");
+            // Promotion clears the marker, so move an old record's marker first.
+            lifecycle.migrate_legacy_consumption_marker();
 
-        let pending = lifecycle
-            .pending_replacement
-            .as_ref()
-            .expect("pending replacement exists");
-        let artifact = pending
-            .signed_event
-            .as_ref()
-            .expect("prepared replacement has an exact signed event")
-            .clone();
-        let publication = KeyPackagePublication {
-            account_id: self.session.self_id().clone(),
-            key_package: pending.key_package.clone(),
-            slot_id: lifecycle.stable_slot_id.clone(),
-            created_at: artifact.created_at,
-            endpoints: pending
-                .targets
-                .iter()
-                .map(|target| target.endpoint.clone())
-                .collect(),
-        };
-        let receipt = match self
-            .key_packages
-            .publish_prepared_key_package(&publication, &artifact)
-            .await
-        {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                if let Some(pending) = lifecycle.pending_replacement.as_mut() {
-                    pending.attempt_count = pending.attempt_count.saturating_add(1);
-                    pending.last_failure_code = Some(
-                        if error.externally_exposed {
-                            "ambiguous_exposure"
-                        } else {
-                            "publish_failed"
-                        }
-                        .into(),
-                    );
-                    note_key_package_attempt(
-                        &mut pending.targets,
-                        &publication.endpoints,
-                        &[],
-                        &[],
-                        self.wall_clock.now(),
-                    );
-                }
-                lifecycle.phase = cgka_traits::MaintenancePhase::Retry;
-                self.session.put_key_package_lifecycle(&lifecycle)?;
-                return Err(error.into());
+            let pending = lifecycle
+                .pending_replacement
+                .as_ref()
+                .expect("pending replacement exists");
+            let artifact = pending
+                .signed_event
+                .as_ref()
+                .expect("prepared replacement has an exact signed event")
+                .clone();
+            let refused_before =
+                pending.last_failure_code.as_deref() == Some(KEY_PACKAGE_ARTIFACT_UNUSABLE);
+            let publication = KeyPackagePublication {
+                account_id: self.session.self_id().clone(),
+                key_package: pending.key_package.clone(),
+                slot_id: lifecycle.stable_slot_id.clone(),
+                created_at: artifact.created_at,
+                endpoints: pending
+                    .targets
+                    .iter()
+                    .map(|target| target.endpoint.clone())
+                    .collect(),
+            };
+            let error = match self
+                .key_packages
+                .publish_prepared_key_package(&publication, &artifact)
+                .await
+            {
+                Ok(receipt) => break (lifecycle, artifact, publication, receipt),
+                Err(error) => error,
+            };
+            // The publisher will never send these signed bytes, for example
+            // because an earlier build signed them under rules this one no
+            // longer accepts (D8). Supersede the replacement with one signed
+            // now; the old one stays retained with its event id, since an
+            // earlier build may have sent it. Bytes this build signed and the
+            // publisher still refuses are not superseded again, so a publisher
+            // that refuses its own artifacts cannot mint a bundle per attempt.
+            if error.artifact_unusable && !supersede_pending && !refused_before {
+                tracing::info!(
+                    target: TRACE_TARGET,
+                    method = "publish_fresh_key_package",
+                    "superseding a key package replacement the publisher can no longer send"
+                );
+                supersede_pending = true;
+                continue;
             }
+            if let Some(pending) = lifecycle.pending_replacement.as_mut() {
+                pending.attempt_count = pending.attempt_count.saturating_add(1);
+                pending.last_failure_code = Some(
+                    if error.artifact_unusable {
+                        KEY_PACKAGE_ARTIFACT_UNUSABLE
+                    } else if error.externally_exposed {
+                        "ambiguous_exposure"
+                    } else {
+                        "publish_failed"
+                    }
+                    .into(),
+                );
+                note_key_package_attempt(
+                    &mut pending.targets,
+                    &publication.endpoints,
+                    &[],
+                    &[],
+                    self.wall_clock.now(),
+                );
+            }
+            lifecycle.phase = cgka_traits::MaintenancePhase::Retry;
+            self.session.put_key_package_lifecycle(&lifecycle)?;
+            return Err(error.into());
         };
         if receipt.accepted.is_empty() {
             if let Some(pending) = lifecycle.pending_replacement.as_mut() {
@@ -1285,9 +1357,17 @@ where
         );
         let previous_was_consumed = lifecycle.current_key_package_ref.is_some()
             && lifecycle.current_key_package_ref == lifecycle.last_consumed_key_package_ref;
-        // Inviters may still hold the replaced publication, so its private
-        // material outlives the replacement; a consumed package only for
-        // CONSUMED_KEY_PACKAGE_RETENTION_SECS (mdk#2344).
+        // Inviters may still hold a replaced publication, so its private
+        // material outlives this confirmed replacement by the grace period,
+        // consumed or not (mdk#2344). That includes pending replacements
+        // superseded before any was confirmed.
+        let confirmed_at = self.wall_clock.now();
+        for material in &mut lifecycle.retained_private_material {
+            if material.awaiting_confirmed_replacement {
+                material.awaiting_confirmed_replacement = false;
+                material.replaced_at = confirmed_at;
+            }
+        }
         let mut retired = Vec::new();
         if let Some(key_package) = lifecycle.current_key_package.clone() {
             match (
@@ -1300,9 +1380,10 @@ where
                         key_package,
                         key_package_ref,
                         not_after,
-                        replaced_at: self.wall_clock.now(),
+                        replaced_at: confirmed_at,
                         consumed: previous_was_consumed,
                         authored_event_id: lifecycle.authored_event_id.clone(),
+                        awaiting_confirmed_replacement: false,
                     }),
                 // Without a lifetime there is no deletion bound to retain it
                 // under.
@@ -1386,15 +1467,38 @@ where
                             .any(|target| key_package_target_retry_due(target, now))
                 }
                 None => {
-                    lifecycle.current_key_package.is_none()
-                        || lifecycle.last_consumed_key_package_ref
-                            == lifecycle.current_key_package_ref
-                        || lifecycle.refresh_at.is_some_and(|deadline| deadline <= now)
-                        || !lifecycle.upgrade_rotation_recorded
-                        || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION
+                    lifecycle.last_consumed_key_package_ref == lifecycle.current_key_package_ref
+                        || self.current_key_package_replacement_due(&lifecycle, now)
                 }
             },
         })
+    }
+
+    /// Whether the current KeyPackage is due for replacement for any reason
+    /// other than a Welcome consuming it: there is none, its weekly refresh
+    /// is due, the generator policy changed, or the capabilities this client
+    /// supports changed (`foundation/key-packages.md`, "Refreshing a slot").
+    fn current_key_package_replacement_due(
+        &self,
+        lifecycle: &KeyPackageLifecycleState,
+        now: Timestamp,
+    ) -> bool {
+        let Some(current) = lifecycle.current_key_package.as_ref() else {
+            return true;
+        };
+        key_package_refresh_due(lifecycle, now)
+            || !lifecycle.upgrade_rotation_recorded
+            || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION
+            || !self.advertises_current_capabilities(current)
+    }
+
+    /// Whether `key_package` advertises what one built now would. A package
+    /// this device cannot read is left to the other replacement triggers, so
+    /// it cannot cause a replacement on every maintenance tick.
+    fn advertises_current_capabilities(&self, key_package: &KeyPackage) -> bool {
+        self.session
+            .key_package_advertises_current_capabilities(key_package)
+            .unwrap_or(true)
     }
 
     pub fn key_package_has_pending_fanout(&self) -> AccountResult<bool> {
@@ -1472,6 +1576,20 @@ where
                 self.session.put_key_package_lifecycle(&lifecycle)?;
                 Ok(())
             }
+            Err(error) if error.artifact_unusable => {
+                // Back off as for any failure: while maintenance is paused no
+                // replacement is staged, so this would otherwise repeat every
+                // tick.
+                note_key_package_attempt(
+                    &mut lifecycle.publication_targets,
+                    &publication.endpoints,
+                    &[],
+                    &[],
+                    self.wall_clock.now(),
+                );
+                self.replace_unusable_current_artifact(&mut lifecycle)?;
+                Err(error.into())
+            }
             Err(error) => {
                 note_key_package_attempt(
                     &mut lifecycle.publication_targets,
@@ -1494,10 +1612,7 @@ where
             Some(lifecycle) => {
                 lifecycle.pending_replacement.is_none()
                     && lifecycle.last_consumed_key_package_ref != lifecycle.current_key_package_ref
-                    && (lifecycle.current_key_package.is_none()
-                        || lifecycle.refresh_at.is_some_and(|deadline| deadline <= now)
-                        || !lifecycle.upgrade_rotation_recorded
-                        || lifecycle.generation_revision < KEY_PACKAGE_GENERATION_REVISION)
+                    && self.current_key_package_replacement_due(&lifecycle, now)
             }
         })
     }
@@ -6179,6 +6294,19 @@ fn apply_report_to_fanout(
             );
         }
     }
+}
+
+/// The weekly refresh: due at the sampled `refresh_at`, and never later than
+/// [`KEY_PACKAGE_REFRESH_MAX_SECS`] after publication. The second bound also
+/// covers a record whose `refresh_at` was scheduled under the earlier 84-day
+/// lifetime.
+fn key_package_refresh_due(lifecycle: &KeyPackageLifecycleState, now: Timestamp) -> bool {
+    lifecycle.refresh_at.is_some_and(|deadline| deadline <= now)
+        || lifecycle
+            .authored_event_created_at
+            .is_some_and(|published| {
+                published.0.saturating_add(KEY_PACKAGE_REFRESH_MAX_SECS) <= now.0
+            })
 }
 
 fn current_key_package_republish_blocker(

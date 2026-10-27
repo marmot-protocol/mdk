@@ -615,15 +615,24 @@ impl AccountDeviceSession {
         &mut self,
         state: &mut KeyPackageLifecycleState,
         authored_created_at: cgka_traits::Timestamp,
-        refresh_lead_secs: u64,
+        refresh_after_secs: u64,
         targets: Vec<TransportFanoutTarget>,
     ) -> SessionResult<KeyPackage> {
         Ok(self.engine.stage_key_package_replacement(
             state,
             authored_created_at,
-            refresh_lead_secs,
+            refresh_after_secs,
             targets,
         )?)
+    }
+
+    pub fn key_package_advertises_current_capabilities(
+        &self,
+        key_package: &KeyPackage,
+    ) -> SessionResult<bool> {
+        Ok(self
+            .engine
+            .key_package_advertises_current_capabilities(key_package)?)
     }
 
     pub fn promote_key_package_lifecycle(

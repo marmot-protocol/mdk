@@ -2563,6 +2563,28 @@ async fn create_group_rejects_expired_invitee_keypackage() {
 }
 
 #[tokio::test]
+async fn fresh_key_package_lasts_thirty_days_and_invitees_may_last_eighty_four() {
+    let mut bob = build_client(b"bob", selfremove_registry());
+    // The publishing target: 30 days plus an hour of clock-skew margin
+    // (foundation/key-packages.md, "Refreshing a slot").
+    let published = key_package_metadata(&bob.fresh_key_package().await.unwrap()).unwrap();
+    assert_eq!(published.not_after - published.not_before, 2_595_600);
+
+    // A receiver keeps the 84-day validity limit, so a longer range from
+    // another client still validates.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let longest = key_package_with_account_identity_proof_and_lifetime(
+        b"carol-84-days",
+        Lifetime::init(now - 3_600, now - 3_600 + 7_261_200),
+    );
+    let accepted = key_package_metadata(&longest).expect("a KeyPackage at the validity limit");
+    assert_eq!(accepted.not_after - accepted.not_before, 7_261_200);
+}
+
+#[tokio::test]
 async fn create_group_rejects_invitee_keypackage_with_excessive_lifetime_range() {
     let mut alice = build_client(b"alice", selfremove_registry());
     let now = std::time::SystemTime::now()

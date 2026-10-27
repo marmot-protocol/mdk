@@ -158,14 +158,17 @@ async fn signed_retry_reads_its_client_tag_through_the_shared_reader() {
     // name are ignored on read, so that artifact no longer matches either.
     let mut never_written = unreadable_client_tags("whitenoise");
     never_written.push(vec![client_tag(&["whitenoise", "31990:abc:app"])]);
+    // Such an artifact is unusable rather than retryable, so the runtime
+    // re-signs it instead of retrying it until it expires (D8).
     for tags in never_written {
         let artifact = artifact_with_client_tags(&keys, &prepared, tags.clone());
         let attempts = relay.attempted_events().len();
+        let error = publisher
+            .publish_prepared_key_package(&publication, &artifact)
+            .await
+            .expect_err(&format!("{tags:?}"));
         assert!(
-            publisher
-                .publish_prepared_key_package(&publication, &artifact)
-                .await
-                .is_err(),
+            error.artifact_unusable && !error.externally_exposed,
             "{tags:?}"
         );
         assert_eq!(relay.attempted_events().len(), attempts, "{tags:?}");

@@ -88,8 +88,8 @@ pub use ingest::{
     LocalIngestState, PeeledContent, PeeledMessage, ProposalRejectionCategory, StaleReason,
 };
 pub use maintenance::{
-    CONSUMED_KEY_PACKAGE_RETENTION_SECS, DurableGroupEvolution, DurableTransportFanout,
-    GroupEvolutionPhase, GroupEvolutionSemantic, GroupMaintenanceState, GroupMaintenanceStatus,
+    DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic,
+    GroupMaintenanceState, GroupMaintenanceStatus, KEY_PACKAGE_REPLACEMENT_GRACE_SECS,
     KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase, MaintenanceRandom,
     MaintenanceRunSummary, MaintenanceTrigger, MonotonicClock, PendingKeyPackageReplacement,
     PeriodicMaintenancePolicy, PostJoinHistoryFetch, PostJoinHistoryFetchCompletion,
