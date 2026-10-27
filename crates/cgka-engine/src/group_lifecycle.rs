@@ -900,12 +900,7 @@ impl<S: StorageProvider> Engine<S> {
             }
             match self.do_join_welcome(welcome).await {
                 Ok(_) => joined = true,
-                // An offer stored before deliveries were checked against
-                // this device's KeyPackages may be another device's.
-                Err(error)
-                    if terminal_welcome_error(&error)
-                        || matches!(error, EngineError::WelcomeNotAddressedToThisDevice) =>
-                {
+                Err(error) if terminal_welcome_error(&error) => {
                     self.storage.take_welcome(&candidate.message_id)?;
                 }
                 Err(_) => {
@@ -1174,11 +1169,27 @@ impl<S: StorageProvider> Engine<S> {
                 (Some(_), Some(maintenance)) => maintenance.key_package_lifecycle()?,
                 _ => None,
             };
-            let consumed_key_package_ref = welcome_key_package_of_this_device(
+            let consumed_key_package_ref = match welcome_key_package_of_this_device(
                 lifecycle.as_ref(),
                 key_package_claim.as_ref(),
-                consumed_key_package_ref,
-            )?;
+                consumed_key_package_ref.clone(),
+            ) {
+                // An offer this device already holds passed this check when
+                // it arrived, or was stored before deliveries were checked,
+                // when the MLS match alone decided. Such an offer may wrap
+                // this device's own Welcome in another device's delivery,
+                // and this device's own copy has usually passed the transport
+                // cursor, so the MLS match decides it still.
+                Err(EngineError::WelcomeNotAddressedToThisDevice)
+                    if storage
+                        .list_welcomes()?
+                        .iter()
+                        .any(|offer| offer.message_id == welcome_id) =>
+                {
+                    consumed_key_package_ref.ok_or(EngineError::MissingWelcomeKeyPackage)?
+                }
+                decided => decided?,
+            };
             let processed = openmls::group::ProcessedWelcome::new_from_welcome(
                 &provider,
                 &join_config,

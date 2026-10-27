@@ -81,7 +81,9 @@
   it records no failed join, never becomes a rejoin offer, and leaves the
   device's KeyPackages as they were, and analytics count it as a duplicate.
   Before, a device already in a group recorded the Welcome for a sibling device
-  added later as a failed join. KeyPackage lifecycle records now keep the
+  added later as a failed join. A rejoin offer stored by an earlier release
+  is still decided by its MLS Welcome alone, so one stored under a sibling's
+  delivery stays confirmable. KeyPackage lifecycle records now keep the
   publication id of each replaced KeyPackage. Packages replaced before this
   release have none, so a Welcome that opens with one of them still joins.
 

@@ -9,6 +9,20 @@ fn nostr_device_session(
     key: &SqlCipherKey,
     account: &[u8],
 ) -> AccountDeviceSession {
+    nostr_device_session_with_peeler(path, key, account, Box::new(nostr_peeler(account)))
+}
+
+fn nostr_peeler(account: &[u8]) -> transport_nostr_peeler::NostrMlsPeeler {
+    transport_nostr_peeler::NostrMlsPeeler::new()
+        .with_welcome_signer(deterministic_nostr_keys(account))
+}
+
+fn nostr_device_session_with_peeler(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    account: &[u8],
+    peeler: Box<dyn TransportPeeler>,
+) -> AccountDeviceSession {
     use cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID;
     let keys = deterministic_nostr_keys(account);
     let mut components = default_group_components();
@@ -18,9 +32,7 @@ fn nostr_device_session(
             path,
             SqlCipherKey::new(key.as_secret_str()).unwrap(),
             pad32(account),
-            Box::new(
-                transport_nostr_peeler::NostrMlsPeeler::new().with_welcome_signer(keys.clone()),
-            ),
+            peeler,
         )
         .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner { keys }))
         .protocol_profile(ProtocolProfile::Current)
@@ -51,18 +63,38 @@ struct Device {
 
 impl Device {
     async fn open(path: std::path::PathBuf, key: &SqlCipherKey, account: &[u8]) -> Self {
-        let mut device = Self {
+        let mut device = Self::with_session(
+            nostr_device_session(path, key, account),
+            cgka_traits::engine::KeyPackage::new(Vec::new()),
+        );
+        device.publish().await;
+        device
+    }
+
+    fn with_session(
+        session: AccountDeviceSession,
+        key_package: cgka_traits::engine::KeyPackage,
+    ) -> Self {
+        Self {
             runtime: AccountDeviceRuntime::new(
-                nostr_device_session(path, key, account),
+                session,
                 RecordingAdapter::default(),
                 StaticTransportRouting::new(vec![])
                     .key_package_endpoints(vec![TransportEndpoint("wss://keys.example".into())]),
                 RecordingKeyPackages::default(),
             ),
-            key_package: cgka_traits::engine::KeyPackage::new(Vec::new()),
-        };
-        device.publish().await;
-        device
+            key_package,
+        }
+    }
+
+    /// Close the device and open its database again, as after an app update.
+    fn reopen(self, path: std::path::PathBuf, key: &SqlCipherKey, account: &[u8]) -> Self {
+        let Self {
+            runtime,
+            key_package,
+        } = self;
+        drop(runtime);
+        Self::with_session(nostr_device_session(path, key, account), key_package)
     }
 
     async fn publish(&mut self) {
@@ -279,6 +311,49 @@ fn assert_only_consumed(
     after.last_consumed_at = before.last_consumed_at;
     after.last_consumed_key_package_ref = before.last_consumed_key_package_ref.clone();
     assert_eq!(&after, before);
+}
+
+/// Peels as releases before this check did: the rumor's KeyPackage claim never
+/// reached the engine.
+struct ClaimlessPeeler(transport_nostr_peeler::NostrMlsPeeler);
+
+#[async_trait]
+impl TransportPeeler for ClaimlessPeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<PeeledMessage, PeelerError> {
+        self.0.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
+        let mut peeled = self.0.peel_welcome(msg).await?;
+        if let PeeledContent::Welcome {
+            key_package_event_id,
+            ..
+        } = &mut peeled.content
+        {
+            *key_package_event_id = None;
+        }
+        Ok(peeled)
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.0.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.0.wrap_welcome(payload, recipient).await
+    }
 }
 
 /// Bob, and two devices of Alice's account that have each published a
@@ -578,6 +653,115 @@ async fn a_welcome_naming_a_superseded_key_package_still_joins() {
             .retained_private_material
             .iter()
             .any(|material| material.key_package.bytes == fetched.bytes && material.consumed)
+    );
+}
+
+/// The phone holds a group Bob has since removed Alice from, and Bob's next
+/// Commit adds the phone's new KeyPackage and the laptop. The phone runs a
+/// release from before deliveries were checked against its KeyPackages.
+/// Returns the phone, the group, and the rumors to the phone and to the
+/// laptop.
+async fn rejoin_before_the_upgrade(
+    dir: &tempfile::TempDir,
+    key: &SqlCipherKey,
+) -> (
+    Device,
+    GroupId,
+    TransportMessage,
+    TransportMessage,
+) {
+    let path = dir.path().join("alice-phone.sqlite");
+    let mut phone = Device::with_session(
+        nostr_device_session_with_peeler(
+            path,
+            key,
+            b"alice",
+            Box::new(ClaimlessPeeler(nostr_peeler(b"alice"))),
+        ),
+        cgka_traits::engine::KeyPackage::new(Vec::new()),
+    );
+    phone.publish().await;
+    let laptop = Device::open(dir.path().join("alice-laptop.sqlite"), key, b"alice").await;
+    let mut bob = nostr_device_session(dir.path().join("bob.sqlite"), key, b"bob");
+    let (group_id, welcomes) = create_group(&mut bob, &[&phone.key_package], "upgrade").await;
+    let [to_phone] = &rumors_for(&welcomes, b"alice", &[&phone.key_package]).await[..] else {
+        unreachable!()
+    };
+    assert_eq!(
+        phone.ingest(to_phone).await.outcome,
+        cgka_traits::IngestOutcome::Processed
+    );
+    evolve(
+        &mut bob,
+        SendIntent::RemoveMembers {
+            group_id: group_id.clone(),
+            members: vec![phone.runtime.session().self_id()],
+        },
+    )
+    .await;
+    phone.publish().await;
+    let welcomes = evolve(
+        &mut bob,
+        SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![phone.key_package.clone(), laptop.key_package.clone()],
+            initial_admins: Vec::new(),
+        },
+    )
+    .await;
+    let [to_phone, to_laptop] = &rumors_for(
+        &welcomes,
+        b"alice",
+        &[&phone.key_package, &laptop.key_package],
+    )
+    .await[..]
+    else {
+        unreachable!()
+    };
+    (phone, group_id, to_phone.clone(), to_laptop.clone())
+}
+
+fn rejoin_required() -> cgka_traits::IngestOutcome {
+    cgka_traits::IngestOutcome::LocalState {
+        state: cgka_traits::LocalIngestState::RejoinConfirmationRequired,
+    }
+}
+
+#[tokio::test]
+async fn an_offer_stored_before_the_upgrade_under_a_siblings_rumor_still_rejoins() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("multi-device upgrade offer").unwrap();
+    let (mut phone, group_id, to_phone, to_laptop) = rejoin_before_the_upgrade(&dir, &key).await;
+    // The old release offers the laptop's rumor, which also opens with the
+    // phone's KeyPackage, and keeps that first copy when the phone's own
+    // rumor arrives.
+    let results = phone.ingest_all(&[&to_laptop, &to_phone]).await;
+    assert_eq!(
+        outcomes(&results),
+        vec![rejoin_required(), rejoin_required()]
+    );
+    assert_eq!(phone.rejoin_offers(&group_id), vec![to_laptop.id.clone()]);
+
+    // After the update the stored offer is still the phone's to confirm: its
+    // Welcome opens with the phone's own KeyPackage, and the phone's own
+    // rumor is long past the transport cursor.
+    let mut phone = phone.reopen(dir.path().join("alice-phone.sqlite"), &key, b"alice");
+    assert_eq!(phone.ingest(&to_phone).await.outcome, rejoin_required());
+    assert_eq!(phone.rejoin_offers(&group_id), vec![to_laptop.id.clone()]);
+    let offer = phone
+        .runtime
+        .pending_group_rejoins_for(&group_id)
+        .unwrap()
+        .remove(0);
+    let joined = phone
+        .runtime
+        .confirm_group_rejoin(&offer.message_id, &offer.rejoin.unwrap().local_state_token)
+        .await
+        .unwrap();
+    assert_eq!(joined, group_id);
+    assert_eq!(
+        phone.lifecycle().last_consumed_key_package_ref,
+        Some(key_package_ref(&phone.key_package))
     );
 }
 
