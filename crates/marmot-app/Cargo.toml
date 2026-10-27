@@ -7,6 +7,8 @@ publish.workspace = true
 
 [features]
 default = []
+# Local-only bounded incident capture; never enabled in ordinary artifacts.
+incident-send-trace = []
 product-analytics-export = []
 # Test-only convergence timing/rewind overrides. Never enable in app artifacts.
 test-policy-overrides = [

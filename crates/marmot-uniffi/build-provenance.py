@@ -32,6 +32,7 @@ def feature_set():
     return {
         "otlp_export": enabled("OTLP_EXPORT"),
         "product_analytics_export": enabled("PRODUCT_ANALYTICS_EXPORT"),
+        "incident_send_trace": enabled("INCIDENT_SEND_TRACE"),
     }
 
 

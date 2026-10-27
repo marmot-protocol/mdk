@@ -403,6 +403,7 @@ class AndroidArtifactTests(unittest.TestCase):
         write_executable(tools / "zip", ZIP_SHIM)
         env = os.environ.copy()
         env["PATH"] = f"{tools}:{env['PATH']}"
+        env.pop("INCIDENT_SEND_TRACE", None)
 
         accepted = good_libraries()
         rejected = dict(accepted)
@@ -416,6 +417,7 @@ class AndroidArtifactTests(unittest.TestCase):
         archive = next((release_ok.directory / "dist").glob("*.zip"))
         report = json.loads(unzip_text(archive, "marmotkit-android-0.10.4/android-elf.json"))
         manifest = json.loads(unzip_text(archive, "marmotkit-android-0.10.4/manifest.json"))
+        self.assertEqual(manifest["features"], ["otlp-export", "product-analytics-export"])
         self.assertEqual(manifest["elf_validation"], "android-elf.json")
         self.assertEqual(manifest["contents"], [
             "kotlin/dev/ipf/marmotkit/marmot_uniffi.kt",
@@ -426,6 +428,14 @@ class AndroidArtifactTests(unittest.TestCase):
         ])
         self.assertTrue(all(min(entry["load_alignments"]) >= 16384
                             for key, entry in report["libraries"].items() if "arm64" in key or "x86_64" in key))
+
+        diagnostic = self.assemble_release(release_script, env | {"INCIDENT_SEND_TRACE": "1"}, accepted)
+        self.assertEqual(diagnostic.returncode, 0, diagnostic.stdout + diagnostic.stderr)
+        diagnostic_archive = next((diagnostic.directory / "dist").glob("*.zip"))
+        diagnostic_manifest = json.loads(unzip_text(diagnostic_archive, "marmotkit-android-0.10.4/manifest.json"))
+        self.assertEqual(diagnostic_manifest["features"], [
+            "incident-send-trace", "otlp-export", "product-analytics-export",
+        ])
 
         release_bad = self.assemble_release(release_script, env, rejected)
         self.assertNotEqual(release_bad.returncode, 0, release_bad.stdout + release_bad.stderr)

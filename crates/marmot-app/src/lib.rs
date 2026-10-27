@@ -90,6 +90,8 @@ mod chat_presentation;
 mod client;
 mod config;
 mod deployment;
+#[cfg(feature = "incident-send-trace")]
+mod incident_send_trace;
 pub use deployment::{
     KeyPackageClientPreference, MarmotDeployment, NEUTRAL_KEYCHAIN_SERVICE_NAME,
     OpenRankingProvider,
@@ -508,6 +510,8 @@ fn media_close_key(label: &str) -> String {
 
 #[derive(Clone)]
 pub struct MarmotApp {
+    #[cfg(feature = "incident-send-trace")]
+    incident_trace: Arc<incident_send_trace::Trace>,
     block_list_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     moderation_reports: Arc<moderation_reports::ModerationReportState>,
     pub(crate) block_list_updates: Arc<tokio::sync::watch::Sender<u64>>,
@@ -1598,6 +1602,8 @@ impl MarmotApp {
         );
         Self {
             account_home: AccountHome::open(&root),
+            #[cfg(feature = "incident-send-trace")]
+            incident_trace: Arc::new(incident_send_trace::Trace::new(&root)),
             root,
             root_runtime_lease: Arc::new(Mutex::new(None)),
             storage_closed: Arc::new(AtomicBool::new(false)),
@@ -1695,6 +1701,8 @@ impl MarmotApp {
         );
         Self {
             root: root.as_ref().to_path_buf(),
+            #[cfg(feature = "incident-send-trace")]
+            incident_trace: Arc::new(incident_send_trace::Trace::new(root.as_ref())),
             root_runtime_lease: Arc::new(Mutex::new(None)),
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
@@ -6396,6 +6404,8 @@ impl MarmotApp {
     /// Every database is attempted even if an earlier one fails; the first
     /// error is returned once all of them have been closed.
     pub fn close_storage(&self) -> Result<(), AppError> {
+        #[cfg(feature = "incident-send-trace")]
+        self.incident_trace.enable(false);
         let started_at = Instant::now();
         // Exclusive for the whole teardown. The `storage_closed` flag alone
         // would not make this atomic: two concurrent closes could interleave so

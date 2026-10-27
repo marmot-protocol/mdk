@@ -252,6 +252,27 @@ class BuildPhases(unittest.TestCase):
         self.assertIn("below 16 KB", result.stderr)
         self.assertNotIn("Done.", result.stdout)
 
+    def test_incident_tracing_is_not_part_of_normal_android_builds(self):
+        self.run_phase("kotlin-bindings.sh", "generate", INCIDENT_SEND_TRACE="0")
+        self.run_phase("kotlin-bindings.sh", "native", ANDROID_ABIS="arm64-v8a", INCIDENT_SEND_TRACE="0")
+        self.assertNotIn("incident-send-trace", json.dumps(self.commands()))
+
+    def test_incident_tracing_requires_build_only_before_any_compiler_runs(self):
+        result = self.run_phase("kotlin-bindings.sh", "generate", success=False,
+            INCIDENT_SEND_TRACE="1", MARMOTKIT_BUILD_ONLY="0")
+        self.assertIn("restricted to build-only", result.stderr)
+        self.assertEqual(self.commands(), [])
+
+    def test_incident_feature_matches_generator_and_native_builds(self):
+        self.run_phase("kotlin-bindings.sh", "generate",
+            INCIDENT_SEND_TRACE="1", MARMOTKIT_BUILD_ONLY="1")
+        self.run_phase("kotlin-bindings.sh", "native", ANDROID_ABIS="arm64-v8a",
+            INCIDENT_SEND_TRACE="1", MARMOTKIT_BUILD_ONLY="1")
+        commands = [c for c in self.commands() if c["tool"] == "cargo"]
+        self.assertEqual(len(commands), 3)
+        for command in commands:
+            self.assertIn("incident-send-trace", " ".join(command["args"]))
+
     def test_installed_target_survives_long_rustup_output(self):
         targets = "aarch64-linux-android " + "armv7-unknown-linux-gnueabihf " * 2048
         self.run_phase("kotlin-bindings.sh", "native", ANDROID_ABIS="arm64-v8a",
@@ -351,6 +372,38 @@ class BuildPhases(unittest.TestCase):
                 "MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi",
                 step,
             )
+
+    def test_incident_identity_rejects_publishing_and_nightly_runs(self):
+        self.shim(self.bin / "git")
+        (self.root / "Cargo.toml").write_text('version = "0.14.0"\n')
+        workflow = (TOOLS.parents[1] / ".github/workflows/bindings.yaml").read_text()
+        block = workflow.split("      - name: Resolve release identity\n", 1)[1]
+        script = textwrap.dedent(block.split("        run: |\n", 1)[1].split("\n  apple-build:", 1)[0])
+        for build_only, nightly, success in [
+                ("true", "", True), ("false", "", False),
+                ("true", "0.14.0-nightly.20261027", False)]:
+            with self.subTest(build_only=build_only, nightly=nightly):
+                result = subprocess.run(["bash", "-c", script], cwd=self.root,
+                    env=self.env | dict(GITHUB_EVENT_NAME="workflow_dispatch",
+                        GITHUB_REF="refs/heads/diagnostic", BUILD_ONLY=build_only,
+                        INCIDENT_SEND_TRACE="true", NIGHTLY_VERSION=nightly,
+                        REQUESTED_SHA="a" * 40, BUILDER_SHA="b" * 40,
+                        GITHUB_OUTPUT=str(self.root / "outputs")), capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
+                if not success:
+                    self.assertIn("non-publishing build-only", result.stderr)
+
+    def test_incident_feature_is_part_of_verified_android_provenance(self):
+        self.env["INCIDENT_SEND_TRACE"] = "1"
+        paths = self.record_inputs(["kotlin", "arm64-v8a", "armeabi-v7a", "x86", "x86_64"])
+        self.assertTrue(json.loads(paths[0].read_text())["feature_set"]["incident_send_trace"])
+        self.provenance("verify", "android", "--artifact-root", self.crate / "output/android", *paths)
+        Path(self.env["GITHUB_ENV"]).unlink()
+        data = json.loads(paths[-1].read_text())
+        data["feature_set"]["incident_send_trace"] = False
+        paths[-1].write_text(json.dumps(data))
+        self.provenance("verify", "android", "--artifact-root", self.crate / "output/android", *paths, success=False)
+        self.assertFalse(Path(self.env["GITHUB_ENV"]).exists())
 
     def test_master_cache_warming_rejects_untrusted_source_ancestry(self):
         # Execute the workflow's actual identity script, rather than a copy of

@@ -17,6 +17,11 @@ on:
         required: false
         default: false
         type: boolean
+      incident_send_trace:
+        description: Android-only local send tracing; requires build_only and never publishes
+        required: false
+        default: false
+        type: boolean
   workflow_call:
     inputs:
       source_sha:
@@ -25,6 +30,11 @@ on:
         type: string
       build_only:
         description: Build and validate workflow artifacts without staging a release
+        required: false
+        default: false
+        type: boolean
+      incident_send_trace:
+        description: Android-only local send tracing; requires build_only
         required: false
         default: false
         type: boolean
@@ -109,6 +119,7 @@ jobs:
           REQUESTED_SHA: ${{ inputs.source_sha }}
           BUILDER_SHA: ${{ github.sha }}
           BUILD_ONLY: ${{ inputs.build_only }}
+          INCIDENT_SEND_TRACE: ${{ inputs.incident_send_trace }}
           NIGHTLY_VERSION: ${{ inputs.nightly_version }}
         run: |
           set -euo pipefail
@@ -116,6 +127,11 @@ jobs:
           workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           is_nightly=false
           NIGHTLY_VERSION="${NIGHTLY_VERSION:-}"
+          if [[ "${INCIDENT_SEND_TRACE:-false}" == true ]] && \
+             [[ "$BUILD_ONLY" != true || -n "$NIGHTLY_VERSION" ]]; then
+            echo "error: incident send tracing requires a non-publishing build-only run" >&2
+            exit 1
+          fi
 
           # Called by nightly-releases.yml: the caller's event is schedule or
           # workflow_dispatch, so check the nightly input before the event.
@@ -195,6 +211,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   apple-build:
+    if: ${{ !inputs.incident_send_trace }}
     name: Build Apple input (${{ matrix.part }})
     runs-on: macos-latest
     needs: metadata
@@ -292,6 +309,7 @@ jobs:
           retention-days: 7
 
   ios-bindings:
+    if: ${{ !inputs.incident_send_trace }}
     name: Assemble and validate iOS bindings
     runs-on: macos-latest
     needs: [metadata, apple-build]
@@ -415,6 +433,7 @@ jobs:
           if-no-files-found: error
 
   macos-bindings:
+    if: ${{ !inputs.incident_send_trace }}
     name: Assemble and validate macOS bindings
     runs-on: macos-latest
     needs: [metadata, apple-build]
@@ -535,6 +554,9 @@ jobs:
           if-no-files-found: error
 
   android-build:
+    env:
+      INCIDENT_SEND_TRACE: ${{ inputs.incident_send_trace && '1' || '0' }}
+      MARMOTKIT_BUILD_ONLY: ${{ inputs.build_only && '1' || '0' }}
     name: Build Android input (${{ matrix.part }})
     runs-on: ubuntu-latest
     needs: metadata
@@ -661,6 +683,9 @@ jobs:
           retention-days: 7
 
   android-bindings:
+    env:
+      INCIDENT_SEND_TRACE: ${{ inputs.incident_send_trace && '1' || '0' }}
+      MARMOTKIT_BUILD_ONLY: ${{ inputs.build_only && '1' || '0' }}
     name: Assemble and validate Android bindings
     runs-on: ubuntu-latest
     needs: [metadata, android-build]
@@ -709,6 +734,10 @@ jobs:
           version="$RELEASE_ID"
           workspace_version="$(sed -n 's/^version = "\(.*\)"/\1/p' packaged-source/Cargo.toml | head -n 1)"
           lock_sha="$(shasum -a 256 packaged-source/Cargo.lock | awk '{print $1}')"
+          selected_features='["otlp-export", "product-analytics-export"]'
+          if [[ "${INCIDENT_SEND_TRACE:-0}" == 1 ]]; then
+            selected_features='["incident-send-trace", "otlp-export", "product-analytics-export"]'
+          fi
           stage_parent="$RUNNER_TEMP/marmotkit-android-stage"
           bundle_dir="$stage_parent/marmotkit-android-$version"
           asset="$RUNNER_TEMP/marmotkit-android-$version.zip"
@@ -751,6 +780,7 @@ jobs:
             "tag": "$tag",
             "source_sha": "$SOURCE_SHA",
             "builder_sha": "$BUILDER_SHA",
+            "features": $selected_features,
             "workspace_version": "$workspace_version",
             "cargo_lock_sha256": "$lock_sha",
             "rustc": "$MARMOTKIT_BUILD_RUSTC",

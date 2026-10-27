@@ -60,6 +60,14 @@ if [[ "${PRODUCT_ANALYTICS_EXPORT:-0}" == "1" || "${PRODUCT_ANALYTICS_EXPORT:-}"
   FEATURE_ARGS+=(--features product-analytics-export)
   BINDGEN_FEATURES="${BINDGEN_FEATURES},product-analytics-export"
 fi
+if [[ "${INCIDENT_SEND_TRACE:-0}" == "1" || "${INCIDENT_SEND_TRACE:-}" == "true" ]]; then
+  if [[ "${MARMOTKIT_BUILD_ONLY:-0}" != "1" && "${MARMOTKIT_BUILD_ONLY:-}" != "true" ]]; then
+    echo "error: incident send tracing is restricted to build-only diagnostic artifacts" >&2
+    exit 1
+  fi
+  FEATURE_ARGS+=(--features incident-send-trace)
+  BINDGEN_FEATURES="${BINDGEN_FEATURES},incident-send-trace"
+fi
 
 
 ANDROID_API="${ANDROID_API:-26}"

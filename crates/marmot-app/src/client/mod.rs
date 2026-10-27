@@ -4579,6 +4579,19 @@ impl AppClient {
             &app_event_id,
         ));
 
+        #[cfg(feature = "incident-send-trace")]
+        let incident_trace = self.app.incident_trace.clone();
+        #[cfg(feature = "incident-send-trace")]
+        let incident_owner = incident_trace.owner(&self.state.label);
+        #[cfg(feature = "incident-send-trace")]
+        let incident_operation = incident_trace.operation(
+            incident_owner,
+            audit_context
+                .as_ref()
+                .and_then(|c| c.operation_id.as_deref())
+                .unwrap_or(""),
+            0,
+        );
         let should_project_locally = !notifications::is_push_gossip_kind(event.kind);
         if should_project_locally {
             let update = self.record_send_intent_projection(group_id, &sender, &event)?;
@@ -4586,10 +4599,24 @@ impl AppClient {
             self.publish_conversation_captures(group_id);
         }
 
-        let send_result = match self
+        #[cfg(feature = "incident-send-trace")]
+        incident_trace.emit(
+            crate::incident_send_trace::Kind::PreEngineSyncBegin,
+            incident_owner,
+            incident_operation,
+            [0; 8],
+        );
+        let sync_result = self
             .sync_runtime_groups_for_send("send_app_event_with_local_projection")
-            .await
-        {
+            .await;
+        #[cfg(feature = "incident-send-trace")]
+        incident_trace.emit(
+            crate::incident_send_trace::Kind::PreEngineSyncEnd,
+            incident_owner,
+            incident_operation,
+            crate::incident_send_trace::values(u64::from(sync_result.is_ok())),
+        );
+        let send_result = match sync_result {
             Ok(()) => {
                 let send_intent = SendIntent::AppMessage {
                     group_id: group_id.clone(),
@@ -4599,7 +4626,14 @@ impl AppClient {
                 // Thread the human-action context through the engine so the
                 // send's audit rows carry `human_action`, matching
                 // create_group/invite/etc.
-                match &audit_context {
+                #[cfg(feature = "incident-send-trace")]
+                incident_trace.emit(
+                    crate::incident_send_trace::Kind::RuntimeSendBegin,
+                    incident_owner,
+                    incident_operation,
+                    [0; 8],
+                );
+                let runtime_result = match &audit_context {
                     Some(context) => {
                         self.runtime
                             .send_with_audit_context(send_intent, context.clone())
@@ -4607,7 +4641,15 @@ impl AppClient {
                     }
                     None => self.runtime.send(send_intent).await,
                 }
-                .map_err(AppError::from)
+                .map_err(AppError::from);
+                #[cfg(feature = "incident-send-trace")]
+                incident_trace.emit(
+                    crate::incident_send_trace::Kind::RuntimeSendEnd,
+                    incident_owner,
+                    incident_operation,
+                    crate::incident_send_trace::values(u64::from(runtime_result.is_ok())),
+                );
+                runtime_result
             }
             // The inactive-account queue carries no epoch pin, so an
             // epoch-bound payload cannot take it: it would drain under

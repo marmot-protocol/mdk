@@ -12,6 +12,7 @@ crate-type = ["cdylib", "staticlib", "lib"]
 [features]
 product-analytics-export = ["marmot-app/product-analytics-export"]
 default = []
+incident-send-trace = ["marmot-app/incident-send-trace"]
 cli = ["uniffi/cli"]
 otlp-export = ["marmot-app/otlp-export"]
 

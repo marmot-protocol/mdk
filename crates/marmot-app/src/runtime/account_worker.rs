@@ -751,6 +751,23 @@ pub(crate) enum AccountWorkerCommand {
 }
 
 impl AccountWorkerCommand {
+    #[cfg(feature = "incident-send-trace")]
+    fn incident_kind(&self) -> u64 {
+        match self {
+            Self::CatchUp { .. } => 1,
+            Self::RepairFullHistory { .. } => 2,
+            Self::SendMessageDraft { .. }
+            | Self::SendMessage { .. }
+            | Self::SendAppEvent { .. } => 3,
+            Self::RetryGroupConvergence { .. } => 4,
+            Self::Drain { .. } => 5,
+            Self::ConnectivityRestored { .. } => 6,
+            command if command.readable_during_comparison_catch_up() => 7,
+            command if command.needs_media_slot() => 8,
+            _ => 9,
+        }
+    }
+
     /// Full-history repair runs one job in place, so it waits while the
     /// account's worker-owned job is in flight: there is one job per account.
     /// A catch-up only drains live input, like a delivery, so it crosses the
@@ -1871,7 +1888,56 @@ async fn run_app_runtime_account_worker(
     let mut comparison_recovery: Option<ComparisonRecoveryJob> = None;
     let mut replay_changes = client.adapter.replay_changes().await;
     let mut admission_retry = ReplayAdmissionRetry::default();
+    #[cfg(feature = "incident-send-trace")]
+    let incident_trace = app.incident_trace.clone();
+    #[cfg(feature = "incident-send-trace")]
+    let incident_owner = incident_trace.owner(&account_label);
+    #[cfg(feature = "incident-send-trace")]
+    let incident_generation = incident_trace.token();
+    #[cfg(feature = "incident-send-trace")]
+    incident_trace.emit(
+        crate::incident_send_trace::Kind::WorkerStart,
+        incident_owner,
+        0,
+        crate::incident_send_trace::values(incident_generation),
+    );
     'worker: loop {
+        #[cfg(feature = "incident-send-trace")]
+        let incident_owner = incident_trace.owner(&account_label);
+        #[cfg(feature = "incident-send-trace")]
+        let _incident_loop = incident_trace.branch(incident_owner, 10);
+        #[cfg(feature = "incident-send-trace")]
+        {
+            let now = TokioInstant::now();
+            let flags = u64::from(local_submission_due)
+                | (u64::from(local_submission_service_owed) << 1)
+                | (u64::from(avatar_due) << 2)
+                | (u64::from(presentation_due) << 3)
+                | (u64::from(attachment_due) << 4)
+                | (u64::from(lifecycle.is_stopping()) << 5)
+                | (u64::from(scheduled_convergence.timer.deadline() <= now) << 6);
+            incident_trace.worker_state(
+                incident_owner,
+                [
+                    pending.len() as u64,
+                    commands.len() as u64,
+                    flags,
+                    local_submission_retry_at
+                        .saturating_duration_since(now)
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                    scheduled_convergence
+                        .timer
+                        .deadline()
+                        .saturating_duration_since(now)
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                    scheduled_convergence.deadlines.len() as u64,
+                    incident_generation,
+                    0,
+                ],
+            );
+        }
         // Activation may replace the source watch. Reacquire only a live
         // receiver; a closed activation must not turn this into a busy loop.
         if replay_changes.is_none() {
@@ -1890,6 +1956,8 @@ async fn run_app_runtime_account_worker(
         {
             Ok(false)
         } else {
+            #[cfg(feature = "incident-send-trace")]
+            let _incident_branch = incident_trace.branch(incident_owner, 9);
             admission_retry.admit_native_turn(&mut client).await
         } {
             Ok(progress) => progress,
@@ -1910,6 +1978,8 @@ async fn run_app_runtime_account_worker(
             && job.network.is_none()
             && admission_retry.ready()
         {
+            #[cfg(feature = "incident-send-trace")]
+            let _incident_branch = incident_trace.branch(incident_owner, 11);
             let turn = match job.admission.as_mut() {
                 Some(admission) => {
                     client
@@ -2110,6 +2180,8 @@ async fn run_app_runtime_account_worker(
             commands.len(),
             yield_to_convergence,
         );
+        #[cfg(feature = "incident-send-trace")]
+        let _incident_select = incident_trace.branch(incident_owner, 13);
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
@@ -2130,6 +2202,8 @@ async fn run_app_runtime_account_worker(
                     .wait()
                     .await
             }, if comparison_recovery.as_ref().is_some_and(|job| job.network.is_some()) => {
+                #[cfg(feature = "incident-send-trace")]
+                let _incident_branch = incident_trace.branch(incident_owner, 11);
                 let job = comparison_recovery.as_mut().expect("completed comparison task exists");
                 job.network = None;
                 match completed {
@@ -2174,6 +2248,8 @@ async fn run_app_runtime_account_worker(
                     .expect("Welcome recovery branch requires a live task");
                 (&mut recovery.handle).await
             }, if welcome_recovery.is_some() => {
+                #[cfg(feature = "incident-send-trace")]
+                let _incident_branch = incident_trace.branch(incident_owner, 12);
                 let mut recovery = welcome_recovery
                     .take()
                     .expect("completed Welcome recovery task must still be owned");
@@ -2201,6 +2277,8 @@ async fn run_app_runtime_account_worker(
             }
             // Consume completed blobs before admitting more commands.
             done = media_http_rx.recv() => {
+                #[cfg(feature = "incident-send-trace")]
+                let _incident_branch = incident_trace.branch(incident_owner, 8);
                 match done {
                     Some(done) => {
                         complete_media_http(&mut client, done, &shared, &media_http).await;
@@ -2225,6 +2303,10 @@ async fn run_app_runtime_account_worker(
                 yield_to_convergence = true;
                 match command {
                     Some((command, approved_pending)) => {
+                        #[cfg(feature = "incident-send-trace")]
+                        let _incident_branch = incident_trace.branch(incident_owner, 1);
+                        #[cfg(feature = "incident-send-trace")]
+                        incident_trace.command(incident_owner, command.incident_kind());
                         #[cfg(test)]
                         tests::secondary_retry_scheduler_tests::record_command(&account_id_hex, &command);
                         // ready_command_index has already approved pending work
@@ -2335,6 +2417,8 @@ async fn run_app_runtime_account_worker(
                 }
             }
             _ = scheduled_convergence.timer.as_mut(), if !scheduled_convergence_held_for_test(&account_id_hex) => {
+                #[cfg(feature = "incident-send-trace")]
+                let _incident_branch = incident_trace.branch(incident_owner, 2);
                 yield_to_convergence = false;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
                 let secondary_retry_yield = wait_for_local_submission_or_shutdown(
@@ -2565,6 +2649,8 @@ async fn run_app_runtime_account_worker(
                 // commands remain queued until that durable sequence lands.
                 let delivery_started = matches!(&received, Ok(transport_nostr::AccountDeliveryReceive::Delivery(_)))
                     .then(Instant::now);
+                #[cfg(feature = "incident-send-trace")]
+                let _incident_branch = incident_trace.branch(incident_owner, 3);
                 let receive_observation = shared.app_performance_telemetry().observe(RuntimeOp::WorkerReceive);
                 let result = match received {
                     Ok(transport_nostr::AccountDeliveryReceive::Delivery(delivery)) => {
@@ -2894,6 +2980,8 @@ async fn run_app_runtime_account_worker(
                 }
             }
             _ = tokio::task::yield_now(), if avatar_due && !lifecycle.is_stopping() => {
+                #[cfg(feature = "incident-send-trace")]
+                let _incident_branch = incident_trace.branch(incident_owner, 4);
                 avatar_due = false;
                 let identities = avatar_identities.run(&client, &account_id_hex);
                 let acquisition = schedule_avatar_acquisition(&client, &media_http, &mut avatar_resumed);
@@ -2923,6 +3011,8 @@ async fn run_app_runtime_account_worker(
                 if result.is_ok() { presentation_due = true; avatar_due = true; attachment_due = true; }
             }
             _ = tokio::task::yield_now(), if presentation_due => {
+                #[cfg(feature = "incident-send-trace")]
+                let _incident_branch = incident_trace.branch(incident_owner, 5);
                 if lifecycle.is_stopping() { continue 'worker; }
                 avatar_due = true;
                 presentation_due = match presentation_maintenance.run(&client, &account_id_hex) {
@@ -2938,6 +3028,8 @@ async fn run_app_runtime_account_worker(
                 attachment_due = true;
             }
             _ = tokio::task::yield_now(), if attachment_due => {
+                #[cfg(feature = "incident-send-trace")]
+                let _incident_branch = incident_trace.branch(incident_owner, 6);
                 if lifecycle.is_stopping() { continue 'worker; }
                 attachment_due = match attachments::schedule(&client, &shared, &media_http, &mut attachment_admission) {
                     Ok(more) => more,
@@ -2956,6 +3048,8 @@ async fn run_app_runtime_account_worker(
                 continue 'worker;
             }
             _ = maintenance_tick.tick() => {
+                #[cfg(feature = "incident-send-trace")]
+                let _incident_branch = incident_trace.branch(incident_owner, 7);
                 local_submission_due = true;
                 attachment_due = true;
                 presentation_due = true;
@@ -6517,15 +6611,65 @@ async fn publish_next_local_submission(
 ) -> Option<Duration> {
     #[cfg(test)]
     tests::secondary_retry_scheduler_tests::record_drain(account_id_hex);
+    #[cfg(feature = "incident-send-trace")]
+    let trace = app.incident_trace.clone();
+    #[cfg(feature = "incident-send-trace")]
+    let trace_owner = trace.owner(account_label);
+    #[cfg(feature = "incident-send-trace")]
+    let _incident_branch = trace.branch(trace_owner, 14);
+    #[cfg(feature = "incident-send-trace")]
+    trace.emit(
+        crate::incident_send_trace::Kind::SelectionAttempt,
+        trace_owner,
+        0,
+        [0; 8],
+    );
     let (submission, queued) = {
         // Account-local admission may be waiting on storage. Do not park this
         // executor thread or the worker's shutdown/read serving behind it.
         let gate = shared.local_submission_gate(account_id_hex);
         let Ok(_admission) = gate.try_lock() else {
+            #[cfg(feature = "incident-send-trace")]
+            trace.emit(
+                crate::incident_send_trace::Kind::GateBusy,
+                trace_owner,
+                0,
+                [0; 8],
+            );
             return Some(Duration::from_millis(100));
         };
-        let storage = app.account_storage(account_label).ok()?;
-        let submission = storage.app_storage().next_local_submission().ok()??;
+        let storage = match app.account_storage(account_label) {
+            Ok(storage) => storage,
+            Err(_) => {
+                #[cfg(feature = "incident-send-trace")]
+                trace.emit(
+                    crate::incident_send_trace::Kind::StorageError,
+                    trace_owner,
+                    0,
+                    [0; 8],
+                );
+                return None;
+            }
+        };
+        let submission = match storage.app_storage().next_local_submission() {
+            Ok(Some(submission)) => submission,
+            result => {
+                #[cfg(feature = "incident-send-trace")]
+                trace.emit(
+                    if result.is_err() {
+                        crate::incident_send_trace::Kind::QueueError
+                    } else {
+                        crate::incident_send_trace::Kind::QueueEmpty
+                    },
+                    trace_owner,
+                    0,
+                    [0; 8],
+                );
+                #[cfg(not(feature = "incident-send-trace"))]
+                let _ = result;
+                return None;
+            }
+        };
         let queued = shared
             .local_submission_queue
             .lock()
@@ -6536,6 +6680,32 @@ async fn publish_next_local_submission(
                 &submission.message_id_hex,
             );
         (submission, queued)
+    };
+    #[cfg(feature = "incident-send-trace")]
+    let trace_operation = {
+        let key = marmot_forensics::application_send_operation_id(
+            &hex::decode(&submission.group_id_hex).unwrap_or_default(),
+            &submission.message_id_hex,
+        );
+        let known = trace.operation(trace_owner, &key, 0);
+        let operation = if known == 0 {
+            trace.operation(trace_owner, &key, trace.token())
+        } else {
+            known
+        };
+        trace.emit(
+            crate::incident_send_trace::Kind::Selected,
+            trace_owner,
+            operation,
+            [0, u64::from(known == 0), 0, 0, 0, 0, 0, 0],
+        );
+        trace.emit(
+            crate::incident_send_trace::Kind::ExecutionBegin,
+            trace_owner,
+            operation,
+            [0; 8],
+        );
+        operation
     };
     if let Some(queued) = queued {
         queued.finish(&shared.app_performance_telemetry());
@@ -6552,6 +6722,13 @@ async fn publish_next_local_submission(
         .await;
     client.send_telemetry = None;
     execution.finish_app(&result);
+    #[cfg(feature = "incident-send-trace")]
+    trace.emit(
+        crate::incident_send_trace::Kind::ExecutionEnd,
+        trace_owner,
+        trace_operation,
+        crate::incident_send_trace::values(u64::from(result.is_ok())),
+    );
     shared.app_performance_telemetry().record(
         AppPerformanceOperation::OutboundMessageSend,
         started.elapsed(),
@@ -6560,6 +6737,13 @@ async fn publish_next_local_submission(
     // A failed completion write must not strand later app-owned rows until
     // maintenance; bound retries when this row remains at the queue's head.
     let finished = app.finish_local_message(account_label, &submission, &result);
+    #[cfg(feature = "incident-send-trace")]
+    trace.emit(
+        crate::incident_send_trace::Kind::Completion,
+        trace_owner,
+        trace_operation,
+        crate::incident_send_trace::values(u64::from(finished.is_ok())),
+    );
     let retry = if finished.is_err() {
         Duration::from_millis(100)
     } else {

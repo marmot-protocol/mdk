@@ -331,8 +331,47 @@ impl MarmotAppRuntime {
         draft: Option<LocalDraftAdmission>,
         edit_of_client_token: Option<String>,
     ) -> Result<crate::LocalSendAcceptance, AppError> {
-        self.accounts.worker_commands(account).await?;
-        let account = self.accounts.resolve(account)?;
+        #[cfg(feature = "incident-send-trace")]
+        let trace = self.accounts.app.incident_trace.clone();
+        #[cfg(feature = "incident-send-trace")]
+        let trace_call = trace.token();
+        #[cfg(feature = "incident-send-trace")]
+        trace.emit(
+            crate::incident_send_trace::Kind::AdmissionBegin,
+            0,
+            trace_call,
+            [0; 8],
+        );
+        self.accounts
+            .worker_commands(account)
+            .await
+            .inspect_err(|_| {
+                #[cfg(feature = "incident-send-trace")]
+                trace.emit(
+                    crate::incident_send_trace::Kind::AdmissionFailed,
+                    0,
+                    trace_call,
+                    [0; 8],
+                );
+            })?;
+        let account = self.accounts.resolve(account).inspect_err(|_| {
+            #[cfg(feature = "incident-send-trace")]
+            trace.emit(
+                crate::incident_send_trace::Kind::AdmissionFailed,
+                0,
+                trace_call,
+                [0; 8],
+            );
+        })?;
+        #[cfg(feature = "incident-send-trace")]
+        let trace_owner = trace.owner(&account.label);
+        #[cfg(feature = "incident-send-trace")]
+        trace.emit(
+            crate::incident_send_trace::Kind::WorkerAcquired,
+            trace_owner,
+            trace_call,
+            [0; 8],
+        );
         let app = self.accounts.app.clone();
         let shared = self.accounts.shared.clone();
         let events = self.accounts.events.clone();
@@ -344,9 +383,31 @@ impl MarmotAppRuntime {
             // worker cannot select a commit before timing registration; other
             // accounts never wait for this database. Global map locks stay short.
             let gate = shared.local_submission_gate(&account.account_id_hex);
+            #[cfg(feature = "incident-send-trace")]
+            trace.emit(
+                crate::incident_send_trace::Kind::GateWait,
+                trace_owner,
+                trace_call,
+                [0; 8],
+            );
             let admission = gate.blocking_lock();
-            shared.lifecycle().ensure_running()?;
-            let (accepted, update) = app.admit_local_message_with_draft_policy_at(
+            #[cfg(feature = "incident-send-trace")]
+            trace.emit(
+                crate::incident_send_trace::Kind::GateAcquired,
+                trace_owner,
+                trace_call,
+                [0; 8],
+            );
+            shared.lifecycle().ensure_running().inspect_err(|_| {
+                #[cfg(feature = "incident-send-trace")]
+                trace.emit(
+                    crate::incident_send_trace::Kind::AdmissionFailed,
+                    trace_owner,
+                    trace_call,
+                    [0; 8],
+                );
+            })?;
+            let admitted = app.admit_local_message_with_draft_policy_at(
                 &account.label,
                 &group,
                 token,
@@ -354,7 +415,35 @@ impl MarmotAppRuntime {
                 draft,
                 edit_of_client_token,
                 crate::unix_now_seconds(),
-            )?;
+            );
+            #[cfg(feature = "incident-send-trace")]
+            if admitted.is_err() {
+                trace.emit(
+                    crate::incident_send_trace::Kind::AdmissionFailed,
+                    trace_owner,
+                    trace_call,
+                    [0; 8],
+                );
+            }
+            let (accepted, update) = admitted?;
+            #[cfg(feature = "incident-send-trace")]
+            {
+                let key = marmot_forensics::application_send_operation_id(
+                    group.as_slice(),
+                    &accepted.message_id_hex,
+                );
+                let original = trace.operation(trace_owner, &key, trace_call);
+                trace.emit(
+                    if update.is_some() {
+                        crate::incident_send_trace::Kind::AdmissionCommitted
+                    } else {
+                        crate::incident_send_trace::Kind::AdmissionDuplicate
+                    },
+                    trace_owner,
+                    trace_call,
+                    crate::incident_send_trace::values(original),
+                );
+            }
             if update.is_some() {
                 let mut queue = shared
                     .local_submission_queue

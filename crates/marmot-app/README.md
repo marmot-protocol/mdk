@@ -507,3 +507,26 @@ cargo test -p marmot-app --features otlp-export
 ```
 
 See [`AGENTS.md`](AGENTS.md) for the module map, invariants, and privacy-safe telemetry rules.
+
+
+## Incident send capture
+
+`incident-send-trace` is an off-by-default, local-only diagnostic feature forwarded by
+`marmot-uniffi`. It uses the existing forensic audit consent setting. It does not change
+send scheduling, databases, bindings, audit v5, or upload contracts. Producers enqueue
+fixed numeric records without waiting for locks or disk; a dedicated thread writes four
+256 KiB JSONL segments and a bounded manifest under `<app-root>/local-send-trace/`.
+Enabling/disabling capture joins its writer at the control boundary and can block there.
+
+A host may export these allowlisted files through its explicit private log export:
+`segment-0.jsonl` through `segment-3.jsonl`, and `manifest.json`. Export is best effort:
+files can rotate or change while copied. Clear removes those files plus `manifest.tmp`;
+the writer detects removal of its current segment, discards queued history and live
+snapshots, and establishes a counted new coverage boundary. Never upload this sidecar
+through the audit uploader. [Capture format and interpretation](src/incident_send_trace/FORMAT.md)
+describe its privacy, correlation and loss limits.
+
+```sh
+cargo test --offline --locked -p marmot-app --features incident-send-trace --lib incident_send_trace::tests
+cargo check --offline --locked -p marmot-app
+```

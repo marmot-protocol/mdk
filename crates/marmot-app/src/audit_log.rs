@@ -584,8 +584,14 @@ impl MarmotApp {
         // A disable, clear, or later re-enable must invalidate an old HTTP
         // result even when the persisted switch ends up enabled again.
         let _mutation = self.audit_export_lifecycle.mutate_all();
+        #[cfg(feature = "incident-send-trace")]
+        if !settings.enabled {
+            self.incident_trace.enable(false);
+        }
         self.shared_storage()?
             .set_audit_log_settings(&audit_log_settings_to_storage(settings.clone()))?;
+        #[cfg(feature = "incident-send-trace")]
+        self.incident_trace.enable(settings.enabled);
         Ok(settings)
     }
 
@@ -878,6 +884,11 @@ impl MarmotApp {
                     None,
                     marmot_forensics::AuditEventKind::SourceContext { source },
                 ));
+                #[cfg(feature = "incident-send-trace")]
+                {
+                    Some(self.incident_trace.decorate(label, Box::new(recorder)))
+                }
+                #[cfg(not(feature = "incident-send-trace"))]
                 Some(Box::new(recorder))
             }
             Err(e) => {
