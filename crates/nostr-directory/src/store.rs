@@ -79,11 +79,10 @@ impl<R: DirectoryResources> Directory<R> {
 
     pub(crate) fn directory_freshness(&self) -> DirectoryFreshness {
         if let Some(clock) = &self.config.test_clock {
-            return DirectoryFreshness {
-                max_created_at: clock
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    .saturating_add(self.config.max_future_skew.as_secs()),
-            };
+            return DirectoryFreshness::at(
+                clock.load(std::sync::atomic::Ordering::SeqCst),
+                self.config.max_future_skew,
+            );
         }
         DirectoryFreshness::from_now(self.config.max_future_skew)
     }

@@ -11586,6 +11586,127 @@ async fn superseded_invite_retains_recovery_material_after_reporting() {
     }
 }
 
+/// A lost invite comes back with one package per device of the account it
+/// named, never with one package twice.
+#[tokio::test]
+async fn superseded_invite_reissues_with_every_device_of_the_invited_account() {
+    let (mut alice, alice_storage) = build_client(b"alice");
+    let (mut bob, bob_storage) = build_client(b"bob");
+    let (mut carol, _) = build_client(b"carol");
+    let (mut carol_laptop, _) = build_client(b"carol");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (group_id, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "before".into(),
+            description: String::new(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("creation")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"bob"))
+        .await
+        .unwrap();
+    let (inviter, storage, winner) = if committer_wins(&alice.self_id(), &bob.self_id()) {
+        (&mut bob, &bob_storage, &mut alice)
+    } else {
+        (&mut alice, &alice_storage, &mut bob)
+    };
+    let SendResult::GroupEvolution {
+        msg: invite_commit,
+        pending,
+        ..
+    } = inviter
+        .send(SendIntent::Invite {
+            group_id: group_id.clone(),
+            key_packages: vec![carol.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("invite")
+    };
+    inviter.confirm_published(pending).await.unwrap();
+    let (rename, pending) = evolution(
+        winner
+            .send(SendIntent::UpdateGroupData {
+                group_id: group_id.clone(),
+                name: Some("canonical".into()),
+                description: None,
+            })
+            .await
+            .unwrap(),
+    );
+    winner.confirm_published(pending).await.unwrap();
+    for (engine, rival) in [(&mut *inviter, &rename), (&mut *winner, &invite_commit)] {
+        engine
+            .buffer_openmls_convergence_message_at(&group_id, route(rival.clone(), &group_id), 500)
+            .unwrap();
+        engine
+            .converge_stored_openmls_messages_at(&group_id, 1_000_000)
+            .unwrap();
+    }
+    let reports = inviter.reissue_superseded_own_commits_from_state().unwrap();
+    assert_eq!(
+        reports[0].outcome,
+        SupersededIntentOutcome::ReinviteRequired
+    );
+    let phone = carol.fresh_key_package().await.unwrap();
+    let laptop = carol_laptop.fresh_key_package().await.unwrap();
+    assert!(
+        inviter
+            .reissue_invite_with_key_packages(&invite_commit.id, vec![phone.clone(), phone.clone()])
+            .is_err()
+    );
+    assert!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+    let report = inviter
+        .reissue_invite_with_key_packages(&invite_commit.id, vec![phone, laptop])
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.outcome, SupersededIntentOutcome::Reissued);
+    let mut drained = inviter
+        .converge_and_drain_queued_outbound_intents(&group_id, 2_000_000)
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution {
+        pending, welcomes, ..
+    } = drained.remove(0)
+    else {
+        panic!("reinvite")
+    };
+    inviter.confirm_published(pending).await.unwrap();
+    // One Commit, one Welcome delivery per device.
+    assert!(drained.is_empty());
+    assert_eq!(welcomes.len(), 2);
+    for device in [&mut carol, &mut carol_laptop] {
+        device
+            .join_welcome(welcome_for(&welcomes, b"carol"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        inviter
+            .members(&group_id)
+            .unwrap()
+            .iter()
+            .filter(|member| member.id == carol.self_id())
+            .count(),
+        2
+    );
+}
+
 #[tokio::test]
 async fn reinvite_lookup_budget_and_pacing_survive_restart() {
     use cgka_traits::storage::{OwnCommitBaseline, OwnCommitIntent, ReinviteRetry};

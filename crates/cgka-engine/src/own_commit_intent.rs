@@ -512,14 +512,18 @@ impl<S: StorageProvider> Engine<S> {
             self.storage.put_own_commit_intent(&record)?;
             return Ok(Some(report));
         }
+        // An account may bring one package per device, but never the same
+        // package twice.
         let mut actual = std::collections::BTreeSet::new();
+        let mut fresh = std::collections::BTreeSet::new();
         for package in &key_packages {
             let metadata = crate::key_package::key_package_metadata(package)?;
             if consumed.contains(&metadata.key_package_ref_hex)
-                || !actual.insert(metadata.credential_identity_hex)
+                || !fresh.insert(metadata.key_package_ref_hex)
             {
                 return Err(EngineError::InvalidWelcome);
             }
+            actual.insert(metadata.credential_identity_hex);
         }
         if actual != expected {
             return Err(EngineError::InvalidWelcome);

@@ -1,7 +1,7 @@
 //! Projections group members by account when one account holds several
-//! leaves (mdk#2628, item 1.1). The invite path picks one KeyPackage per
-//! account, so these tests add a second device through the engine's Invite
-//! intent, as an ordinary admin Commit.
+//! leaves (mdk#2628, item 1.1), and creating or inviting adds every device of
+//! an account (item 1.3). Tests that add a device to an account already in the
+//! group do it through the engine's Invite intent, as an ordinary admin Commit.
 
 use super::canonical_membership::{app_at, deliver_new, published_key_package};
 use super::*;
@@ -163,6 +163,188 @@ fn self_remove_delay_ms(admin: &mut AppClient, group: &GroupId) -> u64 {
         .scheduled_self_remove_auto_commit_delay_ms(group)
         .unwrap()
         .unwrap()
+}
+
+/// `label`'s client on each of its devices: the one in `home` first, then one
+/// per imported device home, each with a published KeyPackage. Returns the
+/// clients, their apps and their KeyPackage event ids, in that order.
+async fn devices_with_key_packages(
+    app: &MarmotApp,
+    home: &AccountHome,
+    label: &str,
+    device_dirs: &[tempfile::TempDir],
+    relay: &Arc<ScriptedPushRelayClient>,
+) -> (Vec<AppClient>, Vec<MarmotApp>, Vec<String>) {
+    let mut apps = vec![app.clone()];
+    for device_dir in device_dirs {
+        second_device(home, label, device_dir);
+        apps.push(app_at(device_dir, relay.clone()));
+    }
+    let mut clients = Vec::new();
+    let mut key_packages = Vec::new();
+    for app in &apps {
+        let mut client = app.client(label).await.unwrap();
+        let key_package = published_key_package(&mut client, relay).await;
+        key_packages.push(hex::encode(key_package.source.unwrap().event_id.as_slice()));
+        client.sync().await.unwrap();
+        clients.push(client);
+    }
+    (clients, apps, key_packages)
+}
+
+/// The KeyPackage event each Welcome rumor gift-wrapped to `label` names.
+fn welcome_rumor_key_packages(
+    home: &AccountHome,
+    label: &str,
+    events: &[NostrTransportEvent],
+) -> Vec<String> {
+    let keys = home.load_signing_keys(label).unwrap();
+    let account = keys.public_key().to_hex();
+    let mut named = events
+        .iter()
+        .filter(|event| {
+            event.kind == 1059
+                && event
+                    .single_tag_value("p")
+                    .is_ok_and(|recipient| recipient == account)
+        })
+        .map(|wrap| {
+            let rumor =
+                nostr::nips::nip59::extract_rumor(&keys, &wrap.to_verified_nostr_event().unwrap())
+                    .unwrap()
+                    .rumor;
+            assert_eq!(rumor.kind.as_u16(), 444);
+            rumor
+                .tags
+                .iter()
+                .map(|tag| tag.as_slice().to_vec())
+                .find(|tag| tag[0] == "e")
+                .unwrap()[1]
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    named.sort();
+    named
+}
+
+/// Inviting an account with three devices adds all three in one Commit, with
+/// one Welcome rumor per device naming that device's KeyPackage. Each device
+/// joins through its own rumor, and every member sees one account with three
+/// devices.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_adds_every_device_of_the_account_in_one_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let device_dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let home = AccountHome::open(dir.path());
+    let alice_id = home.create_account("alice").unwrap().account_id_hex;
+    let bob_id = home.create_account("bob").unwrap().account_id_hex;
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_at(&dir, relay.clone());
+    remember_test_member_inbox(&app, &bob_id, "wss://relay.example");
+    let (mut bobs, _apps, key_packages) =
+        devices_with_key_packages(&app, &home, "bob", &device_dirs, &relay).await;
+    let mut alice = app.client("alice").await.unwrap();
+    let group = alice.create_group("team", &[]).await.unwrap();
+
+    let before = relay.published_events.lock().unwrap().len();
+    alice
+        .invite_members(&group, &[bob_id.as_str()])
+        .await
+        .unwrap();
+    let published = relay.published_events.lock().unwrap()[before..].to_vec();
+    assert_eq!(
+        published
+            .iter()
+            .filter(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+            .count(),
+        1,
+        "one Commit adds the account"
+    );
+    let mut expected_key_packages = key_packages;
+    expected_key_packages.sort();
+    assert_eq!(
+        welcome_rumor_key_packages(&home, "bob", &published),
+        expected_key_packages
+    );
+
+    for bob in &mut bobs {
+        let mut cursor = 0;
+        deliver_new(bob, &relay, &mut cursor).await;
+        bob.sync().await.unwrap();
+        bob.accept_group_invite(&group).unwrap();
+    }
+    let three_devices = sorted(vec![(alice_id.clone(), 1), (bob_id.clone(), 3)]);
+    assert_eq!(member_view(&alice, &group), three_devices);
+    for (device, bob) in bobs.iter().enumerate() {
+        assert_eq!(
+            member_view(bob, &group),
+            three_devices,
+            "bob device {device}"
+        );
+    }
+    assert_eq!(stored_member_count(&app, "alice", &group), Some(2));
+}
+
+/// Creating a 1:1 with an account that has two devices adds both, leaves the
+/// creator's own other device out, and stays a 1:1 on every device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_chat_created_with_a_two_device_account_adds_both_and_stays_direct() {
+    let dir = tempfile::tempdir().unwrap();
+    let bob_dirs = [tempfile::tempdir().unwrap()];
+    let alice_dirs = [tempfile::tempdir().unwrap()];
+    let home = AccountHome::open(dir.path());
+    let alice_id = home.create_account("alice").unwrap().account_id_hex;
+    let bob_id = home.create_account("bob").unwrap().account_id_hex;
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = app_at(&dir, relay.clone());
+    remember_test_member_inbox(&app, &bob_id, "wss://relay.example");
+    remember_test_member_inbox(&app, &alice_id, "wss://relay.example");
+    let (mut bobs, bob_apps, bob_key_packages) =
+        devices_with_key_packages(&app, &home, "bob", &bob_dirs, &relay).await;
+    // Alice's other device has a published KeyPackage too.
+    let (mut alices, _alice_apps, _) =
+        devices_with_key_packages(&app, &home, "alice", &alice_dirs, &relay).await;
+    let alice = &mut alices[0];
+
+    let before = relay.published_events.lock().unwrap().len();
+    let group = alice.create_group("", &[&bob_id]).await.unwrap();
+    let published = relay.published_events.lock().unwrap()[before..].to_vec();
+    let mut expected_key_packages = bob_key_packages;
+    expected_key_packages.sort();
+    assert_eq!(
+        welcome_rumor_key_packages(&home, "bob", &published),
+        expected_key_packages
+    );
+    assert!(
+        welcome_rumor_key_packages(&home, "alice", &published).is_empty(),
+        "the creator's own other device stays out"
+    );
+
+    for bob in &mut bobs {
+        let mut cursor = 0;
+        deliver_new(bob, &relay, &mut cursor).await;
+        bob.sync().await.unwrap();
+        bob.accept_group_invite(&group).unwrap();
+    }
+    let two_devices = sorted(vec![(alice_id.clone(), 1), (bob_id.clone(), 2)]);
+    for (app, client, peer) in [
+        (&app, &*alice, &bob_id),
+        (&bob_apps[0], &bobs[0], &alice_id),
+        (&bob_apps[1], &bobs[1], &alice_id),
+    ] {
+        let label = client.state.label.clone();
+        assert_eq!(member_view(client, &group), two_devices, "{label}");
+        assert_eq!(
+            conversation_kind(app, &label, &group),
+            crate::ChatConversationKind::Direct,
+            "{label}"
+        );
+        assert_eq!(
+            presentation_peer(app, &label, &group).as_ref(),
+            Some(peer),
+            "{label}"
+        );
+    }
 }
 
 fn conversation_kind(app: &MarmotApp, label: &str, group: &GroupId) -> crate::ChatConversationKind {

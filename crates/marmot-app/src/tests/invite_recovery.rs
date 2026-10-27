@@ -98,10 +98,11 @@ async fn invite_recovery_supports_prewarm_and_multi_member_lookup() {
                 .iter()
                 .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
     }));
+    // Deletion proofs read only deletions; KeyPackage reads carry their own.
     assert!(
         requests
             .iter()
-            .filter(|request| request.queries.iter().any(|query| query.kind == 5))
+            .filter(|request| request.queries.iter().all(|query| query.kind == 5))
             .all(|request| request
                 .endpoints
                 .contains(&TransportEndpoint(OUTBOX.into()))
@@ -131,7 +132,7 @@ async fn invite_recovery_keeps_advertised_success_free_of_supplementary_reads() 
         assert!(
             !requests
                 .iter()
-                .any(|r| r.queries.iter().any(|q| q.kind == 5))
+                .any(|r| r.queries.iter().all(|q| q.kind == 5))
         );
         assert!(!requests.iter().any(
             |r| r.endpoints.contains(&TransportEndpoint(DISCOVERY.into()))
@@ -149,7 +150,7 @@ async fn invite_recovery_keeps_advertised_success_free_of_supplementary_reads() 
     assert!(
         !requests
             .iter()
-            .any(|request| request.queries.iter().any(|query| query.kind == 5))
+            .any(|request| request.queries.iter().all(|query| query.kind == 5))
     );
     assert!(!requests.iter().any(|request| {
         request
@@ -345,7 +346,9 @@ async fn invite_recovery_ignores_many_unrelated_deletions() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|request| request.queries.iter().any(|q| q.kind == 5))
+            // KeyPackage reads carry their own deletion query; the proofs
+            // are the requests that read only deletions.
+            .filter(|request| request.queries.iter().all(|q| q.kind == 5))
             .all(|request| request.queries.len() == 2
                 && request
                     .queries
@@ -1192,18 +1195,15 @@ async fn assert_recovery_keeps_checked_candidate_across_clock_boundary(membershi
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        crate::key_package_records::preferred_fresh_key_package_from_records(
+        crate::key_package_records::select_key_packages_from_records(
             &account.account_id_hex,
             &records,
             app.directory().directory_freshness_for_test(),
             None,
-            &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
         .unwrap()
-        .value
-        .unwrap()
-        .fetched
-        .key_package_event_id,
+        .value[0]
+            .key_package_event_id,
         future.id
     );
     release.notify_one();
@@ -1245,10 +1245,12 @@ async fn invite_recovery_direct_lookup_keeps_checked_candidate_across_clock_boun
     assert_recovery_keeps_checked_candidate_across_clock_boundary(false).await;
 }
 
-fn package_expiring_at(
+/// A KeyPackage for a new device of `account`, valid until `expires`.
+pub(super) fn package_expiring_at(
     app: &MarmotApp,
     account: &AccountSummary,
     expires: u64,
+    last_resort: bool,
 ) -> cgka_traits::engine::KeyPackage {
     use cgka_engine::account_identity_proof::account_identity_proof_component;
     use cgka_traits::app_components::{
@@ -1263,6 +1265,10 @@ fn package_expiring_at(
     use openmls_basic_credential::SignatureKeyPair;
     use tls_codec::Serialize;
 
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
     let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
     let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
@@ -1276,7 +1282,7 @@ fn package_expiring_at(
         &signer.to_public_vec(),
         ciphersuite,
         ciphersuite.signature_algorithm(),
-        expires.saturating_sub(10),
+        now,
         proof_signer.as_ref(),
     )
     .unwrap();
@@ -1290,7 +1296,7 @@ fn package_expiring_at(
     );
     dictionary.insert(ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, proof);
     let proof = Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary));
-    let bundle = MlsKeyPackage::builder()
+    let mut builder = MlsKeyPackage::builder()
         .leaf_node_capabilities(Capabilities::new(
             None,
             Some(&[ciphersuite]),
@@ -1299,8 +1305,11 @@ fn package_expiring_at(
             None,
         ))
         .leaf_node_extensions(Extensions::single(proof).unwrap())
-        .key_package_lifetime(Lifetime::init(expires.saturating_sub(3600), expires))
-        .mark_as_last_resort()
+        .key_package_lifetime(Lifetime::init(now.saturating_sub(3600), expires));
+    if last_resort {
+        builder = builder.mark_as_last_resort();
+    }
+    let bundle = builder
         .build(
             ciphersuite,
             &provider,
@@ -1325,12 +1334,13 @@ async fn assert_recovery_does_not_switch_after_mls_expiry(membership: bool) {
         .unwrap()
         .as_secs()
         + 10;
-    let mut checked =
-        member_resolution_key_package_event(account, package_expiring_at(&app, account, expires));
+    let mut checked = member_resolution_key_package_event(
+        account,
+        package_expiring_at(&app, account, expires, true),
+    );
     checked.tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = "expiring-checked-slot".into();
-    checked
-        .tags
-        .push(vec!["client".into(), "WhiteNoise".into()]);
+    // The newer publication ranks first, so it is the one proven first.
+    checked.created_at = alternative.created_at + 1;
     alternative
         .tags
         .iter_mut()
@@ -1377,18 +1387,15 @@ async fn assert_recovery_does_not_switch_after_mls_expiry(membership: bool) {
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        crate::key_package_records::preferred_fresh_key_package_from_records(
+        crate::key_package_records::select_key_packages_from_records(
             &account.account_id_hex,
             &records,
             app.directory().directory_freshness_for_test(),
             None,
-            &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
         .unwrap()
-        .value
-        .unwrap()
-        .fetched
-        .key_package_event_id,
+        .value[0]
+            .key_package_event_id,
         checked.id
     );
     let (entered, release) = fetcher.hold_fetches_for_kind(5);
@@ -1420,18 +1427,15 @@ async fn assert_recovery_does_not_switch_after_mls_expiry(membership: bool) {
         .as_secs();
     sleep(Duration::from_secs(expires.saturating_sub(now) + 1)).await;
     assert_eq!(
-        crate::key_package_records::preferred_fresh_key_package_from_records(
+        crate::key_package_records::select_key_packages_from_records(
             &account.account_id_hex,
             &records,
             app.directory().directory_freshness_for_test(),
             None,
-            &crate::MarmotDeployment::white_noise().key_package_client_preference,
         )
         .unwrap()
-        .value
-        .unwrap()
-        .fetched
-        .key_package_event_id,
+        .value[0]
+            .key_package_event_id,
         alternative.id
     );
     release.notify_one();
@@ -1446,18 +1450,19 @@ async fn assert_recovery_does_not_switch_after_mls_expiry(membership: bool) {
         "expiry must fail closed rather than return an unchecked, revoked slot"
     );
     let requests = fetcher.requests.lock().unwrap();
-    assert!(
-        !requests
-            .iter()
-            .flat_map(|request| &request.queries)
-            .any(|query| {
-                query.kind == 5
-                    && query
-                        .reference
-                        .as_ref()
-                        .is_some_and(|(name, value)| *name == 'e' && value == &alternative.id)
-            })
-    );
+    let alternative_proven = requests
+        .iter()
+        .flat_map(|request| &request.queries)
+        .any(|query| {
+            query.kind == 5
+                && query
+                    .reference
+                    .as_ref()
+                    .is_some_and(|(name, value)| *name == 'e' && value == &alternative.id)
+        });
+    // An invite proves every selected device's package, so it finds the
+    // alternative revoked; the direct lookup wants one and never checks it.
+    assert_eq!(alternative_proven, membership);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

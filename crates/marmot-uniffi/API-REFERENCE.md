@@ -4745,9 +4745,9 @@ pub fn marmot_deployment_neutral() -> MarmotDeploymentFfi
 
 **Current free function.** Generated Swift/Kotlin name: `marmotDeploymentNeutral`. **C:** `marmot_deployment_neutral`.
 
-A deployment with no services: recovery requires every relay on a route, onboarding searches only the host's discovery relays, there is no Open Ranking tier or KeyPackage client preference, moderation reporting refuses a destination, and the keychain service is `org.marmot-protocol.mdk`. With no media servers new groups stay text-only, and with no group-image server group images are refused. Start here and fill in the services your deployment operates.
+A deployment with no services: recovery requires every relay on a route, onboarding searches only the host's discovery relays, there is no Open Ranking tier, moderation reporting refuses a destination, and the keychain service is `org.marmot-protocol.mdk`. With no media servers new groups stay text-only, and with no group-image server group images are refused. Start here and fill in the services your deployment operates.
 
-[Source](src/deployment.rs#L109)
+[Source](src/deployment.rs#L99)
 
 ### `marmot_deployment_white_noise`
 
@@ -4757,9 +4757,9 @@ pub fn marmot_deployment_white_noise() -> MarmotDeploymentFfi
 
 **Current free function.** Generated Swift/Kotlin name: `marmotDeploymentWhiteNoise`. **C:** `marmot_deployment_white_noise`.
 
-White Noise's deployment: its recovery relays, discovery indexers, media and image servers, Vertex Open Ranking, KeyPackage client preference, moderation label namespace and keychain service `com.marmot.whitenoise`. White Noise apps pass it to every constructor. Keep `keychain_service` unchanged for an existing install, or its account secrets are stranded.
+White Noise's deployment: its recovery relays, discovery indexers, media and image servers, Vertex Open Ranking, moderation label namespace and keychain service `com.marmot.whitenoise`. White Noise apps pass it to every constructor. Keep `keychain_service` unchanged for an existing install, or its account secrets are stranded.
 
-[Source](src/deployment.rs#L100)
+[Source](src/deployment.rs#L90)
 
 </details>
 

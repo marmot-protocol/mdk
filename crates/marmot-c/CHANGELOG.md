@@ -7,6 +7,12 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- `marmot_deployment_set_key_package_client_preference` is removed
+  (mdk#2628): the KeyPackage `client` tag no longer ranks invite candidates.
+  Drop the call and use matching regenerated headers and libraries.
+
 ### Added
 
 - Add `MARMOT_STATUS_MEDIA_REFERENCE_STALE_EPOCH` (108): the group left the
@@ -18,6 +24,9 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- Creating a group or inviting adds every device of each recipient account
+  (mdk#2628, mdk#1696): every valid, compatible KeyPackage published in the
+  last 30 days, at most 20, or the single best one when none is that recent.
 - Group member rows are accounts, not devices (mdk#2628).
   `MarmotAppGroupMemberRecord` and `MarmotGroupMemberDetails` gain
   `device_count`, and an account with several devices in the group is one

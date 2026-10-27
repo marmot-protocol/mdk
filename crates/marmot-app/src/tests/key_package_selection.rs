@@ -1,5 +1,7 @@
+use super::invite_recovery::package_expiring_at;
 use super::*;
-use crate::key_package_records::preferred_fresh_key_package_from_records;
+use crate::key_package_records::select_key_packages_from_records;
+use nostr_directory::{KEY_PACKAGE_FRESHNESS, KeyPackageSelection, MAX_KEY_PACKAGES_PER_ACCOUNT};
 
 fn candidate(
     account: &AccountSummary,
@@ -17,106 +19,360 @@ fn candidate(
     NostrTransportEvent::new_unsigned_at(event.pubkey, event.kind, tags, event.content, timestamp)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn client_preference_ranks_only_valid_current_slots_and_preserves_recency() {
-    let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
-    let account = &accounts[0];
-    let package = fresh_key_package_for_account(&app, account, false).await;
-    let now = unix_now_seconds();
-    let amethyst = candidate(
-        account,
-        package.clone(),
-        "amethyst",
-        Some("  AmEtHySt\t"),
-        now,
-    );
-    let untagged = candidate(account, package.clone(), "untagged", None, now - 10);
-    let other = candidate(account, package.clone(), "other", Some("other"), now - 20);
-    let white = candidate(
-        account,
-        package.clone(),
-        "white",
-        Some("  WHITEnoise "),
-        now - 30,
-    );
-    let newest_white = candidate(
-        account,
-        package.clone(),
-        "white-two",
-        Some("whitenoise"),
-        now - 5,
-    );
-    let select = |events: Vec<NostrTransportEvent>| {
-        preferred_fresh_key_package_from_records(
-            &account.account_id_hex,
-            &events
-                .into_iter()
-                .map(|event| RelayEventRecord {
-                    event,
-                    endpoints: vec![],
-                })
-                .collect::<Vec<_>>(),
-            app.directory().directory_freshness_for_test(),
-            None,
-            &crate::MarmotDeployment::white_noise().key_package_client_preference,
-        )
+/// A package for a new device: its own leaf signature key, valid for the test.
+fn device_package(app: &MarmotApp, account: &AccountSummary, last_resort: bool) -> KeyPackage {
+    package_expiring_at(app, account, unix_now_seconds() + 3_000, last_resort)
+}
+
+fn select(
+    app: &MarmotApp,
+    account: &AccountSummary,
+    events: &[&NostrTransportEvent],
+) -> Result<KeyPackageSelection, DirectoryError> {
+    let records = events
+        .iter()
+        .map(|event| RelayEventRecord {
+            event: (*event).clone(),
+            endpoints: vec![],
+        })
+        .collect::<Vec<_>>();
+    select_key_packages_from_records(
+        &account.account_id_hex,
+        &records,
+        app.directory().directory_freshness_for_test(),
+        None,
+    )
+}
+
+fn selected(
+    app: &MarmotApp,
+    account: &AccountSummary,
+    events: &[&NostrTransportEvent],
+) -> Vec<String> {
+    select(app, account, events)
         .unwrap()
         .value
-        .unwrap()
-        .fetched
-        .key_package_event_id
-    };
-    assert_eq!(select(vec![amethyst.clone()]), amethyst.id);
-    assert_eq!(
-        select(vec![amethyst.clone(), untagged.clone()]),
-        untagged.id
+        .into_iter()
+        .map(|fetched| fetched.key_package_event_id)
+        .collect()
+}
+
+fn ids(events: &[&NostrTransportEvent]) -> Vec<String> {
+    events.iter().map(|event| event.id.clone()).collect()
+}
+
+fn signed_deletion(
+    app: &MarmotApp,
+    account: &AccountSummary,
+    tags: Vec<Vec<String>>,
+    created_at: u64,
+) -> NostrTransportEvent {
+    let event = EventBuilder::new(Kind::from(5), "")
+        .tags(tags.into_iter().map(|tag| Tag::parse(tag).unwrap()))
+        .custom_created_at(NostrTimestamp::from_secs(created_at))
+        .finalize(
+            &app.account_home()
+                .load_signing_keys(&account.label)
+                .unwrap(),
+        )
+        .unwrap();
+    NostrTransportEvent::from_nostr_event(&event).unwrap()
+}
+
+fn slot_address(account: &AccountSummary, slot: &str) -> Vec<String> {
+    vec![
+        "a".into(),
+        format!(
+            "{KIND_MARMOT_KEY_PACKAGE}:{}:{slot}",
+            account.account_id_hex
+        ),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_fresh_device_slot_is_selected_newest_first() {
+    let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let now = unix_now_seconds();
+    // The client tag no longer ranks anything.
+    let phone = candidate(
+        account,
+        device_package(&app, account, true),
+        "phone",
+        Some("amethyst"),
+        now,
     );
-    assert_eq!(
-        select(vec![other.clone(), untagged.clone(), amethyst.clone()]),
-        untagged.id
+    let laptop = candidate(
+        account,
+        device_package(&app, account, true),
+        "laptop",
+        Some("whitenoise"),
+        now - 10,
     );
-    assert_eq!(
-        select(vec![
-            other.clone(),
-            white.clone(),
-            amethyst.clone(),
-            untagged.clone()
-        ]),
-        white.id
+    let tablet = candidate(
+        account,
+        device_package(&app, account, true),
+        "tablet",
+        None,
+        now - 20,
     );
+    let expected = ids(&[&phone, &laptop, &tablet]);
     assert_eq!(
-        select(vec![white.clone(), newest_white.clone()]),
-        newest_white.id
+        selected(&app, account, &[&tablet, &phone, &laptop]),
+        expected
     );
-    let mut invalid = newest_white.clone();
-    invalid.content = "not base64".into();
-    assert_eq!(select(vec![amethyst.clone(), invalid]), amethyst.id);
-    let mut future = newest_white.clone();
+    // Malformed and future-dated slots are skipped, not fatal.
+    let mut malformed = candidate(
+        account,
+        device_package(&app, account, true),
+        "malformed",
+        None,
+        now,
+    );
+    malformed.content = "not base64".into();
+    let mut future = candidate(
+        account,
+        device_package(&app, account, true),
+        "future",
+        None,
+        now,
+    );
     future.created_at = u64::MAX;
-    assert_eq!(select(vec![amethyst.clone(), future]), amethyst.id);
-    // A newer replacement in the same slot supersedes the old client label.
-    let replaced = candidate(account, package.clone(), "white", Some("amethyst"), now);
-    assert_eq!(select(vec![white, replaced, untagged.clone()]), untagged.id);
-    // NIP-89 may carry an application reference after the client name.
-    let mut referenced_amethyst = amethyst.clone();
-    referenced_amethyst
+    assert_eq!(
+        selected(
+            &app,
+            account,
+            &[&malformed, &future, &tablet, &phone, &laptop]
+        ),
+        expected
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selection_keeps_the_highest_ranked_slots_up_to_the_cap() {
+    let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let now = unix_now_seconds();
+    let events = (0..MAX_KEY_PACKAGES_PER_ACCOUNT as u64 + 5)
+        .map(|age| {
+            candidate(
+                account,
+                device_package(&app, account, true),
+                &format!("device-{age}"),
+                None,
+                now - age,
+            )
+        })
+        .collect::<Vec<_>>();
+    let all = events.iter().rev().collect::<Vec<_>>();
+    assert_eq!(
+        selected(&app, account, &all),
+        ids(&events
+            .iter()
+            .take(MAX_KEY_PACKAGES_PER_ACCOUNT)
+            .collect::<Vec<_>>())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_slots_are_a_single_fallback_only_when_none_is_fresh() {
+    let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let stale_at = unix_now_seconds() - KEY_PACKAGE_FRESHNESS.as_secs() - 60;
+    let stale = (0..3)
+        .map(|age| {
+            candidate(
+                account,
+                device_package(&app, account, true),
+                &format!("stale-{age}"),
+                None,
+                stale_at - age,
+            )
+        })
+        .collect::<Vec<_>>();
+    let all = stale.iter().collect::<Vec<_>>();
+    assert_eq!(selected(&app, account, &all), ids(&[&stale[0]]));
+    let fresh = candidate(
+        account,
+        device_package(&app, account, true),
+        "fresh",
+        None,
+        unix_now_seconds() - 60,
+    );
+    let mut with_fresh = all.clone();
+    with_fresh.push(&fresh);
+    assert_eq!(selected(&app, account, &with_fresh), ids(&[&fresh]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deletion_by_slot_address_or_event_id_skips_a_slot() {
+    let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let now = unix_now_seconds();
+    let phone = candidate(
+        account,
+        device_package(&app, account, true),
+        "phone",
+        None,
+        now,
+    );
+    let older_laptop = candidate(
+        account,
+        device_package(&app, account, true),
+        "laptop",
+        None,
+        now - 40,
+    );
+    let laptop = candidate(
+        account,
+        device_package(&app, account, true),
+        "laptop",
+        None,
+        now - 10,
+    );
+    let tablet = candidate(
+        account,
+        device_package(&app, account, true),
+        "tablet",
+        None,
+        now - 20,
+    );
+    let slots = [&phone, &older_laptop, &laptop, &tablet];
+    let with = |deletion: &NostrTransportEvent| {
+        let mut events = slots.to_vec();
+        events.push(deletion);
+        selected(&app, account, &events)
+    };
+    let by_id = signed_deletion(&app, account, vec![vec!["e".into(), phone.id.clone()]], now);
+    assert_eq!(with(&by_id), ids(&[&laptop, &tablet]));
+    // A deleted current publication still supersedes its slot's older one.
+    let by_id = signed_deletion(
+        &app,
+        account,
+        vec![vec!["e".into(), laptop.id.clone()]],
+        now,
+    );
+    assert_eq!(with(&by_id), ids(&[&phone, &tablet]));
+    let by_address = signed_deletion(
+        &app,
+        account,
+        vec![slot_address(account, "laptop")],
+        now - 10,
+    );
+    assert_eq!(with(&by_address), ids(&[&phone, &tablet]));
+    // An address deletion covers only publications no newer than itself.
+    let earlier = signed_deletion(
+        &app,
+        account,
+        vec![slot_address(account, "laptop")],
+        now - 30,
+    );
+    assert_eq!(with(&earlier), ids(&[&phone, &laptop, &tablet]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn last_resort_packages_rank_after_the_rest() {
+    let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let now = unix_now_seconds();
+    let last_resort = candidate(
+        account,
+        device_package(&app, account, true),
+        "last-resort",
+        None,
+        now,
+    );
+    let single_use = candidate(
+        account,
+        device_package(&app, account, false),
+        "single-use",
+        None,
+        now - 10,
+    );
+    assert_eq!(
+        selected(&app, account, &[&last_resort, &single_use]),
+        ids(&[&single_use, &last_resort])
+    );
+    // With none fresh, the single fallback is the one that is not last-resort.
+    let stale_at = now - KEY_PACKAGE_FRESHNESS.as_secs() - 60;
+    let mut stale_last_resort = last_resort.clone();
+    stale_last_resort.created_at = stale_at;
+    let mut stale_single_use = single_use.clone();
+    stale_single_use.created_at = stale_at - 10;
+    assert_eq!(
+        selected(&app, account, &[&stale_last_resort, &stale_single_use]),
+        vec![stale_single_use.id.clone()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_device_in_several_slots_is_selected_once() {
+    let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let now = unix_now_seconds();
+    let package = device_package(&app, account, true);
+    let newest = candidate(account, package.clone(), "first", None, now);
+    let older = candidate(account, package, "second", None, now - 10);
+    let other = candidate(
+        account,
+        device_package(&app, account, true),
+        "other",
+        None,
+        now - 20,
+    );
+    // A Commit cannot add two leaves with one signature key.
+    assert_eq!(
+        selected(&app, account, &[&older, &other, &newest]),
+        ids(&[&newest, &other])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn equal_timestamps_rank_by_key_package_ref_and_replace_by_lower_event_id() {
+    let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
+    let account = &accounts[0];
+    let now = unix_now_seconds();
+    let first = candidate(
+        account,
+        device_package(&app, account, true),
+        "first",
+        None,
+        now,
+    );
+    let second = candidate(
+        account,
+        device_package(&app, account, true),
+        "second",
+        None,
+        now,
+    );
+    let reference = |event: &NostrTransportEvent| event.tag_value("i").unwrap().to_owned();
+    let mut expected = [&first, &second];
+    expected.sort_by_key(|event| reference(event));
+    assert_eq!(selected(&app, account, &[&second, &first]), ids(&expected));
+    // Within one slot, the lower event id is the current publication.
+    let mut replacement = second.clone();
+    replacement
         .tags
         .iter_mut()
-        .find(|tag| tag[0] == "client")
-        .unwrap()
-        .push("31990:application:amethyst".into());
+        .find(|tag| tag[0] == "d")
+        .unwrap()[1] = "first".into();
+    let replacement = NostrTransportEvent::new_unsigned_at(
+        replacement.pubkey,
+        replacement.kind,
+        replacement.tags,
+        replacement.content,
+        now,
+    );
+    let lower = if replacement.id < first.id {
+        &replacement
+    } else {
+        &first
+    };
     assert_eq!(
-        select(vec![referenced_amethyst, untagged.clone()]),
-        untagged.id
+        selected(&app, account, &[&first, &replacement]),
+        ids(&[lower])
     );
-    let not_exact = candidate(
-        account,
-        package,
-        "lookalike",
-        Some("whitenoise-other"),
-        now - 25,
-    );
-    assert_eq!(select(vec![not_exact, other.clone()]), other.id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -148,52 +404,27 @@ async fn malformed_replacement_suppresses_older_package_in_the_same_slot() {
         .iter_mut()
         .find(|tag| tag[0] == "i")
         .unwrap()[1] = "incorrect-reference".into();
-    let select = |events: Vec<NostrTransportEvent>| {
-        preferred_fresh_key_package_from_records(
-            &account.account_id_hex,
-            &events
-                .into_iter()
-                .map(|event| RelayEventRecord {
-                    event,
-                    endpoints: vec![],
-                })
-                .collect::<Vec<_>>(),
-            app.directory().directory_freshness_for_test(),
-            None,
-            &crate::MarmotDeployment::white_noise().key_package_client_preference,
-        )
-    };
     for malformed in [bad_content, bad_metadata] {
-        // An independent slot remains usable, but the superseded White Noise
-        // package must never be resurrected when its replacement is invalid.
+        // An independent slot remains usable, but the superseded package must
+        // never be resurrected when its replacement is invalid.
         assert_eq!(
-            select(vec![old.clone(), malformed.clone(), fallback.clone()])
-                .unwrap()
-                .value
-                .unwrap()
-                .fetched
-                .key_package_event_id,
-            fallback.id,
+            selected(&app, account, &[&old, &malformed, &fallback]),
+            vec![fallback.id.clone()],
         );
-        assert!(select(vec![old.clone(), malformed.clone()]).is_err());
+        assert!(select(&app, account, &[&old, &malformed]).is_err());
         // Freshness is checked before replacement: future events cannot hide
         // the current publication.
         let mut future = malformed;
         future.created_at = u64::MAX;
         assert_eq!(
-            select(vec![old.clone(), future])
-                .unwrap()
-                .value
-                .unwrap()
-                .fetched
-                .key_package_event_id,
-            old.id,
+            selected(&app, account, &[&old, &future]),
+            vec![old.id.clone()]
         );
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn client_preference_is_used_in_batch_and_single_author_fallback() {
+async fn every_device_is_resolved_from_a_single_author_read() {
     for (reject_batch, truncate_batch) in [(false, false), (true, false), (false, true)] {
         let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
         fetcher
@@ -206,30 +437,51 @@ async fn client_preference_is_used_in_batch_and_single_author_fallback() {
             .unwrap()
             .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
         for account in &accounts {
-            let package = fresh_key_package_for_account(&app, account, false).await;
-            let white = candidate(
+            let now = unix_now_seconds();
+            let older = candidate(
                 account,
-                package.clone(),
-                "white",
+                device_package(&app, account, true),
+                "older",
                 Some("whitenoise"),
-                unix_now_seconds() - 10,
+                now - 10,
             );
-            let amethyst = candidate(
+            let newer = candidate(
                 account,
-                package,
-                "amethyst",
+                device_package(&app, account, true),
+                "newer",
                 Some("amethyst"),
-                unix_now_seconds(),
+                now,
             );
-            expected.push(white.id.clone());
+            // Deleted by a request that arrives only with the KeyPackage read.
+            let deleted = candidate(
+                account,
+                device_package(&app, account, true),
+                "deleted",
+                None,
+                now,
+            );
+            let deletion = signed_deletion(
+                &app,
+                account,
+                vec![
+                    slot_address(account, "deleted"),
+                    vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+                ],
+                now,
+            );
+            expected.extend([newer.id.clone(), older.id.clone()]);
             if truncate_batch {
                 fetcher
                     .key_packages_only_in_single_author
                     .lock()
                     .unwrap()
-                    .insert(white.id.clone());
+                    .insert(older.id.clone());
             }
-            fetcher.events.lock().unwrap().extend([amethyst, white]);
+            fetcher
+                .events
+                .lock()
+                .unwrap()
+                .extend([newer, older, deleted, deletion]);
         }
         let refs = accounts
             .iter()
@@ -240,18 +492,26 @@ async fn client_preference_is_used_in_batch_and_single_author_fallback() {
             .resolve_member_key_packages(&refs)
             .await
             .unwrap();
-        let single_author_lookups = fetcher
-            .requests
-            .lock()
-            .unwrap()
+        let requests = fetcher.requests.lock().unwrap();
+        let single_author_lookups = requests
             .iter()
-            .flat_map(|request| &request.queries)
-            .filter(|query| query.kind == KIND_MARMOT_KEY_PACKAGE && query.authors.len() == 1)
-            .count();
-        assert_eq!(
-            single_author_lookups,
-            if reject_batch || truncate_batch { 2 } else { 0 }
-        );
+            .filter(|request| {
+                request
+                    .queries
+                    .iter()
+                    .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE && query.authors.len() == 1)
+            })
+            .collect::<Vec<_>>();
+        // A multi-author batch never proves an account's whole slot set, so
+        // a Commit reads every account alone.
+        assert_eq!(single_author_lookups.len(), 2);
+        for request in single_author_lookups {
+            assert!(request.queries.iter().any(|query| {
+                query.kind == 5
+                    && query.reference == Some(('k', KIND_MARMOT_KEY_PACKAGE.to_string()))
+            }));
+        }
+        drop(requests);
         assert_eq!(
             actual
                 .iter()
@@ -263,7 +523,7 @@ async fn client_preference_is_used_in_batch_and_single_author_fallback() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_preference_refetch_preserves_only_usable_current_batch_packages() {
+async fn failed_single_author_refetch_preserves_only_usable_current_batch_packages() {
     for batch_case in ["valid", "absent", "malformed", "incompatible"] {
         let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
         app.account_home().create_account("inviter").unwrap();
@@ -278,8 +538,8 @@ async fn failed_preference_refetch_preserves_only_usable_current_batch_packages(
             .iter()
             .map(|account| account.account_id_hex.as_str())
             .collect::<Vec<_>>();
-        // Ready prewarm reuses the batched existence answer, even for untagged
-        // packages; it must not trigger per-author preference queries.
+        // Ready prewarm reuses the batched existence answer; it must not
+        // trigger per-author queries.
         app.directory()
             .prewarm_group_member_key_packages(&refs)
             .await
@@ -446,7 +706,7 @@ async fn per_author_refetch_preserves_slot_replacements_seen_in_batch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn client_preference_skips_incompatible_whitenoise_for_create_and_invite() {
+async fn incompatible_slot_is_skipped_for_create_and_invite() {
     let (_dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let bob = &accounts[0];
     app.account_home().create_account("alice").unwrap();
@@ -522,7 +782,8 @@ async fn client_preference_skips_incompatible_whitenoise_for_create_and_invite()
         .await
         .unwrap();
     assert_eq!(alice.members(&empty).unwrap().len(), 2);
-    // No compatible candidate means no group mutation, even if White Noise is present.
+    // No compatible candidate means no group mutation, even with a newer
+    // incompatible slot present.
     let no_fallback = alice
         .create_group("no compatible candidate", &[])
         .await
@@ -711,33 +972,14 @@ async fn legacy_slots_never_select_or_mask_current_slots() {
     );
     let mut malformed = current.clone();
     malformed.content = BASE64_STANDARD.encode(b"not a key package");
-    let select = |events: &[&NostrTransportEvent]| {
-        let records = events
-            .iter()
-            .map(|event| RelayEventRecord {
-                event: (*event).clone(),
-                endpoints: vec![],
-            })
-            .collect::<Vec<_>>();
-        preferred_fresh_key_package_from_records(
-            &account.account_id_hex,
-            &records,
-            app.directory().directory_freshness_for_test(),
-            None,
-            &crate::MarmotDeployment::white_noise().key_package_client_preference,
-        )
-    };
+    let select = |events: &[&NostrTransportEvent]| select(&app, account, events);
 
     // A newer legacy slot neither wins nor hides an older current slot.
     let selection = select(&[&legacy, &current]).unwrap();
     assert!(selection.legacy_slots);
+    assert_eq!(selection.value.len(), 1);
     assert_eq!(
-        selection
-            .value
-            .unwrap()
-            .fetched
-            .key_package
-            .protocol_profile,
+        selection.value[0].key_package.protocol_profile,
         cgka_traits::group::ProtocolProfile::Current
     );
     // A current slot's rejection outranks the obsolete diagnosis.
