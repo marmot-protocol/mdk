@@ -51,7 +51,7 @@ use storage_sqlite::{
     MessageFormatPromotionProgress, SqlCipherKey, SqliteAccountStorage, SqliteStorageOptions,
 };
 
-const TRACE_TARGET: &str = "cgka_session::session";
+const TRACE_TARGET: &str = "marmot_session::session";
 
 pub type SessionResult<T> = Result<T, SessionError>;
 

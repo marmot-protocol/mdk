@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-10-17
+updated: 2026-10-27
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -772,7 +772,8 @@ Notable tracing targets currently present:
 | `marmot_app::relay_telemetry_export` | Exporter construction, `export_once`, `run`; fields include `point_count` and safe warning categories. |
 | `marmot_app::audit_log` | Audit tracker scheduling/upload summaries; fields include `trigger`, `skipped_reason`, uploaded/failed counts, and file index. Audit content is not logged. |
 | `marmot_app::runtime` | Startup/shutdown and worker lifecycle; fields include elapsed times and active operation counts. |
-| `cgka_session::session` | Session lifecycle method markers such as open, send, ingest, publish confirmation, and catch-up. |
+| `marmot_session::session` | Session lifecycle method markers such as open, send, ingest, publish confirmation, and catch-up. |
+| `marmot_session::runtime` | Account-device runtime markers and warnings: transport activation, publish-confirmation retries, KeyPackage publication and republication, and due maintenance; fields are counts, attempts, and safe error categories. |
 | `cgka_engine::engine_metrics` | Snapshotting engine metrics. |
 | `cgka_engine::snapshot_guard` | Snapshot retention/cleanup warnings with safe counts/status only. |
 | `marmot_account::*` and `marmot_app::*` | Account/app lifecycle warnings and projection/cache method markers. |
