@@ -577,6 +577,8 @@ pub(crate) struct MemberResolutionDirectoryFetcher {
     failing_endpoint: std::sync::Mutex<Option<String>>,
     failing_endpoint_kind: std::sync::Mutex<Option<u64>>,
     fetch_gate_kind: std::sync::Mutex<Option<u64>>,
+    /// Answer every deletion proof with nothing, as a relay that lost them.
+    pub(crate) empty_deletion_proofs: std::sync::atomic::AtomicBool,
     fetch_gate: std::sync::Mutex<
         Option<(
             std::sync::Arc<tokio::sync::Notify>,
@@ -613,6 +615,37 @@ impl MemberResolutionDirectoryFetcher {
     }
 }
 
+/// The KeyPackage query of a KeyPackage read, checking that the read also
+/// asks for the authors' KeyPackage deletion requests.
+fn key_package_read(
+    request: &transport_nostr::DirectoryFetchRequest,
+) -> &transport_nostr::DirectoryEventQuery {
+    assert_eq!(request.queries.len(), 2, "{:?}", request.queries);
+    let packages = request
+        .queries
+        .iter()
+        .find(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
+        .unwrap();
+    assert!(request.queries.iter().any(|query| {
+        query.kind == 5
+            && query.authors == packages.authors
+            && query.reference == Some(('k', KIND_MARMOT_KEY_PACKAGE.to_string()))
+    }));
+    packages
+}
+
+/// Whether a fixture knob set for `kind` applies to `query`. A kind 5 knob
+/// targets deletion proofs, not the deletion read sent with every KeyPackage
+/// fetch.
+fn targets_kind(query: &transport_nostr::DirectoryEventQuery, kind: Option<u64>) -> bool {
+    Some(query.kind) == kind
+        && (query.kind != 5
+            || query
+                .reference
+                .as_ref()
+                .is_none_or(|(name, _)| *name != 'k'))
+}
+
 #[async_trait]
 impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher {
     async fn fetch_directory_events(
@@ -622,10 +655,11 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
         self.requests.lock().unwrap().push(request.clone());
         let gate = {
             let mut fetch_gate = self.fetch_gate.lock().unwrap();
+            let gate_kind = *self.fetch_gate_kind.lock().unwrap();
             if request
                 .queries
                 .iter()
-                .any(|query| Some(query.kind) == *self.fetch_gate_kind.lock().unwrap())
+                .any(|query| targets_kind(query, gate_kind))
             {
                 fetch_gate.take()
             } else {
@@ -674,6 +708,16 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
                 .any(|endpoint| endpoint.0 == stalled)
         }) {
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if self
+            .empty_deletion_proofs
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && request
+                .queries
+                .iter()
+                .all(|query| targets_kind(query, Some(5)))
+        {
+            return Ok(Vec::new());
         }
         let single_author_only = self.key_packages_only_in_single_author.lock().unwrap();
         let multi_author_only = self.key_packages_only_in_multi_author.lock().unwrap();
@@ -749,7 +793,7 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
                     || request
                         .queries
                         .iter()
-                        .any(|query| Some(query.kind) == incomplete_kind))
+                        .any(|query| targets_kind(query, incomplete_kind)))
                     && request
                         .endpoints
                         .iter()
@@ -9632,7 +9676,7 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
         1,
         "prewarmed routes should avoid repeating discovery"
     );
-    assert_eq!(requests[0].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
+    key_package_read(&requests[0]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9795,7 +9839,7 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     assert_eq!(
         requests.len(),
         3,
-        "prewarm needs discovery, outbox and package batches, without preference refetches"
+        "prewarm needs discovery, outbox and package batches, without single-author reads"
     );
     assert_eq!(requests[0].queries.len(), 2);
     assert!(
@@ -9815,10 +9859,12 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
             .iter()
             .all(|query| query.authors.len() == 8)
     );
-    assert_eq!(requests[2].queries.len(), 1);
-    assert_eq!(requests[2].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
-    assert_eq!(requests[2].queries[0].authors.len(), 8);
-    assert_eq!(requests[2].queries[0].limit, 8 * 12);
+    let packages = key_package_read(&requests[2]);
+    assert_eq!(packages.authors.len(), 8);
+    assert_eq!(
+        packages.limit,
+        transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT
+    );
     drop(requests);
 
     for account in &accounts {
@@ -9841,7 +9887,7 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
         12,
-        "create reuses discovery routes but adds a package batch and eight preference refetches"
+        "create reuses discovery routes but adds a package batch and eight single-author reads"
     );
 }
 
@@ -9911,7 +9957,7 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
         "discovery covers the outbox; prewarm adds only the package batch"
     );
     assert_eq!(requests[0].queries.len(), 2);
-    assert_eq!(requests[1].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
+    key_package_read(&requests[1]);
     assert_eq!(
         app.directory()
             .resolve_member_key_packages(&members)
@@ -9923,7 +9969,7 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
         5,
-        "create adds the package batch and two preference refetches, without relay discovery"
+        "create adds the package batch and two single-author reads, without relay discovery"
     );
 }
 

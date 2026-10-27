@@ -998,6 +998,141 @@ async fn founding_preparation_matches_two_recipients_without_order_inference() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn founding_preparation_records_every_device_of_one_account() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut scenario = Scenario::new().await;
+        let bob_second_dir = tempfile::tempdir().unwrap();
+        let secret = AccountHome::open(scenario._bob_dir.path())
+            .load_signing_keys("bob")
+            .unwrap()
+            .secret_key()
+            .to_secret_hex();
+        AccountHome::open(bob_second_dir.path())
+            .import_account("bob", &secret)
+            .unwrap();
+        let bob_second_app = app(
+            bob_second_dir.path(),
+            &scenario._relay.url().await.to_string(),
+        );
+        let mut bob_second = bob_second_app.client("bob").await.unwrap();
+        bob_second.publish_key_package().await.unwrap();
+        let second_key_package_event_id: [u8; 32] = bob_second
+            .runtime
+            .key_package_maintenance_status()
+            .unwrap()
+            .unwrap()
+            .authored_event_id
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap();
+
+        let group = scenario
+            .alice
+            .create_group_with_initial_source_and_optional_telemetry(
+                "two device preparation",
+                &[&scenario.bob_id],
+                crate::AppCreateGroupOptions::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .group_id;
+        let retained = scenario
+            .alice
+            .runtime
+            .outstanding_welcome_deliveries()
+            .unwrap();
+        assert_eq!(retained.len(), 2);
+        assert!(
+            retained
+                .iter()
+                .all(|(retained_group, _)| *retained_group == group)
+        );
+        let bob_ref =
+            MemberRef::from_member_identity(&hex::decode(&scenario.bob_id).unwrap()).unwrap();
+        let prepared = scenario
+            .sender_capture()
+            .rows
+            .iter()
+            .filter_map(|row| match &row.fields().event {
+                Event::WelcomePrepared(prepared) => Some(prepared),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prepared.len(), 2);
+        assert!(prepared.iter().all(|row| row.recipient_ref == bob_ref));
+        let mut key_packages = prepared
+            .iter()
+            .map(|row| row.key_package_event_ref.clone().unwrap())
+            .collect::<Vec<_>>();
+        key_packages.sort();
+        let mut expected = vec![
+            NostrEventRef::from_validated_event_id(&scenario.key_package_event_id),
+            NostrEventRef::from_validated_event_id(&second_key_package_event_id),
+        ];
+        expected.sort();
+        assert_eq!(key_packages, expected);
+        let mut outer = prepared
+            .iter()
+            .map(|row| row.outer_event_ref.clone().unwrap())
+            .collect::<Vec<_>>();
+        outer.sort();
+        let mut retained_outer = retained
+            .iter()
+            .map(|(_, welcome)| {
+                NostrEventRef::from_validated_event_id(
+                    &<[u8; 32]>::try_from(welcome.id.as_slice()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        retained_outer.sort();
+        assert_eq!(outer, retained_outer);
+        scenario.assert_clean();
+
+        // The create audit counts the person added, not their devices.
+        let rows = scenario
+            .alice
+            .app
+            .audit_log_files()
+            .unwrap()
+            .iter()
+            .flat_map(|file| {
+                std::fs::read_to_string(&file.path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let create = rows
+            .iter()
+            .find(|row| row["event"]["type"] == "create_group_entry")
+            .expect("create_group_entry row");
+        assert_eq!(
+            create["event"]["record_context"]["human_action"]["target_count"],
+            1
+        );
+
+        // One account's KeyPackage repeated is not two devices.
+        let mut repeated = probe_with_ids(0x55, 0x66);
+        let selection = || FoundingSelection {
+            recipient_hex: scenario.bob_id.clone(),
+            key_package_event_id: Some(MessageId::new(scenario.key_package_event_id.to_vec())),
+        };
+        assert!(
+            repeated
+                .begin_founding(vec![selection(), selection()])
+                .is_none()
+        );
+        assert_eq!(repeated.invalid, 1);
+    })
+    .await
+    .expect("bounded two-device preparation");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hash_valid_unsigned_gift_wrap_is_observed_then_rejected_without_inner_refs() {
     tokio::time::timeout(Duration::from_secs(60), async {
         let mut scenario = Scenario::new().await;

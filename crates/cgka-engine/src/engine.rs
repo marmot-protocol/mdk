@@ -1320,9 +1320,10 @@ impl<S: StorageProvider> Engine<S> {
 
     /// Compute per-message recipient expectations for a completed send/create,
     /// derived from authenticated membership: the main message (commit, app
-    /// message, or proposal) targets all OTHER current group members; each
-    /// welcome targets only its added member. Recipients are represented only by
-    /// salted member refs and aggregate counts.
+    /// message, or proposal) targets all OTHER current group members, each
+    /// account once however many devices it has; each welcome targets only its
+    /// added member. Recipients are represented only by salted member refs and
+    /// aggregate counts.
     fn recipient_expectation_records(
         &self,
         group_id: &GroupId,
@@ -1353,7 +1354,12 @@ impl<S: StorageProvider> Engine<S> {
         if let Some((msg, artifact_kind)) = main {
             let self_id = self.identity.self_id();
             let members = self.do_members(group_id).unwrap_or_default();
-            let others: Vec<_> = members.iter().filter(|m| &m.id != self_id).collect();
+            let mut others = Vec::new();
+            for member in &members {
+                if &member.id != self_id && !others.contains(&&member.id) {
+                    others.push(&member.id);
+                }
+            }
             rows.push((
                 hex::encode(msg.id.as_slice()),
                 RecipientExpectation {
@@ -1363,7 +1369,7 @@ impl<S: StorageProvider> Engine<S> {
                     basis_commit_id: None,
                     expected_member_refs: others
                         .iter()
-                        .map(|m| crate::audit_helpers::member_ref_hex(&m.id))
+                        .map(|id| crate::audit_helpers::member_ref_hex(id))
                         .collect(),
                     expected_count: Some(others.len() as u64),
                 },

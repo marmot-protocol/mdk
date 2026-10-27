@@ -1,8 +1,10 @@
 //! The KeyPackage `client` tag: the sender's bounds, the shared reader at each
-//! place MDK reads the tag, and no other published event shape carrying it.
+//! place MDK reads the tag, selection ignoring it, and no other published event
+//! shape carrying it.
 
+use super::invite_recovery::package_expiring_at;
 use super::*;
-use crate::key_package_records::preferred_fresh_key_package_from_records;
+use crate::key_package_records::select_key_packages_from_records;
 use std::collections::BTreeSet;
 use transport_nostr_adapter::{CLIENT_NAME_MAX_BYTES, CLIENT_TAG};
 
@@ -176,18 +178,16 @@ async fn signed_retry_reads_its_client_tag_through_the_shared_reader() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn selection_reads_the_client_tag_through_the_shared_reader() {
+async fn selection_ignores_the_client_tag() {
     let (_dir, app, accounts, _) = member_resolution_fixture(1, false).await;
     let account = &accounts[0];
-    let package = fresh_key_package_for_account(&app, account, false).await;
-    // Ranking an over-long name last shows whether it was read at all.
-    let preference = crate::KeyPackageClientPreference {
-        preferred: Vec::new(),
-        last: vec!["amethyst".into(), overlong_name()],
-    };
     let now = unix_now_seconds();
     let slot_event = |slot: &str, client_tags: Vec<Vec<String>>, created_at: u64| {
-        let event = member_resolution_key_package_event(account, package.clone());
+        // Each slot is its own device, so neither collapses into the other.
+        let event = member_resolution_key_package_event(
+            account,
+            package_expiring_at(&app, account, now + 3_000, true),
+        );
         let mut tags = event.tags;
         tags.iter_mut().find(|tag| tag[0] == "d").unwrap()[1] = slot.into();
         tags.extend(client_tags);
@@ -200,7 +200,7 @@ async fn selection_reads_the_client_tag_through_the_shared_reader() {
         )
     };
     let select = |events: Vec<NostrTransportEvent>| {
-        preferred_fresh_key_package_from_records(
+        select_key_packages_from_records(
             &account.account_id_hex,
             &events
                 .into_iter()
@@ -211,43 +211,31 @@ async fn selection_reads_the_client_tag_through_the_shared_reader() {
                 .collect::<Vec<_>>(),
             app.directory().directory_freshness_for_test(),
             None,
-            &preference,
         )
         .unwrap()
         .value
-        .unwrap()
-        .fetched
-        .key_package_event_id
+        .into_iter()
+        .map(|fetched| fetched.key_package_event_id)
+        .collect::<Vec<_>>()
     };
     let untagged = slot_event("untagged", Vec::new(), now - 10);
-
-    for tags in [
+    let mut every_shape = vec![
         vec![client_tag(&["amethyst"])],
         vec![client_tag(&[
             "amethyst",
             "31990:abc:app",
             "wss://hint.example",
         ])],
-    ] {
+    ];
+    every_shape.extend(unreadable_client_tags("amethyst"));
+    for tags in every_shape {
+        // Neither a readable nor an unreadable tag rejects the package or
+        // moves it: recency alone ranks the two devices.
         let labelled = slot_event("labelled", tags.clone(), now);
-        assert_eq!(select(vec![labelled.clone()]), labelled.id, "{tags:?}");
         assert_eq!(
-            select(vec![labelled, untagged.clone()]),
-            untagged.id,
-            "{tags:?} names a client ranked last"
-        );
-    }
-    for tags in unreadable_client_tags("amethyst") {
-        let unlabelled = slot_event("unlabelled", tags.clone(), now);
-        assert_eq!(
-            select(vec![unlabelled.clone()]),
-            unlabelled.id,
-            "{tags:?} must not reject the KeyPackage"
-        );
-        assert_eq!(
-            select(vec![unlabelled.clone(), untagged.clone()]),
-            unlabelled.id,
-            "{tags:?} must read as no tag, leaving recency to decide"
+            select(vec![untagged.clone(), labelled.clone()]),
+            vec![labelled.id.clone(), untagged.id.clone()],
+            "{tags:?}"
         );
     }
 }

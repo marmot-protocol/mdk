@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT;
+use transport_nostr_adapter::{KIND_MARMOT_KEY_PACKAGE, RELAY_REPLAY_PAGE_LIMIT};
 use transport_nostr_peeler::{NostrTransportEvent, SdkSigner};
 
 use super::DIRECTORY_RELAY_CONNECT_WAIT;
@@ -242,6 +242,15 @@ impl DirectoryEventQuery {
         query
     }
 
+    /// The authors' kind 5 deletion requests that name kind `30443` in a `k`
+    /// tag, read alongside their KeyPackages. `k` is only a fetch filter: a
+    /// request without it is still honoured when another lookup finds it.
+    pub fn key_package_deletions(authors: Vec<String>, limit: usize) -> Self {
+        let mut query = Self::new(5, authors, limit);
+        query.reference = Some(('k', KIND_MARMOT_KEY_PACKAGE.to_string()));
+        query
+    }
+
     fn validate_reference(&self) -> Result<(), String> {
         let Some((name, value)) = &self.reference else {
             return if self.since.is_none() {
@@ -250,6 +259,13 @@ impl DirectoryEventQuery {
                 Err("invalid directory since constraint".into())
             };
         };
+        if self.kind == 5
+            && *name == 'k'
+            && self.since.is_none()
+            && *value == KIND_MARMOT_KEY_PACKAGE.to_string()
+        {
+            return Ok(());
+        }
         if self.kind != 5 || self.authors.len() != 1 {
             return Err("invalid deletion query scope".into());
         }
@@ -1851,6 +1867,37 @@ mod tests {
                 Some(1),
             ),
         ] {
+            assert!(DirectoryFetchRequest::new(endpoint.clone(), vec![invalid]).is_err());
+        }
+    }
+
+    #[test]
+    fn key_package_deletion_query_spans_authors_and_matches_only_kind_tagged_requests() {
+        use nostr_sdk::prelude::{EventBuilder, Keys, Tag};
+        let (alice, bob) = (Keys::generate(), Keys::generate());
+        let authors = vec![alice.public_key().to_hex(), bob.public_key().to_hex()];
+        let query = DirectoryEventQuery::key_package_deletions(authors, 8);
+        let endpoint = vec![TransportEndpoint("wss://relay.example".into())];
+        assert!(DirectoryFetchRequest::new(endpoint.clone(), vec![query.clone()]).is_ok());
+        let deletion = |keys: &Keys, kind: &str| {
+            EventBuilder::new(Kind::from(5), "")
+                .tags([
+                    Tag::custom("e", ["12".repeat(32)]),
+                    Tag::custom("k", [kind]),
+                ])
+                .finalize(keys)
+                .unwrap()
+        };
+        assert!(validated_directory_event(&deletion(&alice, "30443"), &query).is_some());
+        assert!(validated_directory_event(&deletion(&bob, "30443"), &query).is_some());
+        assert!(validated_directory_event(&deletion(&bob, "1"), &query).is_none());
+        let stranger = deletion(&Keys::generate(), "30443");
+        assert!(validated_directory_event(&stranger, &query).is_none());
+        let mut other_kind = query.clone();
+        other_kind.reference = Some(('k', "1".into()));
+        let mut bounded = query;
+        bounded.since = Some(1);
+        for invalid in [other_kind, bounded] {
             assert!(DirectoryFetchRequest::new(endpoint.clone(), vec![invalid]).is_err());
         }
     }

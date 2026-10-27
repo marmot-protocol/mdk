@@ -1,7 +1,7 @@
 //! The deployment record a host passes at construction. It mirrors
 //! `marmot_app::MarmotDeployment`.
 
-use marmot_app::{KeyPackageClientPreference, MarmotDeployment, OpenRankingProvider};
+use marmot_app::{MarmotDeployment, OpenRankingProvider};
 
 /// An Open Ranking pubkey-search endpoint and the relays that hydrate its
 /// results into signed kind-0 profiles. With no profile relay the tier is off.
@@ -34,10 +34,6 @@ pub struct MarmotDeploymentFfi {
     pub profile_image_endpoint: Option<String>,
     /// Optional Open Ranking discovery tier for directory search.
     pub open_ranking: Option<OpenRankingProviderFfi>,
-    /// KeyPackage `client` tags ranked first, case-insensitively.
-    pub key_package_preferred_clients: Vec<String>,
-    /// KeyPackage `client` tags ranked last, case-insensitively.
-    pub key_package_last_clients: Vec<String>,
     /// NIP-32 namespace on moderation report labels. The operator's report
     /// parser matches it; reporting refuses a destination while it is unset.
     pub moderation_label_namespace: Option<String>,
@@ -61,8 +57,6 @@ impl From<MarmotDeployment> for MarmotDeploymentFfi {
                     search_endpoint: provider.search_endpoint,
                     profile_relays: provider.profile_relays,
                 }),
-            key_package_preferred_clients: deployment.key_package_client_preference.preferred,
-            key_package_last_clients: deployment.key_package_client_preference.last,
             moderation_label_namespace: deployment.moderation_label_namespace,
             keychain_service: deployment.keychain_service,
         }
@@ -81,10 +75,6 @@ impl From<MarmotDeploymentFfi> for MarmotDeployment {
                 search_endpoint: provider.search_endpoint,
                 profile_relays: provider.profile_relays,
             }),
-            key_package_client_preference: KeyPackageClientPreference {
-                preferred: deployment.key_package_preferred_clients,
-                last: deployment.key_package_last_clients,
-            },
             moderation_label_namespace: deployment.moderation_label_namespace,
             keychain_service: deployment.keychain_service,
         }
@@ -93,8 +83,8 @@ impl From<MarmotDeploymentFfi> for MarmotDeployment {
 }
 
 /// White Noise's deployment: its recovery relays, discovery indexers, media
-/// and image servers, Vertex Open Ranking, KeyPackage client preference,
-/// moderation label namespace and keychain service `com.marmot.whitenoise`.
+/// and image servers, Vertex Open Ranking, moderation label namespace and
+/// keychain service `com.marmot.whitenoise`.
 /// White Noise apps pass it to every constructor.
 #[uniffi::export]
 pub fn marmot_deployment_white_noise() -> MarmotDeploymentFfi {

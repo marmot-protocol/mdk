@@ -250,6 +250,10 @@ impl AppClient {
                 }
                 Err(error) => return Err(error.into()),
             };
+            // Only accounts with no device on the canonical roster are looked
+            // up again. A lost device of an account still in the group, or one
+            // left out below, is reported by the engine as needing a new
+            // invite (mdk#2628, D13).
             let mut members = Vec::new();
             for package in key_packages {
                 let metadata = self
@@ -278,7 +282,7 @@ impl AppClient {
                         }
                         Err(_) => break,
                     };
-                    match self
+                    let resolved = match self
                         .app
                         .directory()
                         .resolve_compatible_member_key_packages(
@@ -290,7 +294,28 @@ impl AppClient {
                     {
                         Ok(resolved) => resolved.key_packages,
                         Err(_) => break,
+                    };
+                    let refs = |package: &cgka_traits::engine::KeyPackage| {
+                        self.runtime
+                            .key_package_metadata(package)
+                            .map(|metadata| {
+                                (
+                                    metadata.credential_identity_hex,
+                                    metadata.key_package_ref_hex,
+                                )
+                            })
+                            .map_err(marmot_session::SessionError::from)
+                    };
+                    let consumed = key_packages
+                        .iter()
+                        .map(|package| refs(package).map(|(_, reference)| reference))
+                        .collect::<Result<HashSet<_>, _>>()?;
+                    let mut tagged = Vec::with_capacity(resolved.len());
+                    for package in resolved {
+                        let (account, reference) = refs(&package)?;
+                        tagged.push((account, consumed.contains(&reference), package));
                     }
+                    without_consumed_packages(tagged)
                 };
             match self
                 .runtime
@@ -318,5 +343,43 @@ impl AppClient {
             break;
         }
         Ok(())
+    }
+}
+
+/// The lost invite consumed its packages, and the engine refuses to reissue
+/// one. A device that has not replaced its consumed package sits the reissue
+/// out while another device of its account can join, and the engine reports
+/// that device as needing a new invite. An account left with
+/// only consumed packages keeps them, so the reissue waits for a replacement
+/// as it does for a single-device account.
+fn without_consumed_packages<T>(packages: Vec<(String, bool, T)>) -> Vec<T> {
+    let joinable = packages
+        .iter()
+        .filter(|(_, consumed, _)| !consumed)
+        .map(|(account, _, _)| account.clone())
+        .collect::<HashSet<_>>();
+    packages
+        .into_iter()
+        .filter(|(account, consumed, _)| !consumed || !joinable.contains(account))
+        .map(|(_, _, package)| package)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::without_consumed_packages;
+
+    #[test]
+    fn a_device_with_a_consumed_package_sits_out_while_its_account_can_join() {
+        let package = |account: &str, consumed, name| (account.to_owned(), consumed, name);
+        assert_eq!(
+            without_consumed_packages(vec![
+                package("bob", false, "bob laptop"),
+                package("bob", true, "bob phone"),
+                package("carol", true, "carol phone"),
+                package("dave", false, "dave phone"),
+            ]),
+            vec!["bob laptop", "carol phone", "dave phone"]
+        );
     }
 }

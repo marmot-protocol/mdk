@@ -61,6 +61,12 @@ pub struct KeyPackageMetadata {
     pub mls_extensions: Vec<u16>,
     pub mls_proposals: Vec<u16>,
     pub app_components: Vec<u16>,
+    /// The embedded LeafNode's MLS signature public key. RFC 9420 keeps it
+    /// unique among a group's leaves, so one Commit cannot add two
+    /// KeyPackages that share it.
+    pub leaf_signature_key: Vec<u8>,
+    /// Whether the KeyPackage is marked last-resort.
+    pub last_resort: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -166,6 +172,8 @@ pub fn key_package_metadata(kp: &KeyPackage) -> Result<KeyPackageMetadata, Engin
         mls_extensions: capabilities.extensions.into_iter().collect(),
         mls_proposals: capabilities.proposals.into_iter().collect(),
         app_components: capabilities.app_components.ids.into_iter().collect(),
+        leaf_signature_key: key_package.leaf_node().signature_key().as_slice().to_vec(),
+        last_resort: key_package.last_resort(),
     })
 }
 

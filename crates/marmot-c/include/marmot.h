@@ -10289,17 +10289,6 @@ MarmotStatus marmot_deployment_set_open_ranking(struct MarmotDeployment *deploym
                                                 uintptr_t profile_relays_len);
 
 /**
- * Replace the KeyPackage `client` tags ranked first and ranked last.
- * # Safety
- * deployment must be live; each list must point to its length of valid strings (or be NULL with 0).
- */
-MarmotStatus marmot_deployment_set_key_package_client_preference(struct MarmotDeployment *deployment,
-                                                                 const char *const *preferred,
-                                                                 uintptr_t preferred_len,
-                                                                 const char *const *last,
-                                                                 uintptr_t last_len);
-
-/**
  * Set the NIP-32 namespace on moderation report labels; NULL unsets it, and
  * reporting then refuses a destination.
  * # Safety

@@ -223,9 +223,21 @@ impl<S: StorageProvider> Engine<S> {
             &mut required,
             &crate::capability_manager::required_role_capabilities_from_group(&mls_group),
         );
+        // A device already in the group is skipped rather than added again:
+        // its new leaf would repeat a signature key, and OpenMLS refuses the
+        // whole Commit. So is a second package from one device in this invite.
+        let current_members = crate::group_lifecycle::marmot_members(&mls_group);
+        let mut signature_keys = current_members
+            .iter()
+            .map(|member| member.credential.clone())
+            .collect::<HashSet<_>>();
+        let mut source_kps = Vec::with_capacity(key_packages.len());
         let mut parsed_kps = Vec::with_capacity(key_packages.len());
-        for kp in &key_packages {
-            let parsed = self.parse_key_package(kp)?;
+        for kp in key_packages {
+            let parsed = self.parse_key_package(&kp)?;
+            if !signature_keys.insert(parsed.leaf_node().signature_key().as_slice().to_vec()) {
+                continue;
+            }
             if kp.protocol_profile != existing.protocol_profile {
                 return Err(EngineError::InvalidAccountIdentityProof(format!(
                     "cannot invite a {:?} KeyPackage into a {:?} group",
@@ -240,16 +252,28 @@ impl<S: StorageProvider> Engine<S> {
                     had: Box::new(had),
                 });
             }
+            source_kps.push(kp);
             parsed_kps.push(parsed);
         }
+        if parsed_kps.is_empty() {
+            return Err(EngineError::Other(
+                "the invite adds no device: each one is already in the group".into(),
+            ));
+        }
+        let key_packages = source_kps;
 
         let mut resulting_admins = Vec::new();
         let mut granted_admin_ids = Vec::new();
         if !initial_admins.is_empty() {
-            let invitee_ids = parsed_kps
-                .iter()
-                .map(|kp| crate::identity::validated_member_id_of_leaf(kp.leaf_node()))
-                .collect::<Result<Vec<_>, _>>()?;
+            // An account that already has a device here is a member, and
+            // granting it admin is a separate action.
+            let mut invitee_ids = Vec::with_capacity(parsed_kps.len());
+            for kp in &parsed_kps {
+                let id = crate::identity::validated_member_id_of_leaf(kp.leaf_node())?;
+                if !current_members.iter().any(|member| member.id == id) {
+                    invitee_ids.push(id);
+                }
+            }
             let current_admins = crate::app_components::admins_of_group(&mls_group)?;
             resulting_admins = current_admins.clone();
             let mut seen_grants = HashSet::new();

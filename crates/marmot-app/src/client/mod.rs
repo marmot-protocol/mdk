@@ -2392,11 +2392,12 @@ impl AppClient {
         if !optional_app_components.is_empty() {
             changed_fields.push("image");
         }
+        // The people added, not their devices' KeyPackages.
         let mut audit_context = Self::local_human_action_context(
             "create_group",
             changed_fields,
             touched_components,
-            Some(members.len() as u64),
+            Some(resolved.stats.unique_members as u64),
         );
 
         request.members = members;
@@ -2928,15 +2929,17 @@ impl AppClient {
                 &requirements,
                 nostr_directory::MemberResolutionPurpose::Commit,
             )
-            .await
-            .map(|resolved| resolved.key_packages);
+            .await;
         record_app_performance(
             telemetry,
             AppPerformanceOperation::GroupInviteKeyPackageLookup,
             key_package_started_at.elapsed(),
             key_packages.is_ok(),
         );
-        let key_packages = key_packages?;
+        let nostr_directory::ResolvedMemberKeyPackages {
+            key_packages,
+            stats,
+        } = key_packages?;
 
         let mut initial_admins = Vec::with_capacity(initial_admin_refs.len());
         for admin in initial_admin_refs {
@@ -2959,11 +2962,12 @@ impl AppClient {
             affected_fields.push("admins");
             affected_components.push(GROUP_ADMIN_POLICY_COMPONENT_ID);
         }
+        // The people invited, not their devices' KeyPackages.
         let audit_context = Self::local_human_action_context(
             "invite_members",
             affected_fields,
             affected_components,
-            Some(key_packages.len() as u64),
+            Some(stats.unique_members as u64),
         );
 
         let pre_send_sync_started_at = Instant::now();

@@ -6,7 +6,7 @@
 //! checkpoint are distinct evidence boundaries. A sender founding preparation
 //! also records the returned retained artifact and recipient engine join.
 //! Publication receipts are captured at the account owner boundary.
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -38,7 +38,9 @@ pub(crate) struct FoundingSelection {
 }
 
 pub(crate) struct PendingFounding {
-    selected: BTreeMap<Vec<u8>, (LocalId, [u8; 32])>,
+    /// Each recipient's selected KeyPackages, in the order the engine wraps
+    /// their Welcomes.
+    selected: BTreeMap<Vec<u8>, VecDeque<(LocalId, [u8; 32])>>,
 }
 
 /// One selected AppClient delivery episode. The app arms it before engine
@@ -327,7 +329,7 @@ impl WelcomeProbe {
             self.dropped += selections.len();
             return None;
         }
-        let mut selected = BTreeMap::new();
+        let mut selected = BTreeMap::<Vec<u8>, VecDeque<(LocalId, [u8; 32])>>::new();
         for selection in selections {
             let Ok(recipient) = hex::decode(selection.recipient_hex) else {
                 self.invalid += 1;
@@ -345,18 +347,20 @@ impl WelcomeProbe {
                 self.invalid += 1;
                 return None;
             };
-            let op_id = self.local_id();
-            if selected.insert(recipient, (op_id, event_id)).is_some() {
+            let packages = selected.entry(recipient).or_default();
+            if packages.iter().any(|(_, selected)| *selected == event_id) {
                 self.invalid += 1;
                 return None;
             }
+            packages.push_back((self.local_id(), event_id));
         }
         Some(PendingFounding { selected })
     }
 
     /// The returned FoundingGroupCreated artifact comes after the engine's
     /// canonical transaction retained these exact Welcome messages as Sent.
-    /// Match by validated recipient identity, never by incidental vec order.
+    /// Match by validated recipient identity. One account's several
+    /// KeyPackages match in the order the engine wrapped their Welcomes.
     pub(crate) fn founding_prepared(
         &mut self,
         mut pending: PendingFounding,
@@ -385,8 +389,10 @@ impl WelcomeProbe {
                     self.invalid += 1;
                     return;
                 };
-                let Some((op_id, key_package_event_id)) =
-                    pending.selected.remove(recipient.as_slice())
+                let Some((op_id, key_package_event_id)) = pending
+                    .selected
+                    .get_mut(recipient.as_slice())
+                    .and_then(VecDeque::pop_front)
                 else {
                     self.invalid += 1;
                     return;
@@ -413,7 +419,12 @@ impl WelcomeProbe {
                 rows.push((op_id, recipient_ref, key_package_event_id, outer_event_id));
             }
         }
-        if !found_work || !pending.selected.is_empty() {
+        if !found_work
+            || pending
+                .selected
+                .values()
+                .any(|packages| !packages.is_empty())
+        {
             self.invalid += 1;
             return;
         }

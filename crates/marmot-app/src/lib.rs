@@ -93,10 +93,7 @@ mod client;
 mod config;
 mod deployment;
 mod export_config;
-pub use deployment::{
-    KeyPackageClientPreference, MarmotDeployment, NEUTRAL_KEYCHAIN_SERVICE_NAME,
-    OpenRankingProvider,
-};
+pub use deployment::{MarmotDeployment, NEUTRAL_KEYCHAIN_SERVICE_NAME, OpenRankingProvider};
 pub mod conversation_presentation;
 mod conversions;
 mod directory_resources;
@@ -403,8 +400,7 @@ use key_package_records::{
 };
 #[cfg(test)]
 use key_package_records::{
-    fresh_or_cached_key_package, latest_fresh_key_package_from_records,
-    validated_cached_key_package,
+    fresh_or_cached_key_package, select_key_packages_from_records, validated_cached_key_package,
 };
 use nostr_directory::DirectoryCache;
 use nostr_directory::display_name_for_profile;
@@ -5912,11 +5908,11 @@ impl MarmotApp {
                     .await?;
                 let mut fetched = fresh_or_cached_key_package(
                     &account_id,
-                    latest_fresh_key_package_from_records(
+                    select_key_packages_from_records(
                         &account_id,
-                        records,
+                        &records,
                         self.directory().directory_freshness_for_test(),
-                        &self.deployment().key_package_client_preference,
+                        None,
                     )?,
                     Some(entry.clone()),
                 )?;

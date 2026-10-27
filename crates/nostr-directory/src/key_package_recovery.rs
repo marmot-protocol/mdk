@@ -6,18 +6,19 @@ use std::collections::BTreeSet;
 use cgka_engine::key_package::KeyPackageRequirements;
 use cgka_traits::TransportEndpoint;
 use nostr_sdk::prelude::RelayUrl;
-use transport_nostr_adapter::KIND_MARMOT_KEY_PACKAGE;
 
 use super::Directory;
 use super::resources::DirectoryResources;
 use crate::DirectoryFreshness;
 use crate::published_records::{
-    KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, preferred_fresh_key_package_from_records,
-    without_revoked_slot_winners,
+    KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, key_package_queries,
+    key_package_read_page_full, select_key_packages_from_records, without_revoked_slot_winners,
 };
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord};
 
 const RECOVERY_ENDPOINT_LIMIT: usize = 8;
+/// How many revoked candidates recovery replaces before it reports the lookup
+/// incomplete. Proving a candidate undeleted spends none of it.
 const RECOVERY_CANDIDATE_LIMIT: usize = 12;
 
 pub(super) struct RecoveredKeyPackageRecords {
@@ -37,6 +38,8 @@ pub(super) struct KeyPackageRecoveryRequest<'a> {
     pub(super) requirements: Option<&'a KeyPackageRequirements>,
     /// Public metadata only. Membership callers must never nominate a cache.
     pub(super) cached_target: Option<KeyPackageRecoveryTarget>,
+    /// How many of the best-ranked selected candidates to prove undeleted.
+    pub(super) wanted: usize,
 }
 
 impl<R: DirectoryResources> Directory<R> {
@@ -54,16 +57,18 @@ impl<R: DirectoryResources> Directory<R> {
             discovery,
             requirements,
             cached_target,
+            wanted,
         } = request;
+        // A full page of KeyPackages or deletion requests hides what lies
+        // past it; recovery's targeted reads cannot show that either.
+        if key_package_read_page_full(account, &observed) {
+            return Err(recovery_incomplete(account));
+        }
         let freshness = self.directory_freshness();
-        if preferred_fresh_key_package_from_records(
-            account,
-            &observed,
-            freshness,
-            requirements,
-            &self.config.key_package_client_preference,
-        )
-        .is_ok_and(|selection| selection.value.is_some())
+        // What the read found is used even when the read was incomplete:
+        // every device is sought, not guaranteed (mdk#2628, D12).
+        if select_key_packages_from_records(account, &observed, freshness, requirements)
+            .is_ok_and(|selection| !selection.value.is_empty())
         {
             return Ok(RecoveredKeyPackageRecords {
                 freshness,
@@ -99,11 +104,7 @@ impl<R: DirectoryResources> Directory<R> {
                 .relay_plane
                 .fetch_directory_events_with_completion(
                     supplementary.clone(),
-                    vec![DirectoryEventQuery::new(
-                        KIND_MARMOT_KEY_PACKAGE,
-                        vec![account.to_owned()],
-                        12,
-                    )],
+                    key_package_queries(vec![account.to_owned()]),
                 )
                 .await
             {
@@ -115,44 +116,80 @@ impl<R: DirectoryResources> Directory<R> {
             }
         }
         let routes = distinct_recovery_routes(searched.iter().chain(&supplementary));
-        let mut deletions = Vec::new();
-        for round in 0..=RECOVERY_CANDIDATE_LIMIT {
-            // Preserve every newest slot as a barrier, including malformed,
-            // incompatible and already-revoked replacements.
-            let (records, evidence) =
-                without_revoked_slot_winners(account, observed.clone(), &deletions, freshness);
-            // A known validation error precedes an incomplete negative lookup;
-            // it never authorizes returning an unproven usable package.
-            let selection = preferred_fresh_key_package_from_records(
-                account,
-                &records,
-                freshness,
-                requirements,
-                &self.config.key_package_client_preference,
-            )?;
-            let target = selection
-                .value
-                .as_ref()
-                .map(|selected| KeyPackageRecoveryTarget::from_fetched(&selected.fetched))
-                .or_else(|| {
-                    selection
-                        .rejected_future
-                        .then_some(cached_target.as_ref())
-                        .flatten()
-                        .filter(|target| evidence.allows_target(target))
-                        .cloned()
-                });
-            let Some(target) = target else {
-                if !package_coverage {
-                    return Err(recovery_incomplete(account));
+        // Deletion requests read with the KeyPackages count from the start; a
+        // later scoped read that misses one never revives what it covers.
+        let mut deletions = observed
+            .iter()
+            .filter(|record| record.event.kind == 5)
+            .cloned()
+            .collect::<Vec<_>>();
+        // Event ids whose deletion lookup completed without a match.
+        let mut proven = BTreeSet::new();
+        // The selection being proven. It is redrawn only after a revocation:
+        // time passing during a deletion read must never swap in a different
+        // candidate.
+        let mut targets = None;
+        let mut revocations = 0;
+        // Every pass proves a candidate not proven before or revokes one, so
+        // the selection's size and the revocation limit bound the loop.
+        loop {
+            let current = match &mut targets {
+                Some(current) => current,
+                None => {
+                    // Preserve every newest slot as a barrier, including
+                    // malformed, incompatible and already-revoked replacements.
+                    let (records, evidence) = without_revoked_slot_winners(
+                        account,
+                        observed.clone(),
+                        &deletions,
+                        freshness,
+                    );
+                    // A known validation error precedes an incomplete negative
+                    // lookup; it never authorizes returning an unproven
+                    // usable package.
+                    let selection = select_key_packages_from_records(
+                        account,
+                        &records,
+                        freshness,
+                        requirements,
+                    )?;
+                    let mut selected = selection
+                        .value
+                        .iter()
+                        .take(wanted)
+                        .map(KeyPackageRecoveryTarget::from_fetched)
+                        .collect::<Vec<_>>();
+                    if selected.is_empty()
+                        && selection.rejected_future
+                        && let Some(cached) = cached_target
+                            .as_ref()
+                            .filter(|target| evidence.allows_target(target))
+                    {
+                        selected.push(cached.clone());
+                    }
+                    if selected.is_empty() {
+                        if !package_coverage {
+                            return Err(recovery_incomplete(account));
+                        }
+                        return Ok(RecoveredKeyPackageRecords {
+                            freshness,
+                            records,
+                            cache_evidence: Some(evidence),
+                        });
+                    }
+                    targets.insert(selected)
                 }
-                return Ok(RecoveredKeyPackageRecords {
-                    freshness,
-                    records,
-                    cache_evidence: Some(evidence),
-                });
             };
-            if round == RECOVERY_CANDIDATE_LIMIT || !package_coverage || routes.is_empty() {
+            let Some(target) = current
+                .iter()
+                .find(|target| !proven.contains(&target.event_id))
+                .cloned()
+            else {
+                return Ok(proven_records(
+                    account, observed, &deletions, freshness, &proven,
+                ));
+            };
+            if !package_coverage || routes.is_empty() || revocations == RECOVERY_CANDIDATE_LIMIT {
                 return Err(recovery_incomplete(account));
             }
             let queries = vec![
@@ -195,27 +232,37 @@ impl<R: DirectoryResources> Directory<R> {
                 }
             }
             if revoked {
+                revocations += 1;
+                targets = None;
                 continue;
             }
             if !deletion_coverage {
                 return Err(recovery_incomplete(account));
             }
-            let (mut records, evidence) =
-                without_revoked_slot_winners(account, observed, &deletions, freshness);
-            // Final admission revalidates MLS lifetime on the real wall clock.
-            // It may reject this identity after a slow deletion read, but must
-            // never select a different fresh slot whose deletion was not read.
-            // Preserve rejected-future metadata for the existing diagnostic
-            // cache fallback, whose exact target was checked above.
-            records
-                .retain(|record| !freshness.accepts(record) || record.event.id == target.event_id);
-            return Ok(RecoveredKeyPackageRecords {
-                freshness,
-                records,
-                cache_evidence: Some(evidence),
-            });
+            proven.insert(target.event_id);
         }
-        Err(recovery_incomplete(account))
+    }
+}
+
+/// Records whose only fresh candidates are the `proven` ones. Final admission
+/// revalidates MLS lifetime on the real wall clock. It may reject a proven
+/// identity after a slow deletion read, but must never select a different
+/// fresh slot whose deletion was not read. Rejected-future metadata stays for
+/// the diagnostic cache fallback, whose exact target was checked.
+fn proven_records(
+    account: &str,
+    observed: Vec<DirectoryRelayEventRecord>,
+    deletions: &[DirectoryRelayEventRecord],
+    freshness: DirectoryFreshness,
+    proven: &BTreeSet<String>,
+) -> RecoveredKeyPackageRecords {
+    let (mut records, evidence) =
+        without_revoked_slot_winners(account, observed, deletions, freshness);
+    records.retain(|record| !freshness.accepts(record) || proven.contains(&record.event.id));
+    RecoveredKeyPackageRecords {
+        freshness,
+        records,
+        cache_evidence: Some(evidence),
     }
 }
 

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `MarmotDeployment::key_package_client_preference` and
+  `KeyPackageClientPreference` are removed (mdk#2628). The KeyPackage `client`
+  tag no longer ranks invite candidates; it is still published when
+  `key_package_client_name` is set.
+
 ### Added
 
 - The crate root re-exports `AccountError`, `SessionError`,
@@ -62,6 +69,36 @@
 
 ### Changed
 
+- Creating a group or inviting adds every device of each recipient account
+  (mdk#2628, mdk#1696). The directory reads an account's KeyPackages together
+  with its KeyPackage deletion requests, then selects every valid, compatible
+  KeyPackage published in the last 30 days, at most 20, or the single best one
+  when none is that recent. A publication slot contributes at most one, and a
+  KeyPackage a deletion request covers, by slot address or event id, is
+  skipped. A lookup reads up to one relay page of 500 of an account's
+  KeyPackages and 500 of its deletion requests; a relay that returns a full
+  page of either leaves the lookup incomplete, since what lies past it may
+  change the selection. Every device is sought, not guaranteed: a device
+  whose KeyPackage no relay returns is left out, and inviting the account
+  again adds it. An invite adds only devices not already in the group, and
+  one that would add none still fails.
+  KeyPackages not marked last-resort rank first, then the most
+  recently published, then the lower KeyPackageRef; one device publishing in
+  several slots counts once. One Commit adds the account, with one Welcome
+  rumor per KeyPackage, and the roster lists each added device while that
+  Commit awaits publication. Reissuing a lost invite leaves out a device that
+  has not yet replaced the KeyPackage the lost invite consumed, while another
+  device of its account can still join. A lost invite that cannot re-add every
+  device it added, including a new device of an account already in the group,
+  is reported as a conflict that needs a new invite, never as applied. The
+  creator's own other devices stay out of a new group.
+  `ResolvedMemberKeyPackages::key_packages` lists each account's
+  KeyPackages best first. Directory lookup returns the best of the same
+  selection. Within one slot, a tie on `created_at` now goes to the lower
+  event id, as NIP-01 says, where it went to the higher. Create and invite now
+  read each recipient account on its own on every deployment, White Noise's
+  included: a read bounded across accounts cannot prove that it saw every
+  slot.
 - MDK now treats data under app component id `0x800a` like any id the
   registry does not assign, where it used to reject it (mdk#2628). `0x800a`
   was the draft multi-device join authorization, which the registry withdrew

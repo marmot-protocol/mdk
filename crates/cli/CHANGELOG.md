@@ -35,6 +35,9 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Changed
 
+- Creating a group or inviting adds every device of each recipient account (mdk#2628, mdk#1696): every valid,
+  compatible KeyPackage published in the last 30 days, at most 20, or the single best one when none is that recent.
+  `key-package` lookup returns the best of the same selection and no longer prefers a package by its `client` tag.
 - `groups members`, `groups show` and `groups management` list each member account once, even when it has several
   devices in the group, and each `members` entry gains `device_count` (mdk#2628). Member counts, admin counts and the
   last-admin check count accounts, and a chat between two accounts stays direct whatever devices either person uses.
