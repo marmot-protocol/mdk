@@ -6402,7 +6402,7 @@ impl AccountDeviceEffects {
 pub struct AccountIngestEffects {
     pub outcome: IngestOutcome,
     /// The engine kept no durable trace of this delivery's transport object.
-    /// Carried verbatim from [`IngestEffects::left_object_unpersisted`].
+    /// Carried verbatim from the session's ingest effects.
     pub left_object_unpersisted: bool,
     pub effects: AccountDeviceEffects,
 }

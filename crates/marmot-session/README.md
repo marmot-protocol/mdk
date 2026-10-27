@@ -6,8 +6,9 @@ account-device identity opens an `AccountDeviceSession`, the production-shaped w
 app events plus publishable transport work, and the runtime publishes that work, then confirms or rolls back the
 session's pending state. App and runtime developers embedding Marmot below `marmot-app` are the main audience.
 
-The crate root is the facade: the runtime, its effects, `SessionConfig`, the errors, the engine types the session
-exposes, and the session itself.
+The crate root is the facade: the runtime, its effects, `SessionConfig`, the errors, and the engine types the session
+exposes. The session itself is a private module; the `test-support` feature re-exports it for tests that drive it
+directly.
 
 ## Opening a session
 
@@ -56,7 +57,8 @@ the default.
 - Provides `canonical_group_membership` for startup reconciliation: authenticated leaf indexes and account
   identities, plus whether this device's own leaf is active. Pending roster projections do not replace those facts.
   Live termination and token cleanup use immutable engine effects captured at apply, rather than this reader.
-- Offers `promote_legacy_message_rows` for host-scheduled, bounded promotion of legacy stored rows after readiness.
+- Offers `promote_legacy_message_rows` for bounded promotion of legacy stored rows after readiness. Its tests drive it
+  here; a host schedules the same promotion on its own clone of the engine's connection.
 - Wraps the configured forensic recorder in the account-device's `SharedRecorder`, builds the engine with a clone,
   and writes the open-time `recorder_health` row. `audit_recorder()` hands out the handle; the runtime and the host
   record, rotate and finish the log through their own clones.

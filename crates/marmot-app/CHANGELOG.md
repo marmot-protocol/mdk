@@ -26,6 +26,12 @@
   `AccountError` and `MaintenanceTiming`, move to `marmot_session::`;
   `marmot-account` keeps account homes and secret storage. Types keep their
   names, and the `marmot_app` re-exports are unchanged.
+- `marmot_session::AccountDeviceSession` and `IngestEffects` are public only
+  under `marmot-session`'s `test-support` feature (mdk#2602). Hosts reach the
+  session through `AccountDeviceRuntime`, as they already had to. Three
+  session methods that nothing called are gone:
+  `set_message_draft_commit_observer`, `delete_key_package` and
+  `create_group_with_audit_context`.
 - What an error reports depends on what it is, not on which lower-stack
   layers wrapped it (mdk#2602). Three answers change:
   - A storage failure that the account session reported itself is now the

@@ -181,8 +181,8 @@ impl SessionConfig {
 
     /// Open with the cheap seed pass only (mdk#1161): every stored group is
     /// listed but gated `GroupNotHydrated` until the caller drives per-group
-    /// hydration ([`AccountDeviceSession::hydrate_next_groups`] /
-    /// [`AccountDeviceSession::ensure_group_hydrated`]) or a send/ingest
+    /// hydration (the runtime's `hydrate_next_groups` /
+    /// `ensure_group_hydrated`) or a send/ingest
     /// promotes a group on demand. Default is the eager open, which fully
     /// hydrates (or quarantines) every group before returning — embedders
     /// without a background pipeline should keep the default.
@@ -222,8 +222,8 @@ impl SessionConfig {
 
     /// Select the profile emitted by fresh KeyPackages and newly created
     /// groups. Defaults to current. Existing groups keep their persisted
-    /// profile. Passing legacy is rejected by [`AccountDeviceSession::open`];
-    /// only the explicitly named compatibility-fixture seam can open it.
+    /// profile. Passing legacy is rejected when the session opens; only the
+    /// explicitly named compatibility-fixture seam can open it.
     pub fn protocol_profile(mut self, protocol_profile: ProtocolProfile) -> Self {
         self.protocol_profile = protocol_profile;
         self.allow_legacy_compatibility_profile = false;
@@ -239,8 +239,8 @@ impl SessionConfig {
         self
     }
 
-    /// Options for the connection [`AccountDeviceSession::open`] opens. No
-    /// effect on a session built with [`Self::with_storage`].
+    /// Options for the connection the session opens. No effect on a session
+    /// built with [`Self::with_storage`].
     pub fn storage_options(mut self, options: SqliteStorageOptions) -> Self {
         self.storage_options = options;
         self
@@ -287,7 +287,10 @@ pub struct GroupAuthorityView<'a> {
 }
 
 impl GroupAuthorityView<'_> {
-    /// See [`AccountDeviceSession::with_group_authority_snapshot`].
+    /// Compose host-owned persisted reads with compact live authority using
+    /// the session's exact store and one deferred snapshot. The callback is
+    /// synchronous/read-only; it must not access a different account store or
+    /// use a startup/recovery copy of engine facts. No engine hydration runs.
     pub fn with_group_authority_snapshot<T, E>(
         &self,
         group_id: &GroupId,
@@ -315,7 +318,7 @@ pub struct HydrationProgress {
     pub remaining: usize,
 }
 
-/// Privacy-safe stage timings captured during [`AccountDeviceSession::open`].
+/// Privacy-safe stage timings captured while the session opens.
 ///
 /// Durations and aggregate counts only — no account, group, or key identifiers
 /// — so callers can feed them straight into fixed-bucket telemetry (mdk#1161).
@@ -552,16 +555,6 @@ impl AccountDeviceSession {
         })
     }
 
-    /// Forward the host's post-commit storage wakeup to the actual engine
-    /// connection. Projection policy and subscription ownership stay in the host.
-    #[doc(hidden)]
-    pub fn set_message_draft_commit_observer(
-        &self,
-        observer: storage_sqlite::MessageDraftCommitObserver,
-    ) {
-        self.storage.set_message_draft_commit_observer(observer);
-    }
-
     /// Stage timings captured by [`Self::open`]; durations and aggregate
     /// counts only, safe for fixed-bucket telemetry.
     pub fn open_timings(&self) -> &SessionOpenTimings {
@@ -575,6 +568,7 @@ impl AccountDeviceSession {
     /// of [`Self::open`]: migration 47 preserves legacy rows so a large
     /// account's payload decoding does not extend the account-open critical
     /// path. The result contains aggregate counts only.
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub fn promote_legacy_message_rows(
         &self,
         limit: usize,
@@ -582,6 +576,7 @@ impl AccountDeviceSession {
         Ok(self.storage.promote_legacy_message_rows(limit)?)
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
         tracing::debug!(
             target: TRACE_TARGET,
@@ -606,29 +601,6 @@ impl AccountDeviceSession {
         key_package: &KeyPackage,
     ) -> Result<cgka_engine::KeyPackageMetadata, EngineError> {
         cgka_engine::key_package_metadata(key_package)
-    }
-
-    /// Delete a previously generated KeyPackage bundle from storage.
-    ///
-    /// Used by the account orchestration layer to prune the private bundle
-    /// persisted by `fresh_key_package` when publication fails, so a retrying
-    /// app does not accumulate orphaned private key material (mdk#160).
-    pub async fn delete_key_package(
-        &mut self,
-        key_package: &KeyPackage,
-    ) -> Result<(), EngineError> {
-        tracing::debug!(
-            target: TRACE_TARGET,
-            method = "delete_key_package",
-            "deleting key package bundle"
-        );
-        self.engine.delete_key_package(key_package).await?;
-        tracing::debug!(
-            target: TRACE_TARGET,
-            method = "delete_key_package",
-            "key package bundle deleted"
-        );
-        Ok(())
     }
 
     pub fn key_package_lifecycle(&self) -> SessionResult<Option<KeyPackageLifecycleState>> {
@@ -700,6 +672,7 @@ impl AccountDeviceSession {
             .list_maintenance_obligations_for_group(group_id)?)
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub fn delete_maintenance_obligation(&self, id: &MessageId) -> SessionResult<()> {
         Ok(self.storage.delete_maintenance_obligation(id)?)
     }
@@ -1041,15 +1014,6 @@ impl AccountDeviceSession {
         Ok(CreateGroupEffects { group_id, effects })
     }
 
-    pub async fn create_group_with_audit_context(
-        &mut self,
-        req: CreateGroupRequest,
-        context: AuditEventContext,
-    ) -> SessionResult<CreateGroupEffects> {
-        self.create_group_with_optional_app_components_and_audit_context(req, Vec::new(), context)
-            .await
-    }
-
     pub async fn create_group_with_optional_app_components_and_audit_context(
         &mut self,
         req: CreateGroupRequest,
@@ -1140,6 +1104,7 @@ impl AccountDeviceSession {
         Ok(self.collect_effects(vec![result]))
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn ingest(&mut self, msg: TransportMessage) -> SessionResult<IngestEffects> {
         tracing::debug!(
             target: TRACE_TARGET,
@@ -1440,6 +1405,7 @@ impl AccountDeviceSession {
         self.collect_effects(vec![])
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub fn epoch(&self, group_id: &GroupId) -> Result<EpochId, EngineError> {
         self.engine.epoch(group_id)
     }
@@ -1566,6 +1532,7 @@ impl AccountDeviceSession {
         self.engine.self_id()
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub fn set_convergence_policy(
         &mut self,
         policy: CanonicalizationPolicy,
