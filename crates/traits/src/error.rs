@@ -217,6 +217,12 @@ pub enum EngineError {
     )]
     MissingWelcomeKeyPackage,
 
+    /// The Welcome delivery names a KeyPackage this device did not publish,
+    /// such as another device's of the same account. Not a failed join: the
+    /// device leaves its KeyPackages as they were.
+    #[error("welcome is not addressed to this device")]
+    WelcomeNotAddressedToThisDevice,
+
     #[error("welcome already processed")]
     WelcomeAlreadyProcessed,
 
@@ -282,6 +288,7 @@ impl EngineError {
             EngineError::Serialize(_) => "serialize",
             EngineError::InvalidWelcome => "invalid_welcome",
             EngineError::MissingWelcomeKeyPackage => "missing_welcome_key_package",
+            EngineError::WelcomeNotAddressedToThisDevice => "welcome_not_addressed_to_this_device",
             EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
             EngineError::Backend(_) => "backend",
             EngineError::Other(_) => "other",

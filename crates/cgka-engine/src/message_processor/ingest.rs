@@ -345,6 +345,15 @@ impl<S: StorageProvider> Engine<S> {
                     category: InputRejectionCategory::WrongRecipient,
                 })
             }
+            Err(EngineError::WelcomeNotAddressedToThisDevice) => {
+                // Another device's delivery, not a failed join. Only this
+                // wrapper is remembered: this device's own delivery can
+                // carry the same Welcome content and must still open.
+                self.storage.put_ingress_dedup_marker(&msg.id)?;
+                Ok(IngestOutcome::Ignored {
+                    category: InputRejectionCategory::NotAddressedToThisDevice,
+                })
+            }
             Err(error) if group_lifecycle::terminal_welcome_error(&error) => {
                 self.storage.put_ingress_dedup_marker(&msg.id)?;
                 let category = match error {

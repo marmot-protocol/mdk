@@ -56,6 +56,7 @@ impl<S: StorageProvider> Engine<S> {
                         not_after: previous.not_after,
                         replaced_at: authored_created_at,
                         consumed: previous.consumed_at.is_some(),
+                        authored_event_id: previous.signed_event.map(|event| event.id),
                     });
             }
             staged.pending_replacement = Some(PendingKeyPackageReplacement {

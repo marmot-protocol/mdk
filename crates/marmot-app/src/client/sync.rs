@@ -3990,10 +3990,13 @@ impl AppClient {
             observation.finish(match &ingest {
                 Ok(effects) => match &effects.outcome {
                     IngestOutcome::Processed => "success",
+                    // Another device's Welcome delivery is one more copy of
+                    // the account's invitation here, not a rejected Welcome.
                     IngestOutcome::Ignored {
                         category:
                             cgka_traits::InputRejectionCategory::Duplicate
-                            | cgka_traits::InputRejectionCategory::OwnEcho,
+                            | cgka_traits::InputRejectionCategory::OwnEcho
+                            | cgka_traits::InputRejectionCategory::NotAddressedToThisDevice,
                     } => "duplicate",
                     IngestOutcome::Buffered { .. }
                     | IngestOutcome::TransportDeferred { .. }

@@ -279,6 +279,11 @@ pub struct RetainedKeyPackagePrivateMaterial {
     /// `replaced_at`, or at `not_after` if that is earlier.
     #[serde(default)]
     pub consumed: bool,
+    /// The id of the signed publication that carried this package. Missing on
+    /// packages retained before ids were recorded here, and on a replacement
+    /// superseded before it was signed.
+    #[serde(default)]
+    pub authored_event_id: Option<MessageId>,
 }
 
 impl RetainedKeyPackagePrivateMaterial {
@@ -370,6 +375,34 @@ impl KeyPackageLifecycleState {
             retained_private_material: Vec::new(),
             pending_replacement: None,
         }
+    }
+
+    /// Every publication whose private material this device still holds, as
+    /// `(event id, KeyPackageRef)`: the current package, a signed pending
+    /// replacement, and each retained package whose id was recorded. A Welcome
+    /// delivery is addressed to this device only when it names one of these
+    /// ids (`protocol-core/joining.md`, "Receiving flow" step 2).
+    pub fn held_publications(&self) -> impl Iterator<Item = (&MessageId, &[u8])> {
+        let current = self
+            .authored_event_id
+            .as_ref()
+            .zip(self.current_key_package_ref.as_deref());
+        let pending = self.pending_replacement.as_ref().and_then(|pending| {
+            pending
+                .signed_event
+                .as_ref()
+                .map(|event| (&event.id, pending.key_package_ref.as_slice()))
+        });
+        let retained = self
+            .retained_private_material
+            .iter()
+            .filter_map(|material| {
+                material
+                    .authored_event_id
+                    .as_ref()
+                    .map(|id| (id, material.key_package_ref.as_slice()))
+            });
+        current.into_iter().chain(pending).chain(retained)
     }
 
     /// Record that a successfully processed Welcome consumed `key_package_ref`.
@@ -476,6 +509,7 @@ mod tests {
     };
     use crate::engine::KeyPackage;
     use crate::transport::Timestamp;
+    use crate::types::MessageId;
 
     fn retained(not_after: u64, consumed: bool) -> RetainedKeyPackagePrivateMaterial {
         RetainedKeyPackagePrivateMaterial {
@@ -484,6 +518,7 @@ mod tests {
             not_after: Timestamp(not_after),
             replaced_at: Timestamp(1_000),
             consumed,
+            authored_event_id: None,
         }
     }
 
@@ -608,6 +643,46 @@ mod tests {
         value.as_object_mut().unwrap().remove("consumed");
         let decoded: RetainedKeyPackagePrivateMaterial = serde_json::from_value(value).unwrap();
         assert!(!decoded.consumed);
+    }
+
+    #[test]
+    fn held_publications_name_every_package_with_private_material_and_a_recorded_id() {
+        let id = |byte| MessageId::new(vec![byte; 32]);
+        let mut lifecycle = lifecycle();
+        lifecycle.authored_event_id = Some(id(0x11));
+        lifecycle.retained_private_material[0].authored_event_id = Some(id(0x22));
+        let mut legacy = retained(5_000, false);
+        legacy.key_package_ref = vec![4];
+        lifecycle.retained_private_material.push(legacy);
+        // An unsigned replacement has no publication yet.
+        assert_eq!(
+            lifecycle.held_publications().collect::<Vec<_>>(),
+            vec![(&id(0x11), [1].as_slice()), (&id(0x22), [2].as_slice())]
+        );
+
+        lifecycle.pending_replacement.as_mut().unwrap().signed_event =
+            Some(super::SignedPublicationArtifact {
+                id: id(0x33),
+                created_at: Timestamp(1),
+                bytes: Vec::new(),
+            });
+        // The current package's private material is gone once it expires,
+        // even though the record still names its publication.
+        lifecycle.current_key_package_ref = None;
+        assert_eq!(
+            lifecycle.held_publications().collect::<Vec<_>>(),
+            vec![(&id(0x33), [3].as_slice()), (&id(0x22), [2].as_slice())]
+        );
+    }
+
+    #[test]
+    fn retained_key_package_records_without_a_publication_id_decode_without_one() {
+        let mut material = retained(5_000, false);
+        material.authored_event_id = Some(MessageId::new(vec![0x22; 32]));
+        let mut value = serde_json::to_value(material).unwrap();
+        value.as_object_mut().unwrap().remove("authored_event_id");
+        let decoded: RetainedKeyPackagePrivateMaterial = serde_json::from_value(value).unwrap();
+        assert!(decoded.authored_event_id.is_none());
     }
 
     #[test]

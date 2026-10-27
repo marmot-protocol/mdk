@@ -399,6 +399,9 @@ pub(crate) fn ingest_outcome_event(
                     InputRejectionCategory::MissingWelcomeKeyPackage => {
                         "missing_welcome_key_package"
                     }
+                    InputRejectionCategory::NotAddressedToThisDevice => {
+                        "not_addressed_to_this_device"
+                    }
                     InputRejectionCategory::InvalidSignature => "invalid_signature",
                     InputRejectionCategory::UnsupportedRequiredFeature => {
                         "unsupported_required_feature"

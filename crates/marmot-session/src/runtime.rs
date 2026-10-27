@@ -1301,6 +1301,7 @@ where
                         not_after,
                         replaced_at: self.wall_clock.now(),
                         consumed: previous_was_consumed,
+                        authored_event_id: lifecycle.authored_event_id.clone(),
                     }),
                 // Without a lifetime there is no deletion bound to retain it
                 // under.

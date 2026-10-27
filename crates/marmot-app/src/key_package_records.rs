@@ -939,6 +939,7 @@ mod tests {
             not_after: Timestamp(2),
             replaced_at: Timestamp(1),
             consumed: false,
+            authored_event_id: None,
         }];
 
         assert_eq!(

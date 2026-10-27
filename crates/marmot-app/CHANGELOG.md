@@ -73,6 +73,17 @@
   KeyPackage keeps retrying without being sent until it expires (up to 84
   days). Hosts that configure `whitenoise` or `White Noise Android` are
   unaffected.
+- A device joins a group only through the Welcome delivery that names one of
+  its own KeyPackages (mdk#2628). Welcomes are gift-wrapped to the account, so
+  each device of an account receives the delivery for every device an inviter
+  adds. A delivery naming another device's KeyPackage, or one this device never
+  published, is now ignored as `InputRejectionCategory::NotAddressedToThisDevice`:
+  it records no failed join, never becomes a rejoin offer, and leaves the
+  device's KeyPackages as they were, and analytics count it as a duplicate.
+  Before, a device already in a group recorded the Welcome for a sibling device
+  added later as a failed join. KeyPackage lifecycle records now keep the
+  publication id of each replaced KeyPackage. Packages replaced before this
+  release have none, so a Welcome that opens with one of them still joins.
 
 ### Fixed
 
