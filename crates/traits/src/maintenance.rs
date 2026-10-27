@@ -323,6 +323,7 @@ pub struct PendingKeyPackageReplacement {
 pub const KEY_PACKAGE_REPLACEMENT_GRACE_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredRetainedKeyPackagePrivateMaterial")]
 pub struct RetainedKeyPackagePrivateMaterial {
     pub key_package: KeyPackage,
     pub key_package_ref: Vec<u8>,
@@ -343,8 +344,45 @@ pub struct RetainedKeyPackagePrivateMaterial {
     /// A pending replacement superseded this package before any replacement
     /// was confirmed, so the grace period has not started. Promotion of the
     /// next confirmed replacement starts it.
-    #[serde(default)]
+    ///
+    /// Records written before this flag keep the bound they had then: an
+    /// unconsumed package decodes as awaiting, so `not_after` bounds it until
+    /// a replacement is confirmed, and a consumed one already counts its grace
+    /// period from `replaced_at`.
     pub awaiting_confirmed_replacement: bool,
+}
+
+/// The stored form of [`RetainedKeyPackagePrivateMaterial`], which tells a
+/// record written before `awaiting_confirmed_replacement` from one that says
+/// `false`.
+#[derive(Deserialize)]
+struct StoredRetainedKeyPackagePrivateMaterial {
+    key_package: KeyPackage,
+    key_package_ref: Vec<u8>,
+    not_after: Timestamp,
+    replaced_at: Timestamp,
+    #[serde(default)]
+    consumed: bool,
+    #[serde(default)]
+    authored_event_id: Option<MessageId>,
+    #[serde(default)]
+    awaiting_confirmed_replacement: Option<bool>,
+}
+
+impl From<StoredRetainedKeyPackagePrivateMaterial> for RetainedKeyPackagePrivateMaterial {
+    fn from(stored: StoredRetainedKeyPackagePrivateMaterial) -> Self {
+        Self {
+            key_package: stored.key_package,
+            key_package_ref: stored.key_package_ref,
+            not_after: stored.not_after,
+            replaced_at: stored.replaced_at,
+            consumed: stored.consumed,
+            authored_event_id: stored.authored_event_id,
+            awaiting_confirmed_replacement: stored
+                .awaiting_confirmed_replacement
+                .unwrap_or(!stored.consumed),
+        }
+    }
 }
 
 impl RetainedKeyPackagePrivateMaterial {
@@ -411,6 +449,13 @@ pub struct KeyPackageLifecycleState {
     #[serde(default)]
     pub retained_private_material: Vec<RetainedKeyPackagePrivateMaterial>,
     pub pending_replacement: Option<PendingKeyPackageReplacement>,
+    /// The build that last replaced a KeyPackage because the publisher
+    /// refused its signed bytes as unusable (mdk#2628, D8). Each build does so
+    /// at most once, so a publisher that refuses what this build signs cannot
+    /// make it generate a KeyPackage per attempt, while a later build can
+    /// still replace one an earlier build signed.
+    #[serde(default)]
+    pub unusable_artifact_replaced_by: Option<String>,
 }
 
 impl KeyPackageLifecycleState {
@@ -436,6 +481,7 @@ impl KeyPackageLifecycleState {
             last_consumed_at: None,
             retained_private_material: Vec::new(),
             pending_replacement: None,
+            unusable_artifact_replaced_by: None,
         }
     }
 
@@ -712,16 +758,32 @@ mod tests {
     }
 
     #[test]
-    fn retained_key_package_records_written_before_the_confirmation_flag_start_their_grace() {
-        let mut awaiting = retained(5_000, false);
-        awaiting.awaiting_confirmed_replacement = true;
-        let mut value = serde_json::to_value(awaiting).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("awaiting_confirmed_replacement");
-        let decoded: RetainedKeyPackagePrivateMaterial = serde_json::from_value(value).unwrap();
-        assert!(!decoded.awaiting_confirmed_replacement);
+    fn retained_key_package_records_written_before_the_confirmation_flag_keep_their_bound() {
+        let legacy = |consumed| {
+            let mut value = serde_json::to_value(retained(1_000_000, consumed)).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("awaiting_confirmed_replacement");
+            serde_json::from_value::<RetainedKeyPackagePrivateMaterial>(value).unwrap()
+        };
+        // An unconsumed package was kept until it expired, and its replacement
+        // may not be confirmed yet.
+        let unconsumed = legacy(false);
+        assert!(unconsumed.awaiting_confirmed_replacement);
+        assert_eq!(unconsumed.delete_at(), Timestamp(1_000_000));
+        // A consumed one was already deleted a day after `replaced_at`.
+        let consumed = legacy(true);
+        assert!(!consumed.awaiting_confirmed_replacement);
+        assert_eq!(
+            consumed.delete_at(),
+            Timestamp(1_000 + KEY_PACKAGE_REPLACEMENT_GRACE_SECS)
+        );
+        // A record that says `false` is not legacy.
+        let written = retained(1_000_000, false);
+        let decoded: RetainedKeyPackagePrivateMaterial =
+            serde_json::from_value(serde_json::to_value(&written).unwrap()).unwrap();
+        assert_eq!(decoded, written);
     }
 
     #[test]

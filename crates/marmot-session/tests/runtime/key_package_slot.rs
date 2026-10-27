@@ -383,6 +383,9 @@ struct RefusingKeyPackages {
     refuse_all: Arc<std::sync::atomic::AtomicBool>,
     /// Accept only the first endpoint of each publication.
     partial: Arc<std::sync::atomic::AtomicBool>,
+    /// Never answer for an artifact it does not refuse, as if the process
+    /// stopped while sending it.
+    hang: Arc<std::sync::atomic::AtomicBool>,
     attempts: Arc<Mutex<Vec<(MessageId, bool)>>>,
 }
 
@@ -427,6 +430,9 @@ impl KeyPackagePublisher for RefusingKeyPackages {
             return Err(KeyPackagePublishError::unusable_artifact(
                 "injected unusable artifact",
             ));
+        }
+        if self.hang.load(Ordering::Relaxed) {
+            std::future::pending::<()>().await;
         }
         let accepted = if self.partial.load(Ordering::Relaxed) {
             1
@@ -528,6 +534,151 @@ async fn a_publisher_that_refuses_its_own_artifacts_gets_one_resigned_replacemen
             .key_package,
         pending.key_package
     );
+}
+
+#[tokio::test]
+async fn a_restart_while_sending_the_resigned_replacement_does_not_resign_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("kp slot resign restart").unwrap();
+    let wall = Arc::new(TestWallClock::new(unix_now()));
+    let publisher = RefusingKeyPackages::default();
+    let open = || {
+        slot_runtime(
+            current_session(&database, &key, b"alice"),
+            publisher.clone(),
+            &wall,
+            0,
+            &[KEY_ENDPOINT],
+        )
+    };
+    let mut runtime = open();
+    runtime
+        .prepare_fresh_key_package(vec![TransportEndpoint(KEY_ENDPOINT.into())])
+        .await
+        .unwrap();
+    let stale_event = slot_lifecycle(&runtime)
+        .pending_replacement
+        .unwrap()
+        .signed_event
+        .unwrap();
+    publisher.refuse(&stale_event.id);
+
+    // The process stops while sending the re-signed replacement, before any
+    // refusal of it is recorded.
+    publisher.hang.store(true, Ordering::Relaxed);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            runtime.publish_fresh_key_package()
+        )
+        .await
+        .is_err()
+    );
+    drop(runtime);
+
+    // After the restart this build's publisher refuses everything, and the
+    // build has spent its one replacement.
+    publisher.hang.store(false, Ordering::Relaxed);
+    publisher.refuse_all.store(true, Ordering::Relaxed);
+    let mut runtime = open();
+    assert_eq!(runtime.durably_owned_key_packages().unwrap().len(), 2);
+    for _ in 0..3 {
+        runtime.publish_fresh_key_package().await.unwrap_err();
+    }
+    assert_eq!(runtime.durably_owned_key_packages().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_later_build_replaces_an_artifact_an_earlier_build_could_not_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("kp slot later build").unwrap();
+    let wall = Arc::new(TestWallClock::new(unix_now()));
+    let publisher = RefusingKeyPackages::default();
+    publisher.refuse_all.store(true, Ordering::Relaxed);
+    let mut runtime = slot_runtime(
+        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[KEY_ENDPOINT],
+    );
+    runtime.publish_fresh_key_package().await.unwrap_err();
+    let refused = slot_lifecycle(&runtime).pending_replacement.unwrap();
+    let refused_event = refused.signed_event.clone().unwrap();
+
+    // An earlier build used its one replacement; this build's publisher still
+    // refuses the bytes that build signed, but sends what this build signs.
+    let mut lifecycle = slot_lifecycle(&runtime);
+    lifecycle.unusable_artifact_replaced_by = Some("0.0.0-earlier".into());
+    runtime
+        .session()
+        .put_key_package_lifecycle(&lifecycle)
+        .unwrap();
+    publisher.refuse_all.store(false, Ordering::Relaxed);
+    publisher.refuse(&refused_event.id);
+
+    let published = runtime.publish_fresh_key_package().await.unwrap();
+    assert_ne!(published, refused.key_package);
+    let lifecycle = slot_lifecycle(&runtime);
+    assert!(lifecycle.pending_replacement.is_none());
+    assert_eq!(
+        retained_entry(&lifecycle, &refused.key_package).authored_event_id,
+        Some(refused_event.id)
+    );
+    assert_eq!(
+        lifecycle.unusable_artifact_replaced_by.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[tokio::test]
+async fn a_superseded_replacement_recorded_by_an_earlier_build_waits_for_a_confirmed_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("kp slot legacy superseded").unwrap();
+    let wall = Arc::new(TestWallClock::new(unix_now()));
+    let publisher = RefusingKeyPackages::default();
+    publisher.refuse_all.store(true, Ordering::Relaxed);
+    let mut runtime = slot_runtime(
+        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[KEY_ENDPOINT],
+    );
+    // A replacement superseded by another that no relay has acknowledged.
+    runtime.publish_fresh_key_package().await.unwrap_err();
+    let lifecycle = slot_lifecycle(&runtime);
+    let superseded = lifecycle.retained_private_material[0].key_package.clone();
+
+    // Rewrite the record as a build before the confirmation flag stored it.
+    let mut value = serde_json::to_value(&lifecycle).unwrap();
+    value["retained_private_material"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("awaiting_confirmed_replacement");
+    runtime
+        .session()
+        .put_key_package_lifecycle(&serde_json::from_value(value).unwrap())
+        .unwrap();
+
+    // Days pass without a confirmed replacement, and the key is kept.
+    wall.set(wall.now().0 + 3 * DAY);
+    runtime.run_due_maintenance().await.unwrap();
+    assert!(runtime.durably_owned_key_packages().unwrap().contains(&superseded));
+
+    // Its grace period starts at the confirmed replacement.
+    publisher.refuse_all.store(false, Ordering::Relaxed);
+    wall.set(wall.now().0 + 60 * 60);
+    runtime.run_due_maintenance().await.unwrap();
+    let confirmed_at = wall.now().0;
+    assert!(slot_lifecycle(&runtime).pending_replacement.is_none());
+    wall.set(confirmed_at + cgka_traits::KEY_PACKAGE_REPLACEMENT_GRACE_SECS - 1);
+    runtime.run_due_maintenance().await.unwrap();
+    assert!(runtime.durably_owned_key_packages().unwrap().contains(&superseded));
+    wall.set(confirmed_at + cgka_traits::KEY_PACKAGE_REPLACEMENT_GRACE_SECS);
+    runtime.run_due_maintenance().await.unwrap();
+    assert!(!runtime.durably_owned_key_packages().unwrap().contains(&superseded));
 }
 
 #[tokio::test]

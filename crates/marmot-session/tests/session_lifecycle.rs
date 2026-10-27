@@ -1428,6 +1428,7 @@ async fn account_records_report_a_closed_store_as_the_engine_storage_failure() {
         last_consumed_at: None,
         retained_private_material: Vec::new(),
         pending_replacement: None,
+        unusable_artifact_replaced_by: None,
     };
     let fanout_id = record_id("fanout", &group_id);
     let fanout = DurableTransportFanout {

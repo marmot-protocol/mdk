@@ -138,8 +138,8 @@ Each device keeps one KeyPackage in its own slot and replaces it in place
   KeyPackages share this bound. A retained KeyPackage keeps its publication id, so a Welcome must still name it.
 - **Artifacts it can no longer send.** A publisher reports a signed KeyPackage it will never send (for example one an
   earlier build signed with a client name over 64 bytes) as `artifact_unusable`. The runtime then replaces it with a
-  freshly signed KeyPackage in the same slot instead of retrying it until it expires, at most once per refused
-  replacement.
+  freshly signed KeyPackage in the same slot instead of retrying it until it expires. Each build does this at most
+  once, so a publisher that refuses its own artifacts cannot make it generate a KeyPackage per attempt.
 
 ## KeyPackage generator upgrades
 

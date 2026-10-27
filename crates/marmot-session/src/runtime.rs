@@ -76,6 +76,9 @@ const KEY_PACKAGE_REFRESH_MAX_SECS: u64 = 7 * 24 * 60 * 60;
 /// `last_failure_code` of a pending replacement whose signed bytes the
 /// publisher refused as unusable.
 const KEY_PACKAGE_ARTIFACT_UNUSABLE: &str = "artifact_unusable";
+/// The build recorded in
+/// [`KeyPackageLifecycleState::unusable_artifact_replaced_by`].
+const KEY_PACKAGE_SIGNING_BUILD: &str = env!("CARGO_PKG_VERSION");
 const MAINTENANCE_EOSE_TIMEOUT_SECS: u64 = 5 * 60;
 const MAINTENANCE_POST_EOSE_GRACE_SECS: u64 = 15;
 const MAINTENANCE_QUIET_SECS: u64 = 60;
@@ -1042,7 +1045,7 @@ where
                 self.session.put_key_package_lifecycle(&lifecycle)?;
                 Ok(key_package)
             }
-            Err(error) if error.artifact_unusable => {
+            Err(error) if error.artifact_unusable && may_replace_unusable_artifact(&lifecycle) => {
                 self.replace_unusable_current_artifact(&mut lifecycle)?;
                 self.publish_fresh_key_package().await
             }
@@ -1077,6 +1080,7 @@ where
             method = "replace_unusable_current_artifact",
             "replacing a current key package the publisher can no longer send"
         );
+        lifecycle.unusable_artifact_replaced_by = Some(KEY_PACKAGE_SIGNING_BUILD.into());
         lifecycle.refresh_at = Some(self.wall_clock.now());
         lifecycle.phase = cgka_traits::MaintenancePhase::Retry;
         self.session.put_key_package_lifecycle(lifecycle)?;
@@ -1098,8 +1102,9 @@ where
     }
 
     /// [`Self::prepare_fresh_key_package`]. With `supersede_pending`, a
-    /// pending replacement is superseded by a newly generated one even when
-    /// its generator revision is current.
+    /// pending replacement the publisher refused as unusable is superseded by
+    /// a newly generated one even when its generator revision is current, and
+    /// this build's one such replacement is spent.
     async fn prepare_key_package_replacement(
         &mut self,
         endpoints: Vec<TransportEndpoint>,
@@ -1141,6 +1146,7 @@ where
                     last_consumed_at: None,
                     retained_private_material: Vec::new(),
                     pending_replacement: None,
+                    unusable_artifact_replaced_by: None,
                 }
             }
         };
@@ -1180,6 +1186,11 @@ where
             let refresh_after = self
                 .maintenance_random
                 .sample_inclusive(KEY_PACKAGE_REFRESH_MIN_SECS, KEY_PACKAGE_REFRESH_MAX_SECS);
+            if supersede_pending {
+                // Recorded with the replacement it pays for, so a restart
+                // between the two can neither repeat nor lose it.
+                lifecycle.unusable_artifact_replaced_by = Some(KEY_PACKAGE_SIGNING_BUILD.into());
+            }
             self.session.stage_key_package_replacement(
                 &mut lifecycle,
                 created_at,
@@ -1263,8 +1274,6 @@ where
                 .as_ref()
                 .expect("prepared replacement has an exact signed event")
                 .clone();
-            let refused_before =
-                pending.last_failure_code.as_deref() == Some(KEY_PACKAGE_ARTIFACT_UNUSABLE);
             let publication = KeyPackagePublication {
                 account_id: self.session.self_id().clone(),
                 key_package: pending.key_package.clone(),
@@ -1288,10 +1297,10 @@ where
             // because an earlier build signed them under rules this one no
             // longer accepts (D8). Supersede the replacement with one signed
             // now; the old one stays retained with its event id, since an
-            // earlier build may have sent it. Bytes this build signed and the
-            // publisher still refuses are not superseded again, so a publisher
-            // that refuses its own artifacts cannot mint a bundle per attempt.
-            if error.artifact_unusable && !supersede_pending && !refused_before {
+            // earlier build may have sent it. A build does this at most once,
+            // so a publisher that refuses its own artifacts cannot mint a
+            // bundle per attempt.
+            if error.artifact_unusable && may_replace_unusable_artifact(&lifecycle) {
                 tracing::info!(
                     target: TRACE_TARGET,
                     method = "publish_fresh_key_package",
@@ -1576,7 +1585,7 @@ where
                 self.session.put_key_package_lifecycle(&lifecycle)?;
                 Ok(())
             }
-            Err(error) if error.artifact_unusable => {
+            Err(error) if error.artifact_unusable && may_replace_unusable_artifact(&lifecycle) => {
                 // Back off as for any failure: while maintenance is paused no
                 // replacement is staged, so this would otherwise repeat every
                 // tick.
@@ -6294,6 +6303,13 @@ fn apply_report_to_fanout(
             );
         }
     }
+}
+
+/// Whether this build may still replace a KeyPackage whose signed bytes the
+/// publisher refused as unusable; see
+/// [`KeyPackageLifecycleState::unusable_artifact_replaced_by`].
+fn may_replace_unusable_artifact(lifecycle: &KeyPackageLifecycleState) -> bool {
+    lifecycle.unusable_artifact_replaced_by.as_deref() != Some(KEY_PACKAGE_SIGNING_BUILD)
 }
 
 /// The weekly refresh: due at the sampled `refresh_at`, and never later than

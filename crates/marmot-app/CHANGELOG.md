@@ -98,13 +98,15 @@
   runs, at a stored random time 6 to 7 days after publication. A superseded
   KeyPackage, consumed or not, keeps its private key for 24 hours after the
   replacement's publication is confirmed, or until it expires if sooner;
-  unconsumed ones used to be kept until they expired.
+  unconsumed ones used to be kept until they expired, and ones retained
+  before this release keep that bound until a replacement is confirmed.
   `CONSUMED_KEY_PACKAGE_RETENTION_SECS` is now
   `KEY_PACKAGE_REPLACEMENT_GRACE_SECS`, and retained records carry
   `awaiting_confirmed_replacement`. A `KeyPackagePublisher` reports a signed
   KeyPackage it will never send with `KeyPackagePublishError::unusable_artifact`
   (`artifact_unusable`), and the runtime replaces it with a freshly signed
-  one in the same slot instead of retrying it until it expires.
+  one in the same slot instead of retrying it until it expires, at most once
+  per build (`KeyPackageLifecycleState::unusable_artifact_replaced_by`).
   `NostrKeyPackagePublication::matches_prepared_event` is the check the Nostr
   publishers use.
 - A device joins a group only through the Welcome delivery that names one of
