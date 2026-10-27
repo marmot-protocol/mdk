@@ -86,6 +86,7 @@ mod usage_diagnostics;
 pub use usage_diagnostics::configure_product_analytics_from_environment;
 mod audit_log;
 pub mod audit_otlp_sender;
+mod audit_upload;
 mod chat_presentation;
 mod client;
 mod config;

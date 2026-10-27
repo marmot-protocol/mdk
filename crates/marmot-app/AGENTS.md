@@ -129,9 +129,15 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   messages, app events, push registrations, telemetry/audit settings) in `src/conversions.rs`. They hold no `MarmotApp`
   state.
 - Keep the forensic audit-log feature in `src/audit_log.rs`: the `AuditLog*` DTOs, salted-hash identity derivation,
-  the per-attempt pinned upload path, the per-account upload checkpoint (`audit-upload-checkpoint.json`), and the
-  `MarmotApp` methods for audit settings, recorder open/build, file enumeration, path validation/resolution/removal, and
-  HTTP upload. Audit-log unit tests live in its own `#[cfg(test)] mod tests`.
+  the per-account upload checkpoint file (`audit-upload-checkpoint.json`), and the `MarmotApp` methods for audit
+  settings, recorder open/build, file enumeration, path validation/resolution/removal, and upload. Audit-log unit tests
+  live in its own `#[cfg(test)] mod tests`.
+- Keep the v4 upload's HTTP half in `src/audit_upload.rs`: snapshot capture, the checkpoint record, endpoint validation
+  with its retired-host check, the per-attempt pinned request and the response handling. It opens no files:
+  `audit_log.rs` validates and opens each audit file and reads and writes the checkpoint file, then hands it the open
+  file or the record. It returns `AuditUploadError`; `From<AuditUploadError> for AppError` in `src/error.rs` restores
+  the variant, message and `privacy_safe_kind` the upload reported before it had its own type, and
+  `error::audit_upload_error_tests` covers every failure.
 - Keep the bounded live v5 Welcome capture in `src/client/audit_v5_probe.rs`. It records actual retained founding
   preparation, receipt/peel, app join/checkpoint, and bounded stored-group snapshots through the installed recorder;
   tests retain an in-memory probe for focused product-boundary assertions. Do not infer ACKs, recipient joins, or

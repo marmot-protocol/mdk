@@ -12,7 +12,7 @@ use marmot_forensics::local_delivery::{DeliveryBatch, ReceiverResult};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
-use crate::{audit_log::audit_upload_host_is_retired, collector_host_safety, config};
+use crate::{audit_upload::audit_upload_host_is_retired, collector_host_safety, config};
 
 const MAX_RECORDS: usize = 96;
 const MAX_BODY_BYTES: usize = 65_535;
