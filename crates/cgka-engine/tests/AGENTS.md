@@ -151,6 +151,12 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 - **File:** `update_group_data.rs`
   - **Owns:** Group profile `AppDataUpdate` commits and convergence-side Marmot record refresh
 
+- **File:** `account_devices.rs`
+  - **Owns:** The `marmot.group.account-devices.v1` (0x800d) rules in groups that require it: no data, support, the
+    per-account leaf limit, never un-require. Each rule is checked by the committer, by replay of a raw OpenMLS commit,
+    and at ingest for standalone proposals; before activation, and on the legacy profile, 0x800d data stays unknown
+    data. Needs `test-policy-overrides` or `test-conformance-snapshot`.
+
 - **File:** `epoch_sealed_transport.rs`
   - **Owns:** Engine behavior under production transport visibility via `support::epoch_sealed_peeler` — the sealing
     model's own semantics, the fork shapes that only appear when post-fork traffic on an unadopted branch is
