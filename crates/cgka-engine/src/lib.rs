@@ -68,6 +68,7 @@ pub(crate) mod message_disposition;
 pub mod message_processor;
 pub(crate) mod mls_group_cache;
 pub mod openmls_projection;
+mod own_account_devices;
 pub mod own_commit_intent;
 pub mod pending_commit_guard;
 pub mod provider;

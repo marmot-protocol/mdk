@@ -158,6 +158,31 @@ pub enum SendIntent {
         group_id: GroupId,
         members: Vec<MemberId>,
     },
+    /// Add devices of this device's own account, without admin authority, in
+    /// a group that requires `marmot.group.account-devices.v1`
+    /// (account-devices-v1.md, "Same-account operations").
+    ///
+    /// The caller supplies every KeyPackage: each must belong to this
+    /// device's account, advertise everything the group requires, and keep
+    /// the account within the leaf limit. The caller must have authenticated
+    /// each one as a device its user approved; the engine never selects an
+    /// own-account KeyPackage itself ("Sender rules"). Each added device gets
+    /// its own Welcome, as an [`Self::Invite`]'s devices do.
+    AddOwnAccountDevices {
+        group_id: GroupId,
+        key_packages: Vec<KeyPackage>,
+    },
+    /// Remove other devices of this device's own account, without admin
+    /// authority, in a group that requires
+    /// `marmot.group.account-devices.v1`.
+    ///
+    /// Each device is named by its leaf's signature key, the
+    /// [`Member::credential`](crate::group::Member) bytes reported for that
+    /// leaf. This device leaves through [`Self::Leave`] instead.
+    RemoveOwnAccountDevices {
+        group_id: GroupId,
+        leaf_signature_keys: Vec<Vec<u8>>,
+    },
     /// Leave the group via MIP-03 SelfRemove.
     Leave { group_id: GroupId },
     /// Rotate only this sender's MLS LeafNode key material.
