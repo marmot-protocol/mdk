@@ -57,6 +57,9 @@ fn nostr_routing() -> AppComponentData {
 struct SharedRouting(Arc<Mutex<StaticTransportRouting>>);
 
 impl SharedRouting {
+    // Only the account-devices tests, behind `test-policy-overrides`, add
+    // routes.
+    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
     fn update(&self, extend: impl FnOnce(StaticTransportRouting) -> StaticTransportRouting) {
         let mut routing = self.0.lock().unwrap();
         *routing = extend(routing.clone());
@@ -92,8 +95,11 @@ impl TransportRoutingPolicy for SharedRouting {
 /// KeyPackage.
 struct Device {
     runtime: AccountDeviceRuntime<RecordingAdapter, SharedRouting, RecordingKeyPackages>,
-    /// What the runtime publishes, and where.
+    /// What the runtime publishes, and where. Only the account-devices
+    /// tests, behind `test-policy-overrides`, read them.
+    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
     adapter: RecordingAdapter,
+    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
     routing: SharedRouting,
     /// The device's current KeyPackage as an inviter fetches it, carrying the
     /// id of its publication for the inviter to name in the rumor.
