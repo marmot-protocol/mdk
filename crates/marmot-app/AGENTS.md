@@ -403,7 +403,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   security primitive), `publisher_sequences.rs` (QUIC preview publisher lifecycle state), `agent_streams.rs` (agent
   stream watch DTOs and manager), `root_runtime_lease.rs` (cross-process exclusive root lease), `app_telemetry.rs` +
   `app_telemetry/` (aggregate app-performance telemetry; same privacy model as relay telemetry), `product_analytics/`
-  (opt-in bounded product observations; export behind `product-analytics-export`), `projection.rs` (legacy account
+  (opt-in bounded product observations; export behind `product-analytics-export`), `usage_diagnostics.rs`
+  (`MarmotApp`'s usage-diagnostics consent persistence and the headless-host analytics configuration; it reaches the
+  product collector only through its methods, consent lock before state lock), `projection.rs` (legacy account
   projection import), `messages/` (`AppMessageIntent` and custom-event intents), `local_open_test_gate.rs` and
   `test_support.rs` (test-only gates/helpers).
 - `src/runtime/`: `worker_startup.rs` (per-account startup admission and retry backoff),
