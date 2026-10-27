@@ -134,8 +134,9 @@ Each device keeps one KeyPackage in its own slot and replaces it in place
   random time 6 to 7 days after publication, stored with the lifecycle so a restart keeps it. `run_due_maintenance`
   does the work; account open does not wait for it.
 - **Superseded KeyPackages.** An inviter may already hold the old KeyPackage, so its private key stays for 24 hours
-  after the replacement's publication is confirmed, or until it expires if that is sooner. Consumed and unconsumed
-  KeyPackages share this bound. A retained KeyPackage keeps its publication id, so a Welcome must still name it.
+  after the replacement's publication is confirmed, or until it expires if that is sooner. A KeyPackage a Welcome
+  consumed is kept for 24 hours after it was replaced, without waiting for a confirmed replacement. A retained
+  KeyPackage keeps its publication id, so a Welcome must still name it.
 - **Artifacts it can no longer send.** A publisher reports a signed KeyPackage it will never send (for example one an
   earlier build signed with a client name over 64 bytes) as `artifact_unusable`. The runtime then replaces it with a
   freshly signed KeyPackage in the same slot instead of retrying it until it expires. Each build does this at most

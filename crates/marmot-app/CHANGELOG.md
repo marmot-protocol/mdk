@@ -96,10 +96,11 @@
   replaces the KeyPackage after a Welcome consumes it, when it no longer
   advertises what the build supports, and at least every 7 days while it
   runs, at a stored random time 6 to 7 days after publication. A superseded
-  KeyPackage, consumed or not, keeps its private key for 24 hours after the
+  KeyPackage no Welcome consumed keeps its private key for 24 hours after the
   replacement's publication is confirmed, or until it expires if sooner;
-  unconsumed ones used to be kept until they expired, and ones retained
-  before this release keep that bound until a replacement is confirmed.
+  these used to be kept until they expired, and ones retained before this
+  release keep that bound until a replacement is confirmed. Consumed ones
+  keep the 24-hour rule from mdk#2352.
   `CONSUMED_KEY_PACKAGE_RETENTION_SECS` is now
   `KEY_PACKAGE_REPLACEMENT_GRACE_SECS`, and retained records carry
   `awaiting_confirmed_replacement`. A `KeyPackagePublisher` reports a signed

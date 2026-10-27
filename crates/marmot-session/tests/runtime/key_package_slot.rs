@@ -294,6 +294,51 @@ async fn a_welcome_built_before_a_refresh_opens_for_a_day_after_the_replacement_
 }
 
 #[tokio::test]
+async fn a_consumed_replacement_superseded_before_confirmation_keeps_its_day() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("kp slot consumed superseded").unwrap();
+    let wall = Arc::new(TestWallClock::new(unix_now()));
+    let publisher = RefusingKeyPackages::default();
+    let mut alice = slot_runtime(
+        session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[KEY_ENDPOINT],
+    );
+    let consumed = alice
+        .prepare_fresh_key_package(vec![TransportEndpoint(KEY_ENDPOINT.into())])
+        .await
+        .unwrap();
+
+    // An inviter used the replacement before any relay acknowledged it.
+    let mut bob = session(dir.path().join("bob.sqlite"), &key, b"bob");
+    let alice_id = alice.session().self_id();
+    let welcome = welcome_for_key_package(&mut bob, &alice_id, consumed.clone(), "invite").await;
+    let joined = alice.session_mut().ingest(welcome).await.unwrap();
+    assert_eq!(joined.outcome, cgka_traits::IngestOutcome::Processed);
+
+    // It is superseded, and no replacement is ever confirmed.
+    publisher.refuse_all.store(true, Ordering::Relaxed);
+    alice.publish_fresh_key_package().await.unwrap_err();
+    let retained = retained_entry(&slot_lifecycle(&alice), &consumed);
+    assert!(retained.consumed && !retained.awaiting_confirmed_replacement);
+    // Staging time: the replacement's created_at, a second past the
+    // superseded one's.
+    let superseded_at = retained.replaced_at.0;
+    assert!(superseded_at - wall.now().0 <= 1);
+
+    // It keeps the consumed rule: deleted a day after it was superseded.
+    wall.set(superseded_at + cgka_traits::KEY_PACKAGE_REPLACEMENT_GRACE_SECS - 1);
+    alice.run_due_maintenance().await.unwrap();
+    assert!(alice.durably_owned_key_packages().unwrap().contains(&consumed));
+    wall.set(superseded_at + cgka_traits::KEY_PACKAGE_REPLACEMENT_GRACE_SECS);
+    alice.run_due_maintenance().await.unwrap();
+    assert!(!alice.durably_owned_key_packages().unwrap().contains(&consumed));
+    assert!(slot_lifecycle(&alice).pending_replacement.is_some());
+}
+
+#[tokio::test]
 async fn a_restart_during_a_refresh_keeps_one_slot_and_every_key() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("alice.sqlite");

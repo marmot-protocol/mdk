@@ -328,12 +328,15 @@ pub struct RetainedKeyPackagePrivateMaterial {
     pub key_package: KeyPackage,
     pub key_package_ref: Vec<u8>,
     pub not_after: Timestamp,
-    /// When publication of the replacement was confirmed, which starts the
-    /// grace period. While [`Self::awaiting_confirmed_replacement`] holds, it
-    /// is when the replacement was staged instead.
+    /// When the package was replaced, which starts the grace period: when
+    /// publication of the replacement was confirmed, or for a pending
+    /// replacement superseded before that, when the next one was staged.
+    /// While [`Self::awaiting_confirmed_replacement`] holds, confirmation
+    /// moves it.
     pub replaced_at: Timestamp,
-    /// A successfully processed Welcome consumed this package. Consumed and
-    /// unconsumed packages share one deletion bound, [`Self::delete_at`].
+    /// A successfully processed Welcome consumed this package, so it is
+    /// deleted [`KEY_PACKAGE_REPLACEMENT_GRACE_SECS`] after `replaced_at`
+    /// without waiting for a confirmed replacement (mdk#2352).
     #[serde(default)]
     pub consumed: bool,
     /// The id of the signed publication that carried this package. Missing on
@@ -341,9 +344,10 @@ pub struct RetainedKeyPackagePrivateMaterial {
     /// superseded before it was signed.
     #[serde(default)]
     pub authored_event_id: Option<MessageId>,
-    /// A pending replacement superseded this package before any replacement
-    /// was confirmed, so the grace period has not started. Promotion of the
-    /// next confirmed replacement starts it.
+    /// A pending replacement superseded this unconsumed package before any
+    /// replacement was confirmed, so the grace period has not started.
+    /// Promotion of the next confirmed replacement starts it, and a Welcome
+    /// consuming the package ends the wait.
     ///
     /// Records written before this flag keep the bound they had then: an
     /// unconsumed package decodes as awaiting, so `not_after` bounds it until
@@ -389,9 +393,9 @@ impl RetainedKeyPackagePrivateMaterial {
     /// When the private material must be deleted: at the end of the grace
     /// period, [`KEY_PACKAGE_REPLACEMENT_GRACE_SECS`] after `replaced_at`, or
     /// at `not_after` if that is earlier. Until a replacement is confirmed,
-    /// only `not_after` bounds it.
+    /// only `not_after` bounds an unconsumed package.
     pub fn delete_at(&self) -> Timestamp {
-        if self.awaiting_confirmed_replacement {
+        if self.awaiting_confirmed_replacement && !self.consumed {
             return self.not_after;
         }
         Timestamp(
@@ -553,6 +557,7 @@ impl KeyPackageLifecycleState {
             .find(|material| material.key_package_ref == key_package_ref)
         {
             material.consumed = true;
+            material.awaiting_confirmed_replacement = false;
             return true;
         }
         if let Some(pending) = self
@@ -650,6 +655,24 @@ mod tests {
         let mut awaiting = retained(grace_end + 10, false);
         awaiting.awaiting_confirmed_replacement = true;
         assert_eq!(awaiting.delete_at(), Timestamp(grace_end + 10));
+    }
+
+    #[test]
+    fn a_consumed_key_package_does_not_wait_for_a_confirmed_replacement() {
+        let grace_end = 1_000 + KEY_PACKAGE_REPLACEMENT_GRACE_SECS;
+        let mut lifecycle = KeyPackageLifecycleState::slot_only("slot".into());
+        let mut awaiting = retained(grace_end + 10, false);
+        awaiting.awaiting_confirmed_replacement = true;
+        lifecycle.retained_private_material = vec![awaiting];
+        assert_eq!(
+            lifecycle.retained_private_material[0].delete_at(),
+            Timestamp(grace_end + 10)
+        );
+        // A Welcome consuming it keeps the grace period from `replaced_at`.
+        lifecycle.record_consumed_key_package(&[2], Timestamp(2_000));
+        let consumed = &lifecycle.retained_private_material[0];
+        assert!(consumed.consumed && !consumed.awaiting_confirmed_replacement);
+        assert_eq!(consumed.delete_at(), Timestamp(grace_end));
     }
 
     fn pending(key_package_ref: Vec<u8>) -> PendingKeyPackageReplacement {

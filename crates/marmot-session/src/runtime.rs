@@ -1372,13 +1372,16 @@ where
             && lifecycle.current_key_package_ref == lifecycle.last_consumed_key_package_ref;
         // Inviters may still hold a replaced publication, so its private
         // material outlives this confirmed replacement by the grace period,
-        // consumed or not (mdk#2344). That includes pending replacements
-        // superseded before any was confirmed.
+        // consumed or not (mdk#2344). That includes unconsumed pending
+        // replacements superseded before any was confirmed; a consumed one
+        // keeps the grace period it started when it was superseded.
         let confirmed_at = self.wall_clock.now();
         for material in &mut lifecycle.retained_private_material {
             if material.awaiting_confirmed_replacement {
                 material.awaiting_confirmed_replacement = false;
-                material.replaced_at = confirmed_at;
+                if !material.consumed {
+                    material.replaced_at = confirmed_at;
+                }
             }
         }
         let mut retired = Vec::new();

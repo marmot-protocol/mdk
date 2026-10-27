@@ -51,7 +51,8 @@ impl<S: StorageProvider> Engine<S> {
             // An older pending artifact may have reached a relay even without
             // a recorded ACK. Retain its private material when superseding it;
             // the replacement and this ownership transfer commit together. Its
-            // grace period starts once a replacement is confirmed.
+            // grace period starts once a replacement is confirmed, or now if a
+            // Welcome already consumed it (mdk#2352).
             if let Some(previous) = staged.pending_replacement.take() {
                 staged
                     .retained_private_material
@@ -62,7 +63,7 @@ impl<S: StorageProvider> Engine<S> {
                         replaced_at: authored_created_at,
                         consumed: previous.consumed_at.is_some(),
                         authored_event_id: previous.signed_event.map(|event| event.id),
-                        awaiting_confirmed_replacement: true,
+                        awaiting_confirmed_replacement: previous.consumed_at.is_none(),
                     });
             }
             staged.pending_replacement = Some(PendingKeyPackageReplacement {
