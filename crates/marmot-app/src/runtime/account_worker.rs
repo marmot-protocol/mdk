@@ -4441,7 +4441,8 @@ async fn complete_media_http(
                 tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
                     "attachment completion failed; durable lease permits recovery");
             }
-            shared.attachment_updates.send_modify(|_| {});
+            // The attempt ended without a body: failed, retrying, cancelled or parked.
+            shared.attachment_updates.state_changed();
             drop(background_permit);
         }
         MediaHttpCompletion::AttachmentRetained {
@@ -4452,7 +4453,8 @@ async fn complete_media_http(
                 tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
                     "attachment completion failed; durable lease permits recovery");
             }
-            shared.attachment_updates.send_modify(|_| {});
+            // The body was published (Ready) or the attempt ended without it.
+            shared.attachment_updates.state_changed();
             drop(background_permit);
         }
         MediaHttpCompletion::Avatar { job, result } => {

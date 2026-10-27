@@ -146,6 +146,14 @@
   second. A `next()` call cancelled by its caller, such as a C timeout, no
   longer loses a frame that was waiting out that window: the next call
   delivers it (#2157).
+- Attachment transfer subscriptions read at most four times a second while
+  transfers only report progress, however many downloads run at once. Since
+  #2311 any progress write in the runtime made every open subscription read
+  again at the 25 ms floor, so with several concurrent downloads each read up
+  to forty times a second while still delivering four frames. Workers now
+  report state changes apart from progress: only a row appearing, disappearing
+  or entering another transfer state is read at the floor and delivered at
+  once (#2157).
 
 ## 0.14.0 - 2026-10-23
 

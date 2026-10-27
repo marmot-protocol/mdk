@@ -586,6 +586,9 @@ enum ResponseLength {
     Unknown,
 }
 
+/// Disk pressure that arrives before or during an explicit file download,
+/// with a known or unknown body length, parks the job as storage-blocked
+/// before private staging consumes the reserve, leaving nothing readable.
 async fn check_disk_reserve(length: ResponseLength) {
     let known_length = matches!(length, ResponseLength::Known);
     let plain = vec![42; 2 * ATTACHMENT_CHECKPOINT_BYTES + 71];
@@ -601,7 +604,8 @@ async fn check_disk_reserve(length: ResponseLength) {
     );
     let mut context = resume_context(&store, &job, dir.path(), &reference);
     context.automatic = false;
-    let (updates, mut progress) = tokio::sync::watch::channel(());
+    let updates = crate::runtime::attachment_controls::AttachmentUpdates::default();
+    let mut progress = updates.subscribe();
     context.updates = Some(updates);
     let server_store = store.app_storage();
     let mut policy = context.policy.clone();
@@ -1583,6 +1587,33 @@ async fn attachment_resume_full_disk_during_checkpoint_write_parks() {
 }
 
 /// A day and a second ago: a checkpoint saved then has expired.
+/// Plain byte progress wakes transfer observers without moving the state
+/// generation, so a subscription keeps it to the frame spacing. A body
+/// restart, which can leave a verification phase for Downloading on a
+/// fallback server, and a new verification phase both move it, so a
+/// subscription reads them at the read floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_resume_reports_restarts_and_phases_as_state_changes() {
+    let (dir, _client, store, reference) = offline_fixture().await;
+    let job = claim(&store);
+    let updates = crate::runtime::attachment_controls::AttachmentUpdates::default();
+    let mut observer = updates.subscribe();
+    let context = AttachmentResume {
+        updates: Some(updates.clone()),
+        ..resume_context(&store, &job, dir.path(), &reference)
+    };
+    let generation = |observer: &mut tokio::sync::watch::Receiver<u64>| {
+        assert!(observer.has_changed().unwrap(), "observers were not woken");
+        *observer.borrow_and_update()
+    };
+    context.progress(0, Some(64), true).await.unwrap();
+    assert_eq!(generation(&mut observer), 1, "a restart is a state change");
+    context.progress(32, Some(64), false).await.unwrap();
+    assert_eq!(generation(&mut observer), 1, "byte progress is not");
+    context.phase(2).await.unwrap();
+    assert_eq!(generation(&mut observer), 2, "a verification phase is");
+}
+
 fn earlier_clock() -> u64 {
     crate::unix_now_seconds() - 86401
 }
@@ -2682,7 +2713,8 @@ async fn promoted_body_revocation_order(pause_first: bool) {
         &store.app_storage().attachment_store_identity().unwrap(),
         &reference.media_type,
     );
-    let (updates, mut progress) = tokio::sync::watch::channel(());
+    let updates = crate::runtime::attachment_controls::AttachmentUpdates::default();
+    let mut progress = updates.subscribe();
     resume.updates = Some(updates);
     let prepared = client
         .prepare_background_attachment_download(

@@ -1,9 +1,11 @@
 //! The maintenance tick's legacy body migration (mdk#2314 step 6): one batch
 //! on the blocking pool, with the account's policy and free space, waking
-//! attachment observers when it finishes.
+//! attachment observers with a state change when it finishes.
 use super::*;
 use crate::media::attachment_resume::test_free_space;
 
+/// One maintenance batch moves a legacy body into the media store, still
+/// readable, and wakes observers with a state change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_maintenance_batch_moves_a_legacy_body_and_wakes_observers() {
     let (dir, client, storage, _reference) = offline_fixture().await;
@@ -39,6 +41,7 @@ async fn the_maintenance_batch_moves_a_legacy_body_and_wakes_observers() {
         observer.has_changed().unwrap(),
         "completion wakes observers"
     );
+    assert!(*observer.borrow() > 0, "as a state change");
     assert_eq!(storage.app_storage().legacy_attachment_bytes().unwrap(), 0);
     let read = read_retained(&storage, &client.app, "alice", &asset, now, 0, 1024)
         .unwrap()
@@ -55,7 +58,7 @@ async fn the_maintenance_batch_moves_a_legacy_body_and_wakes_observers() {
 }
 
 /// The maintenance tick's compaction runs once per worker ownership, awaited
-/// off the worker's async thread, and wakes observers.
+/// off the worker's async thread, and wakes observers with a state change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_maintenance_tick_compacts_the_database_once() {
     let (dir, client, storage, _reference) = offline_fixture().await;
@@ -85,6 +88,7 @@ async fn the_maintenance_tick_compacts_the_database_once() {
     maintenance_tick(&client, &shared, &mut admission).await;
     assert!(admission.compaction_attempted);
     assert!(observer.has_changed().unwrap(), "observers hear of it");
+    assert!(*observer.borrow() > 0, "as a state change");
     let after = storage.app_storage().database_space().unwrap();
     assert!(after.incremental);
     assert!(after.file_bytes() < before.file_bytes());
