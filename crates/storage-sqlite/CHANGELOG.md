@@ -33,8 +33,9 @@
   `AccountGroupPushGossipState` gains the matching field.
 - Migration 0122 advances account storage to schema 122 (mdk#2611). It adds
   `joining_since_ms` to `group_push_gossip_state`, which existing rows leave
-  NULL, with a partial index over the rows that have it, and
-  `join_window_counted_ms`, which they leave 0.
+  NULL, with a partial index over the rows that have it,
+  `join_window_counted_ms`, which they leave 0, and `announce_owed_at_ms`,
+  which they leave NULL, with a partial index over the rows that have it.
   `AccountGroupPushGossipState` gains the matching fields.
 - `apply_group_push_token_tombstone` takes an `AccountGroupPushTokenTombstone`
   instead of eight arguments, and stores its optional removal proof.
@@ -63,6 +64,12 @@
   group this device created has no window. `joining_group_push_gossip_states`
   lists the open windows, `count_push_join_window_time` adds time to every one
   whose join has completed, and `record_group_push_gossip_announce` closes one.
+- `record_group_push_announce_owed` and `owed_group_push_announce_states` keep
+  the other announces this device owes a group. Each new debt raises the
+  stored value past the last, even if the clock went back, and returns it.
+  `record_group_push_gossip_announce` now also takes the owed value the
+  published announce was built under, and settles the debt only while it
+  still holds that value; a new Welcome drops it.
 
 ## 0.14.0 - 2026-10-23
 

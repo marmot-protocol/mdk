@@ -511,9 +511,10 @@ async fn periodic_announce_rides_with_the_first_send_after_the_interval() {
     assert_eq!(sent_updates(&fx.alice, from).len(), 1);
 }
 
-/// A Welcome that invites the device again opens a new window. A periodic
-/// announce a send found due before it is not sent inside the new window, and
-/// an announce left in the outbox in the old window holds back no other.
+/// A Welcome that invites the device again opens a new window. An announce
+/// owed inside it waits for the window's end, where one announce settles
+/// both, and an announce left in the outbox in the old window holds back no
+/// other. (Storage drops what was owed before the Welcome.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_join_window_owes_its_own_announce() {
     let mut fx = Fixture::new().await;
@@ -524,12 +525,17 @@ async fn a_new_join_window_owes_its_own_announce() {
     let window = gossip_state(&fx.bob, &group_hex);
     assert!(window.joined_at_ms.is_some());
     let from = gossip_sent(&fx.bob);
-    fx.bob.client.pending_push_announces.insert(group.clone());
+    fx.bob
+        .client
+        .app
+        .record_group_push_announce_owed(&fx.bob.label, &group_hex, notifications::unix_now_ms())
+        .unwrap();
     fx.bob.client.accepted_push_announces.insert(
         group.clone(),
         AcceptedPushAnnounce {
             joining_since_ms: Some(window.joining_since_ms.unwrap() - 1),
             app_event_id: "an announce from the old window".to_owned(),
+            settles_owed: None,
         },
     );
     assert!(!fx.bob.client.has_pending_push_registration_work());
@@ -542,7 +548,7 @@ async fn a_new_join_window_owes_its_own_announce() {
     let sent = sent_updates(&fx.bob, from);
     assert_eq!(sent.len(), 1);
     assert_eq!(have(&sent[0]), Some(held(&fx.bob, &group_hex)));
-    assert!(fx.bob.client.pending_push_announces.is_empty());
+    assert_eq!(gossip_state(&fx.bob, &group_hex).announce_owed_at_ms, None);
     assert!(fx.bob.client.accepted_push_announces.is_empty());
 }
 
@@ -637,6 +643,7 @@ async fn an_announce_the_outbox_publishes_later_counts() {
     .await;
     assert!(published.is_ok(), "the outbox publishes it");
     assert_eq!(gossip_state(&fx.bob, &group_hex).joining_since_ms, None);
+    assert!(fx.bob.client.accepted_push_announces.is_empty());
     assert_eq!(sent_updates(&fx.bob, from).len(), 1, "and it is not resent");
     assert!(!fx.bob.client.has_pending_push_registration_work());
 
@@ -646,4 +653,106 @@ async fn an_announce_the_outbox_publishes_later_counts() {
     let sent = sent_updates(&fx.bob, from);
     assert_eq!(sent.len(), 2, "the periodic announce goes out");
     assert_eq!(have(&sent[1]), Some(held(&fx.bob, &group_hex)));
+}
+
+/// An announce the outbox drops is sent again without another group message:
+/// the announce it was sent for stays owed until one is published, which
+/// settles it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_announce_the_outbox_drops_is_sent_again() {
+    let mut fx = Fixture::new().await;
+    let relay = fx.relay.clone();
+    let group = fx.group.clone();
+    let group_hex = fx.group_hex();
+    fx.alice.client.push_announce_timing.interval = Duration::ZERO;
+    fx.alice.client.send(&group, b"a week later").await.unwrap();
+    let before = gossip_state(&fx.alice, &group_hex);
+    assert!(
+        before.announce_owed_at_ms.is_some(),
+        "the periodic one is owed"
+    );
+
+    let from = gossip_sent(&fx.alice);
+    relay.fail_publishes_as_unavailable();
+    assert!(!retry(&mut fx.alice).await);
+    assert_eq!(
+        sent_updates(&fx.alice, from).len(),
+        1,
+        "accepted into the outbox"
+    );
+    assert!(!fx.alice.client.accepted_push_announces.is_empty());
+
+    relay.allow_publishes();
+    relay.reject_next_publish();
+    let dropped = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let _ = fx.alice.client.retry_group_convergence(&group).await;
+            if fx.alice.client.accepted_push_announces.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await;
+    assert!(dropped.is_ok(), "the outbox drops it");
+    let state = gossip_state(&fx.alice, &group_hex);
+    assert_eq!(state.last_announced_at_ms, before.last_announced_at_ms);
+    assert_eq!(state.announce_owed_at_ms, before.announce_owed_at_ms);
+
+    assert!(fx.alice.client.has_pending_push_registration_work());
+    assert!(!retry(&mut fx.alice).await);
+    let sent = sent_updates(&fx.alice, from);
+    assert_eq!(sent.len(), 2, "sent again");
+    assert_eq!(have(&sent[1]), Some(held(&fx.alice, &group_hex)));
+    let state = gossip_state(&fx.alice, &group_hex);
+    assert!(state.last_announced_at_ms > before.last_announced_at_ms);
+    assert_eq!(
+        state.announce_owed_at_ms, None,
+        "the published one settles it"
+    );
+    assert!(!fx.alice.client.has_pending_push_registration_work());
+}
+
+/// A change shared before the catch-up has run is still announced after a
+/// restart: the announce is owed before the plain self-update goes out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_shared_before_the_catch_up_is_announced_after_a_restart() {
+    let mut fx = Fixture::new().await;
+    let group_hex = fx.group_hex();
+    fx.alice.client.test_push_device_can_fetch = Some(false);
+    fx.alice.client.advance_push_join_windows().await;
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    fx.alice.register("alice-token-2", &fx.server);
+    let from = gossip_sent(&fx.alice);
+    assert_eq!(fx.alice.share().await.succeeded_groups, 1);
+    let shared = sent_updates(&fx.alice, from);
+    assert_eq!(shared.len(), 1);
+    assert_eq!(have(&shared[0]), None, "a plain self-update");
+    assert!(
+        gossip_state(&fx.alice, &group_hex)
+            .announce_owed_at_ms
+            .is_some()
+    );
+
+    let app = fx.alice.client.app.clone();
+    let (label, account_id_hex, cursor) = (
+        fx.alice.label.clone(),
+        fx.alice.account_id_hex.clone(),
+        fx.alice.cursor,
+    );
+    drop(fx.alice);
+    let mut alice = Device::open(&app, &label, &account_id_hex, cursor).await;
+    assert!(!retry(&mut alice).await);
+    assert!(
+        sent_updates(&alice, 0).is_empty(),
+        "nothing before the catch-up"
+    );
+    alice.can_fetch().await;
+    assert!(alice.client.has_pending_push_registration_work());
+    assert!(!retry(&mut alice).await);
+    let sent = sent_updates(&alice, 0);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(have(&sent[0]), Some(held(&alice, &group_hex)));
+    assert_eq!(token_leaves(&sent[0]), vec![alice.leaf(&fx.group)]);
+    assert_eq!(gossip_state(&alice, &group_hex).announce_owed_at_ms, None);
 }

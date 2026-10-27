@@ -304,7 +304,7 @@ impl AppClient {
                     }
                 };
                 let announce = self.shares_in_announce(&group_id, &record);
-                let content = if announce {
+                let content = if announce.is_some() {
                     self.build_push_announce(&group_id, std::slice::from_ref(&record))
                 } else {
                     serde_json::to_string(&payload).map_err(AppError::from)
@@ -329,8 +329,8 @@ impl AppClient {
                         if summary.accept_disposition
                             == cgka_traits::SendAcceptDisposition::Published =>
                     {
-                        if announce {
-                            self.record_push_announce(&group_id);
+                        if let Some(settles_owed) = announce {
+                            self.record_push_announce(&group_id, Some(settles_owed));
                         }
                         if let Err(err) = self.app.upsert_group_push_token(&account.label, &record)
                         {
@@ -350,8 +350,12 @@ impl AppClient {
                         )?;
                     }
                     Ok((event, _summary)) => {
-                        if announce {
-                            self.note_push_announce_left_in_outbox(&group_id, event.id);
+                        if let Some(settles_owed) = announce {
+                            self.note_push_announce_left_in_outbox(
+                                &group_id,
+                                event.id,
+                                Some(settles_owed),
+                            );
                         }
                         tracing::debug!(
                             target: "marmot_app::notifications",

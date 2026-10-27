@@ -40,11 +40,13 @@
   shared in a plain self-update and announced after. Inside the window, and
   when re-sharing an unchanged record after a member add, a device shares in
   plain self-updates, with no `have`. The window opens when a Welcome
-  installs the group and survives a restart. Only a published announce
-  counts: one left in the outbox counts once the outbox publishes it, no
-  other is sent in that group meanwhile, and one the outbox drops is owed
-  again. Incoming announces are applied as before, as a self-update or a
-  request.
+  installs the group and survives a restart. Every other announce owed is
+  stored before it is sent, so one the outbox drops, or one deferred until
+  the catch-up has run, is still sent after a restart; a published announce
+  built since settles it, and a new Welcome drops it. Only a published
+  announce counts: one left in the outbox counts once the outbox publishes
+  it, and no other is sent in that group meanwhile. Incoming announces are
+  applied as before, as a self-update or a request.
 
   Known limits, each costing at most a stale or repeated announce:
   - whether a device can fetch is judged for the whole account, not per

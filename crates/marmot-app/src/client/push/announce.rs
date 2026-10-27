@@ -2,9 +2,10 @@
 //! device announces in a group once when its join window there ends, instead
 //! of a plain self-update when it shares a new or changed record after the
 //! window, and with the next group message it sends after the announce
-//! interval has passed.
+//! interval has passed. Every announce owed is stored before it is sent, so
+//! one the outbox drops or a restart interrupts is sent again.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use cgka_traits::GroupId;
@@ -159,6 +160,9 @@ pub(crate) struct AcceptedPushAnnounce {
     /// The join window it was sent in.
     pub(crate) joining_since_ms: Option<i64>,
     pub(crate) app_event_id: String,
+    /// The owed announce it was built under: once published, it settles that
+    /// debt if nothing was owed since.
+    pub(crate) settles_owed: Option<i64>,
 }
 
 fn millis(duration: Duration) -> i64 {
@@ -166,19 +170,21 @@ fn millis(duration: Duration) -> i64 {
 }
 
 impl AppClient {
-    /// Whether this device shares `record` in `group_id` in an announce: its
-    /// join window there has ended or it has none, no announce of its is
-    /// waiting in the group's outbox, the record is new or changed, and the
-    /// device has been able to fetch for the settle time. Otherwise, inside
-    /// the window, when re-sharing a record members may lack, and after a
-    /// failed read, it goes in a plain self-update, which is always valid. A
-    /// change shared before this client's catch-up has run goes in a plain
-    /// self-update too, and the group is owed the announce for once it has.
+    /// Whether this device shares `record` in `group_id` in an announce, and
+    /// if so the owed announce it settles once published. The record must be new or
+    /// changed and the join window there over or never opened; then the group
+    /// is owed an announce, recorded before anything is sent. It goes in this
+    /// share unless an announce of this device's waits in the group's outbox
+    /// or the device has not been able to fetch for the settle time; then the
+    /// share is a plain self-update, which is always valid, and the announce
+    /// owed is sent once it can be. Inside the window, when re-sharing a
+    /// record members may have, and when the debt cannot be recorded, the
+    /// share is a plain self-update too.
     pub(super) fn shares_in_announce(
         &mut self,
         group_id: &GroupId,
         record: &notifications::GroupPushTokenRecord,
-    ) -> bool {
+    ) -> Option<i64> {
         let state = match self
             .app
             .group_push_gossip_state(&self.state.label, &record.group_id_hex)
@@ -191,23 +197,54 @@ impl AppClient {
                     error_kind = error.privacy_safe_kind(),
                     "push join window read failed",
                 );
-                return false;
+                if self.is_new_own_push_record(record) != Some(false) {
+                    self.record_push_announce_owed(group_id, notifications::unix_now_ms());
+                }
+                return None;
             }
         };
-        if self.push_announce_timing.join_window(state.as_ref()) == PushJoinWindow::Open
-            || self.announce_left_in_outbox(group_id, state.as_ref())
-            || !self.is_new_own_push_record(record)
-        {
-            return false;
+        if self.push_announce_timing.join_window(state.as_ref()) == PushJoinWindow::Open {
+            return None;
         }
-        if !self
-            .push_fetch_clock
-            .settled(self.push_announce_timing.catch_up_settle)
-        {
-            self.pending_push_announces.insert(group_id.clone());
-            return false;
+        match self.is_new_own_push_record(record) {
+            Some(true) => {}
+            Some(false) => return None,
+            None => {
+                self.record_push_announce_owed(group_id, notifications::unix_now_ms());
+                return None;
+            }
         }
-        true
+        let owed = self.record_push_announce_owed(group_id, notifications::unix_now_ms())?;
+        if self.announce_left_in_outbox(group_id, state.as_ref())
+            || !self
+                .push_fetch_clock
+                .settled(self.push_announce_timing.catch_up_settle)
+        {
+            return None;
+        }
+        Some(owed)
+    }
+
+    /// Record that this device owes `group_id` an announce as of
+    /// `owed_at_ms`. Returns the value stored, or `None` when nothing was
+    /// recorded.
+    fn record_push_announce_owed(&self, group_id: &GroupId, owed_at_ms: i64) -> Option<i64> {
+        match self.app.record_group_push_announce_owed(
+            &self.state.label,
+            &hex::encode(group_id.as_slice()),
+            owed_at_ms,
+        ) {
+            Ok(owed) => owed,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::notifications",
+                    method = "record_push_announce_owed",
+                    error_kind = error.privacy_safe_kind(),
+                    "owed push announce was not recorded",
+                );
+                None
+            }
+        }
     }
 
     /// Count the time since the last look during which this device could
@@ -320,7 +357,10 @@ impl AppClient {
     /// This device sent a group message in `group_id`, published or accepted
     /// into the group's outbox: owe the group the periodic announce if it is
     /// due, for the account worker to send right after. An announce sent
-    /// while the message waits in the outbox waits behind it.
+    /// while the message waits in the outbox waits behind it. An announce
+    /// already waiting in the outbox stands for it: once published it
+    /// restarts the interval, and if the outbox drops it, the debt it was
+    /// sent for is still owed.
     pub(crate) fn note_push_announce_after_send(&mut self, group_id: &GroupId) {
         let group_id_hex = hex::encode(group_id.as_slice());
         let state = match self
@@ -338,23 +378,26 @@ impl AppClient {
                 return;
             }
         };
+        let now_ms = notifications::unix_now_ms();
         if self
             .push_announce_timing
-            .periodic_due(state.as_ref(), notifications::unix_now_ms())
-            && self.pending_push_announces.insert(group_id.clone())
+            .periodic_due(state.as_ref(), now_ms)
+            && !self.announce_left_in_outbox(group_id, state.as_ref())
+            && self.record_push_announce_owed(group_id, now_ms).is_some()
         {
             self.push_registration_share_queued = true;
         }
     }
 
-    /// Groups that are owed an announce now, by group id: those whose join
-    /// window has ended, and those a sent message found due for the periodic
-    /// one and whose window has not reopened since. A group whose announce
-    /// this client left in the outbox in its current window is skipped. None
-    /// is owed until the device has been able to fetch for the settle time,
-    /// so an announce names what this client's catch-up brought.
-    fn owed_push_announces(&self) -> Result<BTreeSet<String>, AppError> {
-        let mut owed = BTreeSet::new();
+    /// Groups that are owed an announce now, by group id, each with the owed
+    /// announce stored for it (see [`Self::record_push_announce`]): those whose join
+    /// window has ended, and those with another announce owed, outside an
+    /// open window. A group whose announce this client left in the outbox in
+    /// its current window is skipped. None is owed until the device has been
+    /// able to fetch for the settle time, so an announce names what this
+    /// client's catch-up brought.
+    fn owed_push_announces(&self) -> Result<BTreeMap<String, Option<i64>>, AppError> {
+        let mut owed = BTreeMap::new();
         if !self
             .push_fetch_clock
             .settled(self.push_announce_timing.catch_up_settle)
@@ -371,18 +414,20 @@ impl AppClient {
             if self.push_announce_timing.join_window(Some(&state)) == PushJoinWindow::Ended
                 && !self.announce_left_in_outbox(&group_id, Some(&state))
             {
-                owed.insert(state.group_id_hex);
+                owed.insert(state.group_id_hex, state.announce_owed_at_ms);
             }
         }
-        for group_id in &self.pending_push_announces {
-            let group_id_hex = hex::encode(group_id.as_slice());
-            let state = self
-                .app
-                .group_push_gossip_state(&self.state.label, &group_id_hex)?;
-            if self.push_announce_timing.join_window(state.as_ref()) != PushJoinWindow::Open
-                && !self.announce_left_in_outbox(group_id, state.as_ref())
+        for state in self
+            .app
+            .owed_group_push_announce_states(&self.state.label)?
+        {
+            let Ok(group_id) = hex::decode(&state.group_id_hex).map(GroupId::new) else {
+                continue;
+            };
+            if self.push_announce_timing.join_window(Some(&state)) != PushJoinWindow::Open
+                && !self.announce_left_in_outbox(&group_id, Some(&state))
             {
-                owed.insert(group_id_hex);
+                owed.insert(state.group_id_hex, state.announce_owed_at_ms);
             }
         }
         Ok(owed)
@@ -403,13 +448,15 @@ impl AppClient {
             })
     }
 
-    /// The runtime accepted the announce `app_event_id` in `group_id` into
-    /// the outbox without publishing it: send no other there in this join
-    /// window until the outbox publishes or drops it.
+    /// The runtime accepted the announce `app_event_id` in `group_id`, built
+    /// under the owed announce `settles_owed`, into the outbox without
+    /// publishing it: send no other there in this join window until the
+    /// outbox publishes or drops it.
     pub(super) fn note_push_announce_left_in_outbox(
         &mut self,
         group_id: &GroupId,
         app_event_id: String,
+        settles_owed: Option<i64>,
     ) {
         let joining_since_ms = match self
             .app
@@ -431,6 +478,7 @@ impl AppClient {
             AcceptedPushAnnounce {
                 joining_since_ms,
                 app_event_id,
+                settles_owed,
             },
         );
     }
@@ -438,8 +486,8 @@ impl AppClient {
     /// Settle the announces this client left in an outbox that `effects`
     /// report published or dropped. A published one counts as an announce
     /// published at once, unless a Welcome has opened a new join window
-    /// since, which owes its own. A dropped one lifts the hold, so the
-    /// announce owed is sent again.
+    /// since, which owes its own. A dropped one lifts the hold, and the
+    /// announce it was sent for, still owed, is sent again.
     pub(crate) fn settle_accepted_push_announces(
         &mut self,
         effects: &marmot_session::AccountDeviceEffects,
@@ -478,7 +526,7 @@ impl AppClient {
                     if state.as_ref().and_then(|state| state.joining_since_ms)
                         == accepted.joining_since_ms =>
                 {
-                    self.record_push_announce(group_id);
+                    self.record_push_announce(group_id, accepted.settles_owed);
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -497,7 +545,7 @@ impl AppClient {
     /// Whether an announce this device owes can be sent now.
     pub(crate) fn has_due_push_announce(&self) -> bool {
         match self.owed_push_announces() {
-            Ok(owed) => owed.iter().any(|group_id_hex| {
+            Ok(owed) => owed.keys().any(|group_id_hex| {
                 matches!(
                     self.push_gossip_gate(group_id_hex, None),
                     PushGossipGate::Due
@@ -538,56 +586,59 @@ impl AppClient {
             }
         };
         let mut pending = false;
-        for group_id_hex in owed {
+        for (group_id_hex, settles_owed) in owed {
             let Ok(group_id) = hex::decode(&group_id_hex).map(GroupId::new) else {
                 continue;
             };
-            match self.push_gossip_gate(&group_id_hex, None) {
-                PushGossipGate::NotYet => continue,
-                PushGossipGate::Void => {}
-                PushGossipGate::Due => match self.send_push_announce(&group_id).await {
-                    Ok((cgka_traits::SendAcceptDisposition::Published, _)) => {
-                        if !self.record_push_announce(&group_id) {
-                            pending = true;
-                            continue;
-                        }
-                    }
-                    Ok((_, app_event_id)) => {
-                        self.note_push_announce_left_in_outbox(&group_id, app_event_id);
-                    }
-                    // The group's state changed since it was checked; the next
-                    // check sends the announce or finds the group gone.
-                    Err(
-                        AppError::GroupRemoved(_)
-                        | AppError::GroupDisbanding(_)
-                        | AppError::UserBlocked,
-                    ) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "marmot_app::notifications",
-                            method = "send_due_push_announces",
-                            error_kind = error.privacy_safe_kind(),
-                            "push announce remains owed",
-                        );
-                        pending = true;
-                        continue;
-                    }
-                },
+            if !matches!(
+                self.push_gossip_gate(&group_id_hex, None),
+                PushGossipGate::Due
+            ) {
+                continue;
             }
-            self.pending_push_announces.remove(&group_id);
+            match self.send_push_announce(&group_id).await {
+                Ok((cgka_traits::SendAcceptDisposition::Published, _)) => {
+                    pending |= !self.record_push_announce(&group_id, settles_owed);
+                }
+                Ok((_, app_event_id)) => {
+                    self.note_push_announce_left_in_outbox(&group_id, app_event_id, settles_owed);
+                }
+                // The group's state changed since it was checked; the next
+                // check sends the announce or finds the group gone.
+                Err(
+                    AppError::GroupRemoved(_)
+                    | AppError::GroupDisbanding(_)
+                    | AppError::UserBlocked,
+                ) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        target: "marmot_app::notifications",
+                        method = "send_due_push_announces",
+                        error_kind = error.privacy_safe_kind(),
+                        "push announce remains owed",
+                    );
+                    pending = true;
+                }
+            }
         }
         pending
     }
 
     /// Record that an announce in `group_id` was published, closing its join
-    /// window. Returns false when the write failed.
-    pub(super) fn record_push_announce(&mut self, group_id: &GroupId) -> bool {
-        self.pending_push_announces.remove(group_id);
+    /// window. It settles the owed announce it was built under,
+    /// `settles_owed`, unless another was owed since. Returns false when the
+    /// write failed.
+    pub(super) fn record_push_announce(
+        &mut self,
+        group_id: &GroupId,
+        settles_owed: Option<i64>,
+    ) -> bool {
         self.accepted_push_announces.remove(group_id);
         match self.app.record_group_push_gossip_announce(
             &self.state.label,
             &hex::encode(group_id.as_slice()),
             notifications::unix_now_ms(),
+            settles_owed,
         ) {
             Ok(_) => true,
             Err(error) => {
@@ -631,21 +682,20 @@ impl AppClient {
     /// Whether sharing `record` shares a new or changed record of this
     /// device's: none is stored for its record key, or the stored one names
     /// another token or relay hint. Re-sharing the stored registration, as
-    /// after a member add, shares neither. A failed read counts as neither, so
-    /// the share goes in a plain self-update.
-    fn is_new_own_push_record(&self, record: &notifications::GroupPushTokenRecord) -> bool {
+    /// after a member add, shares neither. `None` when the read failed.
+    fn is_new_own_push_record(&self, record: &notifications::GroupPushTokenRecord) -> Option<bool> {
         match self
             .app
             .group_push_tokens(&self.state.label, &record.group_id_hex)
         {
-            Ok(stored) => !stored.iter().any(|stored| {
+            Ok(stored) => Some(!stored.iter().any(|stored| {
                 stored.member_id_hex == record.member_id_hex
                     && stored.leaf_index == record.leaf_index
                     && stored.platform == record.platform
                     && stored.server_pubkey_hex == record.server_pubkey_hex
                     && stored.token_fingerprint == record.token_fingerprint
                     && stored.relay_hint == record.relay_hint
-            }),
+            })),
             Err(error) => {
                 tracing::warn!(
                     target: "marmot_app::notifications",
@@ -653,7 +703,7 @@ impl AppClient {
                     error_kind = error.privacy_safe_kind(),
                     "stored push token read failed",
                 );
-                false
+                None
             }
         }
     }

@@ -747,6 +747,7 @@ async fn durable_send_interrupts_due_secondary_retry_and_updates_live_window() {
         "alice",
         &hex::encode(group.as_slice()),
         crate::notifications::unix_now_ms(),
+        None,
     )
     .unwrap();
     let runtime = crate::MarmotAppRuntime::new(app.clone());

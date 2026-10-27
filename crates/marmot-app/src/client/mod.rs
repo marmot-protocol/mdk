@@ -819,10 +819,6 @@ pub struct AppClient {
     /// The time during which this device could fetch, as this client has
     /// seen it; only that time counts toward a push join window.
     pub(super) push_fetch_clock: push::PushFetchClock,
-    /// Groups owed a push announce that waits for its turn: a sent group
-    /// message found the periodic one due, or a changed record was shared
-    /// before this client's catch-up had run. The account worker sends it.
-    pub(super) pending_push_announces: std::collections::HashSet<GroupId>,
     /// Groups where the runtime accepted a push announce into the outbox
     /// without publishing it. This client sends no other there until the
     /// outbox publishes or drops it, or a Welcome opens a new window.
@@ -3442,7 +3438,6 @@ impl AppClient {
         self.pending_push_leaf_reconciliations.remove(group_id);
         self.pending_member_add_push_shares.remove(group_id);
         self.pending_own_add_push_snapshots.remove(group_id);
-        self.pending_push_announces.remove(group_id);
         self.accepted_push_announces.remove(group_id);
         self.app.presentation_signals.wake();
         // Deletion already committed. A failed transport refresh must not make

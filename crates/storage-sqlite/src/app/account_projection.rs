@@ -490,6 +490,12 @@ pub struct AccountGroupPushGossipState {
     /// during which this device could fetch the group's messages. Zero until
     /// the join completes and for a group with no window.
     pub join_window_counted_ms: i64,
+    /// When this device last came to owe the group an announce besides the
+    /// one that ends its join window: a send found the periodic one due, or
+    /// it shared a new or changed record of its own. Each new debt raises it
+    /// past the previous value, even if the clock went back. `None` when none
+    /// is owed.
+    pub announce_owed_at_ms: Option<i64>,
     /// When this device last announced in the group. `None` if it never has.
     pub last_announced_at_ms: Option<i64>,
     /// The device owes the group a push snapshot once its merged epoch passes
@@ -1362,7 +1368,8 @@ impl SqliteAppStorage {
                          ON CONFLICT(group_id_hex) DO UPDATE SET
                             joining_since_ms = excluded.joining_since_ms,
                             joined_at_ms = NULL,
-                            join_window_counted_ms = 0",
+                            join_window_counted_ms = 0,
+                            announce_owed_at_ms = NULL",
                         params![&group.group_id_hex, unix_now_ms()],
                     )
                     .storage()?;
@@ -3100,7 +3107,7 @@ impl SqliteAppStorage {
         self.lock()?
             .query_row_cached(
                 "SELECT group_id_hex, joined_at_ms, last_announced_at_ms, snapshot_owed_after_epoch,
-                        joining_since_ms, join_window_counted_ms
+                        joining_since_ms, join_window_counted_ms, announce_owed_at_ms
                  FROM group_push_gossip_state
                  WHERE group_id_hex = ?1",
                 params![group_id_hex],
@@ -3116,7 +3123,7 @@ impl SqliteAppStorage {
         let mut statement = conn
             .prepare_cached(
                 "SELECT group_id_hex, joined_at_ms, last_announced_at_ms, snapshot_owed_after_epoch,
-                        joining_since_ms, join_window_counted_ms
+                        joining_since_ms, join_window_counted_ms, announce_owed_at_ms
                  FROM group_push_gossip_state
                  WHERE snapshot_owed_after_epoch IS NOT NULL
                  ORDER BY group_id_hex",
@@ -3138,7 +3145,7 @@ impl SqliteAppStorage {
         let mut statement = conn
             .prepare_cached(
                 "SELECT group_id_hex, joined_at_ms, last_announced_at_ms, snapshot_owed_after_epoch,
-                        joining_since_ms, join_window_counted_ms
+                        joining_since_ms, join_window_counted_ms, announce_owed_at_ms
                  FROM group_push_gossip_state
                  WHERE joining_since_ms IS NOT NULL
                  ORDER BY group_id_hex",
@@ -3148,6 +3155,59 @@ impl SqliteAppStorage {
             .query_map([], group_push_gossip_state_from_row)
             .storage()?
             .collect::<Result<Vec<_>, _>>()
+            .storage()
+    }
+
+    /// Every group where this device owes an announce besides the one that
+    /// ends its join window, in group id order.
+    pub fn owed_group_push_announce_states(
+        &self,
+    ) -> StorageResult<Vec<AccountGroupPushGossipState>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare_cached(
+                "SELECT group_id_hex, joined_at_ms, last_announced_at_ms, snapshot_owed_after_epoch,
+                        joining_since_ms, join_window_counted_ms, announce_owed_at_ms
+                 FROM group_push_gossip_state
+                 WHERE announce_owed_at_ms IS NOT NULL
+                 ORDER BY group_id_hex",
+            )
+            .storage()?;
+        statement
+            .query_map([], group_push_gossip_state_from_row)
+            .storage()?
+            .collect::<Result<Vec<_>, _>>()
+            .storage()
+    }
+
+    /// Record that this device owes `group_id_hex` an announce as of
+    /// `owed_at_ms`, raising the stored value past any earlier one so that
+    /// an announce built before this debt cannot settle it. Returns the value
+    /// stored, or `None`, recording nothing, unless this device is a member of
+    /// a projected group.
+    pub fn record_group_push_announce_owed(
+        &self,
+        group_id_hex: &str,
+        owed_at_ms: i64,
+    ) -> StorageResult<Option<i64>> {
+        self.lock()?
+            .query_row_cached(
+                "INSERT INTO group_push_gossip_state (group_id_hex, announce_owed_at_ms)
+                 SELECT group_id_hex, ?2 FROM account_groups
+                 WHERE group_id_hex = ?1 AND self_membership = 'member'
+                 ON CONFLICT(group_id_hex) DO UPDATE SET
+                    announce_owed_at_ms = MAX(
+                        COALESCE(
+                            group_push_gossip_state.announce_owed_at_ms + 1,
+                            excluded.announce_owed_at_ms
+                        ),
+                        excluded.announce_owed_at_ms
+                    )
+                 RETURNING announce_owed_at_ms",
+                params![group_id_hex, owed_at_ms],
+                |row| row.get(0),
+            )
+            .optional()
             .storage()
     }
 
@@ -3231,28 +3291,39 @@ impl SqliteAppStorage {
             .storage()
     }
 
-    /// Record that this device announced in `group_id_hex`, which it does
-    /// only once its join window there has ended, so the window closes. Keeps
-    /// the latest time. Returns false, recording nothing, unless this device
-    /// is a member of a projected group.
+    /// Record that this device published, at `announced_at_ms`, an announce
+    /// in `group_id_hex` built while the owed announce stood at
+    /// `settles_owed`. It announces only once its join window there has
+    /// ended, so the window closes, and the owed announce is settled only
+    /// while it still holds that value: a debt recorded since the announce was
+    /// built stays owed. Keeps the latest time. Returns false, recording
+    /// nothing, unless this device is a member of a projected group.
     pub fn record_group_push_gossip_announce(
         &self,
         group_id_hex: &str,
         announced_at_ms: i64,
+        settles_owed: Option<i64>,
     ) -> StorageResult<bool> {
-        self.upsert_group_push_gossip_state(
-            "INSERT INTO group_push_gossip_state (group_id_hex, last_announced_at_ms)
-             SELECT group_id_hex, ?2 FROM account_groups
-             WHERE group_id_hex = ?1 AND self_membership = 'member'
-             ON CONFLICT(group_id_hex) DO UPDATE SET
-                last_announced_at_ms = MAX(
-                    COALESCE(group_push_gossip_state.last_announced_at_ms, excluded.last_announced_at_ms),
-                    excluded.last_announced_at_ms
-                ),
-                joining_since_ms = NULL",
-            group_id_hex,
-            announced_at_ms,
-        )
+        Ok(self
+            .lock()?
+            .execute_cached(
+                "INSERT INTO group_push_gossip_state (group_id_hex, last_announced_at_ms)
+                 SELECT group_id_hex, ?2 FROM account_groups
+                 WHERE group_id_hex = ?1 AND self_membership = 'member'
+                 ON CONFLICT(group_id_hex) DO UPDATE SET
+                    last_announced_at_ms = MAX(
+                        COALESCE(group_push_gossip_state.last_announced_at_ms, excluded.last_announced_at_ms),
+                        excluded.last_announced_at_ms
+                    ),
+                    joining_since_ms = NULL,
+                    announce_owed_at_ms = CASE
+                        WHEN group_push_gossip_state.announce_owed_at_ms IS ?3 THEN NULL
+                        ELSE group_push_gossip_state.announce_owed_at_ms
+                    END",
+                params![group_id_hex, announced_at_ms, settles_owed],
+            )
+            .storage()?
+            > 0)
     }
 
     fn upsert_group_push_gossip_state(
@@ -4215,6 +4286,7 @@ fn group_push_gossip_state_from_row(
         joining_since_ms: row.get(4)?,
         joined_at_ms: row.get(1)?,
         join_window_counted_ms: row.get(5)?,
+        announce_owed_at_ms: row.get(6)?,
         last_announced_at_ms: row.get(2)?,
         snapshot_owed_after_epoch: snapshot_owed_after_epoch
             .map(|epoch| {

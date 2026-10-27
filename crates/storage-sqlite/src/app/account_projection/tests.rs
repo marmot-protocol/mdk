@@ -4214,13 +4214,20 @@ fn push_gossip_state_tracks_the_current_membership() {
 
     assert!(app.record_group_push_gossip_join("aa", 10).unwrap());
     assert!(app.record_group_push_gossip_join("aa", 20).unwrap());
-    assert!(app.record_group_push_gossip_announce("aa", 50).unwrap());
-    assert!(app.record_group_push_gossip_announce("aa", 40).unwrap());
+    assert!(
+        app.record_group_push_gossip_announce("aa", 50, None)
+            .unwrap()
+    );
+    assert!(
+        app.record_group_push_gossip_announce("aa", 40, None)
+            .unwrap()
+    );
     let recorded = Some(AccountGroupPushGossipState {
         group_id_hex: "aa".to_owned(),
         joining_since_ms: None,
         joined_at_ms: Some(10),
         join_window_counted_ms: 0,
+        announce_owed_at_ms: None,
         last_announced_at_ms: Some(50),
         snapshot_owed_after_epoch: None,
     });
@@ -4235,9 +4242,17 @@ fn push_gossip_state_tracks_the_current_membership() {
         app.set_group_self_membership("aa", SelfMembership::Member)
             .unwrap();
         assert!(app.record_group_push_gossip_join("aa", 60).unwrap());
+        assert_eq!(
+            app.record_group_push_announce_owed("aa", 60).unwrap(),
+            Some(60)
+        );
         app.set_group_self_membership("aa", membership).unwrap();
         assert_eq!(state("aa"), None, "{membership:?} ends the membership");
-        assert!(!app.record_group_push_gossip_announce("aa", 70).unwrap());
+        assert_eq!(app.record_group_push_announce_owed("aa", 65).unwrap(), None);
+        assert!(
+            !app.record_group_push_gossip_announce("aa", 70, None)
+                .unwrap()
+        );
         assert_eq!(state("aa"), None, "no write after {membership:?}");
     }
     app.set_group_self_membership("aa", SelfMembership::Member)
@@ -4311,7 +4326,10 @@ fn a_welcome_opens_the_push_join_window_until_the_announce() {
     // The announce closes the window, and time no longer counts toward it; a
     // new Welcome opens a fresh one and drops the earlier join and its
     // counted time, keeping the announce time.
-    assert!(app.record_group_push_gossip_announce("bb", 20).unwrap());
+    assert!(
+        app.record_group_push_gossip_announce("bb", 20, None)
+            .unwrap()
+    );
     assert_eq!(state("bb").unwrap().joining_since_ms, None);
     assert_eq!(joining(), Vec::<String>::new());
     assert_eq!(app.count_push_join_window_time(5).unwrap(), 0);
@@ -4336,6 +4354,94 @@ fn a_welcome_opens_the_push_join_window_until_the_announce() {
         welcomed("cc", "w3"),
     ]);
     assert_eq!(state("cc"), None);
+}
+
+/// An owed announce needs a joined group, and each new debt raises it past
+/// the last, even with an earlier clock. A published announce settles it only
+/// while it holds the value the announce was built under; a replay of the
+/// Welcome keeps it, and a new Welcome drops it.
+#[test]
+fn an_owed_push_announce_lasts_until_an_announce_built_under_it_or_a_new_welcome() {
+    let store = SqliteAccountStorage::in_memory().unwrap();
+    let app = store.app_storage();
+    let save = |welcome: &str| {
+        let mut welcomed = group("aa", "welcomed");
+        welcomed.via_welcome_message_id_hex = Some(welcome.to_owned());
+        app.save_account_projection_state(
+            &StoredAccountState {
+                label: "alice".to_owned(),
+                seen_events: Vec::new(),
+                last_transport_timestamp: None,
+                groups: vec![welcomed],
+            },
+            16,
+            MAX_FUTURE_SKEW_SECS,
+        )
+        .unwrap();
+    };
+    let owed = || {
+        app.group_push_gossip_state("aa")
+            .unwrap()
+            .unwrap()
+            .announce_owed_at_ms
+    };
+    let owing = || {
+        app.owed_group_push_announce_states()
+            .unwrap()
+            .into_iter()
+            .map(|state| state.group_id_hex)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(app.record_group_push_announce_owed("aa", 10).unwrap(), None);
+    save("w1");
+    assert_eq!(owed(), None);
+    assert!(owing().is_empty());
+
+    assert_eq!(
+        app.record_group_push_announce_owed("aa", 10).unwrap(),
+        Some(10)
+    );
+    assert_eq!(
+        app.record_group_push_announce_owed("aa", 30).unwrap(),
+        Some(30)
+    );
+    assert_eq!(
+        app.record_group_push_announce_owed("aa", 5).unwrap(),
+        Some(31),
+        "a debt recorded after a clock step back still raises it"
+    );
+    assert_eq!(owing(), vec!["aa".to_owned()]);
+    save("w1");
+    assert_eq!(owed(), Some(31), "a replayed Welcome keeps it");
+
+    assert!(
+        app.record_group_push_gossip_announce("aa", 20, Some(30))
+            .unwrap()
+    );
+    assert_eq!(
+        owed(),
+        Some(31),
+        "an announce built before the last debt settles nothing"
+    );
+    assert!(
+        app.record_group_push_gossip_announce("aa", 25, None)
+            .unwrap()
+    );
+    assert_eq!(owed(), Some(31));
+    assert!(
+        app.record_group_push_gossip_announce("aa", 26, Some(31))
+            .unwrap()
+    );
+    assert_eq!(owed(), None);
+    assert!(owing().is_empty());
+
+    assert!(
+        app.record_group_push_announce_owed("aa", 40)
+            .unwrap()
+            .is_some()
+    );
+    save("w2");
+    assert_eq!(owed(), None, "a new Welcome drops it");
 }
 
 /// An owed push snapshot needs a joined group, keeps the latest owed epoch,

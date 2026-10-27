@@ -206,6 +206,7 @@ async fn late_commit_700_recovers() {
         &bob.label,
         &hex::encode(&group),
         crate::notifications::unix_now_ms(),
+        None,
     )
     .unwrap();
     let old_text = "x".repeat(4_096);
