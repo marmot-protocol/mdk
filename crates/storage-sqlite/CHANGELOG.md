@@ -8,7 +8,8 @@
   `account_groups.member_count` now counts member accounts, so an account
   with several devices in a group counts once and a chat between two
   accounts is `Direct`. The migration rewrites rows whose engine record lists
-  an account more than once; every other row already counted accounts.
+  an account more than once, with the peer index and presentation members
+  their accounts make; every other row already counted accounts.
 - Migration 0117 advances account storage to schema 117 on first open; older
   binaries reject the upgraded database. It queues the current push
   registration once for every joined group while native push is on, so
