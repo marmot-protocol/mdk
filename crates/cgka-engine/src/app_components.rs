@@ -324,6 +324,23 @@ pub(crate) fn require_admin_for_staged_commit(
     require_admin(mls_group, group_id, sender)
 }
 
+/// Receiving-flow step 8 (`protocol-core/joining.md`): the Welcome's `author`
+/// may add in the `joined` state. An active admin may, and so may a device of
+/// the `joiner`'s own account once that state requires
+/// `marmot.group.account-devices.v1` ("Welcome acceptance"). Any other author
+/// is [`EngineError::NotGroupAdmin`], an authorization failure.
+pub(crate) fn require_welcome_author_authority(
+    joined: &MlsGroup,
+    group_id: &GroupId,
+    author: &MemberId,
+    joiner: &MemberId,
+) -> Result<(), EngineError> {
+    if author == joiner && group_requires_account_devices(joined)? {
+        return Ok(());
+    }
+    require_admin(joined, group_id, author)
+}
+
 pub(crate) const fn proposal_rejection_category_tag(
     category: ProposalRejectionCategory,
 ) -> &'static str {
@@ -914,6 +931,26 @@ pub(crate) fn validate_current_profile_group_invariants(
     validate_account_devices_state(group.extensions(), &required_components, &leaves)
 }
 
+/// Receiving-flow step 7 (`protocol-core/joining.md`) for the state a Welcome
+/// joins: [`validate_current_profile_group_invariants`], and the GroupInfo
+/// rule of `marmot.group.account-devices.v1` ("Data"): when the joined state
+/// requires the component, the GroupInfo carries no entry under its id.
+/// `group_info_app_data` is the GroupInfo's `app_data_dictionary`, which the
+/// caller reads before OpenMLS stages the Welcome and drops the GroupInfo.
+pub(crate) fn validate_joined_group_invariants(
+    joined: &MlsGroup,
+    group_info_app_data: Option<&AppDataDictionaryExtension>,
+) -> Result<(), EngineError> {
+    validate_current_profile_group_invariants(joined)?;
+    if carries_account_devices_data(group_info_app_data) && group_requires_account_devices(joined)?
+    {
+        return Err(EngineError::Other(
+            "invalid account-devices state: the GroupInfo carries account-devices data".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate current-profile invariants against the complete state a staged
 /// Commit would produce, before the Commit can mutate canonical group state.
 pub(crate) fn validate_current_profile_invariants_for_staged_commit(
@@ -945,6 +982,12 @@ pub(crate) fn group_requires_account_devices(group: &MlsGroup) -> Result<bool, E
     Ok(required_app_components_of_group(group)?.contains(ACCOUNT_DEVICES_COMPONENT_ID))
 }
 
+/// Whether an `app_data_dictionary`, at any location, carries an entry under
+/// `marmot.group.account-devices.v1`, which defines none.
+fn carries_account_devices_data(dictionary: Option<&AppDataDictionaryExtension>) -> bool {
+    dictionary.is_some_and(|ext| ext.dictionary().contains(&ACCOUNT_DEVICES_COMPONENT_ID))
+}
+
 /// The state rules of `marmot.group.account-devices.v1`, for a state whose
 /// required list is `required`. They apply only while that list contains the
 /// component; before that, an entry under its id is unknown data.
@@ -963,21 +1006,14 @@ fn validate_account_devices_state<'a>(
     if !required.contains(ACCOUNT_DEVICES_COMPONENT_ID) {
         return Ok(());
     }
-    if extensions
-        .app_data_dictionary()
-        .is_some_and(|ext| ext.dictionary().contains(&ACCOUNT_DEVICES_COMPONENT_ID))
-    {
+    if carries_account_devices_data(extensions.app_data_dictionary()) {
         return Err(EngineError::Other(
             "invalid account-devices state: GroupContext carries account-devices data".into(),
         ));
     }
     let mut leaves_per_account: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
     for leaf in leaves {
-        if leaf
-            .extensions()
-            .app_data_dictionary()
-            .is_some_and(|ext| ext.dictionary().contains(&ACCOUNT_DEVICES_COMPONENT_ID))
-        {
+        if carries_account_devices_data(leaf.extensions().app_data_dictionary()) {
             return Err(EngineError::Other(
                 "invalid account-devices state: a leaf carries account-devices data".into(),
             ));
@@ -1036,11 +1072,12 @@ fn validate_account_devices_transition(
     }
     if resulting_required.contains(ACCOUNT_DEVICES_COMPONENT_ID)
         && staged.add_proposals().any(|add| {
-            add.add_proposal()
-                .key_package()
-                .extensions()
-                .app_data_dictionary()
-                .is_some_and(|ext| ext.dictionary().contains(&ACCOUNT_DEVICES_COMPONENT_ID))
+            carries_account_devices_data(
+                add.add_proposal()
+                    .key_package()
+                    .extensions()
+                    .app_data_dictionary(),
+            )
         })
     {
         return Err(EngineError::Other(

@@ -1212,6 +1212,15 @@ impl<S: StorageProvider> Engine<S> {
                     .as_slice()
                     .to_vec(),
             );
+            // Validating the joined state (5b) reads the GroupInfo's own app
+            // data, which OpenMLS drops when it stages the Welcome. Staging
+            // verifies the GroupInfo signature, so a rejected forgery never
+            // reaches that check.
+            let group_info_app_data = processed
+                .unverified_group_info()
+                .extensions()
+                .app_data_dictionary()
+                .cloned();
             // GroupInfo is still unverified here. Every tentative replacement
             // write is rolled back unless OpenMLS and Marmot checks succeed
             // and the local state permits this join.
@@ -1337,8 +1346,11 @@ impl<S: StorageProvider> Engine<S> {
             {
                 return Err(EngineError::InvalidWelcome);
             }
-            crate::app_components::validate_current_profile_group_invariants(&mls_group)
-                .map_err(|_| EngineError::InvalidWelcome)?;
+            crate::app_components::validate_joined_group_invariants(
+                &mls_group,
+                group_info_app_data.as_ref(),
+            )
+            .map_err(|_| EngineError::InvalidWelcome)?;
 
             // Validate every known GroupContext component before any joined
             // state leaves this transaction. Commit ingest validates
@@ -1372,8 +1384,15 @@ impl<S: StorageProvider> Engine<S> {
                 });
             }
 
-            // 5d. The authenticated Welcome sender must be an admin.
-            crate::app_components::require_admin(&mls_group, &group_id, &welcome_sender_id)?;
+            // 5d. The authenticated Welcome sender must be an admin, or a
+            // device of this account in a state that requires
+            // account-devices.
+            crate::app_components::require_welcome_author_authority(
+                &mls_group,
+                &group_id,
+                &welcome_sender_id,
+                self.identity.self_id(),
+            )?;
 
             // 5e. Every advertised admin must have a current member leaf.
             crate::app_components::reject_admins_without_member_leaf(

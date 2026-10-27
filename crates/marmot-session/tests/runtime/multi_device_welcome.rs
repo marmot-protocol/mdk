@@ -769,3 +769,257 @@ async fn an_offer_stored_before_the_upgrade_under_a_siblings_rumor_still_rejoins
 fn publication_id(key_package: &cgka_traits::engine::KeyPackage) -> MessageId {
     key_package.source.clone().unwrap().event_id
 }
+
+/// A Welcome from a device of the joiner's own account, in a group that
+/// requires `marmot.group.account-devices.v1`
+/// (`app-components/account-devices-v1.md`, "Welcome acceptance"). Sessions
+/// advertise the component only in builds that allow it for tests.
+#[cfg(feature = "test-policy-overrides")]
+mod same_account_welcome {
+    use super::*;
+    use cgka_traits::app_components::{ACCOUNT_DEVICES_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID};
+    use cgka_traits::storage::{AccountDeviceSignerStorage, StorageProvider};
+    use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn, ProtocolVersion};
+    use openmls_traits::OpenMlsProvider as _;
+    use tls_codec::{Deserialize as _, Serialize as _};
+
+    const ACCOUNT_DEVICES: Feature = Feature("account-devices");
+
+    /// A device of `account` that advertises account-devices. The test keeps
+    /// a handle on its connection to build Commits the engine does not send.
+    fn advertising_session(
+        path: std::path::PathBuf,
+        key: &SqlCipherKey,
+        account: &[u8],
+    ) -> (AccountDeviceSession, SqliteAccountStorage) {
+        let storage = SqliteAccountStorage::open_encrypted(path, key).unwrap();
+        let mut registry = FeatureRegistry::new();
+        registry.register(
+            ACCOUNT_DEVICES,
+            CapabilityRequirement {
+                requires: Capability::AppComponent(ACCOUNT_DEVICES_COMPONENT_ID),
+                level: RequirementLevel::Optional,
+                description: "account-devices",
+            },
+        );
+        let mut components = default_group_components();
+        components.insert(NOSTR_ROUTING_COMPONENT_ID);
+        components.insert(ACCOUNT_DEVICES_COMPONENT_ID);
+        let session = AccountDeviceSession::open(
+            SessionConfig::with_storage(
+                storage.clone(),
+                Duration::ZERO,
+                pad32(account),
+                Box::new(nostr_peeler(account)),
+            )
+            .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+                keys: deterministic_nostr_keys(account),
+            }))
+            .protocol_profile(ProtocolProfile::Current)
+            .feature_registry(registry)
+            .supported_app_components(components)
+            .allow_account_devices_advertising_for_tests(),
+        )
+        .unwrap();
+        (session, storage)
+    }
+
+    async fn advertising_device(
+        dir: &tempfile::TempDir,
+        key: &SqlCipherKey,
+        name: &str,
+        account: &[u8],
+    ) -> (Device, SqliteAccountStorage) {
+        let (session, storage) =
+            advertising_session(dir.path().join(format!("{name}.sqlite")), key, account);
+        let mut device =
+            Device::with_session(session, cgka_traits::engine::KeyPackage::new(Vec::new()));
+        device.publish().await;
+        (device, storage)
+    }
+
+    /// The MLS Welcome of a same-account Add the `committer` device builds
+    /// with raw OpenMLS on its own connection, adding `key_package`. The
+    /// committer's group stays as it was.
+    fn same_account_add(
+        committer: &Device,
+        storage: &SqliteAccountStorage,
+        group_id: &GroupId,
+        key_package: &cgka_traits::engine::KeyPackage,
+    ) -> Vec<u8> {
+        let crypto = openmls_rust_crypto::RustCrypto::default();
+        let provider = cgka_engine::provider::EngineOpenMlsProvider::<SqliteAccountStorage>::new(
+            &crypto,
+            storage.mls_storage(),
+        );
+        let mut group = openmls::group::MlsGroup::load(
+            provider.storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .unwrap()
+        .unwrap();
+        let binding = storage
+            .account_device_signer(&committer.runtime.self_id())
+            .unwrap()
+            .unwrap();
+        let signer = openmls_basic_credential::SignatureKeyPair::read(
+            storage.mls_storage(),
+            &binding.mls_signature_public_key,
+            cgka_engine::DEFAULT_CIPHERSUITE.signature_algorithm(),
+        )
+        .unwrap();
+        let MlsMessageBodyIn::KeyPackage(added) =
+            MlsMessageIn::tls_deserialize_exact(key_package.bytes())
+                .unwrap()
+                .extract()
+        else {
+            panic!("expected a KeyPackage");
+        };
+        let added = added.validate(&crypto, ProtocolVersion::Mls10).unwrap();
+        let bundle = group
+            .commit_builder()
+            .propose_adds([added])
+            .load_psks(provider.storage())
+            .unwrap()
+            .build(provider.rand(), provider.crypto(), &signer, |_| true)
+            .unwrap()
+            .stage_commit(&provider)
+            .unwrap();
+        group.clear_pending_commit(provider.storage()).unwrap();
+        bundle
+            .into_welcome_msg()
+            .unwrap()
+            .tls_serialize_detached()
+            .unwrap()
+    }
+
+    /// Bob's group, requiring account-devices when `require` is set, with
+    /// Alice's phone as a member who is not an admin. Alice's laptop has
+    /// published a KeyPackage and not joined. Returns the phone's connection
+    /// too.
+    async fn phone_in_bobs_group(
+        dir: &tempfile::TempDir,
+        require: bool,
+    ) -> (Device, SqliteAccountStorage, Device, GroupId) {
+        let key = SqlCipherKey::new("same-account welcome").unwrap();
+        let (mut bob, _) = advertising_session(dir.path().join("bob.sqlite"), &key, b"bob");
+        let (mut phone, phone_storage) = advertising_device(dir, &key, "alice-phone", b"alice").await;
+        let (laptop, _) = advertising_device(dir, &key, "alice-laptop", b"alice").await;
+        let created = bob
+            .create_group(CreateGroupRequest {
+                name: "same account".into(),
+                description: String::new(),
+                members: vec![phone.key_package.clone()],
+                required_features: if require {
+                    vec![ACCOUNT_DEVICES]
+                } else {
+                    Vec::new()
+                },
+                app_components: vec![nostr_routing()],
+                initial_admins: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let [PublishWork::FoundingGroupCreated { welcomes }] = &created.effects.publish[..] else {
+            panic!("expected founding group creation");
+        };
+        let group_id = created.group_id;
+        let [to_phone] = &rumors_for(welcomes, b"alice", &[&phone.key_package]).await[..] else {
+            unreachable!()
+        };
+        assert_eq!(
+            phone.ingest(to_phone).await.outcome,
+            cgka_traits::IngestOutcome::Processed
+        );
+        let record = phone.runtime.group_record(&group_id).unwrap();
+        assert_eq!(
+            record
+                .required_capabilities
+                .app_components
+                .contains(ACCOUNT_DEVICES_COMPONENT_ID),
+            require
+        );
+        let alice = phone.runtime.self_id();
+        assert!(
+            !phone
+                .runtime
+                .admin_pubkeys(&group_id)
+                .unwrap()
+                .iter()
+                .any(|admin| admin.as_slice() == alice.as_slice())
+        );
+        (phone, phone_storage, laptop, group_id)
+    }
+
+    #[tokio::test]
+    async fn a_device_joins_through_its_siblings_welcome_once_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut phone, phone_storage, mut laptop, group_id) =
+            phone_in_bobs_group(&dir, true).await;
+        let (phone_before, laptop_before) = (phone.lifecycle(), laptop.lifecycle());
+        let phone_epoch = phone.runtime.session().epoch(&group_id).unwrap();
+
+        // The phone delivers the Welcome as any inviter does: one rumor,
+        // gift-wrapped to the account and naming the laptop's KeyPackage.
+        let welcome = same_account_add(&phone, &phone_storage, &group_id, &laptop.key_package);
+        let to_laptop = rewrapped(
+            b"alice",
+            b"alice",
+            welcome,
+            publication_id(&laptop.key_package),
+        )
+        .await;
+
+        // The committing phone receives the rumor too, and leaves it alone.
+        let results = phone.ingest_all(&[&to_laptop]).await;
+        assert_eq!(outcomes(&results), vec![not_addressed()]);
+        assert_eq!(phone.lifecycle(), phone_before);
+        assert_eq!(
+            phone.runtime.session().epoch(&group_id).unwrap(),
+            phone_epoch
+        );
+
+        let results = laptop.ingest_all(&[&to_laptop]).await;
+        assert_eq!(joins(&results), vec![(group_id.clone(), to_laptop.id.clone())]);
+        let welcomers: Vec<_> = results
+            .iter()
+            .flat_map(|effects| &effects.effects.events)
+            .filter_map(|event| match event {
+                GroupEvent::GroupJoined { welcomer, .. } => welcomer.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(welcomers, vec![phone.runtime.self_id()]);
+        assert_eq!(
+            laptop.runtime.session().epoch(&group_id).unwrap().0,
+            phone_epoch.0 + 1
+        );
+        assert_only_consumed(&laptop_before, laptop.lifecycle(), &laptop.key_package);
+    }
+
+    #[tokio::test]
+    async fn a_siblings_welcome_fails_as_unauthorized_before_it_is_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let (phone, phone_storage, mut laptop, group_id) = phone_in_bobs_group(&dir, false).await;
+        let laptop_before = laptop.lifecycle();
+        let welcome = same_account_add(&phone, &phone_storage, &group_id, &laptop.key_package);
+        let to_laptop = rewrapped(
+            b"alice",
+            b"alice",
+            welcome,
+            publication_id(&laptop.key_package),
+        )
+        .await;
+
+        // A failed join that leaves the laptop's KeyPackage as it was.
+        let results = laptop.ingest_all(&[&to_laptop]).await;
+        assert_eq!(
+            outcomes(&results),
+            vec![ignored(
+                cgka_traits::ingest::InputRejectionCategory::AuthorizationFailed
+            )]
+        );
+        assert!(laptop.runtime.session().epoch(&group_id).is_err());
+        assert_eq!(laptop.lifecycle(), laptop_before);
+    }
+}

@@ -61,7 +61,7 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 | `own_commit_intent.rs` | `OwnCommitIntent` records and re-issue of own commits superseded by branch selection (mdk#1734) |
 | `maintenance.rs` | KeyPackage replacement staging and promotion (OpenMLS material and the lifecycle record in one transaction) and the own-leaf hash. Scheduling and the other account records live above the engine; it adds no storage forwards for them (mdk#2602) |
 | `group_authority.rs` | Advisory live-engine authority facts for conversation capture; mutations still validate authority |
-| `app_components.rs` | `app_data_dictionary` helpers, LeafNode/group `app_components` bytes, group profile and admin-policy bytes, the resulting-state check every send path and replay call (`validate_current_profile_invariants_for_staged_commit`, including the account-devices rules), standalone proposal admission |
+| `app_components.rs` | `app_data_dictionary` helpers, LeafNode/group `app_components` bytes, group profile and admin-policy bytes, the resulting-state check every send path and replay call (`validate_current_profile_invariants_for_staged_commit`, including the account-devices rules) and its join-time twin (`validate_joined_group_invariants`), the Welcome author check, standalone proposal admission |
 | `account_identity_proof.rs` | Legacy LeafNode identity-proof extension + current app-data component; strict profile classification (mixed rejected) |
 | `app_payload.rs` | `validate_app_payload_for_sender`: `MarmotAppEvent` sender validation |
 | `group_context_view.rs` | `GroupContext` snapshot view; `exporter_secret(label, length)` returns `None` rather than truncating |

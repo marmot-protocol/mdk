@@ -30,6 +30,11 @@ versioning through the workspace version in the root `Cargo.toml`.
   proposal that breaks a rule is rejected. MDK does not advertise 0x800d yet, so it cannot be in such a group; groups
   that don't require it behave as before, and data under 0x800d there is still unknown data. The engine builder now
   refuses to advertise a protocol component id the engine does not implement, such as SafeAAD (0x0002) and 0x800d.
+- In a group that requires `marmot.group.account-devices.v1` (0x800d), a device now joins through a Welcome from
+  another device of its own account, as it does through an admin's (mdk#2628). The joiner applies the component's
+  state rules to the group it joins, as members do to every Commit, and rejects a Welcome whose GroupInfo carries data
+  under 0x800d. In any other group only an admin's Welcome joins, as before. Nothing sends such a Welcome yet, and MDK
+  does not advertise 0x800d, so nothing changes in practice.
 - JSON error codes now depend on what an error is, not on which MDK layers wrapped it (mdk#2602). Two codes change.
   A storage failure from the account session or the engine now always reports `engine_error`. Before, some paths
   reported `command_failed`. An external-signer rejection now reports `command_failed`, with
