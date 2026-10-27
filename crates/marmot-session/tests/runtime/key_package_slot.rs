@@ -537,6 +537,49 @@ async fn a_publisher_that_refuses_its_own_artifacts_gets_one_resigned_replacemen
 }
 
 #[tokio::test]
+async fn paused_maintenance_leaves_an_unusable_replacement_for_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("kp slot unusable while paused").unwrap();
+    let wall = Arc::new(TestWallClock::new(unix_now()));
+    let publisher = RefusingKeyPackages::default();
+    let mut runtime = slot_runtime(
+        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[KEY_ENDPOINT],
+    );
+    let stale = runtime
+        .prepare_fresh_key_package(vec![TransportEndpoint(KEY_ENDPOINT.into())])
+        .await
+        .unwrap();
+    let stale_event = slot_lifecycle(&runtime)
+        .pending_replacement
+        .unwrap()
+        .signed_event
+        .unwrap();
+    publisher.refuse(&stale_event.id);
+
+    // Paused maintenance may retry the prepared replacement but generates no
+    // new key, and the build keeps its one replacement.
+    runtime.pause_maintenance();
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(publisher.attempts(), vec![(stale_event.id.clone(), false)]);
+    let paused = slot_lifecycle(&runtime);
+    assert_eq!(paused.pending_replacement.unwrap().key_package, stale);
+    assert!(paused.unusable_artifact_replaced_by.is_none());
+    assert_eq!(runtime.durably_owned_key_packages().unwrap().len(), 1);
+
+    runtime.resume_maintenance();
+    wall.set(wall.now().0 + 60 * 60);
+    runtime.run_due_maintenance().await.unwrap();
+    let resumed = slot_lifecycle(&runtime);
+    assert!(resumed.pending_replacement.is_none());
+    assert_ne!(resumed.current_key_package, Some(stale));
+    assert_eq!(runtime.durably_owned_key_packages().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn a_restart_while_sending_the_resigned_replacement_does_not_resign_again() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("alice.sqlite");

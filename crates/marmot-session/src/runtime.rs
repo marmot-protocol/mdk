@@ -1299,8 +1299,12 @@ where
             // now; the old one stays retained with its event id, since an
             // earlier build may have sent it. A build does this at most once,
             // so a publisher that refuses its own artifacts cannot mint a
-            // bundle per attempt.
-            if error.artifact_unusable && may_replace_unusable_artifact(&lifecycle) {
+            // bundle per attempt. Paused maintenance only finishes prepared
+            // work, so it leaves the replacement for resume.
+            if error.artifact_unusable
+                && !self.maintenance_paused
+                && may_replace_unusable_artifact(&lifecycle)
+            {
                 tracing::info!(
                     target: TRACE_TARGET,
                     method = "publish_fresh_key_package",
@@ -1585,10 +1589,15 @@ where
                 self.session.put_key_package_lifecycle(&lifecycle)?;
                 Ok(())
             }
-            Err(error) if error.artifact_unusable && may_replace_unusable_artifact(&lifecycle) => {
-                // Back off as for any failure: while maintenance is paused no
-                // replacement is staged, so this would otherwise repeat every
-                // tick.
+            // Paused maintenance only finishes prepared work, so it leaves the
+            // replacement for resume and backs off as for any failure.
+            Err(error)
+                if error.artifact_unusable
+                    && !self.maintenance_paused
+                    && may_replace_unusable_artifact(&lifecycle) =>
+            {
+                // Back off as for any failure in case the replacement cannot
+                // be staged, so this does not repeat every tick.
                 note_key_package_attempt(
                     &mut lifecycle.publication_targets,
                     &publication.endpoints,
