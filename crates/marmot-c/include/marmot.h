@@ -1559,7 +1559,7 @@ typedef struct MarmotClientOptions {
    */
   uint32_t cursor_persistence;
   /**
-   * Optional UTF-8 label; NULL or blank omits the public tag.
+   * Optional UTF-8 label; NULL, blank or over 64 bytes omits the public tag.
    */
   const char *client_name;
   /**
@@ -6054,7 +6054,8 @@ MarmotStatus marmot_client_new_with_secret_store(const char *root_path,
 
 /**
  * Open with an optional public client name for newly prepared KeyPackages.
- * NULL or whitespace-only `client_name` omits the tag. Signed retries keep
+ * NULL, whitespace-only or over-long (more than 64 bytes once trimmed)
+ * `client_name` omits the tag; it is never truncated. Signed retries keep
  * their original tags. NULL `store` selects the platform keychain under the
  * deployment's keychain service.
  * Store ownership transfers only on success, as with `marmot_client_new_with_secret_store`.

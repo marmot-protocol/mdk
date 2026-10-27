@@ -5,6 +5,7 @@ mod draft_lifecycle;
 mod follow_list_edits;
 mod group_lookup;
 pub(crate) mod invite_recovery;
+mod key_package_client_tag;
 mod key_package_inventory;
 mod key_package_relay_lists;
 mod key_package_selection;

@@ -8027,13 +8027,14 @@ impl AppKeyPackagePublisher {
             ));
         }
         Ok(NostrKeyPackagePublication {
+            // A blank or over-long name is left out, never published truncated.
             client_name: self
                 .app
                 .config
                 .key_package_client_name
                 .as_deref()
                 .map(str::trim)
-                .filter(|name| !name.is_empty())
+                .filter(|name| transport_nostr_adapter::is_valid_client_name(name))
                 .map(str::to_owned),
             account_id: publication.account_id.clone(),
             key_package: publication.key_package.clone(),
@@ -8124,10 +8125,13 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         let mut nostr_publication = self.nostr_publication(publication)?;
         let event: NostrTransportEvent = serde_json::from_slice(&artifact.bytes)
             .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
-        // A retry belongs to its durable signed artifact, not the current host config.
-        nostr_publication.client_name = event
-            .tag_value(transport_nostr_adapter::CLIENT_TAG)
-            .map(str::to_owned);
+        // A retry belongs to its durable signed artifact, not the current host
+        // config. An artifact whose tag the shared reader rejects no longer
+        // matches its publication, so it is never resent. One signed before
+        // names were bounded with a name over 64 bytes therefore retries
+        // until it expires; re-signing it belongs to mdk#2628 item 1.2 (D8).
+        nostr_publication.client_name =
+            transport_nostr_adapter::key_package_client_name(&event).map(str::to_owned);
         if event.id != hex::encode(artifact.id.as_slice())
             || event.created_at != artifact.created_at.0
         {

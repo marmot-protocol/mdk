@@ -399,7 +399,8 @@ impl Marmot {
     }
 
     /// Open with an optional public client label for new KeyPackage publications.
-    /// Existing constructors remain untagged. Whitespace-only labels are omitted.
+    /// Existing constructors remain untagged. Whitespace-only labels, and labels
+    /// longer than 64 bytes once trimmed, are omitted rather than truncated.
     /// Hosts must supply this on every foreground/background runtime construction.
     #[uniffi::constructor]
     pub fn new_with_client_name(
