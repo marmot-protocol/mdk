@@ -119,6 +119,63 @@ async fn own_account_intents_leave_pending_proposals_alone() {
     assert_eq!(pending_proposals(&m.bob, &gid), 1);
 }
 
+/// While each Commit's publish is pending, `members()` shows bob's devices as
+/// the Commit leaves them, each added device included although it shares
+/// bob's account. A failed publish puts them back.
+#[tokio::test]
+async fn members_show_a_pending_own_account_commit_until_its_publish_fails() {
+    let mut m = members(true).await;
+    let gid = m.gid.clone();
+    let bob_id = m.bob.engine.self_id();
+    let bob_devices = |device: &Device| {
+        let mut keys: Vec<_> = device
+            .engine
+            .members(&gid)
+            .unwrap()
+            .into_iter()
+            .filter(|member| member.id == bob_id)
+            .map(|member| member.credential)
+            .collect();
+        keys.sort();
+        keys
+    };
+    let before = bob_devices(&m.bob);
+    assert_eq!(before.len(), 2);
+
+    let laptop_kp = new_sibling_key_package(&mut m.bob, b"bob").await;
+    let tablet_kp = new_sibling_key_package(&mut m.bob, b"bob").await;
+    let mut with_added = before.clone();
+    with_added.extend([&laptop_kp, &tablet_kp].map(|kp| {
+        parse_key_package(kp)
+            .leaf_node()
+            .signature_key()
+            .as_slice()
+            .to_vec()
+    }));
+    with_added.sort();
+    let sibling = signature_key(&m.bob_sibling, &gid);
+    let without_sibling: Vec<_> = before
+        .iter()
+        .filter(|key| **key != sibling)
+        .cloned()
+        .collect();
+    for (intent, pending_devices) in [
+        (
+            add_own_devices(&gid, vec![laptop_kp, tablet_kp]),
+            with_added,
+        ),
+        (remove_own_devices(&gid, vec![sibling]), without_sibling),
+    ] {
+        let SendResult::GroupEvolution { pending, .. } = m.bob.engine.send(intent).await.unwrap()
+        else {
+            panic!("expected GroupEvolution")
+        };
+        assert_eq!(bob_devices(&m.bob), pending_devices);
+        m.bob.engine.publish_failed(pending).await.unwrap();
+        assert_eq!(bob_devices(&m.bob), before);
+    }
+}
+
 /// bob adds a new device of his account, then removes his other device. Each
 /// Commit is `ordinary` in bob's stamp and in every receiver's replay; the
 /// other members and bob's siblings accept it, the new device joins through

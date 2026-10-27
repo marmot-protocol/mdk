@@ -230,13 +230,19 @@ impl<S: StorageProvider> Engine<S> {
 
         // `members()` shows the requested leaves while the publish is
         // pending; `confirm_published` and `publish_failed` re-derive the
-        // record from MLS state.
+        // record from MLS state. Every added leaf shares an account with a
+        // current one, so the projection goes by leaf, never by account.
         let mut group_record = existing;
-        group_record.members =
-            crate::group_lifecycle::projected_members_with_pending(&mls_group, &parsed_kps)?;
+        group_record.members = crate::group_lifecycle::marmot_members(&mls_group);
         group_record
             .members
             .retain(|member| !leaf_signature_keys.contains(&member.credential));
+        for kp in &parsed_kps {
+            group_record.members.push(cgka_traits::group::Member {
+                id: crate::identity::validated_member_id_of_leaf(kp.leaf_node())?,
+                credential: kp.leaf_node().signature_key().as_slice().to_vec(),
+            });
+        }
         self.storage.put_group(&group_record)?;
 
         let new_epoch = EpochId(pre_commit_epoch.0.saturating_add(1));
