@@ -1090,7 +1090,8 @@ async fn standalone_proposals_breaking_the_rules_are_rejected_at_ingest() {
 // ── Legacy profile ──────────────────────────────────────────────────────────
 
 /// Legacy groups never require 0x800d: even when one lists it, none of the
-/// rules applies there, as on the clients those groups were deployed with.
+/// rules applies there. 0x800d stays an opaque id that needs GroupContext data
+/// while required, as on the clients those groups were deployed with.
 #[tokio::test]
 async fn legacy_groups_are_not_subject_to_the_rules() {
     let legacy_device = |account: &[u8]| {
@@ -1133,20 +1134,37 @@ async fn legacy_groups_are_not_subject_to_the_rules() {
         .await
         .unwrap();
 
-    activate(&mut alice, &gid, &mut [&mut bob]).await;
-    let write = send_commit(
+    // On the legacy profile 0x800d is an opaque id: requiring it takes
+    // GroupContext data, which stays while it is required.
+    let ids = with_account_devices(required(&alice.engine, &gid));
+    let require_with_data = send_commit(
         &mut alice,
         SendIntent::UpdateAppComponents {
             group_id: gid.clone(),
-            updates: vec![AppComponentData {
-                component_id: ACCOUNT_DEVICES_COMPONENT_ID,
-                data: vec![1],
-            }],
+            updates: vec![
+                AppComponentData {
+                    component_id: APP_COMPONENTS_COMPONENT_ID,
+                    data: encode_components_list(&ids.ids),
+                },
+                AppComponentData {
+                    component_id: ACCOUNT_DEVICES_COMPONENT_ID,
+                    data: vec![1],
+                },
+            ],
         },
         &gid,
     )
     .await;
-    assert_accepted(&mut bob, &write, &gid).await;
+    assert_accepted(&mut bob, &require_with_data, &gid).await;
+    assert!(requires_account_devices(&alice.engine, &gid));
+    let removes_entry = crafted_commit(
+        &alice,
+        &gid,
+        vec![],
+        vec![AppDataUpdateProposal::remove(ACCOUNT_DEVICES_COMPONENT_ID)],
+        None,
+    );
+    assert_rejected_on_replay(&mut bob, &removes_entry, &gid).await;
     let ids = without_account_devices(required(&alice.engine, &gid));
     let unrequire = send_commit(&mut alice, update_required(&gid, &ids), &gid).await;
     assert_accepted(&mut bob, &unrequire, &gid).await;

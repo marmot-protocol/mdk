@@ -839,10 +839,11 @@ pub(crate) fn validate_app_component_integrity_for_staged_commit(
     }
     for component_id in &protected {
         // The account proof is required by the GroupContext but its data is
-        // LeafNode-only, and a no-data component has none at all. Neither
-        // has GroupContext state to keep.
+        // LeafNode-only, and on the current profile a no-data component has
+        // none at all. Neither has GroupContext state to keep. Legacy groups
+        // keep every other required entry, as they always have.
         if *component_id == ACCOUNT_IDENTITY_PROOF_COMPONENT_ID
-            || NO_DATA_APP_COMPONENTS.contains(component_id)
+            || (is_current && NO_DATA_APP_COMPONENTS.contains(component_id))
         {
             continue;
         }
@@ -1891,7 +1892,11 @@ pub(crate) fn validate_app_data_update_batch<'a>(
     mls_group: &MlsGroup,
     updates: impl IntoIterator<Item = &'a AppDataUpdateProposal>,
 ) -> Result<(), EngineError> {
-    validate_app_data_update_batch_against(required_app_components_of_group(mls_group)?, updates)
+    validate_app_data_update_batch_against(
+        required_app_components_of_group(mls_group)?,
+        crate::account_identity_proof::protocol_profile_of_group(mls_group)?,
+        updates,
+    )
 }
 
 /// Validate the parts of an AppDataUpdate operation that are decidable before
@@ -1916,6 +1921,7 @@ fn validate_standalone_app_data_update(update: &AppDataUpdateProposal) -> Result
 
 fn validate_app_data_update_batch_against<'a>(
     mut resulting_required: AppComponentSet,
+    profile: ProtocolProfile,
     updates: impl IntoIterator<Item = &'a AppDataUpdateProposal>,
 ) -> Result<(), EngineError> {
     let updates = updates.into_iter().collect::<Vec<_>>();
@@ -1948,6 +1954,15 @@ fn validate_app_data_update_batch_against<'a>(
         }
     }
 
+    // On the current profile a required no-data component has no state to
+    // keep, so the Commit that activates account-devices may remove an entry
+    // left under its id (account-devices-v1.md, "Data"). Legacy groups keep
+    // the rule for every required id.
+    if profile == ProtocolProfile::Current {
+        for component_id in NO_DATA_APP_COMPONENTS {
+            resulting_required.ids.remove(&component_id);
+        }
+    }
     for update in updates {
         match update.operation() {
             AppDataUpdateOperation::Update(data) => {
@@ -1983,11 +1998,7 @@ fn validate_app_component_remove_against(
             "group lifecycle component cannot be removed".into(),
         ));
     }
-    // A no-data component has no state to keep, and the Commit that activates
-    // account-devices removes any entry left under its id
-    // (account-devices-v1.md, "Data").
-    if resulting_required.contains(component_id) && !NO_DATA_APP_COMPONENTS.contains(&component_id)
-    {
+    if resulting_required.contains(component_id) {
         return Err(EngineError::Other(
             "required Marmot app components cannot be removed".into(),
         ));
@@ -2359,9 +2370,12 @@ mod tests {
             AppDataUpdateProposal::remove(GROUP_PROFILE_COMPONENT_ID),
         ];
 
-        let error =
-            validate_app_data_update_batch_against(AppComponentSet::default(), updates.iter())
-                .expect_err("one operation per component id");
+        let error = validate_app_data_update_batch_against(
+            AppComponentSet::default(),
+            ProtocolProfile::Current,
+            updates.iter(),
+        )
+        .expect_err("one operation per component id");
 
         assert!(error.to_string().contains("multiple AppDataUpdate"));
     }
@@ -2384,7 +2398,7 @@ mod tests {
             AppDataUpdateProposal::remove(GROUP_BLOSSOM_IMAGE_COMPONENT_ID),
         ];
 
-        validate_app_data_update_batch_against(initial, updates.iter())
+        validate_app_data_update_batch_against(initial, ProtocolProfile::Current, updates.iter())
             .expect("the component is optional in the resulting epoch");
     }
 
@@ -2410,10 +2424,34 @@ mod tests {
             GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
         )];
 
-        let error = validate_app_data_update_batch_against(initial, updates.iter())
-            .expect_err("required state must remain present");
+        let error = validate_app_data_update_batch_against(
+            initial,
+            ProtocolProfile::Current,
+            updates.iter(),
+        )
+        .expect_err("required state must remain present");
 
         assert!(error.to_string().contains("required Marmot app components"));
+    }
+
+    #[test]
+    fn required_account_devices_entry_is_removable_only_on_the_current_profile() {
+        let required = AppComponentSet::new([
+            GROUP_PROFILE_COMPONENT_ID,
+            GROUP_ADMIN_POLICY_COMPONENT_ID,
+            ACCOUNT_DEVICES_COMPONENT_ID,
+        ]);
+        let updates = [AppDataUpdateProposal::remove(ACCOUNT_DEVICES_COMPONENT_ID)];
+
+        validate_app_data_update_batch_against(
+            required.clone(),
+            ProtocolProfile::Current,
+            updates.iter(),
+        )
+        .expect("a no-data component has no state to keep");
+        // On a legacy group 0x800d is an opaque id, whose required data stays.
+        validate_app_data_update_batch_against(required, ProtocolProfile::Legacy, updates.iter())
+            .expect_err("legacy validity is unchanged");
     }
 
     #[test]
