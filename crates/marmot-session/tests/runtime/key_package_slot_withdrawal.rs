@@ -131,11 +131,12 @@ async fn a_withdrawn_slot_stays_empty_until_the_device_runs_again() {
 #[tokio::test]
 async fn a_withdrawal_no_relay_accepts_leaves_the_slot_as_it_was() {
     let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("kp slot withdrawal refused").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
     let publisher = WithdrawingKeyPackages::default();
     let mut runtime = slot_runtime(
-        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        current_session(&database, &key, b"alice"),
         publisher.clone(),
         &wall,
         0,
@@ -149,8 +150,21 @@ async fn a_withdrawal_no_relay_accepts_leaves_the_slot_as_it_was() {
     assert_eq!(publisher.withdrawals().len(), 1);
     assert_eq!(slot_lifecycle(&runtime), before);
 
-    // The slot is still this device's to keep fresh.
+    // The device is signing out, so this runtime publishes nothing more ...
     wall.set(before.refresh_at.unwrap().0);
+    runtime.run_due_maintenance().await.unwrap();
+    assert_eq!(publisher.publications.publications().len(), 1);
+    drop(runtime);
+
+    // ... and the slot is still this device's to keep fresh when it runs
+    // again.
+    let mut runtime = slot_runtime(
+        current_session(&database, &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[KEY_ENDPOINT],
+    );
     runtime.run_due_maintenance().await.unwrap();
     assert_eq!(publisher.publications.publications().len(), 2);
 }
@@ -334,11 +348,12 @@ async fn withdrawing_again_after_the_clock_moves_back_keeps_the_later_time() {
 #[tokio::test]
 async fn a_device_that_never_published_withdraws_nothing() {
     let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
     let key = SqlCipherKey::new("kp slot withdrawal unpublished").unwrap();
     let wall = Arc::new(TestWallClock::new(unix_now()));
     let publisher = WithdrawingKeyPackages::default();
     let mut runtime = slot_runtime(
-        current_session(dir.path().join("alice.sqlite"), &key, b"alice"),
+        current_session(&database, &key, b"alice"),
         publisher.clone(),
         &wall,
         0,
@@ -346,4 +361,22 @@ async fn a_device_that_never_published_withdraws_nothing() {
     );
     assert_eq!(runtime.withdraw_key_package_slot().await.unwrap(), 0);
     assert!(publisher.withdrawals().is_empty());
+
+    // Signing out, this runtime publishes no first KeyPackage either.
+    assert!(!runtime.key_package_network_maintenance_due().unwrap());
+    runtime.run_due_maintenance().await.unwrap();
+    runtime.publish_fresh_key_package().await.unwrap_err();
+    assert!(publisher.publications.publications().is_empty());
+    drop(runtime);
+
+    // The device publishes once it runs again.
+    let mut runtime = slot_runtime(
+        current_session(&database, &key, b"alice"),
+        publisher.clone(),
+        &wall,
+        0,
+        &[KEY_ENDPOINT],
+    );
+    runtime.publish_fresh_key_package().await.unwrap();
+    assert_eq!(publisher.publications.publications().len(), 1);
 }

@@ -453,8 +453,9 @@ pub struct AccountDeviceRuntime<A, R = StaticTransportRouting, K = NoopKeyPackag
     maintenance_random: Arc<dyn MaintenanceRandom>,
     maintenance_timing: MaintenanceTiming,
     maintenance_paused: bool,
-    /// This runtime withdrew the device's slot for sign-out, so it publishes
-    /// nothing more. The next runtime for the account republishes.
+    /// This runtime was asked to withdraw the device's slot for sign-out, so
+    /// it publishes nothing more, whether or not a relay accepted. The next
+    /// runtime for the account republishes.
     key_package_slot_withdrawn: bool,
     maintenance_activity: std::sync::Mutex<MaintenanceActivity>,
     maintenance_quiet_monotonic: HashMap<cgka_traits::MessageId, Duration>,
@@ -1570,9 +1571,10 @@ where
     /// republishes, and is undone when no endpoint accepts the request.
     ///
     /// Returns how many endpoints accepted it, or 0 when this device never
-    /// published into the slot. Afterwards this runtime publishes no
-    /// KeyPackage.
+    /// published into the slot. Whatever the outcome, this runtime publishes
+    /// no KeyPackage afterwards: the device is signing out.
     pub async fn withdraw_key_package_slot(&mut self) -> AccountResult<usize> {
+        self.key_package_slot_withdrawn = true;
         let Some(previous) = self.session.key_package_lifecycle()? else {
             return Ok(0);
         };
@@ -1610,8 +1612,6 @@ where
         let mut withdrawn = previous.clone();
         withdrawn.slot_withdrawn_at = Some(created_at);
         self.session.put_key_package_lifecycle(&withdrawn)?;
-        let was_withdrawn = self.key_package_slot_withdrawn;
-        self.key_package_slot_withdrawn = true;
         let withdrawal = KeyPackageSlotWithdrawal {
             account_id: self.session.self_id().clone(),
             slot_id: previous.stable_slot_id.clone(),
@@ -1639,10 +1639,9 @@ where
             ),
             Err(error) => error,
         };
-        // Nothing confirms this withdrawal, so the slot stays as it was,
-        // including an earlier withdrawal by this runtime.
+        // Nothing confirms this withdrawal, so the slot stays as it was, and
+        // the account's next runtime keeps it fresh.
         self.session.put_key_package_lifecycle(&previous)?;
-        self.key_package_slot_withdrawn = was_withdrawn;
         tracing::warn!(
             target: TRACE_TARGET,
             method = "withdraw_key_package_slot",
