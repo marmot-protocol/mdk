@@ -50,6 +50,10 @@ The directory of other people's public Nostr data (step 3 of the 2026-10 archite
   `marmot-app`'s `error::directory_error_tests`.
 - Anything kept between calls belongs in `DirectoryState`. The sync worker's handle has one owner, the state's slot:
   `Directory::sync_worker()` gets or spawns it and `take_sync_worker()` hands it to shutdown.
+- Reach relays only through `transport-nostr`, and build every HTTP client by passing a fresh reqwest builder straight
+  into `DirectoryConfig::http_builder`, the host's proxy-aware builder; `clippy.toml` rejects direct `nostr_sdk` and
+  `reqwest` client constructors. Allow that lint only at that hand-off (today, Open Ranking's client). See
+  `docs/marmot-architecture/overview/dial-safety.md`.
 - Do not change cache SQL, migration ids, file names, TTLs, timeouts or bounds as part of a move. `cache/v1.sql` and
   `cache/v2.sql` are frozen; schema changes add a numbered migration.
 - The public surface is what `src/lib.rs` re-exports, plus the `config` and `error` modules; every other module is
