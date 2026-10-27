@@ -8,12 +8,11 @@ use cgka_traits::app_components::{
     GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
     GROUP_LIFECYCLE_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
-    GroupLifecycleV1, GroupProfileV1, MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID,
-    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, PROTOCOL_OWNED_APP_COMPONENT_IDS,
-    SAFE_AAD_COMPONENT_ID, decode_components_list, decode_encrypted_media_policy_v1,
-    decode_encrypted_media_policy_v2, decode_group_avatar_url_v1, decode_group_blossom_image_v1,
-    decode_group_lifecycle_v1, decode_group_profile_v1, decode_nostr_routing_v1,
-    decode_quic_varint, encode_component_vectors, encode_components_list,
+    GroupLifecycleV1, GroupProfileV1, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+    PROTOCOL_OWNED_APP_COMPONENT_IDS, SAFE_AAD_COMPONENT_ID, decode_components_list,
+    decode_encrypted_media_policy_v1, decode_encrypted_media_policy_v2, decode_group_avatar_url_v1,
+    decode_group_blossom_image_v1, decode_group_lifecycle_v1, decode_group_profile_v1,
+    decode_nostr_routing_v1, decode_quic_varint, encode_component_vectors, encode_components_list,
     encode_group_lifecycle_v1, encode_group_profile_v1,
 };
 use cgka_traits::engine::CommitOrderingPriority;
@@ -48,13 +47,6 @@ pub const CURRENT_PROFILE_REQUIRED_GROUP_CONTEXT_STATE_COMPONENTS: [AppComponent
     [GROUP_ADMIN_POLICY_COMPONENT_ID];
 pub const CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS: [AppComponentId; 1] =
     [ACCOUNT_IDENTITY_PROOF_COMPONENT_ID];
-
-/// Protocol components that never carry persistent dictionary state at all.
-/// The multi-device join authorization rides one `AppEphemeral` proposal and
-/// the registry makes it invalid as GroupContext data, so it has no
-/// GroupContext format to validate.
-const CURRENT_PROFILE_EPHEMERAL_ONLY_APP_COMPONENTS: [AppComponentId; 1] =
-    [MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InitialComponentState {
@@ -1145,13 +1137,11 @@ fn required_app_components_of_extensions(
 }
 
 fn is_known_group_component(component_id: AppComponentId) -> bool {
-    // Protocol-owned minus the ids that carry no GroupContext state at all:
-    // the leaf-only account proof and the ephemeral-only join authorization.
-    // Reading the canonical list keeps a newly assigned component id
-    // format-validated without editing this function.
+    // Protocol-owned minus the leaf-only account proof, which carries no
+    // GroupContext state. Reading the canonical list keeps a newly assigned
+    // component id format-validated without editing this function.
     PROTOCOL_OWNED_APP_COMPONENT_IDS.contains(&component_id)
         && !CURRENT_PROFILE_LEAF_ONLY_APP_COMPONENTS.contains(&component_id)
-        && !CURRENT_PROFILE_EPHEMERAL_ONLY_APP_COMPONENTS.contains(&component_id)
 }
 
 pub(crate) fn ratchet_tree_nodes(
@@ -1591,7 +1581,6 @@ fn validate_initial_app_component(component: &AppComponentData) -> Result<(), En
         APP_COMPONENTS_COMPONENT_ID
         | SAFE_AAD_COMPONENT_ID
         | ACCOUNT_IDENTITY_PROOF_COMPONENT_ID
-        | MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID
         | GROUP_PROFILE_COMPONENT_ID
         | GROUP_ADMIN_POLICY_COMPONENT_ID => Err(EngineError::Other(
             "group creation request cannot override engine-owned app components".into(),
@@ -1644,9 +1633,6 @@ fn validate_app_component_bytes(
         )),
         ACCOUNT_IDENTITY_PROOF_COMPONENT_ID => Err(EngineError::Other(
             "account identity proof is LeafNode-only and cannot be updated in GroupContext".into(),
-        )),
-        MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID => Err(EngineError::Other(
-            "multi-device join authorization is ephemeral-only and cannot be stored in GroupContext".into(),
         )),
         GROUP_PROFILE_COMPONENT_ID => decode_group_profile(data).map(|_| ()),
         GROUP_ADMIN_POLICY_COMPONENT_ID => decode_admin_policy(data).map(|_| ()),
@@ -2008,44 +1994,65 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_state_is_rejected() {
-        let component = AppComponentData {
-            component_id: MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID,
-            data: vec![0; 104],
-        };
-        assert!(validate_initial_app_component(&component).is_err());
-        assert!(validate_app_component_update(&component).is_err());
-        assert!(
+    fn withdrawn_join_authorization_id_validates_like_an_unassigned_id() {
+        // The registry withdrew 0x800a (marmot#427). Every validator that once
+        // refused it now answers exactly as for an id the registry never
+        // assigned: opaque optional data passes, and requiring it fails closed.
+        const WITHDRAWN_JOIN_AUTHORIZATION_ID: AppComponentId = 0x800a;
+        const UNASSIGNED_PROTOCOL_ID: AppComponentId = 0xefff;
+        for component_id in [WITHDRAWN_JOIN_AUTHORIZATION_ID, UNASSIGNED_PROTOCOL_ID] {
+            let component = AppComponentData {
+                component_id,
+                data: vec![0; 104],
+            };
+            validate_initial_app_component(&component).expect("opaque initial data");
+            validate_app_component_update(&component).expect("opaque update");
             validate_standalone_app_data_update(&AppDataUpdateProposal::update(
-                component.component_id,
+                component_id,
                 component.data.clone(),
             ))
-            .is_err()
-        );
+            .expect("opaque standalone update");
 
-        let extensions = current_profile_extensions(
-            [
+            let mandatory = [
                 GROUP_ADMIN_POLICY_COMPONENT_ID,
                 ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
-            ],
-            true,
-            false,
-            &[ExtensionType::AppDataDictionary],
-            &[ProposalType::AppDataUpdate],
-        );
-        let mut dictionary = extensions
-            .app_data_dictionary()
-            .unwrap()
-            .dictionary()
-            .clone();
-        dictionary.insert(component.component_id, component.data);
-        let extensions = Extensions::from_vec(vec![
-            Extension::RequiredCapabilities(extensions.required_capabilities().unwrap().clone()),
-            Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary)),
-        ])
-        .unwrap();
-        let error = validate_current_profile_group_context(&extensions, "test").unwrap_err();
-        assert!(error.to_string().contains("ephemeral-only"));
+            ];
+            let with_data = |required: &[AppComponentId]| {
+                let extensions = current_profile_extensions(
+                    required.iter().copied(),
+                    true,
+                    false,
+                    &[ExtensionType::AppDataDictionary],
+                    &[ProposalType::AppDataUpdate],
+                );
+                let mut dictionary = extensions
+                    .app_data_dictionary()
+                    .unwrap()
+                    .dictionary()
+                    .clone();
+                dictionary.insert(component_id, component.data.clone());
+                Extensions::from_vec(vec![
+                    Extension::RequiredCapabilities(
+                        extensions.required_capabilities().unwrap().clone(),
+                    ),
+                    Extension::AppDataDictionary(AppDataDictionaryExtension::new(dictionary)),
+                ])
+                .unwrap()
+            };
+            validate_current_profile_group_context(&with_data(&mandatory), "optional")
+                .expect("unknown optional state is preserved");
+            let error = validate_current_profile_group_context(
+                &with_data(&[mandatory[0], mandatory[1], component_id]),
+                "required",
+            )
+            .expect_err("unknown required component fails closed");
+            assert!(
+                error.to_string().contains(&format!(
+                    "unsupported required component {component_id:#06x}"
+                )),
+                "{error}"
+            );
+        }
     }
 
     #[test]

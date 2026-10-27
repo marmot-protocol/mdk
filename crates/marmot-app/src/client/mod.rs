@@ -7734,7 +7734,7 @@ mod app_component_gate_tests {
     use crate::AppError;
     use cgka_traits::app_components::{
         APP_COMPONENT_DATA_MAX_LEN, APP_OWNED_APP_COMPONENT_ID_START,
-        MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID, PROTOCOL_OWNED_APP_COMPONENT_IDS,
+        PROTOCOL_OWNED_APP_COMPONENT_IDS,
     };
 
     fn rejected(component_id: u16, data: &[u8]) -> bool {
@@ -7759,12 +7759,13 @@ mod app_component_gate_tests {
     }
 
     #[test]
-    fn registry_draft_and_unassigned_protocol_ids_are_refused() {
-        // 0x800a is assigned to marmot.authorization.multi-device-join.v1 and
-        // 0x800d is the registry's next id. Both were writable while the gate
-        // admitted "private-use minus today's protocol list".
-        assert!(rejected(MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID, &[]));
+    fn withdrawn_and_unassigned_protocol_ids_are_refused() {
+        // 0x800a, withdrawn from the registry (marmot#427), is refused exactly
+        // like 0xefff, which the registry never assigned, and like 0x800d.
+        // Such ids were writable while the gate admitted "private-use minus
+        // today's protocol list".
         assert!(rejected(0x800a, &[]));
+        assert!(rejected(0xefff, &[]));
         assert!(rejected(0x800d, &[]));
     }
 

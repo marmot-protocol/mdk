@@ -1283,42 +1283,104 @@ async fn app_state_budget() {
     alice.confirm_published(pending).await.unwrap();
 }
 
-#[tokio::test]
-async fn ephemeral_update_rejected() {
-    use cgka_traits::app_components::MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID;
-    let (mut alice, _, mut bob, bob_storage, gid) = create_admin_pair_with_storage().await;
-    let component = AppComponentData {
-        component_id: MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID,
-        data: vec![0; 104],
-    };
-    let error = bob
-        .send(SendIntent::UpdateAppComponents {
-            group_id: gid.clone(),
-            updates: vec![component.clone()],
+/// Carry opaque data for `component_id` through each place the engine once
+/// refused 0x800a, in a current-profile group: a peer's commit (built below
+/// the engine, so no sender check applies), a Welcome whose GroupContext
+/// carries it, and a local update. Returns what alice holds after the peer
+/// commit, what carol holds after joining, and what alice holds after her
+/// own update.
+async fn carry_opaque_protocol_component(component_id: u16) -> Vec<Option<Vec<u8>>> {
+    let (mut alice, _) = build_current_with_storage(b"alice");
+    let (mut bob, bob_storage) = build_current_with_storage(b"bob");
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let (gid, create) = alice
+        .create_group(CreateGroupRequest {
+            name: "original".into(),
+            description: "orig description".into(),
+            members: vec![bob_kp],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![bob.self_id()],
         })
         .await
-        .unwrap_err();
-    assert!(error.to_string().contains("ephemeral-only"));
-    let epoch = alice.epoch(&gid).unwrap();
-    let malicious =
-        malicious_app_component_commit(&bob_storage, &bob.self_id(), &gid, vec![component]);
-    let malicious_id = hex::encode(content_id(&malicious).as_slice());
-    alice.ingest(malicious).await.unwrap();
-    let result = alice
-        .converge_stored_openmls_messages_at(&gid, 1_000_000)
         .unwrap();
-    assert!(
-        result
-            .dropped_messages
-            .iter()
-            .any(|dropped| dropped.message_id == malicious_id)
+    let SendResult::FoundingGroupCreated { welcomes } = create else {
+        panic!("expected FoundingGroupCreated, got {create:?}");
+    };
+    bob.join_welcome(welcomes.into_iter().next().unwrap())
+        .await
+        .unwrap();
+    let mut held = Vec::new();
+
+    let epoch = alice.epoch(&gid).unwrap();
+    let peer_commit = malicious_app_component_commit(
+        &bob_storage,
+        &bob.self_id(),
+        &gid,
+        vec![AppComponentData {
+            component_id,
+            data: vec![1; 104],
+        }],
     );
-    assert_eq!(alice.epoch(&gid).unwrap(), epoch);
+    alice.ingest(peer_commit).await.unwrap();
+    converge_buffered_commit(&mut alice, &gid);
+    assert_ne!(alice.epoch(&gid).unwrap(), epoch, "the peer commit applies");
+    held.push(alice.app_component(&gid, component_id).unwrap());
+
+    let mut carol = build_current(b"carol");
+    let carol_kp = carol.fresh_key_package().await.unwrap();
+    let invite = alice
+        .send(SendIntent::Invite {
+            group_id: gid.clone(),
+            key_packages: vec![carol_kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution {
+        pending,
+        mut welcomes,
+        ..
+    } = invite
+    else {
+        panic!("expected GroupEvolution, got {invite:?}");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    carol
+        .join_welcome(welcomes.remove(0))
+        .await
+        .expect("carol joins from the Welcome");
+    held.push(carol.app_component(&gid, component_id).unwrap());
+
+    let update = alice
+        .send(SendIntent::UpdateAppComponents {
+            group_id: gid.clone(),
+            updates: vec![AppComponentData {
+                component_id,
+                data: vec![2; 104],
+            }],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution { pending, .. } = update else {
+        panic!("expected GroupEvolution, got {update:?}");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    held.push(alice.app_component(&gid, component_id).unwrap());
+    held
+}
+
+#[tokio::test]
+async fn withdrawn_join_authorization_id_is_carried_like_an_unassigned_id() {
+    // 0x800a was the draft multi-device join authorization, which the registry
+    // withdrew (marmot#427). The engine refused its data as ephemeral-only; it
+    // now carries it exactly as an id the registry never assigned.
+    let withdrawn = carry_opaque_protocol_component(0x800a).await;
+    let unassigned = carry_opaque_protocol_component(0xefff).await;
+    assert_eq!(withdrawn, unassigned);
     assert_eq!(
-        alice
-            .app_component(&gid, MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID)
-            .unwrap(),
-        None
+        withdrawn,
+        vec![Some(vec![1; 104]), Some(vec![1; 104]), Some(vec![2; 104])]
     );
 }
 
