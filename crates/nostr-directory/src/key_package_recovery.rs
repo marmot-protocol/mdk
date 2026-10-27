@@ -11,8 +11,8 @@ use super::Directory;
 use super::resources::DirectoryResources;
 use crate::DirectoryFreshness;
 use crate::published_records::{
-    KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, key_package_deletion_page_full,
-    key_package_queries, select_key_packages_from_records, without_revoked_slot_winners,
+    KeyPackageRecoveryEvidence, KeyPackageRecoveryTarget, key_package_queries,
+    key_package_read_page_full, select_key_packages_from_records, without_revoked_slot_winners,
 };
 use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord};
 
@@ -59,9 +59,9 @@ impl<R: DirectoryResources> Directory<R> {
             cached_target,
             wanted,
         } = request;
-        // Recovery reads more deletion requests only for candidates it
-        // proves; it cannot prove what a full page left unread elsewhere.
-        if key_package_deletion_page_full(account, &observed) {
+        // A full page of KeyPackages or deletion requests hides what lies
+        // past it; recovery's targeted reads cannot show that either.
+        if key_package_read_page_full(account, &observed) {
             return Err(recovery_incomplete(account));
         }
         let freshness = self.directory_freshness();

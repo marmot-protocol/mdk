@@ -9863,7 +9863,7 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     assert_eq!(packages.authors.len(), 8);
     assert_eq!(
         packages.limit,
-        8 * 2 * nostr_directory::MAX_KEY_PACKAGES_PER_ACCOUNT
+        transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT
     );
     drop(requests);
 

@@ -270,16 +270,18 @@ async fn deletion_by_slot_address_or_event_id_skips_a_slot() {
     assert_eq!(with(&earlier), ids(&[&phone, &laptop, &tablet]));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_full_page_of_deletion_requests_fails_the_lookup() {
-    // Account 0 alone, then beside another account, whose batch defers the
-    // decision to the single-author read and recovery.
+/// One relay page short of full selects; a full page of `kind` fails the
+/// lookup. Account 0 alone, then beside another account, whose batch defers
+/// the decision to the single-author read and recovery.
+async fn assert_a_full_page_fails_the_lookup(kind: u64) {
+    const PAGE: usize = transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT;
     for count in [1, 2] {
         let (_dir, app, accounts, fetcher) = member_resolution_fixture(count, false).await;
         let account = &accounts[0];
         let now = unix_now_seconds();
-        let mut deletions = (0..transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT)
-            .map(|index| {
+        let package = device_package(&app, account, true);
+        let page_event = |index: usize| {
+            if kind == 5 {
                 signed_deletion(
                     &app,
                     account,
@@ -289,15 +291,40 @@ async fn a_full_page_of_deletion_requests_fails_the_lookup() {
                     ],
                     now - 100,
                 )
-            })
-            .collect::<Vec<_>>();
-        let last = deletions.pop().unwrap();
-        fetcher.events.lock().unwrap().extend(deletions);
+            } else {
+                // A page counts whatever the relay returned, valid or not.
+                let event = candidate(
+                    account,
+                    package.clone(),
+                    &format!("slot-{index}"),
+                    None,
+                    now - 100 - index as u64,
+                );
+                NostrTransportEvent::new_unsigned_at(
+                    event.pubkey,
+                    event.kind,
+                    event.tags,
+                    "unparseable".into(),
+                    event.created_at,
+                )
+            }
+        };
+        let existing = fetcher
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == kind && event.pubkey == account.account_id_hex)
+            .count();
+        fetcher
+            .events
+            .lock()
+            .unwrap()
+            .extend((existing..PAGE - 1).map(&page_event));
         let refs = accounts
             .iter()
             .map(|account| account.account_id_hex.as_str())
             .collect::<Vec<_>>();
-        // One short of a page proves the read held every request.
         assert_eq!(
             app.directory()
                 .resolve_member_key_packages(&refs)
@@ -306,7 +333,7 @@ async fn a_full_page_of_deletion_requests_fails_the_lookup() {
                 .len(),
             count
         );
-        fetcher.events.lock().unwrap().push(last);
+        fetcher.events.lock().unwrap().push(page_event(PAGE));
         let error = app
             .directory()
             .resolve_member_key_packages(&refs)
@@ -314,9 +341,78 @@ async fn a_full_page_of_deletion_requests_fails_the_lookup() {
             .unwrap_err();
         assert!(
             matches!(&error, DirectoryError::DirectoryLookupIncomplete(id) if *id == account.account_id_hex),
-            "an unread deletion request may cover the selected slot: {error:?}"
+            "events past a full page may change the selection: {error:?}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_page_of_key_packages_fails_the_lookup() {
+    assert_a_full_page_fails_the_lookup(KIND_MARMOT_KEY_PACKAGE).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_page_of_deletion_requests_fails_the_lookup() {
+    assert_a_full_page_fails_the_lookup(5).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_device_behind_many_newer_slots_still_ranks_first() {
+    // Beside another account, with the shared read refused, so account 0 is
+    // decided by its single-author read, which carries the relay limit.
+    let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+    fetcher
+        .reject_multi_author
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let account = &accounts[0];
+    let now = unix_now_seconds();
+    fetcher.events.lock().unwrap().retain(|event| {
+        event.kind != KIND_MARMOT_KEY_PACKAGE || event.pubkey != account.account_id_hex
+    });
+    let oldest = candidate(
+        account,
+        device_package(&app, account, false),
+        "oldest",
+        None,
+        now - 1_000,
+    );
+    let last_resort = device_package(&app, account, true);
+    let newer = (0..3 * MAX_KEY_PACKAGES_PER_ACCOUNT as u64)
+        .map(|index| {
+            candidate(
+                account,
+                last_resort.clone(),
+                &format!("newer-{index}"),
+                None,
+                now - index,
+            )
+        })
+        .collect::<Vec<_>>();
+    let expected = vec![oldest.id.clone(), newer[0].id.clone()];
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .extend(newer.into_iter().chain([oldest]));
+    let selected = app
+        .directory()
+        .resolve_member_key_packages(&[
+            accounts[0].account_id_hex.as_str(),
+            accounts[1].account_id_hex.as_str(),
+        ])
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|package| {
+            let source = package.source.as_ref().unwrap();
+            (cgka_engine::key_package::key_package_metadata(&package)
+                .unwrap()
+                .credential_identity_hex
+                == account.account_id_hex)
+                .then(|| hex::encode(source.event_id.as_slice()))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(selected, expected);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

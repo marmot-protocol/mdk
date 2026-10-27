@@ -494,50 +494,45 @@ pub fn relay_list_queries(account_id_hex: String) -> Vec<DirectoryEventQuery> {
 pub const MAX_KEY_PACKAGES_PER_ACCOUNT: usize = 20;
 /// A KeyPackage published no longer than this before selection is fresh.
 pub const KEY_PACKAGE_FRESHNESS: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-/// KeyPackage events read per author. Twice the per-account limit, so slots
-/// that turn out invalid, deleted or incompatible leave room for the rest.
-/// Relays keep one event per slot, so this is the newest 40 live slots; an
-/// older slot past them, even one that is not last-resort, is not seen. A read
-/// that fills the limit is reported incomplete, so it never proves absence.
-pub(crate) const KEY_PACKAGE_EVENTS_PER_AUTHOR: usize = 2 * MAX_KEY_PACKAGES_PER_ACCOUNT;
-/// KeyPackage deletion requests read alongside the KeyPackages: one relay
-/// page. Deletion requests are small, and few accounts publish many, so a
-/// page that comes back full fails the lookup instead of selecting a slot an
-/// unread request may cover ([`key_package_deletion_page_full`]).
-pub(crate) const KEY_PACKAGE_DELETIONS_READ: usize = RELAY_REPLAY_PAGE_LIMIT;
+/// KeyPackage events, and separately deletion requests, read in one lookup:
+/// one relay page each. Relays keep one event per slot and each slot is one
+/// device, so every slot of a normal account fits, along with its deletion
+/// requests. A page that comes back full fails the lookup instead of ranking
+/// without what lies past it ([`key_package_read_page_full`]). Only the
+/// account's own key can publish into its slots or delete them, so only the
+/// account itself can make itself uninvitable this way.
+pub(crate) const KEY_PACKAGE_READ_PAGE: usize = RELAY_REPLAY_PAGE_LIMIT;
 
 /// The KeyPackage events and the deletion requests read alongside them.
 pub(crate) fn key_package_queries(authors: Vec<String>) -> Vec<DirectoryEventQuery> {
-    let count = authors.len();
     vec![
         DirectoryEventQuery::new(
             KIND_MARMOT_KEY_PACKAGE,
             authors.clone(),
-            count * KEY_PACKAGE_EVENTS_PER_AUTHOR,
+            KEY_PACKAGE_READ_PAGE,
         ),
-        DirectoryEventQuery::key_package_deletions(authors, KEY_PACKAGE_DELETIONS_READ),
+        DirectoryEventQuery::key_package_deletions(authors, KEY_PACKAGE_READ_PAGE),
     ]
 }
 
-/// Whether some relay returned a full page of `account`'s deletion requests.
-/// Older requests past the page were not read, and one of them may cover a
-/// slot that still selects.
-pub(crate) fn key_package_deletion_page_full(account: &str, records: &[RelayEventRecord]) -> bool {
-    let mut per_endpoint = std::collections::BTreeMap::<_, BTreeSet<_>>::new();
-    for record in records
-        .iter()
-        .filter(|record| record.event.kind == 5 && record.event.pubkey == account)
-    {
+/// Whether some relay returned a full page of `account`'s KeyPackages or of
+/// its deletion requests. Nothing past the page was read: an older slot may
+/// outrank every one read, and an older request may cover a slot that still
+/// selects.
+pub(crate) fn key_package_read_page_full(account: &str, records: &[RelayEventRecord]) -> bool {
+    let mut pages = std::collections::BTreeMap::<_, BTreeSet<_>>::new();
+    for record in records.iter().filter(|record| {
+        record.event.pubkey == account
+            && (record.event.kind == KIND_MARMOT_KEY_PACKAGE || record.event.kind == 5)
+    }) {
         for endpoint in &record.endpoints {
-            per_endpoint
-                .entry(endpoint.as_str())
+            pages
+                .entry((endpoint.as_str(), record.event.kind))
                 .or_default()
                 .insert(record.event.id.as_str());
         }
     }
-    per_endpoint
-        .values()
-        .any(|ids| ids.len() >= KEY_PACKAGE_DELETIONS_READ)
+    pages.values().any(|ids| ids.len() >= KEY_PACKAGE_READ_PAGE)
 }
 
 /// One account's selected KeyPackages, best first. `legacy_slots` only

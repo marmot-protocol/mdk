@@ -25,9 +25,8 @@ use super::Directory;
 use super::observer::{DirectoryObservation, DirectoryObserver, ObservedFamily, ObservedUnit};
 use super::resources::DirectoryResources;
 use crate::published_records::{
-    MAX_KEY_PACKAGES_PER_ACCOUNT, fresh_relay_list_status_from_records,
-    key_package_deletion_page_full, key_package_queries, merge_relay_list_status,
-    select_key_packages_from_records,
+    MAX_KEY_PACKAGES_PER_ACCOUNT, fresh_relay_list_status_from_records, key_package_queries,
+    key_package_read_page_full, merge_relay_list_status, select_key_packages_from_records,
 };
 use crate::{AccountRelayListStatus, FetchedKeyPackage};
 use transport_nostr::{DirectoryEventQuery, DirectoryFetchOutcome};
@@ -908,7 +907,7 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                         if !selected.is_empty()
                             && (purpose == MemberResolutionPurpose::Prewarm
                                 || !multiple_authors)
-                            && !key_package_deletion_page_full(account_id, &account_records) =>
+                            && !key_package_read_page_full(account_id, &account_records) =>
                     {
                         outcomes[index] = Some(self.accept_fetched_key_packages(
                             purpose,
@@ -923,8 +922,8 @@ impl<R: DirectoryResources + DirectoryObserver> Directory<R> {
                     // existence, while commits seek every device's slot from
                     // a single-author read. Neither path can detect a newer
                     // publication omitted from a non-prefix response. A full
-                    // page of deletion requests falls back too, and recovery
-                    // reports it incomplete. Keep observed slot replacements
+                    // page of KeyPackages or deletion requests falls back
+                    // too, and recovery reports it incomplete. Keep observed slot replacements
                     // when combining the refetch.
                     _ => {
                         fallback.push(index);
