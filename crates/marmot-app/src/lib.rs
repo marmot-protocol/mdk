@@ -2076,6 +2076,7 @@ impl MarmotApp {
             #[cfg(test)]
             fail_next_terminal_recovery_retire: false,
             post_join_maintenance_subscriptions: HashMap::new(),
+            post_join_history_sessions: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
         };

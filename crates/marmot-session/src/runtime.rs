@@ -24,7 +24,8 @@ use cgka_traits::maintenance::KEY_PACKAGE_GENERATION_REVISION;
 use cgka_traits::maintenance::{
     DurableGroupEvolution, DurableTransportFanout, GroupEvolutionPhase, GroupEvolutionSemantic,
     GroupMaintenanceStatus, KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase,
-    MaintenanceTrigger, PeriodicMaintenancePolicy, RetainedKeyPackagePrivateMaterial,
+    MaintenanceTrigger, PeriodicMaintenancePolicy, PostJoinHistoryFetch,
+    PostJoinHistoryFetchCompletion, PostJoinHistoryFetchOutcome, RetainedKeyPackagePrivateMaterial,
     SendMaintenanceDisposition, TransportFanoutAttemptState, TransportFanoutTarget,
 };
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
@@ -1731,6 +1732,110 @@ where
         Ok(updates)
     }
 
+    /// The group's post-join history fetch. Its completion with
+    /// [`PostJoinHistoryFetchOutcome::Fetched`] means this device has fetched
+    /// and processed the group messages its delivery endpoints hold from its
+    /// join epoch on. A replacement Welcome starts a new fetch, so an earlier
+    /// copy's completion never answers for the current one. `None` for a
+    /// created group and for copies joined before fetches were recorded.
+    pub fn post_join_history_fetch(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<Option<PostJoinHistoryFetch>> {
+        Ok(self
+            .session
+            .group_maintenance(group_id)?
+            .and_then(|state| state.post_join_history))
+    }
+
+    /// Record that the subscription for the group's owed post-join history
+    /// fetch is installed, and return that fetch's id. Its deadline starts
+    /// here, and again at every installation. The self-update obligation's
+    /// own deadline is [`Self::mark_post_join_subscription_installed`]'s.
+    pub fn start_post_join_history_fetch(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<Option<cgka_traits::MessageId>> {
+        let Some(mut state) = self.session.group_maintenance(group_id)? else {
+            return Ok(None);
+        };
+        let Some(fetch) = state
+            .post_join_history
+            .as_mut()
+            .filter(|fetch| fetch.completion.is_none())
+        else {
+            return Ok(None);
+        };
+        fetch.deadline_at =
+            Some(Timestamp(self.wall_clock.now().0.saturating_add(
+                self.maintenance_timing.eose_timeout.as_secs(),
+            )));
+        let id = fetch.obligation_id.clone();
+        self.session.put_group_maintenance(&state)?;
+        Ok(Some(id))
+    }
+
+    /// End the owed post-join history fetch `fetch` as fetched: its
+    /// subscription reached end-of-stored-events and everything it delivered
+    /// has been processed. Returns the recorded completion, or `None` when
+    /// `fetch` is no longer the group's owed fetch.
+    pub fn finish_post_join_history_fetch(
+        &self,
+        group_id: &GroupId,
+        fetch: &cgka_traits::MessageId,
+    ) -> AccountResult<Option<PostJoinHistoryFetchCompletion>> {
+        self.end_post_join_history_fetch(group_id, fetch, PostJoinHistoryFetchOutcome::Fetched)
+    }
+
+    /// End the owed post-join history fetch `fetch` as expired once the
+    /// deadline its installation set has passed. Only for a fetch whose
+    /// subscription has reached no end-of-stored-events. Returns the recorded
+    /// completion, or `None` while the fetch goes on.
+    pub fn expire_post_join_history_fetch(
+        &self,
+        group_id: &GroupId,
+        fetch: &cgka_traits::MessageId,
+    ) -> AccountResult<Option<PostJoinHistoryFetchCompletion>> {
+        self.end_post_join_history_fetch(
+            group_id,
+            fetch,
+            PostJoinHistoryFetchOutcome::DeadlineExpired,
+        )
+    }
+
+    fn end_post_join_history_fetch(
+        &self,
+        group_id: &GroupId,
+        fetch: &cgka_traits::MessageId,
+        outcome: PostJoinHistoryFetchOutcome,
+    ) -> AccountResult<Option<PostJoinHistoryFetchCompletion>> {
+        let Some(mut state) = self.session.group_maintenance(group_id)? else {
+            return Ok(None);
+        };
+        // A fetch that is no longer the group's current one is left alone.
+        let Some(current) = state
+            .post_join_history
+            .as_mut()
+            .filter(|current| current.obligation_id == *fetch && current.completion.is_none())
+        else {
+            return Ok(None);
+        };
+        if outcome == PostJoinHistoryFetchOutcome::DeadlineExpired
+            && !current
+                .deadline_at
+                .is_some_and(|deadline| deadline <= self.wall_clock.now())
+        {
+            return Ok(None);
+        }
+        let completion = PostJoinHistoryFetchCompletion {
+            outcome,
+            completed_at_ms: self.wall_clock.now_ms(),
+        };
+        current.completion = Some(completion);
+        self.session.put_group_maintenance(&state)?;
+        Ok(Some(completion))
+    }
+
     /// Only call this for authenticated, valid MLS commits or proposals.
     pub fn note_valid_state_bearing_input(&mut self, group_id: &GroupId) -> AccountResult<()> {
         let now = self.wall_clock.now();
@@ -2417,6 +2522,7 @@ where
             last_own_leaf_rotation_at: None,
             next_periodic_rotation_at: None,
             leaf_refresh_due_at: None,
+            post_join_history: None,
         });
 
         // Any self-update already in flight refreshes the leaf too.

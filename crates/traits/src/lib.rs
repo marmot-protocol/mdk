@@ -92,7 +92,8 @@ pub use maintenance::{
     GroupEvolutionPhase, GroupEvolutionSemantic, GroupMaintenanceState, GroupMaintenanceStatus,
     KeyPackageLifecycleState, MaintenanceObligation, MaintenancePhase, MaintenanceRandom,
     MaintenanceRunSummary, MaintenanceTrigger, MonotonicClock, PendingKeyPackageReplacement,
-    PeriodicMaintenancePolicy, RetainedKeyPackagePrivateMaterial, SendMaintenanceDisposition,
+    PeriodicMaintenancePolicy, PostJoinHistoryFetch, PostJoinHistoryFetchCompletion,
+    PostJoinHistoryFetchOutcome, RetainedKeyPackagePrivateMaterial, SendMaintenanceDisposition,
     SignedPublicationArtifact, TransportFanoutAttemptState, TransportFanoutTarget, WallClock,
 };
 pub use message::{

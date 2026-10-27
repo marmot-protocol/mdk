@@ -369,6 +369,16 @@ impl AttemptGrant {
     }
 }
 
+/// The post-join history fetch a live maintenance session was installed for,
+/// keyed by the session's subscription id.
+pub(crate) struct PostJoinHistorySession {
+    /// The fetch's id: the post-join obligation created with that copy.
+    pub(crate) fetch: cgka_traits::MessageId,
+    /// The session's recovery boundary qualified: a relay it was admitted
+    /// for reached end-of-stored-events.
+    pub(crate) boundary: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct MaintenanceRecoveryObservation {
     pub(crate) fence: RecoveryRevisionFence,
@@ -1315,15 +1325,34 @@ impl AppClient {
                     self.post_join_maintenance_since(&group_id),
                 )
                 .await?;
-            if let Err(error) = self
+            // The fetch's deadline is set again at every installation, so start
+            // it first: a failed install must not start the obligation's EOSE
+            // deadline, which no reinstallation moves.
+            let fetch = match self
                 .runtime
-                .mark_post_join_subscription_installed(&group_id)
-            {
-                let _ = self
-                    .adapter
-                    .remove_group_maintenance_subscription(&subscription)
-                    .await;
-                return Err(error.into());
+                .start_post_join_history_fetch(&group_id)
+                .and_then(|fetch| {
+                    self.runtime
+                        .mark_post_join_subscription_installed(&group_id)
+                        .map(|()| fetch)
+                }) {
+                Ok(fetch) => fetch,
+                Err(error) => {
+                    let _ = self
+                        .adapter
+                        .remove_group_maintenance_subscription(&subscription)
+                        .await;
+                    return Err(error.into());
+                }
+            };
+            if let Some(fetch) = fetch {
+                self.post_join_history_sessions.insert(
+                    subscription.clone(),
+                    PostJoinHistorySession {
+                        fetch,
+                        boundary: false,
+                    },
+                );
             }
             self.post_join_maintenance_subscriptions
                 .insert(group_id.clone(), (subscription, route));
@@ -1338,6 +1367,75 @@ impl AppClient {
             );
         }
         Ok(())
+    }
+
+    /// End the group's owed post-join history fetch `fetch`. Once its live
+    /// session's boundary has qualified, it ends as fetched when everything
+    /// that group's replay holds has been ingested, however long after the
+    /// deadline that is; before then, it ends only at the deadline set when
+    /// the session was installed. `boundary` is this pass's qualification.
+    /// Returns whether the fetch ended.
+    pub(super) async fn settle_post_join_history_fetch(
+        &mut self,
+        group_id: &cgka_traits::GroupId,
+        fetch: &cgka_traits::MessageId,
+        boundary: bool,
+    ) -> Result<bool, AppError> {
+        let Some((subscription, _)) = self
+            .post_join_maintenance_subscriptions
+            .get(group_id)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        let Some(session) = self
+            .post_join_history_sessions
+            .get_mut(&subscription)
+            .filter(|session| session.fetch == *fetch)
+        else {
+            return Ok(false);
+        };
+        session.boundary |= boundary;
+        let completion = if session.boundary {
+            // Native ingress acknowledges a frame only after its ingest, so a
+            // placed session has had everything it delivered processed. The
+            // group's frames flush only once all of its streams are ready, so
+            // placement is the group's, not this subscription's alone.
+            if self.recovery_owner.native_ingress.is_none()
+                || self.adapter.group_maintenance_placed(&subscription).await != Some(true)
+            {
+                return Ok(false);
+            }
+            self.runtime
+                .finish_post_join_history_fetch(group_id, fetch)?
+        } else {
+            self.runtime
+                .expire_post_join_history_fetch(group_id, fetch)?
+        };
+        let Some(completion) = completion else {
+            return Ok(false);
+        };
+        tracing::debug!(
+            target: "marmot_app::maintenance",
+            method = "settle_post_join_history_fetch",
+            outcome = match completion.outcome {
+                cgka_traits::PostJoinHistoryFetchOutcome::Fetched => "fetched",
+                cgka_traits::PostJoinHistoryFetchOutcome::DeadlineExpired => "deadline_expired",
+            },
+            "post-join history fetch ended"
+        );
+        Ok(true)
+    }
+
+    /// Forget the fetch of every post-join session that is no longer live.
+    pub(super) fn retain_live_post_join_history_sessions(&mut self) {
+        let live = self
+            .post_join_maintenance_subscriptions
+            .values()
+            .map(|(subscription, _)| subscription)
+            .collect::<std::collections::HashSet<_>>();
+        self.post_join_history_sessions
+            .retain(|subscription, _| live.contains(subscription));
     }
 
     pub(super) async fn observe_post_join_recovery_boundary(
@@ -4795,6 +4893,571 @@ mod tests {
             "a paused sweep drops the installed session"
         );
     }
+
+    /// Every subscription but a post-join maintenance REQ, whose end of stored
+    /// events the test reports itself.
+    fn not_post_join_maintenance(
+        subscription: &transport_nostr_adapter::NostrSubscription,
+    ) -> bool {
+        !matches!(
+            subscription,
+            transport_nostr_adapter::NostrSubscription::GroupMaintenance { .. }
+        )
+    }
+
+    /// The state a Welcome join leaves: a PostJoin obligation in `CatchUp` and
+    /// the owed history fetch it names, on a created group of an active client.
+    fn owe_post_join_history_fetch(
+        storage: &storage_sqlite::SqliteAccountStorage,
+        group: &cgka_traits::GroupId,
+        id: u8,
+    ) -> cgka_traits::MessageId {
+        use cgka_traits::storage::MaintenanceStorage;
+        let id = cgka_traits::MessageId::new(vec![id; 32]);
+        storage
+            .put_maintenance_obligation(&cgka_traits::MaintenanceObligation {
+                id: id.clone(),
+                group_id: group.clone(),
+                trigger: cgka_traits::MaintenanceTrigger::PostJoin,
+                phase: cgka_traits::MaintenancePhase::CatchUp,
+                created_at: cgka_traits::Timestamp(unix_now_seconds()),
+                operational_target_at: None,
+                overdue: false,
+                eose_deadline_at: None,
+                grace_until: None,
+                quiet_since: None,
+                own_leaf_baseline_hash: None,
+                sampled_jitter_ms: 0,
+                not_before: None,
+                attempt_count: 0,
+                semantic_rearm_count: 0,
+                last_failure_code: None,
+            })
+            .unwrap();
+        let mut state = storage.group_maintenance(group).unwrap().unwrap();
+        state.post_join_history = Some(cgka_traits::PostJoinHistoryFetch::new(id.clone()));
+        storage.put_group_maintenance(&state).unwrap();
+        id
+    }
+
+    async fn post_join_fetch_fixture(
+        name: &str,
+    ) -> (
+        tempfile::TempDir,
+        crate::MarmotApp,
+        Arc<crate::tests::ScriptedPushRelayClient>,
+        crate::tests::ScriptedEosePump,
+        AppClient,
+        cgka_traits::GroupId,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        crate::AccountHome::open(directory.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(crate::tests::ScriptedPushRelayClient::default());
+        let app = crate::MarmotApp::with_relay_and_config(
+            directory.path(),
+            "wss://relay.example",
+            crate::tests::bounded_epoch_backfill_config()
+                .with_dev_epoch_backfill_retry_backoff_ms(15_000),
+        )
+        .with_test_relay_client(relay.clone());
+        let pump = crate::tests::scripted_eose_pump(
+            app.relay_plane.clone(),
+            relay.clone(),
+            not_post_join_maintenance,
+        );
+        let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
+        client.prepare_transport().await.unwrap();
+        let group = client.create_group(name, &[]).await.unwrap();
+        (directory, app, relay, pump, client, group)
+    }
+
+    /// Request the group's post-join session and run the recovery job that
+    /// installs it.
+    async fn install_post_join_session(client: &mut AppClient) {
+        let storage = client.app.account_storage(&client.state.label).unwrap();
+        client.recovery_owner.test_advance_to_retry(&storage);
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        let grant = client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        client.run_recovery_grant_for_test(grant).await.unwrap();
+        assert_eq!(client.post_join_maintenance_subscriptions.len(), 1);
+    }
+
+    fn maintenance_boundary_requested(storage: &storage_sqlite::SqliteAccountStorage) -> bool {
+        storage
+            .app_storage()
+            .pending_recovery_demands()
+            .unwrap()
+            .iter()
+            .any(|demand| demand.cause == storage_sqlite::RecoveryCause::Maintenance)
+    }
+
+    /// A commit while the post-join REQ waits for its end of stored events
+    /// moves the self-update obligation to `Quiet`. The REQ keeps running, and
+    /// its EOSE ends the fetch without touching that obligation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_commit_during_post_join_catch_up_keeps_the_history_req_until_its_eose() {
+        use cgka_traits::storage::MaintenanceStorage;
+        let (_directory, app, relay, _pump, mut client, group) =
+            post_join_fetch_fixture("commit during catch-up").await;
+        let storage = app.account_storage("alice").unwrap();
+        let fetch = owe_post_join_history_fetch(&storage, &group, 61);
+        install_post_join_session(&mut client).await;
+
+        client
+            .runtime
+            .note_valid_state_bearing_input(&group)
+            .unwrap();
+        let quiet = storage.maintenance_obligation(&fetch).unwrap().unwrap();
+        assert_eq!(quiet.phase, cgka_traits::MaintenancePhase::Quiet);
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        assert!(
+            client
+                .post_join_maintenance_subscriptions
+                .contains_key(&group),
+            "a commit does not retire the history REQ"
+        );
+        assert_eq!(
+            client
+                .runtime
+                .post_join_history_fetch(&group)
+                .unwrap()
+                .unwrap()
+                .completion,
+            None
+        );
+
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .runtime
+                .post_join_history_fetch(&group)
+                .unwrap()
+                .unwrap()
+                .completion
+                .map(|completion| completion.outcome),
+            Some(cgka_traits::PostJoinHistoryFetchOutcome::Fetched)
+        );
+        assert!(client.post_join_maintenance_subscriptions.is_empty());
+        assert!(!maintenance_boundary_requested(&storage));
+        assert_eq!(
+            storage.maintenance_obligation(&fetch).unwrap().unwrap(),
+            quiet,
+            "the fetch's EOSE leaves the quiet timer the commit started"
+        );
+    }
+
+    /// A history REQ that never reaches end of stored events ends its fetch at
+    /// the deadline, and the session goes with it once nothing else waits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unanswered_post_join_history_fetch_ends_at_its_deadline() {
+        use cgka_traits::storage::MaintenanceStorage;
+        let (_directory, app, _relay, _pump, mut client, group) =
+            post_join_fetch_fixture("unanswered fetch").await;
+        let storage = app.account_storage("alice").unwrap();
+        let fetch = owe_post_join_history_fetch(&storage, &group, 62);
+        install_post_join_session(&mut client).await;
+        client
+            .runtime
+            .note_valid_state_bearing_input(&group)
+            .unwrap();
+        let deadline = client
+            .runtime
+            .post_join_history_fetch(&group)
+            .unwrap()
+            .unwrap()
+            .deadline_at
+            .unwrap();
+        assert!(deadline.0 > unix_now_seconds());
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        assert!(
+            client
+                .post_join_maintenance_subscriptions
+                .contains_key(&group)
+        );
+
+        let mut state = storage.group_maintenance(&group).unwrap().unwrap();
+        state.post_join_history.as_mut().unwrap().deadline_at =
+            Some(cgka_traits::Timestamp(unix_now_seconds() - 1));
+        storage.put_group_maintenance(&state).unwrap();
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        let ended = client
+            .runtime
+            .post_join_history_fetch(&group)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended.obligation_id, fetch);
+        assert_eq!(
+            ended.completion.map(|completion| completion.outcome),
+            Some(cgka_traits::PostJoinHistoryFetchOutcome::DeadlineExpired)
+        );
+        assert!(client.post_join_maintenance_subscriptions.is_empty());
+        assert!(!maintenance_boundary_requested(&storage));
+    }
+
+    /// Once the post-join REQ's boundary has qualified, the deadline no longer
+    /// ends the fetch: it waits until what the session delivered has been
+    /// processed, here held back by closed native ingress, and then ends as
+    /// fetched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_qualified_post_join_boundary_waits_past_the_deadline_for_processing() {
+        use cgka_traits::storage::MaintenanceStorage;
+        let (_directory, app, relay, _pump, mut client, group) =
+            post_join_fetch_fixture("processing past deadline").await;
+        let storage = app.account_storage("alice").unwrap();
+        let fetch = owe_post_join_history_fetch(&storage, &group, 67);
+        install_post_join_session(&mut client).await;
+        client
+            .runtime
+            .note_valid_state_bearing_input(&group)
+            .unwrap();
+        let (subscription, _) = client.post_join_maintenance_subscriptions[&group].clone();
+        let ingress = client.recovery_owner.native_ingress.take();
+        assert!(ingress.is_some());
+
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        assert!(client.post_join_history_sessions[&subscription].boundary);
+        let mut state = storage.group_maintenance(&group).unwrap().unwrap();
+        state.post_join_history.as_mut().unwrap().deadline_at =
+            Some(cgka_traits::Timestamp(unix_now_seconds() - 1));
+        storage.put_group_maintenance(&state).unwrap();
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .runtime
+                .post_join_history_fetch(&group)
+                .unwrap()
+                .unwrap()
+                .completion,
+            None,
+            "an answered fetch does not expire before what it delivered is processed"
+        );
+        assert_eq!(
+            client.post_join_maintenance_subscriptions[&group].0,
+            subscription
+        );
+
+        client.recovery_owner.native_ingress = ingress;
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        let ended = client
+            .runtime
+            .post_join_history_fetch(&group)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended.obligation_id, fetch);
+        assert_eq!(
+            ended.completion.map(|completion| completion.outcome),
+            Some(cgka_traits::PostJoinHistoryFetchOutcome::Fetched)
+        );
+        assert!(client.post_join_maintenance_subscriptions.is_empty());
+    }
+
+    /// A superseded post-join self-update re-arms its obligation while the
+    /// fetch is still owed. The fetch keeps the recovery job its session was
+    /// granted under, so the session's boundary still qualifies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rearmed_self_update_keeps_the_fetch_session_checkpointable() {
+        use cgka_traits::storage::MaintenanceStorage;
+        let (_directory, app, relay, _pump, mut client, group) =
+            post_join_fetch_fixture("re-armed self-update").await;
+        let storage = app.account_storage("alice").unwrap();
+        let fetch = owe_post_join_history_fetch(&storage, &group, 68);
+        install_post_join_session(&mut client).await;
+        client
+            .runtime
+            .note_valid_state_bearing_input(&group)
+            .unwrap();
+        let (subscription, _) = client.post_join_maintenance_subscriptions[&group].clone();
+
+        let mut rearmed = storage.maintenance_obligation(&fetch).unwrap().unwrap();
+        rearmed.semantic_rearm_count += 1;
+        storage.put_maintenance_obligation(&rearmed).unwrap();
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        assert_eq!(
+            client.post_join_maintenance_subscriptions[&group].0,
+            subscription
+        );
+        assert!(maintenance_boundary_requested(&storage));
+
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .runtime
+                .post_join_history_fetch(&group)
+                .unwrap()
+                .unwrap()
+                .completion
+                .map(|completion| completion.outcome),
+            Some(cgka_traits::PostJoinHistoryFetchOutcome::Fetched)
+        );
+        assert!(client.post_join_maintenance_subscriptions.is_empty());
+    }
+
+    /// A copy this device has left fetches nothing more: its session goes and
+    /// no boundary is requested for it again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_left_copy_drops_its_owed_post_join_history_fetch() {
+        let (_directory, app, _relay, _pump, mut client, group) =
+            post_join_fetch_fixture("left mid-fetch").await;
+        let storage = app.account_storage("alice").unwrap();
+        owe_post_join_history_fetch(&storage, &group, 66);
+        install_post_join_session(&mut client).await;
+        client
+            .runtime
+            .note_valid_state_bearing_input(&group)
+            .unwrap();
+
+        crate::tests::make_group_terminal(&client, &group, false);
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        assert!(client.post_join_maintenance_subscriptions.is_empty());
+        assert!(!maintenance_boundary_requested(&storage));
+    }
+
+    /// A client that stops before its fetch ends installs the fetch again on
+    /// the next start, with a fresh deadline, even though a commit has since
+    /// left the self-update obligation nothing to wait for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_client_resumes_an_unfinished_post_join_history_fetch() {
+        let (_directory, app, relay, _pump, mut client, group) =
+            post_join_fetch_fixture("restart mid-fetch").await;
+        let storage = app.account_storage("alice").unwrap();
+        let fetch = owe_post_join_history_fetch(&storage, &group, 63);
+        install_post_join_session(&mut client).await;
+        client
+            .runtime
+            .note_valid_state_bearing_input(&group)
+            .unwrap();
+        drop(client);
+
+        let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
+        client.prepare_transport().await.unwrap();
+        install_post_join_session(&mut client).await;
+        let (subscription, _) = client.post_join_maintenance_subscriptions[&group].clone();
+        assert_eq!(
+            client.post_join_history_sessions[&subscription].fetch,
+            fetch
+        );
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .runtime
+                .post_join_history_fetch(&group)
+                .unwrap()
+                .unwrap()
+                .completion
+                .map(|completion| completion.outcome),
+            Some(cgka_traits::PostJoinHistoryFetchOutcome::Fetched)
+        );
+        assert!(client.post_join_maintenance_subscriptions.is_empty());
+    }
+
+    /// A replacement Welcome starts a new fetch. The session installed for the
+    /// earlier copy ran before that copy existed, so its EOSE cannot end it.
+    /// The earlier copy's obligation stays in `CatchUp`, yet the new session is
+    /// the new fetch's, so a commit before its EOSE does not orphan it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replacement_welcome_starts_a_new_post_join_history_fetch() {
+        use cgka_traits::storage::MaintenanceStorage;
+        let (_directory, app, relay, _pump, mut client, group) =
+            post_join_fetch_fixture("re-invite").await;
+        let storage = app.account_storage("alice").unwrap();
+        let first = owe_post_join_history_fetch(&storage, &group, 64);
+        install_post_join_session(&mut client).await;
+        let (first_session, _) = client.post_join_maintenance_subscriptions[&group].clone();
+
+        // The Welcome join rewrites the group's maintenance state and adds its
+        // own obligation. The earlier copy's stays live until maintenance sees
+        // that its leaf has rotated.
+        let second = owe_post_join_history_fetch(&storage, &group, 65);
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        assert_eq!(
+            client.runtime.post_join_history_fetch(&group).unwrap(),
+            Some(cgka_traits::PostJoinHistoryFetch::new(second.clone())),
+            "the earlier copy's session neither ends nor starts the new fetch"
+        );
+        assert!(
+            client
+                .post_join_maintenance_subscriptions
+                .get(&group)
+                .is_none_or(|(subscription, _)| *subscription != first_session)
+        );
+
+        install_post_join_session(&mut client).await;
+        client
+            .runtime
+            .note_valid_state_bearing_input(&group)
+            .unwrap();
+        for obligation in [&first, &second] {
+            assert_eq!(
+                storage
+                    .maintenance_obligation(obligation)
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                cgka_traits::MaintenancePhase::Quiet
+            );
+        }
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        let fetched = client
+            .runtime
+            .post_join_history_fetch(&group)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.obligation_id, second);
+        assert_eq!(
+            fetched.completion.map(|completion| completion.outcome),
+            Some(cgka_traits::PostJoinHistoryFetchOutcome::Fetched)
+        );
+    }
+
+    /// A grant selected for the earlier copy's demand can install its session
+    /// after a replacement Welcome. That demand is the earlier fetch's, so the
+    /// next pass deletes it; the session is requested again under the new
+    /// fetch's own demand, whose EOSE ends the fetch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_granted_before_a_replacement_welcome_is_requested_again() {
+        let (_directory, app, relay, _pump, mut client, group) =
+            post_join_fetch_fixture("stale grant").await;
+        let storage = app.account_storage("alice").unwrap();
+        owe_post_join_history_fetch(&storage, &group, 66);
+        client.recovery_owner.test_advance_to_retry(&storage);
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        let grant = client
+            .authorize_account_recovery(
+                None,
+                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let second = owe_post_join_history_fetch(&storage, &group, 67);
+        client.run_recovery_grant_for_test(grant).await.unwrap();
+        let (stale_session, _) = client.post_join_maintenance_subscriptions[&group].clone();
+        client
+            .runtime
+            .note_valid_state_bearing_input(&group)
+            .unwrap();
+
+        install_post_join_session(&mut client).await;
+        assert_ne!(
+            client.post_join_maintenance_subscriptions[&group].0,
+            stale_session
+        );
+        crate::tests::report_scripted_eose(
+            &app.relay_plane,
+            &relay,
+            crate::tests::every_subscription,
+        )
+        .await;
+        client
+            .advance_post_join_maintenance_subscriptions()
+            .await
+            .unwrap();
+        let fetched = client
+            .runtime
+            .post_join_history_fetch(&group)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.obligation_id, second);
+        assert_eq!(
+            fetched.completion.map(|completion| completion.outcome),
+            Some(cgka_traits::PostJoinHistoryFetchOutcome::Fetched)
+        );
+    }
+
     #[test]
     fn outcome_policy_distinguishes_unknown_input_from_proven_incapability() {
         use storage_sqlite::{RecoveryEligibility as E, RecoveryScopeOutcome as O};
