@@ -51,8 +51,8 @@ reads a client's latest `observe_exact` state: it checks whether that state requ
 leaf advertises it, the GroupContext carries no data for it and no account holds more than 20 leaves.
 `remove_own_account_devices` sends a same-account Commit: `client` removes the current leaves of `devices`, other
 devices of its own account, by value, and records `pending`. In a group that requires 0x800d it needs no admin and has
-`ordinary` branch priority. It is group-scoped, needs the `account_devices` capability, and runs through the engine's
-test-only stand-in until the same-account Remove intent lands.
+`ordinary` branch priority. It is group-scoped, needs the `account_devices` capability, and sends the engine's
+same-account Remove intent.
 
 ## Deterministic expansion
 

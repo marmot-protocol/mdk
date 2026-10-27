@@ -2450,30 +2450,41 @@ impl HarnessClient {
         }
     }
 
-    /// This client's leaf index in the default group.
-    pub fn own_leaf_index(&self) -> Result<u32, EngineError> {
+    /// This client's leaf signature key in the default group, which names
+    /// this device to a same-account Remove.
+    pub fn own_leaf_signature_key(&self) -> Result<Vec<u8>, EngineError> {
         let gid = self
             .default_group
             .clone()
             .ok_or_else(Self::missing_default_group)?;
-        self.engine().own_leaf_index(&gid)
+        let group = openmls::group::MlsGroup::load(
+            self.storage().mls_storage(),
+            &openmls::group::GroupId::from_slice(gid.as_slice()),
+        )
+        .map_err(|error| EngineError::Backend(format!("load MLS group: {error:?}")))?
+        .ok_or_else(|| EngineError::UnknownGroup(gid.clone()))?;
+        let leaf = group
+            .own_leaf_node()
+            .ok_or_else(|| EngineError::Backend("no own leaf in the MLS group".into()))?;
+        Ok(leaf.signature_key().as_slice().to_vec())
     }
 
-    /// Stage a same-account Commit that removes `leaves`, other devices of
-    /// this client's account, by value. It goes through the engine's
-    /// test-only stand-in for the same-account Remove intent (mdk#2628 item
-    /// 2.1e).
-    pub(crate) async fn try_remove_own_account_leaves(
+    /// Send a same-account Commit that removes the devices with
+    /// `leaf_signature_keys`, other devices of this client's account
+    /// (`SendIntent::RemoveOwnAccountDevices`).
+    pub(crate) async fn try_remove_own_account_devices(
         &mut self,
-        leaves: Vec<u32>,
+        leaf_signature_keys: Vec<Vec<u8>>,
     ) -> Result<PendingStateRef, EngineError> {
-        let result = self.try_remove_own_account_leaves_inner(leaves).await;
+        let result = self
+            .try_remove_own_account_devices_inner(leaf_signature_keys)
+            .await;
         self.release_unconsumed_scenario_input_on_err(result)
     }
 
-    async fn try_remove_own_account_leaves_inner(
+    async fn try_remove_own_account_devices_inner(
         &mut self,
-        leaves: Vec<u32>,
+        leaf_signature_keys: Vec<Vec<u8>>,
     ) -> Result<PendingStateRef, EngineError> {
         let gid = self
             .default_group
@@ -2481,7 +2492,10 @@ impl HarnessClient {
             .ok_or_else(Self::missing_default_group)?;
         let result = self
             .engine_mut()
-            .send_leaf_removals_for_tests(&gid, leaves)
+            .send(SendIntent::RemoveOwnAccountDevices {
+                group_id: gid.clone(),
+                leaf_signature_keys,
+            })
             .await?;
         self.publish_group_evolution(result, &gid, "remove_own_account_devices")
             .await

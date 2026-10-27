@@ -170,8 +170,9 @@ longer matches the record it was admitted from is an integrity failure, and that
 
 The runtime arms one timer deadline per group. Scheduling traffic for one group cannot postpone another group's earlier
 cutoff. After a completed pass, one persisted, already-queued admin group-state intent receives one preparation attempt
-before an inbound-only follow-up generation. App messages, leave work, and automatic maintenance do not consume that
-slot; a failed preparation cannot hold it indefinitely.
+before an inbound-only follow-up generation. In a group that requires `marmot.group.account-devices.v1`, a queued
+same-account intent (adding or removing the sender's own devices) receives the same attempt. App messages, leave work,
+self-updates, and automatic maintenance do not consume that slot; a failed preparation cannot hold it indefinitely.
 
 ## Branch Selection
 

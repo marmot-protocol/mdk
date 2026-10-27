@@ -23,6 +23,15 @@ versioning through the workspace version in the root `Cargo.toml`.
   vectors gain an `account_devices_state` expectation that checks the component's state rules on a client's exact
   state. Four vectors cover activation, activation refused while a member lacks support, and activation racing an
   invite of a member without support, with each side winning once.
+- The engine gains two send intents for a device's own account in a group that requires
+  `marmot.group.account-devices.v1` (0x800d) (mdk#2628). `SendIntent::AddOwnAccountDevices` adds devices of the
+  sender's account from KeyPackages the caller supplies and sends one Welcome rumor per KeyPackage, as an invite does.
+  `SendIntent::RemoveOwnAccountDevices` removes other devices of the account, named by leaf signature key. Each sends
+  a same-account Commit with nothing else in it and leaves pending proposals alone. Anything else is refused before
+  anything is published or changed, including every request in a group that does not require 0x800d. A queued one
+  gets the preparation attempt after a convergence pass that admin intents get; self-updates and Leave still don't.
+  marmot-app does not expose them and MDK does not advertise 0x800d yet, so nothing changes in practice. The
+  simulator's `remove_own_account_devices` now sends the Remove intent.
 
 ### Changed
 

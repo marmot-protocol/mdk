@@ -159,9 +159,16 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     applies the state rules and the GroupInfo rule and accepts a Welcome from its own account; before activation, and on
     the legacy profile, 0x800d data stays unknown data and only an admin's Welcome joins. Also same-account Commits
     (mdk#2628 item 2.1c): which shapes a non-admin may commit, from both sides; the stamp's priority equal to replay's
-    for every class; and races settled the same way on every client. Same-account Removes go through
-    `Engine::send_leaf_removals_for_tests` until the intent lands (item 2.1e). Needs `test-policy-overrides` or
+    for every class; and races settled the same way on every client. Needs `test-policy-overrides` or
     `test-conformance-snapshot`.
+
+- **File:** `account_devices/send_intents.rs`
+  - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and
+    `RemoveOwnAccountDevices`: the committer's Commit is classified same-account, stamped `ordinary`, carries its
+    proposals by value and leaves the proposal store alone; each refusal publishes and changes nothing; every member
+    and sibling accepts, an added device joins through its Welcome and a removed one sees its removal; restart treats
+    them like an Invite and a removal; and fair scheduling gives a queued one the attempt an admin intent gets, never a
+    self-update or a Leave, and only while the group requires 0x800d.
 
 - **File:** `epoch_sealed_transport.rs`
   - **Owns:** Engine behavior under production transport visibility via `support::epoch_sealed_peeler` — the sealing
