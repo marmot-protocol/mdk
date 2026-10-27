@@ -728,6 +728,7 @@ include!("runtime/frozen_fanout.rs");
 include!("runtime/key_package_generation_upgrade.rs");
 include!("runtime/component_migration.rs");
 include!("runtime/multi_device_welcome.rs");
+include!("runtime/key_package_slot.rs");
 
 #[derive(Clone, Default)]
 struct RecordingKeyPackages {
@@ -1734,7 +1735,8 @@ async fn republish_key_package_reuses_current_artifact_when_refresh_is_due() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("marmot kp refresh due republish key").unwrap();
     let publisher = RecordingKeyPackages::default();
-    let wall = Arc::new(TestWallClock::new(90_000));
+    // The KeyPackage's lifetime comes from the system clock.
+    let wall = Arc::new(TestWallClock::new(unix_now()));
     let mut runtime = AccountDeviceRuntime::new(
         session(dir.path().join("alice.sqlite"), &key, b"alice"),
         RecordingAdapter::default(),
@@ -1825,7 +1827,7 @@ async fn republish_key_package_falls_back_when_current_ref_is_consumed() {
     assert!(retained.consumed);
     assert_eq!(
         retained.delete_at().0,
-        retained.replaced_at.0 + cgka_traits::CONSUMED_KEY_PACKAGE_RETENTION_SECS
+        retained.replaced_at.0 + cgka_traits::KEY_PACKAGE_REPLACEMENT_GRACE_SECS
     );
 }
 
@@ -2206,12 +2208,12 @@ async fn consumed_last_resort_private_material_outlives_replacement_for_retentio
     assert!(retained.consumed);
     assert_eq!(
         retained.delete_at().0,
-        now + cgka_traits::CONSUMED_KEY_PACKAGE_RETENTION_SECS
+        now + cgka_traits::KEY_PACKAGE_REPLACEMENT_GRACE_SECS
     );
 
     // An inviter that fetched the old publication before the replacement
     // reached it can still be joined inside the retention window (mdk#2344).
-    wall.set(now + cgka_traits::CONSUMED_KEY_PACKAGE_RETENTION_SECS - 1);
+    wall.set(now + cgka_traits::KEY_PACKAGE_REPLACEMENT_GRACE_SECS - 1);
     assert_eq!(
         runtime
             .sweep_expired_key_package_private_material()
@@ -2230,7 +2232,7 @@ async fn consumed_last_resort_private_material_outlives_replacement_for_retentio
 
     // Once the window has passed the old init key is deleted, so another
     // prebuilt Welcome cannot consume it.
-    wall.set(now + cgka_traits::CONSUMED_KEY_PACKAGE_RETENTION_SECS);
+    wall.set(now + cgka_traits::KEY_PACKAGE_REPLACEMENT_GRACE_SECS);
     assert_eq!(
         runtime
             .sweep_expired_key_package_private_material()
@@ -2345,10 +2347,10 @@ async fn delayed_welcome_for_replaced_key_package_keeps_current_consumption() {
     assert!(replaced.consumed);
     assert_eq!(
         replaced.delete_at().0,
-        now + 10 + cgka_traits::CONSUMED_KEY_PACKAGE_RETENTION_SECS
+        now + 10 + cgka_traits::KEY_PACKAGE_REPLACEMENT_GRACE_SECS
     );
 
-    wall.set(now + 10 + cgka_traits::CONSUMED_KEY_PACKAGE_RETENTION_SECS);
+    wall.set(now + 10 + cgka_traits::KEY_PACKAGE_REPLACEMENT_GRACE_SECS);
     assert_eq!(
         runtime
             .sweep_expired_key_package_private_material()
@@ -2396,7 +2398,7 @@ async fn publish_migrates_a_legacy_retained_consumption_marker_before_clearing_i
     assert!(migrated.consumed);
     assert_eq!(
         migrated.delete_at().0,
-        migrated.replaced_at.0 + cgka_traits::CONSUMED_KEY_PACKAGE_RETENTION_SECS
+        migrated.replaced_at.0 + cgka_traits::KEY_PACKAGE_REPLACEMENT_GRACE_SECS
     );
     assert!(!retained_entry(&lifecycle, &second).consumed);
     assert!(lifecycle.last_consumed_key_package_ref.is_none());

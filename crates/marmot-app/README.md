@@ -168,7 +168,9 @@ requires acknowledgements from its operational relays.
 
 **Publication.** KeyPackage publication keeps a stable replaceable `d` tag per account and tracks the decoded
 KeyPackage ref separately. Normal publish reuses only a cached current-profile last-resort package; explicit rotate, a
-legacy cache entry, or a lifetime-policy rejection creates a new current-profile package under the same slot.
+legacy cache entry, or a lifetime-policy rejection creates a new current-profile package under the same slot. The
+session runtime refreshes the slot at least weekly, after a consumed Welcome and when supported capabilities change;
+see [marmot-session](../marmot-session/README.md#this-devices-keypackage-slot).
 
 **Inventory.** `account_key_package_records` / `account_key_packages` expose one current relay event per addressable
 slot in the validated fetch window. `account_key_package_relay_events` returns that window's current and superseded

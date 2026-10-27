@@ -87,12 +87,29 @@
   value and later values are ignored. More than one `client` tag, or a missing,
   empty or over-long name, reads as no tag and never rejects the KeyPackage.
   A signed retry whose stored tag that reader rejects is not resent, and
-  `NostrKeyPackagePublication` refuses an out-of-bounds `client_name`.
-  Known limitation: suppose a host configured a name over 64 bytes, and a
-  KeyPackage signed before this change has not reached any relay. That
-  KeyPackage keeps retrying without being sent until it expires (up to 84
-  days). Hosts that configure `whitenoise` or `White Noise Android` are
-  unaffected.
+  `NostrKeyPackagePublication` refuses an out-of-bounds `client_name`. Such a
+  KeyPackage, signed before this change with a name over 64 bytes, is
+  replaced by a freshly signed one in the same slot.
+- Each device keeps its KeyPackage slot fresh (mdk#2628). A new KeyPackage
+  is valid for 30 days plus an hour, down from 84 days; KeyPackages from
+  other clients are still accepted up to 84 days. The session runtime
+  replaces the KeyPackage after a Welcome consumes it, when it no longer
+  advertises what the build supports, and at least every 7 days while it
+  runs, at a stored random time 6 to 7 days after publication. A superseded
+  KeyPackage no Welcome consumed keeps its private key for 24 hours after the
+  replacement's publication is confirmed, or until it expires if sooner;
+  these used to be kept until they expired, and ones retained before this
+  release keep that bound until a replacement is confirmed. Consumed ones
+  keep the 24-hour rule from mdk#2352.
+  `CONSUMED_KEY_PACKAGE_RETENTION_SECS` is now
+  `KEY_PACKAGE_REPLACEMENT_GRACE_SECS`, and retained records carry
+  `awaiting_confirmed_replacement`. A `KeyPackagePublisher` reports a signed
+  KeyPackage it will never send with `KeyPackagePublishError::unusable_artifact`
+  (`artifact_unusable`), and the runtime replaces it with a freshly signed
+  one in the same slot instead of retrying it until it expires, at most once
+  per build (`KeyPackageLifecycleState::unusable_artifact_replaced_by`).
+  `NostrKeyPackagePublication::matches_prepared_event` is the check the Nostr
+  publishers use.
 - A device joins a group only through the Welcome delivery that names one of
   its own KeyPackages (mdk#2628). Welcomes are gift-wrapped to the account, so
   each device of an account receives the delivery for every device an inviter
