@@ -5449,6 +5449,115 @@ async fn removed_member_triggers_local_push_token_cleanup() {
     runtime.shutdown().await;
 }
 
+/// Wait until `account` holds no token record of `member`.
+async fn wait_for_no_member_push_token(
+    runtime: &MarmotAppRuntime,
+    account: &str,
+    group: &GroupId,
+    member: &str,
+) {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let view = runtime.group_push_debug_info(account, group).await.unwrap();
+            if view
+                .tokens
+                .iter()
+                .all(|token| token.member_id_hex != member)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the departed member's push tokens must leave the account");
+}
+
+/// A removal blanks a leaf, so a later member's leaf no longer equals its
+/// position in member order. Push debug info checks each record against the
+/// real (member, leaf) roster and reports the device's own leaf (mdk#2622).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_debug_info_reads_real_leaves_after_a_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let carol = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = &alice.account.account_id_hex;
+    let bob_id = &bob.account.account_id_hex;
+    let carol_id = &carol.account.account_id_hex;
+    let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
+    for member in [bob_id, carol_id] {
+        app.set_native_push_enabled(member, true).unwrap();
+        app.upsert_push_registration(
+            member,
+            PushPlatform::Fcm,
+            &format!("token-{}", &member[..8]),
+            &server_pubkey,
+            Some(url.clone()),
+        )
+        .unwrap();
+    }
+    // Bob joins in the founding Commit (leaf 1) and Carol after him (leaf 2).
+    let group_id = runtime
+        .create_group(
+            alice_id,
+            "leaf positions",
+            std::slice::from_ref(bob_id),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_member_push_token(&runtime, alice_id, &group_id, bob_id).await;
+    runtime
+        .invite_members(alice_id, &group_id, std::slice::from_ref(carol_id))
+        .await
+        .unwrap();
+    wait_for_member_push_token(&runtime, carol_id, &group_id, bob_id).await;
+    wait_for_member_push_token(&runtime, carol_id, &group_id, carol_id).await;
+    wait_for_member_push_token(&runtime, alice_id, &group_id, carol_id).await;
+
+    runtime
+        .remove_members(alice_id, &group_id, std::slice::from_ref(bob_id))
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    // Bob's records leave each device once it applies his removal.
+    wait_for_no_member_push_token(&runtime, alice_id, &group_id, bob_id).await;
+    wait_for_no_member_push_token(&runtime, carol_id, &group_id, bob_id).await;
+
+    for (account, local_leaf_index) in [(alice_id, 0), (carol_id, 2)] {
+        let view = runtime
+            .group_push_debug_info(account, &group_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            view.local_registration.local_leaf_index,
+            Some(local_leaf_index),
+            "the device's own leaf, not its position in member order"
+        );
+        let carol_record = view
+            .tokens
+            .iter()
+            .find(|token| &token.member_id_hex == carol_id)
+            .expect("each device holds Carol's record");
+        assert_eq!(carol_record.leaf_index, 2);
+        assert!(carol_record.active_leaf);
+        assert!(carol_record.member_matches_active_leaf);
+        assert_eq!(view.stale_token_count, 0);
+        assert_eq!(view.active_token_count, view.total_token_count);
+    }
+
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eviction_projects_removed_from_group_notification() {
     let dir = tempfile::tempdir().unwrap();

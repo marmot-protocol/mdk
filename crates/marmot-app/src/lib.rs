@@ -4447,11 +4447,15 @@ impl MarmotApp {
             .remove_stale_group_push_tokens(group_id_hex, active_members)?)
     }
 
-    pub fn group_push_debug_info(
+    /// `member_leaves` is the group's canonical device roster and
+    /// `local_leaf_index` this device's own leaf, both read from the live
+    /// session (mdk#2622).
+    pub(crate) fn group_push_debug_info(
         &self,
         account_ref: &str,
         group_id_hex: &str,
-        active_members: &[String],
+        member_leaves: &[cgka_traits::engine::GroupMemberLeaf],
+        local_leaf_index: Option<u32>,
     ) -> Result<GroupPushDebugInfo, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
@@ -4468,12 +4472,17 @@ impl MarmotApp {
             .into_iter()
             .map(|token| group_push_token_from_account(token).map(|stored| stored.record))
             .collect::<Result<Vec<_>, _>>()?;
+        let member_leaves = member_leaves
+            .iter()
+            .map(|leaf| (hex::encode(leaf.member.as_slice()), leaf.leaf_index))
+            .collect::<Vec<_>>();
         Ok(notifications::group_debug_info(
             settings,
             registration,
             tokens,
             &account.account_id_hex,
-            active_members,
+            &member_leaves,
+            local_leaf_index,
         ))
     }
 

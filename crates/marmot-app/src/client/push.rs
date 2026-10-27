@@ -1108,6 +1108,27 @@ impl AppClient {
             .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))
     }
 
+    /// Diagnostics only: trigger selection reads stored records directly. Uses
+    /// the canonical leaf roster that push-token leaf reconciliation uses.
+    pub(crate) fn group_push_debug_info(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<notifications::GroupPushDebugInfo, AppError> {
+        self.ensure_group(group_id)?;
+        let membership = self.runtime.canonical_group_membership(group_id)?;
+        let local_leaf_index = if membership.local_leaf_active {
+            Some(self.runtime.own_leaf_index(group_id)?)
+        } else {
+            None
+        };
+        self.app.group_push_debug_info(
+            &self.state.label,
+            &hex::encode(group_id.as_slice()),
+            &membership.member_leaves,
+            local_leaf_index,
+        )
+    }
+
     pub(crate) fn cleanup_stale_push_tokens_best_effort(&mut self, group_id: &GroupId) {
         match self.reconcile_push_token_leaves(group_id) {
             Ok(()) => {
