@@ -1323,6 +1323,165 @@ async fn replay_transaction_measurement() {
 
 // --- The halts -----------------------------------------------------------
 
+async fn confirmed_update(
+    engine: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+) -> TransportMessage {
+    let SendResult::GroupEvolution { msg, pending, .. } = engine
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected self-update")
+    };
+    engine.confirm_published(pending).await.unwrap();
+    msg
+}
+
+#[tokio::test]
+async fn own_checkpoint_apply_parity() {
+    let (mut alice, storage) = build_client(b"checkpoint-parity-alice");
+    let (mut bob, peer) = build_client(b"checkpoint-parity-bob");
+    let group_id = group_with(&mut alice, &mut [&mut bob]).await;
+    let first = confirmed_update(&mut alice, &group_id).await;
+    adopt_branch(&peer, &group_id, &first);
+    let payload = cgka_traits::app_event::MarmotAppEvent::new(
+        hex::encode(bob.self_id().as_slice()),
+        1_700_000_000,
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "before remote commit",
+    )
+    .encode()
+    .unwrap();
+    let SendResult::ApplicationMessage {
+        msg: application, ..
+    } = bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            expected_epoch: None,
+            payload,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected application")
+    };
+    admit_rival(&storage, &group_id, &application, 2);
+    let remote = confirmed_update(&mut bob, &group_id).await;
+    adopt_branch(&storage, &group_id, &remote);
+    admit_rival(&storage, &group_id, &remote, 2);
+    let mut remote_row = storage.get_message(&remote.id).unwrap();
+    remote_row.state = MessageState::Processed;
+    storage.put_message(&remote_row).unwrap();
+    let last = confirmed_update(&mut alice, &group_id).await;
+    adopt_branch(&peer, &group_id, &last);
+    let expected = replay_state(&peer, &group_id).1;
+
+    // A prior selection parked an own prefix. The later remote and own
+    // commits are still canonical, so selection reconstructs all three.
+    let mut first_row = storage.get_message(&first.id).unwrap();
+    first_row.state = MessageState::ConvergenceDeferred;
+    storage.put_message(&first_row).unwrap();
+    let selected = super::canonicalize_stored_openmls_messages(
+        &storage,
+        &group_id,
+        reconstruction_state(4),
+        vec![],
+        super::CanonicalizationPolicy::default(),
+        100_000,
+    )
+    .unwrap();
+    assert_eq!(
+        selected.accepted_commits,
+        [&first, &remote, &last].map(|message| hex::encode(message.id.as_slice()))
+    );
+    let observations = super::apply_openmls_canonicalization_result(
+        &storage,
+        &group_id,
+        &selected,
+        V1_MAX_REWIND_COMMITS,
+    )
+    .expect("an accepted own/remote/own branch must apply");
+    assert_eq!(replay_state(&storage, &group_id).1, expected);
+    assert!(
+        observations.iter().any(|observation| matches!(
+            observation, super::OpenMlsReplayObservation::ApplicationProcessed { message_id, .. }
+                if *message_id == hex::encode(application.id.as_slice())
+        )),
+        "checkpoint restores must preserve historical application observations"
+    );
+    for message in [&first, &remote, &last] {
+        assert_eq!(
+            storage.get_message(&message.id).unwrap().state,
+            MessageState::Processed
+        );
+    }
+}
+
+#[tokio::test]
+async fn own_checkpoint_checks_parent() {
+    let (mut alice, storage) = build_client(b"checkpoint-parent-alice");
+    let (mut bob, peer) = build_client(b"checkpoint-parent-bob");
+    let group_id = group_with(&mut alice, &mut [&mut bob]).await;
+    let source_epoch = storage.get_group(&group_id).unwrap().epoch.0;
+    let sibling = rival_commit(&peer, &bob.self_id(), &group_id);
+    confirmed_update(&mut alice, &group_id).await;
+    let next = confirmed_update(&mut alice, &group_id).await;
+    let inputs =
+        super::seed_stored_openmls_graph_inputs(&storage, &group_id, source_epoch, None).unwrap();
+    let mut selected = super::canonicalize_stored_openmls_messages(
+        &storage,
+        &group_id,
+        reconstruction_state(source_epoch + 2),
+        vec![],
+        super::CanonicalizationPolicy::default(),
+        100_000,
+    )
+    .unwrap();
+    // Exercise a selected suffix against a different parent at the SAME
+    // epoch: matching source epoch alone cannot authorize a checkpoint.
+    selected.accepted_commits = vec![hex::encode(next.id.as_slice())];
+    storage
+        .rollback_group_state_keeping_live_records(
+            &group_id,
+            &super::retained_anchor_snapshot_name(source_epoch),
+        )
+        .unwrap();
+    adopt_branch(&storage, &group_id, &sibling);
+    let wrong_parent = replay_state(&storage, &group_id);
+    let ledger = storage.list_messages(&group_id, EpochId(0)).unwrap();
+    let replay = super::replay_openmls_messages_prevalidated_output(
+        &storage,
+        &group_id,
+        &[next],
+        &inputs.own_commits,
+        ReplayProfilePolicy::default(),
+    );
+    assert!(
+        replay.is_err(),
+        "own checkpoint must authenticate its source parent"
+    );
+    assert_eq!(replay_state(&storage, &group_id), wrong_parent);
+    let applied = super::apply_openmls_canonicalization_result(
+        &storage,
+        &group_id,
+        &selected,
+        V1_MAX_REWIND_COMMITS,
+    );
+    assert!(
+        applied.is_err(),
+        "apply must reject the same wrong parent as selection"
+    );
+    assert_eq!(replay_state(&storage, &group_id), wrong_parent);
+    assert_eq!(
+        storage.list_messages(&group_id, EpochId(0)).unwrap(),
+        ledger
+    );
+}
+
 #[tokio::test]
 async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
     let (mut alice, alice_storage) = build_client(b"peel-halt-alice");

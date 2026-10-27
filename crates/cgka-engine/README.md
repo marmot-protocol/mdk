@@ -83,6 +83,12 @@ equality, and backends without mutation tracking use the synchronous evaluator. 
 scratch work while durable input remains available. Explicit-time convergence entry points and foreground preflight
 keep their existing semantics.
 
+**Own-commit recovery.** Selection and application reconstruct confirmed local commits through the same
+commit-addressed checkpoints, including local commits after remote commits. Before restoring a checkpoint, replay
+authenticates its public commit against the reconstructed source state and checks the checkpoint's resulting epoch
+and authenticator. Bounded background advances can settle these retained branches without reopening the engine.
+Recovery still requires retained source state; a checkpoint or a peer's higher epoch cannot recover pruned keys.
+
 **Buffered application handoff.** A frozen convergence batch can advance one epoch beyond its admission ceiling.
 Already-unwrapped applications at that new tip remain durable input even when no commit can open another pass.
 Background advancement drains them against the stable canonical state after convergence and deferred peeling finish,

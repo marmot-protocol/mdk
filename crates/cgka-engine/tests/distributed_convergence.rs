@@ -874,6 +874,128 @@ async fn engine_converges_stored_openmls_messages_to_selected_branch() {
     );
 }
 
+async fn advance_scheduled_group(
+    engine: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+    clock: &ManualConvergenceClock,
+) {
+    engine.drain_pending_convergence_groups();
+    for _ in 0..16 {
+        let delay = engine
+            .prepare_convergence_cutoff_delay_ms(group_id)
+            .unwrap()
+            .expect("retained input exposes a scheduler cutoff wake");
+        clock.advance_ms(delay);
+        if engine
+            .advance_convergence_inputs(group_id)
+            .await
+            .expect("scheduled background advance applies the selected branch")
+        {
+            assert!(!engine.has_pending_convergence_inputs(group_id).unwrap());
+            return;
+        }
+    }
+    panic!("bounded background advances must settle the retained branch");
+}
+
+#[tokio::test]
+async fn live_own_chain_recovers() {
+    let clock = ManualConvergenceClock::new(1_000, 10_000);
+    let alice_storage = SqliteAccountStorage::in_memory().unwrap();
+    let carol_storage = SqliteAccountStorage::in_memory().unwrap();
+    let mut alice = build_client_with_storage_and_clock(b"alice", alice_storage, clock.clone());
+    let mut carol =
+        build_client_with_storage_and_clock(b"carol", carol_storage.clone(), clock.clone());
+    let group_id = create_reservation_test_group(&mut alice, &mut carol, "live own chain").await;
+
+    // Carol's historical chain is own A, remote B, own C. Both local commits
+    // have real confirmation checkpoints; neither client is reopened below.
+    let mut commit_ids = Vec::new();
+    for (index, name) in ["own A", "remote B", "own C"].into_iter().enumerate() {
+        let (sender, receiver) = if index == 1 {
+            (&mut alice, &mut carol)
+        } else {
+            (&mut carol, &mut alice)
+        };
+        let commit = alice_rename_commit(sender, &group_id, name).await;
+        assert!(matches!(
+            receiver.ingest(commit.clone()).await.unwrap(),
+            IngestOutcome::Buffered { .. }
+        ));
+        advance_scheduled_group(receiver, &group_id, &clock).await;
+        // Own wire records carry the outer id; their content-id aliases are
+        // Sent/OwnEcho markers, not stamped candidate-graph records.
+        commit_ids.push(if index == 1 {
+            content_id(&commit)
+        } else {
+            commit.id
+        });
+    }
+
+    // Model an earlier displaced canonical row, preserving its immutable MLS
+    // checkpoint and the later Processed rows. Selection can reconstruct this
+    // entire chain; apply must also restore own C after replaying remote B.
+    carol_storage
+        .update_message_state(&commit_ids[0], MessageState::ConvergenceDeferred)
+        .unwrap();
+    for commit_id in &commit_ids[1..] {
+        assert_eq!(
+            carol_storage.get_message(commit_id).unwrap().state,
+            MessageState::Processed
+        );
+    }
+    carol.drain_events();
+    alice.drain_events();
+
+    // A real new remote commit, not a restart or a direct projection apply,
+    // gives the running host its next scheduled convergence cutoff.
+    let next = alice_rename_commit(&mut alice, &group_id, "recovered live").await;
+    assert!(matches!(
+        carol.ingest(next.clone()).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    commit_ids.push(content_id(&next));
+    advance_scheduled_group(&mut carol, &group_id, &clock).await;
+    for commit_id in &commit_ids {
+        assert_eq!(
+            carol_storage.get_message(commit_id).unwrap().state,
+            MessageState::Processed
+        );
+    }
+    assert_eq!(carol.epoch(&group_id).unwrap(), EpochId(5));
+    assert_eq!(
+        carol.members(&group_id).unwrap(),
+        alice.members(&group_id).unwrap()
+    );
+    let exporter = |engine: &Engine<SqliteAccountStorage>| {
+        engine
+            .group_context(&group_id)
+            .unwrap()
+            .exporter_secret("marmot/group-event", 32)
+            .expect("final MLS epoch exports an authenticated group secret")
+    };
+    assert_eq!(exporter(&carol), exporter(&alice));
+
+    for reverse in [false, true] {
+        let (sender, receiver, text) = if reverse {
+            (&mut alice, &mut carol, b"reply after recovery".as_slice())
+        } else {
+            (&mut carol, &mut alice, b"send after recovery".as_slice())
+        };
+        receiver.drain_events();
+        let message = send_app(sender, &group_id, text.to_vec()).await;
+        assert!(matches!(
+            receiver.ingest(message).await.unwrap(),
+            IngestOutcome::Processed
+        ));
+        assert!(receiver.drain_events().iter().any(|event| matches!(
+            event,
+            GroupEvent::MessageReceived { sender: author, payload, .. }
+                if *author == sender.self_id() && app_content(payload) == text
+        )));
+    }
+}
+
 /// A late application from common history can enter convergence while a newer
 /// epoch is contested. Every candidate path starts at the fork epoch, so the
 /// application predates the first commit in every path. It must still be

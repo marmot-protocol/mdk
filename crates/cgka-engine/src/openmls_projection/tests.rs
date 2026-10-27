@@ -1,5 +1,6 @@
 use super::*;
 use cgka_traits::group::Group;
+use cgka_traits::message::MessageRecord;
 use cgka_traits::storage::{GroupStorage, MessageStorage};
 use cgka_traits::transport::{Timestamp, TransportSource};
 use storage_sqlite::SqliteAccountStorage;
