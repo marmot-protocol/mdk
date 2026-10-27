@@ -1582,11 +1582,13 @@ where
         if !published || previous.stable_slot_id.is_empty() {
             return Ok(0);
         }
-        // The deletion covers every publication in the slot up to its time.
+        // The deletion covers every publication in the slot up to its time,
+        // and never moves an earlier withdrawal's time back.
         let created_at = previous
             .authored_event_created_at
             .into_iter()
             .chain(pending.map(|pending| pending.authored_created_at))
+            .chain(previous.slot_withdrawn_at)
             .fold(self.wall_clock.now(), Timestamp::max);
         let mut endpoints = self.routing.key_package_endpoints().to_vec();
         for target in previous

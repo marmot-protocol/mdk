@@ -260,6 +260,47 @@ async fn a_replacement_prepared_before_the_withdrawal_is_not_published_after_it(
 }
 
 #[tokio::test]
+async fn withdrawing_again_after_the_clock_moves_back_keeps_the_later_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("kp slot withdrawal clock").unwrap();
+    let wall = Arc::new(TestWallClock::new(unix_now()));
+    let publisher = WithdrawingKeyPackages::default();
+    let runtime = |publisher: &WithdrawingKeyPackages| {
+        slot_runtime(
+            current_session(&database, &key, b"alice"),
+            publisher.clone(),
+            &wall,
+            0,
+            &[KEY_ENDPOINT],
+        )
+    };
+    let mut first = runtime(&publisher);
+    first.publish_fresh_key_package().await.unwrap();
+    let start = wall.now().0;
+    wall.set(start + 200);
+    first.withdraw_key_package_slot().await.unwrap();
+    drop(first);
+
+    // Signed out again after the clock went back, the device asks again
+    // without moving the deletion's time back.
+    wall.set(start + 100);
+    let mut second = runtime(&publisher);
+    second.withdraw_key_package_slot().await.unwrap();
+    drop(second);
+    let withdrawals = publisher.withdrawals();
+    assert_eq!(withdrawals.len(), 2);
+    assert!(withdrawals[1].created_at >= withdrawals[0].created_at);
+
+    // So the next publication is newer than both deletions.
+    let mut third = runtime(&publisher);
+    third.run_due_maintenance().await.unwrap();
+    let publications = publisher.publications.publications();
+    assert_eq!(publications.len(), 2);
+    assert!(publications[1].created_at > withdrawals[0].created_at);
+}
+
+#[tokio::test]
 async fn a_device_that_never_published_withdraws_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let key = SqlCipherKey::new("kp slot withdrawal unpublished").unwrap();
