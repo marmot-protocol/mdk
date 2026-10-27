@@ -101,6 +101,48 @@ These are the scenarios another implementation should be able to load from JSON 
 - Pressure: same-epoch invite commit race.
 - Expected: one invite branch wins branch selection, the other is parked off the canonical branch, and active clients converge on the same member set with a settled convergence decision recorded.
 
+### `account-devices-activation/v1`
+
+- File: `vectors/account-devices-activation.v1.json`
+- Setup: an explicit topology gives Alice two devices (`alice-phone`, `alice-laptop`) and Bob one, all supporting
+  `marmot.group.account-devices.v1` (0x800d). Alice's phone creates the group and then sends the Commit that makes it
+  require 0x800d.
+- Pressure: the activation Commit through the normal publication, transport and apply path, with two leaves of one
+  account in the group.
+- Expected: all three clients reach the same exact state at epoch 2, that state requires 0x800d and satisfies its
+  state rules, and nothing is left pending.
+
+### `account-devices-activation-needs-support/v1`
+
+- File: `vectors/account-devices-activation-needs-support.v1.json`
+- Setup: Alice and Bob support 0x800d and Carol doesn't. Alice's first activation attempt is refused. Carol then gains
+  support and self-updates, and Alice activates again.
+- Pressure: the rule that every leaf must advertise a required component, and the upgrade path through a leaf refresh.
+- Expected: the first attempt fails locally with the engine's generic `other` error and changes nothing; after Carol's
+  self-update the activation lands, and all three clients reach the same exact state at epoch 3, which requires 0x800d
+  and satisfies its rules.
+
+### `account-devices-activation-loses-to-unsupported-invite/v1`
+
+- File: `vectors/account-devices-activation-loses-to-unsupported-invite.v1.json`
+- Setup: Alice and Bob, both admins that support 0x800d, commit from the same epoch: Alice activates 0x800d while Bob
+  invites Carol, who doesn't support it.
+- Pressure: activation racing a branch that adds a leaf that doesn't advertise the component. Both commits are
+  privileged, so the authenticated committer bytes decide the race; here Bob's invite wins.
+- Expected: Alice, Bob and Carol reach the same exact state at epoch 2 with three members, a state that doesn't require
+  0x800d; Alice and Bob record a settled `tip_committer` decision, Alice's losing activation leaves no pending work, and
+  a fresh activation attempt is refused while Carol lacks support.
+
+### `account-devices-activation-wins-over-unsupported-invite/v1`
+
+- File: `vectors/account-devices-activation-wins-over-unsupported-invite.v1.json`
+- Setup: the same race with the roles swapped: Bob activates 0x800d while Alice invites Carol.
+- Pressure: the same race, with the activation branch winning branch selection.
+- Expected: Alice and Bob reach the same exact state at epoch 2 with two members, a state that requires 0x800d and
+  satisfies its rules, with a settled `tip_committer` decision. Alice's losing invite is not retried and leaves no
+  pending work. As in `concurrent-invite-fork-recovery/v1`, Carol's Welcome belongs to the losing branch and Carol is
+  not run.
+
 ### `cross-route-own-commit-recovery/v1`
 
 - File: `vectors/cross-route-own-commit-recovery.v1.json`

@@ -1,0 +1,191 @@
+{
+  "scenario_name": "account-devices-activation-wins-over-unsupported-invite/v1",
+  "vector_version": "1",
+  "conformance_version": "0.15.0-dev",
+  "seed": null,
+  "application_profile": {
+    "name": "current",
+    "required_group_context_extensions": [
+      "0x0006"
+    ],
+    "required_proposals": [
+      "0x0008"
+    ],
+    "required_app_components": [
+      "0x8003",
+      "0x8009"
+    ],
+    "required_group_context_state_components": [
+      "0x8003"
+    ],
+    "leaf_only_app_components": [
+      "0x8009"
+    ]
+  },
+  "scenario": {
+    "name": "account-devices-activation-wins-over-unsupported-invite/v1",
+    "spec_version": "3",
+    "clients": [
+      "alice",
+      "bob",
+      "carol"
+    ],
+    "steps": [
+      {
+        "type": "set_account_devices_support",
+        "client": "alice",
+        "supported": true
+      },
+      {
+        "type": "set_account_devices_support",
+        "client": "bob",
+        "supported": true
+      },
+      {
+        "type": "create_group",
+        "creator": "alice",
+        "name": "devices",
+        "invitees": [
+          "bob"
+        ],
+        "required_features": [],
+        "initial_admins": [
+          "alice",
+          "bob"
+        ],
+        "pending": "create"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "selection": "welcome",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob"
+        ]
+      },
+      {
+        "type": "require_account_devices",
+        "client": "bob",
+        "pending": "activate"
+      },
+      {
+        "type": "invite_members",
+        "inviter": "alice",
+        "invitees": [
+          "carol"
+        ],
+        "pending": "invite-carol"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "publication": "activate",
+        "outcome": "accepted"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "invite-carol",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      },
+      {
+        "type": "observe_exact",
+        "clients": [
+          "alice",
+          "bob"
+        ]
+      }
+    ]
+  },
+  "expected_outcomes": [
+    {
+      "type": "pending_resolution",
+      "step_index": 8,
+      "client": "bob",
+      "pending": "activate",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 9,
+      "client": "alice",
+      "pending": "invite-carol",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "client_state",
+      "client": "alice",
+      "epoch": 2,
+      "member_count": 2
+    },
+    {
+      "type": "client_state",
+      "client": "bob",
+      "epoch": 2,
+      "member_count": 2
+    },
+    {
+      "type": "clients_exactly_equivalent",
+      "clients": [
+        "alice",
+        "bob"
+      ]
+    },
+    {
+      "type": "account_devices_state",
+      "client": "alice",
+      "required": true
+    },
+    {
+      "type": "account_devices_state",
+      "client": "bob",
+      "required": true
+    },
+    {
+      "type": "convergence_decision",
+      "client": "alice",
+      "selected_tip_epoch": 2,
+      "decisive_rule": "tip_committer"
+    },
+    {
+      "type": "convergence_decision",
+      "client": "bob",
+      "selected_tip_epoch": 2,
+      "decisive_rule": "tip_committer"
+    },
+    {
+      "type": "no_pending_work",
+      "clients": [
+        "alice",
+        "bob"
+      ]
+    }
+  ]
+}

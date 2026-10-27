@@ -136,6 +136,12 @@
                 },
                 {
                   "$ref": "#/$defs/race_invite_profile"
+                },
+                {
+                  "$ref": "#/$defs/require_account_devices"
+                },
+                {
+                  "$ref": "#/$defs/expect_require_account_devices_error"
                 }
               ]
             }
@@ -152,6 +158,15 @@
         },
         {
           "$ref": "#/$defs/race_invite_profile"
+        },
+        {
+          "$ref": "#/$defs/set_account_devices_support"
+        },
+        {
+          "$ref": "#/$defs/require_account_devices"
+        },
+        {
+          "$ref": "#/$defs/expect_require_account_devices_error"
         }
       ]
     },
@@ -451,6 +466,71 @@
         },
         "restart_at_offer": {
           "type": "boolean"
+        }
+      }
+    },
+    "set_account_devices_support": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "client",
+        "supported"
+      ],
+      "properties": {
+        "type": {
+          "const": "set_account_devices_support"
+        },
+        "client": {
+          "type": "string",
+          "minLength": 1
+        },
+        "supported": {
+          "type": "boolean"
+        }
+      }
+    },
+    "require_account_devices": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "client",
+        "pending"
+      ],
+      "properties": {
+        "type": {
+          "const": "require_account_devices"
+        },
+        "client": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pending": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "expect_require_account_devices_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "client",
+        "error"
+      ],
+      "properties": {
+        "type": {
+          "const": "expect_require_account_devices_error"
+        },
+        "client": {
+          "type": "string",
+          "minLength": 1
+        },
+        "error": {
+          "type": "string",
+          "minLength": 1
         }
       }
     }

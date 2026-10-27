@@ -1,0 +1,210 @@
+{
+  "scenario_name": "account-devices-activation-needs-support/v1",
+  "vector_version": "1",
+  "conformance_version": "0.15.0-dev",
+  "seed": null,
+  "application_profile": {
+    "name": "current",
+    "required_group_context_extensions": [
+      "0x0006"
+    ],
+    "required_proposals": [
+      "0x0008"
+    ],
+    "required_app_components": [
+      "0x8003",
+      "0x8009"
+    ],
+    "required_group_context_state_components": [
+      "0x8003"
+    ],
+    "leaf_only_app_components": [
+      "0x8009"
+    ]
+  },
+  "scenario": {
+    "name": "account-devices-activation-needs-support/v1",
+    "spec_version": "3",
+    "clients": [
+      "alice",
+      "bob",
+      "carol"
+    ],
+    "steps": [
+      {
+        "type": "set_account_devices_support",
+        "client": "alice",
+        "supported": true
+      },
+      {
+        "type": "set_account_devices_support",
+        "client": "bob",
+        "supported": true
+      },
+      {
+        "type": "create_group",
+        "creator": "alice",
+        "name": "devices",
+        "invitees": [
+          "bob",
+          "carol"
+        ],
+        "required_features": [],
+        "initial_admins": [
+          "alice"
+        ],
+        "pending": "create"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "selection": "welcome",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "expect_require_account_devices_error",
+        "client": "alice",
+        "error": "other"
+      },
+      {
+        "type": "set_account_devices_support",
+        "client": "carol",
+        "supported": true
+      },
+      {
+        "type": "self_update",
+        "client": "carol",
+        "pending": "carol-refresh"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "carol",
+        "publication": "carol-refresh",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "require_account_devices",
+        "client": "alice",
+        "pending": "activate"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "alice",
+        "publication": "activate",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      },
+      {
+        "type": "observe_exact",
+        "clients": [
+          "alice",
+          "bob",
+          "carol"
+        ]
+      }
+    ]
+  },
+  "expected_outcomes": [
+    {
+      "type": "expected_error",
+      "step_index": 6,
+      "client": "alice",
+      "operation": "require_account_devices",
+      "error": "other"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 9,
+      "client": "carol",
+      "pending": "carol-refresh",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 13,
+      "client": "alice",
+      "pending": "activate",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "client_state",
+      "client": "alice",
+      "epoch": 3,
+      "member_count": 3
+    },
+    {
+      "type": "client_state",
+      "client": "bob",
+      "epoch": 3,
+      "member_count": 3
+    },
+    {
+      "type": "client_state",
+      "client": "carol",
+      "epoch": 3,
+      "member_count": 3
+    },
+    {
+      "type": "clients_exactly_equivalent",
+      "clients": [
+        "alice",
+        "bob",
+        "carol"
+      ]
+    },
+    {
+      "type": "account_devices_state",
+      "client": "alice",
+      "required": true
+    },
+    {
+      "type": "account_devices_state",
+      "client": "bob",
+      "required": true
+    },
+    {
+      "type": "account_devices_state",
+      "client": "carol",
+      "required": true
+    },
+    {
+      "type": "no_pending_work",
+      "clients": [
+        "alice",
+        "bob",
+        "carol"
+      ]
+    }
+  ]
+}

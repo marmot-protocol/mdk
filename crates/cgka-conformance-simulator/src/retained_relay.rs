@@ -12,8 +12,8 @@ use crate::{
     ScenarioRelayV2, ScenarioTopologyV2, ScenarioTransportClass, SubjectCapability,
     SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectFailureCategory,
     SubjectInviteMembers, SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome,
-    SubjectProgressSnapshot, SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication,
-    SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
+    SubjectProgressSnapshot, SubjectRemoveMembers, SubjectRequireAccountDevices, SubjectSelfUpdate,
+    SubjectSendApplication, SubjectUpdateAdminPolicy, SubjectUpdateGroupData,
 };
 use async_trait::async_trait;
 use cgka_traits::group::ProtocolProfile;
@@ -621,6 +621,28 @@ impl ConvergenceSubject for RetainedRelaySubject {
         let action_id = action.action_id.map(str::to_owned);
         let before = self.unresolved_ids(&client)?;
         self.engine.update_admin_policy(action).await?;
+        if let Some(action_id) = action_id {
+            self.tag_new_outbound(&client, &before, &action_id, ScenarioTransportClass::Commit)?;
+        }
+        Ok(())
+    }
+
+    fn set_account_devices_support(
+        &mut self,
+        client: &str,
+        supported: bool,
+    ) -> Result<(), SubjectError> {
+        self.engine.set_account_devices_support(client, supported)
+    }
+
+    async fn require_account_devices(
+        &mut self,
+        action: SubjectRequireAccountDevices<'_>,
+    ) -> Result<(), SubjectError> {
+        let client = action.client.to_owned();
+        let action_id = action.action_id.map(str::to_owned);
+        let before = self.unresolved_ids(&client)?;
+        self.engine.require_account_devices(action).await?;
         if let Some(action_id) = action_id {
             self.tag_new_outbound(&client, &before, &action_id, ScenarioTransportClass::Commit)?;
         }
@@ -1305,6 +1327,37 @@ mod tests {
             report.invariant_failures.is_empty(),
             "unexpected invariant failures: {:#?}",
             report.invariant_failures
+        );
+    }
+
+    #[tokio::test]
+    async fn account_devices_support_and_activation_run_over_retained_relays() {
+        let fixture: crate::VectorFixture = serde_json::from_str(include_str!(
+            "../vectors/account-devices-activation-needs-support.v1.json"
+        ))
+        .expect("vector parses");
+        let scenario = fixture.scenario;
+        let mut subject = RetainedRelaySubject::new(
+            &scenario.clients,
+            &scenario.topology,
+            ProtocolProfile::Current,
+            HarnessStorageMode::TempFileBackedSqlite,
+        )
+        .unwrap();
+
+        let report = run_scenario_report_with_subject(
+            &scenario,
+            None,
+            fixture.expected_outcomes,
+            &mut subject,
+        )
+        .await
+        .expect("run account-devices vector over retained relays");
+
+        assert!(
+            report.expectation_failures.is_empty(),
+            "unexpected failures: {:#?}",
+            report.expectation_failures
         );
     }
 

@@ -28,6 +28,9 @@ pub const SCENARIO_IR_V3_ONLY_STEP_KINDS: &[&str] = &[
     "interrupt_relay",
     "race_invite_profile",
     "race_group_profiles",
+    "set_account_devices_support",
+    "require_account_devices",
+    "expect_require_account_devices_error",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +224,8 @@ fn is_group_scoped(step: &ScenarioStep) -> bool {
             | ScenarioStep::RaceGroupProfiles { .. }
             | ScenarioStep::UpdateAdminPolicy { .. }
             | ScenarioStep::ExpectUpdateAdminPolicyError { .. }
+            | ScenarioStep::RequireAccountDevices { .. }
+            | ScenarioStep::ExpectRequireAccountDevicesError { .. }
             | ScenarioStep::SendAppMessage { .. }
             | ScenarioStep::Leave { .. }
             | ScenarioStep::ProbeBidirectionalDecryptability { .. }
@@ -364,6 +369,9 @@ fn validate_step(
         | ScenarioStep::UpdateGroupData { client, .. }
         | ScenarioStep::ExpectTickError { client, .. }
         | ScenarioStep::Leave { client }
+        | ScenarioStep::SetAccountDevicesSupport { client, .. }
+        | ScenarioStep::RequireAccountDevices { client, .. }
+        | ScenarioStep::ExpectRequireAccountDevicesError { client, .. }
         | ScenarioStep::RestartClient { client }
         | ScenarioStep::SetClientOffline { client }
         | ScenarioStep::ReconnectClient { client } => {

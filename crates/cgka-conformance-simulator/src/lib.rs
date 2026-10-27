@@ -224,8 +224,9 @@ pub use subject::{
     ConvergenceFaultSubject, ConvergenceSubject, EngineHarnessSubject, SubjectCapability,
     SubjectCreateGroup, SubjectDescriptor, SubjectError, SubjectFailureCategory,
     SubjectInviteMembers, SubjectOutboundArtifact, SubjectOutboundKind, SubjectOutboundOutcome,
-    SubjectRemoveMembers, SubjectSelfUpdate, SubjectSendApplication, SubjectUpdateAdminPolicy,
-    SubjectUpdateGroupData, engine_harness_feature_registry, required_capabilities,
+    SubjectRemoveMembers, SubjectRequireAccountDevices, SubjectSelfUpdate, SubjectSendApplication,
+    SubjectUpdateAdminPolicy, SubjectUpdateGroupData, engine_harness_feature_registry,
+    required_capabilities,
 };
 pub use topology::{
     ScenarioAccountV2, ScenarioDeviceV2, ScenarioGroupV2, ScenarioProcessV2, ScenarioRelayV2,
