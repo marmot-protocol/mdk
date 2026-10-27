@@ -18,6 +18,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Changed
 
+- Group member rows are accounts, not devices (mdk#2628).
+  `MarmotAppGroupMemberRecord` and `MarmotGroupMemberDetails` gain
+  `device_count`, and an account with several devices in the group is one
+  row; `member_count`, admin counts and `is_last_admin` count accounts. Use
+  matching regenerated headers and libraries.
 - `marmot_attachment_transfer_subscription_next` returns a replacement that
   changes a row's transfer state as soon as the engine reports it; progress-only
   replacements still arrive at most four per second. A timeout no longer loses

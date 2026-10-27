@@ -241,11 +241,16 @@ impl From<AppGroupEncryptedMediaComponent> for AppGroupEncryptedMediaComponentFf
     }
 }
 
+/// One member account. An account with several devices in the group is one
+/// record.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct AppGroupMemberRecordFfi {
     pub member_id_hex: String,
     pub account: Option<String>,
     pub local: bool,
+    /// How many of this account's devices are in the group.
+    #[uniffi(default = 1)]
+    pub device_count: u32,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -271,6 +276,7 @@ impl From<AppGroupMemberRecord> for AppGroupMemberRecordFfi {
             member_id_hex: value.member_id_hex,
             account: value.account,
             local: value.local,
+            device_count: value.device_count,
         }
     }
 }
@@ -282,6 +288,8 @@ pub struct MemberRefFfi {
     pub npub: String,
 }
 
+/// One member account. An account with several devices in the group is one
+/// entry.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct GroupMemberDetailsFfi {
     pub member_id_hex: String,
@@ -291,6 +299,9 @@ pub struct GroupMemberDetailsFfi {
     pub is_self: bool,
     pub npub: String,
     pub display_name: Option<String>,
+    /// How many of this account's devices are in the group.
+    #[uniffi(default = 1)]
+    pub device_count: u32,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -437,6 +448,7 @@ pub(crate) fn group_details_ffi(
                 member_id_hex: member.member_id_hex,
                 account: member.account,
                 local: member.local,
+                device_count: member.device_count,
             })
         })
         .collect::<Result<Vec<_>, MarmotKitError>>()?;
@@ -491,6 +503,7 @@ pub(crate) fn group_roster_ffi(roster: AppGroupRoster) -> Result<GroupRosterFfi,
                 is_self: member.is_self,
                 npub,
                 display_name: member.display_name,
+                device_count: member.device_count,
             })
         })
         .collect::<Result<Vec<_>, MarmotKitError>>()?;
@@ -767,6 +780,7 @@ mod group_roster_tests {
                 is_admin: true,
                 is_self: true,
                 display_name: Some("Alice".to_owned()),
+                device_count: 2,
             }],
             epoch: 12,
             roster_revision: 12,
@@ -780,6 +794,7 @@ mod group_roster_tests {
         assert!(matches!(ffi.self_membership, SelfMembershipFfi::Removed));
         assert_eq!(ffi.members.len(), 1);
         assert_eq!(ffi.members[0].display_name.as_deref(), Some("Alice"));
+        assert_eq!(ffi.members[0].device_count, 2);
     }
 }
 

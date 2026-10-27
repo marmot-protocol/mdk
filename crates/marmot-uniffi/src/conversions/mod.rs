@@ -132,6 +132,7 @@ mod tests {
             is_self,
             npub: "npub1placeholder".into(),
             display_name: None,
+            device_count: 1,
         }
     }
 

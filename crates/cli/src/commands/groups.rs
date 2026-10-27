@@ -1865,6 +1865,7 @@ fn group_members_json(members: Vec<AppGroupMemberRecord>) -> Result<Vec<Value>, 
                 "member_id": member.member_id_hex,
                 "npub": npub_for_account_id(&member.member_id_hex)?,
                 "local": member.local,
+                "device_count": member.device_count,
             }))
         })
         .collect()

@@ -14,6 +14,13 @@
 
 ### Changed
 
+- Group member rows are accounts, not devices (mdk#2628). `group_members`,
+  `group_details`, `group_roster`, `group_member_ids_page` and
+  `group_conversation_snapshot` list an account with several devices in the
+  group once, and `AppGroupMemberRecordFfi` and `GroupMemberDetailsFfi` gain
+  `device_count` (binding default 1). `member_count`, admin counts and
+  `is_last_admin` count accounts, and a chat between two accounts stays direct
+  whatever devices either person uses.
 - `AttachmentTransferSubscription.next()` returns a replacement that changes a
   row's transfer state as soon as the engine reports it; progress-only
   replacements still arrive at most four per second. A host that polled

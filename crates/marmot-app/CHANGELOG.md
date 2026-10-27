@@ -29,6 +29,17 @@
   refuses every id below the application range.
   `cgka_traits::app_components::MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID`
   is removed.
+- Member projections count accounts, not leaves (mdk#2628). An account
+  with several devices holds one leaf per device in a group. `members`,
+  `group_roster`, the group member-id page and the conversation snapshot now
+  list each account once, with `device_count` on `AppGroupMemberRecord` and
+  `AppGroupRosterMember`. `member_count` on `AppGroupRecord`,
+  `AppGroupMlsState` and `AppGroupRoster` counts accounts. A chat between two
+  accounts stays direct, in the chat list, direct-chat reuse and its title
+  and avatar, whatever devices either person uses. Groups where every account
+  has one device look as before. The v5 audit group baseline also counts
+  accounts and no longer reports an account's second device as an invalid
+  member identity.
 - `cgka-session` is now `marmot-session`, which also takes the account-device
   runtime from `marmot-account` (mdk#2602). `cgka_session::*` and the
   runtime's `marmot_account::*` paths, such as `AccountDeviceRuntime`,

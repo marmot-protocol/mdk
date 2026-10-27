@@ -581,12 +581,13 @@ impl WelcomeProbe {
                 Some(BaselineMember { member_ref, admin })
             })
             .collect::<Vec<_>>();
+        // One entry per account: an account with several devices holds
+        // several leaves, which is not an identity fault.
         members.sort_by(|a, b| a.member_ref.cmp(&b.member_ref));
-        let before_dedup = members.len();
         members.dedup_by(|a, b| a.member_ref == b.member_ref);
-        let member_count = u32::try_from(group.members.len()).ok();
+        let member_count = u32::try_from(crate::groups::member_account_count(&group.members)).ok();
         let mut limitations = Vec::new();
-        if invalid_member_identity || members.len() != before_dedup {
+        if invalid_member_identity {
             limitations.push(Limitation::MemberIdentityInvalid);
         }
         if members.len() > MAX_MEMBERS {

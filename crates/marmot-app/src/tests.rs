@@ -10,6 +10,8 @@ mod key_package_inventory;
 mod key_package_relay_lists;
 mod key_package_selection;
 mod message_journeys;
+#[cfg(feature = "test-policy-overrides")]
+mod multi_device_members;
 mod publication_progress;
 #[cfg(feature = "test-policy-overrides")]
 mod push_snapshot;

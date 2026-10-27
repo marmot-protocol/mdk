@@ -219,13 +219,16 @@ c_mirror! {
 }
 
 c_mirror! {
-    /// One member row of the group roster.
+    /// One member account of the group roster. An account with several
+    /// devices in the group is one row.
     MarmotAppGroupMemberRecord from AppGroupMemberRecordFfi,
     list(MarmotAppGroupMemberRecordList, marmot_app_group_member_record_list_free) {
         str member_id_hex,
         /// Local account label when this member is one of ours. Nullable.
         opt_str account,
         copy local: bool,
+        /// How many of this account's devices are in the group.
+        copy device_count: u32,
     }
 }
 
@@ -240,7 +243,8 @@ c_mirror! {
 }
 
 c_mirror! {
-    /// Enriched member row for group detail screens.
+    /// Enriched member row for group detail screens. An account with
+    /// several devices in the group is one row.
     MarmotGroupMemberDetails from GroupMemberDetailsFfi {
         str member_id_hex,
         opt_str account,
@@ -249,6 +253,8 @@ c_mirror! {
         copy is_self: bool,
         str npub,
         opt_str display_name,
+        /// How many of this account's devices are in the group.
+        copy device_count: u32,
     }
 }
 
