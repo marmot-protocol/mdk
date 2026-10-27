@@ -20,6 +20,15 @@
 
 ### Changed
 
+- MDK now treats data under app component id `0x800a` like any id the
+  registry does not assign, where it used to reject it (mdk#2628). `0x800a`
+  was the draft multi-device join authorization, which the registry withdrew
+  (marmot#427). A commit or Welcome whose group state carries `0x800a` data
+  now applies, and the bytes are kept as they are; a group that requires
+  `0x800a` still fails closed. `update_app_component` still refuses it, as it
+  refuses every id below the application range.
+  `cgka_traits::app_components::MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID`
+  is removed.
 - `cgka-session` is now `marmot-session`, which also takes the account-device
   runtime from `marmot-account` (mdk#2602). `cgka_session::*` and the
   runtime's `marmot_account::*` paths, such as `AccountDeviceRuntime`,

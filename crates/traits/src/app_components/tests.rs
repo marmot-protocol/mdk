@@ -909,11 +909,9 @@ fn protocol_component_ids_stay_below_the_application_range() {
 }
 
 #[test]
-fn multi_device_join_authorization_is_protocol_owned() {
-    // Registry id 0x800a is draft and AppEphemeral-only. It must still be
-    // refused to applications; being unassigned in MDK once made it writable.
-    assert!(
-        super::PROTOCOL_OWNED_APP_COMPONENT_IDS
-            .contains(&super::MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID)
-    );
+fn withdrawn_multi_device_join_id_is_not_protocol_owned() {
+    // The registry withdrew 0x800a (marmot#427). Leaving it off the list makes
+    // the engine treat its data like any unassigned id's; the application-range
+    // boundary still keeps applications off it, as off every protocol id.
+    assert!(!super::PROTOCOL_OWNED_APP_COMPONENT_IDS.contains(&0x800a));
 }

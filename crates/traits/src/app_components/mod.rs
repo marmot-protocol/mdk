@@ -104,11 +104,9 @@ pub const GROUP_ENCRYPTED_MEDIA_COMPONENT_ID: AppComponentId =
 /// `app_data_dictionary`; GroupContext dictionaries only require the id via
 /// `app_components`.
 pub const ACCOUNT_IDENTITY_PROOF_COMPONENT_ID: AppComponentId = 0x8009;
-/// Draft multi-device join authorization. Carried only as an MLS
-/// `AppEphemeral` proposal in a multi-device External Commit: the registry
-/// makes it invalid as GroupContext, LeafNode, KeyPackage, GroupInfo or
-/// SafeAAD component data, so it never becomes persistent group state.
-pub const MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID: AppComponentId = 0x800a;
+// 0x800a was the draft multi-device join authorization. The registry
+// withdrew it (marmot#427), so MDK treats it like any id the registry does
+// not assign.
 pub const GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID: AppComponentId = 0x800b;
 pub const GROUP_LIFECYCLE_COMPONENT_ID: AppComponentId = 0x800c;
 
@@ -134,8 +132,8 @@ pub const APP_COMPONENT_DATA_MAX_LEN: usize = 4096;
 
 /// Every component id the protocol owns, in registry assignment order.
 ///
-/// Add every new protocol component constant here, including draft and
-/// ephemeral-only ones: the engine's GroupContext format validation reads
+/// Add every new protocol component constant here, including draft ones: the
+/// engine's GroupContext format validation reads
 /// this list, so an id left out is never format-checked. Applications are
 /// kept away from all of these by the separate
 /// [`APP_OWNED_APP_COMPONENT_ID_START`] boundary rather than by this list, so
@@ -152,7 +150,6 @@ pub const PROTOCOL_OWNED_APP_COMPONENT_IDS: &[AppComponentId] = &[
     GROUP_AVATAR_URL_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
     ACCOUNT_IDENTITY_PROOF_COMPONENT_ID,
-    MULTI_DEVICE_JOIN_AUTHORIZATION_COMPONENT_ID,
     GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
     GROUP_LIFECYCLE_COMPONENT_ID,
 ];

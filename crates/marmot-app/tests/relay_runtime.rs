@@ -3595,10 +3595,10 @@ async fn app_component_lifecycle() {
     );
 
     let epoch = runtime.group_mls_state(&alice, &group).await.unwrap().epoch;
-    // Protocol space: an assigned id, the draft multi-device-join id the
-    // registry already owns, and the registry's next unassigned id. All three
-    // are below the application range and none of them reaches an MLS commit.
-    for protocol_id in [0x8003, 0x800a, 0x800d] {
+    // Protocol space: an assigned id, the withdrawn multi-device-join id
+    // (marmot#427), 0x800d, and an id the registry never assigned. All are
+    // below the application range and none of them reaches an MLS commit.
+    for protocol_id in [0x8003, 0x800a, 0x800d, 0xefff] {
         let reserved = runtime
             .update_app_component(&alice, &group, protocol_id, vec![])
             .await
