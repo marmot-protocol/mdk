@@ -495,6 +495,9 @@ pub struct AppPerformanceSnapshot {
 pub struct AppPerformanceTelemetry {
     runtime: runtime::RuntimeTelemetry,
     product: Option<crate::ProductAnalytics>,
+    /// Reads the process-wide SQLCipher migration probe `(runs, skips)` for snapshots. The runtime
+    /// hands it in; a recorder without one reports zero.
+    sqlcipher_probe_counters: Option<fn() -> (u64, u64)>,
     inner: Arc<Mutex<AppPerformanceTelemetryInner>>,
 }
 
@@ -687,6 +690,12 @@ impl AppPerformanceTelemetry {
         Self {
             product: Some(product),
             ..Self::default()
+        }
+    }
+    pub(crate) fn with_sqlcipher_probe_counters(self, read: fn() -> (u64, u64)) -> Self {
+        Self {
+            sqlcipher_probe_counters: Some(read),
+            ..self
         }
     }
     fn record_product(
@@ -1211,7 +1220,7 @@ impl AppPerformanceTelemetry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (sqlcipher_migration_probe_runs, sqlcipher_migration_probe_skips) =
-            crate::sqlcipher::sqlcipher_migration_probe_counters();
+            self.sqlcipher_probe_counters.map_or((0, 0), |read| read());
         AppPerformanceSnapshot {
             runtime_operations: self.runtime.snapshot(),
             app_start: inner.app_start.snapshot(),
@@ -1806,7 +1815,8 @@ mod tests {
         // The counters are process-global atomics shared with every test in
         // this process, so bracket the snapshot between two direct reads
         // instead of asserting exact values.
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = AppPerformanceTelemetry::default()
+            .with_sqlcipher_probe_counters(crate::sqlcipher::sqlcipher_migration_probe_counters);
         let before = crate::sqlcipher::sqlcipher_migration_probe_counters();
         let snapshot = telemetry.snapshot();
         let after = crate::sqlcipher::sqlcipher_migration_probe_counters();

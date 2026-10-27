@@ -3,7 +3,7 @@
 //!
 //! These are pure, stateless conversions for account state, groups, group
 //! components, messages, app events, notification/push registrations, and
-//! telemetry/audit settings. They hold no `MarmotApp` state.
+//! telemetry/audit/usage-diagnostics settings. They hold no `MarmotApp` state.
 
 use crate::error::AppError;
 use crate::notifications;
@@ -16,7 +16,7 @@ use crate::{
     GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
     GROUP_MESSAGE_RETENTION_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID, GroupPushTokenRecord,
     NOSTR_ROUTING_COMPONENT_ID, NotificationSettings, PushPlatform, PushRegistration,
-    RelayTelemetrySettings,
+    RelayTelemetrySettings, UsageDiagnosticsDecision, UsageDiagnosticsSettings,
 };
 use cgka_traits::app_components::{
     GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
@@ -27,6 +27,7 @@ use storage_sqlite::{
     AccountPushTokenRemovalProof, AccountStoredPushRegistration, StoredAccountGroup,
     StoredAccountGroupComponent, StoredAccountState, StoredAppEvent, StoredAppMessageRecord,
     StoredAuditLogSettings, StoredNostrRoute, StoredRelayTelemetrySettings,
+    StoredUsageDiagnosticsSettings,
 };
 
 pub(crate) fn stored_state_from_account_state(state: &AccountState) -> StoredAccountState {
@@ -401,6 +402,22 @@ pub(crate) fn relay_telemetry_settings_to_storage(
     StoredRelayTelemetrySettings {
         export_enabled: settings.export_enabled,
         export_interval_seconds: settings.export_interval_seconds,
+    }
+}
+
+pub(crate) fn usage_diagnostics_settings_from_storage(
+    r: &StoredUsageDiagnosticsSettings,
+) -> UsageDiagnosticsSettings {
+    UsageDiagnosticsSettings {
+        decision: match r.decision {
+            1 => UsageDiagnosticsDecision::Declined,
+            2 => UsageDiagnosticsDecision::Granted,
+            _ => UsageDiagnosticsDecision::AcceptanceRequired,
+        },
+        policy_revision: r.policy_revision.clone(),
+        registry_revision: r.registry_revision.clone(),
+        updated_at_ms: r.updated_at_ms,
+        previously_enabled: r.previously_enabled,
     }
 }
 

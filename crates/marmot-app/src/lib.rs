@@ -82,6 +82,8 @@ mod collector_host_safety;
 mod network_proxy;
 pub mod product_analytics;
 pub use product_analytics::*;
+mod usage_diagnostics;
+pub use usage_diagnostics::configure_product_analytics_from_environment;
 mod audit_log;
 pub mod audit_otlp_sender;
 mod chat_presentation;
@@ -1352,22 +1354,6 @@ pub(crate) struct AppMessageProjection {
     /// the signed MLS group state when the delete is recorded and persisted
     /// with the event. `false` for every other projection.
     pub(crate) moderation_grant: bool,
-}
-
-fn generate_telemetry_install_id() -> String {
-    let mut bytes = [0u8; 16];
-    OsRng.fill_bytes(&mut bytes);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let encoded = hex::encode(bytes);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &encoded[0..8],
-        &encoded[8..12],
-        &encoded[12..16],
-        &encoded[16..20],
-        &encoded[20..32]
-    )
 }
 
 #[derive(Clone)]

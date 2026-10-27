@@ -590,7 +590,10 @@ impl RuntimeSharedServices {
             attachment_cancellations: watch::channel(()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: app.relay_plane.clone(),
-            observer: crate::observer::Observer::sharing(&app.product_analytics),
+            observer: crate::observer::Observer::sharing(
+                &app.product_analytics,
+                crate::sqlcipher::sqlcipher_migration_probe_counters,
+            ),
             product_worker: Arc::new(StdMutex::new(None)),
             diagnostics_executor: Arc::new(StdMutex::new(None)),
             agent_streams: AgentStreamWatchManager::default(),
@@ -3011,13 +3014,7 @@ impl MarmotAppRuntime {
         let mut status = self.shared.observer.product().status();
         status.telemetry = if self.shared.observer.product().permit().is_none() {
             crate::DiagnosticsExporterStatus::Disabled
-        } else if self
-            .shared
-            .observer
-            .product()
-            .telemetry_rejected
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        } else if self.shared.observer.product().telemetry_rejected() {
             crate::DiagnosticsExporterStatus::ConfigurationRejected
         } else if !cfg!(feature = "otlp-export") {
             crate::DiagnosticsExporterStatus::UnsupportedBuild
@@ -3263,11 +3260,7 @@ impl MarmotAppRuntime {
         if self.shared.lifecycle().is_running() {
             self.accounts.app.restore_usage_diagnostics()?;
         }
-        self.shared
-            .observer
-            .product()
-            .telemetry_rejected
-            .store(false, std::sync::atomic::Ordering::Release);
+        self.shared.observer.product().clear_telemetry_rejection();
         self.refresh_diagnostics_exporters()?;
         Ok(self.shared.relay_telemetry_runtime_config())
     }
