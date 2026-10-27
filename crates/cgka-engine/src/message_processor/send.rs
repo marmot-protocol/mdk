@@ -813,11 +813,7 @@ impl<S: StorageProvider> Engine<S> {
             }
             Err(e) => return Err(EngineError::Storage(e)),
         };
-        if !group
-            .members
-            .iter()
-            .any(|member| &member.id == self.identity.self_id())
-        {
+        if !crate::identity::local_copy_is_member(&group, self.identity.self_id()) {
             self.clear_leave_request_state(group_id)?;
             return Ok(false);
         }

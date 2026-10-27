@@ -106,9 +106,25 @@
   delivery stays confirmable. KeyPackage lifecycle records now keep the
   publication id of each replaced KeyPackage. Packages replaced before this
   release have none, so a Welcome that opens with one of them still joins.
+- Hosts no longer receive leaf indexes (mdk#2628).
+  `GroupEvent::GroupMemberLeavesRemoved` in `SyncSummary.events` and
+  `RuntimeGroupEvent` now always carries empty `leaves`; MDK still reads them
+  itself to drop removed devices' push records. Hosts learn which accounts
+  left from `departed_members` and `GroupStateChanged`, and that this device
+  was removed from `LocalGroupCopyTerminated`. MarmotKit and the C ABI
+  already left the leaves out.
 
 ### Fixed
 
+- A removed device whose account still has another device in the group is no
+  longer treated as a member (mdk#2628). A Welcome that re-adds it now joins
+  directly; before, it became a rejoin offer that needed the user's
+  confirmation. Reopening it drops a leave request it can never send, and the
+  one-time self-membership backfill records it as `Removed`. A current-epoch
+  message from another device of the same account now clears the recovery
+  warning, as one from any other member does. Groups where every account has
+  one device behave as before, and removing an account still removes all its
+  devices in one Commit.
 - Push triggers carry one fresh random padding chunk per gift wrap
   (mdk#2605). Senders reuse each recipient's stored token ciphertext, so
   repeat triggers to the same recipients were byte-identical and

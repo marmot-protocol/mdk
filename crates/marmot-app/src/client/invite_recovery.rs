@@ -151,16 +151,15 @@ impl AppClient {
         for event in &effects.events {
             let group = match event {
                 cgka_traits::engine::GroupEvent::GroupJoined { group_id, .. } => Some(group_id),
+                // MLS never decrypts this device's own messages, so every received
+                // message came from another leaf. One from a sibling device of this
+                // account proves current-epoch health like any other member's.
                 cgka_traits::engine::GroupEvent::MessageReceived {
-                    group_id,
-                    sender,
-                    epoch,
-                    ..
-                } if sender != &self.runtime.self_id()
-                    && self
-                        .runtime
-                        .group_record(group_id)
-                        .is_ok_and(|group| group.epoch == *epoch) =>
+                    group_id, epoch, ..
+                } if self
+                    .runtime
+                    .group_record(group_id)
+                    .is_ok_and(|group| group.epoch == *epoch) =>
                 {
                     Some(group_id)
                 }

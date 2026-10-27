@@ -3672,8 +3672,10 @@ impl AppClient {
     ///
     /// For each row carrying `'member'`, it asks the engine for the group's
     /// roster (`runtime.members`, sourced from the hydrated Marmot record's
-    /// post-merge member set) and plans `Removed` only when the local account id
-    /// is absent. A pending publication, engine error, or malformed id aborts
+    /// post-merge member set) and plans `Removed` only when this device's own
+    /// leaf is gone: the local account id is absent, or the engine has marked
+    /// the copy removed while a sibling device keeps the account on the
+    /// roster. A pending publication, engine error, or malformed id aborts
     /// before any plan is written, so uncertainty never suppresses. The work is
     /// gated behind a once-only account-import marker, so subsequent opens are
     /// a single marker read and the hot path stays projection-only.
@@ -3724,8 +3726,12 @@ impl AppClient {
             // (unknown/quarantined group, partially-missing live state), abort
             // the whole pass before writing anything. The preserving defaults
             // remain and the unset marker makes the next open retry.
-            let members = match self.runtime.members(&group_id) {
-                Ok(members) => members,
+            let roster = self
+                .runtime
+                .members(&group_id)
+                .and_then(|members| Ok((members, self.runtime.group_record(&group_id)?.removed)));
+            let (members, copy_removed) = match roster {
+                Ok(roster) => roster,
                 Err(error) => {
                     tracing::warn!(
                         target: "marmot_app::client",
@@ -3739,7 +3745,7 @@ impl AppClient {
             };
             reconciliation.push((
                 group_id_hex,
-                local_account_removed_from_roster(&members, &local_account_id_hex),
+                copy_removed || local_account_removed_from_roster(&members, &local_account_id_hex),
             ));
         }
         for (group_id_hex, removed) in reconciliation {
@@ -7990,6 +7996,53 @@ mod self_membership_backfill_tests {
             !app.account_import_marker("alice", crate::SELF_MEMBERSHIP_BACKFILL_MARKER)
                 .unwrap(),
             "pending projection must leave the marker unset for retry",
+        );
+    }
+
+    /// A removed copy backfills as removed even while its account stays on the
+    /// roster: another device of the account can keep a leaf after this
+    /// device's own leaf is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removed_copy_with_its_account_on_the_roster_backfills_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let removed = client.create_group("removed device", &[]).await.unwrap();
+        let live = client.create_group("live device", &[]).await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        storage
+            .app_storage()
+            .reset_direct_conversation_members_backfill(crate::SELF_MEMBERSHIP_BACKFILL_MARKER)
+            .unwrap();
+        let mut record = storage.get_group(&removed).unwrap();
+        record.removed = true;
+        assert!(
+            record
+                .members
+                .iter()
+                .any(|member| member.id == client.runtime.self_id())
+        );
+        storage.put_group(&record).unwrap();
+
+        client.backfill_self_membership_once().unwrap();
+
+        for (group_id, membership) in [
+            (&removed, SelfMembership::Removed),
+            (&live, SelfMembership::Member),
+        ] {
+            assert_eq!(
+                app.stored_group_self_membership("alice", &hex::encode(group_id.as_slice()))
+                    .unwrap(),
+                Some(membership)
+            );
+        }
+        assert!(
+            app.account_import_marker("alice", crate::SELF_MEMBERSHIP_BACKFILL_MARKER)
+                .unwrap()
         );
     }
 

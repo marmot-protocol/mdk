@@ -2402,11 +2402,7 @@ impl<S: StorageProvider> Engine<S> {
         provider: &crate::provider::EngineOpenMlsProvider<'_, S>,
         stored_message_records: &[cgka_traits::message::MessageRecord],
     ) -> Result<Option<LeaveRequest>, StorageError> {
-        let self_is_still_member = group
-            .members
-            .iter()
-            .any(|member| &member.id == self.identity.self_id());
-        if !self_is_still_member {
+        if !crate::identity::local_copy_is_member(group, self.identity.self_id()) {
             self.storage.clear_leave_request(group_id)?;
             return Ok(None);
         }
@@ -2541,11 +2537,7 @@ impl<S: StorageProvider> Engine<S> {
         provider: &crate::provider::EngineOpenMlsProvider<'_, S>,
         stored_message_records: &[cgka_traits::message::MessageRecord],
     ) -> Result<bool, cgka_traits::storage::StorageError> {
-        if !group
-            .members
-            .iter()
-            .any(|member| &member.id == self.identity.self_id())
-        {
+        if !crate::identity::local_copy_is_member(group, self.identity.self_id()) {
             return Ok(false);
         }
 

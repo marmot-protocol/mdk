@@ -2376,6 +2376,62 @@ async fn recovery_warning_is_hidden_for_terminal_groups_but_not_repairable_group
     }
 }
 
+/// A current-epoch message from another device of this account proves the
+/// group is healthy, exactly like one from another account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sibling_device_message_clears_the_recovery_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("sibling recovery", &[]).await.unwrap();
+    let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+    app.account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .record_recovery_evidence(
+            &[storage_sqlite::StoredEpochStallEvidence {
+                group_id_hex: hex::encode(group_id.as_slice()),
+                stalled_epoch: epoch.0,
+                fruitless_completions: 3,
+                fruitless_reported: true,
+                last_arm_at_ms: 1,
+            }],
+            3,
+        )
+        .unwrap();
+    assert!(
+        client
+            .group_recovery_status(&group_id)
+            .unwrap()
+            .automatic_recovery_failed
+    );
+
+    let effects = marmot_session::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
+            authority: None,
+            group_id: group_id.clone(),
+            message_id: cgka_traits::MessageId::new(vec![0xa2; 32]),
+            sender: client.runtime.self_id(),
+            epoch,
+            payload: Vec::new(),
+            retention: None,
+            encrypted_media_secret: None,
+        }],
+        ..Default::default()
+    };
+    client.observe_recovery_health(&effects).unwrap();
+    assert!(
+        !client
+            .group_recovery_status(&group_id)
+            .unwrap()
+            .automatic_recovery_failed
+    );
+}
+
 /// A tracked group stalled below the arm threshold, so `mark_replayed` is the
 /// only thing that can stop it from arming when its next undecryptable lands.
 ///
@@ -16221,6 +16277,66 @@ async fn a_drained_member_departure_removes_that_members_group_push_tokens() {
             .collect::<HashSet<_>>(),
         HashSet::from([staying]),
         "a drained departure must drop the departed member's push records and keep the rest"
+    );
+}
+
+/// A device departure reaches hosts without leaf indexes. MDK still drops the
+/// removed device's push record; hosts learn only which accounts left, and an
+/// account whose other device stays has not left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_departure_event_carries_no_leaf_index() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://device-departure.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("device departure", &[]).await.unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let peer = nostr::prelude::Keys::generate().public_key().to_hex();
+    for leaf in [1, 2] {
+        app.upsert_group_push_token(
+            "alice",
+            &drained_seam_push_token(&group_id_hex, &peer, leaf),
+        )
+        .unwrap();
+    }
+
+    let effects = marmot_session::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(1),
+            leaves: vec![cgka_traits::engine::GroupMemberLeaf {
+                member: MemberId::new(hex::decode(&peer).unwrap()),
+                leaf_index: 1,
+            }],
+            departed_members: vec![],
+        }],
+        ..Default::default()
+    };
+    let summary = client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+
+    let remaining = app.group_push_tokens("alice", &group_id_hex).unwrap();
+    assert_eq!(
+        remaining
+            .iter()
+            .map(|token| token.leaf_index)
+            .collect::<Vec<_>>(),
+        vec![2],
+        "only the removed device's push record is dropped"
+    );
+    assert_eq!(
+        summary.events,
+        vec![cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved {
+            group_id,
+            epoch: cgka_traits::EpochId(1),
+            leaves: vec![],
+            departed_members: vec![],
+        }]
     );
 }
 
