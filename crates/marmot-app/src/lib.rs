@@ -147,6 +147,7 @@ pub use startup_diagnostics::{
 };
 #[cfg(feature = "test-policy-overrides")]
 mod test_support;
+mod wiring;
 
 pub use cgka_traits::engine::{
     SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
@@ -590,7 +591,7 @@ pub struct MarmotApp {
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
-    product_analytics: ProductAnalytics,
+    product_analytics: observer::ProductRecorder,
     startup_diagnostics: startup_diagnostics::NativeStartupDiagnostics,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
     public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
@@ -1588,8 +1589,9 @@ impl MarmotApp {
             config.allow_loopback_relay_endpoints,
         );
         collector_host_safety::hand_in_http_builder(network_proxy::http_builder);
-        let product_analytics = ProductAnalytics::default();
-        product_analytics.silence(
+        let product_analytics = observer::ProductRecorder::default();
+        wiring::silence(
+            &product_analytics,
             config.usage_diagnostics_silent
                 || config.cursor_persistence == CursorPersistence::Frozen,
         );
@@ -1686,8 +1688,9 @@ impl MarmotApp {
             config.allow_loopback_relay_endpoints,
         );
         collector_host_safety::hand_in_http_builder(network_proxy::http_builder);
-        let product_analytics = ProductAnalytics::default();
-        product_analytics.silence(
+        let product_analytics = observer::ProductRecorder::default();
+        wiring::silence(
+            &product_analytics,
             config.usage_diagnostics_silent
                 || config.cursor_persistence == CursorPersistence::Frozen,
         );
@@ -6821,9 +6824,11 @@ impl MarmotApp {
                 SqlcipherDatabaseKind::Session,
             )?
         };
-        let migration_observation =
-            self.product_analytics
-                .begin(ProductFamily::Storage, "migration", ProductUnit::Attempt);
+        let migration_observation = self.product_analytics.operation(
+            ProductFamily::Storage,
+            "migration",
+            ProductUnit::Attempt,
+        );
         probe.phase(NativeStartupStage::EncryptedStoreOpen);
         let observer = |progress| {
             use storage_sqlite::{StorageOpenPhase as Phase, StorageOpenProgress as Progress};
@@ -6969,12 +6974,12 @@ impl MarmotApp {
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let observation = self
             .product_analytics
-            .begin(
+            .operation(
                 ProductFamily::MessageAction,
                 "publication",
                 ProductUnit::Transition,
             )
-            .map(ProductObservation::counts_only);
+            .map(crate::observer::ProductOperation::counts_only);
         let storage = self.account_storage(label)?;
         let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
             let authority_update = storage.app_storage().finalize_app_event_authority(

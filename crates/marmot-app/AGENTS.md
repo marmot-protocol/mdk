@@ -392,6 +392,12 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   loopback IP literal is a local-test endpoint, and all its addresses must be loopback. The default build includes this
   helper so forensic audit uploads share it; do not feature-gate the module or introduce a second uploader. See
   `docs/marmot-architecture/relay-observability.md`, `audit-logging.md`, and `overview/dial-safety.md`.
+- The diagnostics code is moving to its own crate (mdk#2627). The rest of this crate records through `Observer`'s
+  views (`observer.rs`: `ProductRecorder`, `PerformanceRecorder`, `ProductOperation`) and runs the collectors through
+  `wiring.rs`. Hosts can name `ProductAnalytics`, `AppPerformanceTelemetry`, `ProductObservation`, `DiagnosticsPermit`
+  and `AuditOtlpSender`, so do not make their crate-private methods `pub` and do not call them from outside the
+  moving set; add the method to a view or to `wiring.rs`. Items the rest of the crate names from a private module
+  in the set are `pub` there.
 
 ## Code map (modules not covered above)
 
@@ -413,9 +419,11 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   security primitive), `publisher_sequences.rs` (QUIC preview publisher lifecycle state), `agent_streams.rs` (agent
   stream watch DTOs and manager), `root_runtime_lease.rs` (cross-process exclusive root lease), `app_telemetry.rs` +
   `app_telemetry/` (aggregate app-performance telemetry; same privacy model as relay telemetry), `product_analytics/`
-  (opt-in bounded product observations; export behind `product-analytics-export`), `usage_diagnostics.rs`
+  (opt-in bounded product observations; export behind `product-analytics-export`), `observer.rs` (`Observer`, the
+  runtime's recording handle, and its recorder views), `wiring.rs` (consent receipts, silencing, the telemetry
+  origin, collector configuration and the delivery worker), `usage_diagnostics.rs`
   (`MarmotApp`'s usage-diagnostics consent persistence and the headless-host analytics configuration; it reaches the
-  product collector only through its methods, consent lock before state lock), `projection.rs` (legacy account
+  product collector only through `wiring.rs`, consent lock before state lock), `projection.rs` (legacy account
   projection import), `messages/` (`AppMessageIntent` and custom-event intents), `local_open_test_gate.rs` and
   `test_support.rs` (test-only gates/helpers).
 - `src/runtime/`: `worker_startup.rs` (per-account startup admission and retry backoff),

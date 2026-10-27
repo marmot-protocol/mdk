@@ -11,7 +11,7 @@ use std::time::Duration;
 /// Default export poll/push interval. Coarse on purpose: the data is
 /// aggregate and cumulative, so a coarse window respects battery and metered
 /// networks without losing resolution.
-pub(crate) const DEFAULT_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
+pub const DEFAULT_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RelayTelemetryResource {
@@ -108,7 +108,7 @@ impl RelayTelemetryRuntimeConfig {
     }
 }
 
-pub(crate) fn trim_optional(value: Option<String>) -> Option<String> {
+pub fn trim_optional(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let value = value.trim().to_owned();
         (!value.is_empty()).then_some(value)
@@ -246,7 +246,7 @@ pub(crate) fn parse_relay_telemetry_endpoint(endpoint: &str) -> Option<url::Url>
 
 /// Accept `https` for any host; accept `http` only for a loopback host (a local
 /// test collector). Reject anything else, including unparseable endpoints.
-pub(crate) fn endpoint_transport_allowed(endpoint: &str) -> bool {
+pub fn endpoint_transport_allowed(endpoint: &str) -> bool {
     let Ok(url) = url::Url::parse(endpoint) else {
         return false;
     };

@@ -19,7 +19,8 @@ use super::host_safety::{
     is_loopback_host, parse_profile_image_fetch_url, parse_profile_image_redirect_url,
     reject_non_public_ip, validate_blossom_fetch_url,
 };
-use crate::app_telemetry::{AppPerformanceOperation, AppPerformanceTelemetry};
+use crate::app_telemetry::AppPerformanceOperation;
+use crate::observer::PerformanceRecorder;
 use crate::{AppError, unix_now_seconds};
 
 #[cfg(test)]
@@ -1042,7 +1043,7 @@ pub(crate) async fn fetch_blossom_file_with_transport(
 pub(super) async fn fetch_blossom_blob_with_observer(
     url: &str,
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
 ) -> Result<Vec<u8>, AppError> {
     fetch_blossom_blob_with_observer_until(
         url,
@@ -1059,7 +1060,7 @@ pub(super) async fn fetch_blossom_blob_with_observer(
 pub(super) async fn fetch_blossom_blob_with_observer_until(
     url: &str,
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     deadline: tokio::time::Instant,
 ) -> Result<Vec<u8>, AppError> {
     fetch_blossom_blob_bounded(
@@ -1076,7 +1077,7 @@ pub(super) async fn fetch_blossom_blob_with_observer_until(
 pub(super) async fn fetch_blossom_blob_bounded(
     url: &str,
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     deadline: tokio::time::Instant,
     max_bytes: u64,
 ) -> Result<Vec<u8>, AppError> {
@@ -1098,7 +1099,7 @@ pub(super) struct FetchedBlob {
 pub(super) async fn fetch_blossom_blob_classified_until(
     url: &str,
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     deadline: tokio::time::Instant,
 ) -> Result<FetchedBlob, AttachmentDownloadFailure> {
     fetch_blossom_blob_bounded_classified(
@@ -1114,7 +1115,7 @@ pub(super) async fn fetch_blossom_blob_classified_until(
 pub(super) async fn fetch_blossom_blob_bounded_classified(
     url: &str,
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     deadline: tokio::time::Instant,
     max_bytes: u64,
 ) -> Result<FetchedBlob, AttachmentDownloadFailure> {
@@ -1238,7 +1239,7 @@ pub(super) async fn fetch_http_with_bounded_redirects<C, CFut, R>(
     max_body_bytes: u64,
     deadline: tokio::time::Instant,
     startup_timeout: Option<Duration>,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     client_for_url: C,
     redirect_target: R,
 ) -> Result<Vec<u8>, AppError>
@@ -1265,7 +1266,7 @@ pub(super) async fn fetch_http_classified<C, CFut, R>(
     max_body_bytes: u64,
     deadline: tokio::time::Instant,
     startup_timeout: Option<Duration>,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     client_for_url: C,
     redirect_target: R,
 ) -> Result<Vec<u8>, AttachmentDownloadFailure>
@@ -1294,7 +1295,7 @@ async fn fetch_http_resumable<C, CFut, R>(
     max_body_bytes: u64,
     deadline: tokio::time::Instant,
     startup_timeout: Option<Duration>,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     resume: Option<&Arc<super::attachment_resume::AttachmentResume>>,
     mut client_for_url: C,
     mut redirect_target: R,
@@ -1869,7 +1870,7 @@ async fn read_limited_blossom_body_until(
     response: reqwest::Response,
     max_bytes: u64,
     first_byte_deadline: Option<tokio::time::Instant>,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
 ) -> Result<Vec<u8>, AttachmentDownloadFailure> {
     if let Some(content_length) = response.content_length()
         && content_length > max_bytes
@@ -1980,7 +1981,7 @@ async fn read_limited_blossom_body_until(
 
 /// Record one fixed phase without accepting caller-controlled labels.
 fn record_download_phase(
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     operation: AppPerformanceOperation,
     started_at: Instant,
     success: bool,

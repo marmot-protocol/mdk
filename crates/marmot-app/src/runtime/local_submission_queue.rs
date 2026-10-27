@@ -9,6 +9,7 @@
 
 use super::*;
 use crate::app_telemetry::runtime::Observation;
+use crate::observer::PerformanceRecorder;
 
 const OBSERVATION_LIMIT: usize = 1024;
 
@@ -27,7 +28,7 @@ pub(super) struct QueueObservation {
 }
 
 impl QueueObservation {
-    pub(super) fn finish(self, telemetry: &AppPerformanceTelemetry) {
+    pub(super) fn finish(self, telemetry: &PerformanceRecorder) {
         telemetry.record(
             AppPerformanceOperation::OutboundMessageQueueWait,
             self.started.elapsed(),
@@ -55,7 +56,7 @@ impl LocalSubmissionQueue {
         account: &str,
         group: &str,
         message: &str,
-        telemetry: &AppPerformanceTelemetry,
+        telemetry: &PerformanceRecorder,
     ) {
         let key = (account.to_owned(), group.to_owned(), message.to_owned());
         if self.observations.contains_key(&key) {
@@ -99,7 +100,7 @@ impl LocalSubmissionQueue {
 mod tests {
     use super::*;
 
-    fn queue_snapshot(telemetry: &AppPerformanceTelemetry) -> crate::RuntimePerformanceSnapshot {
+    fn queue_snapshot(telemetry: &PerformanceRecorder) -> crate::RuntimePerformanceSnapshot {
         telemetry
             .snapshot()
             .runtime_operations
@@ -110,7 +111,7 @@ mod tests {
 
     #[test]
     fn duplicate_admission_preserves_start_and_first_execution_is_measured_once() {
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         let mut queue = LocalSubmissionQueue::default();
         queue.admitted(
             "private-account",
@@ -144,7 +145,7 @@ mod tests {
 
     #[test]
     fn capacity_and_shutdown_are_bounded_cancellations_without_duration_samples() {
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         let mut queue = LocalSubmissionQueue::default();
         for message in 0..=OBSERVATION_LIMIT {
             queue.admitted(
@@ -167,7 +168,7 @@ mod tests {
 
     #[test]
     fn private_keys_never_enter_snapshots_and_restored_rows_have_no_sample() {
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         let mut queue = LocalSubmissionQueue::default();
         queue.admitted(
             "private-account",
@@ -194,7 +195,7 @@ mod tests {
 
     #[test]
     fn equal_message_ids_in_different_groups_have_independent_admission_waits() {
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         let mut queue = LocalSubmissionQueue::default();
         queue.admitted("account", "group-one", "same-message", &telemetry);
         queue.admitted("account", "group-two", "same-message", &telemetry);
@@ -231,7 +232,7 @@ mod tests {
 
     #[test]
     fn permanent_account_deletion_cancels_only_its_pending_observations() {
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         let mut queue = LocalSubmissionQueue::default();
         queue.admitted("deleted", "group", "message", &telemetry);
         queue.admitted("retained", "group", "message", &telemetry);
