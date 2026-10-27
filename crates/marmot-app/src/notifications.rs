@@ -56,6 +56,8 @@ pub const KIND_MARMOT_NOTIFICATION_SERVER_RELAYS: u64 = 10050;
 pub const PUSH_VERSION: &str = "marmot-push-v1";
 pub const PUSH_ENCRYPTED_TOKEN_LEN: usize = 1084;
 const PUSH_MAX_GOSSIP_ENTRIES: usize = 32;
+/// Most elements a kind 447 announce's `have` may carry.
+const PUSH_MAX_HAVE_ENTRIES: usize = 4_096;
 const PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS: usize = 32;
 // NIP-59's nested encryption fits 19 tokens below a 64 KiB event ceiling;
 // 20 tokens cross it. The protocol's 32-token rumor bound remains separate.
@@ -405,6 +407,16 @@ pub(crate) struct PushTokenGossipEntry {
     pub encrypted_token: String,
     pub owner_ts: i64,
     pub owner_sig: String,
+}
+
+/// A kind 447 announce: the sender's own current records in `tokens`, and in
+/// `have` the records and tombstones it holds in the group, each named by
+/// [`push_have_element`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PushTokenAnnouncePayload {
+    pub v: String,
+    pub tokens: Vec<PushTokenGossipEntry>,
+    pub have: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1189,6 +1201,20 @@ pub(crate) async fn local_token_removal_payload(
     Ok((payload, record))
 }
 
+/// The `have` element naming the record or tombstone whose
+/// `SHA-256(SignedRecord)` is `record_digest_hex`: the digest's first 8 bytes
+/// as standard base64. `None` unless the digest is 64 hex characters.
+pub(crate) fn push_have_element(record_digest_hex: &str) -> Option<String> {
+    if record_digest_hex.len() != 64 {
+        return None;
+    }
+    let digest = hex::decode(record_digest_hex).ok()?;
+    Some(BASE64_STANDARD.encode(&digest[..8]))
+}
+
+/// Decode inbound kind 447, 448 or 449 content. An announce's `have` is not
+/// read: this device sends no repair replies yet, so it applies an announce
+/// as the self-update or request its `tokens` make it.
 pub(crate) fn parse_push_gossip(
     kind: u64,
     group_id_hex: &str,
@@ -2458,7 +2484,7 @@ pub(crate) fn decrypt_push_token_for_test(
 }
 
 mod lists;
-pub(crate) use lists::push_gossip_lists;
+pub(crate) use lists::{push_announce, push_gossip_lists};
 
 #[cfg(test)]
 mod tests;

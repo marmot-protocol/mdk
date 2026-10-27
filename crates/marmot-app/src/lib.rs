@@ -2018,6 +2018,9 @@ impl MarmotApp {
             push_registration_share_queued: false,
             pending_member_add_push_shares: Default::default(),
             pending_own_add_push_snapshots: Default::default(),
+            push_announce_timing: Default::default(),
+            push_fetch_clock: client::PushFetchClock::new(notifications::unix_now_ms()),
+            accepted_push_announces: Default::default(),
             pending_failed_sync_summary: SyncSummary::default(),
             pending_native_sync_summary: SyncSummary::default(),
             native_sync_deliveries: 0,
@@ -2051,6 +2054,12 @@ impl MarmotApp {
             strict_quarantined_group_reads: false,
             #[cfg(test)]
             fail_drained_effect_checkpoints: false,
+            #[cfg(test)]
+            test_sent_push_gossip: Vec::new(),
+            #[cfg(test)]
+            test_push_device_can_fetch: None,
+            #[cfg(test)]
+            test_fail_push_announce_owed_write: false,
             pending_welcome_delivery_events: Vec::new(),
             pending_superseded_change_events: Vec::new(),
             maintenance_failed_backlog: 0,
@@ -4127,6 +4136,115 @@ impl MarmotApp {
             .account_storage(&account.label)?
             .app_storage()
             .record_group_push_snapshot_owed(group_id_hex, after_epoch)?)
+    }
+
+    /// This device's push gossip state in `group_id_hex`, if it has any.
+    pub(crate) fn group_push_gossip_state(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<storage_sqlite::AccountGroupPushGossipState>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .group_push_gossip_state(group_id_hex)?)
+    }
+
+    /// Every group where this device owes an announce besides the one that
+    /// ends its join window.
+    pub(crate) fn owed_group_push_announce_states(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<storage_sqlite::AccountGroupPushGossipState>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .owed_group_push_announce_states()?)
+    }
+
+    /// Record that this device owes `group_id_hex` an announce as of
+    /// `owed_at_ms`. Returns the value stored, or `None` unless this device
+    /// is a member of the projected group.
+    pub(crate) fn record_group_push_announce_owed(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        owed_at_ms: i64,
+    ) -> Result<Option<i64>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .record_group_push_announce_owed(group_id_hex, owed_at_ms)?)
+    }
+
+    /// Every group where this device has a push join window open, or one that
+    /// ended without its announce yet.
+    pub(crate) fn joining_group_push_gossip_states(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<storage_sqlite::AccountGroupPushGossipState>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .joining_group_push_gossip_states()?)
+    }
+
+    /// Record when this device's join to `group_id_hex` completed. Returns
+    /// false unless this device is a member of the projected group.
+    pub(crate) fn record_group_push_gossip_join(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        joined_at_ms: i64,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .record_group_push_gossip_join(group_id_hex, joined_at_ms)?)
+    }
+
+    /// Count `counted_ms`, time during which this device could fetch, toward
+    /// every push join window whose join has completed.
+    pub(crate) fn count_push_join_window_time(
+        &self,
+        account_ref: &str,
+        counted_ms: i64,
+    ) -> Result<usize, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .count_push_join_window_time(counted_ms)?)
+    }
+
+    /// Record that this device published, at `announced_at_ms`, an announce
+    /// in `group_id_hex` built while the owed announce stood at
+    /// `settles_owed`, settling it if it still does. Returns false unless
+    /// this device is a member of the projected group.
+    pub(crate) fn record_group_push_gossip_announce(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        announced_at_ms: i64,
+        settles_owed: Option<i64>,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .record_group_push_gossip_announce(group_id_hex, announced_at_ms, settles_owed)?)
     }
 
     /// Replace the owed snapshot epoch of `group_id_hex` with `replacement`
