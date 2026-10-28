@@ -537,3 +537,69 @@ async fn a_failed_pass_keeps_its_backoff_and_park_across_a_restart() {
         .expect("a parked pass stays parked after restart");
     assert_eq!(ALWAYS - case.fault.remaining(), failures);
 }
+
+/// The simulator's structural progress reads a failed batch the way the
+/// runtime's readiness does: a backing-off pass is a wake at its retry time, a
+/// parked one is idle, and the send it holds back is not runnable meanwhile.
+#[cfg(feature = "test-conformance-snapshot")]
+#[tokio::test]
+async fn structural_progress_waits_out_a_failed_pass_and_idles_a_parked_one() {
+    let mut case = failing_catch_up("retry-progress").await;
+    case.fault.arm(ALWAYS);
+    assert!(case.attempt().is_err());
+    let payload = cgka_traits::app_event::MarmotAppEvent::new(
+        hex::encode(case.carol.self_id().as_slice()),
+        1_700_000_000,
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "queued behind the batch",
+    )
+    .encode()
+    .unwrap();
+    let sent = case
+        .carol
+        .send(SendIntent::AppMessage {
+            group_id: case.group_id.clone(),
+            payload,
+            expected_epoch: None,
+        })
+        .await
+        .expect("a send during backoff queues");
+    assert!(matches!(sent, SendResult::Queued { .. }), "got {sent:?}");
+    case.carol.drain_events();
+
+    let retry = case.retry().expect("the failure is recorded on the pass");
+    let waiting = case
+        .carol
+        .conformance_structural_progress_snapshot(&case.group_id)
+        .unwrap();
+    assert_eq!(waiting.pending_work.queued_outbound_intents, 1);
+    assert_eq!(
+        waiting.earliest_next_wake_monotonic_ms,
+        Some(retry.next_attempt_monotonic_ms)
+    );
+    assert_eq!(
+        waiting.runnable_work, 0,
+        "nothing behind a backing-off batch can run before its retry: {waiting:?}"
+    );
+
+    case.clock.advance_ms(CONVERGENCE_PASS_RETRY_BASE_MS);
+    let due = case
+        .carol
+        .conformance_structural_progress_snapshot(&case.group_id)
+        .unwrap();
+    assert!(due.runnable_work > 0, "the retry is due: {due:?}");
+
+    case.fail_until_parked();
+    case.carol.drain_events();
+    let parked = case
+        .carol
+        .conformance_structural_progress_snapshot(&case.group_id)
+        .unwrap();
+    assert_eq!(parked.pending_work.queued_outbound_intents, 1);
+    assert_eq!(
+        (parked.runnable_work, parked.earliest_next_wake_monotonic_ms),
+        (0, None),
+        "a parked batch waits for new input, not for time: {parked:?}"
+    );
+}

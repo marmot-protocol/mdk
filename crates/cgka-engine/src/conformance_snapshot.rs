@@ -694,6 +694,16 @@ pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
 
     let mut runnable_work = 0usize;
     let mut next_wake = None;
+    // A failed batch backs off to its retry time and, parked, waits for new
+    // input (mdk#2684). Until then it holds every drain behind it, as the
+    // runtime's own readiness reads do.
+    let failed_pass_waiting = pass
+        .as_ref()
+        .filter(|pass| pass.is_active() && pass.phase != ConvergencePassPhase::Collecting)
+        .and_then(|pass| pass.retry.as_ref())
+        .is_some_and(|retry| {
+            retry.is_parked() || retry.next_attempt_monotonic_ms > now.monotonic_ms
+        });
     if let Some(active) = pass.as_ref().filter(|pass| pass.is_active()) {
         match active.phase {
             ConvergencePassPhase::Collecting => {
@@ -705,16 +715,28 @@ pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
                 }
             }
             ConvergencePassPhase::Frozen | ConvergencePassPhase::Resolving => {
-                runnable_work = runnable_work.saturating_add(1);
+                match active.retry.as_ref() {
+                    Some(retry) if retry.is_parked() => {}
+                    Some(retry) if failed_pass_waiting => {
+                        next_wake = Some(retry.next_attempt_monotonic_ms);
+                    }
+                    _ => runnable_work = runnable_work.saturating_add(1),
+                }
             }
             ConvergencePassPhase::Completed => {}
         }
     }
 
+    // `deferred_peel_cutoff_delay_ms` gives deferred rows no wake behind a
+    // failed batch unless a deferred-peel generation sweeps first.
+    let deferred_rows_wait = pass
+        .as_ref()
+        .is_some_and(|pass| pass.is_active() && pass.retry.is_some())
+        && engine.storage.deferred_peel_generation(group_id)?.is_none();
     let mut deferred_normalizations = 0usize;
     for record in messages
         .iter()
-        .filter(|record| record.state == MessageState::PeelDeferred)
+        .filter(|record| !deferred_rows_wait && record.state == MessageState::PeelDeferred)
     {
         let (deferred, changed) = crate::message_processor::normalized_deferred_peel_lifecycle(
             record.deferred_peel.as_ref(),
@@ -759,6 +781,7 @@ pub(crate) fn capture_structural_progress_snapshot<S: StorageProvider>(
             .scheduled_self_remove_auto_commits
             .values()
             .any(|scheduled| scheduled.group_id == *group_id);
+    let future_scheduled_work = future_scheduled_work || failed_pass_waiting;
     if engine.pending_convergence_groups.contains(group_id) && !future_scheduled_work {
         runnable_work = runnable_work.saturating_add(1);
     }

@@ -59,16 +59,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `suppress_local_deleted_group_event` (both event loops), `refresh_group`, `reconcile_live_engine_groups` and
   `refresh_routing`. Every host surface built from engine or recovery state rather than the projection filters with
   `host_may_see_group`, which fails closed: quarantine, history notices and their changes, epoch-stall escalations,
-  deferred events, recovery-status and superseded-change updates, and Welcome redelivery. A new such surface filters
-  too. Trust is separate from hiding. Act on a device group's roster only once `device_groups` says
-  `created` or `linked`; a Welcome into a group no confirmed link named stays `untrusted`. Decide from the engine's
-  durable group record (`stored_group`), never the live group a deferred open has not hydrated, and settle trust in
-  one place (`settle_held_device_group`: the live join, the restart reconcile and a later link); a group that takes a
-  link's id without requiring the roster drops the link's row and projects as any other. A routing rebuild skips a
-  device group a deferred open has not hydrated; the post-hydration reconcile installs its route. The founding Add
-  takes the account's own device only through the confirmed `KeyPackageRef`. Creation and links are reachable only
-  through the `test-policy-overrides` hooks (`dev_create_device_group`, `dev_record_confirmed_device_link`), with
-  `MarmotAppConfig::dev_device_groups` set, until pairing reaches the app.
+  deferred events, recovery-status and superseded-change updates, convergence park notices, and Welcome redelivery. A
+  new such surface filters too. Trust is separate from hiding. Act on a device group's roster only once
+  `device_groups` says `created` or `linked`; a Welcome into a group no confirmed link named stays `untrusted`. Decide
+  from the engine's durable group record (`stored_group`), never the live group a deferred open has not hydrated, and
+  settle trust in one place (`settle_held_device_group`: the live join, the restart reconcile and a later link); a
+  group that takes a link's id without requiring the roster drops the link's row and projects as any other. A routing
+  rebuild skips a device group a deferred open has not hydrated; the post-hydration reconcile installs its route. The
+  founding Add takes the account's own device only through the confirmed `KeyPackageRef`. Creation and links are
+  reachable only through the `test-policy-overrides` hooks (`dev_create_device_group`,
+  `dev_record_confirmed_device_link`), with `MarmotAppConfig::dev_device_groups` set, until pairing reaches the app.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.

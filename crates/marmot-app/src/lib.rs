@@ -2114,6 +2114,8 @@ impl MarmotApp {
             fail_next_released_backfill_reload: false,
             #[cfg(test)]
             fail_next_terminal_recovery_retire: false,
+            #[cfg(test)]
+            fail_next_convergence_retry_advance: false,
             post_join_maintenance_subscriptions: HashMap::new(),
             post_join_history_sessions: HashMap::new(),
             encrypted_media_not_required_epochs: HashMap::new(),

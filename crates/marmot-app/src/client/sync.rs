@@ -894,8 +894,12 @@ impl AppClient {
     /// Record whether `group_id`'s convergence pass is parked, owing hosts a
     /// group-state notice when that changed since they last heard (mdk#2684).
     /// Every entry point that can spend the budget re-reads the schedule, so
-    /// the notice does not depend on which one parked it.
+    /// the notice does not depend on which one parked it. A group hosts may
+    /// not see owes them nothing.
     pub(crate) fn note_convergence_park(&mut self, group_id: &cgka_traits::GroupId, parked: bool) {
+        if !self.host_may_see_group(group_id) {
+            return;
+        }
         let changed = if parked {
             self.announced_convergence_parks.insert(group_id.clone())
         } else {

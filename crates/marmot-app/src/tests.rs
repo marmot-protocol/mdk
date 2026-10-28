@@ -23716,25 +23716,15 @@ async fn assert_peer_leave_behind_fanout(remove_observer: bool) {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_parked_convergence_pass_owes_hosts_one_notice_per_change() {
+/// Plant a frozen batch whose failure budget ran out (mdk#2684), however it
+/// got there.
+fn plant_parked_convergence_pass(app: &MarmotApp, group_id: &cgka_traits::GroupId, epoch: u64) {
     use cgka_traits::convergence_pass::{
         ConvergencePassPhase, ConvergencePassRetry, ConvergencePassStep, DurableConvergencePass,
     };
     use cgka_traits::storage::ConvergencePassStorage;
-    let dir = tempfile::tempdir().unwrap();
-    AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-    let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("parked", &[]).await.unwrap();
-    let epoch = client.group_mls_state(&group_id).unwrap().epoch;
-    assert!(client.take_convergence_park_notices().is_empty());
-    // A frozen batch whose budget ran out (mdk#2684), however it got there.
-    let storage = app.account_storage("alice").unwrap();
-    storage
+    app.account_storage("alice")
+        .unwrap()
         .put_convergence_pass(&DurableConvergencePass {
             group_id: group_id.clone(),
             generation: 1,
@@ -23760,6 +23750,22 @@ async fn a_parked_convergence_pass_owes_hosts_one_notice_per_change() {
             }),
         })
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_convergence_pass_owes_hosts_one_notice_per_change() {
+    use cgka_traits::storage::ConvergencePassStorage;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("parked", &[]).await.unwrap();
+    let epoch = client.group_mls_state(&group_id).unwrap().epoch;
+    assert!(client.take_convergence_park_notices().is_empty());
+    plant_parked_convergence_pass(&app, &group_id, epoch);
 
     let mut notices = Vec::new();
     for _ in 0..2 {
@@ -23781,7 +23787,10 @@ async fn a_parked_convergence_pass_owes_hosts_one_notice_per_change() {
             .convergence_parked
     );
 
-    storage.delete_convergence_pass(&group_id).unwrap();
+    app.account_storage("alice")
+        .unwrap()
+        .delete_convergence_pass(&group_id)
+        .unwrap();
     let mut notices = Vec::new();
     for _ in 0..2 {
         client.convergence_schedule_state(&group_id).unwrap();
@@ -23798,6 +23807,40 @@ async fn a_parked_convergence_pass_owes_hosts_one_notice_per_change() {
             .unwrap()
             .convergence_parked
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_convergence_retry_whose_advance_fails_still_wakes_the_group() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client.create_group("parked", &[]).await.unwrap();
+    let epoch = client.group_mls_state(&group_id).unwrap().epoch;
+    plant_parked_convergence_pass(&app, &group_id, epoch);
+    client.take_pending_convergence_groups();
+
+    // The retry un-parks the batch, then its advance fails before any attempt
+    // could park it again (mdk#2684).
+    client.fail_next_convergence_retry_advance = true;
+    assert!(client.retry_group_convergence(&group_id).await.is_err());
+    let pass = app
+        .convergence_pass_for_test("alice", &group_id)
+        .unwrap()
+        .expect("the batch survives the failed advance");
+    assert!(!pass.is_parked());
+    assert_eq!(
+        client.take_pending_convergence_groups(),
+        vec![group_id.clone()],
+        "the worker's next schedule read must still see the group"
+    );
+    assert!(matches!(
+        client.convergence_schedule_state(&group_id).unwrap(),
+        crate::ConvergenceScheduleState::Ready
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
