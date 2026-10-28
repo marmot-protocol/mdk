@@ -1319,6 +1319,19 @@ impl AccountDeviceSession {
             .engine
             .ingest_with_audit_context(&delivery.message, Some(transport_context))
             .await?;
+        if matches!(&outcome, IngestOutcome::GroupRecovery { .. }) {
+            return Ok(IngestEffects {
+                outcome,
+                left_object_unpersisted: true,
+                effects: SessionEffects {
+                    events: Vec::new(),
+                    publish: Vec::new(),
+                    queued: Vec::new(),
+                    pending_convergence: Vec::new(),
+                },
+                valid_proposal_groups: Vec::new(),
+            });
+        }
         let left_object_unpersisted = self.engine.last_ingest_left_object_unpersisted();
         tracing::debug!(
             target: TRACE_TARGET,
@@ -1907,6 +1920,7 @@ fn send_result_kind(result: &SendResult) -> &'static str {
 fn ingest_outcome_kind(outcome: &IngestOutcome) -> &'static str {
     match outcome {
         IngestOutcome::Processed => "processed",
+        IngestOutcome::GroupRecovery { .. } => "account_control",
         IngestOutcome::Buffered { .. } => "buffered",
         IngestOutcome::Ignored { .. } => "ignored",
         IngestOutcome::LocalState { .. } => "local_state",

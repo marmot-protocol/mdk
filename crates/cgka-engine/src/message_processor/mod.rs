@@ -59,7 +59,7 @@ use crate::openmls_projection::decode_openmls_wire_projection;
 use crate::queued_intent_refusal::QueuedPreparationFailure;
 use cgka_traits::engine::{GroupEvent, GroupStateChange, SendIntent, SendResult};
 use cgka_traits::engine_state::EpochState;
-use cgka_traits::error::EngineError;
+use cgka_traits::error::{EngineError, PeelerError};
 use cgka_traits::ingest::{
     DeferralLineage, InboundResourceLimit, IngestOutcome, InputRejectionCategory, LocalIngestState,
 };
@@ -3032,6 +3032,9 @@ impl<S: StorageProvider> Engine<S> {
                 self.release_cap_slot_if_row_left_peel_deferred(record, current);
                 Ok(!store::row_state_is_awaiting_retry(current))
             }
+            Ok(Outcome(IngestOutcome::GroupRecovery { .. })) => Err(EngineError::Peeler(
+                PeelerError::Malformed("group retry returned account control".into()),
+            )),
             Ok(Outcome(IngestOutcome::Processed)) => {
                 // Applied. A direct apply records the wrapper in the
                 // processed-transport-id set rather than restating its row, so
@@ -4345,6 +4348,16 @@ mod deferred_peel_accounting_tests {
         struct OpaquePeeler;
         #[async_trait::async_trait]
         impl TransportPeeler for OpaquePeeler {
+            async fn wrap_group_recovery(
+                &self,
+                _message: &cgka_traits::GroupRecoveryMessage,
+                _recipient: &cgka_traits::MemberId,
+            ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+                Err(cgka_traits::PeelerError::Malformed(
+                    "pass-through fixture has no authenticated account channel".into(),
+                ))
+            }
+
             async fn peel_group_message(
                 &self,
                 _: &TransportMessage,
@@ -4388,7 +4401,7 @@ mod deferred_peel_accounting_tests {
         if let SendResult::GroupCreated { pending, .. } = created {
             engine.confirm_published(pending).await.unwrap();
         }
-        engine.peeler = Box::new(OpaquePeeler);
+        engine.peeler = std::sync::Arc::new(OpaquePeeler);
         let mut ids = Vec::new();
         for index in 0..65u8 {
             let id = MessageId::new(vec![255 - index; 32]);

@@ -167,6 +167,16 @@ impl CountingEpochGatePeeler {
 
 #[async_trait]
 impl TransportPeeler for CountingEpochGatePeeler {
+    async fn wrap_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &cgka_traits::MemberId,
+    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+        Err(cgka_traits::PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
@@ -247,6 +257,16 @@ impl CancellableEpochSealedPeeler {
 
 #[async_trait]
 impl TransportPeeler for CancellableEpochSealedPeeler {
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &cgka_traits::MemberId,
+    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+        EpochSealedPeeler
+            .wrap_group_recovery(message, recipient)
+            .await
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
@@ -310,6 +330,16 @@ impl NotifyEpochGatePeeler {
 
 #[async_trait]
 impl TransportPeeler for NotifyEpochGatePeeler {
+    async fn wrap_group_recovery(
+        &self,
+        _message: &cgka_traits::GroupRecoveryMessage,
+        _recipient: &cgka_traits::MemberId,
+    ) -> Result<cgka_traits::TransportMessage, cgka_traits::PeelerError> {
+        Err(cgka_traits::PeelerError::Malformed(
+            "pass-through fixture has no authenticated account channel".into(),
+        ))
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,

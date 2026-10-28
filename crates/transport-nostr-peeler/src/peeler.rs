@@ -2,9 +2,11 @@ use crate::error::to_peeler_error;
 use crate::event::decode_hex_exact;
 use crate::signer::{MarmotNostrSigner, SdkSigner};
 use crate::{
-    DEFAULT_EXPORTER_LABEL, EXPIRATION_TAG, GROUP_TAG, KIND_MARMOT_GROUP_MESSAGE,
-    KIND_MARMOT_WELCOME_RUMOR, KIND_NIP59_GIFT_WRAP, NOSTR_GROUP_CONTENT_MIN_LEN,
-    NOSTR_GROUP_KEY_LEN, NostrTransportEvent, RECIPIENT_TAG,
+    DEFAULT_EXPORTER_LABEL, EXPIRATION_TAG, GROUP_RECOVERY_PROTOCOL_TAG,
+    GROUP_RECOVERY_PROTOCOL_VERSION, GROUP_TAG, KIND_MARMOT_GROUP_MESSAGE,
+    KIND_MARMOT_WELCOME_RUMOR, KIND_MDK_GROUP_RECOVERY_RUMOR, KIND_NIP59_GIFT_WRAP,
+    MAX_GROUP_RECOVERY_EVENT_BYTES, NOSTR_GROUP_CONTENT_MIN_LEN, NOSTR_GROUP_KEY_LEN,
+    NostrTransportEvent, RECIPIENT_TAG,
 };
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -12,6 +14,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use cgka_traits::engine::WelcomeMetadata;
 use cgka_traits::error::PeelerError;
 use cgka_traits::group_context::GroupContextSnapshot;
+use cgka_traits::group_recovery::{AuthenticatedGroupRecovery, GroupRecoveryMessage};
 use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::peeler::{GroupMessageMetadata, TransportPeeler};
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
@@ -54,16 +57,21 @@ pub struct WelcomePeelProvenance {
 pub enum AccountGiftWrap {
     /// A Welcome rumor, peeled and validated.
     Welcome(Box<PeeledMessage>, WelcomePeelProvenance),
+    /// A private recovery control, authenticated and validated, not a Welcome.
+    GroupRecovery(Box<PeeledMessage>),
     /// Any other rumor. NIP-59 verified the wrap and seal and matched the
     /// rumor's author to the seal's; nothing else about it is checked.
     Other(Box<UnwrappedGift>),
 }
 
 impl AccountGiftWrap {
-    /// The Welcome, or the error a Welcome peel returns for any other rumor.
-    pub fn into_welcome(self) -> Result<(PeeledMessage, WelcomePeelProvenance), PeelerError> {
+    /// The Welcome or private recovery control, with provenance only for a Welcome.
+    pub fn into_welcome(
+        self,
+    ) -> Result<(PeeledMessage, Option<WelcomePeelProvenance>), PeelerError> {
         match self {
-            Self::Welcome(peeled, provenance) => Ok((*peeled, provenance)),
+            Self::Welcome(peeled, provenance) => Ok((*peeled, Some(provenance))),
+            Self::GroupRecovery(peeled) => Ok((*peeled, None)),
             Self::Other(unwrapped) => Err(PeelerError::Malformed(format!(
                 "expected Marmot welcome rumor kind {KIND_MARMOT_WELCOME_RUMOR}, got {}",
                 u16::from(unwrapped.rumor.kind)
@@ -212,13 +220,13 @@ impl NostrMlsPeeler {
         })
     }
 
-    /// Peel once and return the public IDs validated at this transport boundary.
-    /// Existing callers use `TransportPeeler::peel_welcome`, which discards this
-    /// metadata without changing admission or error behavior.
+    /// Unseal once and return public Welcome IDs only for authenticated Welcomes.
+    /// Account-control rumors have no Welcome provenance. The ordinary trait
+    /// method discards this metadata without repeating decryption.
     pub async fn peel_welcome_with_provenance(
         &self,
         msg: &TransportMessage,
-    ) -> Result<(PeeledMessage, WelcomePeelProvenance), PeelerError> {
+    ) -> Result<(PeeledMessage, Option<WelcomePeelProvenance>), PeelerError> {
         self.peel_account_gift_wrap(msg).await?.into_welcome()
     }
 
@@ -239,6 +247,11 @@ impl NostrMlsPeeler {
             )));
         }
         ensure_welcome_routing_matches(&event, msg)?;
+        let recipient = event
+            .single_tag_value(RECIPIENT_TAG)
+            .map_err(to_peeler_error)?;
+        let recipient =
+            decode_hex_exact("recipient p tag", recipient, 32).map_err(to_peeler_error)?;
         ensure_event_identity_matches(&event, msg)?;
         if event.sig.is_none() {
             return Err(PeelerError::InvalidSignature);
@@ -252,6 +265,49 @@ impl NostrMlsPeeler {
                 .await
                 .map_err(map_nip59_error)?;
 
+        // The outer carrier carries no recovery discriminator. Only the verified
+        // seal author's authenticated inner kind and singleton version dispatch.
+        if unwrapped.rumor.kind == Kind::Custom(KIND_MDK_GROUP_RECOVERY_RUMOR) {
+            let local = signer
+                .get_public_key()
+                .await
+                .map_err(|_| PeelerError::DecryptFailed)?;
+            if recipient.as_slice() != local.as_bytes() {
+                return Err(PeelerError::WrongRecipient);
+            }
+            if msg.payload.len() > MAX_GROUP_RECOVERY_EVENT_BYTES {
+                return Err(PeelerError::Malformed(
+                    "recovery carrier exceeds limit".into(),
+                ));
+            }
+            let protocol = rumor_single_tag(&unwrapped.rumor, GROUP_RECOVERY_PROTOCOL_TAG)?;
+            if protocol.len() != 2 || protocol[1] != GROUP_RECOVERY_PROTOCOL_VERSION {
+                return Err(PeelerError::Malformed(
+                    "invalid authenticated recovery protocol tag".into(),
+                ));
+            }
+            let inner_recipient = rumor_single_tag(&unwrapped.rumor, RECIPIENT_TAG)?;
+            if inner_recipient.len() != 2
+                || decode_hex_exact("recovery recipient", &inner_recipient[1], 32)
+                    .map_err(to_peeler_error)?
+                    != recipient
+            {
+                return Err(PeelerError::WrongRecipient);
+            }
+            let message = GroupRecoveryMessage::decode(unwrapped.rumor.content.as_bytes())?;
+            return Ok(AccountGiftWrap::GroupRecovery(Box::new(PeeledMessage {
+                id: msg.id.clone(),
+                group_id: None,
+                sender: None,
+                content: PeeledContent::GroupRecovery {
+                    recovery: Box::new(AuthenticatedGroupRecovery {
+                        sender: MemberId::new(unwrapped.sender.to_bytes().to_vec()),
+                        message,
+                    }),
+                },
+                origin: msg.clone(),
+            })));
+        }
         if unwrapped.rumor.kind != Kind::Custom(KIND_MARMOT_WELCOME_RUMOR) {
             return Ok(AccountGiftWrap::Other(Box::new(unwrapped)));
         }
@@ -370,6 +426,33 @@ impl TransportPeeler for NostrMlsPeeler {
         self.peel_welcome_with_provenance(msg)
             .await
             .map(|(peeled, _)| peeled)
+    }
+
+    async fn wrap_group_recovery(
+        &self,
+        message: &GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        let content = String::from_utf8(message.encode()?)
+            .map_err(|_| PeelerError::WrapFailed("invalid recovery JSON".into()))?;
+        let signer = self.welcome_signer()?;
+        let sender = signer
+            .get_public_key()
+            .await
+            .map_err(|_| PeelerError::WrapFailed("recovery signer unavailable".into()))?;
+        let receiver = Self::recipient_pubkey(recipient)?;
+        let rumor = EventBuilder::new(Kind::Custom(KIND_MDK_GROUP_RECOVERY_RUMOR), content)
+            .tags([
+                Tag::custom(
+                    GROUP_RECOVERY_PROTOCOL_TAG,
+                    [GROUP_RECOVERY_PROTOCOL_VERSION],
+                ),
+                Tag::public_key(receiver),
+            ])
+            .finalize_unsigned(sender);
+        let gift_wrap = crate::gift_wrap_rumor(signer.clone(), receiver, rumor).await?;
+        let event = NostrTransportEvent::from_nostr_event(&gift_wrap).map_err(to_peeler_error)?;
+        event.to_transport_message().map_err(to_peeler_error)
     }
 
     async fn wrap_group_message(
@@ -1230,6 +1313,7 @@ mod tests {
                 .unwrap();
             let (peeled, provenance) = peeler.peel_welcome_with_provenance(&message).await.unwrap();
             assert!(matches!(peeled.content, PeeledContent::Welcome { .. }));
+            let provenance = provenance.expect("Welcome has authenticated provenance");
             assert_eq!(provenance.rumor_event_id, expected);
             assert_eq!(provenance.key_package_event_id, [0x44; 32]);
         }

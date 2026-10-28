@@ -13,6 +13,11 @@ pub enum IngestOutcome {
     /// Message was validated, applied to the group's MLS state, and any
     /// resulting `GroupEvent`s were enqueued for `drain_events`.
     Processed,
+    /// Authenticated account-inbox control for the account runtime. The engine
+    /// has not applied it, persisted it as chat, or authorized group recovery.
+    GroupRecovery {
+        recovery: Box<crate::group_recovery::AuthenticatedGroupRecovery>,
+    },
     /// Message was accepted into durable storage but not yet applied because
     /// the group is temporarily not ingestible, usually during a local
     /// publish-before-apply transition. The engine replays buffered messages
@@ -270,6 +275,10 @@ pub struct PeeledMessage {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeeledContent {
+    /// Authenticated private account control, not MLS or a Welcome.
+    GroupRecovery {
+        recovery: Box<crate::group_recovery::AuthenticatedGroupRecovery>,
+    },
     /// Inner MLS message (commit, application, proposal, etc.) — engine
     /// decides how to apply.
     MlsMessage { bytes: Vec<u8> },

@@ -3904,11 +3904,11 @@ impl AppClient {
         let source_received_at = delivery.received_at.0;
         let group_id_hint = delivery.group_id_hint.clone();
         let reconciliation_record = transport_reconciliation_record(delivery);
-        let welcome = matches!(
+        let inbox = matches!(
             &delivery.message.envelope,
             TransportEnvelope::Welcome { .. }
         );
-        let probe_receive = if welcome && (client.audit_v5_enabled() || cfg!(test)) {
+        let probe_receive = if inbox && (client.audit_v5_enabled() || cfg!(test)) {
             client
                 .audit_v5_probe
                 .as_mut()
@@ -3920,12 +3920,12 @@ impl AppClient {
         // Hold the same account policy lock through admission and projection, so a
         // block cannot commit between authenticating the inviter and creating state.
         let policy_lock = client.app.block_update_lock(&client.state.label).await;
-        let _welcome_policy_guard = if welcome {
+        let _welcome_policy_guard = if inbox {
             Some(policy_lock.lock().await)
         } else {
             None
         };
-        if welcome {
+        if inbox {
             let storage = client
                 .app
                 .account_storage(&client.state.label)?
@@ -3941,18 +3941,18 @@ impl AppClient {
             // Dismissals stay authoritative after unblock. The installed app
             // peeler checks inviter policy after its one authenticated decode.
         }
-        let rejoin_offers_before = if welcome {
+        let rejoin_offers_before = if inbox {
             Some(client.rejoin_offer_snapshot()?)
         } else {
             None
         };
         let observation = client.app.product_analytics.begin(
-            if welcome {
+            if inbox {
                 crate::ProductFamily::Welcome
             } else {
                 crate::ProductFamily::MessageProcessing
             },
-            if welcome { "process" } else { "receive" },
+            if inbox { "process" } else { "receive" },
             crate::ProductUnit::Attempt,
         );
         let telemetry = client.runtime_telemetry.clone();
@@ -4032,9 +4032,12 @@ impl AppClient {
             });
         }
         if let Some(observation) = observation {
-            observation.finish(match &ingest {
+            let outcome = match &ingest {
                 Ok(effects) => match &effects.outcome {
-                    IngestOutcome::Processed => "success",
+                    IngestOutcome::Processed => Some("success"),
+                    // Authenticated control is neither an invitation metric nor
+                    // a reason to export a control-specific discriminator.
+                    IngestOutcome::GroupRecovery { .. } => None,
                     // Another device's Welcome delivery is one more copy of
                     // the account's invitation here, not a rejected Welcome.
                     IngestOutcome::Ignored {
@@ -4042,17 +4045,22 @@ impl AppClient {
                             cgka_traits::InputRejectionCategory::Duplicate
                             | cgka_traits::InputRejectionCategory::OwnEcho
                             | cgka_traits::InputRejectionCategory::NotAddressedToThisDevice,
-                    } => "duplicate",
+                    } => Some("duplicate"),
                     IngestOutcome::Buffered { .. }
                     | IngestOutcome::TransportDeferred { .. }
-                    | IngestOutcome::LocalState { .. } => "deferred",
-                    IngestOutcome::ResourceRefused { .. } => "capacity",
+                    | IngestOutcome::LocalState { .. } => Some("deferred"),
+                    IngestOutcome::ResourceRefused { .. } => Some("capacity"),
                     IngestOutcome::Ignored { .. }
                     | IngestOutcome::Stale { .. }
-                    | IngestOutcome::Rejected { .. } => "rejected",
+                    | IngestOutcome::Rejected { .. } => Some("rejected"),
                 },
-                Err(_) => "failure",
-            });
+                Err(_) => Some("failure"),
+            };
+            if let Some(outcome) = outcome {
+                observation.finish(outcome);
+            } else {
+                observation.discard();
+            }
         }
         let effects = ingest?;
         let queued = client.pending_applied_effects.len();

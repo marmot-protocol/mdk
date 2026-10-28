@@ -606,6 +606,13 @@ mod tests {
         struct OpaquePeeler(NostrMlsPeeler);
         #[async_trait::async_trait]
         impl TransportPeeler for OpaquePeeler {
+            async fn wrap_group_recovery(
+                &self,
+                message: &cgka_traits::GroupRecoveryMessage,
+                recipient: &MemberId,
+            ) -> Result<TransportMessage, PeelerError> {
+                self.0.wrap_group_recovery(message, recipient).await
+            }
             async fn peel_group_message(
                 &self,
                 _: &TransportMessage,
@@ -1686,6 +1693,13 @@ struct WelcomeWrapRefusalPeeler {
 #[cfg(test)]
 #[async_trait::async_trait]
 impl TransportPeeler for WelcomeWrapRefusalPeeler {
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner.wrap_group_recovery(message, recipient).await
+    }
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
@@ -3714,7 +3728,9 @@ impl HarnessClient {
                 payload: bytes,
                 ..msg.clone()
             }),
-            PeeledContent::Welcome { .. } => Err("group peeler returned a welcome".into()),
+            PeeledContent::Welcome { .. } | PeeledContent::GroupRecovery { .. } => {
+                Err("group peeler returned account-inbox content".into())
+            }
         }
     }
 }

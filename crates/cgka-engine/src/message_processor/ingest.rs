@@ -300,15 +300,22 @@ impl<S: StorageProvider> Engine<S> {
             });
         }
 
-        let prepared = self
-            .peeler
-            .peel_welcome(msg)
-            .await
-            .map_err(EngineError::Peeler)
-            .and_then(|peeled| {
-                let content_id = group_lifecycle::welcome_content_dedup_id(&peeled)?;
-                Ok((peeled, content_id))
-            });
+        let peeled = match self.peeler.peel_welcome(msg).await {
+            Ok(cgka_traits::ingest::PeeledMessage {
+                content: PeeledContent::GroupRecovery { recovery },
+                ..
+            }) => {
+                // Account control has no engine-owned durable disposition. The
+                // runtime must authorize and persist it before receipt dedup.
+                self.retryable_unpersisted_ingest_id = Some(msg.id.clone());
+                return Ok(IngestOutcome::GroupRecovery { recovery });
+            }
+            result => result.map_err(EngineError::Peeler),
+        };
+        let prepared = peeled.and_then(|peeled| {
+            let content_id = group_lifecycle::welcome_content_dedup_id(&peeled)?;
+            Ok((peeled, content_id))
+        });
         let content_id = prepared
             .as_ref()
             .ok()
@@ -969,8 +976,8 @@ impl<S: StorageProvider> Engine<S> {
         };
         let mls_bytes = match peeled.content {
             PeeledContent::MlsMessage { bytes } => bytes,
-            PeeledContent::Welcome { .. } => {
-                // A group-message envelope that peels to a Welcome is
+            PeeledContent::Welcome { .. } | PeeledContent::GroupRecovery { .. } => {
+                // A group-message envelope that peels to account-inbox content is
                 // malformed: terminal. Retire the raw deferred row first
                 // so its cap slot is released (mdk#339).
                 self.mark_raw_transport_message_failed_if_awaiting_retry(

@@ -226,7 +226,7 @@ pub struct Engine<S: StorageProvider> {
     /// Profile emitted by newly created KeyPackages and groups. Existing
     /// groups retain their independently persisted/wire-classified profile.
     pub(crate) new_protocol_profile: ProtocolProfile,
-    pub(crate) peeler: Box<dyn TransportPeeler>,
+    pub(crate) peeler: Arc<dyn TransportPeeler>,
     pub(crate) ciphersuite: Ciphersuite,
     pub(crate) max_past_epochs: usize,
     pub(crate) wall_clock: Arc<dyn WallClock>,
@@ -725,7 +725,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             supported_app_components: self.supported_app_components,
             device_tag_group: None,
             new_protocol_profile: self.new_protocol_profile,
-            peeler,
+            peeler: Arc::from(peeler),
             ciphersuite: self.ciphersuite,
             max_past_epochs: self.max_past_epochs,
             wall_clock: self.wall_clock,
@@ -4022,6 +4022,12 @@ impl<S: StorageProvider> Engine<S> {
         device_key_hash: &[u8; 32],
     ) -> Result<cgka_traits::group_recovery::GroupRecoverySource, EngineError> {
         self.do_group_recovery_source(group_id, member, device_key_hash)
+    }
+
+    /// Share the authenticated transport boundary with account-level control
+    /// workflows without moving their parsing or policy into the MLS engine.
+    pub fn transport_peeler(&self) -> Arc<dyn TransportPeeler> {
+        Arc::clone(&self.peeler)
     }
 
     pub fn safe_export_secret_with_epoch(

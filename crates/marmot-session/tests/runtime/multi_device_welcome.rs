@@ -232,6 +232,7 @@ async fn rumor(welcome: &TransportMessage, account: &[u8]) -> (MessageId, Vec<u8
     let PeeledContent::Welcome { bytes, .. } = peeled.content else {
         panic!("a Welcome rumor peels to Welcome content");
     };
+    let provenance = provenance.expect("Welcome has authenticated provenance");
     (
         MessageId::new(provenance.key_package_event_id.to_vec()),
         bytes,
@@ -365,6 +366,14 @@ struct ClaimlessPeeler(transport_nostr_peeler::NostrMlsPeeler);
 
 #[async_trait]
 impl TransportPeeler for ClaimlessPeeler {
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.0.wrap_group_recovery(message, recipient).await
+    }
+
     async fn peel_group_message(
         &self,
         msg: &TransportMessage,
