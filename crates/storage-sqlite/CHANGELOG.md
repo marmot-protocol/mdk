@@ -11,6 +11,8 @@
   from authenticated coordinator epochs, allowing a taller losing copy to rejoin.
   A durable one-shot remote rearm caps reservations at 64 between native/admin
   changes or explicit retry; epoch claims cannot refill the budget indefinitely.
+  Remote height claims are request-scoped, so nonce rotation can select a lower
+  winning source without replenishing cost or the spent refill.
   Older binaries reject
   the upgraded database; deleting a group also deletes its recovery jobs.
 - Migration 0121 advances account storage to schema 121 (mdk#2628). It drops

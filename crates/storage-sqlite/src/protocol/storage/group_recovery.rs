@@ -77,7 +77,7 @@ pub struct GroupRecoveryRecord {
     pub candidate_set_hash: Option<[u8; 32]>,
     /// Native epoch baseline for new local evidence, never a remote source floor.
     pub native_epoch: Option<EpochId>,
-    /// Highest authenticated selected-coordinator epoch observed in this episode.
+    /// Highest authenticated selected-coordinator epoch observed for this request.
     pub observed_epoch: Option<EpochId>,
     /// Remote epoch evidence has spent its one refill until local evidence or retry.
     #[serde(default)]

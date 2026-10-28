@@ -275,11 +275,9 @@ where
                                 if evidence { 0 } else { record.total_attempts };
                             replacement.native_epoch =
                                 Some(record.native_epoch.unwrap_or(state.epoch).max(state.epoch));
-                            replacement.observed_epoch = if evidence {
-                                None
-                            } else {
-                                record.observed_epoch
-                            };
+                            // A new nonce can select a lower winning source.
+                            // Keep its cost and spent refill, not the old claim.
+                            replacement.observed_epoch = None;
                             replacement.remote_rearmed = !evidence && record.remote_rearmed;
                             self.session
                                 .storage

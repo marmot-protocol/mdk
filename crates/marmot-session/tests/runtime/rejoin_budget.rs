@@ -200,6 +200,16 @@ async fn rejoin_retry_epoch_poison() {
     peers.recipient.prepare_group_recovery().unwrap();
     peers.recipient.advance_group_recovery().await.unwrap();
     peers.recipient.retry_group_rejoin(&peers.group).unwrap();
+    let honest = peers.adapter.publishes().last().unwrap().message.clone();
+    let accepted = peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob_id.clone(), honest))
+        .await
+        .unwrap();
+    assert!(
+        matches!(accepted.outcome, cgka_traits::IngestOutcome::Processed),
+        "explicit live-grant retry must immediately release the poisoned epoch floor"
+    );
     peers.wall.set(peers.wall.now().0 + 601);
     peers.coordinator.prepare_group_recovery().unwrap();
     exchange_recovery(&mut peers).await;
@@ -268,14 +278,33 @@ async fn rejoin_remote_epoch_budget() {
                 let selected = peers.recipient.prepare_group_recovery().unwrap();
                 peers.recipient.advance_group_recovery().await.unwrap();
                 if selected == vec![alice_id.clone()] {
-                    let request = recovery_control(
-                        b"cancel-alice",
-                        &peers.bob_adapter.publishes().last().unwrap().message,
-                    )
-                    .await
-                    .message;
+                    let carrier = peers
+                        .bob_adapter
+                        .publishes()
+                        .last()
+                        .unwrap()
+                        .message
+                        .clone();
+                    let request = recovery_control(b"cancel-alice", &carrier).await.message;
                     challenge.request_id = request.request_id;
                     challenge.expires_at = request.expires_at;
+                    peers
+                        .coordinator
+                        .ingest_delivery(&recovery_inbox_delivery(alice_id.clone(), carrier))
+                        .await
+                        .unwrap();
+                    peers.coordinator.prepare_group_recovery().unwrap();
+                    peers.coordinator.advance_group_recovery().await.unwrap();
+                    let honest = peers.adapter.publishes().last().unwrap().message.clone();
+                    let accepted = peers
+                        .recipient
+                        .ingest_delivery(&recovery_inbox_delivery(bob_id.clone(), honest))
+                        .await
+                        .unwrap();
+                    assert!(
+                        matches!(accepted.outcome, cgka_traits::IngestOutcome::Processed),
+                        "a new nonce must accept the coordinator's lower real source without refilling its budget"
+                    );
                     break;
                 }
             }

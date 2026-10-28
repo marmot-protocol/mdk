@@ -139,6 +139,8 @@ request to expire, leaving a live grant time to complete. Elapsed time and resta
 The journal keeps the native epoch baseline separate from its authenticated remote epoch high-water mark. A frozen
 losing branch can be taller than the winning branch: its height never rejects a coordinator's first Challenge or
 the resulting replacement Welcome. Native height is only a baseline for detecting fresh evidence.
+Remote epoch ordering belongs to the current request. A fresh nonce discards the old coordinator's height claim,
+allowing a lower winning source while retaining reservation cost and the spent one-shot refill.
 
 Requests expire after ten minutes; delays are 5, 15, 30, 60 and then 120 seconds, revisited by ordinary maintenance.
 Expiry rotates to the next candidate without resetting episode cost. A coordinator durably reserves a 600-second
