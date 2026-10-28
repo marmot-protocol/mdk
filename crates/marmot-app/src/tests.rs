@@ -23811,6 +23811,7 @@ async fn a_parked_convergence_pass_owes_hosts_one_notice_per_change() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_explicit_convergence_retry_whose_advance_fails_still_wakes_the_group() {
+    use cgka_traits::storage::ConvergencePassStorage;
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -23828,7 +23829,9 @@ async fn an_explicit_convergence_retry_whose_advance_fails_still_wakes_the_group
     client.fail_next_convergence_retry_advance = true;
     assert!(client.retry_group_convergence(&group_id).await.is_err());
     let pass = app
-        .convergence_pass_for_test("alice", &group_id)
+        .account_storage("alice")
+        .unwrap()
+        .convergence_pass(&group_id)
         .unwrap()
         .expect("the batch survives the failed advance");
     assert!(!pass.is_parked());
