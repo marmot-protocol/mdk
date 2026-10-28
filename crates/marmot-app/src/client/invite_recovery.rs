@@ -14,8 +14,10 @@ impl AppClient {
     /// Queue the host notification independently from the storage projection delta.
     pub(crate) fn mark_recovery_status_changed(&mut self, group_id: &GroupId) {
         self.mark_group_projection_dirty(group_id);
-        self.pending_recovery_status_updates
-            .insert(group_id.clone());
+        if self.host_may_see_group(group_id) {
+            self.pending_recovery_status_updates
+                .insert(group_id.clone());
+        }
     }
 
     /// Read only bounded offer metadata, without loading any MLS group.

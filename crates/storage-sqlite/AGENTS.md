@@ -57,6 +57,7 @@ reason in the PR description. A new table needs an owner in `src/base/table_owne
 | `src/app/recovery_health.rs` | Durable reports of unsuccessful automatic synchronization recovery. |
 | `src/app/transport/transport_reconciliation.rs` | Account-private NIP-77 set-reconciliation inventory. |
 | `src/app/pending_welcome_delivery.rs` | Durable pointer to a confirmed create/invite whose Welcome publish failed, for re-delivery (mdk#352). |
+| `src/app/device_groups.rs` | The account's device groups this device knows of and how it came to know each (mdk#2628 item 3.1); at most one row claims the account's. |
 | `src/app/local_submissions.rs` | Device-local submission identity and durable admission before engine work. |
 | `src/app/transport/agent_stream_sequences.rs` | Durable, fail-closed publisher sequence reservations for QUIC previews. |
 | `src/app/account_projection.rs` | Account-level event projection. |

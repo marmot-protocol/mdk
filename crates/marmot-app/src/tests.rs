@@ -3,6 +3,8 @@ mod account_devices_advertising;
 mod audit_ownership;
 #[cfg(feature = "test-policy-overrides")]
 mod canonical_membership;
+#[cfg(feature = "test-policy-overrides")]
+mod device_group;
 mod draft_lifecycle;
 mod follow_list_edits;
 mod group_lookup;

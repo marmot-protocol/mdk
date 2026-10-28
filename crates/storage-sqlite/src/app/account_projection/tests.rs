@@ -4869,6 +4869,17 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
         .app_storage()
         .record_app_event(&app_event("msg-aa", "aa", 10))
         .unwrap();
+    assert!(
+        store
+            .app_storage()
+            .insert_device_group(&crate::DeviceGroupRecord {
+                group_id_hex: "aa".into(),
+                trust: crate::DeviceGroupTrust::Untrusted,
+                key_package_ref_hex: None,
+                recorded_at: 1,
+            })
+            .unwrap()
+    );
     store
         .lock()
         .unwrap()
@@ -4895,6 +4906,7 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
     );
     assert!(!store.is_group_forgotten(&id).unwrap());
     assert!(store.list_groups().unwrap().contains(&id));
+    assert!(store.app_storage().device_group("aa").unwrap().is_some());
     assert_eq!(
         store
             .lock()
@@ -4923,6 +4935,7 @@ fn forget_group_local_is_atomic_and_prevents_protocol_resurrection() {
             .unwrap()
     );
     assert!(store.is_group_forgotten(&id).unwrap());
+    assert!(store.app_storage().device_group("aa").unwrap().is_none());
     assert!(
         store
             .app_storage()

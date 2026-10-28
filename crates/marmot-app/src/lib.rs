@@ -18,8 +18,8 @@ use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY, AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
 };
 use cgka_traits::app_components::{
-    ACCOUNT_DEVICES_COMPONENT_ID, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, NostrRoutingV1,
-    default_group_components,
+    ACCOUNT_DEVICES_COMPONENT_ID, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, DEVICE_ROSTER_COMPONENT_ID,
+    NostrRoutingV1, default_group_components,
 };
 #[allow(deprecated)]
 pub use cgka_traits::app_components::{
@@ -226,6 +226,9 @@ pub use cgka_traits::{
     PollProjection, PollType, PollVote, PollVotePage,
 };
 pub use client::AppClient;
+#[cfg(feature = "test-policy-overrides")]
+#[doc(hidden)]
+pub use client::device_group::ConfirmedDeviceLink;
 pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
     AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
@@ -5517,6 +5520,21 @@ impl MarmotApp {
         bootstrap_relays: Vec<TransportEndpoint>,
         method: &'static str,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        Ok(self
+            .fetch_validated_account_key_packages(label, bootstrap_relays, method)
+            .await?
+            .into_iter()
+            .map(account_key_package_record_from_fetched)
+            .collect())
+    }
+
+    /// The account's published KeyPackages, each validated, oldest first.
+    pub(crate) async fn fetch_validated_account_key_packages(
+        &self,
+        label: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        method: &'static str,
+    ) -> Result<Vec<nostr_directory::FetchedKeyPackage>, AppError> {
         let account = self.account_home().account(label)?;
         let account_id_hex = account.account_id_hex;
 
@@ -5574,9 +5592,7 @@ impl MarmotApp {
         let mut packages = Vec::new();
         for record in relay_records {
             match key_package_from_record(record) {
-                Ok(fetched) => {
-                    packages.push(account_key_package_record_from_fetched(fetched));
-                }
+                Ok(fetched) => packages.push(fetched),
                 Err(err) => {
                     tracing::warn!(
                         target: "marmot_app::key_packages",
@@ -7727,7 +7743,17 @@ impl MarmotApp {
         // through an admin's activation (item 2.4). Advertising it makes
         // leaves eligible and lets this device join groups that require it.
         components.insert(ACCOUNT_DEVICES_COMPONENT_ID);
+        if self.device_groups_enabled() {
+            components.insert(DEVICE_ROSTER_COMPONENT_ID);
+        }
         components.into_iter().collect()
+    }
+
+    /// Whether this device advertises the device roster and so can create and
+    /// join its account's device group. Off outside test-policy builds until
+    /// the roster's spec merges (mdk#2628 item 3.1).
+    pub(crate) fn device_groups_enabled(&self) -> bool {
+        cfg!(feature = "test-policy-overrides") && self.config.dev_device_groups
     }
 
     fn key_package_metadata_matches_current_support(

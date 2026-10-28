@@ -32,6 +32,17 @@ versioning through the workspace version in the root `Cargo.toml`.
   hold at most 20 devices, and each leaf-map entry belongs to a device or to a slot recorded as removed. Until the component's spec
   is adopted, only test-policy builds may advertise it. A release build can't create or join a device group, and it
   treats roster bytes in other groups as unknown data, so nothing ships the format.
+- `marmot-app` keeps an account's device group (mdk#2628 item 3.1). A confirmed device link creates it under the
+  group id the link chose, and the founding Add takes this account's own device only through the exact confirmed
+  KeyPackage. The device that created the group trusts it, and so does a device that joined through the Welcome a
+  confirmed link named. A Welcome into any other device group installs a group the device holds but never trusts.
+  No device group is ever a chat: it stays out of the chat list, invites, timelines and host events, while its
+  relay route stays live. Pairing doesn't reach the app yet, so only test-policy builds reach any of this, through
+  `MarmotAppConfig::dev_device_groups` and two hidden hooks.
+- The engine can create a group under a group id the host chose before the group exists
+  (`create_group_with_chosen_id_and_audit_context`), as a device link needs (mdk#2628). The id has 1 to 255 bytes.
+  An id that names any group this device holds, a removed or forgotten copy included, is refused before anything is
+  written.
 - The conformance simulator models `marmot.group.account-devices.v1` (0x800d) support per client (mdk#2628). Scenario
   IR v3 gains `set_account_devices_support`, `require_account_devices` and `expect_require_account_devices_error`, and
   vectors gain an `account_devices_state` expectation that checks the component's state rules on a client's exact

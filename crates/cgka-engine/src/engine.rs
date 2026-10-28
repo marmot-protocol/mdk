@@ -1243,6 +1243,31 @@ impl<S: StorageProvider> Engine<S> {
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
         context: Option<AuditEventContext>,
     ) -> Result<(GroupId, SendResult), EngineError> {
+        self.create_group_audited(req, optional_app_components, None, context)
+            .await
+    }
+
+    /// Create a group under `group_id`, chosen by the host before the group
+    /// exists, as a device link needs. The id has 1 to 255 bytes and names no
+    /// group this device holds in any state, removed or forgotten copies
+    /// included; otherwise this fails before anything is written.
+    pub async fn create_group_with_chosen_id_and_audit_context(
+        &mut self,
+        req: CreateGroupRequest,
+        group_id: GroupId,
+        context: Option<AuditEventContext>,
+    ) -> Result<(GroupId, SendResult), EngineError> {
+        self.create_group_audited(req, Vec::new(), Some(group_id), context)
+            .await
+    }
+
+    async fn create_group_audited(
+        &mut self,
+        req: CreateGroupRequest,
+        optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+        chosen_group_id: Option<GroupId>,
+        context: Option<AuditEventContext>,
+    ) -> Result<(GroupId, SendResult), EngineError> {
         let operation_id = self.next_audit_operation_id();
         let mut context = context.unwrap_or_default();
         context.operation_id = Some(operation_id);
@@ -1261,7 +1286,9 @@ impl<S: StorageProvider> Engine<S> {
         // The outcome rows below stay inside the scope: the trailing
         // `group_context` row carries no context of its own and inherits it.
         let mut engine = OperationAuditScope::enter(self, context.clone());
-        let result = engine.do_create_group(req, optional_app_components).await;
+        let result = engine
+            .do_create_group(req, optional_app_components, chosen_group_id)
+            .await;
         match &result {
             Ok((group_id, send_result)) => {
                 let mut outcome_context = context.clone();

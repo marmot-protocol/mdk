@@ -196,6 +196,15 @@ impl AppClient {
         let Some(group_id) = event_group_id(event) else {
             return Ok(None);
         };
+        // A device group is never projected, whatever its events say. Its
+        // join settles whether it is one.
+        if self.state_group_record(group_id).is_none()
+            && self.is_device_group(group_id)?
+            && (!matches!(event, cgka_traits::engine::GroupEvent::GroupJoined { .. })
+                || self.settle_held_device_group(group_id)?)
+        {
+            return Ok(Some(self.ensure_device_group_route(group_id)?));
+        }
         if batch_start_frontier.is_none() && self.state_group_record(group_id).is_some() {
             return Ok(None);
         }
@@ -251,6 +260,14 @@ impl AppClient {
 
     pub(crate) fn refresh_group(&mut self, group_id: &GroupId) {
         if self.state_group_record(group_id).is_none() {
+            match self.is_device_group(group_id) {
+                Ok(true) => {
+                    let _ = self.ensure_device_group_route(group_id);
+                    return;
+                }
+                Err(_) => return,
+                Ok(false) => {}
+            }
             match self.has_local_group_deletion_frontier(group_id) {
                 Ok(true) => {
                     let _ = self.ensure_local_deleted_group_route(group_id);
@@ -556,6 +573,11 @@ impl AppClient {
             changed |= self.reconcile_canonical_self_membership(&group_id)?;
             let group_id_hex = hex::encode(group_id.as_slice());
             if !projected.contains(group_id_hex.as_str()) {
+                // A restart settles a join an interrupted run never saw.
+                if self.is_device_group(&group_id)? && self.settle_held_device_group(&group_id)? {
+                    self.ensure_device_group_route(&group_id)?;
+                    continue;
+                }
                 if self
                     .app
                     .account_storage(&self.state.label)?
@@ -605,6 +627,7 @@ impl AppClient {
     /// Deferred runtime opens call this after their background hydration
     /// pipeline; eager clients call it before returning from open.
     pub(crate) fn reconcile_hydrated_account_state(&mut self) -> Result<(), AppError> {
+        self.reconcile_device_groups()?;
         if self.reconcile_live_engine_groups()? {
             self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         }
@@ -1440,6 +1463,7 @@ fn read_marker_error_code(error: &AppError) -> &'static str {
         AppError::DirectoryLookupIncomplete(_) => "read_marker_failed:directory_lookup_incomplete",
         AppError::GroupCreateIncludesCreator => "read_marker_failed:group_create_includes_creator",
         AppError::GroupInviteIncludesInviter => "read_marker_failed:group_invite_includes_inviter",
+        AppError::DeviceGroupRefused(_) => "read_marker_failed:device_group_refused",
         AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",
         AppError::GroupInviteNotPending => "read_marker_failed:group_invite_not_pending",
         AppError::CreatedGroupProjectionUnavailable(_) => {

@@ -143,6 +143,12 @@ pub enum AppError {
     /// account's other devices from published KeyPackages (mdk#2628 D14).
     #[error("invited members must not include the inviter")]
     GroupInviteIncludesInviter,
+    /// A device-group action was refused (mdk#2628 item 3.1): this device
+    /// does not advertise the roster, the confirmed KeyPackage is not this
+    /// account's published one, or the account already has a device group.
+    /// The reason is a fixed, identity-free code.
+    #[error("device group refused: {0}")]
+    DeviceGroupRefused(&'static str),
     #[error("unknown local group")]
     UnknownGroup(String),
     /// Invite acceptance requires a current, non-terminal membership projection
@@ -572,6 +578,7 @@ impl AppError {
             Self::DirectoryLookupIncomplete(_) => "directory_lookup_incomplete",
             Self::GroupCreateIncludesCreator => "group_create_includes_creator",
             Self::GroupInviteIncludesInviter => "group_invite_includes_inviter",
+            Self::DeviceGroupRefused(_) => "device_group_refused",
             Self::UnknownGroup(_) => "unknown_group",
             Self::GroupInviteNotPending => "group_invite_not_pending",
             Self::CreatedGroupProjectionUnavailable(_) => "created_group_projection_unavailable",

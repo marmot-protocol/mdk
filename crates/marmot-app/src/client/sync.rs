@@ -820,6 +820,7 @@ fn defer_event_projection(
     deferred_groups: &[GroupId],
     projected: bool,
     summary: &mut SyncSummary,
+    host_may_see_group: impl Fn(&GroupId) -> bool,
 ) -> bool {
     if projected
         || !event_group_id(event).is_some_and(|group_id| deferred_groups.contains(group_id))
@@ -830,7 +831,8 @@ fn defer_event_projection(
         event,
         cgka_traits::engine::GroupEvent::MessageReceived { .. }
             | cgka_traits::engine::GroupEvent::GroupJoined { .. }
-    ) {
+    ) && event_group_id(event).is_some_and(host_may_see_group)
+    {
         summary.events.push(crate::groups::host_group_event(event));
     }
     true
@@ -2167,6 +2169,7 @@ impl AppClient {
                 &progress.deferred_groups,
                 event_progress.projected,
                 summary,
+                |group_id| self.host_may_see_group(group_id),
             ) {
                 event_progress.completed = true;
                 continue;
@@ -4493,7 +4496,7 @@ impl AppClient {
     /// counts the relay-confirmed fruitless completions those arms produced
     /// ([`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`]). The detector latches
     /// `escalated` for the run either way, so a run reports once.
-    pub(super) fn report_epoch_stall_escalation(
+    pub(crate) fn report_epoch_stall_escalation(
         &mut self,
         group_id: &cgka_traits::GroupId,
         stalled_epoch: u64,
@@ -4512,12 +4515,14 @@ impl AppClient {
             "epoch-gap backfill armed repeatedly without recovering a group; escalating"
         );
         self.record_epoch_stall_backfill_escalated(group_id, stalled_epoch, arms);
-        self.pending_epoch_stall_escalations
-            .push(crate::EpochStallEscalation {
-                group_id: group_id.clone(),
-                stalled_epoch,
-                arms,
-            });
+        if self.host_may_see_group(group_id) {
+            self.pending_epoch_stall_escalations
+                .push(crate::EpochStallEscalation {
+                    group_id: group_id.clone(),
+                    stalled_epoch,
+                    arms,
+                });
+        }
     }
 
     /// Merge durable arms into their existing retry owners. Counters describe
@@ -7020,6 +7025,7 @@ impl AppClient {
                 &progress.deferred_groups,
                 event_progress.projected,
                 summary,
+                |group_id| self.host_may_see_group(group_id),
             ) {
                 event_progress.completed = true;
                 continue;

@@ -2843,6 +2843,7 @@ fn app_error(error: AppError) -> SubjectError {
         | AppError::GroupInviteNotPending
         | AppError::GroupCreateIncludesCreator
         | AppError::GroupInviteIncludesInviter
+        | AppError::DeviceGroupRefused(_)
         | AppError::GroupDisbanding(_)
         | AppError::GroupRemoved(_)
         | AppError::AgentStreamPublisher(_)

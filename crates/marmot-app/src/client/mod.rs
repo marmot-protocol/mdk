@@ -70,6 +70,7 @@ mod audit_recovery;
 mod audit_v5_app_update;
 pub(crate) mod audit_v5_probe;
 pub(crate) mod delivery_spill;
+pub(crate) mod device_group;
 pub(crate) mod epoch_stall;
 pub(crate) mod history_notices;
 mod invite_recovery;
@@ -2707,6 +2708,7 @@ impl AppClient {
         self.runtime
             .quarantined_groups()
             .into_iter()
+            .filter(|(group_id, _)| self.host_may_see_group(group_id))
             .map(|(group_id, reason)| AppQuarantinedGroup {
                 group_id_hex: hex::encode(group_id.as_slice()),
                 reason: reason.into(),
@@ -7066,9 +7068,10 @@ impl AppClient {
     /// those routes before the table goes live, because every caller hands it
     /// straight to the adapter (`activate_transport` / `sync_runtime_groups`),
     /// which would re-subscribe the removed group.
-    fn refresh_routing(&mut self) -> Result<(), AppError> {
+    pub(crate) fn refresh_routing(&mut self) -> Result<(), AppError> {
         let routing = self.app.routing_for(&self.state)?;
         self.preserve_local_deleted_group_routes(&routing)?;
+        self.preserve_device_group_routes(&routing)?;
         let mut snapshot = routing.snapshot();
         snapshot
             .group_routes
@@ -7101,6 +7104,9 @@ impl AppClient {
         effects: &marmot_session::AccountDeviceEffects,
     ) {
         for report in &effects.superseded_intents {
+            if !self.host_may_see_group(&report.group_id) {
+                continue;
+            }
             if report.outcome == cgka_traits::engine::SupersededIntentOutcome::ReinviteRequired {
                 self.mark_group_projection_dirty_hex(hex::encode(report.group_id.as_slice()));
                 // The app owns automatic fresh-material recovery; only terminal
@@ -7507,8 +7513,13 @@ impl AppClient {
     /// Drain the welcomes queued for re-delivery during the last create/invite,
     /// for the runtime worker to broadcast as `WelcomeDeliveryPending` events
     /// (mdk#352).
+    /// A device group's Welcomes stay out of these events; the startup retry
+    /// still redelivers them.
     pub(crate) fn take_pending_welcome_delivery_events(&mut self) -> Vec<PendingWelcomeDelivery> {
         std::mem::take(&mut self.pending_welcome_delivery_events)
+            .into_iter()
+            .filter(|pending| self.host_may_see_group_hex(&pending.group_id_hex))
+            .collect()
     }
 
     /// Prepare one bounded startup retry for every engine-authoritative
@@ -7632,6 +7643,7 @@ impl AppClient {
             .app_storage()
             .list_pending_welcome_deliveries()?
             .into_iter()
+            .filter(|record| self.host_may_see_group_hex(&record.group_id_hex))
             .map(|record| PendingWelcomeDelivery {
                 group_id_hex: record.group_id_hex,
                 message_id_hex: record.message_id_hex,

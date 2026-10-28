@@ -180,6 +180,11 @@ pub struct MarmotAppConfig {
     /// `test-policy-overrides`; restart tests use it to exercise the sole
     /// remaining post-canonical write boundary.
     pub dev_fail_create_local_projection: bool,
+    /// Dev/test-only switch that advertises the device roster
+    /// (`marmot.account.device-roster.v1`), so this device can create and join
+    /// its account's device group (mdk#2628 item 3.1). Honored only with
+    /// `test-policy-overrides` until the roster's spec merges.
+    pub dev_device_groups: bool,
     /// Dev/test-only override that fails invite local projection refresh.
     /// Honored only with `test-policy-overrides`; this proves a canonical
     /// invite still returns success and attempts Welcome fanout.
@@ -282,6 +287,7 @@ impl Default for MarmotAppConfig {
             dev_force_group_read_snapshot_failure: false,
             dev_fail_invite_welcome_intent: false,
             dev_fail_create_local_projection: false,
+            dev_device_groups: false,
             dev_fail_invite_local_refresh: false,
             dev_epoch_backfill_retry_backoff_ms: None,
             dev_epoch_stall_wedge_rearm_interval_ms: None,
@@ -451,6 +457,13 @@ impl MarmotAppConfig {
 
     pub fn with_dev_fail_create_local_projection(mut self, enabled: bool) -> Self {
         self.dev_fail_create_local_projection = enabled;
+        self
+    }
+
+    /// Advertise the device roster in test-policy builds. Normal builds ignore
+    /// this field.
+    pub fn with_dev_device_groups(mut self, enabled: bool) -> Self {
+        self.dev_device_groups = enabled;
         self
     }
 
