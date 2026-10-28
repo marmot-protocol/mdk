@@ -211,3 +211,76 @@ async fn pending_loss_keeps_live_boundaries_from_re_covering_it() {
         );
     }
 }
+
+/// Loss imported after a grant froze can lie inside the window its pass
+/// certified, so settlement must not restore that window's coverage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loss_imported_after_the_grant_froze_keeps_its_debt() {
+    let mut fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    let floor = unix_now_seconds().saturating_sub(30);
+    app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
+        .unwrap();
+    let grant = fixture
+        .client
+        .authorize_account_recovery(
+            None,
+            marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+        )
+        .await
+        .unwrap()
+        .expect("loss selects a grant");
+    // Newer loss, imported while the pass runs, before settlement.
+    app.record_account_delivery_loss_bounded("alice", 42, 2, unix_now_seconds(), Some(floor))
+        .unwrap();
+    fixture.client.synchronize_recovery_loss(&app).unwrap();
+    let certified = grant
+        .inventory
+        .iter()
+        .map(|window| &window.route)
+        .collect::<Vec<_>>();
+    assert!(!certified.is_empty());
+    fixture
+        .client
+        .record_comparison_coverage(&app, &grant, &certified, unix_now_seconds());
+    for route in routes(&fixture.client) {
+        assert!(
+            app.recovery_coverage_ranges(&route, &relay())
+                .unwrap()
+                .iter()
+                .all(|proved| proved.proof != RecoveryCoverageProof::Comparison),
+            "the stale pass records no certificate"
+        );
+    }
+    // A pass frozen after that loss records its certificates.
+    fixture
+        .client
+        .recovery_owner
+        .test_advance_to_retry(&fixture.storage);
+    drop(grant);
+    let fresh = fixture
+        .client
+        .authorize_account_recovery(
+            None,
+            marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+        )
+        .await
+        .unwrap()
+        .expect("the loss is still owed");
+    let certified = fresh
+        .inventory
+        .iter()
+        .map(|window| &window.route)
+        .collect::<Vec<_>>();
+    fixture
+        .client
+        .record_comparison_coverage(&app, &fresh, &certified, unix_now_seconds());
+    assert!(
+        routes(&fixture.client).iter().any(|route| app
+            .recovery_coverage_ranges(route, &relay())
+            .unwrap()
+            .iter()
+            .any(|proved| proved.proof == RecoveryCoverageProof::Comparison)),
+        "a current pass records its certificates"
+    );
+}

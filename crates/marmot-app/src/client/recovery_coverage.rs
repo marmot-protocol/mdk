@@ -244,12 +244,13 @@ impl AppClient {
     }
 
     /// A certified comparison covers its frozen window on each relay that
-    /// certifies the route.
-    fn record_comparison_coverage(
+    /// certifies the route, unless loss was imported after the grant froze:
+    /// that loss may lie inside the window, and its debt must stay.
+    pub(super) fn record_comparison_coverage(
         &self,
         app: &SqliteAppStorage,
         grant: &AttemptGrant,
-        compared: &[RouteComparison],
+        certified: &[&TransportReconciliationRoute],
         now: u64,
     ) {
         let required = grant
@@ -258,10 +259,13 @@ impl AppClient {
             .map(|window| relays(&window.required))
             .collect::<Vec<_>>();
         let mut slices = Vec::new();
-        for comparison in compared.iter().filter(|comparison| comparison.certified) {
-            for (window, required) in grant.inventory.iter().zip(&required).filter(|(window, _)| {
-                window.route == comparison.route && window.since <= window.until
-            }) {
+        for route in certified {
+            for (window, required) in grant
+                .inventory
+                .iter()
+                .zip(&required)
+                .filter(|(window, _)| &window.route == *route && window.since <= window.until)
+            {
                 for relay in required {
                     slices.push(RecoveryCoverageSlice {
                         route: &window.route,
@@ -273,8 +277,12 @@ impl AppClient {
                 }
             }
         }
-        if let Err(error) = app.record_recovery_coverage(&slices, now) {
-            log_failure("record_comparison_coverage", &error.into());
+        match app.record_recovery_coverage_at_loss_revision(&slices, now, grant.fence.loss_revision)
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(target: TARGET, method = "record_comparison_coverage",
+                routes = certified.len(), "newer loss supersedes the pass's certificates"),
+            Err(error) => log_failure("record_comparison_coverage", &error.into()),
         }
     }
 
@@ -287,7 +295,12 @@ impl AppClient {
         compared: &[RouteComparison],
     ) {
         let now = unix_now_seconds();
-        self.record_comparison_coverage(app, grant, compared, now);
+        let certified = compared
+            .iter()
+            .filter(|comparison| comparison.certified)
+            .map(|comparison| &comparison.route)
+            .collect::<Vec<_>>();
+        self.record_comparison_coverage(app, grant, &certified, now);
         match self.coverage_shadow_report(app).await {
             Ok(report) if report.disagreements() > 0 => {
                 tracing::info!(target: TARGET, method = "observe_recovery_coverage",

@@ -280,13 +280,21 @@ pub fn same_relay(left: &str, right: &str) -> bool {
 }
 
 /// One spelling per relay, so endpoint strings from different layers can key
-/// one ledger row: the parsed URL without a trailing slash, or the trimmed
-/// input when it does not parse. Parsing keeps a trailing slash as given.
+/// one ledger row: the parsed URL, or the trimmed input when it does not
+/// parse. Parsing keeps a root path's slash as given, so a bare root slash is
+/// dropped; any other path, slash included, still names its own endpoint.
 pub fn canonical_relay(endpoint: &str) -> String {
     let endpoint = endpoint.trim();
-    let parsed =
+    let mut parsed =
         RelayUrl::parse(endpoint).map_or_else(|_| endpoint.to_owned(), |url| url.to_string());
-    parsed.trim_end_matches('/').to_owned()
+    let authority = parsed.find("://").map_or(0, |index| index + 3);
+    if parsed[authority..]
+        .find('/')
+        .is_some_and(|slash| authority + slash + 1 == parsed.len())
+    {
+        parsed.pop();
+    }
+    parsed
 }
 
 /// The endpoints whose comparison certifies a recovery scope, chosen from the
@@ -667,6 +675,20 @@ mod tests {
             canonical_relay("wss://relay.example"),
             canonical_relay("wss://other.example")
         );
+        // A path names its own endpoint, with or without a trailing slash.
+        assert_ne!(
+            canonical_relay("wss://relay.example/feed"),
+            canonical_relay("wss://relay.example/feed/")
+        );
+        assert_ne!(
+            canonical_relay("wss://relay.example/feed"),
+            canonical_relay("wss://relay.example")
+        );
+        assert_ne!(
+            canonical_relay("wss://relay.example/?a=1"),
+            canonical_relay("wss://relay.example")
+        );
+        assert_eq!(canonical_relay("wss://"), "wss://");
     }
 
     #[test]

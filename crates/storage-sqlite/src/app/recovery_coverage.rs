@@ -267,6 +267,39 @@ impl SqliteAppStorage {
         })
     }
 
+    /// Record slices proved by work frozen at `loss_revision`, only while that
+    /// is still the account's loss revision. A loss imported since then may
+    /// fall inside the slices, so they are dropped and the debt the import
+    /// left stays. Returns whether the slices were recorded.
+    pub fn record_recovery_coverage_at_loss_revision(
+        &self,
+        slices: &[RecoveryCoverageSlice<'_>],
+        now_seconds: u64,
+        loss_revision: u64,
+    ) -> StorageResult<bool> {
+        if slices.is_empty() {
+            return Ok(true);
+        }
+        let expected = integer(loss_revision)?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let current: i64 = conn
+                .query_row_cached(
+                    "SELECT loss_revision FROM account_recovery_state WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .storage()?;
+            if current != expected {
+                return Ok(false);
+            }
+            for slice in slices {
+                record_slice(&conn, slice, now_seconds)?;
+            }
+            Ok(true)
+        })
+    }
+
     /// The routes need everything from `since_seconds` up to now. A goal only
     /// widens; an existing lower floor stays.
     pub fn widen_recovery_coverage_goals(
@@ -784,6 +817,37 @@ mod tests {
         );
         assert_eq!(app.recovery_coverage_goal(&route).unwrap(), Some(200));
         assert_eq!(app.recovery_coverage_goal_routes().unwrap(), vec![route]);
+    }
+
+    #[test]
+    fn fenced_slices_are_dropped_after_a_newer_loss() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let route = group(1);
+        let frozen = app.recovery_revision_fence().unwrap().loss_revision;
+        app.record_account_delivery_loss_bounded("alice", 41, 3, 1_000, Some(500))
+            .unwrap();
+        app.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(app.recovery_revision_fence().unwrap().loss_revision > frozen);
+        let slice = RecoveryCoverageSlice {
+            route: &route,
+            relay: RELAY_A,
+            since_seconds: 100,
+            until_seconds: 900,
+            proof: RecoveryCoverageProof::Comparison,
+        };
+        assert!(
+            !app.record_recovery_coverage_at_loss_revision(&[slice], 1_000, frozen)
+                .unwrap()
+        );
+        assert!(ranges(&app, &route, RELAY_A).is_empty());
+        let current = app.recovery_revision_fence().unwrap().loss_revision;
+        assert!(
+            app.record_recovery_coverage_at_loss_revision(&[slice], 1_000, current)
+                .unwrap()
+        );
+        assert_eq!(ranges(&app, &route, RELAY_A).len(), 1);
     }
 
     #[test]
