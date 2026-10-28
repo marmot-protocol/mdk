@@ -703,12 +703,14 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   survive notification-worker cancellation; owner cancellation retains credit through IO
   cleanup. Empty expiry creates no loss. Actual discarded ciphertext and real notification
   gaps retain separate loss evidence. A capture cut by its comparison deadline, or failed,
-  discards its own pages without new loss: they re-fetch a window the pending obligation
-  still owes, and a new loss would wipe that obligation's scope certificates so it could
-  never finish. That loss is deferred on the source, not dropped: a finished capture clears
-  it, and a reconnect, refusal, removal or execution failure records it, since the source
-  can then be admitted or retired without the capture. See design section 0 for the
-  limited native predicate.
+  discards what its source held without new loss, including copies the live REQ delivered
+  before the capture: the source stays unadmitted, the pending obligation still owes that
+  window, and a new loss would wipe that obligation's scope certificates so it could never
+  finish. That loss is deferred on the source, not dropped: a finished capture clears it,
+  and a reconnect, refusal, removal or execution failure records it, since the source can
+  then be admitted or retired without the capture. A parked obligation leaves it deferred
+  until one of those happens; the parked notice already reports that history as possibly
+  incomplete. See design section 0 for the limited native predicate.
 - Live cursor promotion (design section 6). A delivery the raised floor sends to the spill
   is volatile until its spill write commits; a stop in that window loses it until the
   startup comparison. Routing is by content, so the router cannot tell an unfloored
