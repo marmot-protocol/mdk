@@ -19,9 +19,10 @@ pub use observe::{
     RecoveryDemandTransition, RecoveryLossImport, RecoveryObligationState, RecoveryObligationStatus,
 };
 pub use plan::{
-    RECOVERY_PARK_AFTER_QUIET_PASSES, RecoveryEligibility, RecoveryEndpointCheckpoint,
-    RecoveryPassProgress, RecoveryReplayPlacement, RecoveryScopeCheckpoint, RecoveryScopeOutcome,
-    RecoveryScopePlan, RecoveryScopeToken, StoredRecoveryScope,
+    RECOVERY_PARK_AFTER_ATTEMPTS, RECOVERY_PARK_AFTER_QUIET_PASSES, RecoveryEligibility,
+    RecoveryEndpointCheckpoint, RecoveryPassProgress, RecoveryReplayPlacement,
+    RecoveryScopeCheckpoint, RecoveryScopeOutcome, RecoveryScopePlan, RecoveryScopeToken,
+    StoredRecoveryScope,
 };
 pub use stall::QualifiedRecoveryStallSample;
 
@@ -548,7 +549,13 @@ impl SqliteAppStorage {
             conn.execute_cached("UPDATE account_recovery_state SET route_snapshot=?1,route_revision=route_revision+?2 WHERE singleton=1",
                 params![snapshot.as_slice(),i64::from(changed)]).storage()?;
             if changed {
-                conn.execute_cached("UPDATE account_recovery_obligations SET eligibility=0 WHERE state=0", []).storage()?;
+                // A goal parked by its attempt cap waits for new loss or a
+                // dismissal, not for a route change elsewhere.
+                conn.execute_cached(
+                    "UPDATE account_recovery_obligations SET eligibility=0
+                     WHERE state=0 AND NOT (eligibility=4 AND recovery_attempts>=?1)",
+                    [sqlite_integer(RECOVERY_PARK_AFTER_ATTEMPTS)?],
+                ).storage()?;
             }
             Ok(changed)
         })
@@ -675,6 +682,7 @@ impl SqliteAppStorage {
             {
                 return Ok(false);
             }
+            plan::reset_recovery_attempts(&conn, &expected.obligations)?;
             conn.execute_cached(
                 "UPDATE account_recovery_state SET retry_ordinal=1,retry_recorded_at_ms=?1,
                  retry_delay_ms=?2,retry_not_before_ms=?3 WHERE singleton=1",

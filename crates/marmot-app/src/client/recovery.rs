@@ -670,6 +670,7 @@ impl AccountRecoveryOwner {
                     else {
                         return Err(FreezeError::Stale);
                     };
+                    storage.app_storage().count_recovery_attempt(id)?;
                     let demand = demands
                         .iter()
                         .find(|demand| demand.ticket.id == id)
@@ -2547,6 +2548,113 @@ mod tests {
                 .recovery_loss_watermarks("alice", storage_sqlite::RecoveryLossCause::Queue)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// An owner capture the pass cutoff always cuts (mdk#2660): each attempt
+    /// discards its pages without charging loss or a park streak, pacing
+    /// still backs off, and the attempt cap parks the goal, which a new wire
+    /// generation does not reopen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_capture_cut_every_attempt_parks_at_the_cap() {
+        let (_dir, app, relay, mut client) = native_fixture().await;
+        client.prepare_transport().await.unwrap();
+        relay
+            .acquisition_block
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let storage = app.account_storage("alice").unwrap();
+        let mut native = None;
+        let mut ordinal = 0;
+        for attempt in 1..=storage_sqlite::RECOVERY_PARK_AFTER_ATTEMPTS {
+            if let Some(id) = native {
+                assert_ne!(
+                    storage
+                        .app_storage()
+                        .recovery_obligation_status(id)
+                        .unwrap()
+                        .unwrap()
+                        .eligibility,
+                    storage_sqlite::RecoveryEligibility::NeedsDeepRepair,
+                    "a cut capture spends no park streak (attempt {attempt})"
+                );
+            }
+            client.recovery_owner.test_advance_to_retry(&storage);
+            let mut permit = ExplicitRecoveryPermit::default();
+            let grant = client
+                .authorize_account_recovery(
+                    Some(&mut permit),
+                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
+                )
+                .await
+                .unwrap()
+                .expect("the native goal is still owed");
+            assert!(!grant.replay_capture.is_empty());
+            native = grant
+                .plan()
+                .unwrap()
+                .iter()
+                .find(|obligation| {
+                    obligation.cause == storage_sqlite::RecoveryCause::SubscriptionReplay
+                })
+                .map(|obligation| obligation.id);
+            assert!(native.is_some());
+            let execution = client.begin_comparison_grant(&grant).await.unwrap();
+            let credit = Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .unwrap();
+            let mut job = crate::client::sync::ComparisonNetworkJob::start(
+                &client,
+                &grant,
+                credit,
+                tokio::time::Instant::now() + Duration::from_millis(200),
+                None,
+            )
+            .unwrap();
+            let (_credit, network) = job.wait().await.unwrap();
+            client
+                .admit_comparison_inline(None, grant, execution, network)
+                .await
+                .unwrap();
+            let retry = storage.app_storage().recovery_retry_state().unwrap();
+            assert!(retry.ordinal >= ordinal, "nothing resets pacing");
+            ordinal = retry.ordinal;
+        }
+        assert!(ordinal > 1);
+        let native = native.unwrap();
+        let parked = |storage: &SqliteAccountStorage| {
+            storage
+                .app_storage()
+                .recovery_obligation_status(native)
+                .unwrap()
+                .unwrap()
+                .eligibility
+                == storage_sqlite::RecoveryEligibility::NeedsDeepRepair
+        };
+        assert!(parked(&storage), "the attempt cap parks the goal");
+        assert!(
+            storage
+                .app_storage()
+                .recovery_loss_watermarks(
+                    "alice",
+                    storage_sqlite::RecoveryLossCause::NotificationConsumer
+                )
+                .unwrap()
+                .is_empty(),
+            "a cut capture charges no notification loss"
+        );
+        client.create_group("new native source", &[]).await.unwrap();
+        client.sync_runtime_groups().await.unwrap();
+        client.synchronize_native_replay().await.unwrap();
+        assert!(
+            parked(&storage),
+            "a new wire generation is not new evidence"
+        );
+        assert!(
+            client
+                .history_notices()
+                .unwrap()
+                .iter()
+                .any(|notice| { notice.cause == crate::HistoryNoticeCause::IncrementalHistory })
         );
     }
 
