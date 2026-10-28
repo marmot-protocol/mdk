@@ -1066,6 +1066,26 @@ impl AccountDeviceSession {
         Ok(CreateGroupEffects { group_id, effects })
     }
 
+    pub async fn create_group_with_chosen_id_and_audit_context(
+        &mut self,
+        req: CreateGroupRequest,
+        group_id: GroupId,
+        context: AuditEventContext,
+    ) -> SessionResult<CreateGroupEffects> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            method = "create_group_with_chosen_id",
+            invitee_count = req.members.len(),
+            "creating group under a chosen id"
+        );
+        let (group_id, result) = self
+            .engine
+            .create_group_with_chosen_id_and_audit_context(req, group_id, Some(context))
+            .await?;
+        let effects = self.collect_effects(vec![result]);
+        Ok(CreateGroupEffects { group_id, effects })
+    }
+
     pub async fn send(&mut self, intent: SendIntent) -> SessionResult<SessionEffects> {
         tracing::debug!(
             target: TRACE_TARGET,

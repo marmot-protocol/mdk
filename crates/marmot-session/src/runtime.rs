@@ -3115,6 +3115,21 @@ where
             .await?)
     }
 
+    /// Prepare creation of a group under a group id chosen before it exists,
+    /// as a device link needs. Publish the effects as for
+    /// [`Self::prepare_create_group_with_audit_context`].
+    pub async fn prepare_create_group_with_chosen_id_and_audit_context(
+        &mut self,
+        request: CreateGroupRequest,
+        group_id: GroupId,
+        context: AuditEventContext,
+    ) -> AccountResult<CreateGroupEffects> {
+        Ok(self
+            .session
+            .create_group_with_chosen_id_and_audit_context(request, group_id, context)
+            .await?)
+    }
+
     /// Publish effects returned by
     /// [`Self::prepare_create_group_with_audit_context`].
     pub async fn publish_prepared_session_effects_with_audit_context(

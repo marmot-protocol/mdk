@@ -1952,18 +1952,20 @@ fn deferral_skips_only_unprojected_events_of_deferred_groups() {
         &joined(&deferred),
         groups,
         false,
-        &mut summary
+        &mut summary,
+        |_| true
     ));
     assert!(summary.events.is_empty(), "an outbox event replays instead");
     assert!(
-        !defer_event_projection(&joined(&deferred), groups, true, &mut summary),
+        !defer_event_projection(&joined(&deferred), groups, true, &mut summary, |_| true),
         "a projected outbox event must stage its acknowledgement"
     );
     assert!(!defer_event_projection(
         &joined(&healthy),
         groups,
         false,
-        &mut summary
+        &mut summary,
+        |_| true
     ));
     assert!(summary.events.is_empty());
 
@@ -1971,7 +1973,8 @@ fn deferral_skips_only_unprojected_events_of_deferred_groups() {
         &quarantined,
         groups,
         false,
-        &mut summary
+        &mut summary,
+        |_| true
     ));
     assert_eq!(
         summary.events.len(),
@@ -1982,13 +1985,26 @@ fn deferral_skips_only_unprojected_events_of_deferred_groups() {
         &quarantined,
         groups,
         true,
-        &mut summary
+        &mut summary,
+        |_| true
     ));
     assert_eq!(
         summary.events.len(),
         1,
         "a projected event is not published twice"
     );
+
+    // A group the host may not see, the account's device group, is deferred
+    // like any other, but none of its events reach subscribers.
+    let mut summary = SyncSummary::default();
+    assert!(defer_event_projection(
+        &quarantined,
+        groups,
+        false,
+        &mut summary,
+        |_| false
+    ));
+    assert!(summary.events.is_empty());
 }
 
 /// A drained batch whose projection succeeds but whose checkpoint keeps

@@ -1,0 +1,492 @@
+//! The account's device group (mdk#2628 item 3.1): a hidden group holding
+//! only this account's devices, with their roster
+//! (`marmot.account.device-roster.v1`) as group state.
+//!
+//! - A device group is never a chat. It stays out of the chat list and every
+//!   projection, while its transport routes stay live so its commits arrive.
+//!   A group is one when the engine says it requires the roster, or when
+//!   `device_groups` records it.
+//! - This device trusts one only if it created it or joined it through the
+//!   Welcome a confirmed link named. Requiring the roster never makes a group
+//!   trusted, and holding the account key never authenticates a device.
+//! - The founding Add may hold this account's own device only through the
+//!   exact `KeyPackageRef` a confirmed link names (D14, D21).
+//!
+//! A confirmed link comes from device pairing. Until pairing reaches the app,
+//! only the test-policy hook supplies one.
+
+use cgka_traits::app_components::{
+    AppComponentData, DEVICE_ROSTER_COMPONENT_ID, DeviceEntryV1, DeviceRosterV1, DeviceSlotId,
+    NOSTR_ROUTING_COMPONENT_ID, encode_device_roster_v1, encode_nostr_routing_v1,
+};
+use cgka_traits::engine::CreateGroupRequest;
+use cgka_traits::storage::{GroupStorage as _, MaintenanceStorage as _, StorageError};
+use cgka_traits::{EpochId, Group, GroupId, TransportGroupSubscription};
+use storage_sqlite::{DeviceGroupRecord, DeviceGroupTrust};
+
+use super::{AppClient, UnpublishedWelcomeDelivery, UnpublishedWelcomeKind, group_is_terminal};
+use crate::{AppError, unix_now_seconds};
+
+/// A link both devices confirmed, as device pairing produces it.
+#[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfirmedDeviceLink {
+    /// The new device's published KeyPackage event.
+    pub key_package_event_id_hex: String,
+    /// That KeyPackage's `KeyPackageRef`, covered by the new device's
+    /// confirmation.
+    pub key_package_ref_hex: String,
+    /// The device group, covered by the existing device's confirmation. On a
+    /// first link the existing device chooses it before the group exists.
+    pub device_group_id: GroupId,
+}
+
+impl AppClient {
+    /// Whether `group_id` is a device group.
+    pub(crate) fn is_device_group(&self, group_id: &GroupId) -> Result<bool, AppError> {
+        if self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .device_group(&hex::encode(group_id.as_slice()))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        self.holds_device_group(group_id)
+    }
+
+    /// Whether the engine holds `group_id` as a group requiring the roster.
+    fn holds_device_group(&self, group_id: &GroupId) -> Result<bool, AppError> {
+        Ok(self
+            .stored_group(group_id)?
+            .is_some_and(|group| requires_roster(&group)))
+    }
+
+    /// The engine's durable record of `group_id`. Every device-group decision
+    /// reads it rather than the live group, which a deferred open has not
+    /// hydrated yet and a quarantine hides, so neither changes a verdict.
+    fn stored_group(&self, group_id: &GroupId) -> Result<Option<Group>, AppError> {
+        match self
+            .app
+            .account_storage(&self.state.label)?
+            .get_group(group_id)
+        {
+            Ok(group) => Ok(Some(group)),
+            Err(StorageError::NotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Whether the host may learn of `group_id`: never for a device group,
+    /// and never through a check that failed. Every host surface built from
+    /// engine or recovery state rather than the projection filters with this:
+    /// quarantine, history notices and their changes, epoch-stall
+    /// escalations, deferred events, recovery-status and superseded-change
+    /// updates, and Welcome redelivery.
+    pub(crate) fn host_may_see_group(&self, group_id: &GroupId) -> bool {
+        self.is_device_group(group_id)
+            .is_ok_and(|is_device_group| !is_device_group)
+    }
+
+    /// [`Self::host_may_see_group`] for a hex group id.
+    pub(crate) fn host_may_see_group_hex(&self, group_id_hex: &str) -> bool {
+        hex::decode(group_id_hex).is_ok_and(|bytes| self.host_may_see_group(&GroupId::new(bytes)))
+    }
+
+    /// The device group's current route, or none once the group is terminal
+    /// or unreadable. A device group never switches routes, so it keeps no
+    /// prior ones. A deferred open has not hydrated the group yet: it has no
+    /// route until the post-hydration reconcile installs one, and a routing
+    /// rebuild before then must not fail on it.
+    fn device_group_subscriptions(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<TransportGroupSubscription>, AppError> {
+        if group_is_terminal(&self.runtime, group_id)
+            || self.skips_quarantined_group_reads(group_id)
+        {
+            return Ok(Vec::new());
+        }
+        let routing = match self.nostr_routing_for_group(group_id) {
+            Ok(routing) => routing,
+            Err(error)
+                if matches!(
+                    error.as_engine_error(),
+                    Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+                ) =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(vec![routing.subscription(group_id)?])
+    }
+
+    /// Keep the device group's route live with no projection.
+    pub(crate) fn ensure_device_group_route(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        let subscriptions = self.device_group_subscriptions(group_id)?;
+        Ok(self.routing.replace_group_routes(group_id, subscriptions))
+    }
+
+    /// Add every device group's route to a rebuilt routing snapshot.
+    pub(crate) fn preserve_device_group_routes(
+        &self,
+        routing: &crate::AppTransportRouting,
+    ) -> Result<(), AppError> {
+        for group_id in self.runtime.live_group_ids()? {
+            if self.state_group_record(&group_id).is_none() && self.is_device_group(&group_id)? {
+                routing
+                    .replace_group_routes(&group_id, self.device_group_subscriptions(&group_id)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// The existing device's side of a confirmed link: create the device group
+    /// under the id the link chose, adding the new device's KeyPackage, the
+    /// one with the confirmed `KeyPackageRef` and no other.
+    ///
+    /// Refused unless this device advertises the roster, has no device group
+    /// of its own yet, and finds that KeyPackage published by this account.
+    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+    pub(crate) async fn create_device_group(
+        &mut self,
+        link: &ConfirmedDeviceLink,
+    ) -> Result<GroupId, AppError> {
+        if !self.app.device_groups_enabled() {
+            return Err(AppError::DeviceGroupRefused("roster_unsupported"));
+        }
+        // The id names no group this device holds, so a restart can take a
+        // held group under a `creating` row for this creation's. Nothing else
+        // reaches this client before the row is written.
+        if self.stored_group(&link.device_group_id)?.is_some() {
+            return Err(AppError::DeviceGroupRefused("device_group_exists"));
+        }
+        let account = self.app.account_home().account(&self.state.label)?;
+        let sibling = self
+            .app
+            .fetch_validated_account_key_packages(
+                &self.state.label,
+                Vec::new(),
+                "create_device_group",
+            )
+            .await?
+            .into_iter()
+            .find(|fetched| {
+                fetched.key_package_event_id == link.key_package_event_id_hex
+                    && fetched.key_package_ref_hex == link.key_package_ref_hex
+            })
+            .ok_or(AppError::DeviceGroupRefused("key_package_not_published"))?;
+        // The founding exception: this account's own device, through exactly
+        // the confirmed KeyPackage. Directory validation already bound the
+        // event's author to the credential; check the account and ref again
+        // on the bytes the engine adds.
+        let metadata = marmot_session::key_package_metadata(&sibling.key_package)
+            .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
+        if metadata.credential_identity_hex != account.account_id_hex
+            || metadata.key_package_ref_hex != link.key_package_ref_hex
+        {
+            return Err(AppError::DeviceGroupRefused("key_package_not_confirmed"));
+        }
+        let own_slot = self
+            .app
+            .account_storage(&self.state.label)?
+            .key_package_lifecycle()?
+            .map(|lifecycle| lifecycle.stable_slot_id)
+            .ok_or(AppError::DeviceGroupRefused("slot_unavailable"))?;
+        let own_slot = device_slot(&own_slot)?;
+        let sibling_slot = device_slot(&sibling.key_package_id)?;
+        if own_slot == sibling_slot {
+            return Err(AppError::DeviceGroupRefused("key_package_not_confirmed"));
+        }
+
+        let now = unix_now_seconds();
+        let mut roster = DeviceRosterV1::default();
+        roster.devices.insert(
+            own_slot,
+            DeviceEntryV1 {
+                linked_at: now,
+                ..DeviceEntryV1::default()
+            },
+        );
+        roster.devices.insert(
+            sibling_slot,
+            DeviceEntryV1 {
+                linked_at: now,
+                linked_by: Some(own_slot),
+                announced_key_package: Some(hex::decode(&link.key_package_ref_hex)?),
+                ..DeviceEntryV1::default()
+            },
+        );
+        let roster = encode_device_roster_v1(&roster)
+            .map_err(|_| AppError::DeviceGroupRefused("roster_invalid"))?;
+        let routing = encode_nostr_routing_v1(&self.app.new_nostr_routing(None)?)
+            .map_err(AppError::InvalidNostrRouting)?;
+        let request = CreateGroupRequest {
+            name: String::new(),
+            description: String::new(),
+            members: vec![sibling.key_package],
+            required_features: Vec::new(),
+            app_components: vec![
+                AppComponentData {
+                    component_id: NOSTR_ROUTING_COMPONENT_ID,
+                    data: routing,
+                },
+                AppComponentData {
+                    component_id: DEVICE_ROSTER_COMPONENT_ID,
+                    data: roster,
+                },
+            ],
+            initial_admins: Vec::new(),
+        };
+        self.refresh_member_inbox_routes(std::iter::once(account.account_id_hex.as_str()))?;
+
+        // Record the chosen id before the engine writes anything, so a crash
+        // between the two leaves a row a restart settles.
+        let group_id_hex = hex::encode(link.device_group_id.as_slice());
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        if !storage.insert_device_group(&DeviceGroupRecord {
+            group_id_hex: group_id_hex.clone(),
+            trust: DeviceGroupTrust::Creating,
+            key_package_ref_hex: Some(link.key_package_ref_hex.clone()),
+            recorded_at: now,
+        })? {
+            return Err(AppError::DeviceGroupRefused("device_group_exists"));
+        }
+        let audit_context = Self::local_human_action_context(
+            "create_device_group",
+            vec!["members"],
+            vec![NOSTR_ROUTING_COMPONENT_ID, DEVICE_ROSTER_COMPONENT_ID],
+            Some(1),
+        );
+        let prepared = match self
+            .runtime
+            .prepare_create_group_with_chosen_id_and_audit_context(
+                request,
+                link.device_group_id.clone(),
+                audit_context.clone(),
+            )
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                storage.delete_device_group(&group_id_hex, DeviceGroupTrust::Creating)?;
+                return Err(error.into());
+            }
+        };
+        let group_id = prepared.group_id;
+        // The group is canonical now, so nothing below may turn this into an
+        // error. A restart settles the row and reinstalls the route.
+        super::recover_post_canonical_result(
+            "record_created_device_group",
+            storage
+                .set_device_group_trust(
+                    &group_id_hex,
+                    DeviceGroupTrust::Creating,
+                    DeviceGroupTrust::Created,
+                    None,
+                    now,
+                )
+                .map(drop)
+                .map_err(AppError::from),
+        );
+        let welcome_intents = super::recover_post_canonical_result(
+            "prepare_device_group_welcome_delivery_index",
+            Self::founding_welcome_delivery_intent_ids(&prepared.effects),
+        );
+        self.unpublished_welcome_delivery = Some(UnpublishedWelcomeDelivery {
+            group_id: group_id.clone(),
+            audit_context,
+            kind: UnpublishedWelcomeKind::Founding {
+                effects: prepared.effects,
+                welcome_intents,
+            },
+        });
+        super::recover_post_canonical_result(
+            "install_device_group_route",
+            self.ensure_device_group_route(&group_id).map(drop),
+        );
+        Ok(group_id)
+    }
+
+    /// The new device's side of a confirmed link: trust the Welcome into the
+    /// device group it names. If that Welcome already arrived, the group this
+    /// device holds becomes trusted now. A link never names another group.
+    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+    pub(crate) fn record_confirmed_device_link(
+        &mut self,
+        link: &ConfirmedDeviceLink,
+    ) -> Result<(), AppError> {
+        if !self.app.device_groups_enabled() {
+            return Err(AppError::DeviceGroupRefused("roster_unsupported"));
+        }
+        let held = self.stored_group(&link.device_group_id)?;
+        if held.as_ref().is_some_and(|group| !requires_roster(group)) {
+            return Err(AppError::DeviceGroupRefused("device_group_exists"));
+        }
+        let group_id_hex = hex::encode(link.device_group_id.as_slice());
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let now = unix_now_seconds();
+        if storage.set_device_group_trust(
+            &group_id_hex,
+            DeviceGroupTrust::Untrusted,
+            DeviceGroupTrust::Linked,
+            Some(&link.key_package_ref_hex),
+            now,
+        )? {
+            return Ok(());
+        }
+        if !storage.insert_device_group(&DeviceGroupRecord {
+            group_id_hex,
+            trust: DeviceGroupTrust::AwaitingWelcome,
+            key_package_ref_hex: Some(link.key_package_ref_hex.clone()),
+            recorded_at: now,
+        })? {
+            return Err(AppError::DeviceGroupRefused("device_group_exists"));
+        }
+        // A crash can leave the joined group with no row; settle it now.
+        if held.is_some() {
+            self.settle_held_device_group(&link.device_group_id)?;
+        }
+        Ok(())
+    }
+
+    /// Settle the trust of a device group the engine holds, whether its
+    /// Welcome was just processed or a restart finds a join the app never saw.
+    /// It is trusted only as the one a confirmed link named; any other stays
+    /// untrusted and hidden.
+    ///
+    /// Returns whether the group is a device group. One that took the id a
+    /// link named without requiring the roster is not: the link's waiting row
+    /// goes, and the group projects as any other.
+    pub(crate) fn settle_held_device_group(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        let Some(group) = self.stored_group(group_id)? else {
+            return Ok(true);
+        };
+        if !requires_roster(&group) {
+            if storage.delete_device_group(&group_id_hex, DeviceGroupTrust::AwaitingWelcome)? {
+                tracing::warn!(
+                    target: "marmot_app::client::device_group",
+                    method = "settle_held_device_group",
+                    "a group without the roster took the id a confirmed link named; it is no device group"
+                );
+            }
+            return Ok(storage.device_group(&group_id_hex)?.is_some());
+        }
+        let now = unix_now_seconds();
+        if storage.set_device_group_trust(
+            &group_id_hex,
+            DeviceGroupTrust::AwaitingWelcome,
+            DeviceGroupTrust::Linked,
+            None,
+            now,
+        )? || storage.device_group(&group_id_hex)?.is_some()
+        {
+            return Ok(true);
+        }
+        storage.insert_device_group(&DeviceGroupRecord {
+            group_id_hex,
+            trust: DeviceGroupTrust::Untrusted,
+            key_package_ref_hex: None,
+            recorded_at: now,
+        })?;
+        tracing::warn!(
+            target: "marmot_app::client::device_group",
+            method = "settle_held_device_group",
+            "holds a device group no confirmed link named; it stays untrusted"
+        );
+        Ok(true)
+    }
+
+    /// Settle creations a restart interrupted. A row becomes `created` only
+    /// if the engine holds the group as this device created it: requiring the
+    /// roster, with a copy that began at epoch 0, where no Welcome-installed
+    /// copy begins. Otherwise the row goes, and a device group the engine
+    /// holds settles like any other held one.
+    pub(crate) fn reconcile_device_groups(&mut self) -> Result<(), AppError> {
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        for record in storage.device_groups()? {
+            if record.trust != DeviceGroupTrust::Creating {
+                continue;
+            }
+            let group_id = GroupId::new(hex::decode(&record.group_id_hex)?);
+            let created_here = self.stored_group(&group_id)?.is_some_and(|group| {
+                requires_roster(&group) && group.local_copy_install_epoch == EpochId(0)
+            });
+            if created_here {
+                storage.set_device_group_trust(
+                    &record.group_id_hex,
+                    DeviceGroupTrust::Creating,
+                    DeviceGroupTrust::Created,
+                    None,
+                    record.recorded_at,
+                )?;
+            } else {
+                storage.delete_device_group(&record.group_id_hex, DeviceGroupTrust::Creating)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Test-policy hook: act on `link` as the existing device, as if pairing
+    /// had confirmed it, and deliver the founding Welcome. Pairing does not
+    /// reach the app yet, so this is the only way to create a device group.
+    #[cfg(feature = "test-policy-overrides")]
+    #[doc(hidden)]
+    pub async fn dev_create_device_group(
+        &mut self,
+        link: ConfirmedDeviceLink,
+    ) -> Result<GroupId, AppError> {
+        let group_id = self.create_device_group(&link).await?;
+        self.drive_unpublished_welcome_delivery(None).await;
+        Ok(group_id)
+    }
+
+    /// Test-policy hook: act on `link` as the new device, as if pairing had
+    /// confirmed it.
+    #[cfg(feature = "test-policy-overrides")]
+    #[doc(hidden)]
+    pub fn dev_record_confirmed_device_link(
+        &mut self,
+        link: ConfirmedDeviceLink,
+    ) -> Result<(), AppError> {
+        self.record_confirmed_device_link(&link)
+    }
+
+    /// This account's device group, if this device trusts one.
+    #[cfg(all(test, feature = "test-policy-overrides"))]
+    pub(crate) fn trusted_device_group(&self) -> Result<Option<GroupId>, AppError> {
+        let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        storage
+            .device_groups()?
+            .into_iter()
+            .find(|record| record.trust.is_trusted())
+            .map(|record| Ok(GroupId::new(hex::decode(record.group_id_hex)?)))
+            .transpose()
+    }
+}
+
+fn requires_roster(group: &Group) -> bool {
+    group
+        .required_capabilities
+        .app_components
+        .contains(DEVICE_ROSTER_COMPONENT_ID)
+}
+
+/// A KeyPackage slot as the roster keys it: 32 bytes, the Nostr `d`.
+#[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+fn device_slot(slot_hex: &str) -> Result<DeviceSlotId, AppError> {
+    hex::decode(slot_hex)
+        .ok()
+        .and_then(|bytes| DeviceSlotId::try_from(bytes).ok())
+        .ok_or(AppError::DeviceGroupRefused("slot_unavailable"))
+}

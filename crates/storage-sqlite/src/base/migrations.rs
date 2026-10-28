@@ -262,6 +262,8 @@ mod migration_0122_push_join_window;
 mod migration_0123_recovery_coverage_ledger;
 #[path = "migrations/0124_recovery_attempt_cap.rs"]
 mod migration_0124_recovery_attempt_cap;
+#[path = "migrations/0125_device_groups.rs"]
+mod migration_0125_device_groups;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1026,6 +1028,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0124_recovery_attempt_cap",
         suspend_foreign_keys: &[],
         apply: migration_0124_recovery_attempt_cap::apply,
+    },
+    Migration {
+        version: 125,
+        name: "0125_device_groups",
+        suspend_foreign_keys: &[],
+        apply: migration_0125_device_groups::apply,
     },
 ];
 

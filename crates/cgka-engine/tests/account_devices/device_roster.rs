@@ -20,6 +20,7 @@ use cgka_traits::app_components::{
     DeviceRosterV1, DeviceSlotId, LeafMapKeyV1, RejectedSlotReasonV1, RejectedSlotV1,
     decode_device_roster_v1, encode_device_roster_update_v1, encode_device_roster_v1,
 };
+use cgka_traits::storage::GroupStorage as _;
 
 /// A device of `account` that advertises the device roster beside
 /// account-devices.
@@ -123,14 +124,7 @@ async fn found_device_group(
     }
     let (gid, created) = creator
         .engine
-        .create_group(CreateGroupRequest {
-            name: String::new(),
-            description: String::new(),
-            members: key_packages,
-            required_features: vec![],
-            app_components: vec![roster_component(initial)],
-            initial_admins: vec![],
-        })
+        .create_group(device_group_request(initial, key_packages))
         .await
         .unwrap();
     let SendResult::FoundingGroupCreated { welcomes } = created else {
@@ -140,6 +134,40 @@ async fn found_device_group(
         assert_joins(joiner, welcome, &gid, creator).await;
     }
     gid
+}
+
+/// The founding request of a device group holding `initial` and adding
+/// `key_packages`.
+fn device_group_request(
+    initial: &DeviceRosterV1,
+    key_packages: Vec<KeyPackage>,
+) -> CreateGroupRequest {
+    CreateGroupRequest {
+        name: String::new(),
+        description: String::new(),
+        members: key_packages,
+        required_features: vec![],
+        app_components: vec![roster_component(initial)],
+        initial_admins: vec![],
+    }
+}
+
+/// `creator` founds a device group under `chosen`, the id a device link
+/// chose before the group existed.
+async fn create_under(
+    creator: &mut Device,
+    initial: &DeviceRosterV1,
+    key_packages: Vec<KeyPackage>,
+    chosen: &GroupId,
+) -> Result<(GroupId, SendResult), EngineError> {
+    creator
+        .engine
+        .create_group_with_chosen_id_and_audit_context(
+            device_group_request(initial, key_packages),
+            chosen.clone(),
+            None,
+        )
+        .await
 }
 
 async fn phone_and_laptop() -> (Device, Device, GroupId) {
@@ -175,6 +203,90 @@ async fn a_device_group_holds_its_roster_from_creation() {
         assert!(requires_roster(device, &gid));
         assert_eq!(roster_of(device, &gid), expected);
     }
+}
+
+#[tokio::test]
+async fn a_device_group_is_created_under_the_id_its_link_chose() {
+    let mut phone = roster_device(b"alice");
+    let mut laptop = roster_device(b"alice");
+    let chosen = GroupId::new(vec![0x42; 16]);
+    let key_package = laptop.engine.fresh_key_package().await.unwrap();
+    let initial = roster(&[(1, "Phone"), (2, "Laptop")]);
+    let (gid, created) = create_under(&mut phone, &initial, vec![key_package], &chosen)
+        .await
+        .unwrap();
+    assert_eq!(gid, chosen);
+    let SendResult::FoundingGroupCreated { welcomes } = created else {
+        panic!("current-profile founding group")
+    };
+    assert_joins(&mut laptop, &welcomes[0], &chosen, &phone).await;
+    for device in [&phone, &laptop] {
+        assert!(requires_roster(device, &chosen));
+        assert_eq!(roster_of(device, &chosen), initial);
+    }
+}
+
+#[tokio::test]
+async fn a_chosen_group_id_names_no_group_the_device_holds() {
+    let (mut phone, mut laptop, gid) = phone_and_laptop().await;
+    let initial = roster(&[(1, "Phone")]);
+    let epoch = phone.engine.epoch(&gid).unwrap();
+    let held = roster_of(&phone, &gid);
+
+    // Live state: refused before anything is written, and the held group is
+    // untouched.
+    let refused = create_under(&mut phone, &initial, vec![], &gid).await;
+    assert!(
+        refused
+            .expect_err("the chosen id names a live group")
+            .to_string()
+            .contains("a group with the chosen id already exists")
+    );
+    assert_eq!(phone.engine.epoch(&gid).unwrap(), epoch);
+    assert_eq!(roster_of(&phone, &gid), held);
+
+    // A Marmot record with no live MLS state, as a removed or forgotten copy
+    // keeps: refused, and the record survives the refusal.
+    let mut fresh = roster_device(b"alice");
+    let record = phone.storage.get_group(&gid).unwrap();
+    fresh.storage.put_group(&record).unwrap();
+    let refused = create_under(&mut fresh, &initial, vec![], &gid).await;
+    assert!(
+        refused
+            .expect_err("the chosen id names a held record")
+            .to_string()
+            .contains("a group with the chosen id already exists")
+    );
+    assert_eq!(fresh.storage.get_group(&gid).unwrap(), record);
+
+    // A group this device forgot: refused, and it stays forgotten.
+    assert!(laptop.engine.forget_group_local(&gid).unwrap());
+    let refused = create_under(&mut laptop, &initial, vec![], &gid).await;
+    assert!(
+        refused
+            .expect_err("the chosen id names a forgotten group")
+            .to_string()
+            .contains("the chosen id names a group this device forgot")
+    );
+    assert!(laptop.storage.is_group_forgotten(&gid).unwrap());
+
+    // Lengths outside 1 to 255 bytes.
+    for len in [0, 256] {
+        let refused =
+            create_under(&mut laptop, &initial, vec![], &GroupId::new(vec![7; len])).await;
+        assert!(
+            refused
+                .expect_err("the chosen id has a bad length")
+                .to_string()
+                .contains("a chosen group id has 1 to 255 bytes"),
+            "{len} bytes"
+        );
+    }
+    let longest = GroupId::new(vec![7; 255]);
+    let (created, _) = create_under(&mut laptop, &initial, vec![], &longest)
+        .await
+        .expect("255 bytes is allowed");
+    assert_eq!(created, longest);
 }
 
 #[tokio::test]

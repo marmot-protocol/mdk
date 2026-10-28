@@ -274,13 +274,62 @@ impl<S: StorageProvider> Drop for NewGroupCleanupGuard<S> {
     }
 }
 
+/// The longest group id a host may choose: the bound a device-roster
+/// leaf-map key puts on the group ids it names.
+pub(crate) const MAX_CHOSEN_GROUP_ID_LEN: usize = 255;
+
 impl<S: StorageProvider> Engine<S> {
-    /// Implementation of `CgkaEngine::create_group`.
+    /// A chosen group id must name no group this device holds in any state.
+    /// OpenMLS refuses an id with live state on its own, but a removed or
+    /// forgotten copy can keep a Marmot record without it, and the cleanup
+    /// guard of a failed creation would delete that record.
+    fn ensure_chosen_group_id_is_free(&self, group_id: &GroupId) -> Result<(), EngineError> {
+        if !(1..=MAX_CHOSEN_GROUP_ID_LEN).contains(&group_id.as_slice().len()) {
+            return Err(EngineError::Other(format!(
+                "a chosen group id has 1 to {MAX_CHOSEN_GROUP_ID_LEN} bytes"
+            )));
+        }
+        match self.storage.get_group(group_id) {
+            Ok(_) => {
+                return Err(EngineError::Other(
+                    "a group with the chosen id already exists".into(),
+                ));
+            }
+            Err(cgka_traits::storage::StorageError::NotFound) => {}
+            Err(error) => return Err(error.into()),
+        }
+        // A forgotten id refuses every later record of the group, so a
+        // creation under one would leave MLS state no record can join.
+        if self.storage.is_group_forgotten(group_id)? {
+            return Err(EngineError::Other(
+                "the chosen id names a group this device forgot".into(),
+            ));
+        }
+        let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, self.storage.mls_storage());
+        let live = MlsGroup::load(
+            provider.storage(),
+            &openmls::group::GroupId::from_slice(group_id.as_slice()),
+        )
+        .map_err(|error| EngineError::Backend(format!("load: {error:?}")))?;
+        if live.is_some() {
+            return Err(EngineError::Other(
+                "a group with the chosen id already exists".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Implementation of `CgkaEngine::create_group`, optionally under a group
+    /// id the host chose.
     pub(crate) async fn do_create_group(
         &mut self,
         req: CreateGroupRequest,
         optional_app_components: Vec<cgka_traits::app_components::AppComponentData>,
+        chosen_group_id: Option<GroupId>,
     ) -> Result<(GroupId, SendResult), EngineError> {
+        if let Some(group_id) = &chosen_group_id {
+            self.ensure_chosen_group_id_is_free(group_id)?;
+        }
         // 1. Validate invitees against required capabilities.
         let crate::key_package::CreationKeyPackageCapabilities {
             required: mut required_caps,
@@ -471,12 +520,21 @@ impl<S: StorageProvider> Engine<S> {
         // crash or write fault cannot leave a partial, undiscoverable group.
         let mut mls_group = self.storage.with_transaction(|storage| {
             let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
-            let group = MlsGroup::new(
-                &provider,
-                &self.identity.signer,
-                &group_config,
-                self.identity.credential_with_key.clone(),
-            )
+            let group = match &chosen_group_id {
+                Some(group_id) => MlsGroup::new_with_group_id(
+                    &provider,
+                    &self.identity.signer,
+                    &group_config,
+                    openmls::group::GroupId::from_slice(group_id.as_slice()),
+                    self.identity.credential_with_key.clone(),
+                ),
+                None => MlsGroup::new(
+                    &provider,
+                    &self.identity.signer,
+                    &group_config,
+                    self.identity.credential_with_key.clone(),
+                ),
+            }
             .map_err(|e| EngineError::Backend(format!("group new: {e:?}")))?;
             crate::app_components::validate_current_profile_group_invariants(&group)?;
             Ok::<MlsGroup, EngineError>(group)

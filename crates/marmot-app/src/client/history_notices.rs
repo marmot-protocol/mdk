@@ -21,8 +21,14 @@ impl AppClient {
             .app_storage()
             .parked_recovery_obligations()?
             .iter()
+            .filter(|parked| self.host_may_see_parked(parked.group_id.as_deref()))
             .map(history_notice)
             .collect())
+    }
+
+    /// A group-scoped occurrence reaches the host only for a group it may see.
+    fn host_may_see_parked(&self, group_id: Option<&[u8]>) -> bool {
+        group_id.is_none_or(|group_id| self.host_may_see_group(&GroupId::new(group_id.to_vec())))
     }
 
     /// Notice ids of this group's own parked occurrences, oldest first.
@@ -186,7 +192,13 @@ impl AppClient {
             .collect::<Vec<_>>();
         groups.sort();
         groups.dedup();
-        Some(groups.into_iter().map(GroupId::new).collect())
+        Some(
+            groups
+                .into_iter()
+                .map(GroupId::new)
+                .filter(|group_id| self.host_may_see_group(group_id))
+                .collect(),
+        )
     }
 }
 

@@ -4,6 +4,13 @@
 
 ### Breaking changes
 
+- Migration 0125 advances account storage to schema 125 (mdk#2628 item 3.1).
+  It adds `device_groups`, one row per device group this device knows of, with
+  how it came to know it: `creating`, `created`, `awaiting_welcome`, `linked`
+  or `untrusted`. `SqliteAppStorage` gains `device_group`, `device_groups`,
+  `insert_device_group`, `set_device_group_trust` and `delete_device_group`.
+  At most one row claims the account's device group. A local forget removes
+  the group's row. No rows are seeded.
 - Migration 0121 advances account storage to schema 121 (mdk#2628). It drops
   `cgka_member_capabilities`, the engine's per-account capability cache: with
   several devices per account, one device's capabilities stood in for all of
