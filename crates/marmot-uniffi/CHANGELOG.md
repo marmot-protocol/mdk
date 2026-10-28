@@ -26,6 +26,11 @@
 
 ### Added
 
+- `AppGroupMlsStateFfi.convergence_parked` (default `false`) reports a group
+  whose convergence pass spent its failure budget (mdk#2684). Show it as stuck
+  syncing; `retry_group_convergence` grants one more attempt. Regenerate
+  bindings with the matching native library.
+
 - An admin can turn on account-devices in an existing group (mdk#2628):
   `enable_account_devices(account_ref, group_id_hex)` sends one admin Commit,
   only when the user asks, and the group can never turn it off.

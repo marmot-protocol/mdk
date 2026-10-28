@@ -259,7 +259,9 @@ async fn a_failing_convergence_pass_backs_off_then_parks_after_its_budget() {
         );
         assert_eq!(case.scheduled_delay_ms(), Some(expected_delay));
         assert_eq!(
-            case.carol.deferred_peel_cutoff_delay_ms(&case.group_id).unwrap(),
+            case.carol
+                .deferred_peel_cutoff_delay_ms(&case.group_id)
+                .unwrap(),
             None,
             "deferred rows must not wake the host ahead of the backoff"
         );
@@ -322,7 +324,11 @@ async fn a_failing_convergence_pass_backs_off_then_parks_after_its_budget() {
         ALWAYS - case.fault.remaining(),
         CONVERGENCE_PASS_PARK_AFTER_FAILURES as usize
     );
-    let stored = case.handle.convergence_pass(&case.group_id).unwrap().unwrap();
+    let stored = case
+        .handle
+        .convergence_pass(&case.group_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(stored.phase, ConvergencePassPhase::Resolving);
 
     drop(case.carol);
@@ -343,11 +349,8 @@ async fn a_failing_convergence_pass_backs_off_then_parks_after_its_budget() {
             .collect();
     let failed = (ConvergencePhase::Failed, "pass_failed:apply".to_string());
     let parked = (ConvergencePhase::Blocked, "pass_parked:apply".to_string());
-    let mut expected: Vec<_> = std::iter::repeat_n(
-        failed,
-        CONVERGENCE_PASS_PARK_AFTER_FAILURES as usize - 1,
-    )
-    .collect();
+    let mut expected: Vec<_> =
+        std::iter::repeat_n(failed, CONVERGENCE_PASS_PARK_AFTER_FAILURES as usize - 1).collect();
     expected.push(parked);
     assert_eq!(
         reasons
@@ -442,7 +445,11 @@ async fn an_explicit_retry_grants_one_attempt_and_a_failure_parks_again() {
     let result = case.attempt().expect("the retried pass applies");
     assert_eq!(result.convergence_status, ConvergenceStatus::Settled);
     assert_eq!(case.carol.epoch(&case.group_id).unwrap(), EpochId(2));
-    let completed = case.handle.convergence_pass(&case.group_id).unwrap().unwrap();
+    let completed = case
+        .handle
+        .convergence_pass(&case.group_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(completed.phase, ConvergencePassPhase::Completed);
     assert_eq!(completed.retry, None);
     assert!(
@@ -486,6 +493,7 @@ async fn a_failed_pass_keeps_its_backoff_and_park_across_a_restart() {
     case.restart(60 * 60 * 1_000);
     assert!(case.carol.convergence_pass_parked(&case.group_id).unwrap());
     assert_eq!(case.scheduled_delay_ms(), None);
-    case.attempt().expect("a parked pass stays parked after restart");
+    case.attempt()
+        .expect("a parked pass stays parked after restart");
     assert_eq!(ALWAYS - case.fault.remaining(), failures);
 }

@@ -305,15 +305,11 @@ impl<S: StorageProvider> Engine<S> {
             // or an explicit retry wakes it (mdk#2684). It still gates every
             // later arm, as any active pass does.
             Some(pass) if pass.is_parked() => None,
-            Some(pass) if pass.is_active() => Some(
-                pass.retry
-                    .as_ref()
-                    .map_or(0, |retry| {
-                        retry
-                            .next_attempt_monotonic_ms
-                            .saturating_sub(now.monotonic_ms)
-                    }),
-            ),
+            Some(pass) if pass.is_active() => Some(pass.retry.as_ref().map_or(0, |retry| {
+                retry
+                    .next_attempt_monotonic_ms
+                    .saturating_sub(now.monotonic_ms)
+            })),
             // RawTransport applications do not open a convergence pass. A
             // failed post-confirmation replay still needs a scheduler edge,
             // after existing pass deadlines and pending-publication gates.
@@ -358,7 +354,10 @@ impl<S: StorageProvider> Engine<S> {
     /// and keeps the failure count, so a parked batch that fails again parks
     /// again at once instead of starting a fresh budget. Returns whether a
     /// failed batch was due for it.
-    pub fn retry_failed_convergence_pass(&mut self, group_id: &GroupId) -> Result<bool, StorageError> {
+    pub fn retry_failed_convergence_pass(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, StorageError> {
         let Some(mut pass) = self.storage.convergence_pass(group_id)? else {
             return Ok(false);
         };

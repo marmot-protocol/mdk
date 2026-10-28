@@ -2497,6 +2497,11 @@ typedef struct MarmotAppGroupMlsState {
   char **disbanding_blockers;
   uintptr_t disbanding_blockers_len;
   struct MarmotDisbandRequest *disband_request;
+  /**
+   * Convergence stopped retrying a batch that kept failing; new
+   * input or `marmot_retry_group_convergence` resumes it.
+   */
+  bool convergence_parked;
 } MarmotAppGroupMlsState;
 
 /**

@@ -10650,6 +10650,47 @@ mod tests {
         );
     }
 
+    /// A frozen batch that failed reports its retry delay as a collecting wait
+    /// (mdk#2684). Other groups take the worker's turns meanwhile, and a parked
+    /// batch leaves no deadline at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_convergence_pass_waits_out_its_retry_behind_other_groups() {
+        let failing = test_group_id(43);
+        let other = test_group_id(44);
+        let retry_after = Duration::from_secs(16);
+        let mut scheduled = ScheduledConvergence::new(Duration::ZERO);
+
+        // The failed attempt arms the worker's error backoff; the wake it
+        // gives finds the batch still waiting and re-arms at its retry time.
+        scheduled.schedule_retry_groups([failing.clone()]);
+        tokio::time::advance(retry_delay_for_attempt(1)).await;
+        assert_eq!(scheduled.take_ready(), Some(failing.clone()));
+        scheduled.schedule_after_pass(
+            &failing,
+            ConvergenceScheduleState::Collecting {
+                remaining_ms: retry_after.as_millis() as u64,
+            },
+        );
+        for _ in 0..3 {
+            scheduled.schedule_after_pass(&other, ConvergenceScheduleState::Ready);
+            tokio::time::advance(MIN_CONVERGENCE_SETTLEMENT_DELAY).await;
+            assert!(scheduled.has_ready());
+            assert_eq!(scheduled.take_ready(), Some(other.clone()));
+        }
+        assert!(!scheduled.has_ready());
+        assert!(!scheduled.retry_attempts.contains_key(&failing));
+
+        tokio::time::advance(
+            retry_after + Duration::from_millis(CONVERGENCE_SETTLEMENT_SCHEDULE_MARGIN_MS),
+        )
+        .await;
+        assert_eq!(scheduled.take_ready(), Some(failing.clone()));
+        // Out of budget: the parked batch reports no work and keeps no timer.
+        scheduled.schedule_after_pass(&failing, ConvergenceScheduleState::Idle);
+        assert!(scheduled.deadlines.is_empty());
+        assert_eq!(scheduled.take_ready(), None);
+    }
+
     /// A runnable retained replay wakes once; failures use bounded error
     /// backoff rather than repeatedly rearming the short Ready deadline.
     #[tokio::test(start_paused = true)]

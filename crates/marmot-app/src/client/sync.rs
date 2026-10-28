@@ -927,7 +927,9 @@ impl AppClient {
                     // publications keep their own retry wake.
                     return Ok(if self.runtime.has_pending_outbound_fanouts(group_id)? {
                         ConvergenceScheduleState::PendingOutbound {
-                            retry_after_ms: self.runtime.outbound_fanout_retry_delay_ms(group_id)?,
+                            retry_after_ms: self
+                                .runtime
+                                .outbound_fanout_retry_delay_ms(group_id)?,
                         }
                     } else {
                         ConvergenceScheduleState::Idle

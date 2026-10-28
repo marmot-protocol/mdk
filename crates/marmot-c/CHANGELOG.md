@@ -15,6 +15,11 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `MarmotAppGroupMlsState` gains a trailing `convergence_parked` field for a
+  group whose convergence pass spent its failure budget (mdk#2684). Show it as
+  stuck syncing; `marmot_retry_group_convergence` grants one more attempt.
+  The struct grows, so use matching regenerated headers and libraries.
+
 - `marmot_account_devices_activation` and `marmot_enable_account_devices` let
   an admin turn on account-devices in an existing group, only when the user
   asks (mdk#2628). The first writes a `MarmotAccountDevicesActivation` that
