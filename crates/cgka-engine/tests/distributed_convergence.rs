@@ -52,6 +52,8 @@ mod delivered_witnesses;
 mod encrypted_media_source_secret;
 #[path = "distributed_convergence/historical_application_sender.rs"]
 mod historical_application_sender;
+#[path = "distributed_convergence/phantom_own_commit_branch.rs"]
+mod phantom_own_commit_branch;
 mod support;
 use support::proof_signer;
 

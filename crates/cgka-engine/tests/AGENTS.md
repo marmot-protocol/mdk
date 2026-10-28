@@ -86,6 +86,12 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     epoch's delivered ones for its sender's receive ratchet, and SQLite's content-filtered listing leaves out exactly
     what the engine's own projection of real messages would.
 
+- **File:** `distributed_convergence/phantom_own_commit_branch.rs`
+  - **Owns:** An own-commit checkpoint never restores after a sibling of the parent it was built on (mdk#2657): a
+    parked own commit and the canonical rival at its epoch yield one branch per tip commit, and a pass whose tie
+    would pick the phantom still applies on its first attempt. Also an ignored measurement of host advances and
+    wall time to the first delivered message over a widened group.
+
 - **File:** `distributed_convergence/encrypted_media_source_secret.rs`
   - **Owns:** A replayed media application carries its source-epoch encrypted-media secret on `MessageReceived`
     even when the same pass advances past the anchor horizon and prunes that epoch's retained anchor.
