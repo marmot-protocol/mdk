@@ -1129,6 +1129,109 @@ async fn member_recovery_needs_proof() {
 }
 
 #[tokio::test]
+async fn recovery_binds_coordinator() {
+    let (mut target, target_storage, coordinator, mut sibling, group_id, _) =
+        member_recovery_fixture().await;
+    assert_eq!(coordinator.self_id(), sibling.self_id());
+    let target_key = target.own_recovery_key_hash(&group_id).unwrap();
+    let source = coordinator
+        .group_recovery_source(&group_id, &target.self_id(), &target_key)
+        .unwrap();
+    let grant = signed_member_recovery(
+        &target_storage,
+        &group_id,
+        &coordinator.self_id(),
+        &target.self_id(),
+        source,
+        target.fresh_key_package().await.unwrap(),
+    );
+    coordinator
+        .validate_member_recovery(&group_id, &grant)
+        .unwrap();
+    assert!(matches!(
+        sibling.validate_member_recovery(&group_id, &grant),
+        Err(EngineError::GroupRecoverySourceMismatch { .. })
+    ));
+    let sibling_source = sibling
+        .group_recovery_source(&group_id, &target.self_id(), &target_key)
+        .unwrap();
+    let mut retargeted = grant.clone();
+    retargeted.source = sibling_source.clone();
+    assert!(matches!(
+        sibling.validate_member_recovery(&group_id, &retargeted),
+        Err(EngineError::GroupRecoverySourceMismatch { .. })
+    ));
+    assert!(matches!(
+        sibling
+            .send(SendIntent::RecoverMembers {
+                group_id: group_id.clone(),
+                members: vec![grant],
+            })
+            .await,
+        Err(EngineError::GroupRecoverySourceMismatch { .. })
+    ));
+    let sibling_grant = signed_member_recovery(
+        &target_storage,
+        &group_id,
+        &sibling.self_id(),
+        &target.self_id(),
+        sibling_source,
+        target.fresh_key_package().await.unwrap(),
+    );
+    sibling
+        .validate_member_recovery(&group_id, &sibling_grant)
+        .unwrap();
+    assert!(matches!(
+        coordinator.validate_member_recovery(&group_id, &sibling_grant),
+        Err(EngineError::GroupRecoverySourceMismatch { .. })
+    ));
+}
+
+#[tokio::test]
+async fn recovery_legacy_coordinator() {
+    let (mut admin, storage) = build_with_storage(b"recovery-legacy-admin");
+    let mut target = build_client(b"recovery-legacy-target");
+    let (group_id, created) = admin
+        .create_group(CreateGroupRequest {
+            name: "legacy recovery coordinator".into(),
+            description: String::new(),
+            members: vec![target.fresh_key_package().await.unwrap()],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated {
+        mut welcomes,
+        pending,
+    } = created
+    else {
+        panic!("legacy group")
+    };
+    admin.confirm_published(pending).await.unwrap();
+    target.join_welcome(welcomes.remove(0)).await.unwrap();
+    let target_key = target.own_recovery_key_hash(&group_id).unwrap();
+    admin
+        .group_recovery_source(&group_id, &target.self_id(), &target_key)
+        .unwrap();
+    drop(admin);
+    let mut admin = EngineBuilder::new(storage)
+        .identity(pad32(b"recovery-legacy-admin"))
+        .account_identity_proof_signer(proof_signer(b"recovery-legacy-admin"))
+        .feature_registry(selfremove_registry())
+        .protocol_profile(ProtocolProfile::Current)
+        .peeler(Box::new(MockPeeler))
+        .build()
+        .unwrap();
+    admin.hydrate_all_stored_groups().unwrap();
+    assert!(matches!(
+        admin.group_recovery_source(&group_id, &target.self_id(), &target_key),
+        Err(EngineError::GroupRecoverySourceMismatch { .. })
+    ));
+}
+
+#[tokio::test]
 async fn member_recovery_refuses_stale() {
     let (mut admin, storage, mut target, sibling, group_id, target_storage) =
         member_recovery_fixture().await;

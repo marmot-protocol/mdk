@@ -295,6 +295,7 @@ mod tests {
             leaf_index: 9,
             leaf_hash: [22; 32],
             device_key_hash: [23; 32],
+            coordinator_key_hash: [24; 32],
         };
         let phases = [
             (

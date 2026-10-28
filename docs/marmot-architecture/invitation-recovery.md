@@ -89,9 +89,13 @@ branch. The frozen device's old leaf position is not identity: a prior replaceme
 Welcome was lost. A removed signing key cannot select a new device that reused the same position.
 The recipient publishes a fresh compatible KeyPackage,
 retains its publication event reference, and signs a grant with its existing MLS device key. The grant binds the
-group, coordinator, nonce, expiry, source epoch/authenticator hash, exact leaf/hash, device-key hash and complete
+group, coordinator account and device-key hash, nonce, expiry, source epoch/authenticator hash, exact leaf/hash,
+target device-key hash and complete
 KeyPackage. Possessing the account key or copying a sibling's public KeyPackage is insufficient to replace that
 sibling. A healthy admin device on the same account may coordinate; its own leaf is never a replacement target.
+The recipient selects the first challenged coordinator device for each nonce. Other devices of that admin account
+cannot change the selection or stage the resulting grant; the selected device may refresh its source after an epoch
+advance. This prevents shared-account inbox delivery from producing competing recovery Commits.
 
 The coordinator revalidates current membership, admin authority, source state, package compatibility and device
 proof immediately before staging one atomic remove-and-add Commit. It preserves account admin roles and unrelated
@@ -121,7 +125,8 @@ linked Welcomes; expiry cannot discard publication already owned by that lifecyc
 invented after failure. A reachable eligible admin, compatible implementations, fresh material and eventual network
 delivery remain prerequisites.
 Existing membership-profile cutover rules still apply: a current-profile coordinator cannot recover a leaf in a
-legacy group.
+legacy group. A recipient whose fresh KeyPackages use a different profile skips recovery before publishing one.
+Quarantined group records retire their stale recipient jobs without blocking recovery in other groups.
 
 `MarmotAppRuntime` drives this automatically. Lower-level Rust hosts drive `prepare_group_recovery`, resolve only
 the returned members' safe inbox routes, then call `advance_group_recovery` in their existing account loop. Both

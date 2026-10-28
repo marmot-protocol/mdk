@@ -71,6 +71,7 @@ async fn recovery_account_roundtrip() {
         leaf_index: 3,
         leaf_hash: [5; 32],
         device_key_hash: [9; 32],
+        coordinator_key_hash: [11; 32],
     };
     let mut challenge = request();
     challenge.body = GroupRecoveryBody::Challenge {

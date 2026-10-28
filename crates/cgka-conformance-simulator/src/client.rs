@@ -95,7 +95,7 @@ pub struct HarnessClient {
     next_scenario_input_id: Option<String>,
     scenario_input_tracker: ScenarioInputTracker,
     pending_scenario_inputs: HashMap<PendingStateRef, String>,
-    pending_publication_artifacts: HashMap<PendingStateRef, Vec<MessageId>>,
+    pending_publication_artifacts: HashMap<PendingStateRef, PendingPublication>,
     pending_confirmation_artifacts: HashMap<PendingStateRef, Vec<MessageId>>,
     regenerated_queued_intents: HashMap<MessageId, (GroupId, MessageId)>,
     /// Shared in-memory capture of the engine's forensic audit events, used to
@@ -106,6 +106,13 @@ pub struct HarnessClient {
     scripted_convergence_drain: Option<ScriptedConvergenceDrain>,
     #[cfg(test)]
     welcome_wrap_refusal: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Default)]
+struct PendingPublication {
+    message_ids: Vec<MessageId>,
+    /// Hydrated evolutions retain staged Welcomes until their commit is accepted.
+    deferred_welcomes: Vec<TransportMessage>,
 }
 
 #[cfg(test)]
@@ -433,6 +440,7 @@ mod tests {
     use cgka_engine::conformance_snapshot::ConformancePendingWorkSnapshot;
     use cgka_engine::engine_metrics::HistogramBucket;
     use cgka_traits::engine_state::GroupLifecycleState;
+    use cgka_traits::storage::GroupStorage;
 
     /// Builds a single-bucket histogram fixture.
     fn histogram(upper_bound: u64, count: u64, overflow_count: u64) -> HistogramSnapshot {
@@ -999,6 +1007,195 @@ mod tests {
                 "later named success must keep action id {expected}: {ids:?}"
             );
         }
+    }
+
+    fn native_group(client: &HarnessClient) -> openmls::group::MlsGroup {
+        openmls::group::MlsGroup::load(
+            client.storage().mls_storage(),
+            &openmls::group::GroupId::from_slice(client.group_id().as_slice()),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    async fn auto_recovery_fixture() -> (
+        TransportBus,
+        HarnessClient,
+        HarnessClient,
+        PendingStateRef,
+        MessageId,
+    ) {
+        use cgka_traits::group_recovery::{
+            GroupMemberRecovery, GroupRecoveryBody, GroupRecoveryMessage,
+        };
+
+        let bus = TransportBus::ordered();
+        let mut coordinator = ClientBuilder::new(b"auto-recovery-coordinator".to_vec())
+            .protocol_profile(ProtocolProfile::Current)
+            .storage_mode(HarnessStorageMode::InMemorySqlite)
+            .attach(&bus);
+        let mut target = ClientBuilder::new(b"auto-recovery-target".to_vec())
+            .protocol_profile(ProtocolProfile::Current)
+            .storage_mode(HarnessStorageMode::InMemorySqlite)
+            .attach(&bus);
+        let kp = target.fresh_key_package().await;
+        let (group_id, pending) = coordinator
+            .create_group_with_admins_maybe_pending("auto recovery", vec![kp], vec![], vec![])
+            .await;
+        assert!(pending.is_none());
+        bus.deliver_all();
+        assert!(target.tick_ingest_only().await.iter().all(Result::is_ok));
+        for (_, welcome) in coordinator.engine().outstanding_sent_welcomes().unwrap() {
+            coordinator
+                .engine()
+                .mark_sent_welcome_delivered(&welcome.id)
+                .unwrap();
+        }
+        let source = coordinator
+            .engine()
+            .group_recovery_source(
+                &group_id,
+                &target.member_id(),
+                &target.engine().own_recovery_key_hash(&group_id).unwrap(),
+            )
+            .unwrap();
+        // Model the durable halt that authorizes the target's recovery grant;
+        // the staged evolution and its resumed publication remain real MLS.
+        let mut halted = target.storage().get_group(&group_id).unwrap();
+        halted.unrecoverable = true;
+        target.storage().put_group(&halted).unwrap();
+        target.restart();
+        let key_package = target.fresh_key_package().await;
+        let grant = GroupRecoveryMessage {
+            group_id: group_id.clone(),
+            request_id: [19; 32],
+            expires_at: u64::MAX,
+            body: GroupRecoveryBody::Grant {
+                source: source.clone(),
+                key_package: key_package.clone(),
+                device_signature: Vec::new(),
+            },
+        };
+        let signature = target
+            .engine()
+            .sign_group_recovery(&group_id, &coordinator.member_id(), &grant)
+            .unwrap();
+        let SendResult::GroupEvolution { welcomes, .. } = coordinator
+            .engine_mut()
+            .send(SendIntent::RecoverMembers {
+                group_id,
+                members: vec![GroupMemberRecovery {
+                    member: target.member_id(),
+                    source,
+                    key_package,
+                    request_id: grant.request_id,
+                    expires_at: grant.expires_at,
+                    device_signature: signature,
+                }],
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("recovery must stage a real MLS evolution");
+        };
+        assert_eq!(welcomes.len(), 1);
+        let welcome_id = welcomes[0].id.clone();
+        coordinator.restart();
+        assert!(native_group(&coordinator).pending_commit().is_some());
+        assert!(
+            coordinator
+                .engine()
+                .outstanding_sent_welcomes()
+                .unwrap()
+                .is_empty()
+        );
+        coordinator.drain_auto_publish().await;
+        let pending = coordinator.pending_publication_refs();
+        assert_eq!(pending.len(), 1);
+        (bus, coordinator, target, pending[0], welcome_id)
+    }
+
+    #[tokio::test]
+    async fn auto_recovery_waits_for_ack() {
+        let (bus, mut coordinator, mut target, pending, welcome_id) = auto_recovery_fixture().await;
+        let source_epoch = native_group(&coordinator).epoch();
+        assert!(
+            bus.queued_messages()
+                .iter()
+                .all(|message| message.id != welcome_id),
+            "staged recovery Welcome must remain inaccessible until commit acknowledgement"
+        );
+        assert_eq!(native_group(&target).epoch(), source_epoch);
+        // A failed acknowledgement must not release the staged artifact.
+        let invalid = PendingStateRef::new(pending.as_u64() + 1);
+        assert!(coordinator.try_confirm(invalid).await.is_err());
+        assert!(
+            bus.queued_messages()
+                .iter()
+                .all(|message| message.id != welcome_id)
+        );
+        coordinator.confirm(pending).await;
+        let committed = native_group(&coordinator);
+        assert_eq!(committed.epoch().as_u64(), source_epoch.as_u64() + 1);
+        assert_eq!(
+            bus.queued_messages()
+                .iter()
+                .filter(|message| message.id == welcome_id)
+                .count(),
+            1
+        );
+        assert!(coordinator.try_confirm(pending).await.is_err());
+        coordinator.drain_auto_publish().await;
+        assert_eq!(
+            bus.queued_messages()
+                .iter()
+                .filter(|message| message.id == welcome_id)
+                .count(),
+            1
+        );
+        bus.deliver_all();
+        target.tick_ingest_only().await;
+        let repaired = native_group(&target);
+        assert!(repaired.is_active());
+        assert_eq!(repaired.epoch(), committed.epoch());
+        assert_eq!(
+            repaired.epoch_authenticator().as_slice(),
+            committed.epoch_authenticator().as_slice()
+        );
+        assert!(
+            !target
+                .storage()
+                .get_group(&target.group_id())
+                .unwrap()
+                .unrecoverable
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_recovery_rollback_hides() {
+        let (bus, mut coordinator, mut target, pending, welcome_id) = auto_recovery_fixture().await;
+        let source_epoch = native_group(&coordinator).epoch();
+        assert!(
+            bus.queued_messages()
+                .iter()
+                .all(|message| message.id != welcome_id),
+            "rollback must never have a recipient-visible staged recovery Welcome"
+        );
+        coordinator.fail(pending).await;
+        assert_eq!(native_group(&coordinator).epoch(), source_epoch);
+        assert!(native_group(&coordinator).pending_commit().is_none());
+        coordinator.restart();
+        coordinator.drain_auto_publish().await;
+        bus.deliver_all();
+        assert!(bus.mailbox_snapshot(target.bus_id).is_empty());
+        assert!(target.tick_ingest_only().await.is_empty());
+        assert_eq!(native_group(&target).epoch(), source_epoch);
+        assert!(
+            coordinator
+                .engine()
+                .stored_sent_welcome(&welcome_id)
+                .is_err()
+        );
     }
 
     /// Wraps a scripted drain in a real `HarnessClient` tick surface.
@@ -1723,7 +1920,12 @@ impl HarnessClient {
     ) -> Option<PendingStateRef> {
         self.pending_publication_artifacts
             .iter()
-            .find_map(|(pending, message_ids)| message_ids.contains(message_id).then_some(*pending))
+            .find_map(|(pending, publication)| {
+                publication
+                    .message_ids
+                    .contains(message_id)
+                    .then_some(*pending)
+            })
     }
 
     /// Pending publication handles currently awaiting a transport outcome.
@@ -2131,7 +2333,11 @@ impl HarnessClient {
         pending: PendingStateRef,
     ) -> Result<(), EngineError> {
         self.engine_mut().confirm_published(pending).await?;
-        self.pending_publication_artifacts.remove(&pending);
+        if let Some(publication) = self.pending_publication_artifacts.remove(&pending) {
+            for welcome in publication.deferred_welcomes {
+                self.bus.send(self.bus_id, welcome);
+            }
+        }
         self.pending_confirmation_artifacts.remove(&pending);
         if let Some(scenario_id) = self.pending_scenario_inputs.remove(&pending) {
             self.scenario_input_tracker.record_confirmed(&scenario_id);
@@ -2150,7 +2356,7 @@ impl HarnessClient {
             .pending_publication_artifacts
             .get(&pending)
             .ok_or_else(|| EngineError::Other("missing pending publication bookkeeping".into()))?;
-        if !artifact_ids.is_empty() {
+        if !artifact_ids.message_ids.is_empty() {
             return Ok(false);
         }
         self.try_confirm(pending).await?;
@@ -2178,10 +2384,10 @@ impl HarnessClient {
         let message_ids = self
             .pending_publication_artifacts
             .get(&pending)
-            .cloned()
+            .map(|publication| publication.message_ids.as_slice())
             .unwrap_or_default();
         self.bus
-            .retract_undelivered_publication(self.bus_id, &message_ids)
+            .retract_undelivered_publication(self.bus_id, message_ids)
             .map_err(
                 |recipient_exposures| HarnessPublicationError::AlreadyExposed {
                     recipient_exposures,
@@ -3208,9 +3414,10 @@ impl HarnessClient {
                     .chain(std::iter::once(routed.id.clone())),
             );
             self.remember_pending_confirmation(auto.pending, std::iter::once(routed.id.clone()));
-            for welcome in auto.welcomes {
-                self.bus.send(self.bus_id, welcome);
-            }
+            self.pending_publication_artifacts
+                .get_mut(&auto.pending)
+                .expect("auto publication was registered")
+                .deferred_welcomes = auto.welcomes;
             self.bus.send(self.bus_id, routed);
         }
         let proposals = self.engine_mut().drain_auto_proposals();
@@ -3496,6 +3703,7 @@ impl HarnessClient {
         self.pending_publication_artifacts
             .entry(pending)
             .or_default()
+            .message_ids
             .extend(message_ids);
     }
 

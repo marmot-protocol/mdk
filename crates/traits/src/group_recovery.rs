@@ -13,7 +13,7 @@ pub const MAX_GROUP_RECOVERY_GROUP_ID_BYTES: usize = 1024;
 /// Maximum dedicated recovery KeyPackage TLS payload.
 pub const MAX_GROUP_RECOVERY_KEY_PACKAGE_BYTES: usize = 16 * 1024;
 
-/// An exact leaf on an authenticated MLS branch, with no raw authenticator.
+/// An exact target leaf and coordinating device on an authenticated MLS branch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroupRecoverySource {
@@ -24,6 +24,8 @@ pub struct GroupRecoverySource {
     /// SHA-256 of this device's persisted MLS signature public key. Unlike
     /// the leaf hash, this survives normal HPKE leaf self-updates.
     pub device_key_hash: [u8; 32],
+    /// SHA-256 of the coordinating device's current MLS leaf signature public key.
+    pub coordinator_key_hash: [u8; 32],
 }
 
 /// A member's authorized replacement of one exact leaf.
@@ -145,8 +147,9 @@ fn validate_key_package(key_package: &KeyPackage) -> Result<(), PeelerError> {
 /// Encoding: domain `mdk/group-recovery/grant/v1\0`; u32-big-endian-length
 /// prefixed group ID and coordinator ID; 32-byte request ID; u64-big-endian
 /// expiry; source epoch (u64 BE), authenticator hash (32 bytes), leaf index
-/// (u32 BE), leaf hash (32 bytes), device-key hash (32 bytes); u32-BE-length
-/// prefixed KeyPackage bytes; profile byte (legacy=0, current=1); provenance
+/// (u32 BE), leaf hash (32 bytes), device-key hash (32 bytes), coordinator-key
+/// hash (32 bytes); u32-BE-length prefixed KeyPackage bytes; profile byte
+/// (legacy=0, current=1); provenance
 /// presence byte (0 or 1), followed by the fixed 32-byte source event ID when
 /// present. All lengths and integers have one representation. The signature
 /// proves possession of the old device key, not possession of a public KP.
@@ -184,6 +187,7 @@ pub fn group_recovery_grant_bytes(
             + 4
             + 32
             + 32
+            + 32
             + 4
             + key_package.bytes.len()
             + 1
@@ -202,6 +206,7 @@ pub fn group_recovery_grant_bytes(
     bytes.extend_from_slice(&source.leaf_index.to_be_bytes());
     bytes.extend_from_slice(&source.leaf_hash);
     bytes.extend_from_slice(&source.device_key_hash);
+    bytes.extend_from_slice(&source.coordinator_key_hash);
     bytes.extend_from_slice(&(key_package.bytes.len() as u32).to_be_bytes());
     bytes.extend_from_slice(&key_package.bytes);
     bytes.push(match key_package.protocol_profile {
@@ -328,6 +333,7 @@ mod tests {
                 leaf_index: 3,
                 leaf_hash: [6; 32],
                 device_key_hash: [9; 32],
+                coordinator_key_hash: [11; 32],
             },
             key_package: KeyPackage::new(vec![1, 2, 3]),
             device_signature: vec![10; 64],
@@ -364,6 +370,20 @@ mod tests {
         let mut bad_device = value.clone();
         bad_device["body"]["source"]["device_key_hash"] = serde_json::json!([1, 2]);
         assert!(GroupRecoveryMessage::decode(&serde_json::to_vec(&bad_device).unwrap()).is_err());
+        let mut missing_coordinator = value.clone();
+        missing_coordinator["body"]["source"]
+            .as_object_mut()
+            .unwrap()
+            .remove("coordinator_key_hash");
+        assert!(
+            GroupRecoveryMessage::decode(&serde_json::to_vec(&missing_coordinator).unwrap())
+                .is_err()
+        );
+        let mut bad_coordinator = value.clone();
+        bad_coordinator["body"]["source"]["coordinator_key_hash"] = serde_json::json!([1, 2]);
+        assert!(
+            GroupRecoveryMessage::decode(&serde_json::to_vec(&bad_coordinator).unwrap()).is_err()
+        );
         value["body"]["key_package"]["unknown"] = serde_json::json!(true);
         assert!(GroupRecoveryMessage::decode(&serde_json::to_vec(&value).unwrap()).is_err());
         if let GroupRecoveryBody::Grant { key_package, .. } = &mut message.body {
@@ -388,8 +408,34 @@ mod tests {
             leaf_index: 6,
             leaf_hash: [7; 32],
             device_key_hash: [8; 32],
+            coordinator_key_hash: [12; 32],
         };
         let package = KeyPackage::with_source_event_id(vec![9, 10], MessageId::new(vec![11; 32]));
+        let expected = [
+            b"mdk/group-recovery/grant/v1\0".as_slice(),
+            &16_u32.to_be_bytes(),
+            &[1; 16],
+            &32_u32.to_be_bytes(),
+            &[2; 32],
+            &[3; 32],
+            &1234_u64.to_be_bytes(),
+            &4_u64.to_be_bytes(),
+            &[5; 32],
+            &6_u32.to_be_bytes(),
+            &[7; 32],
+            &[8; 32],
+            &[12; 32],
+            &2_u32.to_be_bytes(),
+            &[9, 10],
+            &[0, 1],
+            &[11; 32],
+        ]
+        .concat();
+        assert_eq!(
+            group_recovery_grant_bytes(&group, &coordinator, &nonce, expiry, &source, &package)
+                .unwrap(),
+            expected
+        );
         let digest = |group: &GroupId,
                       coordinator: &MemberId,
                       nonce: &[u8; 32],
@@ -438,7 +484,7 @@ mod tests {
             original,
             digest(&group, &coordinator, &nonce, expiry + 1, &source, &package)
         );
-        for field in 0..5 {
+        for field in 0..6 {
             let mut altered = source.clone();
             match field {
                 0 => altered.epoch.0 += 1,
@@ -446,6 +492,7 @@ mod tests {
                 2 => altered.leaf_index += 1,
                 3 => altered.leaf_hash[0] ^= 1,
                 4 => altered.device_key_hash[0] ^= 1,
+                5 => altered.coordinator_key_hash[0] ^= 1,
                 _ => unreachable!(),
             }
             assert_ne!(

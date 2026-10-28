@@ -405,7 +405,13 @@ where
         &self,
         group_id: &GroupId,
     ) -> AccountResult<Option<RecipientState>> {
-        self.session.engine.check_group_live(group_id)?;
+        match self.session.engine.check_group_live(group_id) {
+            Ok(()) => {}
+            Err(EngineError::UnknownGroup(_) | EngineError::GroupNotHydrated(_)) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        }
         let group = self
             .session
             .storage
@@ -413,6 +419,7 @@ where
             .map_err(SessionError::from)?;
         if !group.unrecoverable
             || group.is_terminal()
+            || group.protocol_profile != self.session.new_protocol_profile()
             || !matches!(
                 self.session.epoch_state(group_id),
                 Some(EpochState::Unrecoverable { .. })
@@ -662,6 +669,15 @@ where
             || record.expires_at != message.expires_at
             || Some(state.token) != record.local_state_token
             || state.device_key_hash != source.device_key_hash
+        {
+            return Ok(false);
+        }
+        // The account inbox can fan out to several healthy devices. The first
+        // challenge selects one native MLS signer for this request; only that
+        // device may refresh the source after its group advances.
+        if matches!(&record.message.body,
+            GroupRecoveryBody::Challenge { source: old } | GroupRecoveryBody::Grant { source: old, .. }
+                if old.coordinator_key_hash != source.coordinator_key_hash)
         {
             return Ok(false);
         }

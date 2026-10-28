@@ -258,6 +258,13 @@ impl<S: StorageProvider> Engine<S> {
     ) -> Result<GroupRecoverySource, EngineError> {
         self.ensure_group_live(group_id)?;
         let record = self.storage.get_group(group_id)?;
+        if self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current
+            && record.protocol_profile == cgka_traits::group::ProtocolProfile::Legacy
+        {
+            return Err(EngineError::GroupRecoverySourceMismatch {
+                group_id: group_id.clone(),
+            });
+        }
         if record.is_terminal()
             || record.unrecoverable
             || self.leave_in_progress(group_id)?
@@ -281,6 +288,14 @@ impl<S: StorageProvider> Engine<S> {
                 group_id: group_id.clone(),
             });
         }
+        let coordinator_key_hash = Sha256::digest(
+            group
+                .own_leaf_node()
+                .ok_or_else(|| EngineError::Backend("group has no local leaf".into()))?
+                .signature_key()
+                .as_slice(),
+        )
+        .into();
         let nodes = crate::app_components::ratchet_tree_nodes(group.export_ratchet_tree())?;
         let (leaf_index, leaf) = nodes
             .iter()
@@ -320,6 +335,7 @@ impl<S: StorageProvider> Engine<S> {
             leaf_index,
             leaf_hash: Sha256::digest(bytes).into(),
             device_key_hash: *device_key_hash,
+            coordinator_key_hash,
         })
     }
 
@@ -359,8 +375,6 @@ impl<S: StorageProvider> Engine<S> {
         )? != *source
             || recovery.expires_at <= self.wall_clock.now().0
             || recovery.device_signature.len() != 64
-            || (self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current
-                && profile == cgka_traits::group::ProtocolProfile::Legacy)
         {
             return Err(mismatch());
         }

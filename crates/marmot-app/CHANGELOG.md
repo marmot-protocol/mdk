@@ -13,9 +13,10 @@
 
 - Account workers automatically rejoin durably and natively `Unrecoverable`
   group copies through an authenticated account-inbox handshake. A healthy
-  current admin replaces only the authorized device leaf and sends a fresh
+  current admin device replaces only the authorized device leaf and sends a fresh
   Welcome after Commit confirmation. Retry state survives interruption;
-  stored history remains. Usable forks still require explicit consent, and
+  stored history remains. Each grant binds one coordinating device, even on
+  a shared account inbox. Usable forks still require explicit consent, and
   removed members cannot use this path to reenter.
 - The crate root re-exports `AccountError`, `SessionError`,
   `AccountIdentityProofRequest` and `AccountIdentityProofSigner`, so hosts

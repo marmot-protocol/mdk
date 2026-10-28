@@ -1,0 +1,391 @@
+// Recovery eligibility must be checked before account-wide work or public KP rotation.
+fn eligibility_legacy_session(
+    path: impl Into<std::path::PathBuf>,
+    key: &SqlCipherKey,
+    account: &[u8],
+) -> AccountDeviceSession {
+    use cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID;
+    let mut components = default_group_components();
+    components.insert(NOSTR_ROUTING_COMPONENT_ID);
+    AccountDeviceSession::open(
+        SessionConfig::new(
+            path,
+            SqlCipherKey::new(key.as_secret_str()).unwrap(),
+            pad32(account),
+            Box::new(nostr_peeler(account)),
+        )
+        .legacy_compatibility_profile()
+        .account_identity_proof_signer(Arc::new(NostrAccountIdentityProofSigner {
+            keys: deterministic_nostr_keys(account),
+        }))
+        .supported_app_components(components),
+    )
+    .unwrap()
+}
+
+fn eligibility_runtime(
+    session: AccountDeviceSession,
+    peer: MemberId,
+    wall: Arc<TestWallClock>,
+    adapter: RecordingAdapter,
+    publisher: RecordingKeyPackages,
+) -> RecoveryRuntime {
+    let endpoint = TransportEndpoint("wss://eligibility-inbox.example".into());
+    AccountDeviceRuntime::new(
+        session,
+        adapter,
+        StaticTransportRouting::new(vec![endpoint.clone()])
+            .key_package_endpoints(vec![endpoint.clone()])
+            .with_inbox_route(peer, vec![endpoint]),
+        publisher,
+    )
+    .with_maintenance_sources(
+        wall,
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    )
+}
+
+#[tokio::test]
+async fn recovery_legacy_no_rotation() {
+    use cgka_traits::GroupStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("recovery profile eligibility key").unwrap();
+    let bob_path = dir.path().join("bob.sqlite");
+    let mut bob = Device::with_session(
+        eligibility_legacy_session(&bob_path, &key, b"eligibility-bob"),
+        cgka_traits::engine::KeyPackage::new(Vec::new()),
+    );
+    bob.publish().await;
+    let bob_id = bob.runtime.self_id();
+    let mut alice =
+        eligibility_legacy_session(dir.path().join("alice.sqlite"), &key, b"eligibility-alice");
+    let alice_id = alice.self_id();
+    let (group, welcomes) = create_group(&mut alice, &[&bob.key_package], "legacy recovery").await;
+    bob.ingest(&welcomes[0]).await;
+    drop(bob);
+    {
+        let storage = SqliteAccountStorage::open_encrypted(&bob_path, &key).unwrap();
+        let mut record = storage.get_group(&group).unwrap();
+        record.unrecoverable = true;
+        storage.put_group(&record).unwrap();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let wall = Arc::new(TestWallClock::new(now));
+    let adapter = RecordingAdapter::default();
+    let bob_adapter = RecordingAdapter::default();
+    let mut coordinator = eligibility_runtime(
+        alice,
+        bob_id.clone(),
+        wall.clone(),
+        adapter.clone(),
+        RecordingKeyPackages::default(),
+    );
+    let mut recipient = eligibility_runtime(
+        eligibility_legacy_session(&bob_path, &key, b"eligibility-bob"),
+        alice_id.clone(),
+        wall.clone(),
+        bob_adapter.clone(),
+        RecordingKeyPackages::default(),
+    );
+    // Persist a real challenged Legacy job before the host upgrades its generator.
+    assert_eq!(
+        recipient.prepare_group_recovery().unwrap(),
+        vec![alice_id.clone()]
+    );
+    recipient.advance_group_recovery().await.unwrap();
+    coordinator
+        .ingest_delivery(&recovery_inbox_delivery(
+            alice_id.clone(),
+            bob_adapter.publishes().last().unwrap().message.clone(),
+        ))
+        .await
+        .unwrap();
+    coordinator.prepare_group_recovery().unwrap();
+    coordinator.advance_group_recovery().await.unwrap();
+    let challenged = recipient
+        .ingest_delivery(&recovery_inbox_delivery(
+            bob_id,
+            adapter.publishes().last().unwrap().message.clone(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        challenged.outcome,
+        cgka_traits::IngestOutcome::Processed
+    ));
+    drop(recipient);
+
+    let publisher = RecordingKeyPackages::default();
+    let adapter = RecordingAdapter::default();
+    let mut recipient = eligibility_runtime(
+        nostr_device_session(&bob_path, &key, b"eligibility-bob"),
+        alice_id,
+        wall.clone(),
+        adapter.clone(),
+        publisher.clone(),
+    );
+    assert_eq!(
+        recipient.session().new_protocol_profile(),
+        ProtocolProfile::Current
+    );
+    let stored = recipient.group_record(&group).unwrap();
+    assert_eq!(stored.protocol_profile, ProtocolProfile::Legacy);
+    assert!(stored.unrecoverable);
+    assert!(matches!(
+        recipient.epoch_state(&group),
+        Some(cgka_traits::EpochState::Unrecoverable { .. })
+    ));
+    let keys_before = recipient.key_package_maintenance_status().unwrap();
+    // Exercise both the existing challenge and repeated retry/expiry windows.
+    for elapsed in [0, 5, 20, 600, 1_200, 2_400] {
+        wall.set(now + elapsed);
+        recipient.prepare_group_recovery().unwrap();
+        let result = recipient.advance_group_recovery().await;
+        assert!(
+            publisher.publications().is_empty(),
+            "incompatible recovery must not publish a fresh KeyPackage"
+        );
+        assert!(
+            adapter.publishes().is_empty(),
+            "incompatible recovery must not send account controls"
+        );
+        result.unwrap();
+        assert_eq!(
+            recipient.key_package_maintenance_status().unwrap(),
+            keys_before
+        );
+    }
+    assert_eq!(recipient.group_record(&group).unwrap(), stored);
+}
+
+#[tokio::test]
+async fn recovery_quarantine_isolated() {
+    use cgka_traits::GroupStorage;
+    use storage_sqlite::{GroupRecoveryPhase, GroupRecoveryRecord, GroupRecoveryRole};
+
+    let mut peers = recovery_peers().await;
+    let bob_path = peers._dir.path().join("bob.sqlite");
+    let key = SqlCipherKey::new("live recovery cancellation key").unwrap();
+    let alice_id = peers.coordinator.self_id();
+    let bob_id = peers.recipient.self_id();
+    let good_before = peers.recipient.group_record(&peers.group).unwrap();
+    drop(peers.recipient);
+    let orphan = GroupId::new(b"orphaned-recovery-group".to_vec());
+    let now = peers.wall.now().0;
+    {
+        let storage = SqliteAccountStorage::open_encrypted(&bob_path, &key).unwrap();
+        // Clone only public metadata, never native MLS state. The good group remains intact.
+        let mut broken = storage.get_group(&peers.group).unwrap();
+        broken.id = orphan.clone();
+        storage.put_group(&broken).unwrap();
+        storage
+            .put_group_recovery(&GroupRecoveryRecord {
+                group_id: orphan.clone(),
+                request_id: [0x71; 32],
+                role: GroupRecoveryRole::Recipient,
+                peer: alice_id.clone(),
+                leaf_index: 0,
+                local_state_token: Some([0x72; 32]),
+                expires_at: now + 600,
+                retry_at: now.saturating_sub(1),
+                attempts: 0,
+                phase: GroupRecoveryPhase::Request,
+                message: cgka_traits::GroupRecoveryMessage {
+                    group_id: orphan.clone(),
+                    request_id: [0x71; 32],
+                    expires_at: now + 600,
+                    body: cgka_traits::GroupRecoveryBody::Request {
+                        device_key_hash: [0x73; 32],
+                    },
+                },
+                outbound: None,
+                commit_id: None,
+            })
+            .unwrap();
+    }
+    peers.recipient = eligibility_runtime(
+        nostr_device_session(&bob_path, &key, b"cancel-bob"),
+        alice_id.clone(),
+        peers.wall.clone(),
+        peers.bob_adapter.clone(),
+        RecordingKeyPackages::default(),
+    );
+    assert!(
+        peers
+            .recipient
+            .quarantined_groups()
+            .iter()
+            .any(|(id, _)| id == &orphan)
+    );
+    assert_eq!(
+        peers.recipient.group_record(&peers.group).unwrap(),
+        good_before
+    );
+    // The older orphan may consume a reservation, but cannot abort this or the next turn.
+    for _ in 0..2 {
+        peers.recipient.prepare_group_recovery().unwrap();
+        peers.recipient.advance_group_recovery().await.unwrap();
+    }
+    let controls = peers.bob_adapter.publishes();
+    assert_eq!(
+        controls.len(),
+        1,
+        "only the eligible group's request is published"
+    );
+    let authenticated = nostr_peeler(b"cancel-alice")
+        .peel_group_recovery(&controls[0].message)
+        .await
+        .unwrap();
+    assert_eq!(authenticated.message.group_id, peers.group);
+    let received = peers
+        .coordinator
+        .ingest_delivery(&recovery_inbox_delivery(
+            alice_id,
+            controls[0].message.clone(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        received.outcome,
+        cgka_traits::IngestOutcome::Processed
+    ));
+    peers.coordinator.prepare_group_recovery().unwrap();
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    let challenge = peers.adapter.publishes().last().unwrap().message.clone();
+    let received = peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob_id, challenge))
+        .await
+        .unwrap();
+    assert!(matches!(
+        received.outcome,
+        cgka_traits::IngestOutcome::Processed
+    ));
+    peers.recipient.prepare_group_recovery().unwrap();
+    peers.recipient.advance_group_recovery().await.unwrap();
+    assert_eq!(
+        peers.bob_adapter.publishes().len(),
+        2,
+        "the eligible recipient progresses to a signed grant"
+    );
+    assert_eq!(
+        peers.recipient.group_record(&peers.group).unwrap(),
+        good_before
+    );
+}
+
+#[tokio::test]
+async fn recovery_same_device_refresh() {
+    use cgka_traits::GroupRecoveryBody;
+
+    let mut peers = recovery_peers().await;
+    exchange_recovery(&mut peers).await;
+    let original = nostr_peeler(b"cancel-bob")
+        .peel_group_recovery(&peers.adapter.publishes().last().unwrap().message)
+        .await
+        .unwrap();
+    let GroupRecoveryBody::Challenge { source: old_source } = original.message.body else {
+        panic!("expected the initial coordinator challenge");
+    };
+    // Advance real native state after the first Grant was reserved, without
+    // delivering that unrelated Commit to the Unrecoverable recipient.
+    peers
+        .coordinator
+        .send(SendIntent::SelfUpdate {
+            group_id: peers.group.clone(),
+        })
+        .await
+        .unwrap();
+    let advanced_epoch = peers.coordinator.session().epoch(&peers.group).unwrap();
+    assert!(advanced_epoch > old_source.epoch);
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    peers.wall.set(peers.wall.now().0 + 5);
+    assert_eq!(
+        peers.coordinator.prepare_group_recovery().unwrap(),
+        vec![peers.recipient.self_id()]
+    );
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    let refreshed = peers.adapter.publishes().last().unwrap().message.clone();
+    let authenticated = nostr_peeler(b"cancel-bob")
+        .peel_group_recovery(&refreshed)
+        .await
+        .unwrap();
+    let GroupRecoveryBody::Challenge { source } = &authenticated.message.body else {
+        panic!("stale Grant must produce a new native-source challenge");
+    };
+    assert_eq!(
+        authenticated.message.request_id,
+        original.message.request_id
+    );
+    assert_eq!(source.coordinator_key_hash, old_source.coordinator_key_hash);
+    assert_eq!(source.epoch, advanced_epoch);
+    assert_ne!(
+        source.epoch_authenticator_hash,
+        old_source.epoch_authenticator_hash
+    );
+    let bob_id = peers.recipient.self_id();
+    let accepted = peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob_id.clone(), refreshed))
+        .await
+        .unwrap();
+    assert!(matches!(
+        accepted.outcome,
+        cgka_traits::IngestOutcome::Processed
+    ));
+    peers.recipient.prepare_group_recovery().unwrap();
+    peers.recipient.advance_group_recovery().await.unwrap();
+    let grant = peers
+        .bob_adapter
+        .publishes()
+        .last()
+        .unwrap()
+        .message
+        .clone();
+    let accepted = peers
+        .coordinator
+        .ingest_delivery(&recovery_inbox_delivery(peers.coordinator.self_id(), grant))
+        .await
+        .unwrap();
+    assert!(matches!(
+        accepted.outcome,
+        cgka_traits::IngestOutcome::Processed
+    ));
+    peers.coordinator.prepare_group_recovery().unwrap();
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    let welcome = peers
+        .adapter
+        .publishes()
+        .into_iter()
+        .rfind(|attempt| matches!(attempt.message.envelope, TransportEnvelope::Welcome { .. }))
+        .unwrap()
+        .message;
+    peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob_id, welcome))
+        .await
+        .unwrap();
+    assert!(
+        !peers
+            .recipient
+            .group_record(&peers.group)
+            .unwrap()
+            .unrecoverable
+    );
+    assert_eq!(
+        peers.recipient.session().epoch(&peers.group).unwrap(),
+        peers.coordinator.session().epoch(&peers.group).unwrap()
+    );
+    assert_recovery_chat(
+        &mut peers.coordinator,
+        &peers.adapter,
+        &mut peers.recipient,
+        &peers.group,
+    )
+    .await;
+}

@@ -2227,6 +2227,148 @@ async fn recovery_live_cancel_resume() {
 }
 
 #[tokio::test]
+async fn recovery_one_admin_device() {
+    let mut peers = recovery_peers().await;
+    let key = SqlCipherKey::new("live recovery cancellation key").unwrap();
+    let mut sibling = Device::open(
+        peers._dir.path().join("admin-sibling.sqlite"),
+        &key,
+        b"cancel-alice",
+    )
+    .await;
+    let alice_id = peers.coordinator.self_id();
+    let bob_id = peers.recipient.self_id();
+    assert_eq!(sibling.runtime.self_id(), alice_id);
+    peers
+        .coordinator
+        .send(SendIntent::Invite {
+            group_id: peers.group.clone(),
+            key_packages: vec![sibling.key_package.clone()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let welcome = peers.adapter.publishes().into_iter().find(|request| matches!(
+        &request.message.envelope, TransportEnvelope::Welcome { recipient } if recipient == &alice_id
+    )).unwrap().message;
+    sibling.ingest(&welcome).await;
+    let epoch = peers.coordinator.session().epoch(&peers.group).unwrap();
+    assert_eq!(
+        sibling.runtime.session().epoch(&peers.group).unwrap(),
+        epoch
+    );
+    let inbox = TransportEndpoint("wss://recovery-inbox.example".into());
+    let routing = StaticTransportRouting::new(vec![inbox.clone()])
+        .key_package_endpoints(vec![inbox.clone()])
+        .with_group_route(
+            peers.group.clone(),
+            vec![0x5a; 32],
+            vec![TransportEndpoint("wss://recovery-group.example".into())],
+        )
+        .with_inbox_route(alice_id.clone(), vec![inbox.clone()])
+        .with_inbox_route(bob_id.clone(), vec![inbox]);
+    let sibling_adapter = sibling.adapter.clone();
+    drop(sibling);
+    let mut sibling = AccountDeviceRuntime::new(
+        nostr_device_session(
+            peers._dir.path().join("admin-sibling.sqlite"),
+            &key,
+            b"cancel-alice",
+        ),
+        sibling_adapter.clone(),
+        routing,
+        RecordingKeyPackages::default(),
+    )
+    .with_maintenance_sources(
+        peers.wall.clone(),
+        Arc::new(TestMonotonicClock::default()),
+        Arc::new(TestRandom::new(0)),
+    );
+    let prior = peers.adapter.publishes().len();
+    peers.recipient.prepare_group_recovery().unwrap();
+    peers.recipient.advance_group_recovery().await.unwrap();
+    let request = peers
+        .bob_adapter
+        .publishes()
+        .last()
+        .unwrap()
+        .message
+        .clone();
+    for coordinator in [&mut peers.coordinator, &mut sibling] {
+        coordinator
+            .ingest_delivery(&recovery_inbox_delivery(alice_id.clone(), request.clone()))
+            .await
+            .unwrap();
+        coordinator.prepare_group_recovery().unwrap();
+        coordinator.advance_group_recovery().await.unwrap();
+    }
+    for adapter in [&peers.adapter, &sibling_adapter] {
+        let challenge = adapter.publishes().last().unwrap().message.clone();
+        peers
+            .recipient
+            .ingest_delivery(&recovery_inbox_delivery(bob_id.clone(), challenge))
+            .await
+            .unwrap();
+    }
+    peers.recipient.prepare_group_recovery().unwrap();
+    peers.recipient.advance_group_recovery().await.unwrap();
+    let grant = peers
+        .bob_adapter
+        .publishes()
+        .last()
+        .unwrap()
+        .message
+        .clone();
+    for coordinator in [&mut peers.coordinator, &mut sibling] {
+        coordinator
+            .ingest_delivery(&recovery_inbox_delivery(alice_id.clone(), grant.clone()))
+            .await
+            .unwrap();
+        coordinator.prepare_group_recovery().unwrap();
+        coordinator.advance_group_recovery().await.unwrap();
+    }
+    let sent = peers.adapter.publishes();
+    let commits = sent[prior..]
+        .iter()
+        .chain(sibling_adapter.publishes().iter())
+        .filter(|request| {
+            matches!(
+                request.message.envelope,
+                TransportEnvelope::GroupMessage { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        commits, 1,
+        "one grant must authorize only its selected coordinator device"
+    );
+    assert!(peers.coordinator.session().epoch(&peers.group).unwrap() > epoch);
+    assert_eq!(sibling.session().epoch(&peers.group).unwrap(), epoch);
+    let welcome = sent[prior..].iter().find(|request| matches!(
+        &request.message.envelope, TransportEnvelope::Welcome { recipient } if recipient == &bob_id
+    )).unwrap().message.clone();
+    peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(bob_id, welcome))
+        .await
+        .unwrap();
+    assert!(
+        !peers
+            .recipient
+            .group_record(&peers.group)
+            .unwrap()
+            .unrecoverable
+    );
+    assert_recovery_chat(
+        &mut peers.coordinator,
+        &peers.adapter,
+        &mut peers.recipient,
+        &peers.group,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn recovery_welcome_cancel() {
     assert_recovery_cancel(RecoveryCancelPoint::Welcome).await;
 }

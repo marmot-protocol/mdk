@@ -750,6 +750,7 @@ include!("runtime/component_migration.rs");
 include!("runtime/multi_device_welcome.rs");
 include!("runtime/key_package_slot.rs");
 include!("runtime/key_package_slot_withdrawal.rs");
+include!("runtime/recovery_eligibility.rs");
 
 #[derive(Clone, Default)]
 struct RecordingKeyPackages {
