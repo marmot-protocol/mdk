@@ -4,8 +4,11 @@
 //! admits relays only through the dial-safety chokepoint. An endpoint missing
 //! from the pool reads as unreachable.
 //!
-//! nostr-sdk's EOSE parser drops NIP-67 hints, so this relay reports none and
-//! the sweep proves slices by counting against the NIP-11 cap.
+//! nostr-sdk's EOSE parser drops NIP-67 hints, so slice REQs read `more` off
+//! the wire through the client's hint tap ([`super::hint_tap`]). A client
+//! built without the tap ([`NostrSdkRelayClient::new`]), a relay that sends no
+//! hint, or a REQ the tap can't single out reports none. Either way the sweep
+//! proves the slice by counting against the NIP-11 cap.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -18,12 +21,13 @@ use nostr_sdk::prelude::{
 };
 use tokio::sync::Semaphore;
 
+use super::hint_tap::{EoseHints, HintWatch};
 use super::{
     ClosedReason, RelayCaps, SecondReply, SliceQuery, SliceReply, SweepRelay, SweepRoute,
     UnreachableKind,
 };
 use crate::NostrSdkRelayClient;
-use crate::sdk_client::{neg_sync_dry_run, sweep_neg_credit};
+use crate::sdk_client::{neg_sync_dry_run, sweep_eose_hints, sweep_neg_credit};
 
 /// Default bytes one reply may carry. A full wok page is 5,000 events.
 const REPLY_MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -38,6 +42,7 @@ pub struct SdkSweepRelay {
     endpoint: RelayUrl,
     caps: RelayCaps,
     neg_credit: Arc<Semaphore>,
+    eose_hints: Option<Arc<EoseHints>>,
     request_timeout: Duration,
     reply_max_bytes: usize,
 }
@@ -53,6 +58,7 @@ impl SdkSweepRelay {
         Self {
             client: relay_client.client().clone(),
             neg_credit: sweep_neg_credit(relay_client, &endpoint),
+            eose_hints: sweep_eose_hints(relay_client),
             endpoint,
             caps,
             request_timeout,
@@ -118,20 +124,26 @@ impl SweepRelay for SdkSweepRelay {
 
     async fn fetch_slice(&self, query: SliceQuery) -> SliceReply {
         let limit = query.limit.map_or(usize::MAX, |limit| limit as usize);
+        let filter = query.filter();
+        // Registered before the REQ goes out; its EOSE fills it in.
+        let watch = self
+            .eose_hints
+            .as_ref()
+            .map(|hints| hints.watch(&self.endpoint, &filter));
         // One over the limit, so a relay that ignores `limit` reads as a cut.
-        let Some(reply) = self.acquire(query.filter(), limit.saturating_add(1)).await else {
+        let Some(reply) = self.acquire(filter, limit.saturating_add(1)).await else {
             return SliceReply::Unreachable(UnreachableKind::Disconnected);
         };
         match failed_end(reply.end) {
             Ok(()) => SliceReply::Answered {
                 received: reply.raw_received_items,
                 events: reply.events.into_iter().collect(),
-                hint: None,
+                more: watch.as_ref().is_some_and(HintWatch::more),
             },
             Err(FailedEnd::Cut) => SliceReply::Answered {
                 events: Vec::new(),
                 received: usize::MAX,
-                hint: Some(super::EoseHint::More),
+                more: true,
             },
             Err(FailedEnd::Closed(reason)) => SliceReply::Closed(reason),
             Err(FailedEnd::Unreachable(kind)) => SliceReply::Unreachable(kind),

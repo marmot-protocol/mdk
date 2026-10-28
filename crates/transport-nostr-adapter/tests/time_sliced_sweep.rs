@@ -4,7 +4,8 @@
 
 //! The time-sliced sweep over the wire: `SdkSweepRelay` against a local relay
 //! behind the strfry-limits proxy (`support/limit_relay.rs`, 500 clamp, no
-//! NIP-67 hints). Synthetic group events only; no MLS.
+//! NIP-67 hints unless a test turns on wok's). Synthetic group events only; no
+//! MLS.
 
 #[path = "support/limit_relay.rs"]
 mod limit_relay;
@@ -51,6 +52,10 @@ impl Fixture {
     }
 
     async fn with_limits(config: LimitConfig) -> Self {
+        Self::with_client(config, NostrSdkRelayClient::from_builder(Client::builder())).await
+    }
+
+    async fn with_client(config: LimitConfig, sdk: NostrSdkRelayClient) -> Self {
         let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
             events: true,
             max_events: Some(16_384),
@@ -66,7 +71,6 @@ impl Fixture {
         );
         upstream.run().await.unwrap();
         let limit = LimitRelay::start(upstream.url().await.to_string(), config).await;
-        let sdk = NostrSdkRelayClient::from_builder(Client::builder());
         sdk.client().add_relay(limit.url()).await.unwrap();
         sdk.client().connect().await;
         Self {
@@ -87,10 +91,14 @@ impl Fixture {
     }
 
     fn relay(&self) -> SdkSweepRelay {
+        self.relay_with_caps(STRFRY_NIP11)
+    }
+
+    fn relay_with_caps(&self, nip11: &str) -> SdkSweepRelay {
         SdkSweepRelay::new(
             &self.sdk,
             RelayUrl::parse(&self.limit.url()).unwrap(),
-            RelayCaps::from_nip11_json(STRFRY_NIP11).unwrap(),
+            RelayCaps::from_nip11_json(nip11).unwrap(),
             Duration::from_secs(10),
         )
     }
@@ -314,5 +322,113 @@ async fn saturated_second_over_a_default_page_and_byte_budget() {
     assert!(report.covered.iter().any(|slice| slice.since == burst
         && slice.proof == SliceProof::Negentropy
         && slice.events == 5_200));
+    assert_once_in_order(&sink, &wanted);
+}
+
+/// A wok-like NIP-11 document with a 50-event cap.
+const HINTED_NIP11: &str =
+    r#"{"supported_nips":[1,11,42,67,77],"limitation":{"max_limit":50,"default_limit":50}}"#;
+
+fn hinted_limits(eose_hints: bool) -> LimitConfig {
+    LimitConfig {
+        req_limit_clamp: Some(50),
+        eose_hints,
+        ..LimitConfig::default()
+    }
+}
+
+/// Exactly the cap, spread over the day.
+fn one_full_page() -> (Vec<Event>, HashSet<nostr_sdk::prelude::EventId>) {
+    let keys = Keys::generate();
+    let events = (0..50)
+        .map(|n| group_event(&keys, GROUP, T0 + (n as u64) * 1_000, n))
+        .collect::<Vec<_>>();
+    let wanted = events.iter().map(|event| event.id).collect();
+    (events, wanted)
+}
+
+/// A reply holding exactly the cap may hide more, so it is split and proven by
+/// counts. wok's `finish` changes nothing: the sweep runs the same with it,
+/// without it, and through a client built without the tap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finish_hint_changes_nothing() {
+    let mut runs = Vec::new();
+    for (relay_hints, tapped) in [(true, true), (false, true), (true, false)] {
+        let sdk = if tapped {
+            NostrSdkRelayClient::from_builder(Client::builder())
+        } else {
+            NostrSdkRelayClient::new(Client::builder().build())
+        };
+        let fixture = Fixture::with_client(hinted_limits(relay_hints), sdk).await;
+        let (events, wanted) = one_full_page();
+        fixture.store(&events).await;
+        let mut sink = Sink::default();
+        let report = run_sweep(
+            request(range()),
+            &fixture.relay_with_caps(HINTED_NIP11),
+            &mut sink,
+            &MemoryStore::default(),
+            &CancellationToken::new(),
+        )
+        .await;
+        let case = format!("relay hints {relay_hints}, tapped {tapped}");
+        assert_eq!(report.end, SweepEnd::Finished, "{case}: {report:?}");
+        assert_once_in_order(&sink, &wanted);
+        assert!(report.stats.halvings > 0, "{case}");
+        assert!(
+            report
+                .covered
+                .iter()
+                .all(|slice| matches!(slice.proof, SliceProof::BelowCap { cap: 50, .. })),
+            "{case}: {:?}",
+            report.covered
+        );
+        assert_eq!(
+            fixture.limit.stats().finish_hints > 0,
+            relay_hints,
+            "{case}"
+        );
+        runs.push((case, report.stats.requests, report.covered));
+    }
+    let (_, requests, covered) = &runs[0];
+    for (case, other_requests, other_covered) in &runs[1..] {
+        assert_eq!(other_requests, requests, "{case}");
+        assert_eq!(other_covered, covered, "{case}");
+    }
+}
+
+/// A relay that clamps below the cap its NIP-11 document publishes: a count
+/// would take its short reply as complete, but wok's `more` splits it until
+/// every slice's reply is whole, and counts prove those.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn more_hint_splits_a_reply_below_the_published_cap() {
+    let fixture = Fixture::with_limits(hinted_limits(true)).await;
+    let keys = Keys::generate();
+    let events = (0..120)
+        .map(|n| group_event(&keys, GROUP, T0 + (n as u64) * 700, n))
+        .collect::<Vec<_>>();
+    let wanted = events.iter().map(|event| event.id).collect();
+    fixture.store(&events).await;
+    let mut sink = Sink::default();
+    let report = run_sweep(
+        request(range()),
+        // Publishes 500; the relay clamps to 50.
+        &fixture.relay_with_caps(STRFRY_NIP11),
+        &mut sink,
+        &MemoryStore::default(),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(report.end, SweepEnd::Finished, "{report:?}");
+    assert!(report.stats.halvings > 0);
+    assert!(fixture.limit.stats().more_hints > 0);
+    assert!(
+        report
+            .covered
+            .iter()
+            .all(|slice| matches!(slice.proof, SliceProof::BelowCap { cap: 500, .. })),
+        "{:?}",
+        report.covered
+    );
     assert_once_in_order(&sink, &wanted);
 }

@@ -33,6 +33,7 @@ use transport_nostr_peeler::{
 };
 
 use crate::network_proxy as process_proxy;
+use crate::sweep::hint_tap::{EoseHints, HintTransport};
 use crate::{
     NostrAcquisitionCancellation, NostrAcquisitionEnd, NostrAcquisitionEndpoint,
     NostrAcquisitionError, NostrAcquisitionLimits, NostrAcquisitionRequest, NostrAcquisitionResult,
@@ -1316,6 +1317,10 @@ pub struct NostrSdkRelayClient {
     /// Clones share a pool's per-canonical-relay NEG allowance. Independently
     /// built account pools get their own credits, just like their sockets.
     neg_credits: Arc<StdMutex<HashMap<RelayUrl, Arc<Semaphore>>>>,
+    /// NIP-67 hints the sweep's REQs read off the wire. Only clients built
+    /// through [`Self::from_builder`] have the tap; the rest prove slices by
+    /// counting.
+    eose_hints: Option<Arc<EoseHints>>,
     /// Test-only: select every route in ID order, to exercise the cursor alone.
     #[cfg(test)]
     id_order_only: bool,
@@ -1756,6 +1761,7 @@ impl NostrSdkRelayClient {
             registration_log: Arc::new(Mutex::new(HashMap::new())),
             acquisition_memory: Arc::default(),
             neg_credits: Arc::default(),
+            eose_hints: None,
             #[cfg(test)]
             id_order_only: false,
         }
@@ -1893,11 +1899,14 @@ impl NostrSdkRelayClient {
     pub fn from_builder(builder: ClientBuilder) -> Self {
         let gossip = builder.gossip.clone();
         let authenticator_available = builder.authenticator.is_some();
-        let mut client = Self::new(builder.build());
+        let eose_hints = Arc::new(EoseHints::default());
+        let transport = HintTransport::new(builder.websocket_transport.clone(), eose_hints.clone());
+        let mut client = Self::new(builder.websocket_transport(transport).build());
         client.publication = SdkPublication::OwnedRelay {
             gossip,
             authenticator_available,
         };
+        client.eose_hints = Some(eose_hints);
         client
     }
 
@@ -5498,6 +5507,11 @@ pub(crate) fn sweep_neg_credit(
     endpoint: &RelayUrl,
 ) -> Arc<Semaphore> {
     client.neg_credit(endpoint)
+}
+
+/// The client's NIP-67 hint tap, when it was built with one.
+pub(crate) fn sweep_eose_hints(client: &NostrSdkRelayClient) -> Option<Arc<EoseHints>> {
+    client.eose_hints.clone()
 }
 
 /// A dry-run NIP-77 comparison against an empty local set: every id the

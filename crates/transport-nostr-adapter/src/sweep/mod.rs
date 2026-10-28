@@ -14,12 +14,14 @@
 //!   of one second by local insertion, not id. That second goes to
 //!   [`SweepRelay::fetch_second`] (NIP-77 ids, then an ids fetch).
 //!
-//! Completeness ([`SliceProof`]) comes from, in order: a NIP-67 `finish` hint;
-//! a reply below the relay's NIP-11 `limitation.max_limit` (strfry 500, wok's
-//! marmot preset 5,000), counting every EVENT the relay sent, valid or not;
-//! or, when the relay publishes no cap, a reply below the largest full reply
-//! seen from it. A NIP-67 `more` hint always splits. Requested limits are
-//! lowered silently, so the cap is read, never assumed. Each slice REQ asks for
+//! Completeness ([`SliceProof`]) comes from counting: a reply below the
+//! relay's NIP-11 `limitation.max_limit` (strfry 500, wok's marmot preset
+//! 5,000), counting every EVENT the relay sent, valid or not; or, when the
+//! relay publishes no cap, a reply below the largest full reply seen from it.
+//! A NIP-67 `more` hint always splits, but no hint proves a slice: nostr-sdk
+//! drops hints, so the SDK relay reads them off the wire, and there a misread
+//! `finish` would skip history where a misread `more` only costs requests.
+//! Requested limits are lowered silently, so the cap is read, never assumed. Each slice REQ asks for
 //! exactly the cap with one filter, so on wok a reply below it was never cut
 //! (its 10,000 per-REQ total cannot bind first).
 //!
@@ -42,6 +44,8 @@ use nostr::prelude::{Event, Filter, Kind, SingleLetterTag, Timestamp};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "sdk")]
+pub(crate) mod hint_tap;
 #[cfg(feature = "sdk")]
 mod sdk;
 #[cfg(test)]
@@ -158,15 +162,6 @@ impl SliceQuery {
     }
 }
 
-/// NIP-67 hint on EOSE.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EoseHint {
-    /// `["finish"]`: nothing matching is left unsent.
-    Finish,
-    /// `["more"]`: a cut left matching events unsent.
-    More,
-}
-
 /// Why a relay could not be asked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnreachableKind {
@@ -225,7 +220,9 @@ pub enum SliceReply {
     Answered {
         events: Vec<Event>,
         received: usize,
-        hint: Option<EoseHint>,
+        /// The relay said a cut left matching events unsent: NIP-67 `more`,
+        /// or a reply past the requested limit. It splits the slice.
+        more: bool,
     },
     /// The relay sent `CLOSED` before EOSE.
     Closed(ClosedReason),
@@ -262,8 +259,6 @@ pub trait SweepRelay: Send + Sync {
 /// How a covered slice was proven complete.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SliceProof {
-    /// The relay sent the NIP-67 `finish` hint.
-    FinishHint,
     /// Fewer events than the relay's NIP-11 `max_limit`.
     BelowCap { received: u32, cap: u32 },
     /// The relay publishes no cap; fewer events than a full reply it sent.
@@ -644,10 +639,10 @@ where
                 SliceReply::Answered {
                     events,
                     received,
-                    hint,
+                    more,
                 } => {
                     self.answered();
-                    self.slice_answered(since, until, events, received, hint)
+                    self.slice_answered(since, until, events, received, more)
                         .await
                 }
             };
@@ -664,13 +659,13 @@ where
         until: u64,
         events: Vec<Event>,
         received: usize,
-        hint: Option<EoseHint>,
+        more: bool,
     ) -> Option<SweepEnd> {
         let received = u32::try_from(received.max(events.len())).unwrap_or(u32::MAX);
-        let proof = match hint {
-            Some(EoseHint::Finish) => Some(SliceProof::FinishHint),
-            Some(EoseHint::More) => None,
-            None => self.count_proof(received),
+        let proof = if more {
+            None
+        } else {
+            self.count_proof(received)
         };
         let Some(proof) = proof else {
             if since == until {

@@ -1,6 +1,6 @@
 //! The sweep against a model relay that answers as strfry or wok do: inclusive
 //! `since`/`until`, newest first with same-second ties in local insertion
-//! order, a per-filter cap, and (wok) NIP-67 hints and a REQ token bucket.
+//! order, a per-filter cap, and (wok) NIP-67 `more` and a REQ token bucket.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -57,7 +57,8 @@ impl EventFactory {
 enum Profile {
     /// Cap 500, no hints; hidden events count toward the cap but are not sent.
     Strfry,
-    /// Cap 5,000 (marmot preset), NIP-67 hints.
+    /// Cap 5,000 (marmot preset), NIP-67 hints. Only `more` reaches the
+    /// sweep: it never reads `finish`.
     Wok,
 }
 
@@ -225,11 +226,7 @@ impl SweepRelay for ModelRelay {
             .min(self.enforced_cap);
         let sent = matching.iter().take(limit).collect::<Vec<_>>();
         let cut = matching.len() > sent.len();
-        let hint = match self.profile {
-            Profile::Strfry => None,
-            Profile::Wok if cut => Some(EoseHint::More),
-            Profile::Wok => Some(EoseHint::Finish),
-        };
+        let more = self.profile == Profile::Wok && cut;
         let events = sent
             .iter()
             .filter(|stored| !stored.hidden)
@@ -238,7 +235,7 @@ impl SweepRelay for ModelRelay {
         SliceReply::Answered {
             received: events.len(),
             events,
-            hint,
+            more,
         }
     }
 
@@ -601,13 +598,14 @@ async fn saturated_second_without_negentropy_makes_no_progress_there() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn wok_finish_hint_proves_a_reply_at_the_cap() {
+async fn a_reply_at_the_cap_is_split_even_where_the_relay_hints() {
     let mut factory = EventFactory::new();
     let range = SweepRange {
         since: T0,
         until: T0 + DAY - 1,
     };
-    // Exactly the cap: counting alone would split; `finish` says it is all.
+    // Exactly the cap. Wok would say `finish`, but only counting proves a
+    // slice, so the sweep splits it.
     let events = spread(&mut factory, range, 5_000);
     let relay = ModelRelay::new(Profile::Wok, events.clone());
     let mut sink = relay.sink();
@@ -620,9 +618,64 @@ async fn wok_finish_hint_proves_a_reply_at_the_cap() {
     )
     .await;
     assert_eq!(report.end, SweepEnd::Finished);
-    assert_eq!(report.stats.requests, 1);
-    assert_eq!(report.stats.halvings, 0);
-    assert_eq!(report.covered[0].proof, SliceProof::FinishHint);
+    assert!(report.stats.halvings > 0);
+    assert!(
+        report
+            .covered
+            .iter()
+            .all(|slice| matches!(slice.proof, SliceProof::BelowCap { .. }))
+    );
+    assert_admitted_once_in_order(&sink, &events, range);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wrong_more_costs_requests_never_history() {
+    let mut factory = EventFactory::new();
+    let range = SweepRange {
+        since: T0,
+        until: T0 + DAY - 1,
+    };
+    let events = spread(&mut factory, range, 100);
+    let sweep = || {
+        let mut sweep = request(range);
+        sweep.policy.initial_delta = DAY;
+        sweep
+    };
+    let honest = ModelRelay::new(Profile::Wok, events.clone());
+    let baseline = run_sweep(
+        sweep(),
+        &honest,
+        &mut honest.sink(),
+        &MemoryStore::default(),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(baseline.stats.requests, 1);
+
+    // The relay sends the whole slice but says `more`: the sweep drops the
+    // reply, asks for both halves, and admits the same events once.
+    let wrong = ModelRelay::new(Profile::Wok, events.clone());
+    let all = wrong.matching(route(), range.since, range.until);
+    let reply = SliceReply::Answered {
+        received: all.len(),
+        events: all.iter().map(|stored| stored.event.clone()).collect(),
+        more: true,
+    };
+    wrong.script.lock().unwrap().push_back(reply);
+    let mut sink = wrong.sink();
+    let report = run_sweep(
+        sweep(),
+        &wrong,
+        &mut sink,
+        &MemoryStore::default(),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(report.end, SweepEnd::Finished);
+    assert_eq!(report.stats.halvings, 1);
+    assert_eq!(report.stats.requests, baseline.stats.requests + 2);
+    assert_eq!(report.stats.events, baseline.stats.events);
+    assert_contiguous(&report.covered, range);
     assert_admitted_once_in_order(&sink, &events, range);
 }
 
@@ -642,7 +695,7 @@ async fn wok_more_hint_splits_below_the_cap() {
         .push_back(SliceReply::Answered {
             events: Vec::new(),
             received: 10,
-            hint: Some(EoseHint::More),
+            more: true,
         });
     let report = run_sweep(
         request(range),
@@ -825,7 +878,7 @@ async fn unreachable_relay_is_relay_health_not_an_empty_page() {
         SliceReply::Answered {
             events: Vec::new(),
             received: 0,
-            hint: None,
+            more: false,
         },
         SliceReply::Unreachable(UnreachableKind::Disconnected),
     ]);
