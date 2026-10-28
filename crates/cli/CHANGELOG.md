@@ -11,6 +11,12 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Added
 
+- A new `marmot-pairing` crate implements device pairing's code exchange (mdk#2628): Matrix's `m.sas.v1`
+  verification in Marmot encodings, with seven emoji or three numbers to compare, a commitment to the new device's
+  key, and confirmations that cover the new device's exact `KeyPackageRef` and the device group's id. It ends in a
+  verified link and does no I/O. `transport-nostr-adapter` gift-wraps its messages to the account's own key behind
+  the `unreleased-device-pairing` feature. Nothing enables that feature, so no release sends pairing messages until
+  the pairing spec merges.
 - `wn-agent doctor` checks a standalone connector setup without changing anything (mdk#2570). It prints one line per
   check with `ok`, `warn`, `fail` or `unknown` and a next step: the home, socket directory and path, token file, how
   many relays `wn-agent` would use and where they come from, local-signing accounts and account file modes, and, when
