@@ -405,6 +405,8 @@ pub enum PublishWork {
     AutoPublish {
         msg: TransportMessage,
         pending: PendingStateRef,
+        /// Automatic work owns its Welcomes through its own commit ACK.
+        welcomes: Vec<TransportMessage>,
     },
 }
 
@@ -2113,6 +2115,7 @@ impl AccountDeviceSession {
             effects.publish.push(PublishWork::AutoPublish {
                 msg: auto.msg,
                 pending: auto.pending,
+                welcomes: auto.welcomes,
             });
         }
         for msg in self.engine.drain_auto_proposals() {
@@ -2141,6 +2144,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
     match intent {
         SendIntent::AppMessage { .. } => "app_message",
         SendIntent::Invite { .. } => "invite",
+        SendIntent::RecoverMembers { .. } => "recover_members",
         SendIntent::RemoveMembers { .. } => "remove_members",
         SendIntent::AddOwnAccountDevices { .. } => "add_own_account_devices",
         SendIntent::RemoveOwnAccountDevices { .. } => "remove_own_account_devices",

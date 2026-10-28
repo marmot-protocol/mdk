@@ -888,6 +888,9 @@ impl<S: StorageProvider> Engine<S> {
             return self.do_request_disband(group_id);
         }
         if let Some(reason) = self.outbound_queue_reason(&group_id, &intent).await? {
+            if matches!(&intent, SendIntent::RecoverMembers { .. }) {
+                return Err(EngineError::GroupRecoveryUnsettled { group_id });
+            }
             // Retention re-encrypts the payload under the drain-time epoch.
             // A payload pinned to one epoch (an encrypted-media reference,
             // whose key the recipient derives from the delivering message's
@@ -1020,7 +1023,10 @@ impl<S: StorageProvider> Engine<S> {
         // One record read serves this gate and the two terminal gates below.
         let group = self.stored_group_record(&group_id)?;
         if self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current
-            && matches!(intent, SendIntent::Invite { .. })
+            && matches!(
+                intent,
+                SendIntent::Invite { .. } | SendIntent::RecoverMembers { .. }
+            )
         {
             // An Invite needs the record to read its profile; an unknown group
             // fails here with the storage error the direct read used to raise.
@@ -1078,6 +1084,14 @@ impl<S: StorageProvider> Engine<S> {
                     reason: "leave requested",
                 },
             ));
+        }
+        if matches!(intent, SendIntent::RecoverMembers { .. })
+            && !self
+                .epoch_manager
+                .state(&group_id)
+                .is_some_and(|state| state.is_stable())
+        {
+            return Err(EngineError::GroupRecoveryUnsettled { group_id });
         }
         // device-group.md, "Linking a device": a device joins the device
         // group only through `LinkDevice`. The sender rule in
@@ -3869,6 +3883,9 @@ impl<S: StorageProvider> Engine<S> {
         intent: SendIntent,
         reissue_attempts: u32,
     ) -> Result<QueuedOutboundIntent, EngineError> {
+        if matches!(&intent, SendIntent::RecoverMembers { .. }) {
+            return Err(EngineError::GroupRecoveryUnsettled { group_id });
+        }
         let created_at_ms = self.convergence_now_ms();
         let existing_count = self.storage.list_queued_outbound_intents(&group_id)?.len();
         // Refuse before serializing or writing anything. The caller persists
@@ -4202,6 +4219,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
     match intent {
         SendIntent::AppMessage { group_id, .. }
         | SendIntent::Invite { group_id, .. }
+        | SendIntent::RecoverMembers { group_id, .. }
         | SendIntent::RemoveMembers { group_id, .. }
         | SendIntent::AddOwnAccountDevices { group_id, .. }
         | SendIntent::RemoveOwnAccountDevices { group_id, .. }
@@ -4233,6 +4251,7 @@ pub(crate) fn is_fair_scheduled_intent(
 ) -> bool {
     match intent {
         SendIntent::Invite { .. }
+        | SendIntent::RecoverMembers { .. }
         | SendIntent::RemoveMembers { .. }
         | SendIntent::UpdateAppComponents { .. }
         | SendIntent::ReplaceDeviceEntry { .. }

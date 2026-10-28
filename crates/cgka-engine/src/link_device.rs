@@ -171,7 +171,7 @@ impl<S: StorageProvider> Engine<S> {
             .map_err(EngineError::Peeler)?;
         let commit_msg = route_wrapped_group_message(commit_msg, &pre_commit_ctx);
         let welcomes = self
-            .wrap_staged_welcomes(&mls_group, &welcome_bytes, &[key_package], &parsed_kps)
+            .wrap_staged_welcomes(&mls_group, &welcome_bytes, &[key_package], &[], &parsed_kps)
             .await?;
         // `members()` shows the linked device while the publish is pending;
         // `confirm_published` and `publish_failed` re-derive the record from
