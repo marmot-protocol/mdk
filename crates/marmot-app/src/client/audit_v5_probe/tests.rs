@@ -5,6 +5,228 @@ use marmot_account::AccountHome;
 use nostr_relay_builder::MockRelay;
 use std::{path::Path, time::Duration};
 
+#[derive(Debug)]
+struct OnceSigner {
+    keys: nostr::prelude::Keys,
+    consumed: Arc<Mutex<HashSet<String>>>,
+    denied: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl transport_nostr_peeler::MarmotNostrSigner for OnceSigner {
+    fn get_public_key(
+        &self,
+    ) -> transport_nostr_peeler::SignerFuture<
+        '_,
+        Result<nostr::prelude::PublicKey, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::get_public_key(&self.keys)
+    }
+
+    fn sign_event(
+        &self,
+        unsigned: nostr::prelude::UnsignedEvent,
+    ) -> transport_nostr_peeler::SignerFuture<
+        '_,
+        Result<nostr::prelude::Event, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::sign_event(&self.keys, unsigned)
+    }
+
+    fn nip04_encrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::prelude::PublicKey,
+        content: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip04_encrypt(&self.keys, public_key, content)
+    }
+
+    fn nip04_decrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::prelude::PublicKey,
+        payload: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip04_decrypt(&self.keys, public_key, payload)
+    }
+
+    fn nip44_encrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::prelude::PublicKey,
+        content: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        transport_nostr_peeler::MarmotNostrSigner::nip44_encrypt(&self.keys, public_key, content)
+    }
+
+    fn nip44_decrypt<'a>(
+        &'a self,
+        public_key: &'a nostr::prelude::PublicKey,
+        payload: &'a str,
+    ) -> transport_nostr_peeler::SignerFuture<
+        'a,
+        Result<String, transport_nostr_peeler::MarmotSignerError>,
+    > {
+        // An external signer may issue a one-use decryption grant per layer.
+        // Trial classification must not spend the grant before actual admission.
+        if !self.consumed.lock().unwrap().insert(payload.to_owned()) {
+            self.denied.store(true, std::sync::atomic::Ordering::SeqCst);
+            return Box::pin(async { Err("decryption grant already consumed".into()) });
+        }
+        transport_nostr_peeler::MarmotNostrSigner::nip44_decrypt(&self.keys, public_key, payload)
+    }
+}
+
+impl marmot_session::AccountIdentityProofSigner for OnceSigner {
+    fn sign_account_identity_proof(
+        &self,
+        request: &marmot_session::AccountIdentityProofRequest,
+    ) -> Result<[u8; 64], String> {
+        use nostr::prelude::FinalizeEvent;
+        let event = request.proof_event().and_then(|event| {
+            event
+                .finalize(&self.keys)
+                .map_err(|error| error.to_string())
+        })?;
+        request.signature_from_signed_event(event)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn welcome_policy_single_unseal() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        use nostr::prelude::Keys;
+        let relay = MockRelay::run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let alice_dir = tempfile::tempdir().unwrap();
+        let bob_dir = tempfile::tempdir().unwrap();
+        let alice_account = AccountHome::open(alice_dir.path())
+            .create_account("alice")
+            .unwrap();
+        let bob_keys = Keys::generate();
+        let bob_account = AccountHome::open(bob_dir.path())
+            .add_external_signer_account(&bob_keys.public_key().to_hex())
+            .unwrap();
+        let alice_app = app(alice_dir.path(), &url);
+        let bob_app = app(bob_dir.path(), &url);
+        let consumed = Arc::new(Mutex::new(HashSet::new()));
+        let denied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        bob_app
+            .register_external_signer(
+                &bob_account.account_id_hex,
+                OnceSigner {
+                    keys: bob_keys,
+                    consumed: consumed.clone(),
+                    denied: denied.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut alice = alice_app.client("alice").await.unwrap();
+        let mut bob = bob_app.client(&bob_account.account_id_hex).await.unwrap();
+        bob.publish_key_package().await.unwrap();
+        let storage = bob_app
+            .account_storage(&bob_account.label)
+            .unwrap()
+            .app_storage();
+        let unrelated = Keys::generate().public_key().to_hex();
+
+        for (revision, blocked) in [(1, false), (2, true)] {
+            storage
+                .adopt_block_list(
+                    &storage_sqlite::StoredBlockList {
+                        event_id: format!("policy-{revision}"),
+                        event_created_at: revision,
+                        ..Default::default()
+                    },
+                    &[(
+                        if blocked {
+                            alice_account.account_id_hex.clone()
+                        } else {
+                            unrelated.clone()
+                        },
+                        true,
+                    )],
+                    i64::try_from(revision).unwrap(),
+                    &bob_account.label,
+                    &|_, _| false,
+                )
+                .unwrap();
+            let group = alice
+                .create_group_with_initial_source_and_optional_telemetry(
+                    "single-unseal invitation",
+                    &[&bob_account.account_id_hex],
+                    crate::AppCreateGroupOptions::default(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .group_id;
+            let retained = alice.runtime.outstanding_welcome_deliveries().unwrap();
+            let welcome = &retained
+                .iter()
+                .find(|(stored_group, _)| stored_group == &group)
+                .unwrap()
+                .1;
+            let event = NostrTransportEvent::from_transport_message(welcome).unwrap();
+            let outer_ciphertext = event.content.clone();
+            let mut deliveries = bob
+                .adapter
+                .recovered_deliveries(transport_nostr_adapter::NostrRelayEvent {
+                    endpoint: url.clone().into(),
+                    subscription_id: None,
+                    event,
+                })
+                .await
+                .unwrap();
+            assert_eq!(deliveries.len(), 1);
+            bob.relay_plane
+                .route_account_delivery_for_test(deliveries.remove(0));
+            let summary = bob.sync().await.unwrap();
+            assert!(consumed.lock().unwrap().contains(&outer_ciphertext));
+            assert!(
+                !denied.load(std::sync::atomic::Ordering::SeqCst),
+                "invitation policy and MLS admission must share each layer's decryption grant"
+            );
+            assert_eq!(
+                storage
+                    .is_blocked_welcome_dismissed(&hex::encode(welcome.id.as_slice()))
+                    .unwrap(),
+                blocked
+            );
+            let projected = bob_app
+                .group(&bob_account.label, &hex::encode(group.as_slice()))
+                .unwrap();
+            if blocked {
+                assert!(!summary.joined_groups.contains(&group));
+                assert!(projected.is_none());
+                assert!(bob.runtime.group_record(&group).is_err());
+            } else {
+                assert!(summary.joined_groups.contains(&group));
+                assert!(projected.unwrap().pending_confirmation);
+                assert_eq!(bob.runtime.group_record(&group).unwrap().members.len(), 2);
+                bob.accept_group_invite(&group).unwrap();
+                assert!(
+                    !bob_app
+                        .group(&bob_account.label, &hex::encode(group.as_slice()))
+                        .unwrap()
+                        .unwrap()
+                        .pending_confirmation
+                );
+            }
+        }
+    })
+    .await
+    .expect("bounded single-unseal Welcome scenario");
+}
+
 fn actual_v5_rows(app: &MarmotApp, account: &str) -> Vec<Record> {
     let dir = app.account_dir(account);
     let paths = std::fs::read_dir(dir)
@@ -1261,6 +1483,9 @@ async fn ambiguous_nip59_decrypt_error_is_failed_without_inner_refs() {
     let peeler = ProbePeeler {
         inner: NostrMlsPeeler::new().with_welcome_signer(wrong_key),
         slot: slot.clone(),
+        storage: storage_sqlite::SqliteAccountStorage::in_memory()
+            .unwrap()
+            .app_storage(),
     };
     assert!(matches!(
         peeler.peel_welcome(&message).await,

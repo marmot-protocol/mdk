@@ -72,11 +72,12 @@ impl PeelSlot {
     }
 }
 
-/// The only selected test peeler. It delegates product behavior, and observes
-/// the same concrete Welcome peel the engine uses without a second decode.
+/// App-owned inbox boundary: apply invitation policy only after the one
+/// authenticated inner decode, and observe that same peel without repeating it.
 pub(crate) struct ProbePeeler {
     pub inner: NostrMlsPeeler,
     pub slot: Arc<Mutex<PeelSlot>>,
+    pub storage: storage_sqlite::SqliteAppStorage,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -92,7 +93,35 @@ impl TransportPeeler for ProbePeeler {
 
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
         let started = Instant::now();
-        let result = self.inner.peel_welcome_with_provenance(msg).await;
+        let result =
+            self.inner
+                .peel_welcome_with_provenance(msg)
+                .await
+                .and_then(|(peeled, provenance)| {
+                    // The caller holds the account policy lock through admission and
+                    // projection. Only an authenticated Welcome is an invitation.
+                    if matches!(&peeled.content, cgka_traits::PeeledContent::Welcome { .. }) {
+                        let sender = peeled
+                            .sender
+                            .as_ref()
+                            .ok_or(PeelerError::InvalidSignature)?;
+                        let blocked = self
+                            .storage
+                            .is_user_blocked(&hex::encode(sender.as_slice()))
+                            .map_err(|_| {
+                                PeelerError::Backend("Welcome policy storage failed".into())
+                            })?;
+                        if blocked {
+                            self.storage
+                                .dismiss_blocked_welcome(&hex::encode(msg.id.as_slice()))
+                                .map_err(|_| {
+                                    PeelerError::Backend("Welcome dismissal storage failed".into())
+                                })?;
+                            return Err(PeelerError::WrongRecipient);
+                        }
+                    }
+                    Ok((peeled, provenance))
+                });
         let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let mut slot = self.slot.lock().unwrap();
         if let Some((id, receive_id, outer)) = slot.armed.take()

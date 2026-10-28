@@ -975,7 +975,7 @@ impl<S: StorageProvider> Engine<S> {
                     method = "retry_rejoins_after_trusted_removal", "skipping a group awaiting hydration repair");
                 continue;
             }
-            match self.do_join_welcome(welcome).await {
+            match self.do_join_welcome(welcome, None).await {
                 Ok(_) => joined = true,
                 Err(error) if terminal_welcome_error(&error) => {
                     self.storage.take_welcome(&candidate.message_id)?;
@@ -1064,6 +1064,7 @@ impl<S: StorageProvider> Engine<S> {
     pub(crate) async fn do_join_welcome(
         &mut self,
         welcome_msg: TransportMessage,
+        prepeeled: Option<(cgka_traits::ingest::PeeledMessage, MessageId)>,
     ) -> Result<GroupId, EngineError> {
         // 1. Dedupe. The ingest-path welcome handler already guards with
         // `seen_message_ids`; direct `CgkaEngine::join_welcome` callers
@@ -1105,12 +1106,18 @@ impl<S: StorageProvider> Engine<S> {
         let welcome_id = welcome_msg.id.clone();
 
         // 3. Peel.
-        let peeled = self
-            .peeler
-            .peel_welcome(&welcome_msg)
-            .await
-            .map_err(EngineError::Peeler)?;
-        let content_id = welcome_content_dedup_id(&peeled)?;
+        let (peeled, content_id) = match prepeeled {
+            Some(prepared) => prepared,
+            None => {
+                let peeled = self
+                    .peeler
+                    .peel_welcome(&welcome_msg)
+                    .await
+                    .map_err(EngineError::Peeler)?;
+                let content_id = welcome_content_dedup_id(&peeled)?;
+                (peeled, content_id)
+            }
+        };
         if self.storage.has_ingress_dedup_marker(&content_id)? {
             self.storage.put_ingress_dedup_marker(&welcome_id)?;
             return Err(EngineError::WelcomeAlreadyProcessed);
