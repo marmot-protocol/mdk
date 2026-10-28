@@ -195,7 +195,7 @@ async fn ledger_and_obligations_agree_through_a_normal_catch_up() {
 /// the loss un-covered: queue loss drops deliveries the adapter had placed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_loss_keeps_live_boundaries_from_re_covering_it() {
-    let mut fixture = fixture().await;
+    let fixture = fixture().await;
     let app = fixture.storage.app_storage();
     let floor = unix_now_seconds().saturating_sub(30);
     app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
