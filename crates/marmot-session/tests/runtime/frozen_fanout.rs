@@ -2329,7 +2329,7 @@ async fn recovery_live_cancel_resume() {
 
 #[tokio::test]
 async fn recovery_one_admin_device() {
-    let mut peers = recovery_peers().await;
+    let mut peers = recovery_peers(0).await;
     let key = SqlCipherKey::new("live recovery cancellation key").unwrap();
     let mut sibling = Device::open(
         peers._dir.path().join("admin-sibling.sqlite"),
@@ -2479,7 +2479,7 @@ async fn recovery_welcome_cancel() {
 
 #[tokio::test]
 async fn recovery_lost_welcome() {
-    let mut peers = recovery_peers().await;
+    let mut peers = recovery_peers(0).await;
     let old_leaf = peers.recipient.own_leaf_index(&peers.group).unwrap();
     exchange_recovery(&mut peers).await;
     peers.coordinator.advance_group_recovery().await.unwrap();
@@ -2547,7 +2547,7 @@ enum RecoveryCancelPoint {
 
 #[tokio::test]
 async fn recovery_heal_race() {
-    let mut peers = recovery_peers().await;
+    let mut peers = recovery_peers(0).await;
     exchange_recovery(&mut peers).await;
     peers.coordinator.advance_group_recovery().await.unwrap();
     let first = peers
@@ -2665,7 +2665,7 @@ struct RecoveryPeers {
     _dir: tempfile::TempDir,
 }
 
-async fn recovery_peers() -> RecoveryPeers {
+async fn recovery_peers(extra_updates: u32) -> RecoveryPeers {
     use cgka_traits::storage::GroupStorage;
 
     let dir = tempfile::tempdir().unwrap();
@@ -2701,6 +2701,15 @@ async fn recovery_peers() -> RecoveryPeers {
     )
     .await;
     let before = alice.epoch(&group).unwrap();
+    for _ in 0..extra_updates {
+        evolve(
+            bob_device.runtime.session_mut(),
+            SendIntent::SelfUpdate {
+                group_id: group.clone(),
+            },
+        )
+        .await;
+    }
     drop(bob_device);
     let store = storage_sqlite::SqliteAccountStorage::open_encrypted(
         &bob_path,
@@ -2794,10 +2803,14 @@ async fn exchange_recovery(peers: &mut RecoveryPeers) {
     coordinator.prepare_group_recovery().unwrap();
     coordinator.advance_group_recovery().await.unwrap();
     let challenge = adapter.publishes().last().unwrap().message.clone();
-    recipient
+    let challenged = recipient
         .ingest_delivery(&recovery_inbox_delivery(bob_id.clone(), challenge))
         .await
         .unwrap();
+    assert!(
+        matches!(challenged.outcome, cgka_traits::IngestOutcome::Processed),
+        "a selected coordinator's source must not be ordered against the losing native branch"
+    );
     recipient.prepare_group_recovery().unwrap();
     recipient.advance_group_recovery().await.unwrap();
     let grant = bob_adapter.publishes().last().unwrap().message.clone();
@@ -2809,7 +2822,7 @@ async fn exchange_recovery(peers: &mut RecoveryPeers) {
 }
 
 async fn assert_recovery_cancel(point: RecoveryCancelPoint) {
-    let mut peers = recovery_peers().await;
+    let mut peers = recovery_peers(0).await;
     exchange_recovery(&mut peers).await;
     let RecoveryPeers {
         _dir,

@@ -75,7 +75,9 @@ pub struct GroupRecoveryRecord {
     pub total_attempts: u32,
     /// Canonical candidate/admin-set fingerprint last observed by the recipient.
     pub candidate_set_hash: Option<[u8; 32]>,
-    /// Highest native or authenticated selected-coordinator epoch observed.
+    /// Native epoch baseline for new local evidence, never a remote source floor.
+    pub native_epoch: Option<EpochId>,
+    /// Highest authenticated selected-coordinator epoch observed in this episode.
     pub observed_epoch: Option<EpochId>,
     /// Durable reservation of a coordinator Commit, independent of request expiry.
     pub commit_started_at: Option<u64>,
@@ -272,6 +274,7 @@ mod tests {
             attempts: 4,
             total_attempts: 19,
             candidate_set_hash: Some([41; 32]),
+            native_epoch: Some(EpochId(17)),
             observed_epoch: Some(EpochId(23)),
             commit_started_at: Some(1_800_000_000),
             phase: GroupRecoveryPhase::Request,

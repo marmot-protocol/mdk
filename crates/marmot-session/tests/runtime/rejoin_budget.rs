@@ -1,7 +1,152 @@
 // Exercise the runtime owner: reservations precede lookup and survive request TTLs.
 #[tokio::test]
+async fn rejoin_lower_winning_epoch() {
+    let mut peers = recovery_peers(3).await;
+    let frozen = peers.recipient.session().epoch(&peers.group).unwrap();
+    assert!(frozen > EpochId(peers.before.0 + 1));
+    exchange_recovery(&mut peers).await;
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    let welcome = peers
+        .adapter
+        .publishes()
+        .into_iter()
+        .find(|attempt| is_recovery_welcome(&attempt.message))
+        .unwrap()
+        .message;
+    peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(peers.recipient.self_id(), welcome))
+        .await
+        .unwrap();
+    let installed = peers.recipient.group_record(&peers.group).unwrap();
+    assert!(!installed.unrecoverable);
+    assert!(installed.epoch < frozen);
+    assert_eq!(
+        installed.epoch,
+        peers.coordinator.session().epoch(&peers.group).unwrap()
+    );
+    assert_recovery_chat(
+        &mut peers.coordinator,
+        &peers.adapter,
+        &mut peers.recipient,
+        &peers.group,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn rejoin_live_grant_budget() {
+    let mut peers = recovery_peers(0).await;
+    exchange_recovery(&mut peers).await;
+    let original = recovery_control(
+        b"cancel-alice",
+        &peers.bob_adapter.publishes().last().unwrap().message,
+    )
+    .await
+    .message;
+    let path = peers._dir.path().join("bob.sqlite");
+    let key = SqlCipherKey::new("live recovery cancellation key").unwrap();
+    drop(peers.recipient);
+    {
+        let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let mut row = storage.list_group_recoveries().unwrap().remove(0);
+        row.total_attempts = 32;
+        storage.put_group_recovery(&row).unwrap();
+    }
+    peers.recipient = eligibility_runtime(
+        nostr_device_session(path, &key, b"cancel-bob"),
+        peers.coordinator.self_id(),
+        peers.wall.clone(),
+        peers.bob_adapter.clone(),
+        RecordingKeyPackages::default(),
+    );
+    assert!(peers.recipient.prepare_group_recovery().unwrap().is_empty());
+    assert_eq!(
+        peers.recipient.group_rejoin_status(&peers.group).unwrap(),
+        marmot_session::GroupRejoinStatus::Pending { attempts: 32 }
+    );
+    peers.recipient.retry_group_rejoin(&peers.group).unwrap();
+    peers.recipient.prepare_group_recovery().unwrap();
+    peers.recipient.advance_group_recovery().await.unwrap();
+    let retried = recovery_control(
+        b"cancel-alice",
+        &peers.bob_adapter.publishes().last().unwrap().message,
+    )
+    .await
+    .message;
+    assert_eq!(
+        retried, original,
+        "retry must retain the live signed grant and selected coordinator"
+    );
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    let welcome = peers
+        .adapter
+        .publishes()
+        .into_iter()
+        .find(|attempt| is_recovery_welcome(&attempt.message))
+        .unwrap()
+        .message;
+    peers
+        .recipient
+        .ingest_delivery(&recovery_inbox_delivery(peers.recipient.self_id(), welcome))
+        .await
+        .unwrap();
+    assert!(
+        !peers
+            .recipient
+            .group_record(&peers.group)
+            .unwrap()
+            .unrecoverable
+    );
+}
+
+#[tokio::test]
+async fn rejoin_withdrawn_expiry() {
+    use cgka_traits::storage::MessageStorage;
+    let mut peers = recovery_peers(0).await;
+    let started = peers.wall.now().0;
+    exchange_recovery(&mut peers).await;
+    peers.wall.set(started + 100);
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    let path = peers._dir.path().join("alice.sqlite");
+    let key = SqlCipherKey::new("live recovery cancellation key").unwrap();
+    drop(peers.coordinator);
+    {
+        let storage = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
+        let row = storage.list_group_recoveries().unwrap().remove(0);
+        storage
+            .update_message_state(
+                row.commit_id.as_ref().unwrap(),
+                cgka_traits::MessageState::ConvergenceDeferred,
+            )
+            .unwrap();
+    }
+    peers.coordinator = eligibility_runtime(
+        nostr_device_session(path, &key, b"cancel-alice"),
+        peers.recipient.self_id(),
+        peers.wall.clone(),
+        peers.adapter.clone(),
+        RecordingKeyPackages::default(),
+    );
+    peers.wall.set(started + 601);
+    assert_eq!(
+        peers.coordinator.prepare_group_recovery().unwrap(),
+        vec![peers.recipient.self_id()]
+    );
+    peers.coordinator.advance_group_recovery().await.unwrap();
+    assert!(
+        peers
+            .coordinator
+            .prepare_group_recovery()
+            .unwrap()
+            .is_empty(),
+        "an expired withdrawn publication must become quiescent during its cooldown"
+    );
+}
+
+#[tokio::test]
 async fn rejoin_retry_epoch_poison() {
-    let mut peers = recovery_peers().await;
+    let mut peers = recovery_peers(0).await;
     let alice_id = peers.coordinator.self_id();
     let bob_id = peers.recipient.self_id();
     peers.recipient.prepare_group_recovery().unwrap();
@@ -123,7 +268,7 @@ async fn rejoin_retry_epoch_poison() {
 
 #[tokio::test]
 async fn rejoin_fresh_evidence() {
-    let mut peers = recovery_peers().await;
+    let mut peers = recovery_peers(0).await;
     let alice_id = peers.coordinator.self_id();
     let bob_id = peers.recipient.self_id();
     let now = peers.wall.now().0;
@@ -212,7 +357,7 @@ async fn rejoin_fresh_evidence() {
 #[tokio::test]
 async fn rejoin_commit_cooldown() {
     use sha2::{Digest, Sha256};
-    let mut peers = recovery_peers().await;
+    let mut peers = recovery_peers(0).await;
     exchange_recovery(&mut peers).await;
     let grant = recovery_control(
         b"cancel-alice",
@@ -467,7 +612,7 @@ async fn rejoin_two_admin_accounts() {
 
 #[tokio::test]
 async fn rejoin_unreachable_budget() {
-    let mut peers = recovery_peers().await;
+    let mut peers = recovery_peers(0).await;
     assert_eq!(
         peers.coordinator.group_rejoin_status(&peers.group).unwrap(),
         marmot_session::GroupRejoinStatus::Inactive
@@ -520,7 +665,7 @@ async fn rejoin_unreachable_budget() {
 
 #[tokio::test]
 async fn rejoin_removed_budget() {
-    let mut peers = recovery_peers().await;
+    let mut peers = recovery_peers(0).await;
     let bob_id = peers.recipient.self_id();
     let alice_id = peers.coordinator.self_id();
     evolve(
@@ -582,7 +727,7 @@ async fn rejoin_removed_budget() {
 
 #[tokio::test]
 async fn rejoin_phase_budget() {
-    let mut peers = recovery_peers().await;
+    let mut peers = recovery_peers(0).await;
     let now = peers.wall.now().0;
     let alice_id = peers.coordinator.self_id();
     let bob_id = peers.recipient.self_id();

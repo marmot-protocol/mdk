@@ -77,15 +77,39 @@ where
         if !self.session.ensure_group_hydrated(group_id)? {
             return Ok(GroupRejoinStatus::Inactive);
         }
-        let Some(record) = self.new_recipient_recovery(group_id, None, self.wall_clock.now().0)?
-        else {
-            return Ok(GroupRejoinStatus::Inactive);
-        };
+        let now = self.wall_clock.now().0;
         let old = self
             .session
             .storage
             .list_group_recoveries()
             .map_err(SessionError::from)?;
+        let live = old.iter().find(|record| {
+            record.role == Role::Recipient
+                && &record.group_id == group_id
+                && record.expires_at > now
+                && matches!(record.phase, Phase::Grant | Phase::AwaitWelcome)
+        });
+        let record = match live {
+            Some(previous)
+                if self
+                    .recipient_recovery_state(group_id)?
+                    .is_some_and(|state| Some(state.token) == previous.local_state_token) =>
+            {
+                // A live grant still authorizes its original coordinator. Retry
+                // renews the budget without creating a second authorization.
+                let mut record = previous.clone();
+                record.total_attempts = 0;
+                record.attempts = 0;
+                record.retry_at = now;
+                record
+            }
+            _ => {
+                let Some(record) = self.new_recipient_recovery(group_id, None, now)? else {
+                    return Ok(GroupRejoinStatus::Inactive);
+                };
+                record
+            }
+        };
         if !old
             .iter()
             .any(|previous| previous.role == Role::Recipient && &previous.group_id == group_id)
@@ -235,9 +259,7 @@ where
                 } else if let Some(state) = state {
                     let hash = state.candidate_set_hash;
                     let evidence = record.candidate_set_hash != Some(hash)
-                        || record
-                            .observed_epoch
-                            .is_none_or(|epoch| state.epoch > epoch);
+                        || record.native_epoch.is_none_or(|epoch| state.epoch > epoch);
                     if evidence
                         || (record.phase != Phase::Parked
                             && (record.expires_at <= now
@@ -249,12 +271,13 @@ where
                         {
                             replacement.total_attempts =
                                 if evidence { 0 } else { record.total_attempts };
-                            replacement.observed_epoch = Some(
-                                record
-                                    .observed_epoch
-                                    .unwrap_or(state.epoch)
-                                    .max(state.epoch),
-                            );
+                            replacement.native_epoch =
+                                Some(record.native_epoch.unwrap_or(state.epoch).max(state.epoch));
+                            replacement.observed_epoch = if evidence {
+                                None
+                            } else {
+                                record.observed_epoch
+                            };
                             self.session
                                 .storage
                                 .with_transaction(|storage| {
@@ -269,6 +292,7 @@ where
                         }
                     } else if record.phase != Phase::Parked
                         && record.total_attempts >= MAX_RECIPIENT_ATTEMPTS
+                        && record.expires_at <= now
                     {
                         let mut parked = record.clone();
                         parked.phase = Phase::Parked;
@@ -333,6 +357,8 @@ where
         records.retain(|record| {
             record.phase != Phase::Complete
                 && record.phase != Phase::Parked
+                && (record.role != Role::Recipient
+                    || record.total_attempts < MAX_RECIPIENT_ATTEMPTS)
                 && record.retry_at <= now
                 && (record.expires_at > now || record.phase == Phase::Publishing)
         });
@@ -639,7 +665,8 @@ where
             phase: Phase::Request,
             total_attempts: 0,
             candidate_set_hash: Some(state.candidate_set_hash),
-            observed_epoch: Some(state.epoch),
+            native_epoch: Some(state.epoch),
+            observed_epoch: None,
             commit_started_at: None,
             message,
             outbound: None,
@@ -764,6 +791,7 @@ where
             phase: Phase::Challenge,
             total_attempts: 0,
             candidate_set_hash: None,
+            native_epoch: None,
             observed_epoch: None,
             commit_started_at: None,
             message: challenge,
@@ -821,14 +849,15 @@ where
         }
         let newer = record
             .observed_epoch
-            .is_none_or(|epoch| source.epoch > epoch);
+            .or(record.native_epoch)
+            .is_some_and(|epoch| source.epoch > epoch);
         if record.phase == Phase::Parked && !newer {
             return Ok(false);
         }
         if newer {
             record.total_attempts = 0;
-            record.observed_epoch = Some(source.epoch);
         }
+        record.observed_epoch = Some(source.epoch);
         record.leaf_index = source.leaf_index;
         record.phase = Phase::Challenge;
         record.message = message.clone();
@@ -1127,6 +1156,7 @@ where
     fn refresh_recovery_challenge(&mut self, record: &mut Record) -> AccountResult<bool> {
         if record.expires_at <= self.wall_clock.now().0 {
             record.phase = Phase::Complete;
+            record.commit_id = None;
             return Ok(false);
         }
         let old = match &record.message.body {
@@ -1148,6 +1178,7 @@ where
             Err(EngineError::GroupRecoveryUnsettled { .. }) => return Ok(false),
             Err(error) if recovery_expected_refusal(&error) => {
                 record.phase = Phase::Complete;
+                record.commit_id = None;
                 return Ok(false);
             }
             Err(error) => return Err(error.into()),

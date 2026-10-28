@@ -7,7 +7,9 @@
 - Migration 0124 advances account storage to schema 124 after the upstream
   recovery-coverage migration 0123. It adds the protocol-owned `cgka_group_rejoin`
   journal for finite authenticated rejoin episodes, per-member Commit cooldowns
-  and durable publication ownership. Older binaries reject
+  and durable publication ownership. Records separate the native epoch baseline
+  from authenticated coordinator epochs, allowing a taller losing copy to rejoin.
+  Older binaries reject
   the upgraded database; deleting a group also deletes its recovery jobs.
 - Migration 0121 advances account storage to schema 121 (mdk#2628). It drops
   `cgka_member_capabilities`, the engine's per-account capability cache: with

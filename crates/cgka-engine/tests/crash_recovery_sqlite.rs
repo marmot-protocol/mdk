@@ -1954,6 +1954,7 @@ async fn run_recovery_child(database: &Path) {
                 phase: GroupRecoveryPhase::Publishing,
                 total_attempts: 0,
                 candidate_set_hash: None,
+                native_epoch: None,
                 observed_epoch: None,
                 commit_started_at: Some(0),
                 message: GroupRecoveryMessage {

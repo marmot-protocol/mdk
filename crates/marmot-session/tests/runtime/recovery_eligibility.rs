@@ -168,7 +168,7 @@ async fn recovery_quarantine_isolated() {
     use cgka_traits::GroupStorage;
     use storage_sqlite::{GroupRecoveryPhase, GroupRecoveryRecord, GroupRecoveryRole};
 
-    let mut peers = recovery_peers().await;
+    let mut peers = recovery_peers(0).await;
     let bob_path = peers._dir.path().join("bob.sqlite");
     let key = SqlCipherKey::new("live recovery cancellation key").unwrap();
     let alice_id = peers.coordinator.self_id();
@@ -197,6 +197,7 @@ async fn recovery_quarantine_isolated() {
                 phase: GroupRecoveryPhase::Request,
                 total_attempts: 0,
                 candidate_set_hash: None,
+                native_epoch: None,
                 observed_epoch: None,
                 commit_started_at: None,
                 message: cgka_traits::GroupRecoveryMessage {
@@ -284,7 +285,7 @@ async fn recovery_quarantine_isolated() {
 async fn recovery_same_device_refresh() {
     use cgka_traits::GroupRecoveryBody;
 
-    let mut peers = recovery_peers().await;
+    let mut peers = recovery_peers(0).await;
     exchange_recovery(&mut peers).await;
     let original = recovery_control(
         b"cancel-bob",

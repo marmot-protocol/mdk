@@ -131,9 +131,14 @@ Kind `1159` is proposed, not allocated; the wire contract and older-client rollo
 Migration 0124 follows the recovery-coverage ledger's migration 0123. It adds the protocol-owned `cgka_group_rejoin`
 journal and gates older writers. Retry reservations precede directory and network work. One recipient episode
 permits 32 reservations across nonce rotation, request expiry, phase
-changes, cancellation and reopen. Exhaustion durably parks the episode rather than rotating forever. A changed
+changes, cancellation and reopen. Exhaustion stops new reservations; the episode parks after its current request
+expires, leaving a live grant time to complete. A changed
 known admin set, a newer native epoch or authenticated newer coordinator epoch, or explicit user retry rearms it;
 elapsed time and restart do not.
+
+The journal keeps the native epoch baseline separate from its authenticated remote epoch high-water mark. A frozen
+losing branch can be taller than the winning branch: its height never rejects a coordinator's first Challenge or
+the resulting replacement Welcome. Native height is only a baseline for detecting fresh evidence.
 
 Requests expire after ten minutes; delays are 5, 15, 30, 60 and then 120 seconds, revisited by ordinary maintenance.
 Expiry rotates to the next candidate without resetting episode cost. A coordinator durably reserves a 600-second
@@ -157,6 +162,8 @@ methods belong to the same runtime owner; preparation durably reserves each turn
 Hosts can read `group_rejoin_status` as `Inactive`, `Pending { attempts }` or `Parked { attempts }`. A parked episode
 raises the existing app recovery-failure signal so a host can ask the user to retry or request an admin re-add.
 `retry_group_rejoin` explicitly starts a new budget only for an eligible Unrecoverable copy; it grants no authority
-to overwrite a usable copy. It drops remote-only epoch claims while retaining the frozen native epoch as its floor,
-so a dishonest coordinator cannot poison every later user-authorized episode. The app's existing Repair action uses
-that runtime-owned path.
+to overwrite a usable copy. An unexpired grant retains its nonce, selected coordinator and exact signed artifact,
+so Retry does not create a second live authorization. Otherwise Retry drops remote-only epoch claims, so a dishonest
+coordinator cannot poison every later user-authorized episode. The app's existing Repair action uses that runtime-owned
+path. A withdrawn coordinator publication that expires or loses eligibility retires its commit link; the retained
+cooldown row cannot continually reschedule it.
