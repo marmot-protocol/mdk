@@ -143,7 +143,7 @@ enum FrozenPassResolution {
     /// The search used up this slice's budget; the continuation is kept.
     Yielded,
     /// The pass halted or completed with nothing to apply.
-    Finished(CanonicalizationResult),
+    Finished(Box<CanonicalizationResult>),
     /// The selected result is durably applied; the caller announces it.
     Applied(Box<AppliedConvergencePass>),
 }
@@ -1781,7 +1781,7 @@ impl<S: StorageProvider> Engine<S> {
             &run_id,
         ) {
             Ok(FrozenPassResolution::Yielded) => return Ok(waiting_result(previous_tip.0)),
-            Ok(FrozenPassResolution::Finished(result)) => return Ok(result),
+            Ok(FrozenPassResolution::Finished(result)) => return Ok(*result),
             Ok(FrozenPassResolution::Applied(applied)) => *applied,
             Err(ConvergencePassFailure { step, error }) => {
                 self.record_convergence_pass_failure(
@@ -2088,7 +2088,7 @@ impl<S: StorageProvider> Engine<S> {
             .collect();
         self.audit_group_with_context(
             group_id,
-            convergence_run_context(&run_id, ConvergencePhase::Evaluating),
+            convergence_run_context(run_id, ConvergencePhase::Evaluating),
             crate::audit_helpers::convergence_decision_event(
                 previous_tip.0,
                 max_rewind_commits,
@@ -2102,7 +2102,7 @@ impl<S: StorageProvider> Engine<S> {
         ) {
             self.audit_group_with_context(
                 group_id,
-                convergence_run_context(&run_id, ConvergencePhase::Waiting),
+                convergence_run_context(run_id, ConvergencePhase::Waiting),
                 marmot_forensics::AuditEventKind::ConvergenceRunState {
                     phase: ConvergencePhase::Waiting,
                     current_tip_epoch: Some(previous_tip.0),
@@ -2165,7 +2165,7 @@ impl<S: StorageProvider> Engine<S> {
             });
             self.audit_group_with_context(
                 group_id,
-                convergence_run_context(&run_id, ConvergencePhase::Unrecoverable),
+                convergence_run_context(run_id, ConvergencePhase::Unrecoverable),
                 marmot_forensics::AuditEventKind::ConvergenceRunState {
                     phase: ConvergencePhase::Unrecoverable,
                     current_tip_epoch: Some(previous_tip.0),
@@ -2174,12 +2174,12 @@ impl<S: StorageProvider> Engine<S> {
                     error_kind: Some(error_kind.to_string()),
                 },
             );
-            return Ok(FrozenPassResolution::Finished(result));
+            return Ok(FrozenPassResolution::Finished(Box::new(result)));
         }
         if result.convergence_status == ConvergenceStatus::Blocked {
             self.audit_group_with_context(
                 group_id,
-                convergence_run_context(&run_id, ConvergencePhase::Blocked),
+                convergence_run_context(run_id, ConvergencePhase::Blocked),
                 marmot_forensics::AuditEventKind::ConvergenceRunState {
                     phase: ConvergencePhase::Blocked,
                     current_tip_epoch: Some(previous_tip.0),
@@ -2199,7 +2199,7 @@ impl<S: StorageProvider> Engine<S> {
                     ConvergencePassStep::CompleteBlocked,
                 ))?;
             self.schedule_drain_for_retained_outbound_intents(group_id);
-            return Ok(FrozenPassResolution::Finished(result));
+            return Ok(FrozenPassResolution::Finished(Box::new(result)));
         }
 
         let mut completed_pass = pass.clone();

@@ -63,7 +63,7 @@ mod tests {
     use crate::base::test_support::{gid, sample_group};
     use cgka_traits::convergence_pass::{
         ConvergenceCutoffCause, ConvergencePassMember, ConvergencePassMemberRole,
-        ConvergencePassPhase,
+        ConvergencePassPhase, ConvergencePassRetry, ConvergencePassStep,
     };
     use cgka_traits::storage::GroupStorage;
     use cgka_traits::{EpochId, MessageId};
@@ -108,7 +108,23 @@ mod tests {
         );
         assert_eq!(store.list_convergence_passes().unwrap(), vec![pass.clone()]);
 
+        // A failed batch's retry state rides in the same row (mdk#2684).
+        pass.phase = ConvergencePassPhase::Resolving;
+        pass.retry = Some(ConvergencePassRetry {
+            failed_attempts: 12,
+            failed_step: ConvergencePassStep::Apply,
+            next_attempt_monotonic_ms: 2_048,
+            next_attempt_wall_ms: 2_058,
+            parked_at_wall_ms: Some(2_058),
+        });
+        store.put_convergence_pass(&pass).unwrap();
+        assert_eq!(
+            store.convergence_pass(&group.id).unwrap(),
+            Some(pass.clone())
+        );
+
         pass.phase = ConvergencePassPhase::Completed;
+        pass.retry = None;
         store.put_convergence_pass(&pass).unwrap();
         assert_eq!(store.convergence_pass(&group.id).unwrap(), Some(pass));
 
