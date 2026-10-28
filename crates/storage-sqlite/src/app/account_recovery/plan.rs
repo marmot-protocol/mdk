@@ -1009,6 +1009,7 @@ impl SqliteAppStorage {
             }
             let mut seen = std::collections::BTreeSet::new();
             let mut updates = Vec::with_capacity(checkpoints.len());
+            let mut admitted = false;
             for checkpoint in checkpoints {
                 let token = &checkpoint.token;
                 if token.obligation_id != ticket.id || !seen.insert(token.scope_id) {
@@ -1033,6 +1034,7 @@ impl SqliteAppStorage {
                     return Ok(false);
                 }
                 validate_checkpoints(&payload, &checkpoint.endpoints)?;
+                admitted |= checkpoint.replay_admitted && !payload.replay_admitted;
                 payload.replay_admitted |= checkpoint.replay_admitted;
                 updates.push((token.scope_id, encode_scope(&payload)?));
             }
@@ -1042,6 +1044,14 @@ impl SqliteAppStorage {
                     "UPDATE account_recovery_scopes SET scope_payload=?3
                      WHERE obligation_id=?1 AND scope_id=?2",
                     params![ticket.id.as_slice(), sqlite_integer(scope_id)?, payload],
+                ).storage()?;
+            }
+            // A newly admitted scope is the native goal's own progress.
+            if admitted {
+                conn.execute_cached(
+                    "UPDATE account_recovery_obligations SET recovery_attempts=0
+                     WHERE id=?1 AND recovery_attempts!=0",
+                    [ticket.id.as_slice()],
                 ).storage()?;
             }
             let qualified = placement == RecoveryReplayPlacement::Placed

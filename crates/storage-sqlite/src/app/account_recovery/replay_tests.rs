@@ -1101,3 +1101,47 @@ fn native_reopen_keeps_floor() {
     assert_eq!(app.recovery_retry_state().unwrap(), cost);
     reopened.close().unwrap();
 }
+
+/// A newly admitted native scope is the goal's own progress, so it restarts
+/// the attempt count: a goal admitting its sources over many attempts does not
+/// park at the cap. Seeing an admitted scope again is not new progress.
+#[test]
+fn native_admission_restarts_attempt_count() {
+    let app = SqliteAccountStorage::in_memory().unwrap().app_storage();
+    let ticket = native(&app, 1);
+    let (fence, tokens) = prepare(
+        &app,
+        ticket,
+        &[
+            scope(41, 0, 10, PeerAdmission::Granted),
+            scope(77, 3, 20, PeerAdmission::Granted),
+        ],
+    );
+    for _ in 1..RECOVERY_PARK_AFTER_ATTEMPTS {
+        app.count_recovery_attempt(ticket.id).unwrap();
+    }
+    assert!(
+        !app.checkpoint_replay_admission(
+            &fence,
+            ticket,
+            RecoveryReplayPlacement::Placed,
+            &[admission(&tokens[0])]
+        )
+        .unwrap()
+    );
+    assert_eq!(app.count_recovery_attempt(ticket.id).unwrap(), 1);
+    assert!(
+        !app.checkpoint_replay_admission(
+            &fence,
+            ticket,
+            RecoveryReplayPlacement::Placed,
+            &[admission(&tokens[0])]
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        app.count_recovery_attempt(ticket.id).unwrap(),
+        2,
+        "an admitted scope seen again is not new progress"
+    );
+}
