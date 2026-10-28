@@ -896,6 +896,36 @@ mod tests {
     }
 
     #[test]
+    fn legacy_clear_that_restores_loss_uncovers_the_ledger() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        // Generation 12 joins 11's obligation; the worker then re-adopts 11.
+        for token in [11, 12, 11] {
+            app.mark_account_delivery_recovery_bounded("alice", token, 3, Some(500))
+                .unwrap();
+        }
+        let inbox = TransportReconciliationRoute::Inbox;
+        record(
+            &app,
+            &inbox,
+            RELAY_A,
+            100,
+            900,
+            RecoveryCoverageProof::Comparison,
+            1,
+        );
+        // Retiring one generation re-arms the other, which still owes from
+        // its floor.
+        assert!(!app.clear_account_delivery_recovery("alice", 11).unwrap());
+        assert_eq!(
+            ranges(&app, &inbox, RELAY_A),
+            vec![(100, 499, RecoveryCoverageProof::Comparison)]
+        );
+        assert_eq!(app.recovery_coverage_goal(&inbox).unwrap(), Some(500));
+    }
+
+    #[test]
     fn fenced_slices_are_dropped_after_a_newer_loss() {
         let storage = SqliteAccountStorage::in_memory().unwrap();
         let app = storage.app_storage();

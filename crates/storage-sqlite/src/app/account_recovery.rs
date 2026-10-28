@@ -479,6 +479,10 @@ pub(crate) fn restore_legacy_loss_tx(conn: &Connection, label: &str) -> StorageR
         )
         .storage()?;
     }
+    if !rows.is_empty() {
+        let floor = loss::goal_floor(conn, label, RecoveryLossCause::Queue)?;
+        crate::app::recovery_coverage::uncover_loss_tx(conn, floor.unwrap_or(0))?;
+    }
     Ok(!rows.is_empty())
 }
 

@@ -254,8 +254,9 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   point for a covered `(route, relay, since, until, proof)` slice; it merges overlapping or touching ranges of the same
   route, relay and proof and keeps the oldest proof time. Coverage on a route is what every given relay covers, merged
   across proofs. Debt is the goal floor up to a caller-given time minus that coverage; a route without a goal owes
-  nothing. Each delivery or notification loss import un-covers, in its own transaction, every route the ledger holds
-  from the loss floor upward (all of it when the floor is unknown) and widens their goals to it;
+  nothing. Each delivery or notification loss import, and a legacy clear that re-arms an older generation, un-covers in
+  its own transaction every route the ledger holds from the loss floor upward (all of it when the floor is unknown)
+  and widens their goals to it;
   `uncover_recovery_coverage` does the same for the given routes only. `prune_recovery_coverage` drops coverage below the retention floor and raises goals to it. The ledger
   is in shadow mode: no obligation, retry, fence or schedule reads it.
 
