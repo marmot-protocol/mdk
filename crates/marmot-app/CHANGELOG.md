@@ -259,6 +259,12 @@
 - `marmot_app::product_analytics::configure_product_analytics_from_environment`
   no longer resolves (mdk#2627). Hosts call the same function as
   `marmot_app::configure_product_analytics_from_environment`, as before.
+- `MarmotApp`'s `DirectoryObserver` implementation records directory
+  operations through a `marmot-app` type that wraps `ProductObservation`, so
+  the impl survives the collector's move to its own crate (mdk#2627). Its
+  `Observation` associated type is that wrapper, and `ProductObservation` no
+  longer implements `DirectoryObservation`. Directory operations record
+  exactly as before.
 - Collector clients (relay-telemetry export, product analytics, the audit
   upload and `AuditOtlpSender`) take the process SOCKS5 policy from the first
   `MarmotApp` the process builds (mdk#2627). Before one exists they build no

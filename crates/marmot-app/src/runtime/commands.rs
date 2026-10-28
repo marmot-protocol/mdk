@@ -64,7 +64,7 @@ impl AccountManager {
         let handle = tokio::spawn(async move {
             let catch_up_started_at = Instant::now();
             let catch_up = post_mutation.catch_up_account_commands(vec![command]).await;
-            post_mutation.shared.app_performance_telemetry().record(
+            post_mutation.shared.observer.performance().record(
                 AppPerformanceOperation::GroupInvitePostMutationCatchUp,
                 catch_up_started_at.elapsed(),
                 catch_up.is_ok(),
@@ -92,7 +92,8 @@ impl AccountManager {
     ) {
         let observation = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::CatchUpAfterMutation);
         let result = self.catch_up_account_commands(vec![command]).await;
         observation.finish_app(&result);
@@ -121,7 +122,8 @@ impl AccountManager {
             let result = manager.catch_up_account_commands(vec![command]).await;
             manager
                 .shared
-                .app_performance_telemetry()
+                .observer
+                .performance()
                 .record_classified_result(
                     AppPerformanceOperation::AccountCatchUp,
                     started_at.elapsed(),
@@ -130,7 +132,7 @@ impl AccountManager {
                         .err()
                         .map(super::account_catch_up_metric_classification),
                 );
-            manager.shared.app_performance_telemetry().record(
+            manager.shared.observer.performance().record(
                 AppPerformanceOperation::GroupCreatePostMutationCatchUp,
                 started_at.elapsed(),
                 result.is_ok(),
@@ -200,7 +202,7 @@ impl AccountManager {
             .directory()
             .prewarm_group_member_key_packages(&member_refs)
             .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupMemberKeyPackagePrewarm,
             started_at.elapsed(),
             result.is_ok(),
@@ -275,7 +277,7 @@ impl AccountManager {
             Ok::<_, AppError>(created)
         }
         .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupCreateTotalCallerLatency,
             started_at.elapsed(),
             result.is_ok(),
@@ -400,7 +402,7 @@ impl AccountManager {
         }
         .await;
         let result = result.map(|created| created.group_id);
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupCreateTotalCallerLatency,
             started_at.elapsed(),
             result.is_ok(),
@@ -441,7 +443,7 @@ impl AccountManager {
             .create_group_with_options_outcome(account_ref, name, members, options)
             .await
             .and_then(CanonicalCreatedGroup::into_detailed);
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupCreateTotalCallerLatency,
             started_at.elapsed(),
             result.is_ok(),
@@ -563,7 +565,7 @@ impl AccountManager {
             account_worker_response(response).await
         }
         .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupMlsStateRead,
             started_at.elapsed(),
             result.is_ok(),
@@ -854,7 +856,7 @@ impl AccountManager {
             Ok(summary)
         }
         .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupInviteMembers,
             started_at.elapsed(),
             result.is_ok(),
@@ -1130,18 +1132,16 @@ impl AccountManager {
             account_worker_response(response).await
         }
         .await;
-        self.shared
-            .app_performance_telemetry()
-            .record_classified_result(
-                AppPerformanceOperation::GroupAcceptInvite,
-                started_at.elapsed(),
-                result.as_ref().err().map(|error| {
-                    crate::SyncFailureClassification::new(
-                        crate::SyncFailureStage::AccountWorker,
-                        error.sync_error_class(),
-                    )
-                }),
-            );
+        self.shared.observer.performance().record_classified_result(
+            AppPerformanceOperation::GroupAcceptInvite,
+            started_at.elapsed(),
+            result.as_ref().err().map(|error| {
+                crate::SyncFailureClassification::new(
+                    crate::SyncFailureStage::AccountWorker,
+                    error.sync_error_class(),
+                )
+            }),
+        );
         result
     }
 
@@ -1388,7 +1388,7 @@ impl AccountManager {
             Ok(summary)
         }
         .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupPromoteAdmin,
             started_at.elapsed(),
             result.is_ok(),
@@ -1470,7 +1470,7 @@ impl AccountManager {
         revision: crate::MessageDraftRevision,
         attachments: Vec<MediaAttachmentReference>,
     ) -> Result<SendSummary, AppError> {
-        let telemetry = self.shared.app_performance_telemetry();
+        let telemetry = self.shared.observer.performance().clone();
         let caller = telemetry.observe(RuntimeOp::DraftSendCaller);
         let enqueued_at = Instant::now();
         let result = async {
@@ -1513,7 +1513,7 @@ impl AccountManager {
         group_id: &GroupId,
         payload: Vec<u8>,
     ) -> Result<SendSummary, AppError> {
-        let telemetry = self.shared.app_performance_telemetry();
+        let telemetry = self.shared.observer.performance().clone();
         let caller = telemetry.observe(RuntimeOp::DirectSendCaller);
         let enqueued_at = Instant::now();
         let result = async {
@@ -1539,7 +1539,7 @@ impl AccountManager {
         }
         .await;
         caller.finish_app(&result);
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::OutboundMessageResponse,
             enqueued_at.elapsed(),
             result.is_ok(),
@@ -1686,7 +1686,7 @@ impl AccountManager {
             account_worker_response(response).await
         }
         .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::OutboundMessageResponse,
             enqueued_at.elapsed(),
             result.is_ok(),

@@ -357,7 +357,7 @@ fn prepared_group_image_create_has_no_upload_phase_and_is_idempotent() {
             crate::client::PreparedGroupImageUploadStart::Complete(_)
         ));
 
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = crate::observer::PerformanceRecorder::default();
         let group_id = client
             .create_group_with_prepared_initial_image_and_telemetry(
                 "prepared image",
@@ -421,7 +421,7 @@ fn uploaded_prepared_group_image_retry_recovers_from_engine_without_projection()
             .unwrap()
             .unwrap()
             .component_data;
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = crate::observer::PerformanceRecorder::default();
 
         // Simulate the narrow crash window: MLS creation is canonical, but
         // consumption fails and the best-effort app projection is absent.

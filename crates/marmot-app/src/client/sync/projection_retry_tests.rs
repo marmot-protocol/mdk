@@ -277,7 +277,7 @@ async fn cancelled_drain_checkpoint_retains_progress_and_notifications() {
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
     client.prepare_transport().await.unwrap();
-    let telemetry = AppPerformanceTelemetry::default();
+    let telemetry = PerformanceRecorder::default();
     let group = client
         .create_group_with_options_and_telemetry("retry", &[], Default::default(), &telemetry)
         .await
@@ -366,7 +366,7 @@ async fn cancelled_commit_keeps_output() {
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         let group = client
             .create_group_with_options_and_telemetry(
                 "before rename",
@@ -630,7 +630,7 @@ async fn cancelling_public_waits_keeps_repaired_notifications() {
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         let group = client
             .create_group_with_options_and_telemetry("retry", &[], Default::default(), &telemetry)
             .await

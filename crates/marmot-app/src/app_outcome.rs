@@ -5,7 +5,7 @@
 
 use crate::AppError;
 use crate::app_telemetry::runtime::Outcome;
-use crate::product_analytics::StorageFailureKind;
+use crate::observer::StorageFailureKind;
 
 /// The performance outcome of a failed operation: a worker that did not answer in time is a
 /// timeout, a busy worker is not ready, and any other error is a failure.

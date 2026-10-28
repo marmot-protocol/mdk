@@ -17,7 +17,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use transport_nostr_peeler::MarmotNostrSigner;
 
-use crate::app_telemetry::{AppPerformanceOperation, AppPerformanceTelemetry};
+use crate::app_telemetry::AppPerformanceOperation;
+use crate::observer::PerformanceRecorder;
 use crate::{AppError, ChatListAttachmentKind, SendSummary};
 
 mod blossom;
@@ -98,9 +99,10 @@ impl MediaDownloadBenchmarkTransport {
     pub async fn fetch_with_telemetry(
         &self,
         url: &str,
-        telemetry: &AppPerformanceTelemetry,
+        telemetry: &crate::AppPerformanceTelemetry,
     ) -> Result<Vec<u8>, AppError> {
-        blossom::fetch_blossom_blob_with_observer(url, &self.0, Some(telemetry)).await
+        let telemetry = PerformanceRecorder::from(telemetry);
+        blossom::fetch_blossom_blob_with_observer(url, &self.0, Some(&telemetry)).await
     }
 
     /// Fetch one integrity-bound blob through the ordered production locator path.
@@ -108,8 +110,9 @@ impl MediaDownloadBenchmarkTransport {
         &self,
         locators: Vec<String>,
         ciphertext_sha256: String,
-        telemetry: &AppPerformanceTelemetry,
+        telemetry: &crate::AppPerformanceTelemetry,
     ) -> Result<Vec<u8>, AppError> {
+        let telemetry = PerformanceRecorder::from(telemetry);
         let reference = MediaAttachmentReference {
             locators: locators
                 .into_iter()
@@ -133,7 +136,7 @@ impl MediaDownloadBenchmarkTransport {
             &[],
             &[BLOSSOM_LOCATOR_KIND_V1.to_owned()],
             &self.0,
-            Some(telemetry),
+            Some(&telemetry),
         )
         .await
         .map_err(AttachmentDownloadFailure::into_error)
@@ -1022,7 +1025,7 @@ pub(crate) async fn download_encrypted_media_with_transport(
     fallback_endpoints: &[crate::AppBlobEndpoint],
     allowed_locator_kinds: &[String],
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
 ) -> Result<MediaDownloadResult, AppError> {
     download_encrypted_media_classified(
         reference,
@@ -1042,7 +1045,7 @@ pub(crate) async fn download_encrypted_media_classified(
     fallback_endpoints: &[crate::AppBlobEndpoint],
     allowed_locator_kinds: &[String],
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
 ) -> Result<MediaDownloadResult, AttachmentDownloadFailure> {
     // Structural validation only: an out-of-policy or client-unsupported locator
     // is judged at fetch time below, where it degrades to an unfetchable outcome
@@ -1197,7 +1200,7 @@ async fn fetch_encrypted_media_blob_with_observer(
     fallback_endpoints: &[crate::AppBlobEndpoint],
     allowed_locator_kinds: &[String],
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
 ) -> Result<Vec<u8>, AppError> {
     fetch_encrypted_media_blob_classified(
         reference,
@@ -1215,7 +1218,7 @@ async fn fetch_encrypted_media_blob_classified(
     fallback_endpoints: &[crate::AppBlobEndpoint],
     allowed_locator_kinds: &[String],
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
 ) -> Result<Vec<u8>, AttachmentDownloadFailure> {
     // Fetchability is judged against CURRENT policy + current client support.
     // This client only fetches `blossom-v1`, so if the group's current policy
@@ -1434,7 +1437,7 @@ fn media_download_failure(err: AppError) -> AppError {
 
 /// Record one reviewed media phase without dynamic labels or identifiers.
 fn record_media_download_phase(
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     operation: AppPerformanceOperation,
     started_at: Instant,
     success: bool,
@@ -1446,7 +1449,7 @@ fn record_media_download_phase(
 
 /// Record time lost to a candidate only when another locator will be tried.
 fn record_locator_failover_if_needed(
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     started_at: Instant,
     candidate_index: usize,
     candidate_count: usize,

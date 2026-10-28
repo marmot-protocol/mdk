@@ -14,12 +14,13 @@ use marmot_account::AccountSummary;
 use cgka_traits::TransportEndpoint;
 use storage_sqlite::SqliteSharedStorage;
 
+use crate::observer::ProductOperation;
 use crate::{
     APP_CACHE_DB_FILE, AccountRelayListStatus, AppError,
     DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER, MarmotApp, SqlcipherDatabaseKind,
     remove_sqlite_file_set,
 };
-use crate::{ProductFamily, ProductObservation, ProductUnit};
+use crate::{ProductFamily, ProductUnit};
 use nostr_directory::error::DirectoryError;
 use nostr_directory::hydrate_directory_record;
 use nostr_directory::public_directory_user_record;
@@ -123,38 +124,44 @@ impl DirectoryResources for MarmotApp {
 /// Directory analytics go to the app's usage-diagnostics collector, under the
 /// families and units they always used.
 impl DirectoryObserver for MarmotApp {
-    type Observation = ProductObservation;
+    type Observation = DirectoryProductObservation;
 
     fn begin(
         &self,
         family: ObservedFamily,
         operation: &'static str,
         unit: ObservedUnit,
-    ) -> Option<ProductObservation> {
+    ) -> Option<DirectoryProductObservation> {
         self.product_analytics
-            .begin(product_family(family), operation, product_unit(unit))
+            .operation(product_family(family), operation, product_unit(unit))
+            .map(DirectoryProductObservation)
     }
 }
 
-impl DirectoryObservation for ProductObservation {
+/// A directory operation recorded into the app's collector. The directory's observation trait is
+/// implemented on this `marmot-app` type because neither the trait nor the collector's operation
+/// is local to `marmot-app` once the collector moves to its own crate (#2627).
+pub struct DirectoryProductObservation(ProductOperation);
+
+impl DirectoryObservation for DirectoryProductObservation {
     fn counts_only(self) -> Self {
-        ProductObservation::counts_only(self)
+        Self(self.0.counts_only())
     }
 
     fn count(&self, outcome: &str, unit: ObservedUnit, count: u64) {
-        ProductObservation::count(self, outcome, product_unit(unit), count);
+        self.0.count(outcome, product_unit(unit), count);
     }
 
     fn directory_sample(&self, outcome: &str, source: &str, count: u64) {
-        ProductObservation::directory_sample(self, outcome, source, count);
+        self.0.directory_sample(outcome, source, count);
     }
 
     fn finish(self, outcome: &str) {
-        ProductObservation::finish(self, outcome);
+        self.0.finish(outcome);
     }
 
     fn discard(self) {
-        ProductObservation::discard(self);
+        self.0.discard();
     }
 }
 

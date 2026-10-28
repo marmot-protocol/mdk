@@ -953,7 +953,7 @@ async fn encrypted_media_download_records_network_integrity_and_crypto_phases() 
     )
     .await
     .expect("fixture upload should succeed");
-    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+    let telemetry = crate::observer::PerformanceRecorder::default();
     let transport =
         BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
 
@@ -2219,7 +2219,7 @@ async fn shared_deadline_timeout_records_the_active_later_locator_phase() {
         Duration::from_millis(80),
         Duration::from_millis(130),
     );
-    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+    let telemetry = crate::observer::PerformanceRecorder::default();
     let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
 
     let error = fetch_encrypted_media_blob_with_observer(
@@ -2424,7 +2424,7 @@ async fn oversized_content_length_does_not_record_body_transfer_timing() {
     let server = spawn_http_response(response.into_bytes());
     let url = format!("{server}/{}.bin", valid_hash());
     let transport = BlossomHttpTransport::new(true);
-    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+    let telemetry = crate::observer::PerformanceRecorder::default();
 
     let err = fetch_blossom_blob_with_observer(&url, &transport, Some(&telemetry))
         .await
@@ -2445,7 +2445,7 @@ async fn empty_response_records_first_byte_failure_without_body_transfer_timing(
     );
     let url = format!("{server}/{}.bin", valid_hash());
     let transport = BlossomHttpTransport::new(true);
-    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+    let telemetry = crate::observer::PerformanceRecorder::default();
 
     let body = fetch_blossom_blob_with_observer(&url, &transport, Some(&telemetry))
         .await

@@ -2,14 +2,12 @@
 //!
 //! `MarmotApp` keeps the consent receipt and the telemetry install id in shared storage, and
 //! restores them into the product collector, which holds the consent state and its permits. This
-//! module reaches the collector only through its methods. It takes the collector's locks in their
-//! order: the consent lock across the whole change ([`ProductAnalytics::consent_change`]), and the
+//! module reaches the collector only through the wiring surface. It takes the collector's locks in
+//! their order: the consent lock across the whole change ([`wiring::consent_change`]), and the
 //! state lock inside each step.
-//!
-//! [`ProductAnalytics::consent_change`]: crate::ProductAnalytics::consent_change
 
 use crate::conversions::usage_diagnostics_settings_from_storage;
-use crate::product_analytics::ReceiptRevisions;
+use crate::wiring::{self, ReceiptRevisions};
 use crate::{
     AppError, DiagnosticsPermit, MarmotApp, ProductAnalyticsError, ProductAnalyticsMetadata,
     ProductAnalyticsRuntimeConfig, UsageDiagnosticsDecision, UsageDiagnosticsSettings,
@@ -27,13 +25,14 @@ impl MarmotApp {
         let r = self.shared_storage()?.usage_diagnostics_settings()?;
         let mut receipt = usage_diagnostics_settings_from_storage(&r);
         if receipt.decision == UsageDiagnosticsDecision::Granted
-            && self
-                .product_analytics
-                .requires_acceptance(&ReceiptRevisions {
+            && wiring::requires_acceptance(
+                &self.product_analytics,
+                &ReceiptRevisions {
                     policy: r.policy_revision,
                     registry: r.registry_revision,
                     scope: r.scope_revision,
-                })
+                },
+            )
         {
             receipt.decision = UsageDiagnosticsDecision::AcceptanceRequired;
         }
@@ -47,7 +46,7 @@ impl MarmotApp {
     }
 
     pub(crate) fn restore_usage_diagnostics(&self) -> Result<(), AppError> {
-        let consent = self.product_analytics.consent_change();
+        let consent = wiring::consent_change(&self.product_analytics);
         let restored = (|| {
             let receipt = self.usage_diagnostics_settings()?;
             let id = self
@@ -58,11 +57,11 @@ impl MarmotApp {
         })();
         match restored {
             Ok((receipt, id)) => {
-                self.product_analytics.set_receipt(receipt, id);
+                wiring::set_receipt(&self.product_analytics, receipt, id);
                 Ok(())
             }
             Err(error) => {
-                self.product_analytics.revoke_memory();
+                wiring::revoke_memory(&self.product_analytics);
                 consent.fail_closed();
                 Err(error)
             }
@@ -73,13 +72,13 @@ impl MarmotApp {
         &self,
         enabled: bool,
     ) -> Result<UsageDiagnosticsSettings, AppError> {
-        let consent = self.product_analytics.consent_change();
+        let consent = wiring::consent_change(&self.product_analytics);
         let old_id = if enabled && self.product_analytics.permit().is_some() {
             self.telemetry_install_id().ok()
         } else {
             None
         };
-        self.product_analytics.revoke_memory();
+        wiring::revoke_memory(&self.product_analytics);
         // Fail closed until the complete durable write and receipt reload succeed.
         consent.fail_closed();
         let storage = self.shared_storage()?;
@@ -90,12 +89,15 @@ impl MarmotApp {
         r.registry_revision = stamp.revisions.registry;
         r.scope_revision = stamp.revisions.scope;
         r.updated_at_ms = stamp.updated_at_ms;
-        let id = enabled.then(|| old_id.unwrap_or_else(crate::generate_telemetry_install_id));
+        let id = enabled.then(|| old_id.unwrap_or_else(wiring::generate_telemetry_install_id));
         storage.set_usage_diagnostics_settings(&r, id.as_deref())?;
         let receipt = self.stored_usage_diagnostics_settings()?;
         consent.persisted();
-        self.product_analytics
-            .set_receipt(receipt.clone(), id.unwrap_or_default());
+        wiring::set_receipt(
+            &self.product_analytics,
+            receipt.clone(),
+            id.unwrap_or_default(),
+        );
         Ok(receipt)
     }
 }

@@ -11,7 +11,7 @@ use crate::conversation_presentation::{
 };
 use crate::drafts::MessageDraftInvalidation;
 use crate::{AppClient, AppError, MarmotApp, MarmotAppEvent, SelectedMessageDraft};
-use crate::{AppPerformanceTelemetry, RuntimePerformanceOperation as RuntimeOp};
+use crate::{RuntimePerformanceOperation as RuntimeOp, observer::PerformanceRecorder};
 use cgka_traits::{GroupId, StorageError};
 use marmot_session::GroupAuthoritySnapshot;
 use std::{
@@ -541,7 +541,8 @@ async fn acquire_worker(
     while !ready.is_closed() {
         let observation = accounts
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::ConversationWorkerAcquire);
         let result = async {
             let account = accounts.resolve(&label)?;
@@ -581,7 +582,7 @@ pub(super) fn telemetry_outcome<T>(
     }
 }
 async fn measured<T>(
-    telemetry: &AppPerformanceTelemetry,
+    telemetry: &PerformanceRecorder,
     operation: RuntimeOp,
     work: impl std::future::Future<Output = Result<T, ConversationWindowError>>,
 ) -> Result<T, ConversationWindowError> {
@@ -592,7 +593,7 @@ async fn measured<T>(
 }
 
 struct Reader {
-    telemetry: AppPerformanceTelemetry,
+    telemetry: PerformanceRecorder,
     authority_ready: Option<Observation>,
     send_ready: Option<Observation>,
     app: MarmotApp,
@@ -853,7 +854,7 @@ impl MarmotAppRuntime {
         group: &GroupId,
         query: ConversationOpenQuery,
     ) -> Result<RuntimeConversationWindowSubscription, ConversationWindowError> {
-        let telemetry = self.shared.app_performance_telemetry();
+        let telemetry = self.shared.observer.performance().clone();
         measured(&telemetry, RuntimeOp::ConversationOpen, async {
             self.shared.lifecycle().ensure_running()?;
             if !(1..=CONVERSATION_WINDOW_MAX_ROWS).contains(&query.limit) {

@@ -516,7 +516,7 @@ async fn queued_publication_cancel_finalizer_keeps_progress_before_revival() {
             "pending route",
             &[],
             Default::default(),
-            &AppPerformanceTelemetry::default(),
+            &crate::observer::PerformanceRecorder::default(),
         )
         .await
         .unwrap()

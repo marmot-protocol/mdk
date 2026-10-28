@@ -241,7 +241,7 @@ impl AccountStartupStage {
 /// worker keeps its stage in flight until the open itself moves on.
 #[derive(Clone, Debug)]
 pub(crate) struct AccountStartupProgress {
-    telemetry: crate::AppPerformanceTelemetry,
+    telemetry: crate::observer::PerformanceRecorder,
     state: Arc<Mutex<StartupStageState>>,
 }
 
@@ -279,7 +279,7 @@ impl Drop for StageSpan {
 
 impl AccountStartupProgress {
     /// Open the `Spawned` span of a worker about to be spawned.
-    pub(crate) fn new(telemetry: crate::AppPerformanceTelemetry) -> Self {
+    pub(crate) fn new(telemetry: crate::observer::PerformanceRecorder) -> Self {
         let stage = AccountStartupStage::Spawned;
         let span = StageSpan {
             observation: Some(telemetry.observe(stage.operation())),
@@ -942,7 +942,7 @@ impl Drop for WelcomeRecoveryTask {
     }
 }
 
-fn install_storage_telemetry(client: &AppClient, telemetry: &crate::AppPerformanceTelemetry) {
+fn install_storage_telemetry(client: &AppClient, telemetry: &crate::observer::PerformanceRecorder) {
     if let Ok(storage) = client.app.account_storage(&client.state.label) {
         let telemetry = telemetry.clone();
         storage.set_timing_observer(Some(Arc::new(move |operation, duration, success| {
@@ -1011,7 +1011,8 @@ async fn run_app_runtime_account_worker(
         Some(&startup_progress),
     ));
     let startup = shared
-        .app_performance_telemetry()
+        .observer
+        .performance()
         .observe(RuntimeOp::AccountStartup);
     let opened = tokio::select! {
         _ = &mut shutdown => {
@@ -1055,8 +1056,8 @@ async fn run_app_runtime_account_worker(
             return;
         }
     };
-    install_storage_telemetry(&client, &shared.app_performance_telemetry());
-    client.runtime_telemetry = Some(shared.app_performance_telemetry());
+    install_storage_telemetry(&client, shared.observer.performance());
+    client.runtime_telemetry = Some(shared.observer.performance().clone());
     client.recovery_credits = shared.recovery_credit_pool();
     #[cfg(test)]
     {
@@ -1092,7 +1093,7 @@ async fn run_app_runtime_account_worker(
 
     {
         let open_timings = client.runtime.open_timings();
-        let telemetry = shared.app_performance_telemetry();
+        let telemetry = shared.observer.performance().clone();
         telemetry.record(
             AppPerformanceOperation::AccountSessionOpen,
             open_timings.total,
@@ -1120,7 +1121,7 @@ async fn run_app_runtime_account_worker(
         );
     }
     if let Some(ready) = ready.take() {
-        shared.app_performance_telemetry().record(
+        shared.observer.performance().record(
             AppPerformanceOperation::AccountWorkerReadiness,
             worker_started_at.elapsed(),
             true,
@@ -1142,7 +1143,7 @@ async fn run_app_runtime_account_worker(
                 Ok(key_package.bytes().len())
             }
             .await;
-            shared.app_performance_telemetry().record(
+            shared.observer.performance().record(
                 AppPerformanceOperation::AccountInitialKeyPackagePublish,
                 started_at.elapsed(),
                 result.is_ok(),
@@ -1151,7 +1152,7 @@ async fn run_app_runtime_account_worker(
             // an explicit zero rather than omitting the sample so hosts can
             // distinguish "publication finished before sync" from "overlap
             // was not observed".
-            shared.app_performance_telemetry().record(
+            shared.observer.performance().record(
                 AppPerformanceOperation::AccountInitialSyncOverlap,
                 Duration::ZERO,
                 result.is_ok(),
@@ -1205,8 +1206,8 @@ async fn run_app_runtime_account_worker(
     let snapshot_started = Instant::now();
     let read_snapshot = {
         let capture =
-            client.group_read_snapshot_with_stage_telemetry(&shared.app_performance_telemetry());
-        shared.app_performance_telemetry().record(
+            client.group_read_snapshot_with_stage_telemetry(shared.observer.performance());
+        shared.observer.performance().record(
             AppPerformanceOperation::AccountGroupReadSnapshot,
             snapshot_started.elapsed(),
             capture.is_ok(),
@@ -1239,7 +1240,7 @@ async fn run_app_runtime_account_worker(
     let mut local_submission_due = true;
     let mut local_submission_retry_at = TokioInstant::now();
     let sync_started_at = Instant::now();
-    let startup_stage_telemetry = shared.app_performance_telemetry();
+    let startup_stage_telemetry = shared.observer.performance().clone();
     let mut startup_explicit_shutdown = false;
     let publish_startup_summary = |client: &AppClient, summary: &SyncSummary| {
         publish_app_runtime_summary_with_v5(
@@ -1450,12 +1451,12 @@ async fn run_app_runtime_account_worker(
                                         // Once claimed, finish engine ingest and projection
                                         // without cancellation by the network completion.
                                         let delivery_started = Instant::now();
-                                        let receive_observation = shared.app_performance_telemetry()
+                                        let receive_observation = shared.observer.performance()
                                             .observe(RuntimeOp::WorkerReceive);
                                         match client.ingest_received_delivery_with_partial(*delivery).await {
                                             Ok(summary) => {
                                                 receive_observation.finish(TelemetryOutcome::Success);
-                                                shared.app_performance_telemetry().record(
+                                                shared.observer.performance().record(
                                                     AppPerformanceOperation::InboundDeliveryProjection,
                                                     delivery_started.elapsed(), true,
                                                 );
@@ -1492,7 +1493,7 @@ async fn run_app_runtime_account_worker(
                                             }
                                             Err(failure) => {
                                                 receive_observation.finish(TelemetryOutcome::Failure);
-                                                shared.app_performance_telemetry().record(
+                                                shared.observer.performance().record(
                                                     AppPerformanceOperation::InboundDeliveryProjection,
                                                     delivery_started.elapsed(), false,
                                                 );
@@ -1647,7 +1648,7 @@ async fn run_app_runtime_account_worker(
     if let Err(failure) = &mut startup_sync_result {
         client.drain_epoch_stall_escalations(&mut failure.partial_summary);
     }
-    shared.app_performance_telemetry().record_classified_result(
+    shared.observer.performance().record_classified_result(
         AppPerformanceOperation::AccountSync,
         sync_started_at.elapsed(),
         startup_sync_result
@@ -2356,7 +2357,7 @@ async fn run_app_runtime_account_worker(
                     lifecycle.subscribe_shutdown(),
                 ).boxed().shared();
                 let yield_observation = secondary_retry_yield.clone();
-                let mut phase = Some(shared.app_performance_telemetry().observe(RuntimeOp::WorkerConvergence));
+                let mut phase = Some(shared.observer.performance().observe(RuntimeOp::WorkerConvergence));
                 // Recovery owns the live client, but member/roster reads can
                 // use the last committed snapshot while its relay I/O waits.
                 // Mutations retain worker FIFO order; reads use the snapshot.
@@ -2576,7 +2577,7 @@ async fn run_app_runtime_account_worker(
                 // commands remain queued until that durable sequence lands.
                 let delivery_started = matches!(&received, Ok(transport_nostr::AccountDeliveryReceive::Delivery(_)))
                     .then(Instant::now);
-                let receive_observation = shared.app_performance_telemetry().observe(RuntimeOp::WorkerReceive);
+                let receive_observation = shared.observer.performance().observe(RuntimeOp::WorkerReceive);
                 let result = match received {
                     Ok(transport_nostr::AccountDeliveryReceive::Delivery(delivery)) => {
                         client.ingest_received_delivery(*delivery).await
@@ -2590,7 +2591,7 @@ async fn run_app_runtime_account_worker(
                     Err(err) => Err(err),
                 };
                 if result.is_err() && let Some(started) = delivery_started {
-                    shared.app_performance_telemetry().record(
+                    shared.observer.performance().record(
                         AppPerformanceOperation::InboundDeliveryProjection,
                         started.elapsed(),
                         false,
@@ -2612,7 +2613,7 @@ async fn run_app_runtime_account_worker(
                             &account_label,
                         );
                         if let Some(started) = delivery_started {
-                            shared.app_performance_telemetry().record(
+                            shared.observer.performance().record(
                                 AppPerformanceOperation::InboundDeliveryProjection,
                                 started.elapsed(),
                                 true,
@@ -2686,7 +2687,7 @@ async fn run_app_runtime_account_worker(
                         let transport_account = client.adapter.account_id().clone();
                         drop(client);
                         client = loop {
-                            let reconnect_wait = shared.app_performance_telemetry().observe(RuntimeOp::WorkerReconnectWait);
+                            let reconnect_wait = shared.observer.performance().observe(RuntimeOp::WorkerReconnectWait);
                             let retry_started_at = Instant::now();
                             let mut retry_delay =
                                 std::pin::pin!(sleep(reconnect_backoff.next_delay()));
@@ -2720,7 +2721,7 @@ async fn run_app_runtime_account_worker(
                                                             let _ = respond.send(Err(ConversationWindowError::NotReady));
                                                         }
                                                         command => {
-                                                            shared.app_performance_telemetry().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
+                                                            shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
                                                             drop(command);
                                                         },
                                                     }
@@ -2750,7 +2751,7 @@ async fn run_app_runtime_account_worker(
                                             // instead of letting the queue fill
                                             // until host-side timeouts fire.
                                             Some(command) => {
-                                                shared.app_performance_telemetry().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
+                                                shared.observer.performance().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
                                                 drop(command);
                                             },
                                             None => break 'worker,
@@ -2759,7 +2760,7 @@ async fn run_app_runtime_account_worker(
                                 }
                             }
                             reconnect_wait.finish(TelemetryOutcome::Success);
-                            let reopen = shared.app_performance_telemetry().observe(RuntimeOp::WorkerReopen);
+                            let reopen = shared.observer.performance().observe(RuntimeOp::WorkerReopen);
                             let reopened_result = tokio::select! {
                                 _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => break 'worker,
                                 _ = &mut shutdown => break 'worker,
@@ -2773,8 +2774,8 @@ async fn run_app_runtime_account_worker(
                             reopen.finish_app(&reopened_result);
                             match reopened_result {
                                 Ok(mut reopened) => {
-                                    install_storage_telemetry(&reopened, &shared.app_performance_telemetry());
-                                    reopened.runtime_telemetry = Some(shared.app_performance_telemetry());
+                                    install_storage_telemetry(&reopened, shared.observer.performance());
+                                    reopened.runtime_telemetry = Some(shared.observer.performance().clone());
                                     reopened.recovery_credits = shared.recovery_credit_pool();
                                     #[cfg(test)]
                                     {
@@ -2814,7 +2815,7 @@ async fn run_app_runtime_account_worker(
                                     // loop on a full catch-up; the maintenance
                                     // path performs bounded repair syncs when
                                     // required.
-                                    let telemetry = shared.app_performance_telemetry();
+                                    let telemetry = shared.observer.performance().clone();
                                     let prepare_transport = tokio::select! {
                                         _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
                                             reopened.finish_audit_recording();
@@ -2982,7 +2983,7 @@ async fn run_app_runtime_account_worker(
                 if comparison_recovery.is_some() {
                     continue 'worker;
                 }
-                let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerMaintenance);
+                let phase = shared.observer.performance().observe(RuntimeOp::WorkerMaintenance);
                 if client.backfill_content_reports().is_err() {
                     tracing::warn!(
                         target: "marmot_app::account_worker",
@@ -3324,7 +3325,7 @@ async fn finish_periodic_maintenance_after_recovery(
     account_id_hex: &str,
     account_label: &str,
     shared: &RuntimeSharedServices,
-    product_backlog: &crate::product_analytics::ProductBacklogSource,
+    product_backlog: &crate::observer::ProductBacklogSource,
     scheduled_convergence: &mut ScheduledConvergence,
 ) {
     if let Err(err) = client.advance_post_join_maintenance_subscriptions().await {
@@ -3406,7 +3407,7 @@ async fn handle_account_worker_catch_up(
     pending: &mut VecDeque<AccountWorkerCommand>,
     context: AccountWorkerCatchUpContext<'_>,
 ) {
-    let telemetry = context.shared.app_performance_telemetry();
+    let telemetry = context.shared.observer.performance().clone();
     let catch_up_observation = telemetry.observe(RuntimeOp::WorkerCatchUp);
     let snapshot_observation = telemetry.observe(RuntimeOp::WorkerSnapshot);
     let snapshot_result = client.group_read_snapshot();
@@ -3432,7 +3433,7 @@ async fn handle_account_worker_catch_up(
     let mut deferred = VecDeque::new();
     let mut commands_open = true;
     let sync_started_at = Instant::now();
-    let stage_telemetry = context.shared.app_performance_telemetry();
+    let stage_telemetry = context.shared.observer.performance().clone();
     let sync_result = {
         let mut sync = std::pin::pin!(async {
             #[cfg(any(test, feature = "test-policy-overrides"))]
@@ -3604,7 +3605,8 @@ async fn handle_account_worker_catch_up(
     };
     context
         .shared
-        .app_performance_telemetry()
+        .observer
+        .performance()
         .record_classified_result(
             AppPerformanceOperation::AccountSync,
             sync_started_at.elapsed(),
@@ -3794,7 +3796,8 @@ async fn run_startup_hydration_pipeline(
         return StartupHydrationOutcome::Completed;
     }
     let hydration_observation = shared
-        .app_performance_telemetry()
+        .observer
+        .performance()
         .observe(RuntimeOp::WorkerHydration);
     let pipeline_started = Instant::now();
     // Chat-list recency order from the durable projection: the groups the
@@ -3919,7 +3922,7 @@ async fn run_startup_hydration_pipeline(
     } else {
         TelemetryOutcome::Failure
     });
-    shared.app_performance_telemetry().record(
+    shared.observer.performance().record(
         AppPerformanceOperation::AccountGroupHydration,
         pipeline_started.elapsed(),
         pipeline_ok,
@@ -4114,7 +4117,7 @@ async fn handle_startup_hydration_command(
 const MEDIA_HTTP_IN_FLIGHT_LIMIT: usize = 4;
 
 struct MediaHttpContext {
-    product: crate::product_analytics::ProductAnalytics,
+    product: crate::observer::ProductRecorder,
     tx: mpsc::UnboundedSender<MediaHttpDone>,
     permits: Arc<Semaphore>,
     /// Prevent concurrent host retries from uploading the same durable blob
@@ -4132,7 +4135,7 @@ struct MediaHttpDone {
     /// bounded by `MEDIA_HTTP_IN_FLIGHT_LIMIT`.
     permit: OwnedSemaphorePermit,
     completion: MediaHttpCompletion,
-    cancellation: Option<crate::ProductObservation>,
+    cancellation: Option<crate::observer::ProductOperation>,
 }
 
 /// Stores a fetched avatar image as a cache file and settles its attempt.
@@ -4306,7 +4309,7 @@ fn spawn_media_http<T>(
     work: impl std::future::Future<Output = T> + Send + 'static,
     into_done: impl FnOnce(T) -> MediaHttpCompletion + Send + 'static,
 ) {
-    let cancellation = media_http.product.begin(
+    let cancellation = media_http.product.operation(
         crate::ProductFamily::Media,
         "cancel",
         crate::ProductUnit::Attempt,
@@ -4547,7 +4550,7 @@ async fn complete_media_http(
                         .map(|item| item.reference.media_type.as_str())
                 })
                 .unwrap_or("");
-            shared.app_performance_telemetry().record_media(
+            shared.observer.performance().record_media(
                 AppPerformanceOperation::MediaUpload,
                 started_at.elapsed(),
                 result.is_ok(),
@@ -4566,7 +4569,7 @@ async fn complete_media_http(
             respond,
             started_at,
         } => {
-            shared.app_performance_telemetry().record_media(
+            shared.observer.performance().record_media(
                 AppPerformanceOperation::MediaDownload,
                 started_at.elapsed(),
                 result.is_ok(),
@@ -4593,7 +4596,7 @@ async fn complete_media_http(
                     Err(persistence_error) => Err(persistence_error),
                 },
             };
-            shared.app_performance_telemetry().record_media(
+            shared.observer.performance().record_media(
                 AppPerformanceOperation::GroupCreateImageUpload,
                 started_at.elapsed(),
                 succeeded,
@@ -4957,7 +4960,7 @@ fn account_worker_command_future<'a>(
                     ))
                 }
             };
-            shared.app_performance_telemetry().record_classified_result(
+            shared.observer.performance().record_classified_result(
                 AppPerformanceOperation::AccountSync,
                 sync_started_at.elapsed(),
                 result
@@ -5036,7 +5039,7 @@ fn account_worker_command_future<'a>(
                     Err(AccountCatchUpFailure::from_sync_failure(message, &failure))
                 }
             };
-            shared.app_performance_telemetry().record_classified_result(
+            shared.observer.performance().record_classified_result(
                 AppPerformanceOperation::AccountSync,
                 sync_started_at.elapsed(),
                 result
@@ -5058,7 +5061,7 @@ fn account_worker_command_future<'a>(
             prepared_image_upload_id,
             respond,
         } => Box::pin(async move {
-            let telemetry = shared.app_performance_telemetry();
+            let telemetry = shared.observer.performance().clone();
             telemetry.record(
                 AppPerformanceOperation::GroupCreateQueueWait,
                 queued_at.elapsed(),
@@ -5159,7 +5162,7 @@ fn account_worker_command_future<'a>(
         } => Box::pin(async move {
             let started_at = Instant::now();
             let result = client.stage_prepared_initial_group_image(&plaintext, &media_type);
-            shared.app_performance_telemetry().record(
+            shared.observer.performance().record(
                 AppPerformanceOperation::GroupCreateImagePreprocess,
                 started_at.elapsed(),
                 result.is_ok(),
@@ -5522,7 +5525,7 @@ fn account_worker_command_future<'a>(
             initial_admins,
             respond,
         } => Box::pin(async move {
-            let telemetry = shared.app_performance_telemetry();
+            let telemetry = shared.observer.performance().clone();
             let result = async {
                 let member_refs = members.iter().map(String::as_str).collect::<Vec<_>>();
                 let admin_refs = initial_admins
@@ -5954,7 +5957,7 @@ fn account_worker_command_future<'a>(
             if let Some(queued) = queued {
                 queued.finish(TelemetryOutcome::Success);
             }
-            let telemetry = shared.app_performance_telemetry();
+            let telemetry = shared.observer.performance().clone();
             let execution = telemetry.observe(RuntimeOp::SendExecution);
             let send_started_at = Instant::now();
             telemetry.record(
@@ -6027,13 +6030,13 @@ fn account_worker_command_future<'a>(
             respond,
         } => Box::pin(async move {
             let send_started_at = Instant::now();
-            shared.app_performance_telemetry().record(
+            shared.observer.performance().record(
                 AppPerformanceOperation::OutboundMessageQueueWait,
                 enqueued_at.elapsed(),
                 true,
             );
             let mut first_projection = true;
-            client.send_telemetry = Some(shared.app_performance_telemetry());
+            client.send_telemetry = Some(shared.observer.performance().clone());
             let result = match intent {
                 AppMessageIntent::Reaction {
                     target_message_id,
@@ -6050,7 +6053,7 @@ fn account_worker_command_future<'a>(
                             attachments,
                             |update| {
                                 if first_projection {
-                                    shared.app_performance_telemetry().record(
+                                    shared.observer.performance().record(
                                         AppPerformanceOperation::OutboundMessageLocalProjection,
                                         enqueued_at.elapsed(),
                                         true,
@@ -6070,7 +6073,7 @@ fn account_worker_command_future<'a>(
                 intent => client
                     .send_app_event_with_local_projection(&group_id, intent, |update| {
                         if first_projection {
-                            shared.app_performance_telemetry().record(
+                            shared.observer.performance().record(
                                 AppPerformanceOperation::OutboundMessageLocalProjection,
                                 enqueued_at.elapsed(),
                                 true,
@@ -6088,7 +6091,7 @@ fn account_worker_command_future<'a>(
                     .map(|(_event, summary)| summary),
             };
             client.send_telemetry = None;
-            shared.app_performance_telemetry().record(
+            shared.observer.performance().record(
                 AppPerformanceOperation::OutboundMessageSend,
                 send_started_at.elapsed(),
                 result.is_ok(),
@@ -6129,7 +6132,7 @@ fn account_worker_command_future<'a>(
                     })
                 }
                 Err(err) => {
-                    shared.app_performance_telemetry().record(
+                    shared.observer.performance().record(
                         AppPerformanceOperation::MediaUpload,
                         started_at.elapsed(),
                         false,
@@ -6146,7 +6149,7 @@ fn account_worker_command_future<'a>(
             enqueued_at,
             respond,
         } => Box::pin(async move {
-            let telemetry = shared.app_performance_telemetry();
+            let telemetry = shared.observer.performance().clone();
             telemetry.record(
                 AppPerformanceOperation::MediaDownloadQueueWait,
                 enqueued_at.elapsed(),
@@ -6296,7 +6299,7 @@ fn account_worker_command_future<'a>(
                 Ok(key_package.bytes().len())
             }
             .await;
-            shared.app_performance_telemetry().record(
+            shared.observer.performance().record(
                 AppPerformanceOperation::AccountInitialKeyPackagePublish,
                 started_at.elapsed(),
                 result.is_ok(),
@@ -6560,13 +6563,14 @@ async fn publish_next_local_submission(
         (submission, queued)
     };
     if let Some(queued) = queued {
-        queued.finish(&shared.app_performance_telemetry());
+        queued.finish(shared.observer.performance());
     }
     let execution = shared
-        .app_performance_telemetry()
+        .observer
+        .performance()
         .observe(RuntimeOp::SendExecution);
     let started = Instant::now();
-    client.send_telemetry = Some(shared.app_performance_telemetry());
+    client.send_telemetry = Some(shared.observer.performance().clone());
     let result = client
         .publish_local_submission(&submission, |update| {
             publish_app_runtime_projection_update(events, account_id_hex, account_label, update);
@@ -6574,7 +6578,7 @@ async fn publish_next_local_submission(
         .await;
     client.send_telemetry = None;
     execution.finish_app(&result);
-    shared.app_performance_telemetry().record(
+    shared.observer.performance().record(
         AppPerformanceOperation::OutboundMessageSend,
         started.elapsed(),
         result.is_ok(),
@@ -6613,20 +6617,21 @@ async fn send_message_on_worker(
         queued.finish(TelemetryOutcome::Success);
     }
     let execution = shared
-        .app_performance_telemetry()
+        .observer
+        .performance()
         .observe(RuntimeOp::SendExecution);
     let send_started_at = Instant::now();
-    shared.app_performance_telemetry().record(
+    shared.observer.performance().record(
         AppPerformanceOperation::OutboundMessageQueueWait,
         enqueued_at.elapsed(),
         true,
     );
     let mut first_projection = true;
-    client.send_telemetry = Some(shared.app_performance_telemetry());
+    client.send_telemetry = Some(shared.observer.performance().clone());
     let result = client
         .send_with_local_projection(&group_id, &payload, |update| {
             if first_projection {
-                shared.app_performance_telemetry().record(
+                shared.observer.performance().record(
                     AppPerformanceOperation::OutboundMessageLocalProjection,
                     enqueued_at.elapsed(),
                     true,
@@ -6638,7 +6643,7 @@ async fn send_message_on_worker(
         .await;
     client.send_telemetry = None;
     execution.finish_app(&result);
-    shared.app_performance_telemetry().record(
+    shared.observer.performance().record(
         AppPerformanceOperation::OutboundMessageSend,
         send_started_at.elapsed(),
         result.is_ok(),
@@ -8969,7 +8974,7 @@ mod tests {
             commands.clone(),
             receiver,
             ready,
-            AccountStartupProgress::new(shared.app_performance_telemetry()),
+            AccountStartupProgress::new(shared.observer.performance().clone()),
             shutdown_rx,
         );
         let runtime = super::super::MarmotAppRuntime::new(app.clone());
@@ -9617,7 +9622,7 @@ mod tests {
         let shared = RuntimeSharedServices::default();
         client
             .sync_with_stage_telemetry(
-                Some(&shared.app_performance_telemetry()),
+                Some(shared.observer.performance()),
                 crate::client::SyncMode::Startup,
             )
             .await
