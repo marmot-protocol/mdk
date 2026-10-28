@@ -133,6 +133,11 @@ mod nostr_verification;
 mod notifications;
 #[cfg(test)]
 mod observability_crossings_tests;
+#[cfg(any(test, feature = "test-support"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+mod observability_test_support;
+#[cfg(test)]
+mod observability_tests;
 mod observer;
 mod profile_publication;
 mod projection;
