@@ -718,6 +718,10 @@ impl AccountRecoveryOwner {
             Err(FreezeError::Stale) => return Ok(None),
             Err(FreezeError::Storage(error)) => return Err(error),
         };
+        // Native goals have no upper bound: live traffic is their input too.
+        // Only input created before this attempt started can be what the
+        // attempt acquired, so later live messages cannot reset pacing.
+        let started = grant.reservation.recorded_at_ms / 1000;
         let admission = Arc::new(RecoveryAdmissionSnapshot {
             scopes: grant
                 .plan
@@ -730,6 +734,10 @@ impl AccountRecoveryOwner {
                         .iter()
                         .flat_map(|plan| plan.routes.iter().cloned()),
                 )
+                .map(|mut scope| {
+                    scope.until_seconds = scope.until_seconds.min(started);
+                    scope
+                })
                 .collect(),
             attempt: grant.reservation.attempt_serial,
             fence: grant.fence.clone(),
@@ -4082,6 +4090,60 @@ mod tests {
                 .ordinal,
             2
         );
+    }
+
+    /// A native goal's window is open-ended, but only input created before
+    /// the attempt started resets pacing: live traffic during the attempt
+    /// is not what the attempt acquired.
+    #[test]
+    fn live_input_after_the_attempt_started_keeps_pacing() {
+        let (storage, mut owner, now) = fixture();
+        drop(
+            owner
+                .select_authorized_attempt(&storage, RecoveryReadiness::Ready, now, None)
+                .unwrap()
+                .unwrap(),
+        );
+        let later = now + Duration::from_secs(15);
+        let grant = owner
+            .select_authorized_attempt(&storage, RecoveryReadiness::Ready, later, None)
+            .unwrap()
+            .unwrap();
+        let started = grant.reservation.recorded_at_ms / 1000;
+        let id = grant.fence.obligations[0].0;
+        let scope = RecoveryScopePlan {
+            scope_id: 0,
+            route_kind: 0,
+            route_role: 0,
+            group_id: None,
+            transport_group_id: None,
+            since_seconds: Some(5),
+            until_seconds: i64::MAX as u64,
+            known_event_id: None,
+            inventory_floor: None,
+            required_endpoints: vec!["relay".into()],
+            admitted_endpoints: vec!["relay".into()],
+        };
+        let _grant = owner
+            .freeze_plan(&storage, grant, vec![(id, vec![scope])], None)
+            .unwrap()
+            .unwrap();
+        let inbox = storage_sqlite::TransportReconciliationRoute::Inbox;
+        let observe = |created_at| {
+            owner
+                .observe_scoped_admission(&storage.app_storage(), &inbox, created_at, later)
+                .unwrap()
+        };
+        assert!(!observe(started + 1), "live input during the attempt");
+        assert_eq!(
+            storage
+                .app_storage()
+                .recovery_retry_state()
+                .unwrap()
+                .ordinal,
+            2
+        );
+        assert!(observe(started - 1), "history the attempt acquired");
     }
 
     #[test]
