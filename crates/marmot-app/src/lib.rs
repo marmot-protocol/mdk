@@ -137,6 +137,7 @@ mod observer;
 mod profile_publication;
 mod projection;
 mod publisher_sequences;
+mod relay_caps;
 mod relay_telemetry_export;
 mod root_closers;
 mod root_runtime_lease;
@@ -551,6 +552,8 @@ pub struct MarmotApp {
     relay_urls: Vec<String>,
     account_home: AccountHome,
     relay_plane: MarmotRelayPlane,
+    /// Each relay's NIP-11 caps for the history sweep; see [`Self::relay_caps`].
+    relay_caps: relay_caps::RelayCapsCache,
     config: MarmotAppConfig,
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
     /// One encrypted media store per account (mdk#2314), over that account's
@@ -1446,6 +1449,27 @@ impl MarmotApp {
             .retain_safe_discovered_endpoints(endpoints, context)
     }
 
+    /// A relay's caps for the time-sliced history sweep (#2660), from its
+    /// NIP-11 document behind the relay dial gate and cached per canonical
+    /// relay URL. Unknown caps when the document is missing, malformed,
+    /// unreachable or refused, so the sweep infers the cap from full replies.
+    ///
+    /// Nothing refreshes in the background: a call on a stale entry fetches
+    /// again, so call it when a relay reconnects. Caps compare by value, so a
+    /// caller sees a change by comparing a known read with the caps it
+    /// planned with. An unknown read means no information, not a change: a
+    /// failed fetch reads as unknown until a later one succeeds.
+    // Phase 4 of #2660 hands these to `SdkSweepRelay` from the recovery runner.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn relay_caps(
+        &self,
+        endpoint: &str,
+    ) -> transport_nostr_adapter::sweep::RelayCaps {
+        self.relay_caps
+            .caps(endpoint, self.config.allow_loopback_relay_endpoints)
+            .await
+    }
+
     /// Effective settings for this app instance, including its active consent permit.
     /// An unstarted instance reports export disabled even if a grant is persisted.
     /// Read `usage_diagnostics_settings` for the consent decision before startup.
@@ -1608,6 +1632,7 @@ impl MarmotApp {
             audit_export_lifecycle: audit_export_lifecycle::AuditExportLifecycle::default(),
             relay_urls,
             relay_plane,
+            relay_caps: relay_caps::RelayCapsCache::default(),
             config,
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
@@ -1708,6 +1733,7 @@ impl MarmotApp {
             relay_urls,
             account_home,
             relay_plane,
+            relay_caps: relay_caps::RelayCapsCache::default(),
             config,
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),

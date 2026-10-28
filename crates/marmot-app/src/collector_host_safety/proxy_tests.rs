@@ -110,6 +110,8 @@ async fn socks5_pins_dns_fail_closed() {
         let client = pin
             .build_client_from(
                 reqwest::Client::builder().dns_resolver(Arc::new(ForbiddenDns(calls.clone()))),
+                CONNECT_TIMEOUT,
+                REQUEST_TIMEOUT,
             )
             .unwrap();
         let response = client.post(pin.url.clone()).send().await;

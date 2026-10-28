@@ -263,6 +263,8 @@ async fn reqwest_uses_only_pinned_addresses_and_ignores_proxies() {
                 .proxy(
                     reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap(),
                 ),
+            CONNECT_TIMEOUT,
+            REQUEST_TIMEOUT,
         )
         .unwrap();
     let server = tokio::spawn(async move {
