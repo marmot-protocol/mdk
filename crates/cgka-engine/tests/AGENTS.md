@@ -193,10 +193,12 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
 
 - **File:** `account_devices/link_device.rs` (test-policy builds only)
   - **Owns:** The link Commit (mdk#2628 item 3.3b), `LinkDevice`: one privileged admin Commit that adds the linked
-    device and sets its roster entry, accepted by every member, with the device joining through its Welcome; and each
-    refusal before staging (not a device group, another account's KeyPackage, a device already in the group, a
-    KeyPackage without the group's required components, an update that doesn't set exactly one new device announcing
-    that KeyPackage).
+    device and sets its roster entry, accepted by every member, with the device joining through its Welcome. Each
+    refusal leaves the group as it was: not a device group, another account's KeyPackage, a device already in the
+    group, a KeyPackage without the group's required components, an update that doesn't set exactly one device entry,
+    an entry not for a new slot or not announcing the KeyPackage, a roster the link would leave invalid. Also the sender
+    rule refusing any own device-group Commit that takes an Add from the proposal store, and `LinkDeviceUnsettled`
+    instead of a queued link while convergence is unsettled or an own Commit is in flight.
 
 - **File:** `account_devices/send_intents.rs`
   - **Owns:** The same-account send intents (mdk#2628 item 2.1e), `AddOwnAccountDevices` and

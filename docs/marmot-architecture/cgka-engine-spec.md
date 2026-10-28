@@ -159,7 +159,10 @@ would encrypt it under the drain-time epoch, and the payload binds key material 
 encrypted-media `imeta` reference, whose media key recipients derive from the delivering message's epoch). The
 engine MUST refuse such a message with `AppMessageEpochUnsettled` instead of retaining it, and MUST compare the loaded
 MLS epoch against the pin immediately before encryption, refusing with `AppMessageEpochMismatch` when convergence
-folded into the send moved the epoch; neither refusal persists or publishes anything. Current-fingerprint deferred
+folded into the send moved the epoch; neither refusal persists or publishes anything. A device link (`LinkDevice`)
+is the other exception: the engine MUST refuse it with `LinkDeviceUnsettled` whenever it would retain it, and while
+an own Commit is in flight, because the new device stops waiting for its Welcome and a link drained after that would
+add a device that never joins. The caller retries while the new device still waits. Current-fingerprint deferred
 work remains safety-critical ahead of every queued outbound intent.
 Rows already definitively tested under that fingerprint are historical-only maintenance and MUST NOT keep a new or
 queued outbound intent waiting. The durable per-row fingerprint, rather than a process-local numeric cursor,
