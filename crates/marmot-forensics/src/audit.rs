@@ -31,6 +31,10 @@ use web_time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Time bound on one active file, independent of event volume. The app owns
+/// expiry of closed files; daily sealing keeps that policy at day granularity.
+const AUDIT_LOG_SEGMENT_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
 mod recovery;
 mod refusal;
 mod shared;
@@ -44,7 +48,7 @@ pub use refusal::{
     SUBSCRIPTION_REFUSAL_AUDIT_MAX_ENTRIES, SubscriptionRefusalCategory, SubscriptionRefusalEntry,
     SubscriptionRefusalOutcome, SubscriptionRefusalRoute,
 };
-pub use shared::SharedRecorder;
+pub use shared::{SharedRecorder, WeakRecorder};
 
 pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
 
@@ -70,7 +74,7 @@ pub const AUDIT_LOG_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
 ///   still exceed the ceiling and are rejected by the upload size gate.
 ///
 /// Smaller segments would cut the residual further but multiply file count
-/// (segments are never deleted here — retention is mdk#1014); larger ones
+/// (the app owns closed-file expiry); larger ones
 /// re-inflate the residual. 1 MiB is the balance point.
 pub const AUDIT_LOG_SEGMENT_MAX_BYTES: u64 = 1024 * 1024;
 
@@ -1640,6 +1644,47 @@ pub trait ForensicRecorder: Send + Sync {
     fn rotate(&self) -> std::io::Result<()> {
         Ok(())
     }
+
+    /// Run expiry only for a closed file older than this Unix-ms cutoff.
+    /// A live recorder holds its writer lock through the supplied action and
+    /// protects its actual backing inode. The action owns delivery retirement
+    /// and unlink; callers own root/path validation and account admission.
+    fn expire_file_before(
+        &self,
+        path: &Path,
+        cutoff_ms: u64,
+        expire: &mut dyn FnMut(&Path) -> std::io::Result<bool>,
+    ) -> std::io::Result<bool> {
+        expire_closed_audit_file(path, cutoff_ms, expire)
+    }
+}
+
+fn audit_file_expired(path: &Path, cutoff_ms: u64) -> std::io::Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    let modified = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    Ok(modified < u128::from(cutoff_ms))
+}
+
+fn expire_closed_audit_file(
+    path: &Path,
+    cutoff_ms: u64,
+    expire: &mut dyn FnMut(&Path) -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
+    if !audit_file_expired(path, cutoff_ms)? {
+        return Ok(false);
+    }
+    expire(path)
 }
 
 /// Default recorder. Drops every event without observable side effects.
@@ -1700,6 +1745,7 @@ struct JsonlInner {
     seal_retry_after: Option<Instant>,
     /// Bytes in the file the writer currently owns, driving segment rolls.
     active_bytes: u64,
+    active_started_at: SystemTime,
     /// Retry deadline after a failed roll; recording continues during backoff.
     segment_retry_after: Option<Instant>,
     /// The writer may remain at a segment path if compensation also failed.
@@ -1709,8 +1755,8 @@ struct JsonlInner {
     /// segment. Scanned once when absent and advanced after each sealed
     /// segment; the `exists()` probe in [`JsonlRecorder::next_segment_path`]
     /// stays the authority that no roll ever overwrites a segment, so a stale
-    /// or absent hint costs a gap in the numbering at worst. Unbounded segment
-    /// counts are mdk#1014's to bound.
+    /// or absent hint costs a gap in the numbering at worst. The app owns
+    /// expiry of old segments.
     next_segment_index: Option<u32>,
     /// Most recently explicitly recorded `AuditEventKind::SourceContext`.
     /// Retained even when the best-effort write fails so a later successful
@@ -1720,6 +1766,7 @@ struct JsonlInner {
     /// Repeated source bytes do not consume the next segment's event budget.
     /// Even an oversized source must not cause a roll on every ordinary event.
     repeated_source_bytes: u64,
+    source_prefix_pending: bool,
     /// Test seam: fail the next row or segment-prefix write after capturing source
     /// context, so retention can be proven independently of a durable write.
     #[cfg(test)]
@@ -1831,6 +1878,7 @@ impl JsonlRecorder {
         // owner-only and tighten pre-existing permissive files.
         let file = fs_private::open_private_append(&path)?;
         let active_bytes = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let active_started_at = active_file_started_at(&path, active_bytes);
         let recorder_session_id = generate_recorder_session_id();
         let is_v5 = producer.is_some();
         let format = if let Some(producer) = producer {
@@ -1864,11 +1912,13 @@ impl JsonlRecorder {
                 writer_needs_seal: false,
                 seal_retry_after: None,
                 active_bytes,
+                active_started_at,
                 segment_retry_after: None,
                 writer_path: path.clone(),
                 next_segment_index: None,
                 retained_source_context: None,
                 repeated_source_bytes: 0,
+                source_prefix_pending: false,
                 #[cfg(test)]
                 fail_next_write: false,
                 #[cfg(test)]
@@ -1893,7 +1943,7 @@ impl JsonlRecorder {
         // segment and the uploader surfaces it. Best-effort: a roll failure
         // must not cost the caller its audit log entirely, so recording
         // continues into the existing file.
-        if active_bytes >= AUDIT_LOG_SEGMENT_MAX_BYTES {
+        if active_bytes > 0 {
             let mut inner = recorder
                 .inner
                 .lock()
@@ -1906,6 +1956,35 @@ impl JsonlRecorder {
         recorder.record(AuditRecord::new(None, recorder_started_kind()));
         Ok(recorder)
     }
+}
+
+/// Read only the bounded first row on reopen, so short repeated sessions do
+/// not postpone a file's daily boundary. Unknown legacy heads are sealed once.
+fn active_file_started_at(path: &Path, active_bytes: u64) -> SystemTime {
+    use std::io::{BufRead, Read};
+    if active_bytes == 0 {
+        return SystemTime::now();
+    }
+    let timestamp = (|| {
+        let mut first = Vec::new();
+        std::io::BufReader::new(File::open(path).ok()?)
+            .take(65_536)
+            .read_until(b'\n', &mut first)
+            .ok()?;
+        if !first.ends_with(b"\n") {
+            return None;
+        }
+        let row: serde_json::Value = serde_json::from_slice(&first).ok()?;
+        let millis = row["wall_time_ms"]
+            .as_u64()
+            .or_else(|| row["wall_time_ms"].as_str()?.parse::<u64>().ok())?;
+        UNIX_EPOCH.checked_add(Duration::from_millis(millis))
+    })();
+    timestamp.unwrap_or_else(|| {
+        SystemTime::now()
+            .checked_sub(AUDIT_LOG_SEGMENT_MAX_AGE)
+            .unwrap_or(UNIX_EPOCH)
+    })
 }
 
 /// The `recorder_started` boundary row recorded by [`JsonlRecorder::open`] and
@@ -1991,6 +2070,25 @@ impl ForensicRecorder for JsonlRecorder {
         if self.ensure_safe_writer(&mut inner).is_err() {
             return;
         }
+        // Seal before the first row after a quiet day, so a fresh event does
+        // not extend the lifetime of the preceding day's records.
+        if inner.source_prefix_pending {
+            inner.source_prefix_pending = false;
+            if let Some(source) = inner.retained_source_context.clone() {
+                Self::write_record(
+                    &mut inner,
+                    AuditRecord::new(None, AuditEventKind::SourceContext { source }),
+                );
+                inner.repeated_source_bytes = inner.active_bytes;
+            }
+        }
+        if inner.active_bytes == inner.repeated_source_bytes {
+            inner.active_started_at = SystemTime::now();
+        }
+        self.try_roll_segment(&mut inner, Instant::now());
+        if self.ensure_safe_writer(&mut inner).is_err() {
+            return;
+        }
         Self::try_report_pending_capture_loss(&mut inner);
         let before = inner.health.clone();
         if Self::write_record(&mut inner, record) {
@@ -2009,6 +2107,23 @@ impl ForensicRecorder for JsonlRecorder {
         if !matches!(inner.format, RecorderFormat::V5 { .. }) || inner.recording_finished {
             return;
         }
+        if self.ensure_safe_writer(&mut inner).is_err() {
+            return;
+        }
+        if inner.source_prefix_pending {
+            inner.source_prefix_pending = false;
+            if let Some(source) = inner.retained_source_context.clone() {
+                Self::write_record(
+                    &mut inner,
+                    AuditRecord::new(None, AuditEventKind::SourceContext { source }),
+                );
+                inner.repeated_source_bytes = inner.active_bytes;
+            }
+        }
+        if inner.active_bytes == inner.repeated_source_bytes {
+            inner.active_started_at = SystemTime::now();
+        }
+        self.try_roll_segment(&mut inner, Instant::now());
         if self.ensure_safe_writer(&mut inner).is_err() {
             return;
         }
@@ -2033,6 +2148,25 @@ impl ForensicRecorder for JsonlRecorder {
         // The observed clean-close boundary is terminal even if its row
         // cannot be written. A later record must not follow it.
         inner.recording_finished = true;
+        if self.ensure_safe_writer(&mut inner).is_err() {
+            return;
+        }
+        // A quiet shutdown must not refresh a month-old file's retention
+        // clock merely by appending its terminal row.
+        if inner.source_prefix_pending {
+            inner.source_prefix_pending = false;
+            if let Some(source) = inner.retained_source_context.clone() {
+                Self::write_record(
+                    &mut inner,
+                    AuditRecord::new(None, AuditEventKind::SourceContext { source }),
+                );
+                inner.repeated_source_bytes = inner.active_bytes;
+            }
+        }
+        if inner.active_bytes == inner.repeated_source_bytes {
+            inner.active_started_at = SystemTime::now();
+        }
+        self.try_roll_segment(&mut inner, Instant::now());
         if self.ensure_safe_writer(&mut inner).is_err() {
             return;
         }
@@ -2071,6 +2205,30 @@ impl ForensicRecorder for JsonlRecorder {
 
     fn audit_log_path(&self) -> Option<PathBuf> {
         Some(self.path.clone())
+    }
+
+    fn expire_file_before(
+        &self,
+        path: &Path,
+        cutoff_ms: u64,
+        expire: &mut dyn FnMut(&Path) -> std::io::Result<bool>,
+    ) -> std::io::Result<bool> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if path == self.path || path == inner.writer_path {
+            if path != inner.writer_path
+                || inner.writer_needs_seal
+                || inner.active_bytes == 0
+                || !audit_file_expired(path, cutoff_ms)?
+            {
+                return Ok(false);
+            }
+            // Retire idle data too. Close the old writer before the action,
+            // without emitting a row or charging a record failure. The next
+            // actual event repeats source context into the empty fresh file.
+            let sealed = self.seal_segment(&mut inner, false)?;
+            return expire(&sealed);
+        }
+        expire_closed_audit_file(path, cutoff_ms, expire)
     }
 
     fn rotate(&self) -> std::io::Result<()> {
@@ -2165,9 +2323,11 @@ impl JsonlRecorder {
                     inner.next_segment_index = Some(index.saturating_add(1));
                 }
                 inner.active_bytes = 0;
+                inner.active_started_at = SystemTime::now();
                 inner.repeated_source_bytes = 0;
                 inner.writer_path = self.path.clone();
                 inner.writer_needs_seal = false;
+                inner.source_prefix_pending = false;
                 if let Some(source) = inner.retained_source_context.clone() {
                     let before = inner.health.clone();
                     if !Self::write_record(
@@ -2440,10 +2600,15 @@ impl JsonlRecorder {
         if self.disable_segment_rotation.load(Ordering::Relaxed) {
             return;
         }
-        if inner
+        let size_due = inner
             .active_bytes
             .saturating_sub(inner.repeated_source_bytes)
-            < AUDIT_LOG_SEGMENT_MAX_BYTES
+            >= AUDIT_LOG_SEGMENT_MAX_BYTES;
+        let age_due = inner.active_bytes > inner.repeated_source_bytes
+            && SystemTime::now()
+                .duration_since(inner.active_started_at)
+                .is_ok_and(|age| age >= AUDIT_LOG_SEGMENT_MAX_AGE);
+        if !(size_due || age_due)
             || inner
                 .segment_retry_after
                 .is_some_and(|deadline| now < deadline)
@@ -2516,7 +2681,9 @@ impl JsonlRecorder {
         inner.writer_needs_seal = false;
         inner.seal_retry_after = None;
         inner.active_bytes = 0;
+        inner.active_started_at = SystemTime::now();
         inner.repeated_source_bytes = 0;
+        inner.source_prefix_pending = false;
         inner.segment_retry_after = None;
         inner.writer_path = self.path.clone();
         Ok(())
@@ -2529,9 +2696,8 @@ impl JsonlRecorder {
     /// Nothing is deleted or truncated: the rename hands the *same inode* — and
     /// therefore every recorded byte — to the segment name. Only the latest
     /// source context is repeated, with a fresh sequence, in the new file.
-    /// Ordinary events are never replayed. Retention and disk bounding
-    /// of the sealed segments are deliberately out of scope here; they belong to
-    /// mdk#1014.
+    /// Ordinary events are never replayed. The app owns closed-file expiry
+    /// independently of this non-destructive rotation.
     ///
     /// Rotation is transparent to consumers on purpose: `seq`, the recorder
     /// session id, and the health counters carry across the boundary and no
@@ -2546,15 +2712,33 @@ impl JsonlRecorder {
     /// segment is renamed back so the still-open writer fd and the active path
     /// agree again.
     fn roll_into_segment(&self, inner: &mut JsonlInner) -> std::io::Result<()> {
-        // A failed flush must not seal a segment or discard buffered bytes.
-        inner
-            .writer
-            .as_mut()
-            .expect("active writer")
-            .flush()
-            .inspect_err(|_| {
-                inner.health.flush_failures = inner.health.flush_failures.saturating_add(1);
-            })?;
+        self.seal_segment(inner, true).map(|_| ())
+    }
+
+    fn seal_segment(
+        &self,
+        inner: &mut JsonlInner,
+        repeat_context: bool,
+    ) -> std::io::Result<PathBuf> {
+        if repeat_context {
+            inner
+                .writer
+                .as_mut()
+                .expect("active writer")
+                .flush()
+                .inspect_err(|_| {
+                    inner.health.flush_failures = inner.health.flush_failures.saturating_add(1);
+                })?;
+        } else if inner.writer_needs_seal
+            || !inner
+                .writer
+                .as_ref()
+                .expect("active writer")
+                .buffer()
+                .is_empty()
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
         let (segment, index) = self.next_segment_path(inner)?;
         let previous_path = inner.writer_path.clone();
         std::fs::rename(&previous_path, &segment)?;
@@ -2562,18 +2746,20 @@ impl JsonlRecorder {
             Ok(file) => {
                 inner.writer = Some(BufWriter::new(file));
                 inner.active_bytes = 0;
+                inner.active_started_at = SystemTime::now();
                 inner.next_segment_index = Some(index.saturating_add(1));
                 inner.writer_path = self.path.clone();
                 // Use the same best-effort write and health accounting as all
                 // other rows. write_record neither relocks nor attempts rollover.
-                if let Some(source) = inner.retained_source_context.clone() {
+                if repeat_context && let Some(source) = inner.retained_source_context.clone() {
                     Self::write_record(
                         inner,
                         AuditRecord::new(None, AuditEventKind::SourceContext { source }),
                     );
                 }
                 inner.repeated_source_bytes = inner.active_bytes;
-                Ok(())
+                inner.source_prefix_pending = !repeat_context;
+                Ok(segment)
             }
             Err(err) => {
                 // Compensate the one applied step. If even this fails the data

@@ -2563,6 +2563,7 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         | EngineError::InvalidAccountIdentityProof(_)
         | EngineError::InvalidKeyPackageLifetime { .. }
         | EngineError::InvalidKeyPackageCapabilities { .. }
+        | EngineError::NoDataAppComponent { .. }
         | EngineError::UnsupportedCiphersuite { .. }
         | EngineError::InvalidAppMessagePayload(_)
         // A halted group refusing new work is deliberate, not a protocol
@@ -2642,6 +2643,7 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
         EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",
         EngineError::InvalidKeyPackageCapabilities { .. } => "invalid_key_package_capabilities",
+        EngineError::NoDataAppComponent { .. } => "no_data_app_component",
         EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
         EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
         EngineError::UnknownPending => "unknown_pending",

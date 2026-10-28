@@ -384,6 +384,7 @@ impl AppClient {
     /// One `recovery_need_changed` row per loss cause an import changed, with
     /// the goal bound the comparison will use after it.
     pub(crate) fn record_recovery_loss_imports(&self, imports: Vec<RecoveryLossImport>) {
+        self.record_coverage_loss(&imports);
         if imports.is_empty() || !self.audit_v5_enabled() {
             return;
         }
@@ -418,6 +419,7 @@ impl AppClient {
         ticket: RecoveryDemandTicket,
         transition: RecoveryDemandTransition,
     ) {
+        self.record_coverage_request(cause);
         let Some(change) = need_change(transition) else {
             return;
         };

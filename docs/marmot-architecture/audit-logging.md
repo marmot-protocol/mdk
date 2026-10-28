@@ -1414,7 +1414,7 @@ Files are sorted by app account label, then file name.
 ### Segment rotation
 
 The recorder seals the active file into an immutable segment once new event bytes, excluding the repeated source
-prefix, reach `AUDIT_LOG_SEGMENT_MAX_BYTES` (1 MiB) and
+prefix, reach `AUDIT_LOG_SEGMENT_MAX_BYTES` (1 MiB), or a day elapses before the next row, and
 continues into a fresh file at the same path. Segments are named `audit-<engine_id>-v4-seg<NNNNNN>.jsonl`, so they are
 still enumerated by `audit_log_files()` and sort ahead of the active file.
 
@@ -1433,7 +1433,46 @@ still enumerated by `audit_log_files()` and sort ahead of the active file.
   reopen renames the segment back to the active path and recording continues into the same file. The recorder then stops
   attempting rolls for a 30-second backoff before retrying, so transient `ENOSPC`/`EMFILE` errors cost a delayed roll,
   not a session with rotation disabled.
-- Retention, deletion, and disk bounding of sealed segments are out of scope here; they belong to mdk#1014.
+- Segment rotation itself retains all bytes; the local retention sweep below expires old records.
+
+### Local retention
+
+MDK expires closed forensic files 30 days after their last filesystem write, without a user setting. Recorders seal
+at 1 MiB or before the first row after a day, whichever comes first, preserving original bytes, inode identity,
+session, sequence and the repeated source header. Daily files therefore keep roughly 30 days of history, with up to
+one extra day plus the hourly sweep delay. Reopening uses the bounded first row to preserve the age boundary across
+short sessions. Header-only prefixes do not roll on their own; their age clock starts with the next actual row.
+A quiet shutdown rolls before its stop row rather than refreshing an old file's retention clock.
+Legacy files are not split or rewritten; they age out 30 days after their last write.
+
+Exclusive-root startup sweeps account directories and failed-wipe remnants. Scanning uses filenames and metadata;
+expiry consults bounded delivery state (at most 1 MiB) and a bounded source fingerprint when a cursor exists.
+An installation-wide hourly worker also covers signed-out/dormant accounts and remnants created after launch,
+independently of recording consent, upload configuration and upload success. Its metadata scanner has a size-one
+path queue and owns no recorder or storage guard. Each unlink is admitted separately; shutdown cancels the walk
+without waiting for payload copying or holding account commands behind a full sweep.
+
+Only the reserved `audit-<32 lowercase hex>-v4/v5[-seg<index>].jsonl` families are swept. Symlinks are not followed;
+custom names, databases and the always-on key-reveal security log are excluded. Empty or malformed reserved files
+expire by the same metadata policy. Failures are isolated per file/account, nonfatal and retried on the next sweep
+or open. Already-known sealed files unlink without staging space. An old active filename needs a durable cursor
+retirement first; a metadata-write failure leaves its bytes intact while other sealed files continue expiring.
+
+A weak recorder registry serializes writer creation and expiry. The live recorder rechecks each candidate under
+its writer lock. Expired idle data is sealed into a closed inode after a fresh empty writer is ready; this emits no
+rows or record failures, and source context is deferred to the next actual event. Uncertain writers stay protected,
+including the actual segment path after failed roll compensation.
+Expiry serializes local cursor work for the source directory and cancels only an attempt owning the expiring inode.
+Other uploads remain valid, including another file in the same account; their local completion waits for retirement.
+No account-file lookup or installation-wide cancellation is needed for orphan directories or failed wipes.
+
+Before deleting a tracked source still known as active, retirement seals its filename and durably publishes its closed
+alias and exact final byte length. It preserves ACKs and prepared ranges. A crash leaves a discoverable sealed inode
+or a durably retired alias; publication/unlink errors compensate both cursor and filename, retaining source bytes if
+compensation cannot complete. Acknowledged sources disappear without false gaps; unobserved or prepared unsent tails
+retain genuine missing-source evidence. Generic missing-active detection stays conservative. Delivery drops retired,
+gap-free acknowledged journals while retaining real gaps and unaccepted extents. Retention never claims expired data
+reached a receiver.
 
 ### Explicit upload
 
@@ -1528,7 +1567,7 @@ Nested directories are not traversed, and files outside the leased root are not 
 a scan/deletion failure does not prevent startup or processing
 other accounts/files, and a later exclusive-root open retries. Logs contain only deleted/failed counts. Remaining
 legacy files still fail the v4 upload gate. Cleanup does not rewrite the upload-checkpoint sidecar; the tracker
-retains its existing pruning behavior. This retirement does not introduce ongoing v4 retention limits.
+retains its existing pruning behavior. Ongoing v4/v5 expiry is owned by the separate local retention sweep.
 There is no date-based sunset: direct upgrades from old builds, restored backups, and previous deletion failures
 can reintroduce legacy files later. Removing the scan requires an explicit change to those upgrade/restore guarantees.
 
@@ -1622,13 +1661,11 @@ it, plus whether that was an accepted upload, a file above the request ceiling, 
   instead of failing on every trigger. It never blocks the files behind it.
 - There is no app-level escape hatch for a file above the ceiling. `post_audit_log_file` enforces the same limit before
   it opens a request body, so an oversized legacy audit file is not transferable through any app API: it stays on disk
-  for local handling. Goggles must reject legacy schemas even through other upload paths. Deleting it is
-  mdk#1014's contract. Segment rotation is what keeps any newly produced file well under the ceiling, so this is an
-  upgrade-path condition only.
+  for local handling until its records expire through local retention. Goggles must reject legacy schemas even through
+  other upload paths. Segment rotation keeps newly produced files below the ceiling, so this is an upgrade-path condition.
 - The sidecar is bounded by the account's *live* audit files, not by its upload history: entries for files that are gone
-  are pruned each run. Because sealed segments are never deleted (mdk#1014), that bound still grows with cumulative
-  audit volume — each tracker run stats every enumerated file and rewrites the whole sidecar. Both costs are linear in
-  file count and small next to the HTTP request each run already makes.
+  are pruned each run. Local retention removes expired segments; each tracker run stats every enumerated file and
+  rewrites the whole sidecar. Both costs are linear in file count and small next to the HTTP request each run makes.
 
 The runtime has a coalescing uploader queue of size `1`: triggers arriving while an update is scheduled or running
 collapse into exactly one follow-up run, and two updates never upload concurrently. It schedules tracker updates after

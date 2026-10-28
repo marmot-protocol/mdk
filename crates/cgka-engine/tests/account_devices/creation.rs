@@ -113,6 +113,64 @@ async fn a_founding_add_over_the_leaf_limit_is_refused_before_any_welcome() {
     assert!(requires_account_devices(&alice.engine, &gid));
 }
 
+/// A host cannot supply a 0x800d entry among the optional initial
+/// components, whether or not the founders would make the group require it:
+/// the component has no data for any client to create. The refusal is typed
+/// and leaves no group, Welcome or event behind.
+#[tokio::test]
+async fn a_host_cannot_supply_account_devices_data_at_creation() {
+    let mut alice = device(b"alice", true);
+    let bob_kp = key_package(b"bob", true).await;
+    let dave_kp = key_package(b"dave", false).await;
+    for (members, data) in [
+        (vec![bob_kp.clone()], Vec::new()),
+        (vec![bob_kp.clone()], vec![0x01]),
+        (vec![bob_kp.clone(), dave_kp.clone()], Vec::new()),
+        (vec![bob_kp.clone(), dave_kp.clone()], vec![0x01]),
+    ] {
+        let refused = alice
+            .engine
+            .create_group_with_optional_app_components(
+                CreateGroupRequest {
+                    name: "account-devices".into(),
+                    description: String::new(),
+                    members,
+                    required_features: vec![],
+                    app_components: vec![],
+                    initial_admins: vec![],
+                },
+                vec![AppComponentData {
+                    component_id: ACCOUNT_DEVICES_COMPONENT_ID,
+                    data,
+                }],
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(EngineError::NoDataAppComponent {
+                    component_id: ACCOUNT_DEVICES_COMPONENT_ID
+                })
+            ),
+            "expected NoDataAppComponent, got {refused:?}"
+        );
+        assert!(alice.storage.list_groups().unwrap().is_empty());
+        assert!(alice.engine.live_group_ids().unwrap().is_empty());
+        assert!(
+            !alice
+                .engine
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, GroupEvent::GroupCreated { .. }))
+        );
+    }
+
+    // Without the entry the same founders create the group.
+    let (gid, welcomes) = create(&mut alice, vec![bob_kp], vec![]).await.unwrap();
+    assert_eq!(welcomes.len(), 1);
+    assert!(requires_account_devices(&alice.engine, &gid));
+}
+
 /// bob, who is not an admin, adds a device of his account to the group alice
 /// founded, and that device then removes bob's first one. alice accepts both
 /// Commits and the new device joins through bob's Welcome.

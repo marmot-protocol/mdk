@@ -157,6 +157,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   adapter's queued subscription refusals (`take_subscription_refusals`) into one `subscription_refused` row. Scenario
   tests live in
   `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
+- Keep the coverage-ledger recorder in `src/client/recovery_coverage.rs` (mdk#2660 phase 2, shadow mode). It records
+  at owner seams only: loss imports (`record_recovery_loss_imports`, goals only: storage un-covers the ledger inside
+  the import transaction), history requests (`record_recovery_request`), native synchronization
+  (`synchronize_native_replay`) and settlement (`settle_recovery_grant`). Its writes are best effort and nothing
+  schedules, retries or fences on the ledger; do not read it from recovery decisions until phase 4 replaces the
+  obligations. It records no live boundary while a loss obligation is pending. `coverage_shadow_report` is the
+  test-visible comparison with pending obligations; a scope holds proof only as completion would count it (its
+  predicate at the current loss, route, inventory and obligation revisions), and a scope whose floor is unknown or
+  older than the retained window is owed from the retention floor. It logs aggregate counts only. Known disagreements
+  are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
   and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown
@@ -194,10 +204,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   and retries like any other rejection.
   Shutdown cancels pending or in-flight automatic work; unacknowledged files remain on disk.
   Tests may shorten the window per runtime via `test-policy-overrides`; paused-clock tests pin the production default.
-  Retention/deletion of v4 sealed segments is mdk#1014, not this contract.
+  `audit_log/retention.rs` owns the fixed 30-day local forensic retention policy, independently of uploads and consent.
+  Sweep metadata on exclusive-root startup and hourly across accounts and failed-wipe remnants, independent of
+  account workers. Use a size-one candidate queue and per-file storage admission. Retire through local delivery before
+  unlinking; drain directory-local cursor work, cancel only a prepared attempt owning that inode and block new
+  reservations for that directory. Other uploads must remain valid; never globally fence orphan/tombstone cleanup;
+  never rewrite rows or unlink the actual live inode. Serialize the weak registry with writer creation and let the
+  recorder recheck metadata and protect its canonical/actual backing paths under its own lock.
 - Keep the upload checkpoint's cost proportional to the account's *live* audit files, not to its history. `retain_present`
-  prunes entries for files that are gone, so the sidecar is O(live `audit-*.jsonl` files) — but nothing deletes sealed
-  segments (mdk#1014), so that bound grows with cumulative audit volume, and each tracker run stats every file and
+  prunes entries for files that are gone, so the sidecar is O(live `audit-*.jsonl` files). Retention deletes expired
+  segments, and each tracker run stats every file and
   rewrites the whole sidecar. Do not add a per-upload or per-line entry, and do not treat the sidecar as durable state:
   losing it costs one repeat transfer per file and nothing else.
 - A file above `AUDIT_LOG_UPLOAD_MAX_BYTES` has no app-level transfer path. `post_audit_log_file` enforces the same
@@ -434,7 +450,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `local_submissions.rs`,
   `agent_publisher.rs` (host-driven agent publishing), `attachment_controls.rs`, `attachment_permission.rs`
   (runtime-only network approval; never restore it from disk).
-- `src/client/`: `recovery.rs` (recovery grant authorization), `invite_recovery.rs` (durable invitation recovery),
+- `src/client/`: `recovery.rs` (recovery grant authorization), `recovery_coverage.rs` (the shadow coverage-ledger
+  recorder and its comparison with pending obligations, mdk#2660), `invite_recovery.rs` (durable invitation recovery),
   `epoch_stall.rs` (epoch-gap backfill detection), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/comparison_job.rs` (the one recovery comparison
   job).

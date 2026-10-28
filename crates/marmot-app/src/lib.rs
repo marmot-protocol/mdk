@@ -592,6 +592,7 @@ pub struct MarmotApp {
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
+    audit_recorders: Arc<Mutex<HashMap<String, audit_log::AuditRecorderSlot>>>,
     product_analytics: observer::ProductRecorder,
     startup_diagnostics: startup_diagnostics::NativeStartupDiagnostics,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
@@ -1641,6 +1642,7 @@ impl MarmotApp {
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
+            audit_recorders: Arc::default(),
             product_analytics,
             startup_diagnostics: Default::default(),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
@@ -1740,6 +1742,7 @@ impl MarmotApp {
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
             audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
+            audit_recorders: Arc::default(),
             product_analytics,
             startup_diagnostics: Default::default(),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
@@ -1765,6 +1768,7 @@ impl MarmotApp {
         let root = root.as_ref().to_path_buf();
         let lease = MarmotRootRuntimeLease::try_acquire(&root)?;
         audit_log::cleanup_legacy_audit_logs(&root);
+        audit_log::cleanup_expired_audit_logs(&root);
         let app =
             Self::with_relays_and_account_home_and_config(&root, relay_urls, account_home, config);
         *app.root_runtime_lease
@@ -4920,6 +4924,8 @@ impl MarmotApp {
                 false
             }
         };
+        let audit_slot = self.audit_recorder_slot(label);
+        let mut audit_registration = audit_slot.lock().unwrap_or_else(|p| p.into_inner());
         if audit_log_enabled && let Some(recorder) = self.open_audit_recorder(label, &account_id) {
             session_config = session_config.recorder(recorder);
         }
@@ -4994,6 +5000,8 @@ impl MarmotApp {
             transport = Some((adapter.clone(), routing.clone()));
             Ok::<_, AppError>((adapter, routing, key_packages))
         })?;
+        *audit_registration = Some(runtime.audit_recorder().downgrade());
+        drop(audit_registration);
         let (adapter, routing) = transport.expect("an opened runtime built its transport");
         if let Some(timing) = dev_maintenance_timing(&self.config) {
             runtime = runtime.with_maintenance_timing(timing);

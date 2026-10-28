@@ -39,6 +39,9 @@ pub mod reason {
     pub const KIND_NOT_ALLOWED: &str = "invalid: kind not allowed";
     pub const MALFORMED: &str = "invalid: malformed REQ";
     pub const TOO_MANY_TAGS: &str = "invalid: too many tags in filter";
+    /// wok's refusal when a connection's queued scans are full.
+    pub const RATE_LIMITED: &str =
+        "rate-limited: too many historical queries waiting on this connection";
     /// strfry sends this as a NOTICE with no session id.
     pub const TOO_MANY_NEG: &str = "ERROR: too many concurrent NEG requests";
 }
@@ -98,6 +101,10 @@ pub struct LimitConfig {
     pub max_tag_keys_per_filter: usize,
     /// Clamp each ordinary REQ filter's `limit` (absent or larger) to this.
     pub req_limit_clamp: Option<u64>,
+    /// `limit` given to an ordinary REQ filter that names none, before the
+    /// clamp (wok: NIP-11 `default_limit` below `max_limit`). `None` leaves it
+    /// to the clamp.
+    pub req_default_limit: Option<u64>,
     /// Live NEG sessions per connection (a separate counter from REQs).
     pub max_neg_sessions: usize,
     /// Phantom NEG sessions every connection starts with, to pre-fill the cap.
@@ -118,6 +125,7 @@ impl Default for LimitConfig {
             allowed_kinds: Some(PRODUCTION_ALLOWED_KINDS.into_iter().collect()),
             max_tag_keys_per_filter: 3,
             req_limit_clamp: Some(REQ_LIMIT_CLAMP),
+            req_default_limit: None,
             max_neg_sessions: 200,
             neg_prefilled_sessions: 0,
             neg_counts_toward_limit: false,
@@ -312,6 +320,8 @@ struct Shared {
     stats: LimitStats,
     states: Vec<ConnectionState>,
     neg_fault: Option<NegFault>,
+    /// REQs still to refuse with `reason::RATE_LIMITED`.
+    rate_limit_next_reqs: usize,
     /// Delay before each client frame is handled, so a refusal or an upstream
     /// answer costs about one simulated round trip.
     client_delay: Duration,
@@ -509,6 +519,11 @@ impl LimitRelay {
         self.shared.lock().unwrap().client_delay = delay;
     }
 
+    /// Refuse the next `count` otherwise-valid REQs with `reason::RATE_LIMITED`.
+    pub fn rate_limit_next_reqs(&self, count: usize) {
+        self.shared.lock().unwrap().rate_limit_next_reqs = count;
+    }
+
     /// Switch the injected NEG behaviour for every connection.
     pub fn set_neg_fault(&self, fault: NegFault) {
         self.shared.lock().unwrap().neg_fault = Some(fault);
@@ -672,6 +687,10 @@ fn inspect_client_frame(
             {
                 violation = Some(reason::TOO_MANY_SUBSCRIPTIONS);
             }
+            if violation.is_none() && shared.rate_limit_next_reqs > 0 {
+                shared.rate_limit_next_reqs -= 1;
+                violation = Some(reason::RATE_LIMITED);
+            }
             let outcome = match violation {
                 None if already_active => ReqOutcome::Replaced,
                 None => ReqOutcome::Accepted,
@@ -692,6 +711,12 @@ fn inspect_client_frame(
                     let mut frame = frame;
                     let mut clamped = false;
                     for filter in frame.iter_mut().skip(2) {
+                        if let Some(default) = config.req_default_limit
+                            && filter.get("limit").is_none()
+                        {
+                            filter["limit"] = Value::from(default);
+                            clamped = true;
+                        }
                         let limit = filter.get("limit").and_then(Value::as_u64);
                         shared.stats.max_req_limit_seen =
                             shared.stats.max_req_limit_seen.max(limit.unwrap_or(0));
