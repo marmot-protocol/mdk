@@ -55,7 +55,7 @@ impl EventFactory {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Profile {
-    /// Cap 500, no hints; hidden events count toward the cap.
+    /// Cap 500, no hints; hidden events count toward the cap but are not sent.
     Strfry,
     /// Cap 5,000 (marmot preset), NIP-67 hints.
     Wok,
@@ -230,13 +230,14 @@ impl SweepRelay for ModelRelay {
             Profile::Wok if cut => Some(EoseHint::More),
             Profile::Wok => Some(EoseHint::Finish),
         };
+        let events = sent
+            .iter()
+            .filter(|stored| !stored.hidden)
+            .map(|stored| stored.event.clone())
+            .collect::<Vec<_>>();
         SliceReply::Answered {
-            received: sent.len(),
-            events: sent
-                .iter()
-                .filter(|stored| !stored.hidden)
-                .map(|stored| stored.event.clone())
-                .collect(),
+            received: events.len(),
+            events,
             hint,
         }
     }
@@ -458,8 +459,11 @@ async fn full_replies_halve_and_sparse_replies_grow() {
     assert_eq!(again.stats.requests, 0);
 }
 
+/// The module's known limit, pinned so a change to it is deliberate: strfry
+/// spends its cap on events it then withholds, so a short page over a
+/// restricted-read kind is not proof. Kind 445 is readable by everyone.
 #[tokio::test(start_paused = true)]
-async fn hidden_events_count_toward_strfry_cap() {
+async fn withheld_events_defeat_the_count_proof() {
     let mut factory = EventFactory::new();
     let range = SweepRange {
         since: T0,
@@ -467,16 +471,18 @@ async fn hidden_events_count_toward_strfry_cap() {
     };
     let events = spread(&mut factory, range, 480);
     let mut relay = ModelRelay::new(Profile::Strfry, events.clone());
-    // 40 unreadable events push the slice to the cap though only 480 arrive.
-    for n in 0..40 {
+    // 40 newest-second unreadable events take cap room; 460 arrive.
+    for _ in 0..40 {
         relay.store.push(Stored {
-            event: factory.event(GROUP, T0 + n * 600),
+            event: factory.event(GROUP, range.until),
             hidden: true,
         });
     }
     let mut sink = relay.sink();
+    let mut sweep = request(range);
+    sweep.policy.initial_delta = DAY;
     let report = run_sweep(
-        request(range),
+        sweep,
         &relay,
         &mut sink,
         &MemoryStore::default(),
@@ -484,12 +490,12 @@ async fn hidden_events_count_toward_strfry_cap() {
     )
     .await;
     assert_eq!(report.end, SweepEnd::Finished);
-    assert!(
-        report.stats.halvings >= 1,
-        "a reply at the cap is not complete"
+    assert_eq!(report.stats.requests, 1);
+    assert_eq!(
+        sink.events.len(),
+        460,
+        "the 20 oldest readable events are missed"
     );
-    assert_contiguous(&report.covered, range);
-    assert_admitted_once_in_order(&sink, &events, range);
 }
 
 #[tokio::test(start_paused = true)]
@@ -627,7 +633,8 @@ async fn wok_more_hint_splits_below_the_cap() {
         until: T0 + DAY - 1,
     };
     let relay = ModelRelay::new(Profile::Wok, Vec::new());
-    // A REQ cut below the filter cap (wok's per-REQ total): `more` wins.
+    // A cut the count cannot see (one filter asking for the cap makes this
+    // unreachable on wok today): `more` still wins.
     relay
         .script
         .lock()
@@ -871,6 +878,44 @@ async fn deadline_is_a_pause() {
     .await;
     assert_eq!(report.end, SweepEnd::DeadlineReached);
     assert_eq!(report.outcome(), SweepOutcomeKind::AnsweredNoProgress);
+
+    // Cut before the relay answered at all: nobody's fault, charge nothing.
+    let relay = ModelRelay::new(Profile::Strfry, Vec::new());
+    let mut sweep = request(month());
+    sweep.deadline = Some(Instant::now() + Duration::from_millis(30));
+    let report = run_sweep(
+        sweep,
+        &relay,
+        &mut relay.sink(),
+        &MemoryStore::default(),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(report.end, SweepEnd::DeadlineReached);
+    assert_eq!(report.outcome(), SweepOutcomeKind::Unanswered);
+
+    // Likewise a deadline spent waiting out a rate limit.
+    let relay = ModelRelay::new(Profile::Wok, Vec::new());
+    relay
+        .script
+        .lock()
+        .unwrap()
+        .push_back(SliceReply::Closed(ClosedReason::from_message(
+            "rate-limited: slow down",
+        )));
+    let mut sweep = request(month());
+    sweep.deadline = Some(Instant::now() + Duration::from_millis(500));
+    let report = run_sweep(
+        sweep,
+        &relay,
+        &mut relay.sink(),
+        &MemoryStore::default(),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(report.end, SweepEnd::DeadlineReached);
+    assert_eq!(report.stats.rate_limited_waits, 1);
+    assert_eq!(report.outcome(), SweepOutcomeKind::Unanswered);
 }
 
 /// The issue's completion bar: a large group finishes over successive cut

@@ -16,11 +16,17 @@
 //!
 //! Completeness ([`SliceProof`]) comes from, in order: a NIP-67 `finish` hint;
 //! a reply below the relay's NIP-11 `limitation.max_limit` (strfry 500, wok's
-//! marmot preset 5,000), counting every EVENT the relay sent, valid or not,
-//! because strfry counts hidden events toward the cap; or, when the relay
-//! publishes no cap, a reply below the largest full reply seen from it. A
-//! NIP-67 `more` hint always splits. Requested limits are lowered silently, so
-//! the cap is read, never assumed.
+//! marmot preset 5,000), counting every EVENT the relay sent, valid or not;
+//! or, when the relay publishes no cap, a reply below the largest full reply
+//! seen from it. A NIP-67 `more` hint always splits. Requested limits are
+//! lowered silently, so the cap is read, never assumed. Each slice REQ asks for
+//! exactly the cap with one filter, so on wok a reply below it was never cut
+//! (its 10,000 per-REQ total cannot bind first).
+//!
+//! Known limit: strfry counts events this connection may not read toward the
+//! cap without sending them, so a short page proves completeness only while the
+//! swept kind is readable by everyone. Kind 445 is; a restricted-read kind
+//! would need another proof (NIP-77) before it could be swept this way.
 //!
 //! The sweep schedules nothing. Its caller (the recovery runner, phase 4)
 //! decides which route, relay and range to sweep, and reads the call's
@@ -214,7 +220,8 @@ impl ClosedReason {
 pub enum SliceReply {
     /// The relay reached EOSE. `received` counts every EVENT it sent for the
     /// REQ, including ones that failed validation, since those still count
-    /// toward the relay's cap.
+    /// toward the relay's cap. Events it withheld are invisible here (see the
+    /// module's known limit).
     Answered {
         events: Vec<Event>,
         received: usize,
@@ -414,6 +421,9 @@ pub enum SweepOutcomeKind {
     Refused,
     /// Cancelled before anything was covered.
     Cancelled,
+    /// The call's deadline came before the relay answered anything: neither
+    /// the route's nor the relay's fault, so charge nothing.
+    Unanswered,
     /// The range was already covered.
     NothingOwed,
     /// Local admission or cursor storage failed.
@@ -429,6 +439,8 @@ pub struct SweepStats {
     pub rate_limited_waits: u32,
     pub blocked_waits: u32,
     pub saturated_seconds: u32,
+    /// Answers the relay gave (slice replies and saturated-second replies).
+    pub answers: u32,
     pub events: u64,
 }
 
@@ -453,6 +465,7 @@ impl SweepReport {
             SweepEnd::Cancelled => SweepOutcomeKind::Cancelled,
             SweepEnd::Unreachable(_) => SweepOutcomeKind::RelayUnreachable,
             SweepEnd::Refused(_) | SweepEnd::RateLimited => SweepOutcomeKind::Refused,
+            SweepEnd::DeadlineReached if self.stats.answers == 0 => SweepOutcomeKind::Unanswered,
             SweepEnd::DeadlineReached | SweepEnd::SaturatedSecond { .. } => {
                 SweepOutcomeKind::AnsweredNoProgress
             }
@@ -586,6 +599,7 @@ fn finish(
         rate_limited_waits = stats.rate_limited_waits,
         blocked_waits = stats.blocked_waits,
         saturated_seconds = stats.saturated_seconds,
+        answers = stats.answers,
         events = stats.events,
     );
     report
@@ -697,7 +711,10 @@ where
                     self.cover(second, second, SliceProof::Negentropy, events)
                         .await
                 }
-                SecondReply::Unproven => Some(SweepEnd::SaturatedSecond { second }),
+                SecondReply::Unproven => {
+                    self.answered();
+                    Some(SweepEnd::SaturatedSecond { second })
+                }
                 SecondReply::Closed(reason) => match self.refused(reason).await {
                     Refusal::Retry => continue,
                     Refusal::Stop(end) => Some(end),
@@ -824,6 +841,7 @@ where
     }
 
     fn answered(&mut self) {
+        self.stats.answers += 1;
         self.rate_limited_in_a_row = 0;
         self.blocked_in_a_row = 0;
     }

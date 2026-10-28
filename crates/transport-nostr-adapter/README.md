@@ -384,7 +384,7 @@ caller's sink oldest first and the cursor advances through the caller's store, s
 where it stopped and never fetches a covered slice again. A full reply halves Δ, a nearly empty one doubles it, and
 a full one-second slice is fetched through NIP-77. Completeness comes from a NIP-67 `finish` hint, a reply below the
 relay's NIP-11 `max_limit` (strfry 500, wok's marmot preset 5,000), or, with no published cap, a reply below the
-largest full reply the relay sent. `rate-limited:` refusals are waited out; unreachable relays and refusals are
+largest full reply the relay sent. That count is proof only for kinds everyone may read, as kind 445 is: strfry spends its cap on events it withholds. `rate-limited:` refusals are waited out; unreachable relays and refusals are
 reported apart from "answered, nothing new". Each call reports its covered slices (with their proof) and one
 outcome for the caller's backoff. `SdkSweepRelay` (`sdk` feature) runs it over a relay already in a
 `NostrSdkRelayClient`'s pool; nostr-sdk drops NIP-67 hints, so it proves slices by counting. Nothing schedules the
