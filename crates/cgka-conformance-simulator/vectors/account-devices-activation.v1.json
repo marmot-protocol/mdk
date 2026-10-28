@@ -95,11 +95,6 @@
         "supported": true
       },
       {
-        "type": "set_account_devices_support",
-        "client": "bob",
-        "supported": true
-      },
-      {
         "type": "create_group",
         "creator": "alice-phone",
         "name": "devices",
@@ -125,6 +120,33 @@
       {
         "type": "tick",
         "clients": [
+          "alice-laptop",
+          "bob"
+        ]
+      },
+      {
+        "type": "set_account_devices_support",
+        "client": "bob",
+        "supported": true
+      },
+      {
+        "type": "self_update",
+        "client": "bob",
+        "pending": "bob-refresh"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "publication": "bob-refresh",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice-phone",
           "alice-laptop",
           "bob"
         ]
@@ -165,6 +187,13 @@
     {
       "type": "pending_resolution",
       "step_index": 8,
+      "client": "bob",
+      "pending": "bob-refresh",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 12,
       "client": "alice-phone",
       "pending": "activate",
       "resolution": "confirmed"
@@ -172,19 +201,19 @@
     {
       "type": "client_state",
       "client": "alice-phone",
-      "epoch": 2,
+      "epoch": 3,
       "member_count": 3
     },
     {
       "type": "client_state",
       "client": "alice-laptop",
-      "epoch": 2,
+      "epoch": 3,
       "member_count": 3
     },
     {
       "type": "client_state",
       "client": "bob",
-      "epoch": 2,
+      "epoch": 3,
       "member_count": 3
     },
     {

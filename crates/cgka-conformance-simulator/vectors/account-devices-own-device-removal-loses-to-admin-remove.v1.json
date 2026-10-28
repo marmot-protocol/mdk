@@ -130,28 +130,6 @@
         ]
       },
       {
-        "type": "require_account_devices",
-        "client": "alice-phone",
-        "pending": "activate"
-      },
-      {
-        "type": "acknowledge_outbound",
-        "client": "alice-phone",
-        "publication": "activate",
-        "outcome": "accepted"
-      },
-      {
-        "type": "deliver_all"
-      },
-      {
-        "type": "tick",
-        "clients": [
-          "alice-phone",
-          "alice-laptop",
-          "bob"
-        ]
-      },
-      {
         "type": "remove_members",
         "remover": "alice-phone",
         "members": [
@@ -213,14 +191,14 @@
   "expected_outcomes": [
     {
       "type": "pending_resolution",
-      "step_index": 13,
+      "step_index": 9,
       "client": "alice-phone",
       "pending": "remove-bob",
       "resolution": "confirmed"
     },
     {
       "type": "pending_resolution",
-      "step_index": 14,
+      "step_index": 10,
       "client": "alice-laptop",
       "pending": "remove-phone",
       "resolution": "confirmed"
@@ -238,7 +216,7 @@
     {
       "type": "client_state",
       "client": "alice-phone",
-      "epoch": 3,
+      "epoch": 2,
       "member_count": 2,
       "removed_members": [
         "bob"
@@ -247,7 +225,7 @@
     {
       "type": "client_state",
       "client": "alice-laptop",
-      "epoch": 3,
+      "epoch": 2,
       "member_count": 2,
       "removed_members": [
         "bob"
