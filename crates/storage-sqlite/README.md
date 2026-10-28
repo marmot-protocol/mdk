@@ -258,7 +258,10 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   its own transaction what the generations it newly charged lost. A generation recorded through
   `record_account_recovery_loss_routed` with its routes (migration 0128, at most `MAX_LOSS_ROUTES`) un-covers only
   those routes, each from its own bound, and widens their goals; any other generation un-covers every route the ledger
-  holds from its floor upward (all of it when a floor is unknown) and widens their goals to it.
+  holds from its floor upward (all of it when a floor is unknown) and widens their goals to it. Un-covering follows
+  what each write owes, not the count: a restored generation counts again from zero under its durable marker, so a
+  write can bring new loss without raising the stored count, and a worker observation past the durable count makes its
+  generation account-wide.
   `uncover_recovery_coverage` does the same for the given routes only. A released receipt (`cross/release.rs`) un-covers its event's second on each route its inventory row
   placed it on. Live boundaries never cover that second again, since the REQ that delivered the event will not
   deliver it again; only a fetch proof (comparison, sweep slice, re-check) covers it, on its own relay, and the hold

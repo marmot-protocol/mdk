@@ -118,10 +118,10 @@ pub(super) fn goal_floor(
 /// is un-covered on every route, as if a charge had named none.
 pub const MAX_LOSS_ROUTES: usize = 256;
 
-/// The routes one generation's import un-covers, each from the earliest
-/// `created_at` it could have lost there, or `None` when it un-covers every
-/// route from its floor: some charge named no route or time, or it touched
-/// more than [`MAX_LOSS_ROUTES`].
+/// The routes one generation's import un-covers: those a write since its last
+/// un-cover named, each from the earliest `created_at` it could have lost
+/// there. `None` when it un-covers every route from its floor: some charge
+/// named no route or time, or it touched more than [`MAX_LOSS_ROUTES`].
 pub(super) fn evidence_routes(
     conn: &Connection,
     label: &str,
@@ -142,7 +142,7 @@ pub(super) fn evidence_routes(
     }
     conn.prepare_cached(
         "SELECT route_kind, route_id, bound_seconds FROM account_delivery_loss_evidence_routes
-         WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3",
+         WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3 AND owed = 1",
     )
     .storage()?
     .query_map(params![label, cause, token], |row| {
@@ -187,6 +187,64 @@ pub(super) fn evidence_floor(
         Some((1, Some(seconds))) => u64::try_from(seconds).unwrap_or(0),
         _ => 0,
     })
+}
+
+/// Make a generation account-wide: every route lost coverage from its floor,
+/// so it lists none.
+pub(super) fn unroute_tx(
+    conn: &Connection,
+    label: &str,
+    cause: i64,
+    token: i64,
+) -> StorageResult<()> {
+    conn.execute_cached(
+        "UPDATE account_delivery_loss_evidence SET route_state = 0, uncover_owed = 1
+         WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3",
+        params![label, cause, token],
+    )
+    .storage()?;
+    drop_unrouted_routes_tx(conn, label, cause, token)
+}
+
+/// An account-wide generation needs no route rows.
+fn drop_unrouted_routes_tx(
+    conn: &Connection,
+    label: &str,
+    cause: i64,
+    token: i64,
+) -> StorageResult<()> {
+    conn.execute_cached(
+        "DELETE FROM account_delivery_loss_evidence_routes
+         WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3
+           AND NOT EXISTS (SELECT 1 FROM account_delivery_loss_evidence
+               WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3
+                 AND route_state = 1)",
+        params![label, cause, token],
+    )
+    .storage()?;
+    Ok(())
+}
+
+/// The generation's import un-covered everything its writes had brought.
+pub(super) fn settle_owed_tx(
+    conn: &Connection,
+    label: &str,
+    cause: i64,
+    token: i64,
+) -> StorageResult<()> {
+    conn.execute_cached(
+        "UPDATE account_delivery_loss_evidence SET uncover_owed = 0
+         WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3",
+        params![label, cause, token],
+    )
+    .storage()?;
+    conn.execute_cached(
+        "UPDATE account_delivery_loss_evidence_routes SET owed = 0
+         WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3 AND owed = 1",
+        params![label, cause, token],
+    )
+    .storage()?;
+    Ok(())
 }
 
 impl SqliteAppStorage {
@@ -236,7 +294,9 @@ impl SqliteAppStorage {
     /// Like [`Self::record_account_recovery_loss_bounded`], also naming the
     /// routes these charges lost on, each with the earliest `created_at` it
     /// could have lost there. `None` means some charge named no route, and
-    /// the generation un-covers every route from then on.
+    /// the generation un-covers every route from then on. Each write owes an
+    /// un-cover of what it names, even when its count adds nothing: a
+    /// restored generation counts again from zero under the same marker.
     #[allow(clippy::too_many_arguments)]
     pub fn record_account_recovery_loss_routed(
         &self,
@@ -258,11 +318,12 @@ impl SqliteAppStorage {
                 &format!(
                     "INSERT INTO account_delivery_loss_evidence
                      (account_label,cause,marker_token,pending_since,dropped_count,
-                      bound_state,bound_seconds,route_state)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                      bound_state,bound_seconds,route_state,uncover_owed)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,1)
                      ON CONFLICT(account_label,cause,marker_token) DO UPDATE SET
                          dropped_count=MAX(dropped_count,excluded.dropped_count),
                          route_state=MIN(route_state,excluded.route_state),
+                         uncover_owed=1,
                          {}",
                     crate::app::account_recovery::LOSS_BOUND_MERGE
                 ),
@@ -286,8 +347,16 @@ impl SqliteAppStorage {
                      SELECT ?1, ?2, ?3, ?4, ?5, ?6 FROM account_delivery_loss_evidence
                      WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3
                        AND route_state = 1
-                     ON CONFLICT DO UPDATE SET bound_seconds = MIN(bound_seconds, excluded.bound_seconds)",
-                    params![label, cause as i64, token, kind, id, sqlite_integer(*bound)?],
+                     ON CONFLICT DO UPDATE SET
+                         bound_seconds = MIN(bound_seconds, excluded.bound_seconds), owed = 1",
+                    params![
+                        label,
+                        cause as i64,
+                        token,
+                        kind,
+                        id,
+                        sqlite_integer(*bound)?
+                    ],
                 )
                 .storage()?;
             }
@@ -300,24 +369,10 @@ impl SqliteAppStorage {
                 )
                 .storage()?;
             if usize::try_from(listed).map_or(true, |listed| listed > MAX_LOSS_ROUTES) {
-                conn.execute_cached(
-                    "UPDATE account_delivery_loss_evidence SET route_state = 0
-                     WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3",
-                    params![label, cause as i64, token],
-                )
-                .storage()?;
+                unroute_tx(&conn, label, cause as i64, token)
+            } else {
+                drop_unrouted_routes_tx(&conn, label, cause as i64, token)
             }
-            // An account-wide generation needs no route rows.
-            conn.execute_cached(
-                "DELETE FROM account_delivery_loss_evidence_routes
-                 WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3
-                   AND NOT EXISTS (SELECT 1 FROM account_delivery_loss_evidence
-                       WHERE account_label = ?1 AND cause = ?2 AND marker_token = ?3
-                         AND route_state = 1)",
-                params![label, cause as i64, token],
-            )
-            .storage()?;
-            Ok(())
         })
     }
 

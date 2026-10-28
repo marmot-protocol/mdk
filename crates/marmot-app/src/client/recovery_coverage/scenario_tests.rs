@@ -253,6 +253,53 @@ async fn routed_queue_loss_uncovers_only_its_routes() {
     }
 }
 
+/// A restored generation counts again from zero under its durable marker, so
+/// its new loss leaves the stored count where it was. Each write still costs
+/// coverage: first the new route it names, then every route once a drop
+/// names none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_generation_still_uncovers_its_new_loss() {
+    let fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    let routes = routes(&fixture.client);
+    let group = routes
+        .iter()
+        .find(|route| matches!(route, TransportReconciliationRoute::Group(_)))
+        .unwrap()
+        .clone();
+    let inbox = TransportReconciliationRoute::Inbox;
+    assert!(routes.contains(&inbox));
+    let floor = unix_now_seconds().saturating_sub(30);
+    let lose = |count, lost: Option<&[(TransportReconciliationRoute, u64)]>| {
+        app.record_account_recovery_loss_routed(
+            "alice",
+            storage_sqlite::RecoveryLossCause::Queue,
+            41,
+            count,
+            unix_now_seconds(),
+            Some(floor),
+            lost,
+        )
+        .unwrap();
+        fixture.client.synchronize_recovery_loss(&app).unwrap();
+    };
+    let owed = |route: &TransportReconciliationRoute| {
+        !app.recovery_coverage_debt(route, &[relay()], unix_now_seconds())
+            .unwrap()
+            .is_empty()
+    };
+    lose(50, Some(&[(group.clone(), floor)]));
+    fixture.client.record_native_coverage(&app).await;
+    assert!(!owed(&inbox));
+
+    lose(1, Some(&[(inbox.clone(), floor)]));
+    assert!(owed(&inbox), "the restored generation lost the inbox");
+    lose(2, None);
+    for route in &routes {
+        assert!(owed(route), "a drop that named no route costs every route");
+    }
+}
+
 /// Loss imported after a grant was selected can lie inside the window its
 /// pass certified, so settlement must not restore that window's coverage
 /// from the loss's floor up; below the floor the certificate stands.

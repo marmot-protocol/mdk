@@ -344,13 +344,28 @@ pub(crate) fn arm_overflow_tx(
     }
     // Preserve what the worker already observed, even when this token's marker
     // callback has not committed yet. A delayed duplicate cannot rearm debt.
+    // Drops past the durable count have no marker write naming their routes
+    // yet, and the import below covers their count, so they un-cover every
+    // route; an absent row starts account-wide.
+    let durable: Option<i64> = conn
+        .query_row_cached(
+            "SELECT dropped_count FROM account_delivery_loss_evidence
+             WHERE account_label = ?1 AND cause = 0 AND marker_token = ?2",
+            params![label, token],
+            |row| row.get(0),
+        )
+        .optional()
+        .storage()?;
+    if durable.is_some_and(|durable| durable < dropped) {
+        loss::unroute_tx(conn, label, 0, token)?;
+    }
     let (bound_state, bound_seconds) = loss_bound_values(earliest_created_at)?;
     conn.execute_cached(
         &format!(
             "INSERT INTO account_delivery_loss_evidence
              (account_label, cause, marker_token, pending_since, dropped_count, imported_count,
-              bound_state, bound_seconds)
-             VALUES (?1, 0, ?2, ?3, ?4, ?4, ?5, ?6)
+              bound_state, bound_seconds, uncover_owed)
+             VALUES (?1, 0, ?2, ?3, ?4, ?4, ?5, ?6, 1)
              ON CONFLICT(account_label, cause, marker_token) DO UPDATE SET
                  dropped_count = MAX(dropped_count, excluded.dropped_count),
                  imported_count = MAX(COALESCE(imported_count, 0), excluded.imported_count),
@@ -389,6 +404,8 @@ struct ChargedLoss {
 }
 
 impl ChargedLoss {
+    /// Charge what the generation's writes owe and settle those flags; the
+    /// caller un-covers it in the same transaction.
     fn charge(
         &mut self,
         conn: &Connection,
@@ -408,7 +425,7 @@ impl ChargedLoss {
                 self.every_route = Some(self.every_route.map_or(floor, |lowest| lowest.min(floor)));
             }
         }
-        Ok(())
+        loss::settle_owed_tx(conn, label, cause, token)
     }
 
     /// Un-cover what was lost, in the import's transaction. Returns whether
@@ -529,6 +546,8 @@ pub(crate) fn restore_legacy_loss_tx(conn: &Connection, label: &str) -> StorageR
             params![label, token],
         )
         .storage()?;
+        // The account-wide un-cover below covers whatever its writes owed.
+        loss::settle_owed_tx(conn, label, 0, *token)?;
         let restored = loss::evidence_floor(conn, label, 0, *token)?;
         floor = Some(floor.map_or(restored, |floor| floor.min(restored)));
     }
@@ -781,8 +800,10 @@ impl SqliteAppStorage {
     /// demand creation share a transaction, so cancellation cannot lose either.
     ///
     /// Returns what the import charged, at most one entry per loss cause, so
-    /// the owner can record the change. Loss that changed no obligation
-    /// revision reports nothing.
+    /// the owner can record the change. A cause whose import changed no
+    /// obligation revision reports only when it un-covered every route.
+    /// Un-covering follows what each write owes, not the count: a restored
+    /// generation's new loss can leave its count where it was.
     pub fn synchronize_account_delivery_loss(
         &self,
         label: &str,
@@ -791,7 +812,8 @@ impl SqliteAppStorage {
             .lock()?
             .query_row_cached(
                 "SELECT EXISTS(SELECT 1 FROM account_delivery_loss_evidence
-             WHERE account_label = ?1 AND (imported_count IS NULL OR dropped_count > imported_count))",
+             WHERE account_label = ?1
+               AND (imported_count IS NULL OR dropped_count > imported_count OR uncover_owed = 1))",
                 [label],
                 |row| row.get(0),
             )
@@ -816,7 +838,7 @@ impl SqliteAppStorage {
                         "SELECT cause,marker_token,pending_since,dropped_count,imported_count
                      FROM account_delivery_loss_evidence
                      WHERE account_label=?1 AND (cause,marker_token)>(?2,?3)
-                     AND (imported_count IS NULL OR dropped_count>imported_count)
+                     AND (imported_count IS NULL OR dropped_count>imported_count OR uncover_owed=1)
                      ORDER BY cause,marker_token LIMIT 1",
                         params![label, cursor.0, cursor.1],
                         |row| {
@@ -835,6 +857,7 @@ impl SqliteAppStorage {
                     break;
                 };
                 cursor = (cause, token);
+                let unimported = imported.is_none_or(|imported| dropped > imported);
                 if let Some(slot) = usize::try_from(cause)
                     .ok()
                     .and_then(|cause| imports.get_mut(cause))
@@ -849,13 +872,15 @@ impl SqliteAppStorage {
                         lost.charge(&conn, label, cause, token)?;
                     }
                 }
-                join_loss_tx(&conn, label, cause, token, dropped, observed_at, true)?;
-                conn.execute_cached(
-                    "UPDATE account_delivery_loss_evidence SET imported_count = ?3
-                     WHERE account_label = ?1 AND cause = ?4 AND marker_token = ?2",
-                    params![label, token, dropped, cause],
-                )
-                .storage()?;
+                if unimported {
+                    join_loss_tx(&conn, label, cause, token, dropped, observed_at, true)?;
+                    conn.execute_cached(
+                        "UPDATE account_delivery_loss_evidence SET imported_count = ?3
+                         WHERE account_label = ?1 AND cause = ?4 AND marker_token = ?2",
+                        params![label, token, dropped, cause],
+                    )
+                    .storage()?;
+                }
             }
             let mut changes = Vec::new();
             for (cause, slot) in imports.into_iter().enumerate() {
@@ -865,13 +890,14 @@ impl SqliteAppStorage {
                 let cause_value = i64::try_from(cause).map_err(|_| {
                     StorageError::Serialization("unsupported recovery loss cause".into())
                 })?;
+                let every_route = lost.uncover(&conn)?;
                 let Some(after) =
                     observe::demand_row(&conn, &loss_demand_key(cause_value, label)?)?
                 else {
                     continue;
                 };
                 let transition = observe::transition(before.as_ref(), &after);
-                if transition == RecoveryDemandTransition::Unchanged {
+                if transition == RecoveryDemandTransition::Unchanged && !every_route {
                     continue;
                 }
                 let cause = if cause == 0 {
@@ -880,7 +906,6 @@ impl SqliteAppStorage {
                     RecoveryLossCause::NotificationConsumer
                 };
                 let goal_floor = loss::goal_floor(&conn, label, cause)?;
-                let every_route = lost.uncover(&conn)?;
                 changes.push(RecoveryLossImport {
                     cause,
                     obligation: observe::ticket(&after)?,
@@ -895,9 +920,11 @@ impl SqliteAppStorage {
     }
 
     /// [`Self::mark_account_delivery_recovery_bounded`], also reporting how the
-    /// worker's observation changed the queue-loss obligation, when it did.
-    /// The marker writer usually imported the generation first, so this is
-    /// most often `None`.
+    /// worker's observation changed the queue-loss obligation, when it did or
+    /// when it un-covered every route. The marker writer usually imported the
+    /// generation first, so this is most often `None`. It un-covers what the
+    /// generation's writes owe, and an observation past the durable count
+    /// owes every route.
     pub fn mark_account_delivery_recovery_observed(
         &self,
         label: &str,
@@ -929,17 +956,31 @@ impl SqliteAppStorage {
                 crate::base::codec::unix_now_seconds_i64(),
                 earliest_created_at,
             )?;
+            // What a write flagged, or count this observation imported.
+            let owed: bool = conn
+                .query_row_cached(
+                    "SELECT uncover_owed = 1 OR ?3 IS NULL OR dropped_count > ?3
+                     FROM account_delivery_loss_evidence
+                     WHERE account_label = ?1 AND cause = 0 AND marker_token = ?2",
+                    params![label, token, imported],
+                    |row| row.get(0),
+                )
+                .optional()
+                .storage()?
+                .unwrap_or(false);
+            let mut lost = ChargedLoss::default();
+            if owed {
+                lost.charge(&conn, label, 0, token)?;
+            }
+            let every_route = lost.uncover(&conn)?;
             let Some(after) = observe::demand_row(&conn, &key)? else {
                 return Ok(None);
             };
             let transition = observe::transition(before.as_ref(), &after);
-            if transition == RecoveryDemandTransition::Unchanged {
+            if transition == RecoveryDemandTransition::Unchanged && !every_route {
                 return Ok(None);
             }
             let goal_floor = loss::goal_floor(&conn, label, RecoveryLossCause::Queue)?;
-            let mut lost = ChargedLoss::default();
-            lost.charge(&conn, label, 0, token)?;
-            let every_route = lost.uncover(&conn)?;
             Ok(Some(RecoveryLossImport {
                 cause: RecoveryLossCause::Queue,
                 obligation: observe::ticket(&after)?,

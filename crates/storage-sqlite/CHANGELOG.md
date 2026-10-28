@@ -5,12 +5,16 @@
 ### Breaking changes
 
 - Migration 0128 advances account storage to schema 128 (mdk#2660 phase 4).
-  It adds `route_state` to `account_delivery_loss_evidence`, which existing
-  rows leave 0, and `account_delivery_loss_evidence_routes`: the routes a loss
-  generation lost deliveries on, each with the earliest `created_at` lost
-  there. `record_account_recovery_loss_routed` records them; a generation
-  with every charge routed, and at most `MAX_LOSS_ROUTES` routes, un-covers
-  only those routes at import. `RecoveryLossImport` gains `every_route`.
+  It adds `route_state` and `uncover_owed` to `account_delivery_loss_evidence`,
+  which existing rows leave 0, and `account_delivery_loss_evidence_routes`:
+  the routes a loss generation lost deliveries on, each with the earliest
+  `created_at` lost there. `record_account_recovery_loss_routed` records them;
+  a generation with every charge routed, and at most `MAX_LOSS_ROUTES` routes,
+  un-covers only those routes at import. Each write owes an un-cover of what
+  it names until the next import, even when the count does not move, and a
+  worker observation past the durable count makes its generation account-wide.
+  `RecoveryLossImport` gains `every_route`, and an import that un-covered every
+  route is reported even when its obligation did not change.
 - Migration 0127 advances account storage to schema 127 (mdk#2660 phase 4).
   It adds the recovery runner's retry state, which nothing in production
   writes yet: `account_recovery_units` (per route and relay: active, broken
