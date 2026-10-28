@@ -159,9 +159,10 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     applies the state rules and the GroupInfo rule and accepts a Welcome from its own account; before activation, and on
     the legacy profile, 0x800d data stays unknown data and only an admin's Welcome joins. Also same-account Commits
     (mdk#2628 item 2.1c): which shapes a non-admin may commit, from both sides; the stamp's priority equal to replay's
-    for every class; and races settled the same way on every client. Needs `test-policy-overrides` or
-    `test-conformance-snapshot`. Its `found_group(.., false, ..)` founds with a member that does not advertise 0x800d
-    and then removes it, because creation requires 0x800d whenever every founder advertises it.
+    for every class; and races settled the same way on every client. Also that the builder accepts 0x800d and still
+    refuses protocol ids the engine does not implement. Its `found_group(.., false, ..)` founds with a member that
+    does not advertise 0x800d and then removes it, because creation requires 0x800d whenever every founder advertises
+    it.
 
 - **File:** `account_devices/creation.rs`
   - **Owns:** Creating a group (mdk#2628 item 2.3): the founding state requires 0x800d exactly when the creator's leaf

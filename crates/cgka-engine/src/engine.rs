@@ -399,7 +399,6 @@ pub struct EngineBuilder<S: StorageProvider> {
         Option<Arc<dyn crate::account_identity_proof::AccountIdentityProofSigner>>,
     registry: FeatureRegistry,
     supported_app_components: AppComponentSet,
-    allow_account_devices_advertising: bool,
     new_protocol_profile: ProtocolProfile,
     allow_legacy_compatibility_profile: bool,
     peeler: Option<Box<dyn TransportPeeler>>,
@@ -425,7 +424,6 @@ impl<S: StorageProvider> EngineBuilder<S> {
             account_identity_proof_signer: None,
             registry: FeatureRegistry::new(),
             supported_app_components: AppComponentSet::new(default_group_components()),
-            allow_account_devices_advertising: false,
             new_protocol_profile: ProtocolProfile::Current,
             allow_legacy_compatibility_profile: false,
             peeler: None,
@@ -470,19 +468,6 @@ impl<S: StorageProvider> EngineBuilder<S> {
         components: impl IntoIterator<Item = AppComponentId>,
     ) -> Self {
         self.supported_app_components = AppComponentSet::new(components);
-        self
-    }
-
-    /// Let [`Self::supported_app_components`] include
-    /// `marmot.group.account-devices.v1`, which the engine enforces but does
-    /// not advertise yet (mdk#2628, item 2.2). Test and conformance builds
-    /// only, so they can model groups that require it.
-    #[cfg(any(
-        feature = "test-policy-overrides",
-        feature = "test-conformance-snapshot"
-    ))]
-    pub fn allow_account_devices_advertising_for_tests(mut self) -> Self {
-        self.allow_account_devices_advertising = true;
         self
     }
 
@@ -606,10 +591,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
                 "max_past_epochs must equal the pinned v1 app-message window".into(),
             ));
         }
-        crate::app_components::validate_supported_app_components(
-            &self.supported_app_components,
-            self.allow_account_devices_advertising,
-        )?;
+        crate::app_components::validate_supported_app_components(&self.supported_app_components)?;
         let identity_bytes = self
             .identity_bytes
             .ok_or_else(|| EngineError::Other("identity bytes are required".into()))?;

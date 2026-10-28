@@ -407,7 +407,6 @@ fn restart(device: Device, account: &[u8]) -> Device {
         .protocol_profile(ProtocolProfile::Current)
         .feature_registry(registry())
         .supported_app_components(supported)
-        .allow_account_devices_advertising_for_tests()
         .peeler(Box::<MockPeeler>::default())
         .build()
         .unwrap();

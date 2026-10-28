@@ -1227,8 +1227,9 @@ impl ClientBuilder {
         self
     }
 
-    /// Advertise `marmot.group.account-devices.v1` (0x800d), which production
-    /// builds do not advertise yet.
+    /// Advertise `marmot.group.account-devices.v1` (0x800d). Clients start
+    /// without it, so scenarios can model devices on either side of an
+    /// upgrade.
     pub fn account_devices_supported(mut self, supported: bool) -> Self {
         self.account_devices_supported = supported;
         self
@@ -1386,9 +1387,6 @@ fn build_harness_engine(
         ))
         .peeler(peeler)
         .recorder(Box::new(CapturingRecorder::new(audit_capture.clone())));
-    if options.account_devices_supported {
-        builder = builder.allow_account_devices_advertising_for_tests();
-    }
     #[cfg(debug_assertions)]
     if protocol_profile == ProtocolProfile::Legacy {
         builder = builder.legacy_compatibility_profile();
