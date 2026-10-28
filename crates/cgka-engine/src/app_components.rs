@@ -1071,7 +1071,9 @@ pub(crate) fn group_requires_account_devices(group: &MlsGroup) -> Result<bool, E
 
 /// Whether an `app_data_dictionary`, at any location, carries an entry under
 /// `marmot.group.account-devices.v1`, which defines none.
-fn carries_account_devices_data(dictionary: Option<&AppDataDictionaryExtension>) -> bool {
+pub(crate) fn carries_account_devices_data(
+    dictionary: Option<&AppDataDictionaryExtension>,
+) -> bool {
     dictionary.is_some_and(|ext| ext.dictionary().contains(&ACCOUNT_DEVICES_COMPONENT_ID))
 }
 

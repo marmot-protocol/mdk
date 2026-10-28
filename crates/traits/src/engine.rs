@@ -213,6 +213,18 @@ pub enum SendIntent {
     /// Install `marmot.group.lifecycle.v1 = active` and require the component
     /// in one admin Commit for a compatible existing group.
     EnableDisbanding { group_id: GroupId },
+    /// Require `marmot.group.account-devices.v1` in an existing group, in one
+    /// admin Commit (account-devices-v1.md, "Activation in an existing
+    /// group"). Only ever sent because the user asked: the engine never turns
+    /// it on by itself.
+    ///
+    /// Refused with [`crate::error::EngineError::AccountDevicesActivationRefused`]
+    /// (or [`crate::error::EngineError::NotGroupAdmin`]) before anything is
+    /// staged, when the group already requires the component, is on the
+    /// legacy profile, or has a leaf that does not advertise it or an account
+    /// over the leaf limit. The checks run against the state the Commit is
+    /// prepared on, so an intent queued behind other work sees that work.
+    EnableAccountDevices { group_id: GroupId },
     /// Persist the irreversible local intent to terminate the group. Preparing
     /// and publishing the terminal Commit is driven asynchronously from this
     /// durable request.

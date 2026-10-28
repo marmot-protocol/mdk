@@ -1,14 +1,15 @@
 //! C mirrors of the group conversions.
 
 use marmot_uniffi::conversions::{
-    AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupHydrationQuarantineReasonFfi,
-    AppGroupMemberIdsFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi, AppGroupRecordFfi,
-    AppProtocolProfileFfi, AppQuarantinedGroupFfi, CreatedGroupFfi, DisbandFailureReasonFfi,
-    DisbandRequestFfi, EncryptedMediaVersionFfi, GroupAppComponentFfi, GroupCommitDeliveryFfi,
-    GroupConversationSnapshotFfi, GroupDetailsFfi, GroupInviteDeclineResultFfi,
-    GroupLifecycleStateFfi, GroupManagementStateFfi, GroupMemberActionStateFfi,
-    GroupMemberDetailsFfi, GroupMutationResultFfi, GroupRecoveryStatusFfi,
-    GroupRejoinInvitationFfi, GroupRosterFfi, MemberRefFfi, SelfMembershipFfi,
+    AccountDevicesActivationFfi, AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi,
+    AppGroupHydrationQuarantineReasonFfi, AppGroupMemberIdsFfi, AppGroupMemberRecordFfi,
+    AppGroupMlsStateFfi, AppGroupRecordFfi, AppProtocolProfileFfi, AppQuarantinedGroupFfi,
+    CreatedGroupFfi, DisbandFailureReasonFfi, DisbandRequestFfi, EncryptedMediaVersionFfi,
+    GroupAppComponentFfi, GroupCommitDeliveryFfi, GroupConversationSnapshotFfi, GroupDetailsFfi,
+    GroupInviteDeclineResultFfi, GroupLifecycleStateFfi, GroupManagementStateFfi,
+    GroupMemberActionStateFfi, GroupMemberDetailsFfi, GroupMutationResultFfi,
+    GroupRecoveryStatusFfi, GroupRejoinInvitationFfi, GroupRosterFfi, MemberRefFfi,
+    SelfMembershipFfi,
 };
 // Group-creation option/image records live on the command module rather
 // than `conversions`, because they are inputs, not projections.
@@ -40,6 +41,20 @@ c_mirror! {
         str_vec owed_relay_urls/owed_relay_urls_len,
         copy relay_count: u32,
         copy since: u64,
+    }
+}
+
+c_enum! {
+    /// Whether the account can turn on account-devices in a group now. Every
+    /// answer is about the whole group, never which members or devices.
+    MarmotAccountDevicesActivation from AccountDevicesActivationFfi {
+        Eligible,
+        NotAdmin,
+        AlreadyEnabled,
+        LegacyGroup,
+        MembersNeedUpdate,
+        DevicesNeedReplacement,
+        DeviceLimitExceeded,
     }
 }
 

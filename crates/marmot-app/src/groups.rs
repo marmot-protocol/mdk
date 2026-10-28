@@ -225,6 +225,52 @@ pub struct AppGroupRecord {
     pub via_welcome_message_id_hex: Option<String>,
 }
 
+/// Whether this device can turn on `marmot.group.account-devices.v1` in a
+/// group now, so its own devices can later add and remove each other there
+/// without an admin. A host asks before offering the action. Every answer is a
+/// fact about the whole group: it never says which members or devices hold
+/// it back.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppAccountDevicesActivation {
+    /// This device's account is an admin and every device in the group is
+    /// ready.
+    Eligible,
+    /// Only an admin can turn it on.
+    NotAdmin,
+    /// The group already has it, for good.
+    AlreadyEnabled,
+    /// The group predates the current protocol profile and never gets it.
+    LegacyGroup,
+    /// At least one device in the group runs a client that does not support
+    /// it yet.
+    MembersNeedUpdate,
+    /// At least one device's leaf carries data under the component's id,
+    /// which another client wrote before activation. A client update does not
+    /// clear it: that device has to replace its leaf without the data, or
+    /// leave and be added again.
+    DevicesNeedReplacement,
+    /// At least one account has more devices in the group than the limit.
+    DeviceLimitExceeded,
+}
+
+impl From<Option<cgka_traits::error::AccountDevicesActivationRefusal>>
+    for AppAccountDevicesActivation
+{
+    fn from(refusal: Option<cgka_traits::error::AccountDevicesActivationRefusal>) -> Self {
+        use cgka_traits::error::AccountDevicesActivationRefusal as Refusal;
+        match refusal {
+            None => Self::Eligible,
+            Some(Refusal::NotAdmin) => Self::NotAdmin,
+            Some(Refusal::AlreadyRequired) => Self::AlreadyEnabled,
+            Some(Refusal::LegacyProfile) => Self::LegacyGroup,
+            Some(Refusal::UnsupportedLeaves) => Self::MembersNeedUpdate,
+            Some(Refusal::LeafCarriesData) => Self::DevicesNeedReplacement,
+            Some(Refusal::LeafLimitExceeded) => Self::DeviceLimitExceeded,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AppProtocolProfile {

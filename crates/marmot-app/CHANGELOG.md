@@ -11,6 +11,13 @@
 
 ### Added
 
+- An admin can turn on `marmot.group.account-devices.v1` in an existing group
+  (mdk#2628). `AppClient::enable_account_devices` and
+  `MarmotAppRuntime::enable_account_devices` send one admin Commit, only when
+  the user asks; MDK never turns it on by itself and no member can turn it
+  off. `account_devices_activation` answers whether the group is eligible
+  with an `AppAccountDevicesActivation`, aggregate only: it never says which
+  members or devices hold the group back.
 - The crate root re-exports `AccountError`, `SessionError`,
   `AccountIdentityProofRequest` and `AccountIdentityProofSigner`, so hosts
   reach the lower stack's error and signer types through `marmot_app`

@@ -5,8 +5,8 @@ use crate::engine::Engine;
 use crate::pending_commit_guard::PendingCommitCleanupGuard;
 use crate::provider::EngineOpenMlsProvider;
 use cgka_traits::app_components::{
-    APP_OWNED_APP_COMPONENT_ID_START, AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID,
-    GROUP_PROFILE_COMPONENT_ID,
+    APP_OWNED_APP_COMPONENT_ID_START, AppComponentData, AppComponentId,
+    GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_PROFILE_COMPONENT_ID,
 };
 use cgka_traits::engine::SendResult;
 use cgka_traits::engine_state::{EpochState, StagedCommitHandle};
@@ -68,6 +68,20 @@ impl<S: StorageProvider> Engine<S> {
         group_id: GroupId,
         updates: Vec<AppComponentData>,
     ) -> Result<SendResult, EngineError> {
+        self.do_send_app_data_updates(group_id, updates, Vec::new())
+            .await
+    }
+
+    /// Stage one admin Commit that sets each of `updates` and removes each of
+    /// `removals`. [`Self::do_send_update_app_components`] sends updates only;
+    /// account-devices activation also removes an entry its component never
+    /// defined ([`crate::account_devices_activation`]).
+    pub(crate) async fn do_send_app_data_updates(
+        &mut self,
+        group_id: GroupId,
+        updates: Vec<AppComponentData>,
+        removals: Vec<AppComponentId>,
+    ) -> Result<SendResult, EngineError> {
         if updates.is_empty() {
             return Err(EngineError::Other(
                 "UpdateAppComponents requires at least one component update".into(),
@@ -87,6 +101,13 @@ impl<S: StorageProvider> Engine<S> {
         }
 
         let mut seen = BTreeSet::new();
+        for component_id in &removals {
+            if !seen.insert(*component_id) {
+                return Err(EngineError::Other(
+                    "UpdateAppComponents contains duplicate component ids".into(),
+                ));
+            }
+        }
         for update in &updates {
             if !seen.insert(update.component_id) {
                 return Err(EngineError::Other(
@@ -180,6 +201,9 @@ impl<S: StorageProvider> Engine<S> {
                     update.data.clone(),
                 )))
             })
+            .chain(removals.iter().map(|component_id| {
+                Proposal::AppDataUpdate(Box::new(AppDataUpdateProposal::remove(*component_id)))
+            }))
             .collect::<Vec<_>>();
         let commit_out = self
             .stage_commit_with_app_data_updates(

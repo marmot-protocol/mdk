@@ -24172,6 +24172,11 @@ async fn group_changes_refuse_while_epoch_gap_recovery_holds_the_group() {
         "enable_group_disbanding",
     );
     assert_group_catching_up(
+        client.enable_account_devices(&group_id).await,
+        &group_hex,
+        "enable_account_devices",
+    );
+    assert_group_catching_up(
         client.disband_group(&group_id).await,
         &group_hex,
         "disband_group",

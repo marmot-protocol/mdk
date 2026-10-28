@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use marmot_app::{
-    AppBlobEndpoint, AppDisbandFailureReason, AppDisbandRequest, AppGroupAdminPolicyComponent,
-    AppGroupConversationSnapshot, AppGroupEncryptedMediaComponent,
+    AppAccountDevicesActivation, AppBlobEndpoint, AppDisbandFailureReason, AppDisbandRequest,
+    AppGroupAdminPolicyComponent, AppGroupConversationSnapshot, AppGroupEncryptedMediaComponent,
     AppGroupHydrationQuarantineReason, AppGroupLifecycleState, AppGroupMemberIds,
     AppGroupMemberRecord, AppGroupMlsState, AppGroupNostrRoutingComponent,
     AppGroupProfileComponent, AppGroupRecord, AppGroupRoster, AppProtocolProfile,
@@ -156,6 +156,43 @@ impl From<AppGroupRecord> for AppGroupRecordFfi {
             disbanded: value.disbanded,
             welcomer_account_id_hex: value.welcomer_account_id_hex,
             via_welcome_message_id_hex: value.via_welcome_message_id_hex,
+        }
+    }
+}
+
+/// Whether this account can turn on account-devices in a group now, so its own
+/// devices can later add and remove each other there without an admin. A host
+/// asks before offering the action. Every answer is about the whole group: it
+/// never says which members or devices hold it back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum AccountDevicesActivationFfi {
+    /// The account is an admin and every device in the group is ready.
+    Eligible,
+    /// Only an admin can turn it on.
+    NotAdmin,
+    /// The group already has it, for good.
+    AlreadyEnabled,
+    /// The group is on the legacy protocol profile and never gets it.
+    LegacyGroup,
+    /// At least one device in the group runs a client without support yet.
+    MembersNeedUpdate,
+    /// At least one device's leaf carries data under the component's id that
+    /// another client wrote; that device has to replace its leaf or rejoin.
+    DevicesNeedReplacement,
+    /// At least one account has more devices in the group than the limit.
+    DeviceLimitExceeded,
+}
+
+impl From<AppAccountDevicesActivation> for AccountDevicesActivationFfi {
+    fn from(value: AppAccountDevicesActivation) -> Self {
+        match value {
+            AppAccountDevicesActivation::Eligible => Self::Eligible,
+            AppAccountDevicesActivation::NotAdmin => Self::NotAdmin,
+            AppAccountDevicesActivation::AlreadyEnabled => Self::AlreadyEnabled,
+            AppAccountDevicesActivation::LegacyGroup => Self::LegacyGroup,
+            AppAccountDevicesActivation::MembersNeedUpdate => Self::MembersNeedUpdate,
+            AppAccountDevicesActivation::DevicesNeedReplacement => Self::DevicesNeedReplacement,
+            AppAccountDevicesActivation::DeviceLimitExceeded => Self::DeviceLimitExceeded,
         }
     }
 }

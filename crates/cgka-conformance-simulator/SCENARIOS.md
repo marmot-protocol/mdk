@@ -130,9 +130,9 @@ These are the scenarios another implementation should be able to load from JSON 
 - Setup: Alice and Bob support 0x800d and Carol doesn't. Alice's first activation attempt is refused. Carol then gains
   support and self-updates, and Alice activates again.
 - Pressure: the rule that every leaf must advertise a required component, and the upgrade path through a leaf refresh.
-- Expected: the first attempt fails locally with the engine's generic `other` error and changes nothing; after Carol's
-  self-update the activation lands, and all three clients reach the same exact state at epoch 3, which requires 0x800d
-  and satisfies its rules.
+- Expected: the first attempt is refused before staging with `account_devices_activation_refused` and changes nothing;
+  after Carol's self-update the activation lands, and all three clients reach the same exact state at epoch 3, which
+  requires 0x800d and satisfies its rules.
 
 ### `account-devices-activation-loses-to-unsupported-invite/v1`
 

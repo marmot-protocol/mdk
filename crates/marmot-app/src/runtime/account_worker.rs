@@ -409,6 +409,14 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
     },
+    AccountDevicesActivation {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<crate::AppAccountDevicesActivation, AppError>>,
+    },
+    EnableAccountDevices {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<SendSummary, AppError>>,
+    },
     DisbandGroup {
         group_id: GroupId,
         respond: oneshot::Sender<Result<AppDisbandRequest, AppError>>,
@@ -782,6 +790,7 @@ impl AccountWorkerCommand {
                 | Self::HistoryNotices { .. }
                 | Self::GroupCommitDelivery { .. }
                 | Self::GroupPushDebugInfo { .. }
+                | Self::AccountDevicesActivation { .. }
         )
     }
 
@@ -4054,6 +4063,10 @@ async fn handle_startup_hydration_command(
             let _ = client.runtime.ensure_group_hydrated(&group_id);
             let _ = respond.send(client.group_push_debug_info(&group_id));
         }
+        AccountWorkerCommand::AccountDevicesActivation { group_id, respond } => {
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
+            let _ = respond.send(client.account_devices_activation(&group_id));
+        }
         AccountWorkerCommand::QuarantinedGroups { respond } => {
             let _ = respond.send(Ok(client.quarantined_groups()));
         }
@@ -5300,6 +5313,27 @@ fn account_worker_command_future<'a>(
         }),
         AccountWorkerCommand::EnableGroupDisbanding { group_id, respond } => Box::pin(async move {
             let result = client.enable_group_disbanding(&group_id).await;
+            if result.is_ok() {
+                publish_app_runtime_group_state_updated(
+                    events,
+                    account_id_hex,
+                    account_label,
+                    &group_id,
+                );
+            }
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::AccountDevicesActivation { group_id, respond } => {
+            Box::pin(async move {
+                let _ = client.runtime.ensure_group_hydrated(&group_id);
+                let result = client.account_devices_activation(&group_id);
+                let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+                true
+            })
+        }
+        AccountWorkerCommand::EnableAccountDevices { group_id, respond } => Box::pin(async move {
+            let result = client.enable_account_devices(&group_id).await;
             if result.is_ok() {
                 publish_app_runtime_group_state_updated(
                     events,

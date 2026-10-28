@@ -643,6 +643,16 @@ where
         Ok(self.session.disbanding_support_blockers(group_id)?)
     }
 
+    /// Why this device cannot turn on `marmot.group.account-devices.v1` in
+    /// `group_id` now, or `None` when it can. The send intent repeats the
+    /// check when its Commit is prepared.
+    pub fn account_devices_activation_refusal(
+        &self,
+        group_id: &GroupId,
+    ) -> AccountResult<Option<cgka_traits::error::AccountDevicesActivationRefusal>> {
+        Ok(self.session.account_devices_activation_refusal(group_id)?)
+    }
+
     pub fn acknowledge_disband_failure(&self, group_id: &GroupId) -> AccountResult<bool> {
         Ok(self.session.acknowledge_disband_failure(group_id)?)
     }
@@ -6636,6 +6646,7 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
             | SendIntent::UpdateAppComponents { .. }
             | SendIntent::UpdateGroupData { .. }
             | SendIntent::EnableDisbanding { .. }
+            | SendIntent::EnableAccountDevices { .. }
     )
 }
 

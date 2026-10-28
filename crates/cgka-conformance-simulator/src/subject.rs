@@ -2559,6 +2559,7 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         | EngineError::MissingRequiredCapabilities { .. }
         | EngineError::DisbandingUnsupportedMembers { .. }
         | EngineError::DisbandingNotEnabled { .. }
+        | EngineError::AccountDevicesActivationRefused { .. }
         | EngineError::InvalidCredentialIdentity(_)
         | EngineError::InvalidAccountIdentityProof(_)
         | EngineError::InvalidKeyPackageLifetime { .. }
@@ -2639,6 +2640,7 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
         EngineError::DisbandingUnsupportedMembers { .. } => "disbanding_unsupported_members",
         EngineError::DisbandingNotEnabled { .. } => "disbanding_not_enabled",
+        EngineError::AccountDevicesActivationRefused { .. } => "account_devices_activation_refused",
         EngineError::InvalidCredentialIdentity(_) => "invalid_credential_identity",
         EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
         EngineError::InvalidKeyPackageLifetime { .. } => "invalid_key_package_lifetime",

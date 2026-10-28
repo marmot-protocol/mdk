@@ -171,6 +171,10 @@ pub enum MarmotStatus {
     /// The group's epoch is unsettled, so an attachment cannot be sent yet;
     /// sync and send again (mdk#2158).
     MediaReferenceEpochUnsettled = 109,
+    /// The group cannot turn on account-devices now; the detail names the
+    /// aggregate reason `marmot_account_devices_activation` reports. It never
+    /// names which members or devices hold the group back.
+    AccountDevicesActivationRefused = 110,
 }
 
 thread_local! {
@@ -304,6 +308,9 @@ pub(crate) fn status_from_error(err: &MarmotKitError) -> MarmotStatus {
             MarmotStatus::DisbandingUnsupportedMembers
         }
         MarmotKitError::DisbandingNotEnabled { .. } => MarmotStatus::DisbandingNotEnabled,
+        MarmotKitError::AccountDevicesActivationRefused { .. } => {
+            MarmotStatus::AccountDevicesActivationRefused
+        }
         MarmotKitError::GroupDisbanding { .. } => MarmotStatus::GroupDisbanding,
         MarmotKitError::GroupRemoved { .. } => MarmotStatus::GroupRemoved,
         MarmotKitError::GroupCatchingUp { .. } => MarmotStatus::GroupCatchingUp,
@@ -505,6 +512,10 @@ mod tests {
             MarmotKitError::DisbandingNotEnabled {
                 group_id_hex: "aa".into(),
             },
+            MarmotKitError::AccountDevicesActivationRefused {
+                group_id_hex: "aa".into(),
+                reason: marmot_uniffi::AccountDevicesActivationFfi::MembersNeedUpdate,
+            },
             MarmotKitError::GroupDisbanding {
                 group_id_hex: "aa".into(),
             },
@@ -570,7 +581,7 @@ mod tests {
         ];
         assert_eq!(
             variants.len(),
-            100,
+            101,
             "list every MarmotKitError variant exactly once (update this count with the enum)"
         );
         assert_eq!(status_from_error(&MarmotKitError::UserBlocked) as i32, 78);
@@ -615,6 +626,13 @@ mod tests {
             status_from_error(&MarmotKitError::MediaReferenceEpochUnsettled { source_epoch: 2 })
                 as i32,
             109
+        );
+        assert_eq!(
+            status_from_error(&MarmotKitError::AccountDevicesActivationRefused {
+                group_id_hex: "aa".into(),
+                reason: marmot_uniffi::AccountDevicesActivationFfi::NotAdmin,
+            }) as i32,
+            110
         );
         assert_eq!(
             status_from_error(&MarmotKitError::BlockListUnavailable) as i32,

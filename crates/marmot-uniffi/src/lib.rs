@@ -84,9 +84,9 @@ pub use commands::{
     PublicEventPreviewStateFfi, parse_media_imeta_tag, verify_public_nostr_event_json,
 };
 pub use conversions::{
-    AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi, AppGroupMemberIdsFfi,
-    AppPerformanceOperationSnapshotFfi, AppPerformanceSnapshotFfi, AuditLogDeleteResultFfi,
-    AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigV4Ffi,
+    AccountDevicesActivationFfi, AppBlobEndpointFfi, AppGroupEncryptedMediaComponentFfi,
+    AppGroupMemberIdsFfi, AppPerformanceOperationSnapshotFfi, AppPerformanceSnapshotFfi,
+    AuditLogDeleteResultFfi, AuditLogFileFfi, AuditLogSettingsFfi, AuditLogTrackerConfigV4Ffi,
     AuditLogTrackerUpdateResultFfi, AuditLogTrackerUpdateResultV5Ffi, AuditLogUploadResultFfi,
     AuditLogUploadSourceV4Ffi, AuditOtlpConfigV5Ffi, AuditOtlpTrackerResultV5Ffi,
     BackgroundNotificationCollectionFfi, CachedIdentityProjectionFfi, ChatConversationKindFfi,

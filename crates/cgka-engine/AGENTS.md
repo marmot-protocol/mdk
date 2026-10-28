@@ -58,6 +58,7 @@ Each module's top-level rustdoc is the source of truth; this is an index.
 | `upgrade.rs` | `do_upgrade_group_capabilities` (MLS primitives via `GroupContextExtensions`, app components via `AppDataUpdate`) |
 | `update_group_data.rs` | `SendIntent::UpdateGroupData`: stages an `AppDataUpdate` for `marmot.group.profile.v1`; admin-policy and routing updates are out of scope |
 | `disband.rs` | Durable terminal group-disband workflow |
+| `account_devices_activation.rs` | `SendIntent::EnableAccountDevices`: one admin Commit that requires 0x800d (and removes a stray GroupContext entry under its id) through the AppDataUpdate path; one aggregate eligibility check, `account_devices_activation_refusal`, serves the host's read and the refusal before staging; no `OwnCommitIntent` re-issue |
 | `own_commit_intent.rs` | `OwnCommitIntent` records and re-issue of own commits superseded by branch selection (mdk#1734) |
 | `own_account_devices.rs` | `SendIntent::AddOwnAccountDevices` / `RemoveOwnAccountDevices`: a by-value same-account Commit that leaves the proposal store alone, refused unless the classifier calls it same-account (so only while the group requires 0x800d); no `OwnCommitIntent` re-issue |
 | `maintenance.rs` | KeyPackage replacement staging and promotion (OpenMLS material and the lifecycle record in one transaction) and the own-leaf hash. Scheduling and the other account records live above the engine; it adds no storage forwards for them (mdk#2602) |

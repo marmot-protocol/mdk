@@ -894,6 +894,11 @@ impl<S: StorageProvider> Engine<S> {
                     expected: *expected,
                 });
             }
+            // An activation the current state already refuses is answered now,
+            // not accepted and then refused at drain.
+            if matches!(&intent, SendIntent::EnableAccountDevices { .. }) {
+                self.check_account_devices_activation(&group_id)?;
+            }
             let queued = self.queue_outbound_intent(group_id, intent, 0)?;
             reason.trace();
             return Ok(queued);
@@ -1145,6 +1150,28 @@ impl<S: StorageProvider> Engine<S> {
             );
             let result = match prepared {
                 Ok(result) => result,
+                Err(error)
+                    if crate::account_devices_activation::is_refused_queued_activation(
+                        &record.intent,
+                        &error,
+                    ) =>
+                {
+                    // Nothing was staged. Retire the intent like a direct
+                    // send's refusal; the host reads the outcome back from
+                    // `account_devices_activation_refusal`.
+                    self.storage.delete_queued_outbound_intent(&record.id)?;
+                    tracing::info!(
+                        target: "cgka_engine::message_processor",
+                        method = "converge_and_drain_with_deadline",
+                        error_kind = error.privacy_safe_kind(),
+                        "queued account-devices activation refused on the settled state; retired"
+                    );
+                    if reservation.is_available() {
+                        reservation.consume_attempt(self, group_id, false)?;
+                        break;
+                    }
+                    continue;
+                }
                 Err(_) if reservation.is_available() => {
                     // The protocol grants one preparation attempt, not an
                     // indefinite reservation. Keep the durable intent queued,
@@ -4039,6 +4066,7 @@ fn send_intent_group_id(intent: &SendIntent) -> &GroupId {
         | SendIntent::UpdateAppComponents { group_id, .. }
         | SendIntent::UpdateGroupData { group_id, .. }
         | SendIntent::EnableDisbanding { group_id }
+        | SendIntent::EnableAccountDevices { group_id }
         | SendIntent::Disband { group_id } => group_id,
     }
 }
@@ -4060,6 +4088,7 @@ pub(crate) fn is_fair_scheduled_intent(
         | SendIntent::UpdateAppComponents { .. }
         | SendIntent::UpdateGroupData { .. }
         | SendIntent::EnableDisbanding { .. }
+        | SendIntent::EnableAccountDevices { .. }
         | SendIntent::Disband { .. } => true,
         SendIntent::AddOwnAccountDevices { .. } | SendIntent::RemoveOwnAccountDevices { .. } => {
             account_devices_required

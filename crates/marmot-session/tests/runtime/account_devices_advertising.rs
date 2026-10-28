@@ -1,7 +1,8 @@
 // Advertising `marmot.group.account-devices.v1` (mdk#2628, item 2.2). A build
 // that starts advertising it replaces this device's published KeyPackage and
 // refreshes its own leaf in each existing group through the randomized
-// stale-leaf refresh. Neither makes an existing group require it.
+// stale-leaf refresh. Neither makes an existing group require it; only an
+// admin turns it on, when the user asks (item 2.4).
 
 /// A current-profile device of `account`; its build advertises
 /// account-devices when `upgraded`, on top of what it supported before.
@@ -357,4 +358,112 @@ fn joined_group(effects: &marmot_session::IngestEffects) -> GroupId {
             _ => None,
         })
         .expect("the Welcome joined a group")
+}
+
+/// Turning account-devices on (mdk#2628 item 2.4) waits for the user and for
+/// every leaf. An upgraded admin whose own leaf is still stale is told the
+/// group has an unsupported leaf, not which; once the leaf is refreshed the
+/// admin's activation goes out through the account runtime like any admin
+/// Commit, and the other member follows. A non-admin is only told it cannot
+/// decide.
+#[tokio::test]
+async fn an_admin_turns_account_devices_on_once_every_leaf_advertises_it() {
+    use cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID;
+    use cgka_traits::error::AccountDevicesActivationRefusal as Refusal;
+
+    let dir = tempfile::tempdir().unwrap();
+    let key = SqlCipherKey::new("account-devices activation").unwrap();
+    let alice_database = dir.path().join("alice.sqlite");
+    let mut bob = account_devices_session(dir.path().join("bob.sqlite"), &key, b"bob", true);
+    let mut alice = account_devices_session(&alice_database, &key, b"alice", false);
+    let bob_kp = bob.fresh_key_package().await.unwrap();
+    let welcome = welcome_for_key_package(&mut alice, &bob.self_id(), bob_kp, "activate").await;
+    let joined = bob.ingest(welcome).await.unwrap();
+    let group_id = joined_group(&joined);
+    drop(alice);
+
+    let adapter = RecordingAdapter::default();
+    let routing = StaticTransportRouting::new(vec![])
+        .required_acks(1)
+        .with_group_route(
+            group_id.clone(),
+            group_id.as_slice().to_vec(),
+            vec![TransportEndpoint("wss://group.example".into())],
+        );
+    let mut runtime = AccountDeviceRuntime::new(
+        account_devices_session(&alice_database, &key, b"alice", true),
+        adapter.clone(),
+        routing,
+        RecordingKeyPackages::default(),
+    );
+    assert_eq!(
+        bob.account_devices_activation_refusal(&group_id).unwrap(),
+        Some(Refusal::NotAdmin)
+    );
+    assert_eq!(
+        runtime.account_devices_activation_refusal(&group_id).unwrap(),
+        Some(Refusal::UnsupportedLeaves)
+    );
+    let epoch = runtime.session().epoch(&group_id).unwrap();
+    let refused = runtime
+        .send(SendIntent::EnableAccountDevices {
+            group_id: group_id.clone(),
+        })
+        .await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(runtime.session().epoch(&group_id).unwrap(), epoch);
+    assert!(adapter.publishes().is_empty());
+
+    runtime
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.account_devices_activation_refusal(&group_id).unwrap(),
+        None
+    );
+    runtime
+        .send(SendIntent::EnableAccountDevices {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(runtime.session().epoch(&group_id).unwrap().0, epoch.0 + 2);
+    assert_eq!(
+        runtime.account_devices_activation_refusal(&group_id).unwrap(),
+        Some(Refusal::AlreadyRequired)
+    );
+
+    let commits: Vec<_> = adapter
+        .publishes()
+        .into_iter()
+        .map(|publish| publish.message)
+        .filter(|message| matches!(message.envelope, TransportEnvelope::GroupMessage { .. }))
+        .collect();
+    assert_eq!(commits.len(), 2);
+    for commit in commits {
+        bob.ingest(commit).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(
+            cgka_engine::canonicalization::V1_SETTLEMENT_QUIESCENCE_MS + 200,
+        ))
+        .await;
+        bob.advance_convergence(&group_id).await.unwrap();
+    }
+    assert_eq!(
+        bob.epoch(&group_id).unwrap(),
+        runtime.session().epoch(&group_id).unwrap()
+    );
+    for record in [
+        bob.group_record(&group_id).unwrap(),
+        runtime.session().group_record(&group_id).unwrap(),
+    ] {
+        assert!(
+            record
+                .required_capabilities
+                .app_components
+                .contains(ACCOUNT_DEVICES_COMPONENT_ID)
+        );
+    }
 }

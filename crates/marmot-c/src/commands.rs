@@ -48,14 +48,14 @@ use crate::types::directory::MarmotUserDirectorySearchResultList;
 use crate::types::draft::MarmotMessageDraftAttachmentInput;
 use crate::types::draft::{MarmotMessageDraft, MarmotMessageDraftSummaryList};
 use crate::types::group::{
-    MarmotAppBlobEndpoint, MarmotAppGroupMemberIdsList, MarmotAppGroupMemberRecordList,
-    MarmotAppGroupMlsState, MarmotAppGroupRecord, MarmotAppQuarantinedGroupList,
-    MarmotCreateGroupOptions, MarmotCreatedGroup, MarmotDisbandRequest, MarmotGroupAppComponent,
-    MarmotGroupCommitDelivery, MarmotGroupConversationSnapshot, MarmotGroupDetails,
-    MarmotGroupInviteDeclineResult, MarmotGroupManagementState, MarmotGroupMutationResult,
-    MarmotGroupRecoveryStatus, MarmotGroupRoster, MarmotInitialGroupImage,
-    MarmotMemberKeyPackagePrewarmSummary, MarmotMemberRef, MarmotPreparedGroupImageUpload,
-    MarmotPreparedGroupImageUploadList,
+    MarmotAccountDevicesActivation, MarmotAppBlobEndpoint, MarmotAppGroupMemberIdsList,
+    MarmotAppGroupMemberRecordList, MarmotAppGroupMlsState, MarmotAppGroupRecord,
+    MarmotAppQuarantinedGroupList, MarmotCreateGroupOptions, MarmotCreatedGroup,
+    MarmotDisbandRequest, MarmotGroupAppComponent, MarmotGroupCommitDelivery,
+    MarmotGroupConversationSnapshot, MarmotGroupDetails, MarmotGroupInviteDeclineResult,
+    MarmotGroupManagementState, MarmotGroupMutationResult, MarmotGroupRecoveryStatus,
+    MarmotGroupRoster, MarmotInitialGroupImage, MarmotMemberKeyPackagePrewarmSummary,
+    MarmotMemberRef, MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
 };
 use crate::types::history_notice::MarmotHistoryNoticeList;
 use crate::types::local_submissions::{
@@ -1087,6 +1087,18 @@ c_cmd! {
     /// is accepted. Requires admin. Free with
     /// `marmot_group_mutation_result_free`.
     async fn marmot_enable_group_disbanding(account_ref: str, group_id_hex: str) -> rec(MarmotGroupMutationResult) = enable_group_disbanding;
+
+    /// Whether the account can turn on account-devices in the group now.
+    /// Ask before offering `marmot_enable_account_devices`. The answer is
+    /// about the whole group, never which members or devices hold it back.
+    async fn marmot_account_devices_activation(account_ref: str, group_id_hex: str) -> enum_ret(MarmotAccountDevicesActivation) = account_devices_activation;
+
+    /// Turn on account-devices in one admin Commit, only when the user asks;
+    /// it can never be turned off. Returns
+    /// `MARMOT_STATUS_ACCOUNT_DEVICES_ACTIVATION_REFUSED` unless
+    /// `marmot_account_devices_activation` would answer `ELIGIBLE`. Free with
+    /// `marmot_group_mutation_result_free`.
+    async fn marmot_enable_account_devices(account_ref: str, group_id_hex: str) -> rec(MarmotGroupMutationResult) = enable_account_devices;
 
     /// Request terminal disbanding of the group. Writes this account's
     /// durable request outcome; free it with

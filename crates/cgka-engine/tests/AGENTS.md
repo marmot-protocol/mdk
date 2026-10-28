@@ -170,6 +170,13 @@ epoch-scoped readability; `MockPeeler` stays right for everything else.
     with no group, Welcome or event left; invitees join the requiring group, a non-admin member then adds and removes
     its own devices, and a device that does not advertise 0x800d cannot be added later, from both sides.
 
+- **File:** `account_devices/activation.rs`
+  - **Owns:** Turning account-devices on in an existing group (mdk#2628 item 2.4), `EnableAccountDevices`: an admin's
+    Commit that every member accepts; each refusal (not an admin, already required, a leaf without support or with data
+    under the id, an account over the leaf limit) comes before staging with the same aggregate reason the eligibility
+    read gives; a stray GroupContext entry is removed; a pending standalone Add of a device without support stays out
+    of the Commit. The legacy refusal is in `account_devices.rs`'s legacy test.
+
 - **File:** `account_devices/device_roster.rs` (test-policy builds only)
   - **Owns:** `marmot.account.device-roster.v1` (0x800e, mdk#2628 item 3.1): a device group holds its roster from
     creation; a roster update is a diff every member applies to the parent's roster, and a committer that writes the

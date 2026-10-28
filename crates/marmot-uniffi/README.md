@@ -26,6 +26,7 @@ Read the documentation at the tag matching your binaries; `master` can describe 
 - Messages and moderation: [deletion provenance and custom events](#deletion-provenance-and-custom-events),
   [group-system previews](#group-system-previews),
   [device-local membership events](#device-local-membership-events), [members are accounts](#members-are-accounts),
+  [turning on account devices](#turning-on-account-devices),
   [group reporting](#group-reporting),
   [moderation reports to the operator](#moderation-reports-to-the-operator),
   [history may be incomplete notices](#history-may-be-incomplete-notices)
@@ -874,6 +875,29 @@ accounts: a 1:1 chat stays a 1:1 whatever devices either person uses. A member r
 `device_count` is how many of that account's devices are in the group; nothing else
 about another account's devices reaches the bindings. A group-system row marks only
 an account's first device joining or its last device leaving.
+
+## Turning on account devices
+
+A group can require `marmot.group.account-devices.v1`, after which a member's own devices
+may add and remove each other there without an admin. A new group requires it on its
+own when every founding device supports it. An existing group gets it only through
+`enable_account_devices(account_ref, group_id_hex)`: one admin Commit, sent only when
+the user asks, which no member can ever undo. MDK never turns it on by itself.
+
+Before offering the action, call `account_devices_activation(account_ref, group_id_hex)`.
+Offer it only on `Eligible`. Otherwise say why: `NotAdmin`, `AlreadyEnabled`,
+`LegacyGroup`, `MembersNeedUpdate` (some device in the group runs a client without
+support; it becomes eligible as those clients update and refresh their leaves),
+`DevicesNeedReplacement` (some device's leaf carries data under the component's id
+that another client wrote; an update does not clear it, so that device has to replace
+its leaf or leave and be added again) or `DeviceLimitExceeded`. The answer is about the
+whole group and never names which members or devices hold it back; a non-admin only
+ever learns `NotAdmin`. It is advisory: `enable_account_devices` checks again and fails
+with `MarmotKitError::AccountDevicesActivationRefused` and the same reason. When the
+group is still settling incoming changes, the call checks the current state, then
+waits for the group to settle and checks once more before committing. If that second
+check refuses, the activation is dropped rather than retried, so read
+`account_devices_activation` again to show the outcome.
 
 ## Group-system previews
 

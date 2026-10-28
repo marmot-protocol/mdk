@@ -20,9 +20,8 @@ use cgka_engine::engine_metrics::{EngineMetricsSnapshot, HistogramSnapshot};
 use cgka_engine::feature_registry::FeatureRegistry;
 use cgka_engine::{ConvergenceClock, Engine, EngineBuilder};
 use cgka_traits::app_components::{
-    ACCOUNT_DEVICES_COMPONENT_ID, APP_COMPONENTS_COMPONENT_ID, AppComponentData,
-    GROUP_ADMIN_POLICY_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
-    default_group_components, encode_components_list, encode_nostr_routing_v1,
+    ACCOUNT_DEVICES_COMPONENT_ID, AppComponentData, GROUP_ADMIN_POLICY_COMPONENT_ID,
+    NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, default_group_components, encode_nostr_routing_v1,
 };
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent};
 #[cfg(test)]
@@ -2407,20 +2406,10 @@ impl HarnessClient {
             .default_group
             .clone()
             .ok_or_else(Self::missing_default_group)?;
-        let mut required = self
-            .engine()
-            .group_record(&gid)?
-            .required_capabilities
-            .app_components;
-        required.insert(ACCOUNT_DEVICES_COMPONENT_ID);
         let res = self
             .engine_mut()
-            .send(SendIntent::UpdateAppComponents {
+            .send(SendIntent::EnableAccountDevices {
                 group_id: gid.clone(),
-                updates: vec![AppComponentData {
-                    component_id: APP_COMPONENTS_COMPONENT_ID,
-                    data: encode_components_list(&required.ids),
-                }],
             })
             .await?;
         match res {

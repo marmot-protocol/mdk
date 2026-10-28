@@ -145,6 +145,9 @@ impl<S: StorageProvider> Engine<S> {
             SendIntent::EnableDisbanding { group_id } => {
                 self.do_enable_group_disbanding(group_id).await
             }
+            SendIntent::EnableAccountDevices { group_id } => {
+                self.do_enable_account_devices(group_id).await
+            }
             SendIntent::Disband { group_id } => self.do_request_disband(group_id),
         };
         if let (

@@ -1,5 +1,5 @@
 //! `marmot.group.account-devices.v1` (0x800d) resulting-state rules
-//! (account-devices-v1.md; mdk#2628 items 2.1b, 2.1c and 2.1d).
+//! (account-devices-v1.md; mdk#2628 items 2.1b, 2.1c, 2.1d and 2.4).
 //!
 //! Covers, for a group whose GroupContext `app_components` list requires
 //! 0x800d:
@@ -81,6 +81,9 @@ mod send_intents;
 
 #[path = "account_devices/creation.rs"]
 mod creation;
+
+#[path = "account_devices/activation.rs"]
+mod activation;
 
 // The device roster's wire format is unreleased, so only test-policy builds
 // may advertise it (mdk#2628 3.1).
@@ -1347,6 +1350,27 @@ async fn legacy_groups_are_not_subject_to_the_rules() {
         .join_welcome(welcomes.into_iter().next().unwrap())
         .await
         .unwrap();
+
+    // The account-devices activation intent refuses a legacy group outright.
+    assert_eq!(
+        alice
+            .engine
+            .account_devices_activation_refusal(&gid)
+            .unwrap(),
+        Some(cgka_traits::error::AccountDevicesActivationRefusal::LegacyProfile)
+    );
+    assert!(matches!(
+        alice
+            .engine
+            .send(SendIntent::EnableAccountDevices {
+                group_id: gid.clone(),
+            })
+            .await,
+        Err(EngineError::AccountDevicesActivationRefused {
+            reason: cgka_traits::error::AccountDevicesActivationRefusal::LegacyProfile,
+            ..
+        })
+    ));
 
     // On the legacy profile 0x800d is an opaque id: requiring it takes
     // GroupContext data, which stays while it is required.

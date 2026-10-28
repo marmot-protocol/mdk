@@ -578,6 +578,10 @@ fn snapshot_send_intents() {
             leaf_signature_keys: vec![vec![0x5C; 4]],
         }
     );
+    insta::assert_json_snapshot!(
+        "intent_enable_account_devices",
+        SendIntent::EnableAccountDevices { group_id: gid() }
+    );
     insta::assert_json_snapshot!("intent_leave", SendIntent::Leave { group_id: gid() });
     insta::assert_json_snapshot!(
         "intent_update_group_data",
