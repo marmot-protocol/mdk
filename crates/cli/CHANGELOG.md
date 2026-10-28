@@ -39,6 +39,10 @@ versioning through the workspace version in the root `Cargo.toml`.
   No device group is ever a chat: it stays out of the chat list, invites, timelines and host events, while its
   relay route stays live. Pairing doesn't reach the app yet, so only test-policy builds reach any of this, through
   `MarmotAppConfig::dev_device_groups` and two hidden hooks.
+- Hosts can list the account's own devices from its device group's roster (mdk#2628 item 3.1):
+  `linked_devices` in `marmot-app`, UniFFI and C, with this device first, and a `LinkedDevicesChanged` event to
+  re-read it, since the device group's own events never reach hosts. Release builds list nothing until the roster's
+  spec lands.
 - `SendIntent::LinkDevice` adds a newly linked device to the account's device group and writes its roster entry in
   one admin Commit (mdk#2628 item 3.3b). That Commit is the link's approval. It takes the one KeyPackage device
   pairing confirmed, which must be the account's own and advertise everything the device group requires, and a roster

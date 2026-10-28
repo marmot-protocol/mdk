@@ -58,6 +58,7 @@ use crate::types::group::{
     MarmotMemberRef, MarmotPreparedGroupImageUpload, MarmotPreparedGroupImageUploadList,
 };
 use crate::types::history_notice::MarmotHistoryNoticeList;
+use crate::types::linked_device::MarmotLinkedDeviceList;
 use crate::types::local_submissions::{
     MarmotLocalSendAcceptance, MarmotLocalSendStatus, MarmotMediaUploadSubmission,
 };
@@ -767,6 +768,14 @@ c_cmd! {
     /// Durable; recorded as its own outcome, never as recovered history.
     /// Writes false for a stale id; a malformed id returns `MARMOT_STATUS_INVALID_HEX`.
     async fn marmot_dismiss_history_notice(account_ref: str, notice_id: str) -> scalar(bool) = dismiss_history_notice;
+
+    /// List this account's own devices from the roster of the device group
+    /// this device trusts: this device first, then by when each was linked.
+    /// Empty until this device trusts a device group, and always empty in
+    /// release builds until the roster's spec lands. Re-read on the
+    /// `LinkedDevicesChanged` event. Free with
+    /// `marmot_linked_device_list_free`.
+    async fn marmot_linked_devices(account_ref: str) -> rec(MarmotLinkedDeviceList) = linked_devices;
 
     /// Accept a pending group invite; writes the now-confirmed group
     /// record. Free with `marmot_app_group_record_free`.

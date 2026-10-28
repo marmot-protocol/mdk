@@ -536,13 +536,14 @@ impl AppClient {
         let Some(group_id) = self.trusted_device_group()? else {
             return Ok(None);
         };
+        let unavailable = || AppError::DeviceGroupRefused("roster_unavailable");
         if self
-            .stored_group(&group_id)?
+            .stored_group(&group_id)
+            .map_err(|_| unavailable())?
             .is_none_or(|group| group.is_terminal() || !requires_roster(&group))
         {
             return Ok(None);
         }
-        let unavailable = || AppError::DeviceGroupRefused("roster_unavailable");
         if !self
             .runtime
             .ensure_group_hydrated(&group_id)

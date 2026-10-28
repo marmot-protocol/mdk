@@ -973,6 +973,19 @@ minutes returns the same `report_id`. Each account may send 20 reports per hour
 reports. The C ABI mirrors these calls. See the
 [wire format](../../docs/marmot-architecture/moderation-reports.md).
 
+## Linked devices
+
+`linked_devices(account_ref)` returns this account's own devices as `LinkedDeviceFfi` records, read from the roster of
+the device group this device trusts, for a Devices screen:
+
+- This device comes first (`is_this_device`), then the rest by `linked_at`. Every entry is this account's own device.
+- `slot_id_hex` is the device's KeyPackage slot, the handle later device actions take. `label`, `client` and
+  `platform` are empty until set; `linked_by_slot_id_hex` is `None` for the device that founded the group.
+- The list is empty until this device trusts a device group (a single-device account has none), and in every release
+  build until the roster's spec lands.
+- The device group's own events never reach hosts. Re-read on `MarmotEventFfi::LinkedDevicesChanged`, which carries no
+  device or group identities and may fire with no visible change.
+
 ## History may be incomplete notices
 
 Automatic recovery stops retrying an obligation after a fixed budget of attempts that

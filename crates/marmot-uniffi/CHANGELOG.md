@@ -4,6 +4,10 @@
 
 ### Breaking changes
 
+- `MarmotEventFfi` adds `LinkedDevicesChanged { account_id_hex, account_label }`
+  (mdk#2628). Update exhaustive Swift/Kotlin handling and regenerate bindings
+  with the matching native library.
+
 - `MarmotKitError` adds `AccountDevicesActivationRefused { group_id_hex, reason }`
   for an `enable_account_devices` call the group cannot take now (mdk#2628).
   Update exhaustive Swift/Kotlin handling and regenerate bindings with the
@@ -25,6 +29,12 @@
   native library (#2158).
 
 ### Added
+
+- `linked_devices(account_ref)` returns this account's own devices as
+  `LinkedDeviceFfi` records, from the roster of the device group this device
+  trusts, this device first (mdk#2628 item 3.1). Re-read it on
+  `LinkedDevicesChanged`. It is empty in release builds until the roster's
+  spec lands.
 
 - An admin can turn on account-devices in an existing group (mdk#2628):
   `enable_account_devices(account_ref, group_id_hex)` sends one admin Commit,

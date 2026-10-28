@@ -1137,3 +1137,37 @@ async fn the_runtime_announces_a_device_group_join_and_lists_its_devices() {
     );
     runtime.shutdown().await;
 }
+
+/// A trusted device group whose roster cannot be read refuses with a fixed
+/// code that never names the group, and a terminal one lists nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_roster_never_names_the_group_and_a_terminal_one_lists_nothing() {
+    let Devices {
+        _dirs,
+        phone_app,
+        mut phone,
+        link,
+        ..
+    } = phone_and_laptop().await;
+    let group = phone.dev_create_device_group(link).await.unwrap();
+    let storage = phone_app.account_storage("alice").unwrap();
+    let stored = || cgka_traits::storage::GroupStorage::get_group(&storage, &group).unwrap();
+
+    // The group fails hydration on the next open.
+    let mut damaged = stored();
+    damaged.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+    cgka_traits::storage::GroupStorage::put_group(&storage, &damaged).unwrap();
+    drop(phone);
+    let mut phone = phone_app.client("alice").await.unwrap();
+    let error = phone.linked_devices().unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::DeviceGroupRefused("roster_unavailable")
+    ));
+    assert!(!error.to_string().contains(&hex::encode(group.as_slice())));
+
+    let mut removed = stored();
+    removed.removed = true;
+    cgka_traits::storage::GroupStorage::put_group(&storage, &removed).unwrap();
+    assert!(phone.linked_devices().unwrap().is_empty());
+}

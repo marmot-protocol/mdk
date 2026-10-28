@@ -69,6 +69,10 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   takes the account's own device only through the confirmed `KeyPackageRef`. Creation and links are reachable only
   through the `test-policy-overrides` hooks (`dev_create_device_group`, `dev_record_confirmed_device_link`), with
   `MarmotAppConfig::dev_device_groups` set, until pairing reaches the app.
+- Read the device roster only through `trusted_device_roster` (the trusted group's decoded roster, or none). Hosts see
+  it only as `linked_devices`, this account's own devices; its errors never name the group. The device group's events
+  stay hidden, so every hidden device-group event and every change of trust sets `linked_devices_changed`, which the
+  worker's account-level publication seam drains into one payload-free `LinkedDevicesChanged`.
 - Keep group DTOs, component projections, and group event projection helpers in `src/groups.rs`.
   `AppCreateGroupOptions::relays` overrides founding group routing only; validate through `RelaySafetyPolicy`
   before member resolution or group mutation, and preserve app-configured relays when omitted.

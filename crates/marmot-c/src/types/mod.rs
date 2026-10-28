@@ -16,6 +16,7 @@ pub mod draft;
 pub mod event;
 pub mod group;
 pub mod history_notice;
+pub mod linked_device;
 pub mod local_submissions;
 pub mod maintenance;
 pub mod markdown;

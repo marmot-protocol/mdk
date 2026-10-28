@@ -316,6 +316,13 @@ pub enum MarmotEvent {
         account_id_hex: *mut c_char,
         account_label: *mut c_char,
     },
+    /// The account's linked devices may have changed; re-read
+    /// `marmot_linked_devices`. Carries no device or group identities, and
+    /// may fire with no visible change.
+    LinkedDevicesChanged {
+        account_id_hex: *mut c_char,
+        account_label: *mut c_char,
+    },
 }
 
 impl From<MarmotEventFfi> for MarmotEvent {
@@ -423,6 +430,13 @@ impl From<MarmotEventFfi> for MarmotEvent {
                 account_id_hex: owned_c_string(account_id_hex),
                 account_label: owned_c_string(account_label),
             },
+            F::LinkedDevicesChanged {
+                account_id_hex,
+                account_label,
+            } => Self::LinkedDevicesChanged {
+                account_id_hex: owned_c_string(account_id_hex),
+                account_label: owned_c_string(account_label),
+            },
         }
     }
 }
@@ -472,6 +486,10 @@ impl CFree for MarmotEvent {
                     account_label,
                 }
                 | Self::HistoryNoticesChanged {
+                    account_id_hex,
+                    account_label,
+                }
+                | Self::LinkedDevicesChanged {
                     account_id_hex,
                     account_label,
                 } => {
@@ -569,6 +587,36 @@ mod tests {
         }
         assert_eq!(audit::live_allocations(), before);
     }
+
+    #[test]
+    fn linked_devices_change_carries_only_its_account_and_frees_deeply() {
+        let _lock = audit::test_lock();
+        let before = audit::live_allocations();
+        let event = boxed(MarmotEvent::from(MarmotEventFfi::LinkedDevicesChanged {
+            account_id_hex: "ad".repeat(32),
+            account_label: "carol".to_owned(),
+        }));
+        unsafe {
+            let MarmotEvent::LinkedDevicesChanged {
+                account_id_hex,
+                account_label,
+            } = &*event
+            else {
+                panic!("unexpected event mirror");
+            };
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_id_hex).to_str().unwrap(),
+                "ad".repeat(32)
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(*account_label).to_str().unwrap(),
+                "carol"
+            );
+            marmot_event_free(event);
+        }
+        assert_eq!(audit::live_allocations(), before);
+    }
+
     #[test]
     fn native_membership_events_convert_and_free_deeply() {
         let _lock = audit::test_lock();
