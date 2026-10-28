@@ -708,9 +708,11 @@ the recovery modules, not a rewrite that adds a second system alongside the curr
   window, and a new loss would wipe that obligation's scope certificates so it could never
   finish. That loss is deferred on the source, not dropped: a finished capture clears it,
   and a reconnect, refusal, removal or execution failure records it, since the source can
-  then be admitted or retired without the capture. A parked obligation leaves it deferred
-  until one of those happens; the parked notice already reports that history as possibly
-  incomplete. See design section 0 for the limited native predicate.
+  then be admitted or retired without the capture. A parked obligation, or one whose notice
+  the user dismissed, schedules no capture, so the debt stays deferred until one of those
+  happens: until then the history the cut discarded is reported only by that notice, as
+  possibly incomplete, not as new loss. Native clamp paging is not an owner capture; its
+  cut records loss at once. See design section 0 for the limited native predicate.
 - Live cursor promotion (design section 6). A delivery the raised floor sends to the spill
   is volatile until its spill write commits; a stop in that window loses it until the
   startup comparison. Routing is by content, so the router cannot tell an unfloored

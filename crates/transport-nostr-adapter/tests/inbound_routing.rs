@@ -7212,6 +7212,99 @@ async fn cut_capture_mints_no_loss() {
     assert_replay_idle(&adapter, &account).await;
 }
 
+/// The incident's path (mdk#2660): a clamped relay's live REQ delivers its
+/// stored page, native paging starts, and the owner's grant takes the source
+/// over before the comparison deadline cuts it. The REQ copies the cut
+/// discards are still owed, so it records no loss; a reconnect that readmits
+/// the source without a capture charges it.
+#[tokio::test]
+async fn cut_capture_defers_req_page_loss() {
+    let relay = Arc::new(FakeRelayClient::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    let account = MemberId::new(vec![0xC5; 32]);
+    let group = sync_fixture_group(0xC6);
+    let floor = 1_700_000_000;
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: account.clone(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![group.clone()],
+            since: Some(Timestamp(floor)),
+        })
+        .await
+        .unwrap();
+    assert!(
+        adapter
+            .observe_replay_epoch(
+                Some(&account),
+                &group.endpoints[0],
+                [1, 1],
+                transport_nostr_adapter::ReplayRestart::Connection
+            )
+            .await
+    );
+    let id = group_subscription_id(&adapter, &account, &group).await;
+    for offset in 1..=RELAY_REPLAY_PAGE_LIMIT as u64 {
+        let event = group_event_at(&format!("stored body {offset}"), &group, floor + offset);
+        route_group_copy(&adapter, &group, &id, &event).await;
+    }
+    // Native paging and the owner's capture each wait on their first page.
+    relay
+        .acquisition_delays
+        .lock()
+        .unwrap()
+        .extend([Duration::from_secs(3600), Duration::from_secs(3600)]);
+    adapter
+        .handle_relay_eose(group.endpoints[0].clone(), id.clone())
+        .await;
+    wait_until("the clamped REQ starts native paging", || {
+        relay.acquisitions.lock().unwrap().len() == 1
+    })
+    .await;
+    let plan = capture_plan(&adapter, &account, 1).await;
+    assert!(!plan.sources.is_empty());
+    let cut = NostrAcquisitionCancellation::new();
+    let capture = tokio::spawn({
+        let (adapter, account, cut) = (adapter.clone(), account.clone(), cut.clone());
+        async move { adapter.capture_replay(&account, plan, cut).await.unwrap() }
+    });
+    wait_until("the owner's capture asks for its first page", || {
+        relay.acquisitions.lock().unwrap().len() == 2
+    })
+    .await;
+    cut.cancel();
+    assert_eq!(capture.await.unwrap(), ReplayCaptureOutcome::Cancelled);
+    {
+        let status = adapter.take_replay_status(&account).await;
+        assert!(
+            status.loss.is_none(),
+            "the cut capture's REQ page is still owed"
+        );
+        assert!(
+            status
+                .sources()
+                .any(|source| source.endpoints().any(|endpoint| !endpoint.admitted())),
+            "the cut source stays owed to the next grant"
+        );
+    }
+    assert_no_delivery(&adapter).await;
+    assert!(
+        adapter
+            .observe_replay_epoch(
+                Some(&account),
+                &group.endpoints[0],
+                [1, 2],
+                transport_nostr_adapter::ReplayRestart::Connection
+            )
+            .await
+    );
+    assert_eq!(
+        replay_loss(&adapter, &account).await,
+        NostrNotificationLossFloor::Since(floor),
+        "a reconnect readmits the source without the capture"
+    );
+}
+
 async fn capture_plan(
     adapter: &NostrTransportAdapter,
     account: &MemberId,
