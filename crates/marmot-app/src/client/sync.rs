@@ -417,22 +417,9 @@ fn order_reconciliation_pass(
 }
 
 fn transport_reconciliation_record(
-    account_id: &cgka_traits::MemberId,
     delivery: &cgka_traits::TransportDelivery,
 ) -> Option<(TransportReconciliationRoute, TransportReconciliationItem)> {
-    let route = match &delivery.message.envelope {
-        TransportEnvelope::Welcome { recipient } if recipient == account_id => {
-            TransportReconciliationRoute::Inbox
-        }
-        TransportEnvelope::GroupMessage { transport_group_id }
-            if delivery.group_id_hint.is_some() =>
-        {
-            TransportReconciliationRoute::Group(
-                <[u8; 32]>::try_from(transport_group_id.as_slice()).ok()?,
-            )
-        }
-        _ => return None,
-    };
+    let route = crate::reconciliation_route(transport_nostr::DeliveryRoute::of(delivery)?);
     let event_id = <[u8; 32]>::try_from(delivery.message.id.as_slice()).ok()?;
     Some((
         route,
@@ -3120,9 +3107,7 @@ impl AppClient {
                     self.record_durable_transport_reconciliation_delivery(delivery);
                     None
                 }
-                InventoryWrite::NativeTurn => {
-                    transport_reconciliation_record(self.adapter.account_id(), delivery)
-                }
+                InventoryWrite::NativeTurn => transport_reconciliation_record(delivery),
             };
             self.adapter.release_account_delivery(&delivery.message.id);
             return Ok((
@@ -3817,9 +3802,7 @@ impl AppClient {
         &self,
         delivery: &cgka_traits::TransportDelivery,
     ) {
-        if let Some((route, item)) =
-            transport_reconciliation_record(self.adapter.account_id(), delivery)
-        {
+        if let Some((route, item)) = transport_reconciliation_record(delivery) {
             // Own relay echoes and seen-index hits are skipped precisely because
             // the event is already durable. Recording them here closes the
             // migration/echo seam without replaying them through the engine.
@@ -3848,8 +3831,7 @@ impl AppClient {
         let outer_transport_at = delivery.message.timestamp.0;
         let source_received_at = delivery.received_at.0;
         let group_id_hint = delivery.group_id_hint.clone();
-        let reconciliation_record =
-            transport_reconciliation_record(client.adapter.account_id(), delivery);
+        let reconciliation_record = transport_reconciliation_record(delivery);
         let welcome = matches!(
             &delivery.message.envelope,
             TransportEnvelope::Welcome { .. }
@@ -10065,7 +10047,7 @@ mod tests {
         };
 
         assert_eq!(
-            transport_reconciliation_record(&account, &delivery),
+            transport_reconciliation_record(&delivery),
             Some((
                 storage_sqlite::TransportReconciliationRoute::Group(route_id),
                 storage_sqlite::TransportReconciliationItem {
@@ -10075,7 +10057,7 @@ mod tests {
             ))
         );
         delivery.group_id_hint = None;
-        assert_eq!(transport_reconciliation_record(&account, &delivery), None);
+        assert_eq!(transport_reconciliation_record(&delivery), None);
     }
 
     // Pauses the clock, which needs the current-thread runtime.

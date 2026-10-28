@@ -219,6 +219,40 @@ async fn pending_loss_keeps_live_boundaries_from_re_covering_it() {
     }
 }
 
+/// Queue loss whose drops named their routes un-covers only those routes,
+/// from their own bounds: the inbox, where nothing was dropped, stays covered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routed_queue_loss_uncovers_only_its_routes() {
+    let fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    let routes = routes(&fixture.client);
+    let group = routes
+        .iter()
+        .find(|route| matches!(route, TransportReconciliationRoute::Group(_)))
+        .unwrap()
+        .clone();
+    let floor = unix_now_seconds().saturating_sub(30);
+    app.record_account_recovery_loss_routed(
+        "alice",
+        storage_sqlite::RecoveryLossCause::Queue,
+        41,
+        3,
+        unix_now_seconds(),
+        Some(floor),
+        Some(&[(group.clone(), floor)]),
+    )
+    .unwrap();
+    fixture.client.synchronize_recovery_loss(&app).unwrap();
+    fixture.client.record_native_coverage(&app).await;
+    for route in &routes {
+        let owed = !app
+            .recovery_coverage_debt(route, &[relay()], unix_now_seconds())
+            .unwrap()
+            .is_empty();
+        assert_eq!(owed, *route == group, "only the group lost deliveries");
+    }
+}
+
 /// Loss imported after a grant was selected can lie inside the window its
 /// pass certified, so settlement must not restore that window's coverage
 /// from the loss's floor up; below the floor the certificate stands.

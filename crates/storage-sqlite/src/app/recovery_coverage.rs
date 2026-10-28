@@ -523,6 +523,21 @@ pub(crate) fn uncover_loss_tx(conn: &Connection, floor_seconds: u64) -> StorageR
     )
 }
 
+/// Loss on one route from `floor_seconds` upward, inside the transaction
+/// that imports it: the route loses its coverage from the floor up, its goal
+/// widens to the floor, and the log records it, so a fetch already running on
+/// that route keeps the debt. Other routes keep everything.
+pub(crate) fn uncover_route_loss_tx(
+    conn: &Connection,
+    route: &TransportReconciliationRoute,
+    floor_seconds: u64,
+    now_seconds: u64,
+) -> StorageResult<()> {
+    remove_coverage_tx(conn, Some(route), floor_seconds, None)?;
+    widen_goal(conn, route, floor_seconds)?;
+    log_uncover_tx(conn, Some(route), &[(floor_seconds, None)], now_seconds)
+}
+
 /// A released receipt lets its event be delivered and admitted again, so the
 /// second it was sent in is no longer covered on the routes the inventory
 /// placed it on, and those routes owe it on each relay until a fetch proves it
@@ -755,9 +770,7 @@ impl SqliteAppStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             for route in routes {
-                remove_coverage_tx(&conn, Some(route), floor_seconds, None)?;
-                widen_goal(&conn, route, floor_seconds)?;
-                log_uncover_tx(&conn, Some(route), &[(floor_seconds, None)], now)?;
+                uncover_route_loss_tx(&conn, route, floor_seconds, now)?;
             }
             Ok(())
         })
@@ -1277,6 +1290,148 @@ mod tests {
             assert!(ranges(&app, route, RELAY_A).is_empty());
             assert_eq!(app.recovery_coverage_goal(route).unwrap(), Some(0));
         }
+    }
+
+    /// A generation that names its routes un-covers only those, each from
+    /// its own bound, and widens their goals itself. Other routes keep
+    /// everything.
+    #[test]
+    fn routed_loss_uncovers_only_its_routes_from_their_bounds() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let (inbox, lost, kept) = (TransportReconciliationRoute::Inbox, group(1), group(2));
+        for route in [&inbox, &lost, &kept] {
+            record(
+                &app,
+                route,
+                RELAY_A,
+                100,
+                900,
+                RecoveryCoverageProof::Comparison,
+                1,
+            );
+        }
+        app.record_account_recovery_loss_routed(
+            "alice",
+            crate::RecoveryLossCause::Queue,
+            41,
+            3,
+            1_000,
+            Some(400),
+            Some(&[(inbox.clone(), 600), (lost.clone(), 400)]),
+        )
+        .unwrap();
+        let imports = app.synchronize_account_delivery_loss("alice").unwrap();
+        assert_eq!(imports.len(), 1);
+        assert!(!imports[0].every_route);
+        assert_eq!(
+            ranges(&app, &inbox, RELAY_A),
+            vec![(100, 599, RecoveryCoverageProof::Comparison)]
+        );
+        assert_eq!(
+            ranges(&app, &lost, RELAY_A),
+            vec![(100, 399, RecoveryCoverageProof::Comparison)]
+        );
+        assert_eq!(
+            ranges(&app, &kept, RELAY_A),
+            vec![(100, 900, RecoveryCoverageProof::Comparison)]
+        );
+        assert_eq!(app.recovery_coverage_goal(&inbox).unwrap(), Some(600));
+        assert_eq!(app.recovery_coverage_goal(&lost).unwrap(), Some(400));
+        assert_eq!(app.recovery_coverage_goal(&kept).unwrap(), None);
+    }
+
+    /// One charge that names no route makes its whole generation account-wide,
+    /// and a routed generation imported beside it still un-covers its routes
+    /// below that floor.
+    #[test]
+    fn an_unrouted_charge_makes_its_generation_account_wide() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let (first, second) = (group(1), group(2));
+        for route in [&first, &second] {
+            record(
+                &app,
+                route,
+                RELAY_A,
+                100,
+                900,
+                RecoveryCoverageProof::Comparison,
+                1,
+            );
+        }
+        let routed =
+            |token, count, bound, routes: Option<&[(TransportReconciliationRoute, u64)]>| {
+                app.record_account_recovery_loss_routed(
+                    "alice",
+                    crate::RecoveryLossCause::Queue,
+                    token,
+                    count,
+                    1_000,
+                    Some(bound),
+                    routes,
+                )
+                .unwrap()
+            };
+        routed(41, 1, 700, Some(&[(first.clone(), 700)]));
+        routed(41, 2, 700, None);
+        routed(42, 1, 300, Some(&[(second.clone(), 300)]));
+        let imports = app.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(imports[0].every_route);
+        assert_eq!(
+            ranges(&app, &first, RELAY_A),
+            vec![(100, 699, RecoveryCoverageProof::Comparison)]
+        );
+        assert_eq!(
+            ranges(&app, &second, RELAY_A),
+            vec![(100, 299, RecoveryCoverageProof::Comparison)]
+        );
+    }
+
+    /// A generation that touches more routes than it may list is
+    /// account-wide.
+    #[test]
+    fn a_generation_past_the_route_cap_is_account_wide() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        app.ensure_account_projection("alice").unwrap();
+        let kept = group(255);
+        record(
+            &app,
+            &kept,
+            RELAY_A,
+            100,
+            900,
+            RecoveryCoverageProof::Comparison,
+            1,
+        );
+        let routes = (0..=crate::MAX_LOSS_ROUTES)
+            .map(|i| {
+                let mut id = [0; 32];
+                id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                (TransportReconciliationRoute::Group(id), 500)
+            })
+            .collect::<Vec<_>>();
+        for chunk in routes.chunks(crate::MAX_LOSS_ROUTES / 2 + 1) {
+            app.record_account_recovery_loss_routed(
+                "alice",
+                crate::RecoveryLossCause::Queue,
+                41,
+                1,
+                1_000,
+                Some(500),
+                Some(chunk),
+            )
+            .unwrap();
+        }
+        let imports = app.synchronize_account_delivery_loss("alice").unwrap();
+        assert!(imports[0].every_route);
+        assert_eq!(
+            ranges(&app, &kept, RELAY_A),
+            vec![(100, 499, RecoveryCoverageProof::Comparison)]
+        );
     }
 
     #[test]

@@ -181,8 +181,9 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   tests live in
   `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
 - Keep the coverage-ledger recorder in `src/client/recovery_coverage.rs` (mdk#2660 phase 2, shadow mode). It records
-  at owner seams only: loss imports (`record_recovery_loss_imports`, goals only: storage un-covers the ledger inside
-  the import transaction, and inside each receipt release), history requests (`record_recovery_request`), native
+  at owner seams only: loss imports (`record_recovery_loss_imports`, goals only and only for loss that named no
+  routes: storage un-covers the ledger inside the import transaction, and inside each receipt release), history
+  requests (`record_recovery_request`), native
   synchronization (`synchronize_native_replay`) and settlement (`settle_recovery_grant`). A grant reads the ledger's
   un-cover mark when it is selected (`AttemptGrant::coverage_mark`); its certificates are recorded through
   `record_recovery_coverage_since`, which leaves out whatever was un-covered after that. Its writes are best effort

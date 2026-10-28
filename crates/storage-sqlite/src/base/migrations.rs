@@ -268,6 +268,8 @@ mod migration_0125_device_groups;
 mod migration_0126_recovery_coverage_uncovers;
 #[path = "migrations/0127_recovery_units.rs"]
 mod migration_0127_recovery_units;
+#[path = "migrations/0128_loss_evidence_routes.rs"]
+mod migration_0128_loss_evidence_routes;
 
 #[path = "migrations/0082_deletion_provenance.rs"]
 mod migration_0082_deletion_provenance;
@@ -1051,6 +1053,12 @@ const MIGRATIONS: &[Migration] = &[
         suspend_foreign_keys: &[],
         apply: migration_0127_recovery_units::apply,
     },
+    Migration {
+        version: 128,
+        name: "0128_loss_evidence_routes",
+        suspend_foreign_keys: &[],
+        apply: migration_0128_loss_evidence_routes::apply,
+    },
 ];
 
 /// Run migration 0117's push-token share repair on an open database. Test
@@ -1715,10 +1723,10 @@ mod tests {
             }
             if *table == "account_delivery_loss_evidence" {
                 // Older loss has no known created_at, so it bounds no goal,
-                // and none of it was retired.
+                // none of it was retired, and it named no routes.
                 for row in &mut upgraded {
                     use rusqlite::types::Value::{Integer, Null};
-                    row.extend([Integer(2), Null, Null]);
+                    row.extend([Integer(2), Null, Null, Integer(0)]);
                 }
             }
             if *table == "account_recovery_obligations" {
@@ -2015,6 +2023,9 @@ mod tests {
                             rusqlite::types::Value::Integer(0),
                             rusqlite::types::Value::Integer(0),
                         ]);
+                    } else {
+                        // No existing generation named its routes.
+                        row.push(rusqlite::types::Value::Integer(0));
                     }
                     row
                 })

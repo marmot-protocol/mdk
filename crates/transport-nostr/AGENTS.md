@@ -8,7 +8,9 @@ The shared, process-wide relay plane: relay sessions, per-account delivery and o
 guarded native replay facts, publish accounting, relay telemetry, directory fetches and subscriptions, and the relay host-safety
 chokepoint. It depends on `transport-nostr-adapter`, `transport-nostr-peeler`, `cgka-traits` and `nostr-sdk`; it must
 not depend on `marmot-app` or `storage-sqlite`. The app supplies storage and policy through callbacks and traits
-(`AccountDeliverySpillStore`, `AccountDeliveryRecoveryMarker`, `RelayExportGate`).
+(`AccountDeliverySpillStore`, `AccountDeliveryRecoveryMarker`, `RelayExportGate`). A queue-loss marker carries each
+dropped delivery's route (`DeliveryRoute::of`, the same rule `marmot-app` keys reconciliation by) with the earliest
+`created_at` dropped there, or no routes once any drop had none or a generation passed `MAX_DELIVERY_LOSS_ROUTES`.
 
 ## Key files
 
