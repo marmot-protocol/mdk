@@ -23,6 +23,7 @@ use std::collections::BTreeSet;
 mod avatar_url;
 mod blossom_image;
 mod codec;
+mod device_roster;
 mod encrypted_media;
 mod encrypted_media_v2;
 mod host_safety;
@@ -44,6 +45,14 @@ pub use blossom_image::{
 pub use codec::{
     decode_components_list, decode_quic_varint, encode_component_vectors, encode_components_list,
     encode_quic_varint,
+};
+pub use device_roster::{
+    AccountEntryV1, DEVICE_ROSTER_KEY_PACKAGE_REF_MAX_LEN, DEVICE_ROSTER_LEAF_MAP_VALUE_MAX_LEN,
+    DEVICE_ROSTER_RESERVED_KEY_MAX_LEN, DEVICE_ROSTER_TEXT_MAX_LEN, DeviceEntryV1,
+    DeviceRosterOperationV1, DeviceRosterUpdateV1, DeviceRosterV1, DeviceSettingsV1,
+    DeviceSlotId, DeviceStatusV1, RejectedKeyPackageV1, RejectedSlotReasonV1, RejectedSlotV1,
+    apply_device_roster_update_v1, decode_device_roster_update_v1, decode_device_roster_v1,
+    encode_device_roster_update_v1, encode_device_roster_v1,
 };
 pub use encrypted_media::{
     BlobStoreEndpointV1, EncryptedMediaPolicyV1, decode_encrypted_media_policy_v1,
@@ -120,9 +129,16 @@ pub const ACCOUNT_DEVICES_COMPONENT_ID: AppComponentId = 0x800d;
 /// this. Fixed for the component id; a different cap needs a new id.
 pub const MAX_LEAVES_PER_ACCOUNT: usize = 20;
 
+/// `marmot.account.device-roster.v1`: the roster of an account's device
+/// group (mdk#2628 D16). Requiring it marks a group as a device group; the
+/// marker alone never makes a group trusted. Its update is a diff of keyed
+/// entries ([`DeviceRosterUpdateV1`]). The wire format is unreleased until
+/// its spec lands, so the engine advertises it only in test-policy builds.
+pub const DEVICE_ROSTER_COMPONENT_ID: AppComponentId = 0x800e;
+
 /// First component id applications may allocate for themselves.
 ///
-/// The protocol registry allocates upward from `0x8001` and is at `0x800d`
+/// The protocol registry allocates upward from `0x8001` and is at `0x800e`
 /// today, so "any private-use id the registry has not taken yet" is not a
 /// safe rule for applications: an id chosen that way can be assigned by a
 /// later registry entry, stranding state already committed in live groups.
@@ -163,6 +179,7 @@ pub const PROTOCOL_OWNED_APP_COMPONENT_IDS: &[AppComponentId] = &[
     GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
     GROUP_LIFECYCLE_COMPONENT_ID,
     ACCOUNT_DEVICES_COMPONENT_ID,
+    DEVICE_ROSTER_COMPONENT_ID,
 ];
 
 /// Lookup key for the encrypted-media secret in the
@@ -187,6 +204,7 @@ pub const ACCOUNT_IDENTITY_PROOF_COMPONENT: &str = "marmot.member.account-identi
 pub const GROUP_ENCRYPTED_MEDIA_V2_COMPONENT: &str = "marmot.group.encrypted-media.v2";
 pub const GROUP_LIFECYCLE_COMPONENT: &str = "marmot.group.lifecycle.v1";
 pub const ACCOUNT_DEVICES_COMPONENT: &str = "marmot.group.account-devices.v1";
+pub const DEVICE_ROSTER_COMPONENT: &str = "marmot.account.device-roster.v1";
 pub const ENCRYPTED_MEDIA_FORMAT_V1: &str = "encrypted-media-v1";
 pub const ENCRYPTED_MEDIA_FORMAT_V2: &str = "encrypted-media-v2";
 pub const BLOSSOM_LOCATOR_KIND_V1: &str = "blossom-v1";
