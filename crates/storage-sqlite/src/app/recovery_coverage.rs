@@ -11,6 +11,10 @@
 //! every range un-covered after that, so loss or a released receipt that lands
 //! mid-fetch keeps its debt. Retention pruning is not an un-cover.
 //!
+//! A released receipt's second also stays owed against live boundaries: the
+//! REQ that delivered the event will not deliver it again, so only a fetch
+//! (a comparison, sweep slice or re-check) can prove that second again.
+//!
 //! The ledger is in shadow mode: the app owner fills it from facts it already
 //! has and compares it with the obligations, but nothing schedules, retries or
 //! fences on it yet. Route ids and relay URLs are account-private and must never
@@ -184,6 +188,39 @@ fn subtract(
     debt
 }
 
+/// Seconds on `route` inside `[since, until]` released for replay that no
+/// fetch has proved since, as one-second ranges, oldest first.
+fn released_tx(
+    conn: &Connection,
+    route: &TransportReconciliationRoute,
+    since_seconds: u64,
+    until_seconds: u64,
+) -> StorageResult<Vec<RecoveryCoverageRange>> {
+    let (kind, id) = route.storage_key();
+    conn.prepare_cached(
+        "SELECT second FROM account_recovery_coverage_released
+         WHERE route_kind = ?1 AND route_id = ?2 AND second BETWEEN ?3 AND ?4 ORDER BY second",
+    )
+    .storage()?
+    .query_map(
+        params![kind, id, integer(since_seconds)?, integer(until_seconds)?],
+        |row| row.get::<_, i64>(0),
+    )
+    .storage()?
+    .map(|second| {
+        let second = i64_to_u64(second.storage()?)?;
+        Ok(RecoveryCoverageRange {
+            since_seconds: second,
+            until_seconds: second,
+        })
+    })
+    .collect()
+}
+
+/// Record a slice. A live boundary leaves out every second released for
+/// replay that no fetch has proved since: its REQ delivered that event before
+/// the release and will not deliver it again. Any other proof fetched what it
+/// covers, so the released seconds it covers are proved again.
 fn record_slice(
     conn: &Connection,
     slice: &RecoveryCoverageSlice<'_>,
@@ -192,6 +229,48 @@ fn record_slice(
     if slice.since_seconds > slice.until_seconds || slice.relay.is_empty() {
         return Err(invalid());
     }
+    let range = RecoveryCoverageRange {
+        since_seconds: slice.since_seconds,
+        until_seconds: slice.until_seconds,
+    };
+    if slice.proof == RecoveryCoverageProof::LiveBoundary {
+        let released = released_tx(conn, slice.route, range.since_seconds, range.until_seconds)?;
+        for kept in subtract(range, &released) {
+            record_range(
+                conn,
+                &RecoveryCoverageSlice {
+                    since_seconds: kept.since_seconds,
+                    until_seconds: kept.until_seconds,
+                    ..*slice
+                },
+                now_seconds,
+            )?;
+        }
+        return Ok(());
+    }
+    record_range(conn, slice, now_seconds)?;
+    let (kind, id) = slice.route.storage_key();
+    conn.execute_cached(
+        "DELETE FROM account_recovery_coverage_released
+         WHERE route_kind = ?1 AND route_id = ?2 AND second BETWEEN ?3 AND ?4",
+        params![
+            kind,
+            id,
+            integer(range.since_seconds)?,
+            integer(range.until_seconds)?
+        ],
+    )
+    .storage()?;
+    Ok(())
+}
+
+/// Record a validated slice, merging it with the same proof's ranges it
+/// touches.
+fn record_range(
+    conn: &Connection,
+    slice: &RecoveryCoverageSlice<'_>,
+    now_seconds: u64,
+) -> StorageResult<()> {
     let (kind, id) = slice.route.storage_key();
     let proof = slice.proof as i64;
     let since = integer(slice.since_seconds)?;
@@ -453,8 +532,9 @@ pub(crate) fn uncover_loss_tx(conn: &Connection, floor_seconds: u64) -> StorageR
 
 /// A released receipt lets its event be delivered and admitted again, so the
 /// second it was sent in is no longer covered on the routes the inventory
-/// placed it on, and those routes owe it. Runs in the release's transaction,
-/// before the inventory rows go. A release without inventory rows has no
+/// placed it on, and those routes owe it until a fetch proves it again; a live
+/// boundary cannot. Runs in the release's transaction, before the inventory
+/// rows go. A release without inventory rows has no
 /// trustworthy route or time; the epoch gap it arms keeps that debt.
 pub(crate) fn uncover_released_event_tx(conn: &Connection, event_id: &[u8]) -> StorageResult<()> {
     let placed = conn
@@ -479,6 +559,12 @@ pub(crate) fn uncover_released_event_tx(conn: &Connection, event_id: &[u8]) -> S
         let second = i64_to_u64(created_at)?;
         remove_coverage_tx(conn, Some(&route), second, Some(second))?;
         widen_goal(conn, &route, second)?;
+        conn.execute_cached(
+            "INSERT OR IGNORE INTO account_recovery_coverage_released (route_kind, route_id, second)
+             VALUES (?1, ?2, ?3)",
+            params![kind, id, created_at],
+        )
+        .storage()?;
         log_uncover_tx(conn, Some(&route), &[(second, Some(second))], now)?;
     }
     Ok(())
@@ -487,7 +573,9 @@ pub(crate) fn uncover_released_event_tx(conn: &Connection, event_id: &[u8]) -> S
 impl SqliteAppStorage {
     /// Record covered slices in one transaction. This is the entry point for
     /// every proof, sweep slices included: each slice merges with the same
-    /// route, relay and proof's overlapping or touching ranges.
+    /// route, relay and proof's overlapping or touching ranges. A live
+    /// boundary leaves out the seconds released for replay that no fetch has
+    /// proved since.
     pub fn record_recovery_coverage(
         &self,
         slices: &[RecoveryCoverageSlice<'_>],
@@ -668,6 +756,11 @@ impl SqliteAppStorage {
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
             prune_uncover_log_tx(&conn, Some(now))?;
+            conn.execute_cached(
+                "DELETE FROM account_recovery_coverage_released WHERE second < ?1",
+                [floor],
+            )
+            .storage()?;
             let deleted = conn
                 .execute_cached(
                     "DELETE FROM account_recovery_coverage WHERE until_seconds < ?1",
@@ -1402,6 +1495,109 @@ mod tests {
             })
             .unwrap();
         assert_eq!(app.recovery_coverage_mark().unwrap(), before);
+    }
+
+    /// The live REQ that delivered a released event will not deliver it again,
+    /// so rewriting its unchanged boundary leaves that second owed. A fetch
+    /// that started before the release does not prove it either; one that
+    /// started after does, and then the live boundary covers it again.
+    /// Pruning below the retention floor forgets it.
+    #[test]
+    fn a_live_boundary_leaves_a_released_second_owed_until_a_fetch_proves_it() {
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let app = storage.app_storage();
+        let route = group(1);
+        let live = RecoveryCoverageProof::LiveBoundary;
+        let now = i64_to_u64(crate::base::codec::unix_now_seconds_i64()).unwrap();
+        let (since, sent) = (now - 1_000, now - 500);
+        record(&app, &route, RELAY_A, since, now - 100, live, 1);
+        let released = crate::TransportReconciliationItem {
+            event_id: [9; 32],
+            created_at: sent,
+        };
+        app.record_reconciliation_items(std::iter::once((&route, &released)))
+            .unwrap();
+        let before_release = app.recovery_coverage_mark().unwrap();
+        storage
+            .connection
+            .with_transaction(|| {
+                crate::cross::release::retire_transport_receipts(
+                    &*storage.lock()?,
+                    &cgka_traits::types::MessageId::new(released.event_id.to_vec()),
+                )
+            })
+            .unwrap();
+        record(&app, &route, RELAY_A, since, now, live, 2);
+        assert_eq!(
+            ranges(&app, &route, RELAY_A),
+            vec![(since, sent - 1, live), (sent + 1, now, live)],
+            "the unchanged boundary leaves the released second out"
+        );
+        assert!(
+            app.record_recovery_coverage_since(
+                &[slice(&route, sent - 10, sent + 10)],
+                now,
+                before_release
+            )
+            .unwrap()
+        );
+        record(&app, &route, RELAY_A, since, now, live, 3);
+        let relays = vec![RELAY_A.to_owned()];
+        assert_eq!(
+            app.recovery_coverage_debt(&route, &relays, now).unwrap(),
+            vec![range(sent, sent)],
+            "a fetch from before the release does not prove it"
+        );
+        let after_release = app.recovery_coverage_mark().unwrap();
+        assert!(
+            app.record_recovery_coverage_since(
+                &[slice(&route, sent - 10, sent + 10)],
+                now,
+                after_release
+            )
+            .unwrap()
+        );
+        assert!(
+            app.recovery_coverage_debt(&route, &relays, now)
+                .unwrap()
+                .is_empty()
+        );
+        record(&app, &route, RELAY_A, since, now, live, 4);
+        assert_eq!(
+            ranges(&app, &route, RELAY_A)
+                .into_iter()
+                .filter(|(_, _, proof)| *proof == live)
+                .collect::<Vec<_>>(),
+            vec![(since, now, live)],
+            "once a fetch proved it, the live boundary covers it too"
+        );
+
+        // A second release, then retention passes it: nothing is left owed.
+        let again = crate::TransportReconciliationItem {
+            event_id: [8; 32],
+            created_at: sent,
+        };
+        app.record_reconciliation_items(std::iter::once((&route, &again)))
+            .unwrap();
+        storage
+            .connection
+            .with_transaction(|| {
+                crate::cross::release::retire_transport_receipts(
+                    &*storage.lock()?,
+                    &cgka_traits::types::MessageId::new(again.event_id.to_vec()),
+                )
+            })
+            .unwrap();
+        app.prune_recovery_coverage(sent + 1).unwrap();
+        record(&app, &route, RELAY_A, sent - 10, now, live, 5);
+        assert_eq!(
+            ranges(&app, &route, RELAY_A)
+                .into_iter()
+                .filter(|(_, _, proof)| *proof == live)
+                .collect::<Vec<_>>(),
+            vec![(sent - 10, now, live)],
+            "a pruned release no longer holds the boundary back"
+        );
     }
 
     /// Once the log has pruned past a fetch's start, its write cannot know

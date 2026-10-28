@@ -180,7 +180,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   un-cover mark when it is selected (`AttemptGrant::coverage_mark`); its certificates are recorded through
   `record_recovery_coverage_since`, which leaves out whatever was un-covered after that. Its writes are best effort
   and nothing schedules, retries or fences on the ledger; do not read it from recovery decisions until phase 4
-  replaces the obligations. It records no live boundary while a loss obligation is pending. `coverage_shadow_report`
+  replaces the obligations. It records no live boundary while a loss obligation is pending, and storage keeps a
+  released receipt's second out of live boundaries until a fetch proves it. `coverage_shadow_report`
   is the test-visible comparison with pending obligations; a scope holds proof only as completion would count it (its
   predicate at the current loss, route, inventory and obligation revisions), and a scope whose floor is unknown or
   older than the retained window is owed from the retention floor. It logs aggregate counts only. Known disagreements

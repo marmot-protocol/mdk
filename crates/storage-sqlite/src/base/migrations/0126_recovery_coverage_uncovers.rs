@@ -11,6 +11,10 @@
 //! `account_recovery_coverage_uncover_state` holds the current generation and
 //! the highest generation pruning removed rows of. A write whose fetch started
 //! below that cannot see everything un-covered since, so it records nothing.
+//!
+//! `account_recovery_coverage_released` holds each route's seconds released
+//! for replay that no fetch has proved since. A live boundary leaves them out:
+//! its REQ will not deliver a released event again.
 use crate::SqliteResultExt;
 use cgka_traits::storage::StorageResult;
 use rusqlite::Transaction;
@@ -34,7 +38,13 @@ pub(crate) fn apply(tx: &Transaction<'_>) -> StorageResult<()> {
             pruned_through INTEGER NOT NULL CHECK (pruned_through BETWEEN 0 AND generation)
         );
         INSERT INTO account_recovery_coverage_uncover_state (singleton, generation, pruned_through)
-            VALUES (1, 0, 0);",
+            VALUES (1, 0, 0);
+        CREATE TABLE account_recovery_coverage_released (
+            route_kind INTEGER NOT NULL CHECK (route_kind IN (0, 1)),
+            route_id BLOB NOT NULL,
+            second INTEGER NOT NULL CHECK (second >= 0),
+            PRIMARY KEY (route_kind, route_id, second)
+        ) WITHOUT ROWID;",
     )
     .storage()
 }

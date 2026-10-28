@@ -388,6 +388,60 @@ async fn a_receipt_released_during_a_pass_stays_owed() {
     );
 }
 
+/// A receipt released while its live REQ stays open is not delivered again
+/// by that REQ, so the next observation of the unchanged boundary leaves its
+/// second owed, with no loss pending to hold the boundary back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_receipt_released_under_a_live_boundary_stays_owed() {
+    use cgka_traits::storage::MessageStorage;
+
+    let fixture = fixture().await;
+    let app = fixture.storage.app_storage();
+    fixture.client.record_native_coverage(&app).await;
+    let group_route = routes(&fixture.client)
+        .into_iter()
+        .find(|route| matches!(route, TransportReconciliationRoute::Group(_)))
+        .expect("the group's route");
+    let sent = unix_now_seconds().saturating_sub(60);
+    let relays = [relay()];
+    assert!(
+        app.recovery_coverage_covers(&group_route, &relays, sent - 1, sent + 1)
+            .unwrap(),
+        "the live boundary covers the event's second"
+    );
+    let item = storage_sqlite::TransportReconciliationItem {
+        event_id: [0xfc; 32],
+        created_at: sent,
+    };
+    app.record_reconciliation_items(std::iter::once((&group_route, &item)))
+        .unwrap();
+    let record = cgka_traits::MessageRecord {
+        id: cgka_traits::MessageId::new(item.event_id.to_vec()),
+        group_id: fixture.group.clone(),
+        epoch: cgka_traits::EpochId(0),
+        state: cgka_traits::MessageState::PeelDeferred,
+        payload: Vec::new(),
+        deferred_peel: None,
+    };
+    fixture.storage.put_message(&record).unwrap();
+    fixture.storage.release_message_for_replay(&record).unwrap();
+    report(&fixture).await;
+    fixture.client.record_native_coverage(&app).await;
+    assert!(
+        !app.recovery_coverage_covers(&group_route, &relays, sent, sent)
+            .unwrap(),
+        "the released second stays owed"
+    );
+    assert!(
+        app.recovery_coverage_covers(&group_route, &relays, sent - 1, sent - 1)
+            .unwrap()
+            && app
+                .recovery_coverage_covers(&group_route, &relays, sent + 1, sent + 1)
+                .unwrap(),
+        "the rest of the window stays covered"
+    );
+}
+
 /// A notification lag charges no delivery count, but it is loss: every
 /// current route is un-covered from the lag's REQ floor and owes from there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
