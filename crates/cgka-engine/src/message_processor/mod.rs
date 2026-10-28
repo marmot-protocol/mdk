@@ -23,6 +23,7 @@ enum OutboundQueueReason {
     ConvergencePending,
     ForegroundBudgetExhausted,
     SelfRemoveAutoCommit,
+    ReplayRotation,
     ExplicitQueueRequest,
 }
 
@@ -33,6 +34,7 @@ impl OutboundQueueReason {
             Self::ConvergencePending => "convergence_pending",
             Self::ForegroundBudgetExhausted => "foreground_budget_exhausted",
             Self::SelfRemoveAutoCommit => "self_remove_auto_commit",
+            Self::ReplayRotation => "replay_rotation",
             Self::ExplicitQueueRequest => "explicit_queue_request",
         };
         tracing::debug!(
@@ -1276,6 +1278,9 @@ impl<S: StorageProvider> Engine<S> {
         {
             return Ok(MaintenanceGate::LeaveGated);
         }
+        if self.stage_replay_rotation(group_id).await? {
+            return Ok(MaintenanceGate::StagedCommit);
+        }
         Ok(MaintenanceGate::Clear)
     }
 
@@ -1349,6 +1354,23 @@ impl<S: StorageProvider> Engine<S> {
             AdvanceConvergenceStatus::ForegroundBudgetExhausted => {
                 return Ok(Some(OutboundQueueReason::ForegroundBudgetExhausted));
             }
+        }
+        if matches!(intent, SendIntent::AppMessage { .. })
+            && self.needs_replay_rotation(group_id)?
+        {
+            let queued = self.storage.list_queued_outbound_intents(group_id)?;
+            if queued.len() >= MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP {
+                return Err(EngineError::QueuedOutboundAtCapacity {
+                    group_id: group_id.clone(),
+                });
+            }
+            // An already-owned admin/same-account attempt still precedes
+            // automatic maintenance. Its eventual Commit also changes epochs;
+            // until confirmation no application may use the restored ratchet.
+            if !FairnessReservation::load(self, group_id, &queued)?.is_available() {
+                self.stage_replay_rotation(group_id).await?;
+            }
+            return Ok(Some(OutboundQueueReason::ReplayRotation));
         }
         self.stage_due_self_remove_auto_commit(group_id, now_ms)
             .await

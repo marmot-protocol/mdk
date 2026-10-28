@@ -94,6 +94,17 @@ reconstruction; the convergence coordinator reports a durable `Unrecoverable` ha
 branch. Recovery still requires retained source state; neither a checkpoint nor a peer's higher epoch recovers pruned
 keys.
 
+An installed own checkpoint can rewind an application sender ratchet that already reached a peer. Canonical apply
+therefore retains an epoch-authenticator-bound Manual maintenance obligation. Before encrypting another application
+in that epoch, the engine stages a normal SelfUpdate through automatic publication and retains the application in
+the bounded outbound queue. Only confirmed epoch advancement permits regeneration; failed publication, ordinary
+maintenance phase changes, and reopening cannot release the restored epoch's gate. An already-owned queued
+admin/same-account preparation attempt keeps its fairness priority. The rotation does not consume an outbound queue
+slot, and a full queue still refuses additional applications. Markers expire only after their epochs leave the same
+retained-checkpoint horizon; ordinary traffic and already-applied prefixes do not create new markers. Backends without
+maintenance storage refuse own-checkpoint installation and roll back the selected apply rather than expose a reused
+sender generation.
+
 **Buffered application handoff.** A frozen convergence batch can advance one epoch beyond its admission ceiling.
 Already-unwrapped applications at that new tip remain durable input even when no commit can open another pass.
 Background advancement drains them against the stable canonical state after convergence and deferred peeling finish,

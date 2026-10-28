@@ -3072,7 +3072,7 @@ fn prune_group_state_checkpoints<S: StorageProvider>(
             Err(e) => return Err(e),
         }
     }
-    Ok(())
+    crate::maintenance::prune_replay_rotations(storage, group_id, oldest_retained_epoch)
 }
 
 fn prune_retained_anchor_snapshots<S: StorageProvider>(
@@ -3829,6 +3829,8 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                 consumed_proposal_refs: stamp.consumed_proposal_refs.clone(),
             });
             if let Some(max_rewind) = retain_replayed_anchors {
+                crate::maintenance::require_replay_rotation(storage, group_id, &mls_group)
+                    .map_err(|error| OpenMlsProjectionError::Storage(format!("{error:?}")))?;
                 let intermediate = OpenMlsReplayOutput {
                     observations: Vec::new(),
                     group_changes: Vec::new(),
