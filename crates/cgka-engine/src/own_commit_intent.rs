@@ -89,6 +89,7 @@ impl<S: StorageProvider> Engine<S> {
                 Some((SupersededIntentKind::AppComponents, OwnCommitBaseline::None))
             }
             SendIntent::AppMessage { .. }
+            | SendIntent::RecoverMembers { .. }
             | SendIntent::Leave { .. }
             | SendIntent::SelfUpdate { .. }
             | SendIntent::AddOwnAccountDevices { .. }

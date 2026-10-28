@@ -2572,7 +2572,9 @@ pub(crate) fn classify_engine_error(error: &EngineError) -> (SubjectFailureCateg
         | EngineError::InvalidAppMessagePayload(_)
         // A halted group refusing new work is deliberate, not a protocol
         // violation: the state is durable and names its own repair path.
-        | EngineError::GroupUnrecoverableRepairRequired { .. } => {
+        | EngineError::GroupUnrecoverableRepairRequired { .. }
+        | EngineError::GroupRecoveryUnsettled { .. }
+        | EngineError::GroupRecoverySourceMismatch { .. } => {
             SubjectFailureCategory::ExpectedRefusal
         }
     };
@@ -2631,6 +2633,8 @@ fn observe_engine_error(error: &EngineError) -> String {
         EngineError::WelcomeNotAddressedToThisDevice => "welcome_not_addressed_to_this_device",
         EngineError::WelcomeAlreadyProcessed => "welcome_already_processed",
         EngineError::InvalidTransition(_) => "invalid_transition",
+        EngineError::GroupRecoveryUnsettled { .. } => "group_recovery_unsettled",
+        EngineError::GroupRecoverySourceMismatch { .. } => "group_recovery_source_mismatch",
         EngineError::GroupUnrecoverableRepairRequired { .. } => {
             "group_unrecoverable_repair_required"
         }

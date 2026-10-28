@@ -2761,6 +2761,7 @@ where
                                 publish: vec![PublishWork::AutoPublish {
                                     msg: fanout.exact_message,
                                     pending,
+                                    welcomes: Vec::new(),
                                 }],
                                 queued: Vec::new(),
                                 pending_convergence: Vec::new(),
@@ -3427,7 +3428,9 @@ where
         prepared: PreparedSessionCommit,
     ) -> AccountResult<AccountDeviceEffects> {
         let (mut prepared_effects, _welcomes, pending) = prepared.into_parts();
-        prepared_effects.publish.clear();
+        prepared_effects.publish.retain(|work| {
+            !matches!(work, PublishWork::GroupEvolution { pending: own, .. } | PublishWork::GroupCreated { pending: own, .. } if *own == pending)
+        });
 
         let mut output = AccountDeviceEffects::default();
         let mut queue = VecDeque::new();
@@ -4011,7 +4014,20 @@ where
                     self.publish_founding_group_created(welcomes, output, queue, context.clone())
                         .await?;
                 }
+                PublishWork::AutoPublish {
+                    msg,
+                    pending,
+                    welcomes,
+                } if welcomes.is_empty() => {
+                    self.publish_pending(vec![msg], pending, output, queue, context.clone())
+                        .await?;
+                }
                 PublishWork::GroupEvolution {
+                    msg,
+                    welcomes,
+                    pending,
+                }
+                | PublishWork::AutoPublish {
                     msg,
                     welcomes,
                     pending,
@@ -4025,10 +4041,6 @@ where
                         context.clone(),
                     ))
                     .await?;
-                }
-                PublishWork::AutoPublish { msg, pending } => {
-                    self.publish_pending(vec![msg], pending, output, queue, context.clone())
-                        .await?;
                 }
             }
         }
@@ -4123,6 +4135,7 @@ where
             let outcome = fanout.outcome();
             if outcome.outstanding_targets > 0
                 || matches!(fanout.mls_state(), FanoutMlsState::Pending(_))
+                || !fanout.pending_post_confirmation_welcomes().is_empty()
             {
                 let fanout_group = fanout.group_id().cloned();
                 let status =
@@ -6595,9 +6608,10 @@ fn transport_fanout_target_retry_due(target: &TransportFanoutTarget, now: Timest
         .is_none_or(|last| now.0 >= last.0.saturating_add(backoff))
 }
 
-/// Pull Welcome payloads off publish work so the commit/create can confirm
+/// Pull caller-owned Welcome payloads off publish work so the commit/create can confirm
 /// without waiting for recipient delivery. Empty Welcome vectors remain on the
-/// original work items so later publish still confirms the commit.
+/// original work items so later publish still confirms the commit. Automatic
+/// work retains its Welcomes until its own commit is acknowledged.
 fn take_deferred_welcomes(effects: &mut SessionEffects) -> Vec<TransportMessage> {
     let mut welcomes = Vec::new();
     for work in &mut effects.publish {
@@ -6621,6 +6635,7 @@ fn supports_deferred_commit_publish(intent: &SendIntent) -> bool {
     matches!(
         intent,
         SendIntent::Invite { .. }
+            | SendIntent::RecoverMembers { .. }
             | SendIntent::RemoveMembers { .. }
             | SendIntent::AddOwnAccountDevices { .. }
             | SendIntent::RemoveOwnAccountDevices { .. }

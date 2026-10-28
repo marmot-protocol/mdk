@@ -71,6 +71,7 @@ fn reports_the_device(error: &EngineError) -> bool {
         | EngineError::Peeler(_)
         | EngineError::UnknownGroup(_)
         | EngineError::GroupNotHydrated(_)
+        | EngineError::GroupRecoveryUnsettled { .. }
         | EngineError::GroupUnrecoverableRepairRequired { .. }
         | EngineError::ForkedEpoch { .. }
         | EngineError::QueuedOutboundAtCapacity { .. }
@@ -96,6 +97,7 @@ fn reports_the_device(error: &EngineError) -> bool {
         | EngineError::AppMessageEpochUnsettled { .. }
         | EngineError::LinkDeviceUnsettled { .. }
         | EngineError::DeviceEntryChanged { .. }
+        | EngineError::GroupRecoverySourceMismatch { .. }
         | EngineError::InvalidTransition(_)
         | EngineError::Serialize(_)
         // Every OpenMLS error, verdicts included; see the module docs.

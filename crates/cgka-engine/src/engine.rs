@@ -660,6 +660,25 @@ impl<S: StorageProvider> EngineBuilder<S> {
         )
         .map_err(EngineError::Other)?;
 
+        // Pending handles are account-wide, while hydration is per group and
+        // may be deferred. Reserve every durable handle before exposing the
+        // engine: an ordinary evolution hydrated (or newly staged) first must
+        // not take a recovery's saved handle. Keep those handles unchanged so
+        // frozen fanouts retain their exact commit/Welcome correlation.
+        let mut epoch_manager = crate::epoch_manager::EpochManager::new();
+        for fanout in self.storage.list_outbound_fanouts()? {
+            if let Some(pending) = fanout.pending_ref() {
+                epoch_manager.reserve_pending_ref(pending);
+            }
+        }
+        if let Some(maintenance) = self.storage.maintenance_storage() {
+            for evolution in maintenance.list_group_evolutions()? {
+                if let Some(pending) = evolution.pending_ref {
+                    epoch_manager.reserve_pending_ref(pending);
+                }
+            }
+        }
+
         let pending_application_events = self.storage.list_pending_application_events()?;
         // Upgrade pending outputs from older databases onto the minimal
         // authority-retry rail before the app acknowledges their plaintext.
@@ -711,7 +730,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             max_past_epochs: self.max_past_epochs,
             wall_clock: self.wall_clock,
             maintenance_random: self.maintenance_random,
-            epoch_manager: crate::epoch_manager::EpochManager::new(),
+            epoch_manager,
             mls_group_cache: crate::mls_group_cache::MlsGroupCache::default(),
             pending_origin_commits: HashMap::new(),
             events_buf: pending_application_events.into(),
@@ -1906,7 +1925,7 @@ impl<S: StorageProvider> Engine<S> {
     /// application can run a recovery / resync path — if relays accepted the
     /// commit before the crash, this device is now behind and must catch up.
     ///
-    /// **Member-removing commits are deliberately left untouched.** A surviving
+    /// **Unowned member-removing commits are deliberately left untouched.** A surviving
     /// pending commit is NOT a reliable crash signal on its own: a deferred
     /// SelfRemove-only commit (the MIP-03 leave path) legitimately persists a
     /// staged commit across process boundaries — a remaining member stages the
@@ -1917,8 +1936,11 @@ impl<S: StorageProvider> Engine<S> {
     /// advance past the leave while this device silently rewinds it). Clearing
     /// an additive (invite) commit is safe — it only drops an invitee who never
     /// actually joined — but clearing a Remove/SelfRemove is not. We therefore
-    /// scope crash-recovery to staged commits that remove no members, matching
-    /// the prior (pre-recovery) behaviour for removal-bearing commits.
+    /// scope compatibility crash-recovery to staged commits that remove no
+    /// members. A recovery Preparing descriptor proves the exception: no
+    /// publication handle escaped, so its remove-and-add may be abandoned.
+    /// Prepared/Attempting recovery instead restores its exact pending handle,
+    /// signed commit, and retained Welcomes without reconstructing any bytes.
     fn hydrate_one_stored_group(
         &mut self,
         group_id: &GroupId,
@@ -2070,6 +2092,69 @@ impl<S: StorageProvider> Engine<S> {
                 fanout.group_id() == Some(group_id)
                     && matches!(fanout.mls_state(), cgka_traits::FanoutMlsState::Pending(_))
             });
+        // Preparing is the engine's proof that no signed publication handle
+        // escaped. Unlike compatibility recovery, this may rewind a commit
+        // containing Removes, and must retire its Welcomes in the same unit.
+        if let Some(maintenance) = self.storage.maintenance_storage() {
+            use cgka_traits::maintenance::{GroupEvolutionPhase, GroupEvolutionSemantic};
+            let evolutions = maintenance
+                .list_group_evolutions_for_group(group_id)
+                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            let preparing: Vec<_> = evolutions
+                .iter()
+                .filter(|evolution| {
+                    evolution.phase == GroupEvolutionPhase::Preparing
+                        && matches!(
+                            &evolution.semantic,
+                            GroupEvolutionSemantic::RecoverMembers { .. }
+                        )
+                })
+                .collect();
+            if !preparing.is_empty() {
+                let own_leaf_hash = mls_group
+                    .own_leaf_node()
+                    .and_then(|leaf| leaf.tls_serialize_detached().ok())
+                    .map(|leaf| Sha256::digest(leaf).to_vec());
+                if preparing.len() != 1
+                    || durable_pending_fanout.is_some()
+                    || evolutions.iter().any(|evolution| {
+                        matches!(
+                            evolution.phase,
+                            GroupEvolutionPhase::Prepared | GroupEvolutionPhase::Attempting
+                        )
+                    })
+                    || preparing[0].source_epoch != EpochId(mls_group.epoch().as_u64())
+                    || preparing[0].own_leaf_before_hash != own_leaf_hash
+                {
+                    return Err(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed);
+                }
+                crate::maintenance::rollback_recovery_stage(
+                    &self.storage,
+                    group_id,
+                    &preparing[0].id,
+                )
+                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+                mls_group = openmls::group::MlsGroup::load(self.storage.mls_storage(), &mls_gid)
+                    .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?
+                    .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+                group = self
+                    .storage
+                    .get_group(group_id)
+                    .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            } else if mls_group.pending_commit().is_none()
+                && evolutions.iter().any(|evolution| {
+                    matches!(
+                        &evolution.semantic,
+                        GroupEvolutionSemantic::RecoverMembers { .. }
+                    ) && matches!(
+                        evolution.phase,
+                        GroupEvolutionPhase::Prepared | GroupEvolutionPhase::Attempting
+                    )
+                })
+            {
+                return Err(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed);
+            }
+        }
         let pending_recovery = if mls_group.pending_commit().is_some()
             && let Some(fanout) = durable_pending_fanout.as_ref()
         {
@@ -2127,8 +2212,8 @@ impl<S: StorageProvider> Engine<S> {
         // commit that removes a member would re-add the departed member and
         // fork convergence, so we only recover commits that add no
         // member-removal (no `Remove`, no `SelfRemove`). Removal-bearing
-        // staged commits are left exactly as they were before this recovery
-        // path existed.
+        // staged commits without a recovery Preparing descriptor are left
+        // exactly as they were before this compatibility path existed.
         let staged_removes_member = mls_group.pending_commit().is_some_and(|staged| {
             staged.queued_proposals().any(|queued| {
                 matches!(
@@ -2375,26 +2460,46 @@ impl<S: StorageProvider> Engine<S> {
             .own_leaf_node()
             .and_then(|leaf| leaf.tls_serialize_detached().ok())
             .map(|leaf| Sha256::digest(leaf).to_vec());
-        let evolution = maintenance
+        let evolutions = maintenance
             .list_group_evolutions_for_group(group_id)
-            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?
-            .into_iter()
-            .rev()
-            .find(|evolution| {
-                evolution.source_epoch == source_epoch
-                    && evolution.own_leaf_before_hash == own_leaf_hash
-                    && matches!(
-                        evolution.phase,
-                        GroupEvolutionPhase::Prepared | GroupEvolutionPhase::Attempting
-                    )
-            });
+            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+        if evolutions.iter().any(|evolution| {
+            matches!(
+                &evolution.semantic,
+                cgka_traits::maintenance::GroupEvolutionSemantic::RecoverMembers { .. }
+            ) && matches!(
+                evolution.phase,
+                GroupEvolutionPhase::Prepared | GroupEvolutionPhase::Attempting
+            ) && (evolution.source_epoch != source_epoch
+                || evolution.own_leaf_before_hash != own_leaf_hash)
+        }) {
+            return Err(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed);
+        }
+        let evolution = evolutions.into_iter().rev().find(|evolution| {
+            evolution.source_epoch == source_epoch
+                && evolution.own_leaf_before_hash == own_leaf_hash
+                && matches!(
+                    evolution.phase,
+                    GroupEvolutionPhase::Prepared | GroupEvolutionPhase::Attempting
+                )
+        });
         let Some(evolution) = evolution else {
             return Ok(false);
         };
+        let is_recovery = matches!(
+            &evolution.semantic,
+            cgka_traits::maintenance::GroupEvolutionSemantic::RecoverMembers { .. }
+        );
         let Some(message_id) = evolution.signed_message_id.clone() else {
+            if is_recovery {
+                return Err(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed);
+            }
             return Ok(false);
         };
         let recovery_failed = || {
+            if is_recovery {
+                return Err(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed);
+            }
             tracing::warn!(
                 target: "cgka_engine::maintenance",
                 method = "restore_durable_group_evolution_on_hydrate",
@@ -2419,9 +2524,54 @@ impl<S: StorageProvider> Engine<S> {
         if mls_group.pending_commit().is_none() {
             return recovery_failed();
         }
+        let welcomes = self
+            .staged_welcomes_for_evolution(group_id, source_epoch, &message_id)
+            .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+        if let cgka_traits::maintenance::GroupEvolutionSemantic::RecoverMembers {
+            request_ids, ..
+        } = &evolution.semantic
+            && welcomes.len() != request_ids.len()
+        {
+            return Err(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed);
+        }
 
         self.epoch_manager
             .set_stable(group_id.clone(), source_epoch);
+        if is_recovery {
+            let pending = evolution
+                .pending_ref
+                .ok_or(GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            self.epoch_manager
+                .restore_pending(
+                    group_id.clone(),
+                    source_epoch,
+                    evolution.target_epoch,
+                    cgka_traits::engine_state::StagedCommitHandle::from_bytes(
+                        group_id.as_slice().to_vec(),
+                    ),
+                    pending,
+                    crate::epoch_manager::PendingKind::GroupEvolution,
+                )
+                .map_err(|_| GroupHydrationQuarantineReason::PendingCommitRecoveryFailed)?;
+            self.track_pending_origin_commit(pending, message_id);
+            self.auto_publish_buf.push_back(cgka_traits::AutoPublish {
+                msg: exact_message,
+                welcomes,
+                pending,
+            });
+            self.audit_group(
+                group_id,
+                crate::audit_helpers::epoch_state_changed_event(
+                    None,
+                    "pending_publish",
+                    evolution.target_epoch,
+                    "hydrate_durable_group_evolution",
+                    Some(pending),
+                    Some("group_evolution"),
+                ),
+            );
+            return Ok(true);
+        }
         let pending = self.epoch_manager.next_pending_ref();
         let mut evolution = evolution;
         evolution.pending_ref = Some(pending);
@@ -2450,6 +2600,7 @@ impl<S: StorageProvider> Engine<S> {
         self.track_pending_origin_commit(pending, message_id);
         self.auto_publish_buf.push_back(cgka_traits::AutoPublish {
             msg: exact_message,
+            welcomes,
             pending,
         });
         self.audit_group(
@@ -2464,6 +2615,38 @@ impl<S: StorageProvider> Engine<S> {
             ),
         );
         Ok(true)
+    }
+
+    /// Load only the current source epoch's still-staged delivery artifacts,
+    /// linked to the immutable commit being resumed. They remain unavailable
+    /// to standalone Welcome delivery until that commit is confirmed.
+    fn staged_welcomes_for_evolution(
+        &self,
+        group_id: &GroupId,
+        source_epoch: EpochId,
+        origin_commit_id: &MessageId,
+    ) -> Result<Vec<TransportMessage>, EngineError> {
+        let mut welcomes = Vec::new();
+        for record in
+            self.storage
+                .list_messages_in_states(group_id, &[MessageState::Sent], source_epoch)?
+        {
+            if record.epoch != source_epoch {
+                continue;
+            }
+            let payload = StoredMessagePayload::decode(&record.payload)
+                .map_err(|error| EngineError::Serialize(format!("{error:?}")))?;
+            if let StoredMessagePayload::StagedInviteWelcome {
+                message,
+                origin_commit_id: staged_origin,
+            } = payload
+                && staged_origin == *origin_commit_id
+                && matches!(message.envelope, TransportEnvelope::Welcome { .. })
+            {
+                welcomes.push(message);
+            }
+        }
+        Ok(welcomes)
     }
 
     fn leave_request_to_restore_on_hydrate(
@@ -2744,6 +2927,10 @@ impl<S: StorageProvider> Engine<S> {
                 evolution
                     .pending_ref
                     .is_some_and(|pending| restored_pending.contains(&pending))
+                    && !matches!(
+                        &evolution.semantic,
+                        cgka_traits::maintenance::GroupEvolutionSemantic::RecoverMembers { .. }
+                    )
             }) {
                 evolution.pending_ref = None;
                 let _ = maintenance.put_group_evolution(&evolution);
@@ -3789,6 +3976,50 @@ impl<S: StorageProvider> Engine<S> {
         Ok(admins)
     }
 
+    /// Hash this copy's authenticated MLS device signing key, which remains
+    /// stable across ordinary HPKE leaf refreshes and across source branches.
+    pub fn own_recovery_key_hash(&self, group_id: &GroupId) -> Result<[u8; 32], EngineError> {
+        self.with_live_mls_group(group_id, |group| {
+            let leaf = group
+                .own_leaf_node()
+                .ok_or_else(|| EngineError::NotAMember {
+                    group_id: group_id.clone(),
+                })?;
+            Ok(Sha256::digest(leaf.signature_key().as_slice()).into())
+        })
+    }
+
+    /// Validate an incoming grant without mutation, using the same source,
+    /// membership, capability and device-proof checks as recovery staging.
+    pub fn validate_member_recovery(
+        &self,
+        group_id: &GroupId,
+        recovery: &cgka_traits::group_recovery::GroupMemberRecovery,
+    ) -> Result<(), EngineError> {
+        self.do_validate_member_recovery(group_id, recovery)
+    }
+
+    /// Sign a nonce- and coordinator-bound recovery grant only while this
+    /// device is durably and natively Unrecoverable, never for a usable copy.
+    pub fn sign_group_recovery(
+        &self,
+        group_id: &GroupId,
+        coordinator: &MemberId,
+        message: &cgka_traits::group_recovery::GroupRecoveryMessage,
+    ) -> Result<Vec<u8>, EngineError> {
+        self.do_sign_group_recovery(group_id, coordinator, message)
+    }
+
+    /// Bind a member's signing key to its exact current leaf on a healthy coordinator's branch.
+    pub fn group_recovery_source(
+        &self,
+        group_id: &GroupId,
+        member: &MemberId,
+        device_key_hash: &[u8; 32],
+    ) -> Result<cgka_traits::group_recovery::GroupRecoverySource, EngineError> {
+        self.do_group_recovery_source(group_id, member, device_key_hash)
+    }
+
     pub fn safe_export_secret_with_epoch(
         &mut self,
         group_id: &GroupId,
@@ -4149,6 +4380,15 @@ impl<S: StorageProvider + 'static> CgkaEngine for Engine<S> {
     fn own_leaf_index(&self, group_id: &GroupId) -> Result<u32, EngineError> {
         self.ensure_group_live(group_id)?;
         self.do_own_leaf_index(group_id)
+    }
+
+    fn group_recovery_source(
+        &self,
+        group_id: &GroupId,
+        member: &MemberId,
+        device_key_hash: &[u8; 32],
+    ) -> Result<cgka_traits::group_recovery::GroupRecoverySource, EngineError> {
+        self.do_group_recovery_source(group_id, member, device_key_hash)
     }
 
     fn members(&self, group_id: &GroupId) -> Result<Vec<Member>, EngineError> {
