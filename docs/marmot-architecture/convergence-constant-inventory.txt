@@ -81,3 +81,7 @@ A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_BUFFER_MAX_BYTES
 A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_PAGE_LIMITS
 A17|crates/transport-nostr-adapter/src/lib.rs|REPLAY_OPEN_UNTIL
 A17|crates/transport-nostr-adapter/src/sdk_client.rs|SDK_NOTIFICATION_CAPACITY
+# A18 parks recovery obligations that cannot progress: scope streaks and the attempt cap.
+A18|crates/storage-sqlite/src/app/account_recovery/plan.rs|RECOVERY_PARK_AFTER_QUIET_PASSES
+A18|crates/storage-sqlite/src/app/account_recovery/plan.rs|RECOVERY_PARK_AFTER_UNSERVED_PASSES
+A18|crates/storage-sqlite/src/app/account_recovery/plan.rs|RECOVERY_PARK_AFTER_ATTEMPTS
