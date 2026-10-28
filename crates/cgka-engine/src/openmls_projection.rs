@@ -20,11 +20,9 @@ use cgka_traits::message::{
 use cgka_traits::storage::{StorageError, StorageProvider};
 use cgka_traits::transport::{TransportEnvelope, TransportMessage};
 use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
-use openmls::component::ComponentData;
 use openmls::group::{
     MlsGroup, MlsGroupStateError, ProcessMessageError, ResolveAppDataCommitError, ValidationError,
 };
-use openmls::messages::proposals::AppDataUpdateOperation;
 use openmls::prelude::{
     BasicCredential, ContentType, MlsMessageBodyIn, MlsMessageIn, ProcessedMessage,
     ProcessedMessageContent, Proposal, ProtocolMessage, Sender,
@@ -4460,20 +4458,15 @@ pub(crate) fn process_commit_with_app_data_updates<S: StorageProvider>(
         .collect::<Vec<_>>();
     crate::app_components::validate_app_data_update_batch(mls_group, app_data_updates.iter())
         .map_err(|_| ProcessMessageError::ValidationError(ValidationError::WrongWireFormat))?;
+    let roster_required = crate::app_components::group_requires_device_roster(mls_group)
+        .map_err(|_| ProcessMessageError::ValidationError(ValidationError::WrongWireFormat))?;
     let mut updater = mls_group.app_data_dictionary_updater();
-    for update in app_data_updates {
-        match update.operation() {
-            AppDataUpdateOperation::Update(data) => {
-                updater.set(ComponentData::from_parts(
-                    update.component_id(),
-                    data.clone(),
-                ));
-            }
-            AppDataUpdateOperation::Remove => {
-                updater.remove(&update.component_id());
-            }
-        }
-    }
+    crate::app_components::apply_app_data_updates(
+        roster_required,
+        &mut updater,
+        app_data_updates.iter(),
+    )
+    .map_err(|_| ProcessMessageError::ValidationError(ValidationError::WrongWireFormat))?;
 
     mls_group
         .resolve_app_data_commit(provider, processed, updater.changes())

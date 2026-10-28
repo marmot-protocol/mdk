@@ -82,6 +82,12 @@ mod send_intents;
 #[path = "account_devices/creation.rs"]
 mod creation;
 
+// The device roster's wire format is unreleased, so only test-policy builds
+// may advertise it (mdk#2628 3.1).
+#[cfg(feature = "test-policy-overrides")]
+#[path = "account_devices/device_roster.rs"]
+mod device_roster;
+
 const ACCOUNT_DEVICES: Feature = Feature("account-devices");
 
 fn pad32(name: &[u8]) -> Vec<u8> {
@@ -637,6 +643,10 @@ struct Parts {
     by_reference: Vec<TransportMessage>,
     /// Extensions for the Welcome's GroupInfo, beside the ratchet tree.
     group_info_extensions: Vec<Extension>,
+    /// Resulting GroupContext bytes the committer writes for a component in
+    /// place of its update's bytes, as a client that resolves the update its
+    /// own way would.
+    app_data_state: Vec<(u16, Vec<u8>)>,
 }
 
 /// A Commit `sender` builds with raw OpenMLS, bypassing the engine's send
@@ -769,6 +779,9 @@ fn craft_bundle(
             }
         }
     }
+    for (component_id, state) in parts.app_data_state {
+        updater.set(ComponentData::from_parts(component_id, state.into()));
+    }
     builder.with_app_data_dictionary_updates(updater.changes());
     let bundle = builder
         .build(
@@ -844,6 +857,22 @@ fn standalone_required_list_extensions(
     gid: &GroupId,
     ids: &AppComponentSet,
 ) -> TransportMessage {
+    standalone_dictionary_extensions(
+        sender,
+        gid,
+        APP_COMPONENTS_COMPONENT_ID,
+        encode_components_list(&ids.ids),
+    )
+}
+
+/// A standalone GroupContextExtensions proposal that keeps the current
+/// GroupContext except for `bytes` under `component_id`.
+fn standalone_dictionary_extensions(
+    sender: &Device,
+    gid: &GroupId,
+    component_id: u16,
+    bytes: Vec<u8>,
+) -> TransportMessage {
     let crypto = RustCrypto::default();
     let provider =
         EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, sender.storage.mls_storage());
@@ -854,10 +883,7 @@ fn standalone_required_list_extensions(
         .unwrap()
         .dictionary()
         .clone();
-    dictionary.insert(
-        APP_COMPONENTS_COMPONENT_ID,
-        encode_components_list(&ids.ids),
-    );
+    dictionary.insert(component_id, bytes);
     extensions
         .add_or_replace(Extension::AppDataDictionary(
             AppDataDictionaryExtension::new(dictionary),
