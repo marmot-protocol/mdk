@@ -1283,6 +1283,7 @@ async fn partial_native_projection_retries_without_republishing() {
                 group_id: group.clone(),
                 message_id: MessageId::new(vec![kind as u8; 32]),
                 sender: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                sender_leaf_index: None,
                 epoch: client.runtime.group_record(&group).unwrap().epoch,
                 payload: cgka_traits::app_event::MarmotAppEvent::new(
                     &account.account_id_hex,

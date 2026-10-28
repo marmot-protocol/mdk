@@ -1,3 +1,5 @@
+#[cfg(feature = "test-policy-overrides")]
+mod account_devices_advertising;
 mod audit_ownership;
 #[cfg(feature = "test-policy-overrides")]
 mod canonical_membership;
@@ -15,6 +17,8 @@ mod multi_device_members;
 mod publication_progress;
 #[cfg(feature = "test-policy-overrides")]
 mod push_announce;
+#[cfg(feature = "test-policy-overrides")]
+mod push_repair;
 #[cfg(feature = "test-policy-overrides")]
 mod push_snapshot;
 #[cfg(feature = "test-policy-overrides")]
@@ -355,7 +359,7 @@ fn prepared_group_image_create_has_no_upload_phase_and_is_idempotent() {
             crate::client::PreparedGroupImageUploadStart::Complete(_)
         ));
 
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = crate::observer::PerformanceRecorder::default();
         let group_id = client
             .create_group_with_prepared_initial_image_and_telemetry(
                 "prepared image",
@@ -419,7 +423,7 @@ fn uploaded_prepared_group_image_retry_recovers_from_engine_without_projection()
             .unwrap()
             .unwrap()
             .component_data;
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = crate::observer::PerformanceRecorder::default();
 
         // Simulate the narrow crash window: MLS creation is canonical, but
         // consumption fails and the best-effort app projection is absent.
@@ -2329,6 +2333,7 @@ fn recovery_warning_requires_qualified_local_observations_and_survives_local_com
                 group_id: group_id.clone(),
                 message_id: cgka_traits::MessageId::new(vec![0xa1; 32]),
                 sender: cgka_traits::MemberId::new(vec![0xb1; 32]),
+                sender_leaf_index: None,
                 epoch: current,
                 payload: Vec::new(),
                 retention: None,
@@ -2462,6 +2467,7 @@ async fn sibling_device_message_clears_the_recovery_warning() {
             group_id: group_id.clone(),
             message_id: cgka_traits::MessageId::new(vec![0xa2; 32]),
             sender: client.runtime.self_id(),
+            sender_leaf_index: None,
             epoch,
             payload: Vec::new(),
             retention: None,
@@ -7274,12 +7280,19 @@ async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
     );
     assert!(result.profile.is_some());
     assert_eq!(result.readiness, AccountSetupReadiness::LocalReady);
-    assert_eq!(
-        runtime
+    // The background setup task records its publication phase on its own
+    // schedule; it can trail the worker's blocked KeyPackage publish.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime
             .account_setup_readiness(&result.account.account_id_hex)
-            .unwrap(),
-        AccountSetupReadiness::Publishing
-    );
+            .unwrap()
+            != AccountSetupReadiness::Publishing
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background setup must report publication while it is blocked");
     let lifecycle = app
         .account_storage(&result.account.label)
         .unwrap()
@@ -8240,6 +8253,47 @@ async fn key_package_cutover_retains_current_cache_without_scheduling_replacemen
         !app.retire_cached_non_current_key_package(&account.label)
             .await,
         "current cache must not enter the strict cutover replacement path"
+    );
+    assert!(record_path.exists());
+    assert!(!app.key_package_cutover_replacement_pending(&account.label));
+}
+
+/// A published current-profile KeyPackage that predates a newly supported
+/// component is still joinable: the runtime replaces it in its slot and keeps
+/// its key for the grace, so the cutover cleanup must not delete it first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn key_package_cutover_leaves_a_cache_missing_a_new_component_to_slot_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("before-account-devices").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let before_account_devices = app
+        .supported_app_component_ids()
+        .into_iter()
+        .filter(|id| *id != cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID)
+        .collect();
+    let published =
+        fresh_key_package_with_components(&app, &account, false, before_account_devices).await;
+    let metadata = cgka_engine::key_package::key_package_metadata(&published).unwrap();
+    let record_path = app.key_package_record_path(&account.label);
+    write_json(
+        &record_path,
+        &KeyPackageRecord {
+            account_label: account.label.clone(),
+            account_id_hex: account.account_id_hex,
+            key_package_id: "published-slot".into(),
+            key_package_ref_hex: metadata.key_package_ref_hex,
+            key_package_event_id: "33".repeat(32),
+            published_at: 1,
+            key_package_hex: hex::encode(published.bytes()),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !app.retire_cached_non_current_key_package(&account.label)
+            .await,
+        "a joinable KeyPackage is replaced in its slot, never deleted first"
     );
     assert!(record_path.exists());
     assert!(!app.key_package_cutover_replacement_pending(&account.label));
@@ -16425,6 +16479,27 @@ async fn host_departure_event_carries_no_leaf_index() {
     );
 }
 
+/// A received message's sender leaf is a device destination MDK keeps to
+/// itself: hosts receive the event without it.
+#[test]
+fn hosts_receive_no_sender_leaf() {
+    let event = |sender_leaf_index| cgka_traits::engine::GroupEvent::MessageReceived {
+        group_id: GroupId::new(vec![0x5A; 16]),
+        message_id: cgka_traits::MessageId::new(vec![0x11; 32]),
+        sender: MemberId::new(vec![0x22; 32]),
+        sender_leaf_index,
+        epoch: cgka_traits::EpochId(4),
+        payload: b"{}".to_vec(),
+        retention: None,
+        authority: None,
+        encrypted_media_secret: None,
+    };
+    assert_eq!(
+        crate::groups::host_group_event(&event(Some(3))),
+        event(None)
+    );
+}
+
 /// `account_groups.self_membership` is the source of truth for the account
 /// unread aggregate. A self-departure observed only on the drained seam must
 /// move it, and a drained re-join must move it back — otherwise a crash during
@@ -18576,6 +18651,7 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
             group_id: group_id.clone(),
             message_id: fresh.reports[0].message_id.clone(),
             sender: MemberId::new(hex::decode(&sender).unwrap()),
+            sender_leaf_index: None,
             epoch: reopened.runtime.group_record(&group_id).unwrap().epoch,
             payload: fresh_payload,
             retention: None,
@@ -18685,6 +18761,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             group_id: group_id.clone(),
             message_id: historical.reports[0].message_id.clone(),
             sender: sender.clone(),
+            sender_leaf_index: None,
             epoch,
             payload: historical_payload,
             retention: None,
@@ -18695,6 +18772,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             group_id: group_id.clone(),
             message_id: fresh.reports[0].message_id.clone(),
             sender,
+            sender_leaf_index: None,
             epoch,
             payload: fresh_payload,
             retention: None,
@@ -18773,6 +18851,7 @@ async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash(
         group_id: group_id.clone(),
         message_id: message_id.clone(),
         sender,
+        sender_leaf_index: None,
         epoch: client.runtime.group_record(&group_id).unwrap().epoch,
         payload: fresh_payload,
         retention: None,
@@ -18858,6 +18937,7 @@ async fn account_open_keeps_first_fresh_chat_pending_when_group_projection_is_un
         group_id: group_id.clone(),
         message_id,
         sender,
+        sender_leaf_index: None,
         epoch: client.runtime.group_record(&group_id).unwrap().epoch,
         payload: fresh_payload,
         retention: None,
@@ -22684,6 +22764,7 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
             group_id: group_id.clone(),
             message_id: sent.reports[0].message_id.clone(),
             sender: MemberId::new(hex::decode(&sender_hex).unwrap()),
+            sender_leaf_index: None,
             epoch: source_epoch,
             payload,
             retention: None,

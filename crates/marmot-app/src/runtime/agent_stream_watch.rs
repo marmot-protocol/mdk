@@ -426,7 +426,7 @@ struct BrokerWatch {
 async fn watch_broker_candidates(
     watch: BrokerWatch,
     updates_tx: mpsc::Sender<RuntimeAgentStreamUpdate>,
-    product: crate::product_analytics::ProductAnalytics,
+    product: crate::observer::ProductRecorder,
 ) -> RuntimeAgentStreamUpdate {
     let mut first_preview = product.begin(
         crate::ProductFamily::Stream,

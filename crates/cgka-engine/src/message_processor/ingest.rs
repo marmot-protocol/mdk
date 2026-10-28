@@ -1419,6 +1419,10 @@ impl<S: StorageProvider> Engine<S> {
 
         // Classify content.
         let sender_id = member_id_of_processed_message(&processed, &mls_group);
+        let sender_leaf_index = match processed.sender() {
+            Sender::Member(leaf) => Some(leaf.u32()),
+            _ => None,
+        };
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(bytes) => {
                 let Some(sender) = sender_id else {
@@ -1546,6 +1550,7 @@ impl<S: StorageProvider> Engine<S> {
                     group_id: group_id.clone(),
                     message_id: msg.id.clone(),
                     sender,
+                    sender_leaf_index,
                     epoch: msg_epoch,
                     payload,
                     authority,

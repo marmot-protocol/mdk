@@ -37,11 +37,6 @@
         "supported": true
       },
       {
-        "type": "set_account_devices_support",
-        "client": "bob",
-        "supported": true
-      },
-      {
         "type": "create_group",
         "creator": "alice",
         "name": "devices",
@@ -67,6 +62,32 @@
       {
         "type": "tick",
         "clients": [
+          "bob"
+        ]
+      },
+      {
+        "type": "set_account_devices_support",
+        "client": "bob",
+        "supported": true
+      },
+      {
+        "type": "self_update",
+        "client": "bob",
+        "pending": "bob-refresh"
+      },
+      {
+        "type": "acknowledge_outbound",
+        "client": "bob",
+        "publication": "bob-refresh",
+        "outcome": "accepted"
+      },
+      {
+        "type": "deliver_all"
+      },
+      {
+        "type": "tick",
+        "clients": [
+          "alice",
           "bob"
         ]
       },
@@ -135,21 +156,28 @@
   "expected_outcomes": [
     {
       "type": "pending_resolution",
-      "step_index": 8,
+      "step_index": 7,
+      "client": "bob",
+      "pending": "bob-refresh",
+      "resolution": "confirmed"
+    },
+    {
+      "type": "pending_resolution",
+      "step_index": 12,
       "client": "alice",
       "pending": "activate",
       "resolution": "confirmed"
     },
     {
       "type": "pending_resolution",
-      "step_index": 9,
+      "step_index": 13,
       "client": "bob",
       "pending": "invite-carol",
       "resolution": "confirmed"
     },
     {
       "type": "expected_error",
-      "step_index": 15,
+      "step_index": 19,
       "client": "alice",
       "operation": "require_account_devices",
       "error": "other"
@@ -157,19 +185,19 @@
     {
       "type": "client_state",
       "client": "alice",
-      "epoch": 2,
+      "epoch": 3,
       "member_count": 3
     },
     {
       "type": "client_state",
       "client": "bob",
-      "epoch": 2,
+      "epoch": 3,
       "member_count": 3
     },
     {
       "type": "client_state",
       "client": "carol",
-      "epoch": 2,
+      "epoch": 3,
       "member_count": 3
     },
     {
@@ -198,13 +226,13 @@
     {
       "type": "convergence_decision",
       "client": "alice",
-      "selected_tip_epoch": 2,
+      "selected_tip_epoch": 3,
       "decisive_rule": "tip_committer"
     },
     {
       "type": "convergence_decision",
       "client": "bob",
-      "selected_tip_epoch": 2,
+      "selected_tip_epoch": 3,
       "decisive_rule": "tip_committer"
     },
     {

@@ -194,14 +194,15 @@ steps, bypass required publication barriers, or guarantee zero network delay or 
 
 ```sh
 cargo test -p marmot-session
-cargo test -p marmot-session --features test-policy-overrides   # also groups that require account-devices
 ```
 
 - `tests/runtime.rs` plus `tests/runtime/` — the account-device runtime over a real session and a scripted transport:
   transport activation, KeyPackage publication, rotation and retention, Welcome publication, durable maintenance,
   publish confirmation and rollback, frozen fanouts and relay retries, KeyPackage generator upgrades, app-component
   migration, and each device of an account joining only through the Welcome delivery that names its own KeyPackage,
-  including, in a group that requires account-devices, a Welcome from another device of the account.
+  including, in a group that requires account-devices, a Welcome from another device of the account. An upgrade to
+  advertising account-devices replaces the published KeyPackage in its slot and refreshes each existing leaf at its
+  own random time.
 - `tests/session_lifecycle.rs` — encrypted open/create/confirm/close/reopen, Welcome and app-message ingest,
   auto-publish and SelfRemove re-proposal work, convergence releasing queued outbound work, disband requests, compact authority
   capture, the account records' liveness gate and closed-store failures, KeyPackage cutover on open, and the legacy-row

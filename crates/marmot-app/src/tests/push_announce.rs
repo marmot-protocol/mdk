@@ -83,7 +83,7 @@ fn gossip_state(device: &Device, group_hex: &str) -> storage_sqlite::AccountGrou
 /// `device`'s post-join history fetch in `group` has fetched and processed
 /// the group's messages from its join epoch on. Returns when it ended. The
 /// scripted relay sends no EOSE, so the test ends it.
-fn finish_post_join_fetch(device: &Device, group: &GroupId) -> i64 {
+pub(super) fn finish_post_join_fetch(device: &Device, group: &GroupId) -> i64 {
     let runtime = &device.client.runtime;
     let fetch = runtime
         .start_post_join_history_fetch(group)
@@ -97,7 +97,7 @@ fn finish_post_join_fetch(device: &Device, group: &GroupId) -> i64 {
 }
 
 /// T has been counted since every join of `device` completed.
-fn end_join_windows(device: &mut Device) {
+pub(super) fn end_join_windows(device: &mut Device) {
     device.client.push_announce_timing.join_window = Duration::ZERO;
 }
 
@@ -522,6 +522,9 @@ async fn a_new_join_window_owes_its_own_announce() {
     let group_hex = fx.group_hex();
     finish_post_join_fetch(&fx.bob, &group);
     fx.bob.can_fetch().await;
+    // Bob owes a repair reply to Alice's first announce, which named only her
+    // own record; this test is about announces.
+    fx.bob.client.push_repairs = Default::default();
     let window = gossip_state(&fx.bob, &group_hex);
     assert!(window.joined_at_ms.is_some());
     let from = gossip_sent(&fx.bob);

@@ -69,11 +69,15 @@ pub(crate) async fn send_audit_otlp_once_for_app(
         {
             return Ok(AuditOtlpAttemptOutcome::Cancelled);
         }
-        app.audit_export_lifecycle
-            .reserve(&account.account_id_hex, sender.destination())
+        app.audit_export_lifecycle.reserve(
+            &account.account_id_hex,
+            crate::wiring::audit_destination(sender),
+        )
     } else {
-        app.audit_export_lifecycle
-            .reserve(&account.account_id_hex, sender.destination())
+        app.audit_export_lifecycle.reserve(
+            &account.account_id_hex,
+            crate::wiring::audit_destination(sender),
+        )
     };
     let Some(attempt) = attempt else {
         return Ok(AuditOtlpAttemptOutcome::Busy);

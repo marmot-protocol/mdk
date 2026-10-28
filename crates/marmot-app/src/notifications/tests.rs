@@ -1514,6 +1514,79 @@ fn push_announce_names_a_prefix_that_fits_64_kib() {
     }
 }
 
+/// A kind 447 asks for repair as an announce, by the 8-byte digests its
+/// `have` names, or as a request, an empty or missing `tokens` with no `have`, which
+/// names nothing. A self-update without `have`, a `have` that is not an array
+/// or holds more than 4,096 elements, and another version ask for nothing.
+#[test]
+fn repair_ask_reads_have_and_takes_a_request_as_an_empty_have() {
+    let digest = "ab".repeat(32);
+    let element = push_have_element(&digest).unwrap();
+    let ask = |tokens: serde_json::Value, have: Option<serde_json::Value>| {
+        let mut content = serde_json::json!({"v": PUSH_VERSION, "tokens": tokens});
+        if let Some(have) = have {
+            content["have"] = have;
+        }
+        parse_push_repair_ask(&content.to_string())
+    };
+    let entry = serde_json::json!([{"member_id_hex": "not checked here"}]);
+    assert_eq!(ask(serde_json::json!([]), None), Some(PushHave::new()));
+    assert_eq!(
+        ask(serde_json::json!([]), Some(serde_json::json!([]))),
+        Some(PushHave::new())
+    );
+    assert_eq!(
+        ask(
+            entry.clone(),
+            Some(serde_json::json!([
+                element,
+                element,
+                "not base64!",
+                7,
+                null,
+                BASE64_STANDARD.encode([1_u8; 9]),
+                BASE64_STANDARD.encode([1_u8; 7]),
+            ]))
+        ),
+        Some(PushHave::from([push_have_prefix(&digest).unwrap()]))
+    );
+    let at_cap = vec![serde_json::json!(0); PUSH_MAX_HAVE_ENTRIES];
+    assert_eq!(
+        ask(
+            serde_json::json!([]),
+            Some(serde_json::Value::Array(at_cap))
+        ),
+        Some(PushHave::new())
+    );
+
+    assert_eq!(ask(entry, None), None, "a self-update");
+    for have in [
+        serde_json::json!("not an array"),
+        serde_json::Value::Null,
+        serde_json::json!({"0": element}),
+        serde_json::json!(7),
+        serde_json::Value::Array(vec![serde_json::json!(element); PUSH_MAX_HAVE_ENTRIES + 1]),
+    ] {
+        assert_eq!(ask(serde_json::json!([]), Some(have)), None);
+    }
+    assert_eq!(
+        parse_push_repair_ask(
+            &serde_json::json!({"v": "marmot-push-v2", "tokens": []}).to_string()
+        ),
+        None
+    );
+    assert_eq!(
+        parse_push_repair_ask(r#"{"v": "marmot-push-v1"}"#),
+        Some(PushHave::new()),
+        "a missing `tokens` reads as an empty one"
+    );
+    assert_eq!(
+        parse_push_repair_ask(r#"{"v": "marmot-push-v1", "tokens": {}}"#),
+        None
+    );
+    assert_eq!(parse_push_repair_ask("not json"), None);
+}
+
 /// Inbound kind 447 decoding ignores `have`, whatever it holds, and applies
 /// the announce's `tokens` as a self-update.
 #[test]

@@ -22,9 +22,9 @@ use crate::groups::{
 use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
-    AccountState, AppError, AppMessageProjection, AppPerformanceTelemetry, ClassifiedSyncFailure,
-    SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure, SyncSummary,
-    TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
+    AccountState, AppError, AppMessageProjection, ClassifiedSyncFailure, SDK_DRAIN_WAIT,
+    SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure, SyncSummary,
+    TRANSPORT_CURSOR_MAX_FUTURE_SKEW, observer::PerformanceRecorder, unix_now_seconds,
 };
 use marmot_forensics::{
     AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillExecutionSeam,
@@ -270,6 +270,17 @@ fn event_source_message_id_hex(event: &cgka_traits::engine::GroupEvent, fallback
             hex::encode(via_welcome.as_slice())
         }
         _ => fallback.to_owned(),
+    }
+}
+
+/// The MLS leaf that sent a received application message, when the engine
+/// recorded it.
+fn event_sender_leaf(event: &cgka_traits::engine::GroupEvent) -> Option<u32> {
+    match event {
+        cgka_traits::engine::GroupEvent::MessageReceived {
+            sender_leaf_index, ..
+        } => *sender_leaf_index,
+        _ => None,
     }
 }
 
@@ -1665,7 +1676,7 @@ impl AppClient {
 
     pub(crate) async fn prepare_transport_with_telemetry(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
     ) -> Result<(), AppError> {
         self.prepare_transport_for_sync(telemetry)
             .await
@@ -1674,7 +1685,7 @@ impl AppClient {
 
     async fn prepare_transport_for_sync(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
     ) -> Result<(), (SyncFailureStage, AppError)> {
         // Failed/cancelled activation must retain a retry intent for scheduled work.
         self.pending_runtime_group_subscription_refresh = true;
@@ -1753,7 +1764,7 @@ impl AppClient {
 
     pub(crate) async fn sync_with_stage_telemetry(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
         mode: SyncMode,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         match self.sync_inner(telemetry, mode).await {
@@ -1790,7 +1801,7 @@ impl AppClient {
     /// maintenance, only drains: the worker's own job serves its debt.
     async fn sync_inner(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
         mode: SyncMode,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let routing_changed = self.refresh_sync_routes().map_err(|error| {
@@ -1936,7 +1947,7 @@ impl AppClient {
     /// for the worker's next recovery job instead of spending a reservation.
     pub(crate) async fn prepare_sync_grant(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
         explicit: bool,
         credit_available: bool,
     ) -> Result<Option<AttemptGrant>, AppError> {
@@ -1950,7 +1961,7 @@ impl AppClient {
     /// Record a startup or explicit caller's comparison request.
     fn request_sync_comparison(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
         explicit: bool,
     ) -> Result<(), AppError> {
         if self.app.cursor_persistence() == CursorPersistence::Advance
@@ -1967,7 +1978,7 @@ impl AppClient {
     /// Select the grant a sync's job runs, under the credit it holds.
     async fn select_sync_grant(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
         explicit: bool,
     ) -> Result<Option<AttemptGrant>, AppError> {
         let mut caller = ExplicitRecoveryPermit::default();
@@ -1989,7 +2000,7 @@ impl AppClient {
     /// without touching these subscriptions.
     pub(crate) async fn activate_live_transport(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
     ) -> Result<(), ClassifiedSyncFailure> {
         if self.app.cursor_persistence() == CursorPersistence::Frozen {
             self.adapter.require_fresh_activation().await;
@@ -2222,6 +2233,7 @@ impl AppClient {
                     self.app.allow_loopback_blob_endpoints(),
                 ) && let Err(error) = self.project_received_message(
                     message,
+                    event_sender_leaf(event),
                     event_encrypted_media_secret(event),
                     group_metadata.as_ref(),
                     &mut event_summary,
@@ -6329,6 +6341,7 @@ impl AppClient {
     fn project_received_message(
         &mut self,
         message: crate::ReceivedMessage,
+        sender_leaf: Option<u32>,
         carried_media_secret: Option<&cgka_traits::EncryptedMediaSecret>,
         group_metadata: Option<&cgka_traits::Group>,
         summary: &mut SyncSummary,
@@ -6346,20 +6359,35 @@ impl AppClient {
                         .map(|membership| (profile, membership.member_leaves))
                 })
                 .and_then(|(profile, active_leaves)| {
-                    self.app.ingest_push_gossip_message(
-                        &self.state.label,
-                        &message,
-                        &active_leaves,
-                        profile,
-                    )
+                    self.app
+                        .ingest_push_gossip_message(
+                            &self.state.label,
+                            &message,
+                            &active_leaves,
+                            profile,
+                        )
+                        .map(|action| (action, active_leaves))
                 });
-            if let Err(err) = ingest_result {
-                tracing::warn!(
-                    target: "marmot_app::notifications",
-                    method = "project_received_message",
-                    error_kind = err.privacy_safe_kind(),
-                    "ignoring malformed push token gossip",
-                );
+            match ingest_result {
+                // What an announce asks for is worked out after its own
+                // entries are applied, and ranked over the leaves they were
+                // applied against.
+                Ok((_, active_leaves))
+                    if message.kind == notifications::MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE =>
+                {
+                    self.note_received_push_repair_ask(&message, sender_leaf, &active_leaves);
+                }
+                Ok((action, _)) => {
+                    self.note_push_repair_cover(&message.group_id, message.source_epoch, &action);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "marmot_app::notifications",
+                        method = "project_received_message",
+                        error_kind = err.privacy_safe_kind(),
+                        "ignoring malformed push token gossip",
+                    );
+                }
             }
             return Ok(());
         }
@@ -6708,6 +6736,11 @@ impl AppClient {
                     leaves,
                     departed_members,
                 )?;
+                let leaves = leaves
+                    .iter()
+                    .map(|leaf| leaf.leaf_index)
+                    .collect::<Vec<_>>();
+                self.forget_push_repair_leaves(group_id, &leaves);
             }
             cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated {
                 group_id,
@@ -7046,6 +7079,7 @@ impl AppClient {
                 ) {
                     self.project_received_message(
                         message,
+                        event_sender_leaf(event),
                         event_encrypted_media_secret(event),
                         group_metadata.as_ref(),
                         &mut event_summary,
@@ -7665,7 +7699,7 @@ mod runtime_group_subscription_refresh_tests {
 
     use super::{SyncCheckpointError, SyncSummary};
     use crate::tests::ScriptedPushRelayClient;
-    use crate::{AppPerformanceTelemetry, MarmotApp};
+    use crate::{MarmotApp, observer::PerformanceRecorder};
     use marmot_account::AccountHome;
 
     /// A send can release a peer's route update without changing membership.
@@ -7893,7 +7927,7 @@ mod runtime_group_subscription_refresh_tests {
                     .with_test_relay_client(relay.clone());
                 let mut client = app.client("alice").await.unwrap();
                 client.prepare_transport().await.unwrap();
-                let telemetry = AppPerformanceTelemetry::default();
+                let telemetry = PerformanceRecorder::default();
                 let group = client
                     .create_group_with_options_and_telemetry(
                         "retry",
@@ -8184,7 +8218,7 @@ mod runtime_group_subscription_refresh_tests {
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         client
             .create_group_with_options_and_telemetry(
                 "catch-up retry intent",
@@ -8240,7 +8274,7 @@ mod runtime_group_subscription_refresh_tests {
                 .with_test_relay_client(relay.clone());
             let mut client = app.client("alice").await.unwrap();
             client.prepare_transport().await.unwrap();
-            let telemetry = AppPerformanceTelemetry::default();
+            let telemetry = PerformanceRecorder::default();
             let created = client
                 .create_group_with_options_and_telemetry(
                     "command observation",
@@ -8379,7 +8413,7 @@ mod runtime_group_subscription_refresh_tests {
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         // The managed-runtime create, which defers the relay-side subscription
         // install to a later refresh (the worker performs it after replying).
         // The second group is that outstanding install: the drained disband
@@ -8801,6 +8835,7 @@ mod tests {
                     group_id: group_id.clone(),
                     message_id: sent.reports[0].message_id.clone(),
                     sender: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                    sender_leaf_index: None,
                     epoch: client.runtime.group_record(&group_id).unwrap().epoch,
                     payload,
                     retention: None,

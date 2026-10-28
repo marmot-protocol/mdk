@@ -5,7 +5,7 @@
 //! are no fields for account, group, message, relay, URL, pubkey, payload, or
 //! key material.
 
-pub(crate) mod runtime;
+pub mod runtime;
 pub use runtime::{RuntimePerformanceOperation, RuntimePerformanceSnapshot};
 
 use std::collections::BTreeMap;
@@ -21,7 +21,7 @@ const APP_DURATION_BUCKET_BOUNDS_MS: [u64; 27] = [
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AppPerformanceOperation {
+pub enum AppPerformanceOperation {
     AppStart,
     DirectorySubscriptionSync,
     AccountReconcile,
@@ -497,7 +497,7 @@ pub struct AppPerformanceSnapshot {
 static SQLCIPHER_PROBE_COUNTERS: OnceLock<fn() -> (u64, u64)> = OnceLock::new();
 
 /// Hands in the SQLCipher migration probe reader. Only the first call takes effect.
-pub(crate) fn hand_in_sqlcipher_probe_counters(read: fn() -> (u64, u64)) {
+pub fn hand_in_sqlcipher_probe_counters(read: fn() -> (u64, u64)) {
     let _ = SQLCIPHER_PROBE_COUNTERS.set(read);
 }
 
@@ -1328,7 +1328,7 @@ impl AppPerformanceTelemetry {
 /// [`AppPerformanceOperation::AccountSetupAdvisoryStep`] sample, so the cap
 /// value can be validated against the fleet rather than the one device it was
 /// tuned on.
-pub(crate) async fn bounded_advisory_step<F: std::future::Future>(
+pub async fn bounded_advisory_step<F: std::future::Future>(
     telemetry: &AppPerformanceTelemetry,
     cap: Duration,
     step: &'static str,

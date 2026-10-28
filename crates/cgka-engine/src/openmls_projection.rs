@@ -319,6 +319,8 @@ pub enum OpenMlsReplayObservation {
         message_id: String,
         source_epoch: u64,
         sender: Vec<u8>,
+        /// The MLS leaf that sent it at `source_epoch`.
+        sender_leaf_index: Option<u32>,
         payload: Vec<u8>,
         retention: AppMessageRetentionDecision,
         authority: Option<cgka_traits::app_event::AppMessageAuthority>,
@@ -4202,6 +4204,7 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                         message_id,
                         source_epoch,
                         sender: sender.as_slice().to_vec(),
+                        sender_leaf_index: sender_leaf_index.map(|leaf| leaf.u32()),
                         payload: payload.clone(),
                         authority: if cgka_traits::reporting::requires_source_authority(
                             app_event.kind,

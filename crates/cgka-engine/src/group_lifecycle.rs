@@ -19,7 +19,8 @@ use crate::wire_format::{
 };
 use cgka_traits::TransportEndpoint;
 use cgka_traits::app_components::{
-    ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, AppComponentSet, default_group_components,
+    ACCOUNT_DEVICES_COMPONENT_ID, ACCOUNT_IDENTITY_PROOF_COMPONENT_ID, AppComponentSet,
+    default_group_components,
 };
 use cgka_traits::capabilities::GroupCapabilities;
 use cgka_traits::engine::{CreateGroupRequest, KeyPackage, SendResult, WelcomeMetadata};
@@ -289,6 +290,15 @@ impl<S: StorageProvider> Engine<S> {
         let mut desired_components = AppComponentSet::from(default_group_components());
         for component_id in &required_caps.app_components.ids {
             desired_components.insert(*component_id);
+        }
+        // A creator that supports account-devices requires it when its own
+        // leaf and every founding KeyPackage advertise it
+        // (protocol-core/group-setup.md). The per-leaf negotiation below keeps
+        // it exactly then; the host does not choose it. A founding Add that
+        // breaks the component's rules, the leaf limit included, is refused
+        // below before any Welcome exists. Legacy groups never require it.
+        if self.new_protocol_profile == ProtocolProfile::Current {
+            desired_components.insert(ACCOUNT_DEVICES_COMPONENT_ID);
         }
         let mut self_supported_components = self.supported_app_components.clone();
         if self.new_protocol_profile == ProtocolProfile::Current {

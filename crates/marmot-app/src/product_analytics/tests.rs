@@ -146,7 +146,7 @@ async fn custom_host_timing_events() {
         .unwrap();
     let root = tempfile::tempdir().unwrap();
     let mut app = MarmotApp::with_relay(root.path(), "wss://relay.example");
-    app.product_analytics = collector.clone();
+    app.product_analytics = collector.clone().into();
     let runtime = app.runtime();
     let elapsed = Duration::from_millis(250);
     assert_eq!(
@@ -543,7 +543,7 @@ async fn terminal_shutdown_closes_storage_before_analytics_drain() {
     );
     let home = tempfile::tempdir().unwrap();
     let mut app = MarmotApp::with_relay(home.path(), "wss://relay.example");
-    app.product_analytics = c.clone();
+    app.product_analytics = c.clone().into();
     let runtime = app.runtime();
     let mut config = c.lock().config.clone();
     config.events_endpoint = Some(format!(

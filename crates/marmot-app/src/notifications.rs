@@ -1205,16 +1205,158 @@ pub(crate) async fn local_token_removal_payload(
 /// `SHA-256(SignedRecord)` is `record_digest_hex`: the digest's first 8 bytes
 /// as standard base64. `None` unless the digest is 64 hex characters.
 pub(crate) fn push_have_element(record_digest_hex: &str) -> Option<String> {
+    push_have_prefix(record_digest_hex).map(|prefix| BASE64_STANDARD.encode(prefix))
+}
+
+/// The digest prefix a `have` element names for the record or tombstone whose
+/// `SHA-256(SignedRecord)` is `record_digest_hex`. `None` unless the digest is
+/// 64 hex characters.
+pub(crate) fn push_have_prefix(record_digest_hex: &str) -> Option<[u8; 8]> {
     if record_digest_hex.len() != 64 {
         return None;
     }
     let digest = hex::decode(record_digest_hex).ok()?;
-    Some(BASE64_STANDARD.encode(&digest[..8]))
+    <[u8; 8]>::try_from(&digest[..8]).ok()
 }
 
-/// Decode inbound kind 447, 448 or 449 content. An announce's `have` is not
-/// read: this device sends no repair replies yet, so it applies an announce
-/// as the self-update or request its `tokens` make it.
+/// The `have` of a kind 447 that asks members for what its sender lacks: the
+/// 8-byte digest prefixes it names. A request names none.
+pub(crate) type PushHave = HashSet<[u8; 8]>;
+
+/// What an inbound kind 447 asks of the members that receive it: an announce
+/// asks for what its `have` lacks, and a request (empty or missing `tokens`,
+/// no `have`)
+/// for everything, as an announce whose `have` is empty. `None` for a
+/// self-update with no `have`, or whose `have` is not an array or holds more
+/// than 4,096 elements: such a `have` is ignored before any element is
+/// decoded, and the 447 draws no repair reply. An element that is not a
+/// string decoding to exactly 8 bytes names nothing.
+///
+/// This reads only `v`, `tokens` and `have`; the 447's entries are applied
+/// by [`parse_push_gossip`] whatever its `have` holds.
+pub(crate) fn parse_push_repair_ask(content: &str) -> Option<PushHave> {
+    let shape: PushRepairAskShape = serde_json::from_str(content).ok()?;
+    if shape.v != PUSH_VERSION {
+        return None;
+    }
+    match (shape.tokens, shape.have) {
+        // A missing `tokens` reads as an empty one.
+        (PushArrayLen::Absent | PushArrayLen::Len(0), PushArrayLen::Absent) => {
+            Some(PushHave::new())
+        }
+        (_, PushArrayLen::Len(_)) => {
+            let elements: PushHaveElements = serde_json::from_str(content).ok()?;
+            Some(
+                elements
+                    .have
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter_map(|element| BASE64_STANDARD.decode(element).ok())
+                    .filter_map(|digest| <[u8; 8]>::try_from(digest).ok())
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// A 447's `v`, and the shape of its `tokens` and `have`. A `have` of more
+/// than 4,096 elements fails the whole shape. Nothing here decodes an entry
+/// or element.
+#[derive(Deserialize)]
+struct PushRepairAskShape {
+    v: String,
+    #[serde(default)]
+    tokens: PushArrayLen<{ usize::MAX }>,
+    #[serde(default)]
+    have: PushArrayLen<PUSH_MAX_HAVE_ENTRIES>,
+}
+
+/// A JSON member's shape: absent, not an array, or an array of at most `MAX`
+/// elements, counted without decoding any. A longer array fails to
+/// deserialize as soon as its element `MAX + 1` is seen.
+#[derive(Default)]
+enum PushArrayLen<const MAX: usize> {
+    #[default]
+    Absent,
+    NotArray,
+    Len(usize),
+}
+
+impl<'de, const MAX: usize> Deserialize<'de> for PushArrayLen<MAX> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct LenVisitor<const MAX: usize>;
+
+        impl<'de, const MAX: usize> Visitor<'de> for LenVisitor<MAX> {
+            type Value = PushArrayLen<MAX>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "any JSON value")
+            }
+
+            fn visit_seq<A>(self, mut elements: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut count = 0_usize;
+                while elements.next_element::<IgnoredAny>()?.is_some() {
+                    count += 1;
+                    if count > MAX {
+                        return Err(A::Error::custom(format!("array exceeds {MAX} elements")));
+                    }
+                }
+                Ok(PushArrayLen::Len(count))
+            }
+
+            fn visit_map<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                while entries.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(PushArrayLen::NotArray)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(PushArrayLen::NotArray)
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(PushArrayLen::NotArray)
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(PushArrayLen::NotArray)
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(PushArrayLen::NotArray)
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(PushArrayLen::NotArray)
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(PushArrayLen::NotArray)
+            }
+        }
+
+        deserializer.deserialize_any(LenVisitor::<MAX>)
+    }
+}
+
+/// A `have` already checked to be an array within the element limit.
+#[derive(Deserialize)]
+struct PushHaveElements {
+    have: Vec<serde_json::Value>,
+}
+
+/// Decode inbound kind 447, 448 or 449 content. A 447's `have` is read
+/// separately, by [`parse_push_repair_ask`]: whatever it holds, this applies
+/// the 447 as the self-update or request its `tokens` make it.
 pub(crate) fn parse_push_gossip(
     kind: u64,
     group_id_hex: &str,
@@ -2484,7 +2626,7 @@ pub(crate) fn decrypt_push_token_for_test(
 }
 
 mod lists;
-pub(crate) use lists::{push_announce, push_gossip_lists};
+pub(crate) use lists::{PushGossipLists, push_announce, push_gossip_lists};
 
 #[cfg(test)]
 mod tests;

@@ -277,7 +277,7 @@ async fn cancelled_drain_checkpoint_retains_progress_and_notifications() {
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
     client.prepare_transport().await.unwrap();
-    let telemetry = AppPerformanceTelemetry::default();
+    let telemetry = PerformanceRecorder::default();
     let group = client
         .create_group_with_options_and_telemetry("retry", &[], Default::default(), &telemetry)
         .await
@@ -366,7 +366,7 @@ async fn cancelled_commit_keeps_output() {
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         let group = client
             .create_group_with_options_and_telemetry(
                 "before rename",
@@ -630,7 +630,7 @@ async fn cancelling_public_waits_keeps_repaired_notifications() {
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         let group = client
             .create_group_with_options_and_telemetry("retry", &[], Default::default(), &telemetry)
             .await
@@ -740,6 +740,7 @@ async fn failed_message_projection_does_not_duplicate_its_deferred_summary() {
             group_id: group.clone(),
             message_id: cgka_traits::MessageId::new(vec![0x81; 32]),
             sender: cgka_traits::MemberId::new(hex::decode(account.account_id_hex).unwrap()),
+            sender_leaf_index: None,
             epoch: client.runtime.group_record(&group).unwrap().epoch,
             payload,
             retention: None,
@@ -901,6 +902,7 @@ async fn second_local_delete_discards_retry_that_crossed_the_old_frontier() {
                 group_id: group.clone(),
                 message_id: sent.reports[0].message_id.clone(),
                 sender: cgka_traits::MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                sender_leaf_index: None,
                 epoch: client.runtime.group_record(&group).unwrap().epoch,
                 payload,
                 retention: None,

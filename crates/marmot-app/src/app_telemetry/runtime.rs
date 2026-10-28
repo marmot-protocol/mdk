@@ -158,7 +158,7 @@ struct OperationState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Outcome {
+pub enum Outcome {
     Success,
     Failure,
     Cancelled,
@@ -169,7 +169,7 @@ pub(crate) enum Outcome {
 impl Outcome {
     /// What a finished result records: success, or the outcome its error converts into.
     /// `marmot-app` converts its own errors (`app_outcome`); recording never names them.
-    pub(crate) fn of<T, E>(result: &Result<T, E>) -> Self
+    pub fn of<T, E>(result: &Result<T, E>) -> Self
     where
         for<'e> Self: From<&'e E>,
     {
@@ -316,7 +316,7 @@ impl RuntimeTelemetry {
 
 /// A cancellation-safe timing observation. Contains only a closed operation and
 /// monotonic start; never holds a client, database, account or user identifier.
-pub(crate) struct Observation {
+pub struct Observation {
     telemetry: RuntimeTelemetry,
     operation: RuntimePerformanceOperation,
     started: Instant,
@@ -331,10 +331,10 @@ impl std::fmt::Debug for Observation {
     }
 }
 impl Observation {
-    pub(crate) fn finish(mut self, outcome: Outcome) {
+    pub fn finish(mut self, outcome: Outcome) {
         self.complete(outcome);
     }
-    pub(crate) fn finish_app<T, E>(self, result: &Result<T, E>)
+    pub fn finish_app<T, E>(self, result: &Result<T, E>)
     where
         for<'e> Outcome: From<&'e E>,
     {

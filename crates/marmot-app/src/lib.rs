@@ -17,6 +17,10 @@ use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
     AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY, AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
 };
+use cgka_traits::app_components::{
+    ACCOUNT_DEVICES_COMPONENT_ID, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, NostrRoutingV1,
+    default_group_components,
+};
 #[allow(deprecated)]
 pub use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT as AGENT_TEXT_STREAM_COMPONENT,
@@ -29,9 +33,6 @@ pub use cgka_traits::app_components::{
     GROUP_MESSAGE_RETENTION_COMPONENT, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
     GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT,
     NOSTR_ROUTING_COMPONENT_ID,
-};
-use cgka_traits::app_components::{
-    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, NostrRoutingV1, default_group_components,
 };
 pub use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM};
@@ -147,6 +148,7 @@ pub use startup_diagnostics::{
 };
 #[cfg(feature = "test-policy-overrides")]
 mod test_support;
+mod wiring;
 
 pub use cgka_traits::engine::{
     SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
@@ -590,7 +592,7 @@ pub struct MarmotApp {
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
     audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
-    product_analytics: ProductAnalytics,
+    product_analytics: observer::ProductRecorder,
     startup_diagnostics: startup_diagnostics::NativeStartupDiagnostics,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
     public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
@@ -1588,8 +1590,9 @@ impl MarmotApp {
             config.allow_loopback_relay_endpoints,
         );
         collector_host_safety::hand_in_http_builder(network_proxy::http_builder);
-        let product_analytics = ProductAnalytics::default();
-        product_analytics.silence(
+        let product_analytics = observer::ProductRecorder::default();
+        wiring::silence(
+            &product_analytics,
             config.usage_diagnostics_silent
                 || config.cursor_persistence == CursorPersistence::Frozen,
         );
@@ -1686,8 +1689,9 @@ impl MarmotApp {
             config.allow_loopback_relay_endpoints,
         );
         collector_host_safety::hand_in_http_builder(network_proxy::http_builder);
-        let product_analytics = ProductAnalytics::default();
-        product_analytics.silence(
+        let product_analytics = observer::ProductRecorder::default();
+        wiring::silence(
+            &product_analytics,
             config.usage_diagnostics_silent
                 || config.cursor_persistence == CursorPersistence::Frozen,
         );
@@ -2022,6 +2026,7 @@ impl MarmotApp {
             push_announce_timing: Default::default(),
             push_fetch_clock: client::PushFetchClock::new(notifications::unix_now_ms()),
             accepted_push_announces: Default::default(),
+            push_repairs: Default::default(),
             pending_failed_sync_summary: SyncSummary::default(),
             pending_native_sync_summary: SyncSummary::default(),
             native_sync_deliveries: 0,
@@ -4269,14 +4274,15 @@ impl MarmotApp {
     /// `(owner_ts, record_digest)` ordering primitive and tombstones (enforced by
     /// the storage `apply_*` calls) decide what mutates state. Because authority
     /// comes from each record's `owner_sig`, a kind 448 may carry — and apply —
-    /// records owned by members other than `message.sender`.
+    /// records owned by members other than `message.sender`. Returns the
+    /// entries that passed owner authentication and name a current member.
     pub(crate) fn ingest_push_gossip_message(
         &self,
         account_ref: &str,
         message: &ReceivedMessage,
         active_leaves: &[cgka_traits::engine::GroupMemberLeaf],
         profile: cgka_traits::group::ProtocolProfile,
-    ) -> Result<(), AppError> {
+    ) -> Result<notifications::PushGossipAction, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         let group_id_hex = hex::encode(message.group_id.as_slice());
@@ -4297,14 +4303,14 @@ impl MarmotApp {
             &active_member_ids,
             profile,
         );
-        match action {
+        match &action {
             notifications::PushGossipAction::Upsert(records) => {
                 for record in records {
                     // A valid account signature does not make a departed
                     // sibling leaf eligible for a notification destination.
                     if active_leaves.contains(&(record.member_id_hex.clone(), record.leaf_index)) {
                         storage
-                            .apply_group_push_token(&account_group_push_token_from_app(&record))?;
+                            .apply_group_push_token(&account_group_push_token_from_app(record))?;
                     }
                 }
             }
@@ -4313,14 +4319,14 @@ impl MarmotApp {
                     storage.apply_group_push_token_tombstone(
                         &conversions::account_push_token_tombstone_from_removal(
                             &group_id_hex,
-                            &removal,
+                            removal,
                             notifications::unix_now_ms(),
                         )?,
                     )?;
                 }
             }
         }
-        Ok(())
+        Ok(action)
     }
 
     /// Apply immutable engine leaf-departure facts through the account-scoped storage boundary.
@@ -5197,6 +5203,10 @@ impl MarmotApp {
                 return true;
             }
         };
+        // Current means what the session keeps: a current-profile bundle for
+        // this account. One that only lacks a newly supported component is
+        // still joinable, so it is not deleted here; the runtime replaces it
+        // in its slot and keeps the old key for the grace.
         let is_current = key_package_from_hex_with_optional_source(
             &record.key_package_hex,
             &record.key_package_event_id,
@@ -5204,7 +5214,7 @@ impl MarmotApp {
         .ok()
         .and_then(|key_package| key_package_metadata(&key_package).ok())
         .is_some_and(|metadata| {
-            self.key_package_metadata_matches_current_support(&metadata)
+            metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
                 && metadata.credential_identity_hex == record.account_id_hex
         });
         if is_current {
@@ -6821,9 +6831,11 @@ impl MarmotApp {
                 SqlcipherDatabaseKind::Session,
             )?
         };
-        let migration_observation =
-            self.product_analytics
-                .begin(ProductFamily::Storage, "migration", ProductUnit::Attempt);
+        let migration_observation = self.product_analytics.operation(
+            ProductFamily::Storage,
+            "migration",
+            ProductUnit::Attempt,
+        );
         probe.phase(NativeStartupStage::EncryptedStoreOpen);
         let observer = |progress| {
             use storage_sqlite::{StorageOpenPhase as Phase, StorageOpenProgress as Progress};
@@ -6969,12 +6981,12 @@ impl MarmotApp {
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let observation = self
             .product_analytics
-            .begin(
+            .operation(
                 ProductFamily::MessageAction,
                 "publication",
                 ProductUnit::Transition,
             )
-            .map(ProductObservation::counts_only);
+            .map(crate::observer::ProductOperation::counts_only);
         let storage = self.account_storage(label)?;
         let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
             let authority_update = storage.app_storage().finalize_app_event_authority(
@@ -7676,6 +7688,11 @@ impl MarmotApp {
         // negotiation: each group's required component id selects exactly one.
         components.insert(GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID);
         components.insert(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID);
+        // A new group requires account-devices when every founding device
+        // advertises it (mdk#2628, item 2.3); an existing group gains it only
+        // through an admin's activation (item 2.4). Advertising it makes
+        // leaves eligible and lets this device join groups that require it.
+        components.insert(ACCOUNT_DEVICES_COMPONENT_ID);
         components.into_iter().collect()
     }
 
