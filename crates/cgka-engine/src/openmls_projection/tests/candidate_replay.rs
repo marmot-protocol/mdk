@@ -19,7 +19,8 @@ use cgka_traits::ingest::{PeeledContent, PeeledMessage};
 use cgka_traits::message::{MessageRecord, MessageState, StoredMessagePayload};
 use cgka_traits::peeler::TransportPeeler;
 use cgka_traits::storage::{
-    AccountDeviceSignerStorage, GroupStorage, MessageStorage, StorageProvider,
+    AccountDeviceSignerStorage, GroupStorage, MessageStorage, OutboundIntentStorage,
+    StorageProvider,
 };
 use cgka_traits::transport::{
     EncryptedPayload, Timestamp, TransportEnvelope, TransportMessage, TransportSource,
@@ -158,14 +159,20 @@ fn transport_message(payload: &[u8], envelope: TransportEnvelope) -> TransportMe
 
 fn build_client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory().unwrap();
-    let engine = EngineBuilder::new(storage.clone())
+    (build_client_with_storage(seed, storage.clone()), storage)
+}
+
+fn build_client_with_storage(
+    seed: &[u8],
+    storage: SqliteAccountStorage,
+) -> Engine<SqliteAccountStorage> {
+    EngineBuilder::new(storage)
         .legacy_compatibility_profile()
         .identity(member_id(seed).as_slice().to_vec())
         .account_identity_proof_signer(Arc::new(SeedProofSigner(signing_key(seed))))
         .peeler(Box::new(PassthroughPeeler))
         .build()
-        .unwrap();
-    (engine, storage)
+        .unwrap()
 }
 
 async fn group_with(
@@ -323,6 +330,7 @@ fn adopt_branch(storage: &SqliteAccountStorage, group_id: &GroupId, commit: &Tra
 
     let mut group = storage.get_group(group_id).unwrap();
     group.epoch = EpochId(mls_group.epoch().as_u64());
+    group.members = crate::group_lifecycle::marmot_members(&mls_group);
     storage.put_group(&group).unwrap();
 }
 
@@ -1323,6 +1331,796 @@ async fn replay_transaction_measurement() {
 
 // --- The halts -----------------------------------------------------------
 
+async fn confirmed_update(
+    engine: &mut Engine<SqliteAccountStorage>,
+    group_id: &GroupId,
+) -> TransportMessage {
+    let SendResult::GroupEvolution { msg, pending, .. } = engine
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected self-update")
+    };
+    engine.confirm_published(pending).await.unwrap();
+    msg
+}
+
+#[tokio::test]
+async fn own_checkpoint_apply_parity() {
+    let (mut alice, storage) = build_client(b"checkpoint-parity-alice");
+    let (mut bob, peer) = build_client(b"checkpoint-parity-bob");
+    let group_id = group_with(&mut alice, &mut [&mut bob]).await;
+    let first = confirmed_update(&mut alice, &group_id).await;
+    adopt_branch(&peer, &group_id, &first);
+    let payload = cgka_traits::app_event::MarmotAppEvent::new(
+        hex::encode(bob.self_id().as_slice()),
+        1_700_000_000,
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "before remote commit",
+    )
+    .encode()
+    .unwrap();
+    let SendResult::ApplicationMessage {
+        msg: application, ..
+    } = bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            expected_epoch: None,
+            payload,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected application")
+    };
+    admit_rival(&storage, &group_id, &application, 2);
+    let remote = confirmed_update(&mut bob, &group_id).await;
+    adopt_branch(&storage, &group_id, &remote);
+    admit_rival(&storage, &group_id, &remote, 2);
+    let mut remote_row = storage.get_message(&remote.id).unwrap();
+    remote_row.state = MessageState::Processed;
+    storage.put_message(&remote_row).unwrap();
+    let last = confirmed_update(&mut alice, &group_id).await;
+    adopt_branch(&peer, &group_id, &last);
+    let expected = replay_state(&peer, &group_id).1;
+
+    // A prior selection parked an own prefix. The later remote and own
+    // commits are still canonical, so selection reconstructs all three.
+    let mut first_row = storage.get_message(&first.id).unwrap();
+    first_row.state = MessageState::ConvergenceDeferred;
+    storage.put_message(&first_row).unwrap();
+    let selected = super::canonicalize_stored_openmls_messages(
+        &storage,
+        &group_id,
+        reconstruction_state(4),
+        vec![],
+        super::CanonicalizationPolicy::default(),
+        100_000,
+    )
+    .unwrap();
+    assert_eq!(
+        selected.accepted_commits,
+        [&first, &remote, &last].map(|message| hex::encode(message.id.as_slice()))
+    );
+    let observations = super::apply_openmls_canonicalization_result(
+        &storage,
+        &group_id,
+        &selected,
+        V1_MAX_REWIND_COMMITS,
+    )
+    .expect("an accepted own/remote/own branch must apply");
+    assert_eq!(replay_state(&storage, &group_id).1, expected);
+    assert!(
+        observations.iter().any(|observation| matches!(
+            observation, super::OpenMlsReplayObservation::ApplicationProcessed { message_id, .. }
+                if *message_id == hex::encode(application.id.as_slice())
+        )),
+        "checkpoint restores must preserve historical application observations"
+    );
+    for message in [&first, &remote, &last] {
+        assert_eq!(
+            storage.get_message(&message.id).unwrap().state,
+            MessageState::Processed
+        );
+    }
+}
+
+#[tokio::test]
+async fn own_checkpoint_checks_parent() {
+    let (mut alice, storage) = build_client(b"checkpoint-parent-alice");
+    let (mut bob, peer) = build_client(b"checkpoint-parent-bob");
+    let group_id = group_with(&mut alice, &mut [&mut bob]).await;
+    let source_epoch = storage.get_group(&group_id).unwrap().epoch.0;
+    let sibling = rival_commit(&peer, &bob.self_id(), &group_id);
+    confirmed_update(&mut alice, &group_id).await;
+    let next = confirmed_update(&mut alice, &group_id).await;
+    let inputs =
+        super::seed_stored_openmls_graph_inputs(&storage, &group_id, source_epoch, None).unwrap();
+    let mut selected = super::canonicalize_stored_openmls_messages(
+        &storage,
+        &group_id,
+        reconstruction_state(source_epoch + 2),
+        vec![],
+        super::CanonicalizationPolicy::default(),
+        100_000,
+    )
+    .unwrap();
+    // Exercise a selected suffix against a different parent at the SAME
+    // epoch: matching source epoch alone cannot authorize a checkpoint.
+    selected.accepted_commits = vec![hex::encode(next.id.as_slice())];
+    storage
+        .rollback_group_state_keeping_live_records(
+            &group_id,
+            &super::retained_anchor_snapshot_name(source_epoch),
+        )
+        .unwrap();
+    adopt_branch(&storage, &group_id, &sibling);
+    let wrong_parent = replay_state(&storage, &group_id);
+    let ledger = storage.list_messages(&group_id, EpochId(0)).unwrap();
+    let replay = super::replay_openmls_messages_prevalidated_output(
+        &storage,
+        &group_id,
+        &[next],
+        &inputs.own_commits,
+        ReplayProfilePolicy::default(),
+    );
+    assert!(
+        replay.is_err(),
+        "own checkpoint must authenticate its source parent"
+    );
+    assert_eq!(replay_state(&storage, &group_id), wrong_parent);
+    let applied = super::apply_openmls_canonicalization_result(
+        &storage,
+        &group_id,
+        &selected,
+        V1_MAX_REWIND_COMMITS,
+    );
+    assert!(
+        applied.is_err(),
+        "apply must reject the same wrong parent as selection"
+    );
+    assert_eq!(replay_state(&storage, &group_id), wrong_parent);
+    assert_eq!(
+        storage.list_messages(&group_id, EpochId(0)).unwrap(),
+        ledger
+    );
+}
+
+enum RestorePath {
+    Checkpoint,
+    Sibling,
+}
+
+enum SenderLifecycle {
+    Live,
+    Reopen,
+}
+
+enum OutboundCapacity {
+    Available,
+    Full,
+}
+
+async fn check_restored_tip(
+    path: RestorePath,
+    lifecycle: SenderLifecycle,
+    capacity: OutboundCapacity,
+) {
+    let (mut alice, storage) = build_client(b"restored-tip-alice");
+    let (mut bob, peer) = build_client(b"restored-tip-bob");
+    let group_id = group_with(&mut alice, &mut [&mut bob]).await;
+    let source_epoch = storage.get_group(&group_id).unwrap().epoch.0;
+    let other = rival_commit(&peer, &bob.self_id(), &group_id);
+    let commit = confirmed_update(&mut alice, &group_id).await;
+    adopt_branch(&peer, &group_id, &commit);
+    bob.hydrate_all_stored_groups().unwrap();
+    let expected = replay_state(&peer, &group_id).1;
+    let author = hex::encode(alice.self_id().as_slice());
+    let app_payload = |content: &str| {
+        cgka_traits::app_event::MarmotAppEvent::new(
+            author.clone(),
+            1_700_000_000,
+            cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+            vec![],
+            content,
+        )
+        .encode()
+        .unwrap()
+    };
+    for content in ["before replay one", "before replay two"] {
+        let SendResult::ApplicationMessage { msg, .. } = alice
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                expected_epoch: None,
+                payload: app_payload(content),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected application before replay")
+        };
+        assert!(matches!(
+            bob.ingest(msg).await.unwrap(),
+            cgka_traits::ingest::IngestOutcome::Processed
+        ));
+    }
+    bob.drain_events();
+    if matches!(path, RestorePath::Sibling) {
+        storage
+            .rollback_group_state_keeping_live_records(
+                &group_id,
+                &super::retained_anchor_snapshot_name(source_epoch),
+            )
+            .unwrap();
+        adopt_branch(&storage, &group_id, &other);
+        assert_ne!(replay_state(&storage, &group_id).1, expected);
+    }
+    storage
+        .update_message_state(&commit.id, MessageState::ConvergenceDeferred)
+        .unwrap();
+    let selected = super::canonicalize_stored_openmls_messages(
+        &storage,
+        &group_id,
+        reconstruction_state(source_epoch + 1),
+        vec![],
+        super::CanonicalizationPolicy::default(),
+        100_000,
+    )
+    .unwrap();
+    assert_eq!(
+        selected.accepted_commits,
+        vec![hex::encode(commit.id.as_slice())]
+    );
+    super::apply_openmls_canonicalization_result(
+        &storage,
+        &group_id,
+        &selected,
+        V1_MAX_REWIND_COMMITS,
+    )
+    .unwrap();
+    assert_eq!(replay_state(&storage, &group_id).1, expected);
+    // A scheduler's ordinary completion/failure must not release the durable
+    // cryptographic gate for an epoch whose ratchet was restored.
+    let maintenance = storage.maintenance_storage().unwrap();
+    let obligations = maintenance
+        .list_maintenance_obligations_for_group(&group_id)
+        .unwrap();
+    assert_eq!(obligations.len(), 1);
+    let mut completed = obligations.into_iter().next().unwrap();
+    completed.phase = cgka_traits::maintenance::MaintenancePhase::Complete;
+    maintenance.put_maintenance_obligation(&completed).unwrap();
+    storage
+        .update_message_state(&commit.id, MessageState::ConvergenceDeferred)
+        .unwrap();
+    super::apply_openmls_canonicalization_result(
+        &storage,
+        &group_id,
+        &selected,
+        V1_MAX_REWIND_COMMITS,
+    )
+    .unwrap();
+    assert_eq!(
+        maintenance.maintenance_obligation(&completed.id).unwrap(),
+        Some(completed.clone()),
+        "another restore must not replace or erase established durable ownership"
+    );
+    if matches!(lifecycle, SenderLifecycle::Reopen) {
+        drop(alice);
+        alice = build_client_with_storage(b"restored-tip-alice", storage.clone());
+        alice.hydrate_all_stored_groups().unwrap();
+    }
+    let payload = app_payload("after replay");
+    if matches!(capacity, OutboundCapacity::Available) {
+        let pinned = alice
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                expected_epoch: Some(EpochId(source_epoch + 1)),
+                payload: payload.clone(),
+            })
+            .await;
+        assert!(matches!(
+            pinned,
+            Err(cgka_traits::error::EngineError::AppMessageEpochUnsettled { .. })
+        ));
+        assert!(
+            alice.epoch_manager.state(&group_id).unwrap().is_stable(),
+            "a refused pinned send must not strand a staged rotation"
+        );
+        assert!(alice.drain_auto_publish().is_empty());
+    }
+    if matches!(capacity, OutboundCapacity::Full) {
+        for index in 0..crate::message_processor::MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP {
+            let queued_payload = if index == 0 {
+                payload.clone()
+            } else {
+                app_payload(&format!("queued {index}"))
+            };
+            alice
+                .queue_app_message(group_id.clone(), queued_payload)
+                .await
+                .unwrap();
+        }
+    }
+    let sent = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            expected_epoch: None,
+            payload: payload.clone(),
+        })
+        .await;
+    match capacity {
+        OutboundCapacity::Available => assert!(matches!(sent.unwrap(), SendResult::Queued { .. })),
+        OutboundCapacity::Full => assert!(matches!(
+            sent,
+            Err(cgka_traits::error::EngineError::QueuedOutboundAtCapacity { .. })
+        )),
+    }
+    let now = alice.convergence_now_ms();
+    assert!(
+        alice
+            .converge_and_drain_queued_outbound_intents(&group_id, now)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut publications = alice.drain_auto_publish();
+    assert_eq!(
+        publications.len(),
+        1,
+        "rotation owns its own slot even with a full outbound queue"
+    );
+    assert!(
+        !storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+    let mut rotation = publications.remove(0);
+    assert_eq!(
+        replay_state(&storage, &group_id).1,
+        expected,
+        "staging must not merge before ACK"
+    );
+    if matches!(lifecycle, SenderLifecycle::Reopen) {
+        alice.publish_failed(rotation.pending).await.unwrap();
+        drop(alice);
+        alice = build_client_with_storage(b"restored-tip-alice", storage.clone());
+        alice.hydrate_all_stored_groups().unwrap();
+        drop(bob);
+        bob = build_client_with_storage(b"restored-tip-bob", peer.clone());
+        bob.hydrate_all_stored_groups().unwrap();
+        let now = alice.convergence_now_ms();
+        assert!(
+            alice
+                .converge_and_drain_queued_outbound_intents(&group_id, now)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut retried = alice.drain_auto_publish();
+        assert_eq!(
+            retried.len(),
+            1,
+            "failed publication and reopen retain the rotation obligation"
+        );
+        rotation = retried.remove(0);
+        assert_eq!(replay_state(&storage, &group_id).1, expected);
+    }
+    alice.confirm_published(rotation.pending).await.unwrap();
+    assert!(matches!(
+        bob.ingest(rotation.msg).await.unwrap(),
+        cgka_traits::ingest::IngestOutcome::Buffered { .. }
+    ));
+    bob.converge_stored_openmls_messages_at(&group_id, u64::MAX)
+        .unwrap();
+    let now = alice.convergence_now_ms();
+    let drained = alice
+        .converge_and_drain_queued_outbound_intents(&group_id, now)
+        .await
+        .unwrap();
+    let expected_count = match capacity {
+        OutboundCapacity::Available => 1,
+        OutboundCapacity::Full => crate::message_processor::MAX_QUEUED_OUTBOUND_INTENTS_PER_GROUP,
+    };
+    assert_eq!(drained.len(), expected_count);
+    for result in drained {
+        let SendResult::ApplicationMessage {
+            msg,
+            source_epoch: sent_epoch,
+            ..
+        } = result
+        else {
+            panic!("queued application must drain only after rotation confirmation");
+        };
+        assert_eq!(sent_epoch, EpochId(source_epoch + 2));
+        let (_, intent_id) = alice
+            .regenerated_queued_intent_for_message(&msg.id)
+            .unwrap();
+        assert!(matches!(
+            bob.ingest(msg).await.unwrap(),
+            cgka_traits::ingest::IngestOutcome::Processed
+        ));
+        alice.confirm_regenerated_queued_intent(&intent_id).unwrap();
+    }
+    assert!(
+        storage
+            .list_queued_outbound_intents(&group_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        bob.drain_events().iter().any(|event| matches!(
+            event, cgka_traits::engine::GroupEvent::MessageReceived { payload: received, .. }
+                if *received == payload
+        )),
+        "restoring a used own checkpoint must not reuse an application sender generation"
+    );
+
+    // Ordinary traffic at the new tip must not install another replay gate or
+    // force one self-update per message. Exercise both directions while live.
+    let peer_payload = cgka_traits::app_event::MarmotAppEvent::new(
+        hex::encode(bob.self_id().as_slice()),
+        1_700_000_000,
+        cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "ordinary peer traffic",
+    )
+    .encode()
+    .unwrap();
+    let SendResult::ApplicationMessage { msg, .. } = bob
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            expected_epoch: None,
+            payload: peer_payload,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("peer traffic must not require another rotation")
+    };
+    assert!(matches!(
+        alice.ingest(msg).await.unwrap(),
+        cgka_traits::ingest::IngestOutcome::Processed
+    ));
+    let unchanged = super::canonicalize_stored_openmls_messages(
+        &storage,
+        &group_id,
+        reconstruction_state(source_epoch + 2),
+        vec![],
+        super::CanonicalizationPolicy::default(),
+        100_000,
+    )
+    .unwrap();
+    super::apply_openmls_canonicalization_result(
+        &storage,
+        &group_id,
+        &unchanged,
+        V1_MAX_REWIND_COMMITS,
+    )
+    .unwrap();
+    assert_eq!(
+        maintenance
+            .list_maintenance_obligations_for_group(&group_id)
+            .unwrap()
+            .len(),
+        1,
+        "already-applied own tip and ordinary traffic must not create another rotation marker"
+    );
+    let SendResult::ApplicationMessage { msg, .. } = alice
+        .send(SendIntent::AppMessage {
+            group_id: group_id.clone(),
+            expected_epoch: None,
+            payload: app_payload("after ordinary peer traffic"),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("ordinary traffic must not re-arm rotation")
+    };
+    assert!(matches!(
+        bob.ingest(msg).await.unwrap(),
+        cgka_traits::ingest::IngestOutcome::Processed
+    ));
+    assert!(alice.drain_auto_publish().is_empty());
+    assert!(bob.drain_auto_publish().is_empty());
+    assert_eq!(alice.epoch(&group_id).unwrap(), EpochId(source_epoch + 2));
+
+    if matches!(path, RestorePath::Checkpoint) && matches!(capacity, OutboundCapacity::Available) {
+        let checkpoint = own_commit_checkpoint_id(&storage, &commit.id).unwrap();
+        let mut unrelated = completed.clone();
+        unrelated.id = MessageId::new(vec![9; 32]);
+        maintenance.put_maintenance_obligation(&unrelated).unwrap();
+        let mut wrong_length = completed.clone();
+        let mut bytes = completed.id.as_slice().to_vec();
+        bytes.push(0);
+        wrong_length.id = MessageId::new(bytes);
+        maintenance
+            .put_maintenance_obligation(&wrong_length)
+            .unwrap();
+        for _ in 0..V1_MAX_REWIND_COMMITS - 1 {
+            confirmed_update(&mut alice, &group_id).await;
+        }
+        assert!(
+            maintenance
+                .maintenance_obligation(&completed.id)
+                .unwrap()
+                .is_some(),
+            "inclusive oldest retained epoch must keep its barrier"
+        );
+        assert!(
+            storage
+                .list_group_state_checkpoints(&group_id)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.id == checkpoint)
+        );
+        confirmed_update(&mut alice, &group_id).await;
+        assert!(
+            !storage
+                .list_group_state_checkpoints(&group_id)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.id == checkpoint)
+        );
+        assert!(
+            maintenance
+                .maintenance_obligation(&completed.id)
+                .unwrap()
+                .is_none(),
+            "barrier retires only after its epoch leaves the existing checkpoint horizon"
+        );
+        assert!(
+            maintenance
+                .maintenance_obligation(&unrelated.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            maintenance
+                .maintenance_obligation(&wrong_length.id)
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn own_tip_send_after_replay() {
+    check_restored_tip(
+        RestorePath::Checkpoint,
+        SenderLifecycle::Live,
+        OutboundCapacity::Available,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn own_tip_reorg_send_reopen() {
+    check_restored_tip(
+        RestorePath::Sibling,
+        SenderLifecycle::Reopen,
+        OutboundCapacity::Available,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn own_tip_full_outbound_queue() {
+    check_restored_tip(
+        RestorePath::Checkpoint,
+        SenderLifecycle::Live,
+        OutboundCapacity::Full,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn own_private_checkpoint_refused() {
+    use openmls::group::{MlsGroupJoinConfig, PURE_CIPHERTEXT_WIRE_FORMAT_POLICY};
+
+    let (mut alice, storage) = build_client(b"checkpoint-private-alice");
+    let (mut bob, _) = build_client(b"checkpoint-private-bob");
+    let group_id = group_with(&mut alice, &mut [&mut bob]).await;
+    let source_epoch = storage.get_group(&group_id).unwrap().epoch.0;
+    let mut selected = super::canonicalize_stored_openmls_messages(
+        &storage,
+        &group_id,
+        reconstruction_state(source_epoch),
+        vec![],
+        super::CanonicalizationPolicy::default(),
+        100_000,
+    )
+    .unwrap();
+    let mls_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls = MlsGroup::load(storage.mls_storage(), &mls_id)
+        .unwrap()
+        .unwrap();
+    let config = MlsGroupJoinConfig::builder()
+        .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
+        .max_past_epochs(crate::DEFAULT_MAX_PAST_EPOCHS)
+        .use_ratchet_tree_extension(true)
+        .sender_ratchet_configuration(
+            *crate::join_config(crate::DEFAULT_MAX_PAST_EPOCHS).sender_ratchet_configuration(),
+        )
+        .build();
+    mls.set_configuration(storage.mls_storage(), &config)
+        .unwrap();
+    let message = confirmed_update(&mut alice, &group_id).await;
+    assert!(matches!(
+        MlsMessageIn::tls_deserialize_exact(message.payload.as_slice())
+            .unwrap()
+            .extract(),
+        openmls::prelude::MlsMessageBodyIn::PrivateMessage(_)
+    ));
+    storage
+        .update_message_state(&message.id, MessageState::ConvergenceDeferred)
+        .unwrap();
+    let inputs =
+        super::seed_stored_openmls_graph_inputs(&storage, &group_id, source_epoch, None).unwrap();
+    selected.accepted_commits = vec![hex::encode(message.id.as_slice())];
+    selected.selected_tip = Some(source_epoch + 1);
+    selected.selected_fork_epoch = Some(source_epoch);
+    storage
+        .rollback_group_state_keeping_live_records(
+            &group_id,
+            &super::retained_anchor_snapshot_name(source_epoch),
+        )
+        .unwrap();
+    let before = replay_state(&storage, &group_id);
+    let ledger = storage.list_messages(&group_id, EpochId(0)).unwrap();
+
+    // A genuine locally confirmed ciphertext is still not authenticated by
+    // OpenMLS's OwnPrivateMessage classification. Neither replay seam may
+    // turn that classification into permission to restore a checkpoint.
+    let replay = super::replay_openmls_messages_prevalidated_output(
+        &storage,
+        &group_id,
+        &[message],
+        &inputs.own_commits,
+        ReplayProfilePolicy::default(),
+    );
+    assert!(matches!(
+        replay,
+        Err(super::OpenMlsProjectionError::Replay(_))
+    ));
+    assert_eq!(replay_state(&storage, &group_id), before);
+    let apply = super::apply_openmls_canonicalization_result(
+        &storage,
+        &group_id,
+        &selected,
+        V1_MAX_REWIND_COMMITS,
+    );
+    assert!(matches!(
+        apply,
+        Err(super::OpenMlsProjectionError::Replay(_))
+    ));
+    assert_eq!(replay_state(&storage, &group_id), before);
+    assert_eq!(
+        storage.list_messages(&group_id, EpochId(0)).unwrap(),
+        ledger
+    );
+}
+
+#[tokio::test]
+async fn own_pathless_replay() {
+    let (mut alice, storage) = build_client(b"checkpoint-pathless-alice");
+    let (mut bob, peer) = build_client(b"checkpoint-pathless-bob");
+    let (mut carol, _) = build_client(b"checkpoint-pathless-carol");
+    let group_id = group_with(&mut alice, &mut [&mut bob]).await;
+    let source_epoch = storage.get_group(&group_id).unwrap().epoch.0;
+    let key_package = carol.fresh_key_package().await.unwrap();
+    let openmls::prelude::MlsMessageBodyIn::KeyPackage(key_package) =
+        MlsMessageIn::tls_deserialize_exact(key_package.bytes())
+            .unwrap()
+            .extract()
+    else {
+        panic!("expected KeyPackage");
+    };
+    let crypto = RustCrypto::default();
+    let key_package = key_package
+        .validate(&crypto, openmls::prelude::ProtocolVersion::Mls10)
+        .unwrap();
+    let provider =
+        EngineOpenMlsProvider::<SqliteAccountStorage>::new(&crypto, storage.mls_storage());
+    let mls_id = openmls::group::GroupId::from_slice(group_id.as_slice());
+    let mut mls = MlsGroup::load(provider.storage(), &mls_id)
+        .unwrap()
+        .unwrap();
+    let binding = storage
+        .account_device_signer(&alice.self_id())
+        .unwrap()
+        .unwrap();
+    let signer = SignatureKeyPair::read(
+        storage.mls_storage(),
+        &binding.mls_signature_public_key,
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+    )
+    .unwrap();
+    let (commit, _, _) = mls
+        .add_members_without_update(&provider, &signer, &[key_package])
+        .unwrap();
+    let staged = mls.pending_commit().unwrap();
+    assert!(
+        staged.update_path_leaf_node().is_none(),
+        "fixture must exercise a pathless commit"
+    );
+    let mut stamp = super::own_commit_stamp(&mls, staged, alice.self_id()).unwrap();
+    let message = transport_message(
+        &commit.tls_serialize_detached().unwrap(),
+        TransportEnvelope::GroupMessage {
+            transport_group_id: group_id.as_slice().to_vec(),
+        },
+    );
+    assert!(matches!(
+        MlsMessageIn::tls_deserialize_exact(message.payload.as_slice())
+            .unwrap()
+            .extract(),
+        openmls::prelude::MlsMessageBodyIn::PublicMessage(_)
+    ));
+    admit_rival(&storage, &group_id, &message, source_epoch);
+    stamp.checkpoint_id = Some(own_commit_checkpoint_id(&storage, &message.id).unwrap());
+    mls.merge_pending_commit(&provider).unwrap();
+    stamp.resulting_epoch_authenticator =
+        Some(super::own_commit_post_merge_epoch_authenticator(&mls));
+    let mut group = storage.get_group(&group_id).unwrap();
+    group.epoch = EpochId(source_epoch + 1);
+    group.members = crate::group_lifecycle::marmot_members(&mls);
+    storage.put_group(&group).unwrap();
+    storage
+        .create_group_state_checkpoint(
+            &group_id,
+            &cgka_traits::storage::GroupStateCheckpointRef {
+                id: stamp.checkpoint_id.clone().unwrap(),
+                resulting_epoch: EpochId(source_epoch + 1),
+            },
+        )
+        .unwrap();
+    super::stamp_processed_own_commit_record(&storage, &message.id, Some(stamp)).unwrap();
+    storage
+        .update_message_state(&message.id, MessageState::ConvergenceDeferred)
+        .unwrap();
+    adopt_branch(&peer, &group_id, &message);
+    let peer_members = peer.get_group(&group_id).unwrap().members;
+    assert_eq!(peer_members.len(), 3);
+    assert!(
+        peer_members
+            .iter()
+            .any(|member| member.id == carol.self_id())
+    );
+    let expected = replay_state(&peer, &group_id).1;
+
+    let selected = super::canonicalize_stored_openmls_messages(
+        &storage,
+        &group_id,
+        reconstruction_state(source_epoch + 1),
+        vec![],
+        super::CanonicalizationPolicy::default(),
+        100_000,
+    )
+    .unwrap();
+    assert_eq!(
+        selected.accepted_commits,
+        vec![hex::encode(message.id.as_slice())]
+    );
+    super::apply_openmls_canonicalization_result(
+        &storage,
+        &group_id,
+        &selected,
+        V1_MAX_REWIND_COMMITS,
+    )
+    .expect("authenticated pathless own commit must apply through its checkpoint");
+    assert_eq!(replay_state(&storage, &group_id).1, expected);
+    assert_eq!(
+        storage.get_message(&message.id).unwrap().state,
+        MessageState::Processed
+    );
+    assert_eq!(storage.get_group(&group_id).unwrap().members, peer_members);
+}
+
 #[tokio::test]
 async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
     let (mut alice, alice_storage) = build_client(b"peel-halt-alice");
@@ -1357,6 +2155,24 @@ async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
         "a two-way epoch-1 fork offers a context per branch"
     );
 
+    let mut selected = super::canonicalize_stored_openmls_messages(
+        &alice_storage,
+        &group_id,
+        reconstruction_state(2),
+        vec![],
+        super::CanonicalizationPolicy::default(),
+        100_000,
+    )
+    .unwrap();
+    // Selection may prefer either sibling. Exercise applying the own branch
+    // after its checkpoint disappears between selection and application.
+    selected.accepted_commits = vec![hex::encode(own_commit.id.as_slice())];
+    selected.selected_tip = Some(2);
+    selected.selected_fork_epoch = Some(1);
+    alice_storage
+        .update_message_state(&own_commit.id, MessageState::ConvergenceDeferred)
+        .unwrap();
+
     // MLS cannot replay this device's own path-bearing commit from the
     // public wire echo, so losing its post-merge checkpoint costs
     // enumeration the branch it is standing on.
@@ -1373,6 +2189,23 @@ async fn a_lost_own_commit_checkpoint_halts_enumeration_and_keeps_the_fork() {
     assert!(
         halted.contested,
         "the fork is in the stored graph, not in what enumeration managed to read"
+    );
+    let before = replay_state(&alice_storage, &group_id);
+    let ledger = alice_storage.list_messages(&group_id, EpochId(0)).unwrap();
+    let applied = super::apply_openmls_canonicalization_result(
+        &alice_storage,
+        &group_id,
+        &selected,
+        V1_MAX_REWIND_COMMITS,
+    );
+    assert!(matches!(
+        applied,
+        Err(super::OpenMlsProjectionError::MissingOwnCommitCheckpoint)
+    ));
+    assert_eq!(replay_state(&alice_storage, &group_id), before);
+    assert_eq!(
+        alice_storage.list_messages(&group_id, EpochId(0)).unwrap(),
+        ledger
     );
 }
 

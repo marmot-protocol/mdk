@@ -1,7 +1,7 @@
 ---
 title: "Long-lived runtime state — bounds and reclamation"
 created: 2026-07-02
-updated: 2026-10-20
+updated: 2026-10-28
 tags: [marmot, architecture, runtime, daemon, broker, memory]
 ---
 
@@ -23,6 +23,12 @@ Tracking issue: marmot-protocol/mdk#381.
 - **Each structure documents its bound** (max size, TTL, or eviction policy) below and enforces it in code.
 
 ## Inventory
+
+### Own-checkpoint sender rotation (`cgka-engine/src/maintenance.rs`)
+
+| Structure | Bound | Reclamation |
+| --- | --- | --- |
+| Epoch-bound Manual maintenance markers | One per restored own-checkpoint epoch/authenticator; retained across the same horizon as exact checkpoints | Prune only after checkpoint pruning, strictly below its retained epoch floor. Completed or failed phases never release the restored epoch's send gate. A different authenticated epoch releases that gate; ordinary Manual maintenance may still perform one rotation. Group deletion and terminal teardown remove its records. |
 
 ### `marmot-app` audit export admission (`src/audit_export_lifecycle.rs`)
 

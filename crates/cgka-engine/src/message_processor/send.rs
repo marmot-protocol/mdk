@@ -961,6 +961,19 @@ impl<S: StorageProvider> Engine<S> {
                 current: source_epoch,
             });
         }
+        // Queued preparation bypasses the public send gate. Never encrypt
+        // under an installed checkpoint's possibly reused sender generation,
+        // even if a caller reaches this seam before maintenance is confirmed.
+        if crate::maintenance::replay_rotation_required(&self.storage, &group_id, &mls_group)? {
+            self.return_unmodified_mls_group(&group_id, mls_group);
+            return Err(EngineError::InvalidTransition(
+                cgka_traits::engine_state::InvalidTransition {
+                    from: "RestoredEpoch",
+                    to: "send",
+                    reason: "restored epoch requires a confirmed self update",
+                },
+            ));
+        }
 
         let app_event =
             crate::app_payload::validate_app_payload_for_sender(&payload, self.identity.self_id())?;
