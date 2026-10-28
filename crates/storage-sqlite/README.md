@@ -262,7 +262,7 @@ reservations. The app-side owner supplies validated facts and owns execution pol
   deliver it again; only a fetch proof (comparison, sweep slice, re-check) covers it, on its own relay, and the hold
   ends when retention pruning passes it. A release with no inventory row leaves
   the ledger to the epoch gap it arms. Every un-cover is also
-  appended to the un-cover log (migration 0125) under a new account generation. `recovery_coverage_mark` reads that
+  appended to the un-cover log (migration 0126) under a new account generation. `recovery_coverage_mark` reads that
   generation before a fetch, and `record_recovery_coverage_since` subtracts from its slices every range un-covered
   on their routes after the mark, or records nothing once the log (an hour, at most 4,096 rows) no longer reaches
   back to it. `prune_recovery_coverage` drops coverage below the retention floor, raises goals to it and ages the log;
