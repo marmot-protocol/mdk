@@ -2504,6 +2504,17 @@ async fn run_app_runtime_account_worker(
                                             &account_label,
                                             account_error_message("scheduled convergence failed", &err),
                                         );
+                                        // A failure that spent the pass's budget
+                                        // parks it (mdk#2684); hosts re-read the
+                                        // group to show that.
+                                        if client.convergence_pass_parked(&group_id).unwrap_or(false) {
+                                            publish_app_runtime_group_state_updated(
+                                                &events,
+                                                &account_id_hex,
+                                                &account_label,
+                                                &group_id,
+                                            );
+                                        }
                                     }
                                 }
                             }

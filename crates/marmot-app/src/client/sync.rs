@@ -882,6 +882,15 @@ impl AppClient {
         self.pending_convergence_groups.drain().collect()
     }
 
+    /// Whether this group's convergence pass parked after repeated failures
+    /// (mdk#2684).
+    pub(crate) fn convergence_pass_parked(
+        &self,
+        group_id: &cgka_traits::GroupId,
+    ) -> Result<bool, AppError> {
+        Ok(self.runtime.convergence_pass_parked(group_id)?)
+    }
+
     /// Engine-derived convergence scheduling state for one group.
     ///
     /// Errors propagate: a storage or engine failure must schedule a retry at
@@ -911,6 +920,19 @@ impl AppClient {
                 }
             }
             None => {
+                if self.runtime.convergence_pass_parked(group_id)? {
+                    // A parked pass waits for new input or an explicit retry
+                    // and gates every other arm below (mdk#2684). Waking it
+                    // would only re-read the park; already-staged
+                    // publications keep their own retry wake.
+                    return Ok(if self.runtime.has_pending_outbound_fanouts(group_id)? {
+                        ConvergenceScheduleState::PendingOutbound {
+                            retry_after_ms: self.runtime.outbound_fanout_retry_delay_ms(group_id)?,
+                        }
+                    } else {
+                        ConvergenceScheduleState::Idle
+                    });
+                }
                 if self.runtime.has_pending_convergence_inputs(group_id)? {
                     Ok(ConvergenceScheduleState::PendingUnopenable)
                 } else if self.runtime.has_queued_outbound_intents(group_id)?

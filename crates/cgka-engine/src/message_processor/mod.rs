@@ -3075,6 +3075,18 @@ impl<S: StorageProvider> Engine<S> {
         {
             return Ok(None);
         }
+        // A failed batch runs before any sweep, so its retry time is the wake
+        // (mdk#2684). Reporting rows ready meanwhile would spin the host on an
+        // advance that waits for that batch. A deferred-peel generation still
+        // sweeps first and keeps its own readiness.
+        if self.storage.deferred_peel_generation(group_id)?.is_none()
+            && self
+                .storage
+                .convergence_pass(group_id)?
+                .is_some_and(|pass| pass.is_active() && pass.retry.is_some())
+        {
+            return Ok(None);
+        }
         let now = self.convergence_now();
         // Match the sweep's indexed state filter. Readiness must inspect all
         // deferred metadata, but neither payloads nor processed history are needed.

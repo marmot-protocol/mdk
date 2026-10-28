@@ -301,7 +301,19 @@ impl<S: StorageProvider> Engine<S> {
             Some(pass) if pass.phase == ConvergencePassPhase::Collecting => {
                 Some(pass.cutoff_monotonic_ms().saturating_sub(now.monotonic_ms))
             }
-            Some(pass) if pass.is_active() => Some(0),
+            // A parked batch makes no attempt of its own; new selection input
+            // or an explicit retry wakes it (mdk#2684). It still gates every
+            // later arm, as any active pass does.
+            Some(pass) if pass.is_parked() => None,
+            Some(pass) if pass.is_active() => Some(
+                pass.retry
+                    .as_ref()
+                    .map_or(0, |retry| {
+                        retry
+                            .next_attempt_monotonic_ms
+                            .saturating_sub(now.monotonic_ms)
+                    }),
+            ),
             // RawTransport applications do not open a convergence pass. A
             // failed post-confirmation replay still needs a scheduler edge,
             // after existing pass deadlines and pending-publication gates.
@@ -328,6 +340,61 @@ impl<S: StorageProvider> Engine<S> {
             }
             _ => None,
         })
+    }
+
+    /// Whether this group's active pass spent its failure budget and waits for
+    /// new selection input or an explicit retry (mdk#2684). Hosts show it as
+    /// the group's status and leave the group unscheduled while it holds.
+    pub fn convergence_pass_parked(&self, group_id: &GroupId) -> Result<bool, StorageError> {
+        Ok(self
+            .storage
+            .convergence_pass(group_id)?
+            .is_some_and(|pass| pass.is_parked()))
+    }
+
+    /// Let a frozen batch that failed run its next attempt now (mdk#2684).
+    ///
+    /// The host calls this for a user's explicit retry. It grants one attempt
+    /// and keeps the failure count, so a parked batch that fails again parks
+    /// again at once instead of starting a fresh budget. Returns whether a
+    /// failed batch was due for it.
+    pub fn retry_failed_convergence_pass(&mut self, group_id: &GroupId) -> Result<bool, StorageError> {
+        let Some(mut pass) = self.storage.convergence_pass(group_id)? else {
+            return Ok(false);
+        };
+        if !pass.is_active() {
+            return Ok(false);
+        }
+        let now = self.convergence_now();
+        let Some(retry) = pass.retry.as_mut() else {
+            return Ok(false);
+        };
+        let was_parked = retry.is_parked();
+        retry.next_attempt_monotonic_ms = now.monotonic_ms;
+        retry.next_attempt_wall_ms = now.wall_ms;
+        retry.parked_at_wall_ms = None;
+        let failed_attempts = retry.failed_attempts;
+        pass.clock_instance_id = self.convergence_clock_instance_id;
+        self.storage.put_convergence_pass(&pass)?;
+        self.audit_group(
+            group_id,
+            marmot_forensics::AuditEventKind::ConvergenceRunState {
+                phase: ConvergencePhase::Waiting,
+                current_tip_epoch: Some(pass.base_epoch.0),
+                retained_anchor_horizon: None,
+                reason: Some("pass_retry_requested".to_string()),
+                error_kind: None,
+            },
+        );
+        tracing::info!(
+            target: "cgka_engine::distributed_convergence",
+            method = "retry_failed_convergence_pass",
+            failed_attempts,
+            was_parked,
+            "explicit retry of a failed convergence pass"
+        );
+        self.schedule_pending_convergence_group(group_id);
+        Ok(true)
     }
 
     /// Install the process-wide convergence policy.

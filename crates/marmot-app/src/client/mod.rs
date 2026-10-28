@@ -2685,6 +2685,7 @@ impl AppClient {
             epoch: group.epoch.0,
             member_count: crate::groups::member_account_count(&group.members),
             unrecoverable: group.unrecoverable,
+            convergence_parked: self.runtime.convergence_pass_parked(group_id)?,
             required_app_components: group
                 .required_capabilities
                 .app_components
@@ -6193,6 +6194,9 @@ impl AppClient {
         // pass re-syncs routes before checkpointing. Refuse it up front rather
         // than publish and then fail that checkpoint.
         self.sync_runtime_groups().await?;
+        // An explicit retry is the user's evidence: a parked or backing-off
+        // pass makes its next attempt now (mdk#2684).
+        self.runtime.retry_failed_convergence_pass(group_id)?;
         let effects = self.runtime.advance_convergence(group_id).await?;
         self.observe_convergence_retry_effects(group_id, &effects)
             .await
