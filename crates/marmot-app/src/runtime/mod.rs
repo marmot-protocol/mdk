@@ -2252,6 +2252,30 @@ impl MarmotAppRuntime {
             .await
     }
 
+    /// Whether this account can turn on account-devices in `group_id` now.
+    /// Aggregate only: never which members or devices hold it back.
+    pub async fn account_devices_activation(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<crate::AppAccountDevicesActivation, AppError> {
+        self.accounts
+            .account_devices_activation(account_ref, group_id)
+            .await
+    }
+
+    /// Turn on account-devices in `group_id` in one admin Commit. Only call
+    /// this when the user asks.
+    pub async fn enable_account_devices(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .enable_account_devices(account_ref, group_id)
+            .await
+    }
+
     pub async fn disband_group(
         &self,
         account_ref: &str,

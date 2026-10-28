@@ -28,7 +28,7 @@ use cgka_traits::engine::{
     SendIntent, SendResult, SupersededIntentReport,
 };
 use cgka_traits::engine_state::PendingStateRef;
-use cgka_traits::error::EngineError;
+use cgka_traits::error::{AccountDevicesActivationRefusal, EngineError};
 use cgka_traits::group::{Group, Member, ProtocolProfile};
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::maintenance::{
@@ -1501,6 +1501,16 @@ impl AccountDeviceSession {
         self.engine.disbanding_support_blockers(group_id)
     }
 
+    /// Why this device cannot turn on `marmot.group.account-devices.v1` in
+    /// `group_id` now, or `None` when it can. Aggregate: never which members
+    /// or devices block it.
+    pub fn account_devices_activation_refusal(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<AccountDevicesActivationRefusal>, EngineError> {
+        self.engine.account_devices_activation_refusal(group_id)
+    }
+
     pub fn acknowledge_disband_failure(&self, group_id: &GroupId) -> Result<bool, EngineError> {
         self.engine.acknowledge_disband_failure(group_id)
     }
@@ -1686,6 +1696,7 @@ fn send_intent_kind(intent: &SendIntent) -> &'static str {
         SendIntent::UpdateAppComponents { .. } => "update_app_components",
         SendIntent::UpdateGroupData { .. } => "update_group_data",
         SendIntent::EnableDisbanding { .. } => "enable_disbanding",
+        SendIntent::EnableAccountDevices { .. } => "enable_account_devices",
         SendIntent::Disband { .. } => "disband",
     }
 }

@@ -91,6 +91,16 @@ pub enum EngineError {
     #[error("group disbanding is not enabled")]
     DisbandingNotEnabled { group_id: GroupId },
 
+    /// This device cannot turn on `marmot.group.account-devices.v1` in the
+    /// group (account-devices-v1.md, "Activation in an existing group").
+    /// Refused before anything is staged. `reason` is aggregate: it never
+    /// names which members or devices block activation.
+    #[error("account-devices activation refused: {reason}")]
+    AccountDevicesActivationRefused {
+        group_id: GroupId,
+        reason: AccountDevicesActivationRefusal,
+    },
+
     /// The configured MLS ciphersuite is not the Marmot mandatory-to-implement
     /// ciphersuite. Per `spec/foundation/mls-protocol.md`, Marmot requires
     /// `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (id `0x0001`); building an
@@ -278,6 +288,9 @@ impl EngineError {
             EngineError::MissingRequiredCapabilities { .. } => "missing_required_capabilities",
             EngineError::DisbandingUnsupportedMembers { .. } => "disbanding_unsupported_members",
             EngineError::DisbandingNotEnabled { .. } => "disbanding_not_enabled",
+            EngineError::AccountDevicesActivationRefused { .. } => {
+                "account_devices_activation_refused"
+            }
             EngineError::UnsupportedCiphersuite { .. } => "unsupported_ciphersuite",
             EngineError::InvalidAppMessagePayload(_) => "invalid_app_message_payload",
             EngineError::InvalidAccountIdentityProof(_) => "invalid_account_identity_proof",
@@ -314,6 +327,50 @@ impl EngineError {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         matches!(self, EngineError::Storage(e) if e.is_transient())
+    }
+}
+
+/// Why a group cannot turn on `marmot.group.account-devices.v1` now
+/// (account-devices-v1.md, "Activation in an existing group"). Each reason is
+/// a fact about the whole group, never about a particular member or device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountDevicesActivationRefusal {
+    /// This device's account is not an active admin. Only an admin may change
+    /// the required-component list.
+    NotAdmin,
+    /// The group already requires the component.
+    AlreadyRequired,
+    /// The group is on the legacy profile, which never requires it.
+    LegacyProfile,
+    /// At least one current leaf does not advertise the component, so the
+    /// activation Commit would break the support invariant.
+    UnsupportedLeaves,
+    /// At least one current leaf carries data under the component's id, which
+    /// it defines none of. That leaf has to be replaced first.
+    LeafCarriesData,
+    /// At least one account has more than `max_leaves_per_account` leaves.
+    LeafLimitExceeded,
+}
+
+impl AccountDevicesActivationRefusal {
+    /// Stable snake_case name, safe for logs and status output.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAdmin => "not_admin",
+            Self::AlreadyRequired => "already_required",
+            Self::LegacyProfile => "legacy_profile",
+            Self::UnsupportedLeaves => "unsupported_leaves",
+            Self::LeafCarriesData => "leaf_carries_data",
+            Self::LeafLimitExceeded => "leaf_limit_exceeded",
+        }
+    }
+}
+
+impl std::fmt::Display for AccountDevicesActivationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

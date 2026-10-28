@@ -25,6 +25,7 @@ per feature.
   [KeyPackage inventory](#keypackage-inventory), [invitation lookup outcomes](#invitation-lookup-outcomes), [selected chat-list presentation](#selected-chat-list-presentation),
   [chat screens and avatars](#chat-screens-and-avatars),
   [history may be incomplete notices](#history-may-be-incomplete-notices), [group reporting](#group-reporting),
+  [turning on account devices](#turning-on-account-devices),
   [host-driven agent publishing](#host-driven-agent-publishing),
   [audit v5 recording and delivery](#audit-v5-recording-and-delivery), [legacy audit v4 upload](#legacy-audit-v4-upload)
 - [Smoke test and example](#smoke-test-and-example)
@@ -469,6 +470,13 @@ status is returned.
 The C ABI mirrors the [shared reporting operations](../marmot-uniffi/README.md#group-reporting). Pages are capped at
 100 and cursors are exclusive. Deep-free returned pages with `marmot_content_report_page_free` or
 `marmot_report_dismissal_page_free`; the reported message uses the ordinary timeline record and its free function.
+
+## Turning on account devices
+
+The C ABI mirrors the [shared flow](../marmot-uniffi/README.md#turning-on-account-devices). Call
+`marmot_account_devices_activation` and offer `marmot_enable_account_devices` only on
+`MARMOT_ACCOUNT_DEVICES_ACTIVATION_ELIGIBLE`. A refused activation returns
+`MARMOT_STATUS_ACCOUNT_DEVICES_ACTIVATION_REFUSED`; the last-error detail names the aggregate reason.
 
 ## Host-driven agent publishing
 

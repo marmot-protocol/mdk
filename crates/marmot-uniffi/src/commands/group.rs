@@ -10,11 +10,11 @@ use cgka_traits::GroupId;
 
 use crate::Marmot;
 use crate::conversions::{
-    AppBlobEndpointFfi, AppGroupMemberIdsFfi, AppGroupMemberRecordFfi, AppGroupMlsStateFfi,
-    AppGroupRecordFfi, AppQuarantinedGroupFfi, CreatedGroupFfi, DisbandRequestFfi,
-    GroupAppComponentFfi, GroupCommitDeliveryFfi, GroupConversationSnapshotFfi, GroupDetailsFfi,
-    GroupInviteDeclineResultFfi, GroupMaintenanceStatusFfi, GroupManagementStateFfi,
-    GroupMemberActionStateFfi, GroupMutationResultFfi, GroupRosterFfi,
+    AccountDevicesActivationFfi, AppBlobEndpointFfi, AppGroupMemberIdsFfi, AppGroupMemberRecordFfi,
+    AppGroupMlsStateFfi, AppGroupRecordFfi, AppQuarantinedGroupFfi, CreatedGroupFfi,
+    DisbandRequestFfi, GroupAppComponentFfi, GroupCommitDeliveryFfi, GroupConversationSnapshotFfi,
+    GroupDetailsFfi, GroupInviteDeclineResultFfi, GroupMaintenanceStatusFfi,
+    GroupManagementStateFfi, GroupMemberActionStateFfi, GroupMutationResultFfi, GroupRosterFfi,
     KeyPackageMaintenanceStatusFfi, MaintenanceRunSummaryFfi, MemberRefFfi,
     PeriodicMaintenancePolicyFfi, SendSummaryFfi, group_conversation_snapshot_ffi,
     group_details_from_conversation_snapshot_ffi, group_id_from_hex, group_management_state_ffi,
@@ -719,6 +719,46 @@ impl Marmot {
         let summary = self
             .runtime
             .enable_group_disbanding(&account_ref, &group_id)
+            .await?;
+        group_mutation_result_for(self, &account_ref, &group_id, &group_id_hex, summary.into())
+            .await
+    }
+
+    /// Whether this account can turn on account-devices in the group now, so
+    /// its own devices can later add and remove each other there without an
+    /// admin. Ask before offering `enable_account_devices`. The answer is
+    /// about the whole group and never names the members or devices that
+    /// hold it back.
+    pub async fn account_devices_activation(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<AccountDevicesActivationFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .account_devices_activation(&account_ref, &group_id)
+            .await?
+            .into())
+    }
+
+    /// Turn on account-devices in one admin Commit. Call it only when the user
+    /// asks; it can never be turned off. Refused with
+    /// `AccountDevicesActivationRefused` unless `account_devices_activation`
+    /// would answer `Eligible`.
+    pub async fn enable_account_devices(
+        &self,
+        account_ref: String,
+        group_id_hex: String,
+    ) -> Result<GroupMutationResultFfi, MarmotKitError> {
+        let group_id = group_id_from_hex(&group_id_hex)?;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let state =
+            group_management_state_for(self, &account_ref, &group_id, &group_id_hex).await?;
+        ensure_group_admin(&state, &group_id_hex)?;
+        let summary = self
+            .runtime
+            .enable_account_devices(&account_ref, &group_id)
             .await?;
         group_mutation_result_for(self, &account_ref, &group_id, &group_id_hex, summary.into())
             .await

@@ -13,8 +13,8 @@
 //! - [`Engine::app_component_support_blockers`]: which members' leaves do not
 //!   advertise a component yet, i.e. what keeps a group from being eligible.
 //!
-//! Activating a component (requiring it in GroupContext) is not here; it lands
-//! with its first caller.
+//! Activating a component (requiring it in GroupContext) is not here:
+//! account-devices activation is `crate::account_devices_activation`.
 
 use std::collections::BTreeSet;
 

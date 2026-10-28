@@ -32,6 +32,7 @@
 //! - [`app_components`] - Marmot app-component state in `app_data_dictionary`.
 //! - [`commit_class`] - the one class that decides a Commit's authority and priority.
 
+mod account_devices_activation;
 pub mod account_identity_proof;
 pub mod app_components;
 

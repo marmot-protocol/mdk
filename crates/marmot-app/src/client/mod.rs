@@ -3358,6 +3358,61 @@ impl AppClient {
         Ok(send_summary_from_effects(&effects))
     }
 
+    /// Whether this device can turn on account-devices in `group_id` now. An
+    /// advisory read for offering the action; [`Self::enable_account_devices`]
+    /// checks again on the state its Commit is prepared on.
+    pub fn account_devices_activation(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::AppAccountDevicesActivation, AppError> {
+        self.ensure_group(group_id)?;
+        Ok(self
+            .runtime
+            .account_devices_activation_refusal(group_id)?
+            .into())
+    }
+
+    /// Require `marmot.group.account-devices.v1` in one admin Commit, because
+    /// the user asked: nothing else turns it on. Refused before anything is
+    /// published unless [`Self::account_devices_activation`] would say
+    /// `Eligible`.
+    pub async fn enable_account_devices(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
+        self.ensure_group(group_id)?;
+        self.ensure_group_change_admitted(group_id)?;
+        let audit_context = Self::local_human_action_context(
+            "enable_account_devices",
+            vec!["app_components"],
+            vec![
+                cgka_traits::app_components::APP_COMPONENTS_COMPONENT_ID,
+                cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID,
+            ],
+            None,
+        );
+        self.sync_runtime_groups_for_send("enable_account_devices")
+            .await?;
+        let effects = self
+            .runtime
+            .send_with_audit_context(
+                SendIntent::EnableAccountDevices {
+                    group_id: group_id.clone(),
+                },
+                audit_context.clone(),
+            )
+            .await?;
+        self.observe_recovery_evidence_then_fail_if_publish_failed(&effects)
+            .await?;
+        self.record_human_action_succeeded(group_id, &audit_context, &effects);
+        self.remember_published_reports(&effects);
+        self.refresh_group(group_id);
+        self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        // Like enabling disbanding, this changes what the group allows, not
+        // its history, so it emits no kind-1210 system row.
+        Ok(send_summary_from_effects(&effects))
+    }
+
     /// Persist the irreversible request and return without waiting for the
     /// disband Commit or its mandatory convergence pass.
     pub async fn disband_group(

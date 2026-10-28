@@ -31,6 +31,17 @@ versioning through the workspace version in the root `Cargo.toml`.
   vectors gain an `account_devices_state` expectation that checks the component's state rules on a client's exact
   state. Four vectors cover activation, activation refused while a member lacks support, and activation racing an
   invite of a member without support, with each side winning once.
+- `SendIntent::EnableAccountDevices` turns on `marmot.group.account-devices.v1` (0x800d) in an existing group, in one
+  admin Commit that adds it to the required list and removes any GroupContext entry left under its id (mdk#2628). The
+  engine never sends it by itself. It is refused before anything is staged with
+  `EngineError::AccountDevicesActivationRefused` and an aggregate `AccountDevicesActivationRefusal` when the group
+  already requires the component, is on the legacy profile, has a leaf that does not advertise it or carries data
+  under its id, or has an account over the leaf limit; a non-admin gets `NotGroupAdmin`.
+  `Engine::account_devices_activation_refusal` gives the same answer to a host deciding whether to offer it. A send
+  that has to wait for convergence is checked before it is queued; if the settled state then refuses it, the drain
+  retires it instead of failing every later drain. The
+  conformance simulator's `require_account_devices` now sends this intent, so the activation vectors that expect a
+  refusal name `account_devices_activation_refused` instead of `other`.
 - The engine gains two send intents for a device's own account in a group that requires
   `marmot.group.account-devices.v1` (0x800d) (mdk#2628). `SendIntent::AddOwnAccountDevices` adds devices of the
   sender's account from KeyPackages the caller supplies and sends one Welcome rumor per KeyPackage, as an invite does.

@@ -15,6 +15,13 @@ Versions track the workspace version; releases are tagged `marmotc-v<version>`.
 
 ### Added
 
+- `marmot_account_devices_activation` and `marmot_enable_account_devices` let
+  an admin turn on account-devices in an existing group, only when the user
+  asks (mdk#2628). The first writes a `MarmotAccountDevicesActivation` that
+  never names which members or devices hold the group back; a refused
+  activation returns the new `MARMOT_STATUS_ACCOUNT_DEVICES_ACTIVATION_REFUSED`
+  (110). Existing status values are unchanged. Use matching regenerated
+  headers and libraries.
 - Add `MARMOT_STATUS_MEDIA_REFERENCE_STALE_EPOCH` (108): the group left the
   epoch an attachment was encrypted under, so upload it again; and
   `MARMOT_STATUS_MEDIA_REFERENCE_EPOCH_UNSETTLED` (109): the group's epoch is

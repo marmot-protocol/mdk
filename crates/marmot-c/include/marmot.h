@@ -237,6 +237,12 @@ enum MarmotStatus
    * sync and send again (mdk#2158).
    */
   MARMOT_STATUS_MEDIA_REFERENCE_EPOCH_UNSETTLED = 109,
+  /**
+   * The group cannot turn on account-devices now; the detail names the
+   * aggregate reason `marmot_account_devices_activation` reports. It never
+   * names which members or devices hold the group back.
+   */
+  MARMOT_STATUS_ACCOUNT_DEVICES_ACTIVATION_REFUSED = 110,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -733,6 +739,20 @@ typedef enum MarmotPresentationResolution {
   MARMOT_PRESENTATION_RESOLUTION_LAST_KNOWN,
   MARMOT_PRESENTATION_RESOLUTION_FALLBACK,
 } MarmotPresentationResolution;
+
+/**
+ * Whether the account can turn on account-devices in a group now. Every
+ * answer is about the whole group, never which members or devices.
+ */
+typedef enum MarmotAccountDevicesActivation {
+  MARMOT_ACCOUNT_DEVICES_ACTIVATION_ELIGIBLE,
+  MARMOT_ACCOUNT_DEVICES_ACTIVATION_NOT_ADMIN,
+  MARMOT_ACCOUNT_DEVICES_ACTIVATION_ALREADY_ENABLED,
+  MARMOT_ACCOUNT_DEVICES_ACTIVATION_LEGACY_GROUP,
+  MARMOT_ACCOUNT_DEVICES_ACTIVATION_MEMBERS_NEED_UPDATE,
+  MARMOT_ACCOUNT_DEVICES_ACTIVATION_DEVICES_NEED_REPLACEMENT,
+  MARMOT_ACCOUNT_DEVICES_ACTIVATION_DEVICE_LIMIT_EXCEEDED,
+} MarmotAccountDevicesActivation;
 
 /**
  * How far an account's setup has progressed.
@@ -8559,6 +8579,40 @@ MarmotStatus marmot_enable_group_disbanding(const struct MarmotClient *client,
                                             const char *account_ref,
                                             const char *group_id_hex,
                                             struct MarmotGroupMutationResult **out);
+
+/**
+ * Whether the account can turn on account-devices in the group now.
+ * Ask before offering `marmot_enable_account_devices`. The answer is
+ * about the whole group, never which members or devices hold it back.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_account_devices_activation(const struct MarmotClient *client,
+                                               const char *account_ref,
+                                               const char *group_id_hex,
+                                               enum MarmotAccountDevicesActivation *out);
+
+/**
+ * Turn on account-devices in one admin Commit, only when the user asks;
+ * it can never be turned off. Returns
+ * `MARMOT_STATUS_ACCOUNT_DEVICES_ACTIVATION_REFUSED` unless
+ * `marmot_account_devices_activation` would answer `ELIGIBLE`. Free with
+ * `marmot_group_mutation_result_free`.
+ *
+ * # Safety
+ * `client` must be a live handle; string arguments must be valid
+ * NUL-terminated strings (nullable ones may be NULL); array
+ * arguments must hold their stated length (or be NULL with
+ * length 0); out-pointers must be valid.
+ */
+MarmotStatus marmot_enable_account_devices(const struct MarmotClient *client,
+                                           const char *account_ref,
+                                           const char *group_id_hex,
+                                           struct MarmotGroupMutationResult **out);
 
 /**
  * Request terminal disbanding of the group. Writes this account's

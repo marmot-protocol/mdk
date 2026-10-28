@@ -4,6 +4,11 @@
 
 ### Breaking changes
 
+- `MarmotKitError` adds `AccountDevicesActivationRefused { group_id_hex, reason }`
+  for an `enable_account_devices` call the group cannot take now (mdk#2628).
+  Update exhaustive Swift/Kotlin handling and regenerate bindings with the
+  matching native library.
+
 - `MarmotDeploymentFfi` drops `key_package_preferred_clients` and
   `key_package_last_clients` (mdk#2628): the KeyPackage `client` tag no longer
   ranks invite candidates. Remove them from any record a host builds field by
@@ -18,6 +23,17 @@
   again; the second means the epoch is settling, so sync and send again. Update
   exhaustive Swift/Kotlin handling and regenerate bindings with the matching
   native library (#2158).
+
+### Added
+
+- An admin can turn on account-devices in an existing group (mdk#2628):
+  `enable_account_devices(account_ref, group_id_hex)` sends one admin Commit,
+  only when the user asks, and the group can never turn it off.
+  `account_devices_activation(account_ref, group_id_hex)` answers whether the
+  group is eligible with an `AccountDevicesActivationFfi` (`Eligible`,
+  `NotAdmin`, `AlreadyEnabled`, `LegacyGroup`, `MembersNeedUpdate`,
+  `DevicesNeedReplacement`, `DeviceLimitExceeded`) that never names which members or devices hold it
+  back. See the README's "Turning on account devices".
 
 ### Changed
 

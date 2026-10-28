@@ -251,6 +251,14 @@ pub enum MarmotKitError {
     },
     #[error("group {group_id_hex} has not enabled disbanding")]
     DisbandingNotEnabled { group_id_hex: String },
+    /// The group cannot turn on account-devices now. `reason` is the same
+    /// aggregate answer `Marmot::account_devices_activation` gives, never
+    /// `Eligible`; it never names which members or devices hold it back.
+    #[error("group {group_id_hex} cannot turn on account-devices now: {reason:?}")]
+    AccountDevicesActivationRefused {
+        group_id_hex: String,
+        reason: crate::conversions::AccountDevicesActivationFfi,
+    },
     #[error("group {group_id_hex} is disbanding or disbanded")]
     GroupDisbanding { group_id_hex: String },
     /// This device was removed from the group; it goes on without us. Kept
@@ -700,6 +708,12 @@ impl MarmotKitError {
             EngineError::DisbandingNotEnabled { group_id } => Self::DisbandingNotEnabled {
                 group_id_hex: hex::encode(group_id.as_slice()),
             },
+            EngineError::AccountDevicesActivationRefused { group_id, reason } => {
+                Self::AccountDevicesActivationRefused {
+                    group_id_hex: hex::encode(group_id.as_slice()),
+                    reason: marmot_app::AppAccountDevicesActivation::from(Some(*reason)).into(),
+                }
+            }
             EngineError::UnknownMember { group_id, member } => Self::MemberNotInGroup {
                 group_id_hex: hex::encode(group_id.as_slice()),
                 member_id_hex: hex::encode(member.as_slice()),
@@ -929,6 +943,52 @@ mod tests {
                 assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
             }
             other => panic!("expected DisbandingNotEnabled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn account_devices_activation_refusal_crosses_ffi_with_its_aggregate_reason() {
+        use crate::conversions::AccountDevicesActivationFfi;
+        use cgka_traits::error::AccountDevicesActivationRefusal as Refusal;
+        let group_id = cgka_traits::GroupId::new(vec![0x22; 16]);
+        for (reason, expected) in [
+            (Refusal::NotAdmin, AccountDevicesActivationFfi::NotAdmin),
+            (
+                Refusal::AlreadyRequired,
+                AccountDevicesActivationFfi::AlreadyEnabled,
+            ),
+            (
+                Refusal::LegacyProfile,
+                AccountDevicesActivationFfi::LegacyGroup,
+            ),
+            (
+                Refusal::UnsupportedLeaves,
+                AccountDevicesActivationFfi::MembersNeedUpdate,
+            ),
+            (
+                Refusal::LeafCarriesData,
+                AccountDevicesActivationFfi::DevicesNeedReplacement,
+            ),
+            (
+                Refusal::LeafLimitExceeded,
+                AccountDevicesActivationFfi::DeviceLimitExceeded,
+            ),
+        ] {
+            let ffi =
+                MarmotKitError::from_engine_error(&EngineError::AccountDevicesActivationRefused {
+                    group_id: group_id.clone(),
+                    reason,
+                });
+            match ffi {
+                MarmotKitError::AccountDevicesActivationRefused {
+                    group_id_hex,
+                    reason,
+                } => {
+                    assert_eq!(group_id_hex, hex::encode(group_id.as_slice()));
+                    assert_eq!(reason, expected);
+                }
+                other => panic!("expected AccountDevicesActivationRefused, got {other:?}"),
+            }
         }
     }
 

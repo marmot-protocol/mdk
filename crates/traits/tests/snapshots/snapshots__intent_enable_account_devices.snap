@@ -1,0 +1,14 @@
+---
+source: crates/traits/tests/snapshots.rs
+expression: "SendIntent::EnableAccountDevices { group_id: gid() }"
+---
+{
+  "EnableAccountDevices": {
+    "group_id": [
+      170,
+      170,
+      170,
+      170
+    ]
+  }
+}

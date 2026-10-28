@@ -74,7 +74,7 @@
       {
         "type": "expect_require_account_devices_error",
         "client": "alice",
-        "error": "other"
+        "error": "account_devices_activation_refused"
       },
       {
         "type": "set_account_devices_support",
@@ -141,7 +141,7 @@
       "step_index": 6,
       "client": "alice",
       "operation": "require_account_devices",
-      "error": "other"
+      "error": "account_devices_activation_refused"
     },
     {
       "type": "pending_resolution",
