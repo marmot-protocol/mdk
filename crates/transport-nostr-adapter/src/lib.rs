@@ -2955,8 +2955,8 @@ impl ReplaySupervisor {
                     let owed = paging.credit.is_some()
                         && guard
                             .account_replay_coverage
-                            .get(&self.account_id)
-                            .is_some_and(|coverage| coverage.capture_still_owed(paging));
+                            .get_mut(&self.account_id)
+                            .is_some_and(|coverage| coverage.defer_capture_loss(paging));
                     if !owed {
                         guard
                             .replay_losses
@@ -3765,6 +3765,10 @@ struct ReplayEndpoint {
     boundary_admitted: bool,
     /// The owner takes this ticket; frontend cancellation cannot orphan it.
     queued: Option<ReplayPaging>,
+    /// The oldest loss floor a cut capture left unrecorded because the
+    /// source still awaited the owner. Only a finished capture clears it;
+    /// any other way the source is readmitted or retired records it.
+    loss_debt: Option<u64>,
     cancellation: NostrAcquisitionCancellation,
 }
 
@@ -4397,6 +4401,7 @@ impl AccountReplayCoverage {
                             capturing: false,
                             boundary_admitted: false,
                             queued: None,
+                            loss_debt: None,
                             cancellation: self.cancellation.child_token(),
                         },
                     )
@@ -4495,8 +4500,37 @@ impl AccountReplayCoverage {
         let discarded = self.drop_claims(group_id, claims);
         if force || (discarded && !(refetch && reason == ReplayAbandon::Cut)) {
             self.record_loss(since);
+        } else if discarded {
+            self.defer_loss(&owner.request, owner.relay, since);
         }
         self.wake_replay();
+    }
+
+    /// Hold a cut capture's loss on its endpoint until the source is either
+    /// admitted by a finished capture or readmitted or retired another way.
+    fn defer_loss(&mut self, id: &str, relay: RelayIndex, since: u64) {
+        if let Some(endpoint) = self
+            .endpoint_deadlines
+            .get_mut(id)
+            .and_then(|relays| relays.get_mut(&relay))
+        {
+            endpoint.loss_debt = Some(endpoint.loss_debt.map_or(since, |debt| debt.min(since)));
+        } else {
+            self.record_loss(since);
+        }
+    }
+
+    /// Record a cut capture's deferred loss: the source no longer waits for
+    /// the owner's capture to fetch that window again.
+    fn charge_loss_debt(&mut self, id: &str, relay: RelayIndex) {
+        if let Some(since) = self
+            .endpoint_deadlines
+            .get_mut(id)
+            .and_then(|relays| relays.get_mut(&relay))
+            .and_then(|endpoint| endpoint.loss_debt.take())
+        {
+            self.record_loss(since);
+        }
     }
 
     fn stage_ready(
@@ -4928,6 +4962,16 @@ impl AccountReplayCoverage {
         for (group_id, owner) in &owners {
             self.abandon_stream(group_id, owner, ReplayAbandon::Unfinished);
         }
+        if let Some(floor) = self
+            .endpoint_deadlines
+            .get_mut(id)
+            .into_iter()
+            .flat_map(HashMap::values_mut)
+            .filter_map(|endpoint| endpoint.loss_debt.take())
+            .min()
+        {
+            self.record_loss(floor);
+        }
         for (group_id, owner) in owners {
             let group = self
                 .groups
@@ -5040,6 +5084,15 @@ impl AccountReplayCoverage {
         {
             self.record_loss(self.retained_since.unwrap_or(0));
         }
+        if let Some(floor) = self
+            .endpoint_deadlines
+            .values_mut()
+            .flat_map(HashMap::values_mut)
+            .filter_map(|endpoint| endpoint.loss_debt.take())
+            .min()
+        {
+            self.record_loss(floor);
+        }
         self.retain_supplements();
         self.unplaced
             .retain(|id, _| self.native_ids.contains_key(id));
@@ -5100,6 +5153,10 @@ impl AccountReplayCoverage {
             return None;
         }
         let window = self.windows.get(id)?.clone();
+        if restart == ReplayStart::Connection {
+            // A plain reconnect readmits the source without the owner's capture.
+            self.charge_loss_debt(id, relay);
+        }
         self.source_serial += 1;
         let serial = self.source_serial;
         let deadline = tokio::time::Instant::now() + REPLAY_PAGE_LIMITS.max_duration;
@@ -5429,6 +5486,8 @@ impl AccountReplayCoverage {
         };
         endpoint.capturing = false;
         endpoint.deadline = None;
+        // The finished capture fetched the window the cut left owed.
+        endpoint.loss_debt = None;
         if let Some(replay) = self.replay_mut(id, relay) {
             *replay = RelayReplay::Eose;
         }
@@ -5506,6 +5565,7 @@ impl AccountReplayCoverage {
             return;
         }
         *replay = RelayReplay::Refused;
+        self.charge_loss_debt(id, relay);
         if let Some(endpoint) = self
             .endpoint_deadlines
             .get_mut(id)
@@ -5641,6 +5701,16 @@ impl AccountReplayCoverage {
                 .get(&paging.subscription_id)
                 .and_then(|relays| relays.get(&paging.relay))
                 == Some(&RelayReplay::Incomplete)
+    }
+
+    /// Defer the loss of a discarded page body while its capture's source
+    /// still awaits the owner; false when the loss must be recorded now.
+    fn defer_capture_loss(&mut self, paging: &ReplayPaging) -> bool {
+        if !self.capture_still_owed(paging) {
+            return false;
+        }
+        self.defer_loss(&paging.subscription_id, paging.relay, paging.window.since);
+        true
     }
 
     fn start_route(&mut self, paging: &ReplayPaging, window: &ReplayWindow) -> bool {
@@ -7965,6 +8035,72 @@ mod batch_tests {
                 .restart_request(&id, RelayIndex(2), ReplayStart::Capture)
                 .is_some(),
             "the next grant captures the same source again"
+        );
+    }
+
+    /// A cut capture's loss is only deferred. A reconnect or refusal that
+    /// readmits or retires the source without a finished capture records it;
+    /// a later capture that finishes clears it.
+    #[tokio::test(start_paused = true)]
+    async fn cut_capture_loss_debt_is_charged_unless_a_capture_finishes() {
+        let account = MemberId::new(vec![0xA1; 32]);
+        let (tx, _rx) = mpsc::channel(4);
+        let cut = |coverage: &mut AccountReplayCoverage, id: &str| {
+            coverage.record_eose(id, RelayIndex(1), 0);
+            let paging = paging_for(coverage, id);
+            let routes = paging.window.per_route();
+            assert!(coverage.start_route(&paging, &routes[0]));
+            coverage
+                .stage_delivery(
+                    group_delivery(id, GroupId::new(vec![0; 16]), vec![0; 32], 7),
+                    Some(RelayIndex(2)),
+                    ReplayInput::Page,
+                    &tx,
+                )
+                .unwrap();
+            coverage.stop_capture(id, RelayIndex(2));
+        };
+
+        let (mut coverage, id, losses) = replay_coverage(1);
+        cut(&mut coverage, &id);
+        assert!(losses.pending.lock().unwrap().is_empty());
+        coverage.restart_relay(
+            RelayIndex(2),
+            ReplayRestart::Connection,
+            ReplayOrigin::Changed,
+        );
+        assert_eq!(
+            losses.pending.lock().unwrap().get(&account),
+            Some(&NostrNotificationLossFloor::Since(100)),
+            "a reconnect readmits the source without the capture"
+        );
+
+        let (mut coverage, id, losses) = replay_coverage(1);
+        cut(&mut coverage, &id);
+        coverage.record_refusal(&id, RelayIndex(2), SubscriptionRefusalDisposition::Dropped);
+        assert_eq!(
+            losses.pending.lock().unwrap().get(&account),
+            Some(&NostrNotificationLossFloor::Since(100)),
+            "a refusal retires the source without the capture"
+        );
+
+        let (mut coverage, id, losses) = replay_coverage(1);
+        cut(&mut coverage, &id);
+        let paging = paging_for(&mut coverage, &id);
+        for route in paging.window.per_route() {
+            assert!(coverage.start_route(&paging, &route));
+            assert!(coverage.finish_route(&paging, &route));
+        }
+        coverage.finish_paging(&id, RelayIndex(2));
+        assert_eq!(
+            coverage.subscriptions[&id][&RelayIndex(2)],
+            RelayReplay::Eose
+        );
+        coverage.record_refusal(&id, RelayIndex(2), SubscriptionRefusalDisposition::Dropped);
+        coverage.remove_subscription(&id);
+        assert!(
+            losses.pending.lock().unwrap().is_empty(),
+            "the finished capture fetched the window the cut left owed"
         );
     }
 
