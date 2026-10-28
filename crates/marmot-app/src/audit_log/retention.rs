@@ -181,9 +181,15 @@ impl MarmotApp {
         } else {
             None
         };
-        let registration = slot
-            .as_ref()
-            .map(|slot| slot.lock().unwrap_or_else(|p| p.into_inner()));
+        // An opener holding this slot may still need storage admission.
+        // Never wait on it while holding a lifecycle reader: a queued close
+        // would otherwise block that opener's next read and deadlock all three.
+        let registration = match slot.as_ref().map(|slot| slot.try_lock()) {
+            Some(Ok(guard)) => Some(guard),
+            Some(Err(std::sync::TryLockError::Poisoned(error))) => Some(error.into_inner()),
+            Some(Err(std::sync::TryLockError::WouldBlock)) => return Ok(false),
+            None => None,
+        };
         let recorder = registration
             .as_ref()
             .and_then(|registration| registration.as_ref())
@@ -529,5 +535,23 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fs::read_dir(account).unwrap().count(), 100); // Scanner never deletes.
+    }
+    #[test]
+    fn audit_retention_defers_a_candidate_while_its_account_is_opening() {
+        let root = tempfile::tempdir().unwrap();
+        let home = marmot_account::AccountHome::open(root.path());
+        home.create_account("alice").unwrap();
+        let app = MarmotApp::with_relays_and_account_home(root.path(), Vec::new(), home);
+        let path = app
+            .account_dir("alice")
+            .join(format!("audit-{}-v5-seg000001.jsonl", "a".repeat(32)));
+        fs::write(&path, b"old").unwrap();
+        age(&path, UNIX_EPOCH);
+        let slot = app.audit_recorder_slot("alice");
+        let opening = slot.lock().unwrap();
+        assert!(!app.expire_audit_file(&path).unwrap());
+        assert!(path.exists());
+        drop(opening);
+        assert!(app.expire_audit_file(&path).unwrap());
     }
 }
