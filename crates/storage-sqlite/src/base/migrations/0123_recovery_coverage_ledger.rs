@@ -51,9 +51,11 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         run(&mut conn, &MIGRATIONS[..123]).unwrap();
         let rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM account_recovery_coverage", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM account_recovery_coverage",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(rows, 0);
         assert!(

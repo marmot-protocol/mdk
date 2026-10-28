@@ -148,10 +148,11 @@ impl AppClient {
             .into_iter()
             .map(|current| current.route)
             .collect::<Vec<_>>();
-        if let Err(error) = self
-            .coverage_storage()
-            .and_then(|storage| Ok(storage.app_storage().uncover_recovery_coverage(&routes, floor)?))
-        {
+        if let Err(error) = self.coverage_storage().and_then(|storage| {
+            Ok(storage
+                .app_storage()
+                .uncover_recovery_coverage(&routes, floor)?)
+        }) {
             log_failure("record_coverage_loss", &error);
         }
     }
@@ -258,14 +259,9 @@ impl AppClient {
             .collect::<Vec<_>>();
         let mut slices = Vec::new();
         for comparison in compared.iter().filter(|comparison| comparison.certified) {
-            for (window, required) in grant
-                .inventory
-                .iter()
-                .zip(&required)
-                .filter(|(window, _)| {
-                    window.route == comparison.route && window.since <= window.until
-                })
-            {
+            for (window, required) in grant.inventory.iter().zip(&required).filter(|(window, _)| {
+                window.route == comparison.route && window.since <= window.until
+            }) {
                 for relay in required {
                     slices.push(RecoveryCoverageSlice {
                         route: &window.route,

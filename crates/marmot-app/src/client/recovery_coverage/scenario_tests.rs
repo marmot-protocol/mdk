@@ -123,7 +123,6 @@ async fn ledger_and_obligations_agree_through_a_normal_catch_up() {
     let caught_up = report(&fixture).await;
     assert_eq!(caught_up.disagreements(), 0, "{caught_up:?}");
     for route in &routes {
-        eprintln!("DEBUG inbox={} relay={} ranges={:?}", matches!(route, TransportReconciliationRoute::Inbox), relay(), app.recovery_coverage_ranges(route, &relay()).unwrap());
         let live = app.recovery_coverage_ranges(route, &relay()).unwrap();
         assert!(
             live.iter()
@@ -201,10 +200,7 @@ async fn pending_loss_keeps_live_boundaries_from_re_covering_it() {
     let floor = unix_now_seconds().saturating_sub(30);
     app.record_account_delivery_loss_bounded("alice", 41, 3, unix_now_seconds(), Some(floor))
         .unwrap();
-    fixture
-        .client
-        .synchronize_recovery_loss(&app)
-        .unwrap();
+    fixture.client.synchronize_recovery_loss(&app).unwrap();
     fixture.client.record_native_coverage(&app).await;
     for route in routes(&fixture.client) {
         assert!(

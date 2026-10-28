@@ -413,7 +413,9 @@ impl SqliteAppStorage {
     }
 
     /// Every route with a goal.
-    pub fn recovery_coverage_goal_routes(&self) -> StorageResult<Vec<TransportReconciliationRoute>> {
+    pub fn recovery_coverage_goal_routes(
+        &self,
+    ) -> StorageResult<Vec<TransportReconciliationRoute>> {
         let conn = self.lock()?;
         let rows = conn
             .prepare_cached(
@@ -421,7 +423,9 @@ impl SqliteAppStorage {
                  ORDER BY route_kind, route_id",
             )
             .storage()?
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
             .storage()?
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
@@ -459,8 +463,10 @@ impl SqliteAppStorage {
             .collect::<Result<Vec<_>, _>>()
             .storage()?;
         drop(conn);
-        let mut by_relay: BTreeMap<&str, Vec<RecoveryCoverageRange>> =
-            relays.iter().map(|relay| (relay.as_str(), Vec::new())).collect();
+        let mut by_relay: BTreeMap<&str, Vec<RecoveryCoverageRange>> = relays
+            .iter()
+            .map(|relay| (relay.as_str(), Vec::new()))
+            .collect();
         for (relay, since, until) in &rows {
             if let Some(ranges) = by_relay.get_mut(relay.as_str()) {
                 ranges.push(RecoveryCoverageRange {
@@ -589,7 +595,12 @@ mod tests {
     #[test]
     fn range_algebra_merges_intersects_and_subtracts() {
         assert_eq!(
-            union(vec![range(10, 20), range(21, 30), range(40, 50), range(5, 12)]),
+            union(vec![
+                range(10, 20),
+                range(21, 30),
+                range(40, 50),
+                range(5, 12)
+            ]),
             vec![range(5, 30), range(40, 50)]
         );
         assert_eq!(
@@ -629,8 +640,14 @@ mod tests {
         );
         assert_eq!(ranges(&app, &route, RELAY_A).len(), 2);
         let relays = vec![RELAY_A.to_owned()];
-        assert!(app.recovery_coverage_covers(&route, &relays, 100, 500).unwrap());
-        assert!(!app.recovery_coverage_covers(&route, &relays, 99, 500).unwrap());
+        assert!(
+            app.recovery_coverage_covers(&route, &relays, 100, 500)
+                .unwrap()
+        );
+        assert!(
+            !app.recovery_coverage_covers(&route, &relays, 99, 500)
+                .unwrap()
+        );
         // A slice strictly inside an existing range changes nothing.
         record(&app, &route, RELAY_A, 150, 160, proof, 2_000);
         assert_eq!(
@@ -649,14 +666,34 @@ mod tests {
         let app = storage.app_storage();
         let route = TransportReconciliationRoute::Inbox;
         let both = vec![RELAY_A.to_owned(), RELAY_B.to_owned()];
-        assert!(app.recovery_coverage_debt(&route, &both, 1_000).unwrap().is_empty());
+        assert!(
+            app.recovery_coverage_debt(&route, &both, 1_000)
+                .unwrap()
+                .is_empty()
+        );
         app.widen_recovery_coverage_goals(std::slice::from_ref(&route), 100)
             .unwrap();
         app.widen_recovery_coverage_goals(std::slice::from_ref(&route), 500)
             .unwrap();
         assert_eq!(app.recovery_coverage_goal(&route).unwrap(), Some(100));
-        record(&app, &route, RELAY_A, 100, 1_000, RecoveryCoverageProof::LiveBoundary, 1);
-        record(&app, &route, RELAY_B, 300, 600, RecoveryCoverageProof::Comparison, 1);
+        record(
+            &app,
+            &route,
+            RELAY_A,
+            100,
+            1_000,
+            RecoveryCoverageProof::LiveBoundary,
+            1,
+        );
+        record(
+            &app,
+            &route,
+            RELAY_B,
+            300,
+            600,
+            RecoveryCoverageProof::Comparison,
+            1,
+        );
         assert_eq!(
             app.recovery_coverage_debt(&route, &both, 1_000).unwrap(),
             vec![range(100, 299), range(601, 1_000)]
@@ -676,8 +713,24 @@ mod tests {
         let (lost, kept) = (group(1), group(2));
         for route in [&lost, &kept] {
             for relay in [RELAY_A, RELAY_B] {
-                record(&app, route, relay, 100, 199, RecoveryCoverageProof::Comparison, 1);
-                record(&app, route, relay, 300, 999, RecoveryCoverageProof::Comparison, 1);
+                record(
+                    &app,
+                    route,
+                    relay,
+                    100,
+                    199,
+                    RecoveryCoverageProof::Comparison,
+                    1,
+                );
+                record(
+                    &app,
+                    route,
+                    relay,
+                    300,
+                    999,
+                    RecoveryCoverageProof::Comparison,
+                    1,
+                );
             }
         }
         app.widen_recovery_coverage_goals(&[lost.clone(), kept.clone()], 100)

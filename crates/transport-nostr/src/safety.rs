@@ -280,9 +280,13 @@ pub fn same_relay(left: &str, right: &str) -> bool {
 }
 
 /// One spelling per relay, so endpoint strings from different layers can key
-/// one ledger row: the parsed URL, or the trimmed input when it does not parse.
+/// one ledger row: the parsed URL without a trailing slash, or the trimmed
+/// input when it does not parse. Parsing keeps a trailing slash as given.
 pub fn canonical_relay(endpoint: &str) -> String {
-    RelayUrl::parse(endpoint.trim()).map_or_else(|_| endpoint.trim().to_owned(), |url| url.to_string())
+    let endpoint = endpoint.trim();
+    let parsed =
+        RelayUrl::parse(endpoint).map_or_else(|_| endpoint.to_owned(), |url| url.to_string());
+    parsed.trim_end_matches('/').to_owned()
 }
 
 /// The endpoints whose comparison certifies a recovery scope, chosen from the
@@ -645,6 +649,24 @@ mod tests {
         assert!(same_relay("wss://Relay.Example:443", "wss://relay.example"));
         assert!(same_relay("wss://relay.example/", "wss://relay.example"));
         assert!(!same_relay("wss://relay.example", "wss://other.example"));
+    }
+
+    #[test]
+    fn canonical_relay_spells_same_relays_alike() {
+        for spelling in [
+            "wss://relay.example/",
+            "wss://Relay.Example:443",
+            " wss://relay.example ",
+        ] {
+            assert_eq!(
+                canonical_relay(spelling),
+                canonical_relay("wss://relay.example")
+            );
+        }
+        assert_ne!(
+            canonical_relay("wss://relay.example"),
+            canonical_relay("wss://other.example")
+        );
     }
 
     #[test]
