@@ -273,6 +273,17 @@ fn event_source_message_id_hex(event: &cgka_traits::engine::GroupEvent, fallback
     }
 }
 
+/// The MLS leaf that sent a received application message, when the engine
+/// recorded it.
+fn event_sender_leaf(event: &cgka_traits::engine::GroupEvent) -> Option<u32> {
+    match event {
+        cgka_traits::engine::GroupEvent::MessageReceived {
+            sender_leaf_index, ..
+        } => *sender_leaf_index,
+        _ => None,
+    }
+}
+
 fn event_encrypted_media_secret(
     event: &cgka_traits::engine::GroupEvent,
 ) -> Option<&cgka_traits::EncryptedMediaSecret> {
@@ -2219,6 +2230,7 @@ impl AppClient {
                     self.app.allow_loopback_blob_endpoints(),
                 ) && let Err(error) = self.project_received_message(
                     message,
+                    event_sender_leaf(event),
                     event_encrypted_media_secret(event),
                     group_metadata.as_ref(),
                     &mut event_summary,
@@ -6314,6 +6326,7 @@ impl AppClient {
     fn project_received_message(
         &mut self,
         message: crate::ReceivedMessage,
+        sender_leaf: Option<u32>,
         carried_media_secret: Option<&cgka_traits::EncryptedMediaSecret>,
         group_metadata: Option<&cgka_traits::Group>,
         summary: &mut SyncSummary,
@@ -6331,20 +6344,35 @@ impl AppClient {
                         .map(|membership| (profile, membership.member_leaves))
                 })
                 .and_then(|(profile, active_leaves)| {
-                    self.app.ingest_push_gossip_message(
-                        &self.state.label,
-                        &message,
-                        &active_leaves,
-                        profile,
-                    )
+                    self.app
+                        .ingest_push_gossip_message(
+                            &self.state.label,
+                            &message,
+                            &active_leaves,
+                            profile,
+                        )
+                        .map(|action| (action, active_leaves))
                 });
-            if let Err(err) = ingest_result {
-                tracing::warn!(
-                    target: "marmot_app::notifications",
-                    method = "project_received_message",
-                    error_kind = err.privacy_safe_kind(),
-                    "ignoring malformed push token gossip",
-                );
+            match ingest_result {
+                // What an announce asks for is worked out after its own
+                // entries are applied, and ranked over the leaves they were
+                // applied against.
+                Ok((_, active_leaves))
+                    if message.kind == notifications::MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE =>
+                {
+                    self.note_received_push_repair_ask(&message, sender_leaf, &active_leaves);
+                }
+                Ok((action, _)) => {
+                    self.note_push_repair_cover(&message.group_id, message.source_epoch, &action);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "marmot_app::notifications",
+                        method = "project_received_message",
+                        error_kind = err.privacy_safe_kind(),
+                        "ignoring malformed push token gossip",
+                    );
+                }
             }
             return Ok(());
         }
@@ -6693,6 +6721,11 @@ impl AppClient {
                     leaves,
                     departed_members,
                 )?;
+                let leaves = leaves
+                    .iter()
+                    .map(|leaf| leaf.leaf_index)
+                    .collect::<Vec<_>>();
+                self.forget_push_repair_leaves(group_id, &leaves);
             }
             cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated {
                 group_id,
@@ -7031,6 +7064,7 @@ impl AppClient {
                 ) {
                     self.project_received_message(
                         message,
+                        event_sender_leaf(event),
                         event_encrypted_media_secret(event),
                         group_metadata.as_ref(),
                         &mut event_summary,
@@ -8786,6 +8820,7 @@ mod tests {
                     group_id: group_id.clone(),
                     message_id: sent.reports[0].message_id.clone(),
                     sender: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                    sender_leaf_index: None,
                     epoch: client.runtime.group_record(&group_id).unwrap().epoch,
                     payload,
                     retention: None,

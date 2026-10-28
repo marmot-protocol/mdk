@@ -823,6 +823,9 @@ pub struct AppClient {
     /// without publishing it. This client sends no other there until the
     /// outbox publishes or drops it, or a Welcome opens a new window.
     pub(super) accepted_push_announces: HashMap<GroupId, push::AcceptedPushAnnounce>,
+    /// Announces and requests this device has yet to decide or answer with a
+    /// repair reply, and when it last replied to each announcer's leaf.
+    pub(super) push_repairs: push::PushRepairs,
     /// App-visible outputs ingested during a sync whose account-projection
     /// checkpoint failed. A retained client keeps the matching projected state
     /// and outbox acknowledgements, then returns this summary after its next
@@ -3457,6 +3460,7 @@ impl AppClient {
         self.pending_member_add_push_shares.remove(group_id);
         self.pending_own_add_push_snapshots.remove(group_id);
         self.accepted_push_announces.remove(group_id);
+        self.push_repairs.forget_group(group_id);
         self.app.presentation_signals.wake();
         // Deletion already committed. A failed transport refresh must not make
         // the caller believe the group still exists; ordinary maintenance retries.

@@ -9,11 +9,13 @@ use crate::notifications;
 use super::AppClient;
 
 mod announce;
+mod repair;
 #[cfg(test)]
 mod tests;
 
 use announce::PushShareForm;
 pub(crate) use announce::{AcceptedPushAnnounce, PushAnnounceTiming, PushFetchClock};
+pub(crate) use repair::PushRepairs;
 
 const PUSH_PUBLISH_CONCURRENCY: usize = 4;
 
@@ -430,7 +432,10 @@ impl AppClient {
         let shares_pending = self.retry_pending_push_registration_shares().await;
         // After the shares: one sent after a join window ends is the announce.
         let announces_pending = self.send_due_push_announces().await;
-        snapshots_pending || shares_pending || announces_pending
+        // After the announces, which look at the fetch clock first. A repair
+        // reply is not an announce and settles no announce owed.
+        let repairs_pending = self.send_due_push_repairs().await;
+        snapshots_pending || shares_pending || announces_pending || repairs_pending
     }
 
     async fn retry_pending_push_registration_shares(&mut self) -> bool {
@@ -465,7 +470,12 @@ impl AppClient {
             .app
             .has_pending_push_registration_work(&self.state.label)
         {
-            Ok(pending) => pending || self.has_due_push_snapshot() || self.has_due_push_announce(),
+            Ok(pending) => {
+                pending
+                    || self.has_due_push_snapshot()
+                    || self.has_due_push_announce()
+                    || self.has_due_push_repair()
+            }
             Err(err) => {
                 tracing::warn!(
                     target: "marmot_app::notifications",

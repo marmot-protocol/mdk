@@ -247,6 +247,9 @@ impl<S: cgka_traits::StorageProvider> crate::engine::Engine<S> {
                     message_id: request.message_id.clone(),
                     epoch: request.epoch,
                     sender: request.sender,
+                    // Only moderation controls reach this rail, and its
+                    // durable request keeps no leaf.
+                    sender_leaf_index: None,
                     payload: source.payload,
                     authority: Some(source.authority),
                     retention: request.retention.or_else(|| {

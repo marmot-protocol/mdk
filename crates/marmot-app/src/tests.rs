@@ -16,6 +16,8 @@ mod publication_progress;
 #[cfg(feature = "test-policy-overrides")]
 mod push_announce;
 #[cfg(feature = "test-policy-overrides")]
+mod push_repair;
+#[cfg(feature = "test-policy-overrides")]
 mod push_snapshot;
 #[cfg(feature = "test-policy-overrides")]
 mod push_token_reshare;
@@ -2329,6 +2331,7 @@ fn recovery_warning_requires_qualified_local_observations_and_survives_local_com
                 group_id: group_id.clone(),
                 message_id: cgka_traits::MessageId::new(vec![0xa1; 32]),
                 sender: cgka_traits::MemberId::new(vec![0xb1; 32]),
+                sender_leaf_index: None,
                 epoch: current,
                 payload: Vec::new(),
                 retention: None,
@@ -2462,6 +2465,7 @@ async fn sibling_device_message_clears_the_recovery_warning() {
             group_id: group_id.clone(),
             message_id: cgka_traits::MessageId::new(vec![0xa2; 32]),
             sender: client.runtime.self_id(),
+            sender_leaf_index: None,
             epoch,
             payload: Vec::new(),
             retention: None,
@@ -16388,6 +16392,27 @@ async fn host_departure_event_carries_no_leaf_index() {
     );
 }
 
+/// A received message's sender leaf is a device destination MDK keeps to
+/// itself: hosts receive the event without it.
+#[test]
+fn hosts_receive_no_sender_leaf() {
+    let event = |sender_leaf_index| cgka_traits::engine::GroupEvent::MessageReceived {
+        group_id: GroupId::new(vec![0x5A; 16]),
+        message_id: cgka_traits::MessageId::new(vec![0x11; 32]),
+        sender: MemberId::new(vec![0x22; 32]),
+        sender_leaf_index,
+        epoch: cgka_traits::EpochId(4),
+        payload: b"{}".to_vec(),
+        retention: None,
+        authority: None,
+        encrypted_media_secret: None,
+    };
+    assert_eq!(
+        crate::groups::host_group_event(&event(Some(3))),
+        event(None)
+    );
+}
+
 /// `account_groups.self_membership` is the source of truth for the account
 /// unread aggregate. A self-departure observed only on the drained seam must
 /// move it, and a drained re-join must move it back — otherwise a crash during
@@ -18539,6 +18564,7 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
             group_id: group_id.clone(),
             message_id: fresh.reports[0].message_id.clone(),
             sender: MemberId::new(hex::decode(&sender).unwrap()),
+            sender_leaf_index: None,
             epoch: reopened.runtime.group_record(&group_id).unwrap().epoch,
             payload: fresh_payload,
             retention: None,
@@ -18648,6 +18674,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             group_id: group_id.clone(),
             message_id: historical.reports[0].message_id.clone(),
             sender: sender.clone(),
+            sender_leaf_index: None,
             epoch,
             payload: historical_payload,
             retention: None,
@@ -18658,6 +18685,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             group_id: group_id.clone(),
             message_id: fresh.reports[0].message_id.clone(),
             sender,
+            sender_leaf_index: None,
             epoch,
             payload: fresh_payload,
             retention: None,
@@ -18736,6 +18764,7 @@ async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash(
         group_id: group_id.clone(),
         message_id: message_id.clone(),
         sender,
+        sender_leaf_index: None,
         epoch: client.runtime.group_record(&group_id).unwrap().epoch,
         payload: fresh_payload,
         retention: None,
@@ -18821,6 +18850,7 @@ async fn account_open_keeps_first_fresh_chat_pending_when_group_projection_is_un
         group_id: group_id.clone(),
         message_id,
         sender,
+        sender_leaf_index: None,
         epoch: client.runtime.group_record(&group_id).unwrap().epoch,
         payload: fresh_payload,
         retention: None,
@@ -22647,6 +22677,7 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
             group_id: group_id.clone(),
             message_id: sent.reports[0].message_id.clone(),
             sender: MemberId::new(hex::decode(&sender_hex).unwrap()),
+            sender_leaf_index: None,
             epoch: source_epoch,
             payload,
             retention: None,

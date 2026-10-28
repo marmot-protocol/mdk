@@ -1886,6 +1886,7 @@ mod tests {
             group_id: gid(1),
             message_id,
             sender: MemberId::new(vec![7; 32]),
+            sender_leaf_index: None,
             epoch: EpochId(0),
             payload: b"authenticated chat".to_vec(),
             retention: None,

@@ -2022,6 +2022,7 @@ impl MarmotApp {
             push_announce_timing: Default::default(),
             push_fetch_clock: client::PushFetchClock::new(notifications::unix_now_ms()),
             accepted_push_announces: Default::default(),
+            push_repairs: Default::default(),
             pending_failed_sync_summary: SyncSummary::default(),
             pending_native_sync_summary: SyncSummary::default(),
             native_sync_deliveries: 0,
@@ -4269,14 +4270,15 @@ impl MarmotApp {
     /// `(owner_ts, record_digest)` ordering primitive and tombstones (enforced by
     /// the storage `apply_*` calls) decide what mutates state. Because authority
     /// comes from each record's `owner_sig`, a kind 448 may carry — and apply —
-    /// records owned by members other than `message.sender`.
+    /// records owned by members other than `message.sender`. Returns the
+    /// entries that passed owner authentication and name a current member.
     pub(crate) fn ingest_push_gossip_message(
         &self,
         account_ref: &str,
         message: &ReceivedMessage,
         active_leaves: &[cgka_traits::engine::GroupMemberLeaf],
         profile: cgka_traits::group::ProtocolProfile,
-    ) -> Result<(), AppError> {
+    ) -> Result<notifications::PushGossipAction, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         let group_id_hex = hex::encode(message.group_id.as_slice());
@@ -4297,14 +4299,14 @@ impl MarmotApp {
             &active_member_ids,
             profile,
         );
-        match action {
+        match &action {
             notifications::PushGossipAction::Upsert(records) => {
                 for record in records {
                     // A valid account signature does not make a departed
                     // sibling leaf eligible for a notification destination.
                     if active_leaves.contains(&(record.member_id_hex.clone(), record.leaf_index)) {
                         storage
-                            .apply_group_push_token(&account_group_push_token_from_app(&record))?;
+                            .apply_group_push_token(&account_group_push_token_from_app(record))?;
                     }
                 }
             }
@@ -4313,14 +4315,14 @@ impl MarmotApp {
                     storage.apply_group_push_token_tombstone(
                         &conversions::account_push_token_tombstone_from_removal(
                             &group_id_hex,
-                            &removal,
+                            removal,
                             notifications::unix_now_ms(),
                         )?,
                     )?;
                 }
             }
         }
-        Ok(())
+        Ok(action)
     }
 
     /// Apply immutable engine leaf-departure facts through the account-scoped storage boundary.

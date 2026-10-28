@@ -3080,9 +3080,10 @@ async fn run_app_runtime_account_worker(
                 }
                 // A join window ends once T has been counted since its join
                 // completed, which only time passing shows; the tick counts
-                // it and notices joins that completed.
+                // it and notices joins that completed. Repair asks wait for
+                // the same clock, and replies for their rank's slots.
                 client.advance_push_join_windows().await;
-                if client.has_due_push_announce() {
+                if client.has_due_push_announce() || client.has_due_push_repair() {
                     scheduled_push_retry.observe_pending(true, &command_tx);
                 }
                 scheduled_runtime_group_subscription_refresh.observe_pending(
@@ -6754,11 +6755,13 @@ fn push_registration_retry_delay(attempt: u32) -> Duration {
 
 /// Arm the push retry for the work a worker turn left: a member add on any
 /// ingest or send path that queued a share or owed a snapshot, a sent message
-/// that owes the periodic announce, or an owed snapshot or announce that its
+/// that owes the periodic announce, a received announce or request to decide
+/// a repair reply for, or an owed snapshot, announce or repair reply that its
 /// group's state no longer holds back. What holds one back (hydration, a
 /// queued invite, a disband, a block) changes only through account work, so
 /// checking after every turn notices it without polling. A join window
-/// ending is noticed by the maintenance tick.
+/// ending, and a repair reply's slots passing, are noticed by the maintenance
+/// tick.
 fn schedule_push_work_after_turn(
     client: &mut AppClient,
     scheduled: &mut ScheduledPushRegistrationRetry,
@@ -6768,6 +6771,7 @@ fn schedule_push_work_after_turn(
     if client.take_queued_push_registration_share()
         || client.has_due_push_snapshot()
         || client.has_due_push_announce()
+        || client.has_due_push_repair()
     {
         scheduled.observe_pending(true, commands);
     }
@@ -10303,6 +10307,7 @@ mod tests {
                 group_id,
                 message_id: message_id.clone(),
                 sender: cgka_traits::MemberId::new(vec![0x11; 32]),
+                sender_leaf_index: None,
                 epoch: cgka_traits::EpochId(1),
                 payload: Vec::new(),
                 retention: None,

@@ -66,6 +66,38 @@
     would have brought;
   - an announce held in the outbox when the client restarts is owed again,
     so the outbox may publish it as well as its replacement.
+- Members now repair what an announce lacks (mdk#2611). A device that
+  receives an announce, or a request (a kind 447 with an empty or missing
+  `tokens` and no `have`, taken as an announce whose `have` is empty), works
+  out which records and tombstones it can relay that the announce does not
+  name, once the announce's own entries are applied. Every leaf but the announcer's is
+  ranked by SHA-256 of the announce's event id and the leaf index; only the
+  top three reply, rank `r` after `r` × 30 seconds, with kind 448 and 449
+  lists of just the missing entries, exactly as their owners signed them.
+  Before sending, a device drops whatever kind 448 and 449 entries carried at
+  the announce's epoch or later already cover, sends what it now holds for
+  the rest (a newer entry than a cover still goes), and sends nothing when
+  none is left. A device decides only once its catch-up has run, so replies it
+  catches up on can cancel its own, and replies to each announcer's leaf at
+  most once per 24 hours in a group; every 447's entries are still applied.
+  A `have` that is not an array or holds more than 4,096 elements draws no
+  reply. A repair reply is not an announce: it settles no announce owed and
+  ends no join window. `GroupEvent::MessageReceived` now records the MLS leaf
+  that sent the message (`sender_leaf_index`), which ranking needs; it is
+  cleared before hosts receive the event.
+
+  Known limits, each costing at most an extra reply or a reply left to the
+  announcer's next announce:
+  - repair state lives in memory, so a reply a restart interrupts waits for
+    the announcer's next announce;
+  - a device ranks over the group's leaves as it processes the announce, so
+    when a Commit lands in the same batch, or the announce arrives late,
+    devices can disagree on the top three;
+  - the catch-up limits of announces apply: whether a device can fetch is
+    judged for the whole account, and after the five-minute timeout the
+    catch-up counts as run once any subscription was served;
+  - a 447 carried on the moderation-authority retry rail has no sender leaf
+    and draws no reply.
 
 ### Changed
 

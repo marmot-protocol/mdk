@@ -20,7 +20,7 @@ pub(super) struct Device {
 }
 
 impl Device {
-    async fn create(home: &AccountHome, app: &MarmotApp, label: &str) -> Self {
+    pub(super) async fn create(home: &AccountHome, app: &MarmotApp, label: &str) -> Self {
         let account = home.create_account(label).unwrap();
         remember_test_member_inbox(app, &account.account_id_hex, RELAY);
         Self::open(app, label, &account.account_id_hex, 0).await

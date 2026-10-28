@@ -18,8 +18,8 @@ use crate::messages::AppMessageIntent;
 use crate::notifications;
 
 /// How long a device's push join window lasts once its join completes, how
-/// long it may go without announcing in a group it sends to, and how it tells
-/// that it can fetch.
+/// long it may go without announcing in a group it sends to, how it tells
+/// that it can fetch, and how long each rank waits before a repair reply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PushAnnounceTiming {
     /// T: at least one minute, so the adder's snapshot normally arrives before
@@ -33,9 +33,13 @@ pub(crate) struct PushAnnounceTiming {
     /// hold every window open.
     pub(crate) catch_up_timeout: Duration,
     /// How long this client must have watched the device able to fetch
-    /// before it announces: time for the worker to process what the catch-up
-    /// placed.
+    /// before it announces or decides a repair reply: time for the worker to
+    /// process what the catch-up placed.
     pub(crate) catch_up_settle: Duration,
+    /// The repair reply slot: a leaf of rank `r` replies to an announce `r`
+    /// slots after it decided to, so a reply sent by a higher rank can
+    /// cancel its own.
+    pub(crate) repair_slot: Duration,
 }
 
 impl Default for PushAnnounceTiming {
@@ -45,6 +49,7 @@ impl Default for PushAnnounceTiming {
             interval: Duration::from_secs(7 * 24 * 60 * 60),
             catch_up_timeout: Duration::from_secs(5 * 60),
             catch_up_settle: Duration::from_secs(15),
+            repair_slot: Duration::from_secs(30),
         }
     }
 }
@@ -109,7 +114,7 @@ impl PushFetchClock {
 
     /// Whether this client has watched the device able to fetch for at least
     /// `settle` in the current stretch.
-    fn settled(&self, settle: Duration) -> bool {
+    pub(super) fn settled(&self, settle: Duration) -> bool {
         self.fetching && self.watched_ms >= millis(settle)
     }
 }

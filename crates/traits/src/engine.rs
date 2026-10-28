@@ -650,6 +650,13 @@ pub enum GroupEvent {
         /// sender-controlled wall clock.
         message_id: MessageId,
         sender: MemberId,
+        /// The MLS leaf that sent the message at `epoch`; `sender` names only
+        /// its account, which may hold several leaves. `None` on the
+        /// moderation-authority retry rail and for events stored before it was
+        /// recorded. A device destination: `marmot-app` clears it before
+        /// hosts receive the event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sender_leaf_index: Option<u32>,
         epoch: EpochId,
         payload: Vec<u8>,
         /// Retention policy resolved from the authenticated MLS source epoch.

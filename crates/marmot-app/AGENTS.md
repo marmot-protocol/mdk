@@ -34,7 +34,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   (timeline/group projection accessors, the `*_for_group` component reads, the
   kind-1210 group-system row synthesis, and the local-send projection helpers), `receipts.rs` (the synchronized
   transport receipt view, release-journal consumption, and seen-index maintenance), `push.rs` (push-token registration
-  and gossip, with announces and join windows in `push/announce.rs`, and notification-trigger publishing),
+  and gossip, with announces and join windows in `push/announce.rs`, repair replies in `push/repair.rs`, and
+  notification-trigger publishing),
   `retention.rs` (the engine-owned retention sweep policy, the
   storage-answered expiry/unread scan, per-group outcome orchestration, and decision tests), `history_notices.rs` ("history may be incomplete"
   notices, their worker-owned dismissal and the notice-change baseline; the public DTOs and opaque id codec live

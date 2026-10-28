@@ -3319,6 +3319,7 @@ fn failed_resurrection_projection_save_retains_local_deletion_frontier() {
         group_id: cgka_traits::GroupId::new(vec![0xaa]),
         message_id: fresh_message_id.clone(),
         sender: MemberId::new(vec![7; 32]),
+        sender_leaf_index: None,
         epoch: EpochId(0),
         payload: b"fresh chat".to_vec(),
         retention: None,
