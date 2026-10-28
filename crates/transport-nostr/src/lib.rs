@@ -78,7 +78,7 @@ pub use directory::{
     DirectorySubscriptionFilter, DirectorySubscriptionSyncSummary, DirectorySyncBatch,
     DirectorySyncPlan, NostrSdkDirectoryRelayFetcher,
 };
-pub use safety::{RelaySafetyPolicy, recovery_required_endpoints, same_relay};
+pub use safety::{RelaySafetyPolicy, canonical_relay, recovery_required_endpoints, same_relay};
 pub use telemetry::rollup_from_snapshots;
 
 // Re-exported so the in-tree `tests` module (which uses `super::*`) keeps

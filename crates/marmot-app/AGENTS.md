@@ -157,6 +157,16 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   adapter's queued subscription refusals (`take_subscription_refusals`) into one `subscription_refused` row. Scenario
   tests live in
   `src/client/audit_recovery/scenario_tests.rs` and `sync/comparison_job.rs`.
+- Keep the coverage-ledger recorder in `src/client/recovery_coverage.rs` (mdk#2660 phase 2, shadow mode). It records
+  at owner seams only: loss imports (`record_recovery_loss_imports`, goals only: storage un-covers the ledger inside
+  the import transaction), history requests (`record_recovery_request`), native synchronization
+  (`synchronize_native_replay`) and settlement (`settle_recovery_grant`). Its writes are best effort and nothing
+  schedules, retries or fences on the ledger; do not read it from recovery decisions until phase 4 replaces the
+  obligations. It records no live boundary while a loss obligation is pending. `coverage_shadow_report` is the
+  test-visible comparison with pending obligations; a scope holds proof only as completion would count it (its
+  predicate at the current loss, route, inventory and obligation revisions), and a scope whose floor is unknown or
+  older than the retained window is owed from the retention floor. It logs aggregate counts only. Known disagreements
+  are listed in `docs/marmot-architecture/further-context/account-recovery.md#coverage-ledger-shadow-mode`.
 - Keep the configured audit OTLP/HTTP sender in `src/audit_otlp_sender.rs`. It accepts an owned local-delivery batch,
   checks the prepared destination, preserves each original v5 JSON body inside the restricted OTLP JSON envelope,
   and maps only complete, partial, and retryable receiver outcomes to local finish actions. Blocked and unknown
@@ -440,7 +450,8 @@ Implement shared behavior here, following [MDK's host boundary](../../docs/marmo
   `local_submissions.rs`,
   `agent_publisher.rs` (host-driven agent publishing), `attachment_controls.rs`, `attachment_permission.rs`
   (runtime-only network approval; never restore it from disk).
-- `src/client/`: `recovery.rs` (recovery grant authorization), `invite_recovery.rs` (durable invitation recovery),
+- `src/client/`: `recovery.rs` (recovery grant authorization), `recovery_coverage.rs` (the shadow coverage-ledger
+  recorder and its comparison with pending obligations, mdk#2660), `invite_recovery.rs` (durable invitation recovery),
   `epoch_stall.rs` (epoch-gap backfill detection), `delivery_spill.rs` (worker side of the durable delivery spill),
   `audit_v5_app_update.rs` (bounded app-boundary audit rows), `sync/comparison_job.rs` (the one recovery comparison
   job).
