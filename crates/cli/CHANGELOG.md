@@ -53,6 +53,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 - `groups members`, `groups show` and `groups management` list each member account once, even when it has several
   devices in the group, and each `members` entry gains `device_count` (mdk#2628). Member counts, admin counts and the
   last-admin check count accounts, and a chat between two accounts stays direct whatever devices either person uses.
+- MDK now advertises `marmot.group.account-devices.v1` (0x800d) (mdk#2628). New KeyPackages list it, a device replaces
+  a published KeyPackage that does not, and its leaf in each existing group gains it through the randomized refresh of
+  stale leaves, each group at its own time within five days. No group starts requiring it, and a device that doesn't
+  advertise it can still be invited into groups that don't require it. The engine builder now accepts 0x800d, and the
+  test-only `allow_account_devices_advertising_for_tests` builder flags are gone.
 - MDK now enforces `marmot.group.account-devices.v1` (0x800d) in groups that require it (mdk#2628). In such a group
   nothing carries data for it (GroupContext, leaves, added KeyPackages) and no AppDataUpdate targets it, every leaf
   supports it, no account holds more than 20 leaves, and the group never stops requiring it. A Commit or standalone

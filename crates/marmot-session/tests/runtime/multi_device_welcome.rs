@@ -57,9 +57,6 @@ fn nostr_routing() -> AppComponentData {
 struct SharedRouting(Arc<Mutex<StaticTransportRouting>>);
 
 impl SharedRouting {
-    // Only the account-devices tests, behind `test-policy-overrides`, add
-    // routes.
-    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
     fn update(&self, extend: impl FnOnce(StaticTransportRouting) -> StaticTransportRouting) {
         let mut routing = self.0.lock().unwrap();
         *routing = extend(routing.clone());
@@ -95,11 +92,8 @@ impl TransportRoutingPolicy for SharedRouting {
 /// KeyPackage.
 struct Device {
     runtime: AccountDeviceRuntime<RecordingAdapter, SharedRouting, RecordingKeyPackages>,
-    /// What the runtime publishes, and where. Only the account-devices
-    /// tests, behind `test-policy-overrides`, read them.
-    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+    /// What the runtime publishes, and where.
     adapter: RecordingAdapter,
-    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
     routing: SharedRouting,
     /// The device's current KeyPackage as an inviter fetches it, carrying the
     /// id of its publication for the inviter to name in the rumor.
@@ -824,9 +818,7 @@ fn publication_id(key_package: &cgka_traits::engine::KeyPackage) -> MessageId {
 
 /// A Welcome from a device of the joiner's own account, in a group that
 /// requires `marmot.group.account-devices.v1`
-/// (`app-components/account-devices-v1.md`, "Welcome acceptance"). Sessions
-/// advertise the component only in builds that allow it for tests.
-#[cfg(feature = "test-policy-overrides")]
+/// (`app-components/account-devices-v1.md`, "Welcome acceptance").
 mod same_account_welcome {
     use super::*;
     use cgka_traits::app_components::{ACCOUNT_DEVICES_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID};
@@ -861,8 +853,7 @@ mod same_account_welcome {
                 keys: deterministic_nostr_keys(account),
             }))
             .protocol_profile(ProtocolProfile::Current)
-            .supported_app_components(components)
-            .allow_account_devices_advertising_for_tests(),
+            .supported_app_components(components),
         )
         .unwrap();
         (session, storage)

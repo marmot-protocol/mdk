@@ -17,6 +17,10 @@ use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
     AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY, AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
 };
+use cgka_traits::app_components::{
+    ACCOUNT_DEVICES_COMPONENT_ID, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, NostrRoutingV1,
+    default_group_components,
+};
 #[allow(deprecated)]
 pub use cgka_traits::app_components::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT as AGENT_TEXT_STREAM_COMPONENT,
@@ -29,9 +33,6 @@ pub use cgka_traits::app_components::{
     GROUP_MESSAGE_RETENTION_COMPONENT, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
     GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT,
     NOSTR_ROUTING_COMPONENT_ID,
-};
-use cgka_traits::app_components::{
-    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, NostrRoutingV1, default_group_components,
 };
 pub use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM};
@@ -5199,6 +5200,10 @@ impl MarmotApp {
                 return true;
             }
         };
+        // Current means what the session keeps: a current-profile bundle for
+        // this account. One that only lacks a newly supported component is
+        // still joinable, so it is not deleted here; the runtime replaces it
+        // in its slot and keeps the old key for the grace.
         let is_current = key_package_from_hex_with_optional_source(
             &record.key_package_hex,
             &record.key_package_event_id,
@@ -5206,7 +5211,7 @@ impl MarmotApp {
         .ok()
         .and_then(|key_package| key_package_metadata(&key_package).ok())
         .is_some_and(|metadata| {
-            self.key_package_metadata_matches_current_support(&metadata)
+            metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
                 && metadata.credential_identity_hex == record.account_id_hex
         });
         if is_current {
@@ -7678,6 +7683,11 @@ impl MarmotApp {
         // negotiation: each group's required component id selects exactly one.
         components.insert(GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID);
         components.insert(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID);
+        // Advertised, never turned on here: a group requires account-devices
+        // only when its creator or an admin asks for it (mdk#2628, items 2.3
+        // and 2.4). Advertising it makes leaves eligible and lets this device
+        // join groups that already require it.
+        components.insert(ACCOUNT_DEVICES_COMPONENT_ID);
         components.into_iter().collect()
     }
 

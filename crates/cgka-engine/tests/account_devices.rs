@@ -21,12 +21,6 @@
 //! replay, a crafted standalone proposal is rejected at ingest, and a joiner
 //! refuses a crafted Welcome). Before a group requires 0x800d, its data is
 //! accepted like any unknown component's, and only an admin's Welcome joins.
-//! The builder only lets these tests advertise 0x800d through the test-only
-//! escape hatch, so the file needs one of the test features.
-#![cfg(any(
-    feature = "test-policy-overrides",
-    feature = "test-conformance-snapshot"
-))]
 
 use async_trait::async_trait;
 use cgka_engine::account_identity_proof::account_identity_proof_component;
@@ -227,7 +221,6 @@ fn device(account: &[u8], advertises_account_devices: bool) -> Device {
         .protocol_profile(ProtocolProfile::Current)
         .feature_registry(registry())
         .supported_app_components(supported)
-        .allow_account_devices_advertising_for_tests()
         .peeler(Box::<MockPeeler>::default())
         .build()
         .unwrap();
@@ -891,15 +884,18 @@ fn try_build(supported: Vec<u16>) -> Result<Engine<SqliteAccountStorage>, Engine
 #[test]
 fn builder_refuses_protocol_components_the_engine_does_not_implement() {
     let defaults: Vec<_> = default_group_components().into_iter().collect();
-    for unimplemented in [ACCOUNT_DEVICES_COMPONENT_ID, SAFE_AAD_COMPONENT_ID] {
-        let mut supported = defaults.clone();
-        supported.push(unimplemented);
-        let error = try_build(supported).err().expect("the builder refuses");
-        assert!(
-            error.to_string().contains("does not implement it"),
-            "unexpected error: {error}"
-        );
-    }
+    let mut supported = defaults.clone();
+    supported.push(SAFE_AAD_COMPONENT_ID);
+    let error = try_build(supported).err().expect("the builder refuses");
+    assert!(
+        error.to_string().contains("does not implement it"),
+        "unexpected error: {error}"
+    );
+    // The engine enforces every account-devices rule, so any build may
+    // advertise it (mdk#2628, item 2.2).
+    let mut supported = defaults.clone();
+    supported.push(ACCOUNT_DEVICES_COMPONENT_ID);
+    try_build(supported).expect("account-devices is advertisable");
     // App-owned ids are the host's to advertise.
     let mut supported = defaults;
     supported.push(0xf001);
@@ -1297,7 +1293,6 @@ async fn legacy_groups_are_not_subject_to_the_rules() {
             .account_identity_proof_signer(proof_signer(account))
             .feature_registry(registry())
             .supported_app_components(supported)
-            .allow_account_devices_advertising_for_tests()
             .peeler(Box::<MockPeeler>::default())
             .build()
             .unwrap();

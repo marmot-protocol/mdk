@@ -101,6 +101,17 @@
 
 ### Changed
 
+- MDK now advertises `marmot.group.account-devices.v1` (0x800d) (mdk#2628).
+  New KeyPackages list it. A device whose published KeyPackage does not
+  replaces it in the same slot at its next maintenance, holding the old one's
+  key for 24 hours as after any refresh. Its leaf in each group it is already
+  in gains the component through the randomized refresh of stale leaves: each
+  group draws its own time within five days, and the refresh is an ordinary
+  self-update that keeps every component the group requires. No group starts
+  requiring 0x800d: neither creating a group nor an upgrade asks for it, and
+  the same-account send intents stay out of the app API. A device that
+  advertises it can join a group that requires it, and a device that does not
+  can still be invited into any group that does not.
 - Creating a group or inviting adds every device of each recipient account
   (mdk#2628, mdk#1696). The directory reads an account's KeyPackages together
   with its KeyPackage deletion requests, then selects every valid, compatible

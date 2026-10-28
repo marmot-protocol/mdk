@@ -112,8 +112,9 @@ Load-bearing departures from the original plan; each is also documented at its s
 7. **Two-layer addressing.** `StaleReason::NotForThisClient` is engine-layer identity filtering as well as transport
    defense.
 8. **Advertise only what the engine implements.** `EngineBuilder::build` refuses a protocol-owned component id outside
-   `ADVERTISABLE_PROTOCOL_APP_COMPONENTS`. Account-devices (0x800d) is enforced but stays refused until mdk#2628 item
-   2.2; tests opt in with `allow_account_devices_advertising_for_tests`.
+   `ADVERTISABLE_PROTOCOL_APP_COMPONENTS`. A component joins that list only once the engine enforces every rule of it,
+   because a group may require what its members advertise. Advertising never turns a component on: group creation
+   and upgrades require it only when asked, and upgrades never add account-devices (0x800d).
 
 ## Publish-before-apply
 
